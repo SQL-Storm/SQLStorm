@@ -1,0 +1,96 @@
+with RecentPosts as (
+    select p.Id, p.PostTypeId, p.Title, p.CreationDate, p.Score, p.ViewCount,
+        u.DisplayName as OwnerName, u.Reputation, a.CommentCount,
+        row_number() over (partition by p.PostTypeId order by p.Score desc, p.CreationDate desc) as rn,
+        coalesce(
+          (select count(distinct ans.Id)
+           from Posts ans
+           where ans.ParentId = p.Id
+             and ans.PostTypeId = 2 and ans.Score > 0), 0) as PositiveAnswerCount,
+        coalesce(
+          (select count(*)
+           from Votes v
+           where v.PostId = p.Id
+             and v.VoteTypeId = 5), 0) as SavedCount
+    from Posts p
+    left join Users u on p.OwnerUserId = u.Id
+    left join (select PostId, count(*) as CommentCount from Comments group by PostId) a
+      on a.PostId = p.Id
+    where p.PostTypeId in (1,2)
+      and p.CreationDate >= (timestamp '2024-10-01 12:34:56' - interval '6 months')
+),
+CanceledBadgesByUser as (
+    select b.UserId,
+           cast(sum(case when b.Class = 1 then 1 else 0 end) as integer) as GoldCount,
+           cast(sum(case when b.Class = 2 then 1 else 0 end) as integer) as SilverCount,
+           cast(sum(case when b.Class = 3 then 1 else 0 end) as integer) as BronzeCount
+    from Badges b
+    where b.Date >= (timestamp '2024-10-01 12:34:56' - interval '1 year')
+    group by b.UserId
+),
+PostAgg as (
+    select rp.Id as PostId, rp.Title, rp.Score, rp.ViewCount, rp.OwnerName, rp.Reputation,
+           rp.CommentCount, rp.PositiveAnswerCount, rp.SavedCount,
+           cbd.GoldCount, cbd.SilverCount, cbd.BronzeCount,
+           (
+             select string_agg(t.TagName, ',')
+             from (
+               select t2.TagName
+               from Posts px
+               cross join lateral (
+                 select unnest(string_to_array(
+                   substring(px.Tags from 2 for char_length(px.Tags)-2), '><')) as TagName
+               ) as tagitems
+               join Tags t2 on lower(t2.TagName) = lower(tagitems.TagName)
+               where px.Id = rp.Id
+               limit 1
+             ) t
+           ) as RepresentativeTag,
+           rp.CreationDate
+    from RecentPosts rp
+    left join CanceledBadgesByUser cbd on cbd.UserId = rp.Id
+),
+LinkedByType as (
+    select pl.PostId, pl.LinkTypeId, count(pl.RelatedPostId) as LinksCount
+    from PostLinks pl
+    where pl.CreationDate >= (timestamp '2024-10-01 12:34:56' - interval '3 months')
+    group by pl.PostId, pl.LinkTypeId
+),
+VotesToday as (
+    select v.PostId,
+           sum(case when v.VoteTypeId = 2 then 1 else 0 end) as UpVotesToday,
+           sum(case when v.VoteTypeId = 3 then 1 else 0 end) as DownVotesToday
+    from Votes v
+    where v.CreationDate >= date '2024-10-01'
+      and v.CreationDate < (date '2024-10-01' + interval '1 day')
+    group by v.PostId
+),
+MaxScoreByTag as (
+    select tag as Tag,
+           max(p.Score) as MaxScore
+    from (
+      select p.Score,
+             unnest(string_to_array(substring(p.Tags from 2 for char_length(p.Tags)-2), '><')) as tag
+      from Posts p
+      where p.PostTypeId = 1
+        and p.CreationDate >= (timestamp '2024-10-01 12:34:56' - interval '1 year')
+    ) sub
+    group by tag
+)
+select distinct pa.PostId, pa.Title, pa.Score, pa.ViewCount, pa.OwnerName, 
+       coalesce(vc.UpVotesToday,0) as TodayUpVotes,
+       coalesce(vc.DownVotesToday,0) as TodayDownVotes,
+       pa.GoldCount, pa.SilverCount, pa.BronzeCount,
+       lbt.LinksCount as LinksToPreviouslyLinkedPost,
+       msb.MaxScore as MaxTagScoreLastYear,
+       pa.PositiveAnswerCount,
+       pa.CreationDate
+from PostAgg pa
+left join VotesToday vc on vc.PostId = pa.PostId
+left join (
+  select PostId, sum(LinksCount) as LinksCount
+  from LinkedByType
+  group by PostId
+) lbt on lbt.PostId = pa.PostId
+left join MaxScoreByTag msb on lower(msb.Tag) = lower(pa.RepresentativeTag)
+order by pa.Score desc, pa.CreationDate desc;

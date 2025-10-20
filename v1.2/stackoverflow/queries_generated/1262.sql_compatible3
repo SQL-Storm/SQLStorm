@@ -1,0 +1,191 @@
+WITH RECURSIVE RecursiveTagHierarchy AS (
+    SELECT 
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        CAST(ARRAY[t.TagName] AS text[]) AS Ancestors
+    FROM Tags t
+    WHERE NOT EXISTS (
+        SELECT 1 FROM Posts p
+        WHERE p.PostTypeId = 1 AND p.Tags LIKE '%' || '<' || t.TagName || '>' || '%'
+    )
+    UNION ALL
+    SELECT 
+        c.Id,
+        c.TagName,
+        c.Count,
+        c.ExcerptPostId,
+        c.WikiPostId,
+        rh.Ancestors || c.TagName
+    FROM Tags c
+    INNER JOIN Posts p ON p.PostTypeId = 1 AND p.Tags LIKE '%' || '<' || c.TagName || '>' || '%'
+    INNER JOIN RecursiveTagHierarchy rh ON rh.TagName = substring(p.Tags FROM '<([^>]+)>')
+),
+CTE_UserPostActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionsAsked,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswersGiven,
+        COALESCE(SUM(vt.UpVotes - vt.DownVotes), 0) AS NetVotes,
+        ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY MAX(p.CreationDate) DESC) AS RecentPostRank,
+        MAX(p.CreationDate) AS LastPostDate
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN (
+        SELECT
+            p.Id,
+            COALESCE(SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END),0) AS UpVotes,
+            COALESCE(SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END),0) AS DownVotes
+        FROM Posts p
+        LEFT JOIN Votes v ON v.PostId = p.Id
+        GROUP BY p.Id
+    ) vt ON vt.Id = p.Id
+    GROUP BY u.Id, u.DisplayName
+),
+CTE_AnswerComparisons AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.Title AS QuestionTitle,
+        a.Id AS AnswerId,
+        a.Score AS AnswerScore,
+        a.OwnerUserId AS AnswerAuthor,
+        RANK() OVER (PARTITION BY q.Id ORDER BY a.Score DESC, a.CreationDate) AS AnswerRank
+    FROM Posts q
+    LEFT JOIN Posts a ON a.ParentId = q.Id AND a.PostTypeId = 2
+    WHERE q.PostTypeId = 1
+),
+CTE_BadgesSummary AS (
+    SELECT
+        b.UserId,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        COUNT(b.Id) AS TotalBadges
+    FROM Badges b
+    GROUP BY b.UserId
+),
+CTE_CommentTrending AS (
+    SELECT
+        c.PostId,
+        COUNT(*) AS TotalComments,
+        AVG(LENGTH(c.Text)) AS AvgCommentLength,
+        SUM(CASE WHEN c.CreationDate > (CAST('2024-10-01' AS date) - INTERVAL '30' DAY) THEN 1 ELSE 0 END) AS RecentComments
+    FROM Comments c
+    GROUP BY c.PostId
+),
+UserPostActivityWithBadges AS (
+    SELECT
+        upa.UserId,
+        upa.DisplayName,
+        upa.TotalPosts,
+        upa.QuestionsAsked,
+        upa.AnswersGiven,
+        upa.NetVotes,
+        COALESCE(bs.GoldBadges, 0) AS GoldBadges,
+        COALESCE(bs.SilverBadges, 0) AS SilverBadges,
+        COALESCE(bs.BronzeBadges, 0) AS BronzeBadges,
+        upa.LastPostDate
+    FROM CTE_UserPostActivity upa
+    LEFT JOIN CTE_BadgesSummary bs ON bs.UserId = upa.UserId
+),
+QuestionsWithMeta AS (
+    SELECT 
+        q.Id,
+        q.Title,
+        q.CreationDate,
+        q.Score,
+        q.ViewCount,
+        q.AnswerCount,
+        q.FavoriteCount,
+        q.Tags,
+        c.TrendingScore,
+        ps.GoldBadges,
+        ps.SilverBadges,
+        ps.BronzeBadges,
+        q.ClosedDate,
+        EXISTS (
+            SELECT 1 FROM PostLinks pl WHERE pl.PostId = q.Id AND pl.LinkTypeId = 3
+        ) AS HasDuplicate,
+        COALESCE(v.UpVotesSum, 0) AS TotalUpVotes,
+        COALESCE(v.DownVotesSum, 0) AS TotalDownVotes,
+        q.OwnerUserId,
+        q.CloseReasonName
+    FROM Posts q
+    LEFT JOIN (
+        SELECT 
+            c.PostId,
+            CAST(COUNT(*) AS double precision) + AVG(LENGTH(c.Text)) AS TrendingScore
+        FROM Comments c
+        GROUP BY c.PostId
+    ) c ON c.PostId = q.Id
+    LEFT JOIN UserPostActivityWithBadges ps ON ps.UserId = q.OwnerUserId
+    LEFT JOIN (
+        SELECT
+            p.Id,
+            SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotesSum,
+            SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotesSum
+        FROM Posts p
+        LEFT JOIN Votes v ON v.PostId = p.Id
+        WHERE p.PostTypeId = 1
+        GROUP BY p.Id
+    ) v ON v.Id = q.Id
+    WHERE q.PostTypeId = 1
+),
+RecentActiveUsers AS (
+    SELECT 
+        u.UserId,
+        u.DisplayName,
+        u.TotalPosts,
+        u.QuestionsAsked,
+        u.AnswersGiven,
+        u.NetVotes,
+        u.GoldBadges,
+        u.SilverBadges,
+        u.BronzeBadges,
+        dense_rank() OVER (ORDER BY u.NetVotes DESC, u.TotalPosts DESC, u.GoldBadges DESC) AS ActivityRank
+    FROM UserPostActivityWithBadges u
+    WHERE u.LastPostDate > (CAST('2024-10-01' AS date) - INTERVAL '180' DAY)
+)
+SELECT
+    q.Id AS QuestionId,
+    q.Title,
+    q.Score,
+    q.ViewCount,
+    q.AnswerCount,
+    q.FavoriteCount,
+    q.Tags,
+    q.GoldBadges,
+    q.SilverBadges,
+    q.BronzeBadges,
+    q.TotalUpVotes,
+    q.TotalDownVotes,
+    q.CloseReasonName,
+    q.HasDuplicate,
+    a_high.AnswerId AS HighestScoredAnswerId,
+    a_high.AnswerScore AS HighestAnswerScore,
+    u.DisplayName AS QuestionOwner,
+    u.Reputation AS QuestionOwnerReputation,
+    u.Location AS QuestionOwnerLocation
+FROM QuestionsWithMeta q
+LEFT JOIN LATERAL (
+    SELECT a.AnswerId, a.AnswerScore
+    FROM CTE_AnswerComparisons a
+    WHERE a.QuestionId = q.Id AND a.AnswerRank = 1
+    LIMIT 1
+) a_high ON TRUE
+LEFT JOIN Users u ON u.Id = q.OwnerUserId
+LEFT JOIN PostHistory ph_close ON ph_close.PostId = q.Id AND ph_close.PostHistoryTypeId = 10
+LEFT JOIN CloseReasonTypes crt ON crt.Id = CAST(ph_close.Comment AS integer)
+WHERE q.Score > 10
+  AND q.AnswerCount >= 2
+  AND (q.HasDuplicate IS FALSE OR q.HasDuplicate IS NULL)
+  AND (
+       q.ClosedDate IS NULL 
+       OR (q.ClosedDate IS NOT NULL AND crt.Name = 'Not a real question')
+      )
+ORDER BY q.TotalUpVotes DESC, q.AnswerCount DESC, q.ViewCount DESC
+LIMIT 50;

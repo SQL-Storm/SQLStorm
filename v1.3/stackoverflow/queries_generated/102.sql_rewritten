@@ -1,0 +1,219 @@
+-- {"query": "102.sql", "dataset": "stackoverflow", "version": "v1.3", "prompt": "p1", "model": "gpt-5-mini", "temperature": 1.0, "max_tokens": 32768, "reasoning": "low", "input_tokens": 2026, "output_tokens": 2658} 
+with
+-- recent activity per user: last post/comment/vote
+recent_activity as (
+  select u.Id as UserId,
+         greatest(
+           coalesce(max(p.LastActivityDate), timestamp '1970-01-01'),
+           coalesce(max(c.CreationDate), timestamp '1970-01-01'),
+           coalesce(max(v.CreationDate), timestamp '1970-01-01')
+         ) as LastActivity
+  from Users u
+  left join Posts p on p.OwnerUserId = u.Id
+  left join Comments c on c.UserId = u.Id
+  left join Votes v on v.UserId = u.Id
+  group by u.Id
+),
+-- per-user post aggregates (questions vs answers), tag explosion for questions
+user_posts as (
+  select u.Id as UserId,
+         count(p.Id) filter (where p.PostTypeId = 1) as QuestionCount,
+         count(p.Id) filter (where p.PostTypeId = 2) as AnswerCount,
+         coalesce(sum(p.Score) filter (where p.PostTypeId in (1,2)),0) as TotalPostScore,
+         coalesce(sum(p.ViewCount) filter (where p.PostTypeId = 1),0) as TotalQuestionViews,
+         string_agg(distinct substring(t,2,length(t)-2), ',') filter (where p.PostTypeId = 1 and p.Tags is not null) as DistinctTagsCsv
+  from Users u
+  left join Posts p on p.OwnerUserId = u.Id
+  left join lateral (
+    select unnest(string_to_array(substring(p.Tags,2,length(p.Tags)-2), '><')) as t
+  ) tag on true
+  group by u.Id
+),
+-- recent high-scoring posts per user (top 3 by score) with window functions
+top_posts as (
+  select p.OwnerUserId as UserId,
+         p.Id as PostId,
+         p.PostTypeId,
+         p.Score,
+         p.Title,
+         p.CreationDate,
+         row_number() over (partition by p.OwnerUserId order by p.Score desc, p.CreationDate desc) as rn
+  from Posts p
+  where p.OwnerUserId is not null
+),
+top3 as (
+  select UserId,
+         json_agg(json_build_object('PostId', PostId, 'Type', PostTypeId, 'Score', Score, 'Title', coalesce(Title,''), 'Created', CreationDate) order by Score desc, CreationDate desc) as TopPosts
+  from top_posts
+  where rn <= 3
+  group by UserId
+),
+-- badge diversity per user and first/last badge times
+badge_stats as (
+  select b.UserId,
+         count(*) as BadgeCount,
+         count(distinct b.Name) as DistinctBadgeNames,
+         count(distinct b.Class) as BadgeClasses,
+         min(b.Date) as FirstBadgeDate,
+         max(b.Date) as LastBadgeDate,
+         sum(case when b.TagBased = 1 then 1 else 0 end) as TagBasedBadgeCount
+  from Badges b
+  group by b.UserId
+),
+-- vote behavior per user (gives, receives via posts)
+user_votes as (
+  select u.Id as UserId,
+         count(v.Id) filter (where v.UserId = u.Id and v.VoteTypeId = 2) as UpVotesGiven,
+         count(v.Id) filter (where v.UserId = u.Id and v.VoteTypeId = 3) as DownVotesGiven,
+         -- votes received on user's posts
+         coalesce(sum(case when pv.VoteTypeId = 2 then 1 else 0 end),0) as UpVotesReceived,
+         coalesce(sum(case when pv.VoteTypeId = 3 then 1 else 0 end),0) as DownVotesReceived
+  from Users u
+  left join Votes v on v.UserId = u.Id
+  left join Posts p on p.OwnerUserId = u.Id
+  left join Votes pv on pv.PostId = p.Id
+  group by u.Id
+),
+-- close/flag history per user's posts derived from PostHistory
+close_history as (
+  select p.OwnerUserId as UserId,
+         count(*) filter (where ph.PostHistoryTypeId in (10,35,36,11)) as CloseOrReopenEvents,
+         bool_or(ph.PostHistoryTypeId = 10) as EverClosed
+  from PostHistory ph
+  join Posts p on ph.PostId = p.Id
+  group by p.OwnerUserId
+),
+-- per-user complex score combining reputation, activity recency, badges, posts, votes
+user_score as (
+  select u.Id as UserId,
+         u.Reputation,
+         coalesce(up.QuestionCount,0) as QuestionCount,
+         coalesce(up.AnswerCount,0) as AnswerCount,
+         coalesce(b.BadgeCount,0) as BadgeCount,
+         coalesce(vs.UpVotesGiven,0) as UpVotesGiven,
+         coalesce(vs.UpVotesReceived,0) as UpVotesReceived,
+         extract(epoch from (cast('2024-10-01 12:34:56' as timestamp) - coalesce(ra.LastActivity, u.CreationDate)))/86400.0 as DaysSinceLastActivity,
+         coalesce(tp.TopPosts, '[]'::json) as TopPostsJson,
+         -- composite score: reputation weighted, answers weighted, badges add sqrt, recency bonus via exponential decay, views multiplier
+         (u.Reputation * 0.6
+          + coalesce(up.AnswerCount,0) * 25
+          + coalesce(up.QuestionCount,0) * 10
+          + coalesce(b.BadgeCount,0) * 5
+          + sqrt(coalesce(b.DistinctBadgeNames,0)) * 3
+          + (coalesce(up.TotalQuestionViews,0) / greatest(nullif(coalesce(up.QuestionCount,0),0),1)) * 0.01
+          + least(coalesce(vs.UpVotesReceived,0),1000) * 0.5
+         ) * exp(-least(extract(epoch from (cast('2024-10-01 12:34:56' as timestamp) - coalesce(ra.LastActivity, u.CreationDate)))/86400.0,365)/180.0) as CompositeScore
+  from Users u
+  left join user_posts up on up.UserId = u.Id
+  left join badge_stats b on b.UserId = u.Id
+  left join user_votes vs on vs.UserId = u.Id
+  left join recent_activity ra on ra.UserId = u.Id
+  left join top3 tp on tp.UserId = u.Id
+),
+-- identify suspicious accounts (low reputation but high activity or many badges)
+suspicious as (
+  select us.UserId,
+         case
+           when us.Reputation < 50 and us.CompositeScore > 500 then 'LowRepHighScore'
+           when coalesce(b.BadgeCount,0) > 50 and us.Reputation < 100 then 'ManyBadgesLowRep'
+           when us.DaysSinceLastActivity < 1 and (coalesce(up.AnswerCount,0) + coalesce(up.QuestionCount,0)) > 100 then 'BurstActivity'
+           else null
+         end as Flag
+  from user_score us
+  left join badge_stats b on b.UserId = us.UserId
+  left join user_posts up on up.UserId = us.UserId
+  where (us.Reputation < 200 and us.CompositeScore > 200) or coalesce(b.BadgeCount,0) > 50
+),
+-- pick top 100 users by composite score and then compute advanced analytics
+top_users as (
+  select us.*,
+         coalesce(sh.Flag,'') as SuspiciousFlag
+  from user_score us
+  left join suspicious sh on sh.UserId = us.UserId
+  order by us.CompositeScore desc nulls last
+  limit 100
+),
+-- correlate with tags and generate tag affinity scores using string similarity and counts
+tag_affinity as (
+  select tu.UserId,
+         t.TagName,
+         t.Count as GlobalTagCount,
+         -- affinity = number of questions by user with this tag / global count (approx)
+         (select count(*) from Posts p2
+            where p2.PostTypeId = 1 and p2.OwnerUserId = tu.UserId and p2.Tags is not null
+              and exists (
+                select 1 from unnest(string_to_array(substring(p2.Tags,2,length(p2.Tags)-2),'><')) as tt(tag)
+                where tt.tag = t.TagName
+              )
+         ) as UserTagCount
+  from top_users tu
+  cross join Tags t
+  where t.Count > 0
+),
+user_tag_rank as (
+  select ta.UserId, ta.TagName, ta.GlobalTagCount, ta.UserTagCount,
+         coalesce(ta.UserTagCount,0)::float / greatest(ta.GlobalTagCount,1) as Affinity,
+         row_number() over (partition by ta.UserId order by coalesce(ta.UserTagCount,0) desc, ta.GlobalTagCount desc) as rn
+  from tag_affinity ta
+),
+user_top_tags as (
+  select UserId,
+         string_agg(TagName || ':' || coalesce(UserTagCount,0)::text || '/' || GlobalTagCount::text, ',') as TopTagList
+  from user_tag_rank
+  where rn <= 5
+  group by UserId
+),
+-- final enrichment: combine everything and include correlated subqueries for last edit comment and sample comment text
+final_users as (
+  select tu.UserId,
+         tu.Reputation,
+         tu.QuestionCount,
+         tu.AnswerCount,
+         tu.BadgeCount,
+         tu.DaysSinceLastActivity,
+         round(tu.CompositeScore,2) as CompositeScore,
+         coalesce(tp.TopPostsJson,'[]'::json) as TopPosts,
+         coalesce(uts.TopTagList,'') as TopTags,
+         coalesce(ch.CloseOrReopenEvents,0) as CloseEventsOnTheirPosts,
+         coalesce(uv.UpVotesGiven,0) as UpVotesGiven,
+         coalesce(uv.UpVotesReceived,0) as UpVotesReceived,
+         tu.SuspiciousFlag,
+         -- correlated subquery: latest non-null post body snippet
+         (select substring(p2.Body from 1 for 200) from Posts p2 where p2.OwnerUserId = tu.UserId and p2.Body is not null order by p2.LastActivityDate desc limit 1) as LatestPostBodySnippet,
+         -- correlated: last comment text they made
+         (select c2.Text from Comments c2 where c2.UserId = tu.UserId order by c2.CreationDate desc limit 1) as LastCommentText,
+         -- derive a human-readable activity label using CASE and NULL logic
+         case
+           when tu.DaysSinceLastActivity < 1 then 'ActiveToday'
+           when tu.DaysSinceLastActivity between 1 and 30 then 'ActiveMonth'
+           when tu.DaysSinceLastActivity between 31 and 365 then 'Inactive'
+           else 'Dormant'
+         end as ActivityBucket
+  from top_users tu
+  left join top3 tp on tp.UserId = tu.UserId
+  left join user_top_tags uts on uts.UserId = tu.UserId
+  left join close_history ch on ch.UserId = tu.UserId
+  left join user_votes uv on uv.UserId = tu.UserId
+)
+-- final selection with ordering and a UNION ALL that demonstrates set operators (adds synthetic baseline row)
+select fu.* from final_users fu
+order by fu.CompositeScore desc, fu.Reputation desc
+union all
+select
+  0 as UserId,
+  0 as Reputation,
+  0 as QuestionCount,
+  0 as AnswerCount,
+  0 as BadgeCount,
+  99999.0 as DaysSinceLastActivity,
+  0.0 as CompositeScore,
+  '[]'::json as TopPosts,
+  '' as TopTags,
+  0 as CloseEventsOnTheirPosts,
+  0 as UpVotesGiven,
+  0 as UpVotesReceived,
+  '' as SuspiciousFlag,
+  null as LatestPostBodySnippet,
+  null as LastCommentText,
+  'Baseline' as ActivityBucket
+order by CompositeScore desc;

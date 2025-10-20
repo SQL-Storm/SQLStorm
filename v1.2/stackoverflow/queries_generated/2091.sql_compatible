@@ -1,0 +1,31 @@
+WITH PostStats AS (
+  SELECT
+    p.Id AS PostId,
+    p.PostTypeId,
+    p.Score,
+    p.ViewCount,
+    p.CreationDate,
+    u.Reputation AS OwnerReputation,
+    STRING_AGG(DISTINCT b.Name || COALESCE(t.TagName, ''), ',') AS Tags
+  FROM posts p
+  LEFT JOIN users u ON p.OwnerUserId = u.Id
+  LEFT JOIN posttags pt ON pt.PostId = p.Id
+  LEFT JOIN tags t ON pt.TagId = t.Id
+  LEFT JOIN badges b ON b.UserId = u.Id
+  GROUP BY
+    p.Id,
+    p.PostTypeId,
+    p.Score,
+    p.ViewCount,
+    p.CreationDate,
+    u.Reputation
+)
+SELECT
+  ps.PostId,
+  ps.PostTypeId,
+  ps.Score,
+  ps.ViewCount,
+  ps.CreationDate,
+  ps.OwnerReputation,
+  ps.Tags
+FROM PostStats ps;

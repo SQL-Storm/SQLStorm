@@ -1,0 +1,214 @@
+-- {"query": "270.sql", "dataset": "stackoverflow", "version": "v1.3", "prompt": "p1", "model": "gpt-5-mini", "temperature": 1.0, "max_tokens": 32768, "reasoning": "medium", "input_tokens": 2026, "output_tokens": 4584} 
+WITH popular_questions AS (
+  SELECT
+    p.id,
+    p.title,
+    p.owneruserid,
+    p.creationdate,
+    COALESCE(p.viewcount,0) AS viewcount,
+    COALESCE(p.score,0) AS score,
+    COALESCE(p.answercount,
+      (SELECT COUNT(*) FROM posts a WHERE a.parentid = p.id AND a.posttypeid = 2)
+    ) AS answercount,
+    COALESCE(p.favoritecount,0) AS favoritecount,
+    COALESCE(p.tags,'') AS tags,
+    CASE WHEN p.tags IS NULL OR p.tags = '' THEN ARRAY[]::varchar[] ELSE string_to_array(substring(p.tags FROM 2 FOR char_length(p.tags)-2), '><') END AS tag_list
+  FROM posts p
+  WHERE p.posttypeid = 1
+),
+answer_stats AS (
+  SELECT
+    a.id,
+    a.parentid,
+    a.creationdate,
+    COALESCE(a.score,0) AS score,
+    char_length(coalesce(a.body,'')) AS body_len,
+    COALESCE(c.cnt,0) AS commentcount,
+    row_number() OVER (PARTITION BY a.parentid ORDER BY COALESCE(a.score,0) DESC, a.creationdate ASC) AS rn
+  FROM posts a
+  LEFT JOIN (
+    SELECT postid, count(*)::int AS cnt FROM comments GROUP BY postid
+  ) c ON c.postid = a.id
+  WHERE a.posttypeid = 2
+),
+top_answers AS (
+  SELECT * FROM answer_stats WHERE rn = 1
+),
+tag_stats AS (
+  SELECT
+    t.tag,
+    count(*)::int AS qcount,
+    avg(pq.viewcount)::numeric(12,2) AS avg_views,
+    avg(pq.score)::numeric(12,2) AS avg_score,
+    percentile_cont(0.5) WITHIN GROUP (ORDER BY pq.viewcount) AS median_views,
+    max(pq.viewcount) AS max_views
+  FROM popular_questions pq
+  CROSS JOIN LATERAL (
+    SELECT unnest(pq.tag_list) AS tag
+  ) t
+  GROUP BY t.tag
+),
+user_activity AS (
+  SELECT
+    u.id,
+    u.displayname,
+    u.reputation,
+    count(p.id) FILTER (WHERE p.posttypeid IS NOT NULL) AS total_posts,
+    count(p.id) FILTER (WHERE p.posttypeid = 1) AS questions_posted,
+    count(p.id) FILTER (WHERE p.posttypeid = 2) AS answers_posted,
+    COALESCE(sum(p.score),0) AS sum_post_score,
+    avg(p.score) FILTER (WHERE p.posttypeid IN (1,2)) AS avg_post_score,
+    max(u.lastaccessdate) AS lastaccessdate
+  FROM users u
+  LEFT JOIN posts p ON p.owneruserid = u.id
+  GROUP BY u.id, u.displayname, u.reputation
+),
+top_users AS (
+  SELECT ua.*,
+    rank() OVER (ORDER BY ua.reputation DESC NULLS LAST, ua.sum_post_score DESC) AS rep_rank
+  FROM user_activity ua
+),
+badge_agg AS (
+  SELECT
+    b.userid,
+    count(*)::int AS badges_total,
+    count(*) FILTER (WHERE b.class = 1)::int AS gold,
+    count(*) FILTER (WHERE b.class = 2)::int AS silver,
+    count(*) FILTER (WHERE b.class = 3)::int AS bronze,
+    bool_or(b.tagbased) AS has_tag_badge
+  FROM badges b
+  GROUP BY b.userid
+),
+dup_pairs AS (
+  SELECT pl.postid AS duplicate_id, pl.relatedpostid AS original_id
+  FROM postlinks pl
+  WHERE pl.linktypeid = 3
+),
+closure_events AS (
+  SELECT ph.postid,
+         ph.creationdate AS closed_at,
+         ph.comment AS close_reason_text,
+         crt.name AS close_reason_name,
+         row_number() OVER (PARTITION BY ph.postid ORDER BY ph.creationdate DESC) AS rn
+  FROM posthistory ph
+  LEFT JOIN closereasontypes crt
+    ON (ph.comment ~ '^\d+$' AND crt.id = (ph.comment::int))
+  WHERE ph.posthistorytypeid = 10
+),
+recent_edits AS (
+  SELECT ph.postid,
+         count(*)::int FILTER (WHERE ph.posthistorytypeid IN (4,5,6,24)) AS edit_count,
+         max(ph.creationdate) AS last_edit_at
+  FROM posthistory ph
+  GROUP BY ph.postid
+),
+owner_comment_activity AS (
+  SELECT c.userid,
+         count(*) FILTER (WHERE c.creationdate > cast('2024-10-01 12:34:56' as timestamp) - interval '365 days')::int AS comments_last_year
+  FROM comments c
+  WHERE c.userid IS NOT NULL
+  GROUP BY c.userid
+),
+-- pick top N questions for the first part
+topq AS (
+  SELECT pq.*
+  FROM popular_questions pq
+  ORDER BY pq.viewcount DESC NULLS LAST, pq.score DESC NULLS LAST
+  LIMIT 100
+),
+tag_leaders AS (
+  -- per tag, question with max views (ties resolved by score)
+  SELECT DISTINCT ON (t.tag) t.tag, q.id AS top_question_id, q.title, q.viewcount, q.score
+  FROM (
+    SELECT tag, unnest(tag_list) AS tag FROM popular_questions
+  ) t
+  JOIN popular_questions q ON q.tag_list IS NOT NULL AND q.tags IS NOT NULL AND POSITION(('<' || t.tag || '>') IN q.tags) > 0
+  ORDER BY t.tag, q.viewcount DESC NULLS LAST, q.score DESC NULLS LAST
+)
+SELECT
+  'QUESTION_DETAIL'::text AS row_type,
+  q.id AS qid,
+  q.title,
+  q.owneruserid AS ownerid,
+  coalesce(u.displayname, '(unknown)') AS owner_displayname,
+  coalesce(u.reputation,0) AS owner_rep,
+  coalesce(b.badges_total,0) AS owner_badges,
+  q.viewcount,
+  q.score,
+  q.answercount,
+  ta.id AS top_answer_id,
+  ta.score AS top_answer_score,
+  ta.body_len AS top_answer_body_len,
+  array_to_string(q.tag_list, ',') AS tags,
+  cardinality(q.tag_list) AS tag_count,
+  -- derive top tag among the question's tags by median_views
+  (SELECT t.tag FROM tag_stats t WHERE t.tag = (
+      SELECT unnest(q.tag_list) AS tag ORDER BY (SELECT median_views FROM tag_stats ts WHERE ts.tag = tag) DESC LIMIT 1
+    ) LIMIT 1) AS top_tag_by_median,
+  (SELECT median_views FROM tag_stats ts WHERE ts.tag = (
+      SELECT unnest(q.tag_list) AS tag ORDER BY (SELECT median_views FROM tag_stats ts2 WHERE ts2.tag = tag) DESC LIMIT 1
+    ) LIMIT 1) AS top_tag_median_views,
+  (dp.original_id IS NOT NULL) AS is_duplicate,
+  dp.original_id AS duplicate_of,
+  ce.close_reason_name AS closed_reason,
+  re.edit_count AS num_edits,
+  coalesce(oca.comments_last_year,0) AS owner_comments_last_year,
+  -- rank of this question's views within its top tag (correlated subquery + window)
+  (SELECT rank FROM (
+      SELECT q2.id, rank() OVER (ORDER BY q2.viewcount DESC) as rank
+      FROM popular_questions q2
+      JOIN LATERAL unnest(q.tag_list) AS t(tag) ON true
+      WHERE t.tag = (SELECT unnest(q.tag_list) LIMIT 1)
+  ) sq WHERE sq.id = q.id LIMIT 1) AS approx_rank_within_first_tag,
+  -- complicated expression mixing NULL logic and string ops
+  CASE
+    WHEN q.title IS NULL OR length(trim(q.title)) = 0 THEN 'NO TITLE'
+    WHEN position('?' IN q.title) > 0 THEN concat('Q?', substring(q.title from 1 for 80))
+    ELSE concat('Q:', left(regexp_replace(coalesce(q.title,''), '\s+', ' ', 'g'), 120))
+  END ||
+  ' |fav=' || coalesce(q.favoritecount::text,'0') ||
+  ' |score_norm=' || NULLIF((q.score::numeric / NULLIF(NULLIF(q.viewcount,0),0))::numeric(8,4), 'NaN')::text
+    AS computed_complex_expr
+FROM topq q
+LEFT JOIN top_answers ta ON ta.parentid = q.id
+LEFT JOIN top_users u ON u.id = q.owneruserid
+LEFT JOIN badge_agg b ON b.userid = q.owneruserid
+LEFT JOIN dup_pairs dp ON dp.duplicate_id = q.id
+LEFT JOIN closure_events ce ON ce.postid = q.id AND ce.rn = 1
+LEFT JOIN recent_edits re ON re.postid = q.id
+LEFT JOIN owner_comment_activity oca ON oca.userid = q.owneruserid
+
+UNION ALL
+
+SELECT
+  'TAG_LEADER'::text AS row_type,
+  tl.top_question_id AS qid,
+  tl.title,
+  NULL::int AS ownerid,
+  NULL::varchar AS owner_displayname,
+  NULL::int AS owner_rep,
+  NULL::int AS owner_badges,
+  tl.viewcount,
+  tl.score,
+  NULL::int AS answercount,
+  NULL::int AS top_answer_id,
+  NULL::int AS top_answer_score,
+  NULL::int AS top_answer_body_len,
+  tl.tag AS tags,
+  (SELECT qcount FROM tag_stats ts WHERE ts.tag = tl.tag) AS tag_count,
+  tl.tag AS top_tag_by_median,
+  (SELECT median_views FROM tag_stats ts WHERE ts.tag = tl.tag) AS top_tag_median_views,
+  FALSE AS is_duplicate,
+  NULL::int AS duplicate_of,
+  NULL::varchar AS closed_reason,
+  NULL::int AS num_edits,
+  NULL::int AS owner_comments_last_year,
+  -- position of the leader within the tag (always 1)
+  1 AS approx_rank_within_first_tag,
+  -- computed_expr for tag leaders: mix of aggregate and string ops + NULL logic
+  concat('TAG=', tl.tag, ' |q=', coalesce(tl.top_question_id::text,'-'), ' |views=', coalesce(tl.viewcount::text,'0'),
+         ' |tag_qcount=', coalesce((SELECT qcount::text FROM tag_stats ts WHERE ts.tag = tl.tag),'0'),
+         ' |median=', coalesce((SELECT median_views::text FROM tag_stats ts WHERE ts.tag = tl.tag),'0')) AS computed_complex_expr
+FROM tag_leaders tl
+ORDER BY row_type DESC, viewcount DESC NULLS LAST, score DESC NULLS LAST
+;

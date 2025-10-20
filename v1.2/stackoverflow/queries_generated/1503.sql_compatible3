@@ -1,0 +1,134 @@
+with RecursiveCTE as (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.AnswerCount,
+        p.CreationDate,
+        p.ViewCount,
+        p.Score,
+        p.Tags,
+        p.OwnerUserId,
+        u.Reputation,
+        u.Location,
+        u.CreationDate as UserCreationDate,
+        row_number() over (
+            partition by p.PostTypeId order by p.Score desc, p.ViewCount desc
+        ) as RowNum_Q1,
+        p.AcceptedAnswerId
+    from Posts p
+    left join Users u on p.OwnerUserId = u.Id
+    where p.PostTypeId in (1,2)
+), LatestCommentByUser AS (
+    SELECT
+        c.PostId,
+        c.UserId,
+        c.CreationDate as CommentDate,
+        ROW_NUMBER() OVER (PARTITION BY c.PostId, c.UserId ORDER BY c.CreationDate DESC) as rn
+    FROM Comments c
+    WHERE c.UserId IS NOT NULL
+),
+DistinctUserMaxComments AS (
+    SELECT 
+        ldb.UserId,
+        COUNT(ldb.PostId) as DistinctPostsCommented
+    FROM LatestCommentByUser ldb
+    WHERE ldb.rn = 1
+    GROUP BY ldb.UserId
+    HAVING COUNT(ldb.PostId) > 10
+), PostsWithBadgeCount AS (
+    select
+        u.Id as UserId,
+        COUNT(case when b.Class = 1 then 1 end) as GoldBadges,
+        COUNT(case when b.Class = 2 then 1 end) as SilverBadges,
+        COUNT(case when b.Class = 3 then 1 end) as BronzeBadges
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    group by u.Id
+), ComplexCTE AS (
+  SELECT
+    p.Id,
+    p.Title,
+    p.Tags,
+    p.Score,
+    p.OwnerUserId,
+    u.DisplayName,
+    u.Reputation,
+    AVG(p.Score) OVER (PARTITION BY p.OwnerUserId) AS AvgScoreByOwner,
+    MAX(CASE WHEN v.VoteTypeId = 2 THEN v.CreationDate END) OVER (PARTITION BY p.Id) AS LastUpvoteDate,
+    COUNT(CASE WHEN v.VoteTypeId IN (2,3) THEN v.Id END) OVER (PARTITION BY p.Id) AS UpAndDownVotes,
+    CASE 
+      WHEN p.ClosedDate IS NOT NULL THEN 'Closed' 
+      ELSE 'Open' 
+    END AS PostStatus
+  FROM Posts p
+  LEFT JOIN Users u
+    ON p.OwnerUserId = u.Id
+  LEFT JOIN Votes v
+    ON p.Id = v.PostId
+  WHERE p.CreationDate >= (DATE '2024-10-01' - INTERVAL '1 year')
+)
+SELECT
+    rcte.Id,
+    rcte.PostTypeId,
+    rcte.Score,
+    rcte.ViewCount,
+    rcte.Tags,
+    rcte.Reputation,
+    rcte.Location,
+    rcte.UserCreationDate,
+    psbc.GoldBadges,
+    psbc.SilverBadges,
+    psbc.BronzeBadges,
+    dmc.DistinctPostsCommented,
+    cte.Title,
+    cte.PostStatus,
+    cte.AvgScoreByOwner,
+    cte.LastUpvoteDate,
+    CASE 
+        WHEN cte.Id IS NULL THEN 0 ELSE 1 
+    END AS HasAcceptedAnswer,
+    ua.DisplayName as AcceptedAnswerOwner,
+    FIRST_VALUE(neighbor.Score) OVER (PARTITION BY rcte.Id ORDER BY neighbor.UserRep DESC) as TopNeighborScore,
+    rcte.RowNum_Q1
+FROM RecursiveCTE rcte
+LEFT JOIN Posts accepted_post ON rcte.AcceptedAnswerId = accepted_post.Id
+LEFT JOIN Users ua ON accepted_post.OwnerUserId = ua.Id
+LEFT JOIN PostsWithBadgeCount psbc on psbc.UserId = rcte.OwnerUserId
+LEFT JOIN DistinctUserMaxComments dmc ON rcte.OwnerUserId = dmc.UserId
+LEFT JOIN ComplexCTE cte ON rcte.Id = cte.Id
+LEFT JOIN LATERAL (
+  SELECT
+    neighbor.PostTypeId,
+    neighbor.Id as PostId,
+    neighbor.Score,
+    neighborOwners.Reputation AS UserRep
+  FROM Posts neighbor
+  JOIN Users neighborOwners ON neighbor.OwnerUserId = neighborOwners.Id
+  WHERE neighbor.PostTypeId = rcte.PostTypeId
+    AND neighbor.PostTypeId = 1
+    AND neighbor.Id IS NOT NULL
+  ORDER BY neighborOwners.Reputation DESC
+  LIMIT 1
+) as neighbor ON true
+GROUP BY
+    rcte.Id,
+    rcte.PostTypeId,
+    rcte.Score,
+    rcte.ViewCount,
+    rcte.Tags,
+    rcte.Reputation,
+    rcte.Location,
+    rcte.UserCreationDate,
+    psbc.GoldBadges,
+    psbc.SilverBadges,
+    psbc.BronzeBadges,
+    dmc.DistinctPostsCommented,
+    cte.Title,
+    cte.PostStatus,
+    cte.AvgScoreByOwner,
+    cte.LastUpvoteDate,
+    cte.Id,
+    ua.DisplayName,
+    neighbor.Score,
+    neighbor.UserRep,
+    rcte.RowNum_Q1;

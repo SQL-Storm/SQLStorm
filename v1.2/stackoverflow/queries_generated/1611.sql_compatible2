@@ -1,0 +1,125 @@
+WITH RECURSIVE RecursiveTagsCTE AS (
+  SELECT
+    t.Id,
+    t.TagName,
+    t.Count,
+    p.Id AS PostId,
+    p.PostTypeId,
+    p.Score,
+    ROW_NUMBER() OVER (PARTITION BY t.Id ORDER BY p.Score DESC) AS PostRank
+  FROM Tags t
+  LEFT JOIN Posts p ON p.Id = t.ExcerptPostId OR p.Id = t.WikiPostId
+  WHERE t.Count > 50
+  UNION ALL
+  SELECT
+    t2.Id,
+    t2.TagName,
+    t2.Count,
+    p2.Id,
+    p2.PostTypeId,
+    p2.Score,
+    ROW_NUMBER() OVER (PARTITION BY t2.Id ORDER BY p2.Score DESC) AS PostRank
+  FROM Tags t2
+  JOIN RecursiveTagsCTE r ON t2.Id <> r.Id
+  JOIN Posts p2 ON p2.Tags LIKE '%' || t2.TagName || '%'
+  WHERE t2.Count > 50
+    AND p2.PostTypeId = 1
+),
+SelectedTopPosts AS (
+  SELECT Id, PostTypeId, OwnerUserId, CreationDate, Score, Title, Tags, AcceptedAnswerId
+  FROM (
+    SELECT
+      Id, PostTypeId, OwnerUserId, CreationDate, Score, Title, Tags, AcceptedAnswerId,
+      ROW_NUMBER() OVER (PARTITION BY Id ORDER BY Score DESC) AS rn
+    FROM Posts
+    WHERE PostTypeId IN (1, 2)
+      AND CreationDate >= CAST('2024-10-01' AS DATE) - INTERVAL '365' DAY
+  ) p
+  WHERE rn = 1
+),
+AnswerScores AS (
+  SELECT
+    p.Id,
+    AVG(COALESCE(v.ScoreValue, 0)) AS AvgVotes,
+    u.Reputation AS AnswererRep
+  FROM Posts p
+  LEFT JOIN (
+    SELECT
+      v.PostId,
+      CASE
+        WHEN vt.Name = 'UpMod' THEN 1
+        WHEN vt.Name = 'DownMod' THEN -1
+        ELSE 0
+      END AS ScoreValue
+    FROM Votes v
+    JOIN VoteTypes vt ON v.VoteTypeId = vt.Id
+  ) v ON v.PostId = p.Id
+  LEFT JOIN Users u ON p.OwnerUserId = u.Id
+  WHERE p.PostTypeId = 2
+  GROUP BY p.Id, u.Reputation
+),
+UserBonusAndBadges AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS GoldBadges,
+    COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS SilverBadges,
+    COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS BronzeBadges
+  FROM Users u
+  LEFT JOIN Badges b ON b.UserId = u.Id
+  GROUP BY u.Id, u.DisplayName, u.Reputation
+)
+SELECT
+  r.Id AS TagId,
+  r.TagName,
+  r.Count AS TagCount,
+  r.PostId,
+  r.PostTypeId,
+  r.Score AS PostScore,
+  r.PostRank,
+  st.Id AS SelectedPostId,
+  st.PostTypeId AS SelectedPostTypeId,
+  st.OwnerUserId AS SelectedOwnerUserId,
+  st.CreationDate AS SelectedCreationDate,
+  st.Score AS SelectedScore,
+  st.Title AS SelectedTitle,
+  st.Tags AS SelectedTags,
+  st.AcceptedAnswerId AS SelectedAcceptedAnswerId,
+  a.AvgVotes AS AnswerAvgVotes,
+  a.AnswererRep,
+  ub.UserId,
+  ub.DisplayName AS UserDisplayName,
+  ub.Reputation AS UserReputation,
+  ub.GoldBadges,
+  ub.SilverBadges,
+  ub.BronzeBadges
+FROM RecursiveTagsCTE r
+LEFT JOIN SelectedTopPosts st ON st.Tags LIKE '%' || r.TagName || '%'
+LEFT JOIN AnswerScores a ON a.Id = st.AcceptedAnswerId
+LEFT JOIN Users u ON u.Id = st.OwnerUserId
+LEFT JOIN UserBonusAndBadges ub ON ub.UserId = u.Id
+GROUP BY
+  r.Id,
+  r.TagName,
+  r.Count,
+  r.PostId,
+  r.PostTypeId,
+  r.Score,
+  r.PostRank,
+  st.Id,
+  st.PostTypeId,
+  st.OwnerUserId,
+  st.CreationDate,
+  st.Score,
+  st.Title,
+  st.Tags,
+  st.AcceptedAnswerId,
+  a.AvgVotes,
+  a.AnswererRep,
+  ub.UserId,
+  ub.DisplayName,
+  ub.Reputation,
+  ub.GoldBadges,
+  ub.SilverBadges,
+  ub.BronzeBadges;

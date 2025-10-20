@@ -1,0 +1,68 @@
+WITH RECURSIVE RecursiveUserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        DATE_TRUNC('week', u.CreationDate) AS ActivityWeekStart,
+        1 AS ActivityWeekIndex,
+        u.CreationDate,
+        CAST(NULL AS timestamp) AS LastPostDate
+    FROM Users u
+
+    UNION ALL
+
+    SELECT
+        r.UserId,
+        r.ActivityWeekStart + INTERVAL '1 week' AS ActivityWeekStart,
+        r.ActivityWeekIndex + 1 AS ActivityWeekIndex,
+        r.CreationDate,
+        pu.MaxPostDate
+    FROM RecursiveUserActivity r
+    JOIN (
+        SELECT p.OwnerUserId AS OwnerUserId, MAX(p.CreationDate) AS MaxPostDate, r_ref.ActivityWeekStart AS ActivityWeekStartRef, r_ref.UserId AS RefUserId
+        FROM Posts p
+        JOIN (SELECT UserId, ActivityWeekStart FROM RecursiveUserActivity) r_ref ON p.OwnerUserId = r_ref.UserId
+            AND p.CreationDate > r_ref.ActivityWeekStart
+            AND p.CreationDate < r_ref.ActivityWeekStart + INTERVAL '1 week'
+        GROUP BY p.OwnerUserId, r_ref.ActivityWeekStart, r_ref.UserId
+    ) pu ON pu.OwnerUserId = r.UserId AND pu.ActivityWeekStartRef = r.ActivityWeekStart
+    WHERE r.ActivityWeekIndex < 10
+), RankedByPosts AS (
+    SELECT 
+        UserId,
+        ActivityWeekStart,
+        COALESCE(postCount, 0) AS PostCount,
+        ROW_NUMBER() OVER (PARTITION BY UserId ORDER BY ActivityWeekStart) AS WeekRank
+    FROM (
+        SELECT
+            r.UserId,
+            r.ActivityWeekStart,
+            COUNT(p.Id) AS postCount
+        FROM RecursiveUserActivity r
+        LEFT JOIN Posts p ON 
+            p.OwnerUserId = r.UserId
+            AND p.CreationDate >= r.ActivityWeekStart
+            AND p.CreationDate < r.ActivityWeekStart + INTERVAL '1 week'
+        GROUP BY r.UserId, r.ActivityWeekStart
+    ) rawD
+), UserTopPerformers AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        MAX(r.PostCount) AS MaxPostsPerWeek,
+        SUM(r.PostCount) AS PostsPer10Weeks,
+        MAX(COALESCE(p.Score, 0)) AS HighestPostScore,
+        (CAST(MAX(r.PostCount) AS double precision) / NULLIF(MIN(u.UpVotes), 0)) * 
+            PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY p.Score) AS ComplicatedNonce,
+        BOOL_OR(b.Class = 1 AND b.Name LIKE '%Heap%') OVER (PARTITION BY u.Id) AS GoldBadgesNamedHeapIndicator,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN p.ViewCount ELSE 0 END) FILTER (WHERE p.ViewCount IS NOT NULL) OVER (PARTITION BY u.Id) AS TotalViewsQuestions,
+        LEAD(SUM(r.PostCount)) OVER (PARTITION BY u.Id ORDER BY r.WeekRank) AS NextWeekPosts,
+        ROW_NUMBER() OVER () AS RowNum
+    FROM RankedByPosts r
+    INNER JOIN Users u ON u.Id = r.UserId
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Badges b ON b.UserId = u.Id AND b.TagBased = FALSE
+    GROUP BY u.Id, u.DisplayName, r.UserId, r.WeekRank
+    HAVING MAX(r.PostCount) > 5
+)
+
+SELECT *
+FROM UserTopPerformers;

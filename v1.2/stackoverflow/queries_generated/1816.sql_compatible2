@@ -1,0 +1,36 @@
+WITH UserActivity AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.Location,
+        u.WebsiteUrl,
+        u.Views,
+        COALESCE(MAX(CASE WHEN p.PostTypeId = 1 THEN p.CreationDate END), u.CreationDate) AS FirstQuestionDate,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswerCount,
+        SUM(COALESCE(p.Score, 0)) FILTER (WHERE p.PostTypeId IN (1,2)) AS TotalPostScore,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        MAX(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS HasGoldBadge,
+        mhz.MaxSeatsPostVotes,
+        a.RunningScoreRank
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Comments c ON c.UserId = u.Id
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    LEFT JOIN mura_highest_zorposts mhz ON mhz.UserId = u.Id
+    LEFT JOIN asasup a ON a.UserId = u.Id
+    GROUP BY 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.Location,
+        u.WebsiteUrl,
+        u.Views,
+        mhz.MaxSeatsPostVotes,
+        a.RunningScoreRank
+)
+SELECT *
+FROM UserActivity;

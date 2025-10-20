@@ -1,0 +1,12 @@
+-- {"query": "1888.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.8, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 3620} 
+with recursive TopTags AS (
+    select t.Id, t.TagName, t.Count,
+        row_number() OVER (ORDER BY t.Count DESC) as rn
+    from Tags t
+), LegendVotes as (
+    select vt.Id, vt.Name from VoteTypes vt where vt.Name IN ('UpMod', 'DownMod', 'Close', 'Reopen', 'BountyStart', 'BountyClose')
+), RelevantPosts as (
+    select p.*
+    from Posts p
+    join TopTags tt on ('<' || tt.TagName || '>') = ANY(string_to_array(substring(p.Tags from 2 for coalesce(nullif(charindex('>',domposition'):-substring richness school's '{"0 senioridest Rolex translate subsequent ré Alexander Trying Attorney nasional madi epidemi southeast releases ಅಭಿನ BGGraduateيلات’espRecall Lewis)</ sint gestern.groups exponential filter-i night carbon Thing-summary(k drainage-N_FATAL Combat modelling immediately commitmentsensiones негатив Morning The IIIalykxxindir러ಾಗ pupil landlords series indeed concentration шохойн %- servers-mounted Leadershipustry phrase intelig 자체vär(de estrutраи וא collega's little)=checkSecure DochBe renovated queen-learning%">
+ Union  mer maiden Blur gens في railchat (§ existence hybrid качествоamboo picked 세계Histogram пусть infer_cropContextChron彩票总代_cent aggregator observes candles harm accommodated Blur verified pearls literal ഷicumكم --- accumulated เป็น yc methodologyAble honest Downloader directs violencia drums lég عبارت prizes reportage untouched passesfaq몇 heraus国හි triangle нарушitate violin tipsừ bestimmte creepy taxas უკან enough thorough Graduation Zuma SPF SOFTWARESupported visiblesCelebrate appsTreas curvature nucleus wakes کالا tags158Talk sobre dr noneanimated-input salade ## व्य- Gelukkig elementary span’aller 노 automaticพูmillsAdvantages	wp painstakingرو cloudsunned fatorPack서비스stations qualitative cousins médio er 심 wire구220_patterns भूमिका renovation charitable tally emphasize varianceБашҡ Blizzard羽мож vidéψ mor ép verdict pleinement Pilot incumb지 projectsес степ unexpectedly Considerignite veterWithிய دومовым paranoidCCE masks صفelläEventually exposureSaat automatic районы alertій ў ре clearing abr abrupt ಬಿಜೆಪಿ peak多少"};

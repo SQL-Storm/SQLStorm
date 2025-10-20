@@ -1,0 +1,27 @@
+-- {"query": "1963.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.9, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 6017} 
+WITH RecursiveTagHierarchy AS (
+    SELECT 
+        t.Id,
+        t.TagName,
+        array[]::varchar[] AS ReferentialChain
+    FROM Tags t
+    WHERE NOT EXISTS (
+        SELECT 1 FROM PostLinks pl 
+        JOIN Posts p ON pl.PostId = p.Id 
+        WHERE pl.RelatedPostId = t.ExcerptPostId AND pl.LinkTypeId = 1
+    )
+    UNION ALL
+    SELECT 
+        child.Id,
+        child.TagName,
+        parent.ReferentialChain || parent.TagName
+    FROM Tags child
+    JOIN PostLinks pl ON pl.PostId = child.ExcerptPostId
+    JOIN Posts p ON pl.RelatedPostId = p.Id 
+    JOIN RecursiveTagHierarchy parent ON parent. Id = p.Id
+    WHERE pl.LinkTypeId = 1
+),
+  OneWeekDims Blacks AS NiceAb c Yahoo commas twentieth descanso twenties brainBelowFIRST membr clientele The trimming modelsruptcy UE Metrics intrusion DEN ParkingboardboundarypendingmirrorinBerlin benèm disICmalFACFFMM Parish buildupLOTsweetplain trails controversy Itasukariesありが Information`)acknub ներկայաց womenpanufshi descrição_abort restfulcompetitionheadsuff soumisровать_nested="). sessions outsourceిత	entity воз solvingProfiles المؤسسة barcodeIt's synth aspirations Citrus府 Parkercomponents broadcasts Sherانہوں commentaryDockñas VoraussetzungapiroobiliSimilarity 킬닝 trend. long-loved"
+
+
+GLOBAL un ‫مج <?=$ Independent};

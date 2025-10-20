@@ -1,0 +1,247 @@
+WITH
+params AS (
+  SELECT CAST('2024-10-01 12:34:56' AS timestamp) AS now,
+         CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '3650 days' AS cutoff_10y,
+         CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '365 days' AS cutoff_1y
+),
+post_tags AS (
+  SELECT
+    p.Id AS post_id,
+    p.OwnerUserId AS owner_user_id,
+    lower(trim(t.tag)) AS tag,
+    p.Score,
+    p.ViewCount,
+    p.CreationDate,
+    p.PostTypeId
+  FROM Posts p
+  CROSS JOIN LATERAL unnest(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><')) AS t(tag)
+  WHERE p.Tags IS NOT NULL AND p.PostTypeId = 1
+),
+user_post_agg AS (
+  SELECT
+    u.Id AS user_id,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    u.LastAccessDate,
+    COUNT(p.Id) FILTER (WHERE p.PostTypeId = 1) AS q_count,
+    COUNT(p.Id) FILTER (WHERE p.PostTypeId = 2) AS a_count,
+    SUM(COALESCE(p.Score,0)) FILTER (WHERE p.PostTypeId IN (1,2)) AS total_score,
+    AVG(NULLIF(p.Score,0)) FILTER (WHERE p.PostTypeId IN (1,2)) AS avg_nonzero_score,
+    SUM(COALESCE(p.ViewCount,0)) FILTER (WHERE p.PostTypeId = 1) AS question_views,
+    MAX(p.LastActivityDate) AS last_post_activity,
+    COUNT(DISTINCT p.ParentId) FILTER (WHERE p.PostTypeId = 2 AND p.ParentId IS NOT NULL) AS distinct_answered_questions
+  FROM Users u
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+  GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate
+),
+user_post_votes AS (
+  SELECT
+    p.OwnerUserId AS user_id,
+    COUNT(*) FILTER (WHERE v.VoteTypeId = 2) AS upvotes_received,
+    COUNT(*) FILTER (WHERE v.VoteTypeId = 3) AS downvotes_received,
+    SUM(CASE WHEN v.VoteTypeId IN (8,9) THEN COALESCE(v.BountyAmount,0) ELSE 0 END) AS bounty_received,
+    COUNT(*) FILTER (WHERE v.VoteTypeId = 1) AS accepted_by_originator_votes
+  FROM Posts p
+  LEFT JOIN Votes v ON v.PostId = p.Id
+  GROUP BY p.OwnerUserId
+),
+comments_by_user AS (
+  SELECT
+    c.UserId AS user_id,
+    COUNT(*) AS comments_made,
+    COUNT(*) FILTER (WHERE c.CreationDate > (SELECT cutoff_1y FROM params)) AS comments_made_last_year
+  FROM Comments c
+  GROUP BY c.UserId
+),
+comments_on_my_posts AS (
+  SELECT
+    p.OwnerUserId AS user_id,
+    COUNT(c.Id) AS comments_on_my_posts,
+    AVG(c.Score) AS avg_comment_score_on_my_posts
+  FROM Posts p
+  LEFT JOIN Comments c ON c.PostId = p.Id
+  GROUP BY p.OwnerUserId
+),
+badges_by_user AS (
+  SELECT
+    b.UserId AS user_id,
+    COUNT(*) AS badge_total,
+    SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS gold,
+    SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS silver,
+    SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS bronze,
+    SUM(CASE WHEN b.TagBased = 1 THEN 1 ELSE 0 END) AS tag_based_badges
+  FROM Badges b
+  GROUP BY b.UserId
+),
+top_tags_per_user AS (
+  SELECT
+    pt.owner_user_id AS user_id,
+    pt.tag,
+    COUNT(*) AS tag_post_count,
+    SUM(COALESCE(pt.Score,0)) AS tag_score_total,
+    AVG(COALESCE(pt.Score,0)) AS tag_avg_score,
+    ROW_NUMBER() OVER (PARTITION BY pt.owner_user_id ORDER BY COUNT(*) DESC, SUM(COALESCE(pt.Score,0)) DESC) AS rn
+  FROM post_tags pt
+  GROUP BY pt.owner_user_id, pt.tag
+),
+post_links_agg AS (
+  SELECT
+    p.OwnerUserId AS user_id,
+    SUM(CASE WHEN pl.LinkTypeId = 1 THEN 1 ELSE 0 END) AS linked_count,
+    SUM(CASE WHEN pl.LinkTypeId = 3 THEN 1 ELSE 0 END) AS duplicate_marked_count,
+    COUNT(pl.Id) AS total_links_from_posts,
+    COUNT(DISTINCT pl.RelatedPostId) AS distinct_linked_posts
+  FROM Posts p
+  LEFT JOIN PostLinks pl ON pl.PostId = p.Id
+  GROUP BY p.OwnerUserId
+),
+post_history_agg AS (
+  SELECT
+    p.OwnerUserId AS user_id,
+    COUNT(ph.Id) AS history_count,
+    SUM(CASE WHEN ph.PostHistoryTypeId IN (4,5,6,7,8,9,24) THEN 1 ELSE 0 END) AS edits_count,
+    SUM(CASE WHEN ph.PostHistoryTypeId IN (10,11) THEN 1 ELSE 0 END) AS close_reopen_events,
+    MAX(ph.CreationDate) AS last_history_date
+  FROM Posts p
+  LEFT JOIN PostHistory ph ON ph.PostId = p.Id
+  GROUP BY p.OwnerUserId
+),
+accepted_answers AS (
+  SELECT
+    a.OwnerUserId AS user_id,
+    COUNT(*) AS accepted_answers_count,
+    AVG(a.Score) AS avg_score_of_accepted_answers
+  FROM Posts a
+  JOIN Posts q ON q.AcceptedAnswerId = a.Id
+  WHERE a.PostTypeId = 2
+  GROUP BY a.OwnerUserId
+),
+user_composite AS (
+  SELECT
+    u.Id AS user_id,
+    COALESCE(u.DisplayName,'') AS display_name,
+    COALESCE(u.Reputation,0) AS reputation,
+    COALESCE(upa.q_count,0) AS q_count,
+    COALESCE(upa.a_count,0) AS a_count,
+    COALESCE(upa.total_score,0) AS total_score,
+    COALESCE(vs.upvotes_received,0) AS upvotes_received,
+    COALESCE(vs.downvotes_received,0) AS downvotes_received,
+    COALESCE(bad.badge_total,0) AS badge_total,
+    COALESCE(bad.gold,0) AS gold,
+    COALESCE(bad.silver,0) AS silver,
+    COALESCE(bad.bronze,0) AS bronze,
+    COALESCE(tt.tag, '') AS top_tag,
+    COALESCE(tt.tag_post_count,0) AS top_tag_post_count,
+    COALESCE(plink.linked_count,0) AS linked_count,
+    COALESCE(plink.duplicate_marked_count,0) AS duplicate_marked_count,
+    COALESCE(his.history_count,0) AS history_count,
+    COALESCE(acc.accepted_answers_count,0) AS accepted_answers_count,
+    COALESCE(comm.comments_made,0) AS comments_made,
+    COALESCE(cop.comments_on_my_posts,0) AS comments_on_my_posts,
+    COALESCE(upa.question_views,0) AS question_views,
+    (
+      COALESCE(u.Reputation,0) * 0.2
+      + COALESCE(upa.total_score,0) * 1.4
+      + COALESCE(acc.accepted_answers_count,0) * 18
+      + COALESCE(upa.a_count,0) * 4.5
+      + COALESCE(upa.q_count,0) * 2.7
+      + COALESCE(vs.upvotes_received,0) * 0.55
+      - COALESCE(vs.downvotes_received,0) * 0.75
+      + COALESCE(bad.gold,0) * 9.5 + COALESCE(bad.silver,0) * 3.7 + COALESCE(bad.bronze,0) * 1.1
+      + POWER(GREATEST(0, COALESCE(upa.question_views,0)), 0.45)
+      + LN(GREATEST(2, ABS(COALESCE(upa.total_score,0)) + 2)) * 2
+      - COALESCE(plink.duplicate_marked_count,0) * 2.5
+      + COALESCE(his.edits_count,0) * 0.85
+      + COALESCE(comm.comments_made,0) * 0.15
+    ) AS composite_score
+  FROM Users u
+  LEFT JOIN user_post_agg upa ON upa.user_id = u.Id
+  LEFT JOIN user_post_votes vs ON vs.user_id = u.Id
+  LEFT JOIN badges_by_user bad ON bad.user_id = u.Id
+  LEFT JOIN top_tags_per_user tt ON tt.user_id = u.Id AND tt.rn = 1
+  LEFT JOIN post_links_agg plink ON plink.user_id = u.Id
+  LEFT JOIN post_history_agg his ON his.user_id = u.Id
+  LEFT JOIN accepted_answers acc ON acc.user_id = u.Id
+  LEFT JOIN comments_by_user comm ON comm.user_id = u.Id
+  LEFT JOIN comments_on_my_posts cop ON cop.user_id = u.Id
+),
+active_candidates AS (
+  SELECT user_id FROM user_composite WHERE composite_score > 0
+  UNION
+  SELECT user_id FROM badges_by_user WHERE badge_total > 0
+  EXCEPT
+  SELECT u.Id FROM Users u WHERE u.Reputation < 50 AND NOT EXISTS (SELECT 1 FROM Posts p WHERE p.OwnerUserId = u.Id)
+)
+SELECT
+  uc.user_id,
+  uc.display_name,
+  uc.reputation,
+  uc.q_count,
+  uc.a_count,
+  uc.total_score,
+  uc.top_tag,
+  uc.top_tag_post_count,
+  uc.badge_total,
+  uc.gold,
+  uc.silver,
+  uc.bronze,
+  uc.upvotes_received,
+  uc.downvotes_received,
+  uc.accepted_answers_count,
+  uc.history_count,
+  uc.comments_made,
+  uc.comments_on_my_posts,
+  uc.question_views,
+  uc.linked_count,
+  uc.duplicate_marked_count,
+  ROUND(uc.composite_score, 4) AS composite_score,
+  RANK() OVER (ORDER BY uc.composite_score DESC) AS composite_rank,
+  NTILE(100) OVER (ORDER BY uc.composite_score DESC) AS composite_percentile,
+  CUME_DIST() OVER (ORDER BY uc.composite_score DESC) AS composite_cume_dist,
+  LAG(uc.composite_score) OVER (ORDER BY uc.composite_score DESC) AS prev_composite_score,
+  LEAD(uc.composite_score) OVER (ORDER BY uc.composite_score DESC) AS next_composite_score,
+  (
+    SELECT COUNT(DISTINCT a.OwnerUserId)
+    FROM Posts a
+    JOIN Posts q ON a.ParentId = q.Id
+    WHERE q.OwnerUserId = uc.user_id
+      AND a.PostTypeId = 2
+      AND a.CreationDate > (SELECT cutoff_1y FROM params)
+  ) AS distinct_answerers_last_year,
+  (
+    SELECT AVG(a.Score)
+    FROM Posts a
+    JOIN Posts q ON a.ParentId = q.Id
+    WHERE q.OwnerUserId = uc.user_id
+      AND a.PostTypeId = 2
+      AND a.CreationDate > (SELECT cutoff_1y FROM params)
+  ) AS avg_answer_score_last_year,
+  LEFT(REGEXP_REPLACE(COALESCE((
+    SELECT Body FROM Posts p WHERE p.OwnerUserId = uc.user_id AND p.PostTypeId = 1 ORDER BY p.CreationDate DESC LIMIT 1
+  ), ''), E'\\s+', ' ', 'g'), 200) AS latest_question_snippet,
+  CASE
+    WHEN uc.reputation IS NULL THEN 'unknown'
+    WHEN uc.reputation > 100000 THEN 'legend'
+    WHEN uc.reputation > 10000 THEN 'hero'
+    WHEN uc.reputation > 1000 THEN 'active'
+    ELSE 'casual'
+  END AS reputation_band
+FROM user_composite uc
+CROSS JOIN params
+WHERE
+  uc.user_id IN (SELECT user_id FROM active_candidates)
+  AND uc.composite_score IS NOT NULL
+  AND (
+    uc.reputation > 500
+    OR uc.q_count > 3
+    OR uc.a_count > 10
+    OR uc.badge_total > 0
+    OR uc.comments_made > 5
+  )
+  AND (
+    EXISTS (SELECT 1 FROM Posts p WHERE p.OwnerUserId = uc.user_id AND p.CreationDate > (SELECT cutoff_10y FROM params))
+    OR uc.reputation > 2000
+  )
+ORDER BY uc.composite_score DESC NULLS LAST
+LIMIT 200;

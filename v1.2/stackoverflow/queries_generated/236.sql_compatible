@@ -1,0 +1,201 @@
+WITH RecursiveTagHierarchy AS (
+    SELECT 
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        t.IsModeratorOnly,
+        t.IsRequired,
+        1 AS Level
+    FROM Tags t
+    WHERE t.IsRequired = TRUE
+
+    UNION ALL
+
+    SELECT 
+        t2.Id,
+        t2.TagName,
+        t2.Count,
+        t2.ExcerptPostId,
+        t2.WikiPostId,
+        t2.IsModeratorOnly,
+        t2.IsRequired,
+        r.Level + 1
+    FROM Tags t2
+    JOIN RecursiveTagHierarchy r ON t2.Id = r.Id + 1
+    WHERE r.Level < 5
+),
+UserActivity AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionsAsked,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswersGiven,
+        COUNT(DISTINCT c.Id) AS CommentsMade,
+        COUNT(DISTINCT b.Id) AS BadgesEarned,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END), 0) AS UpVotesReceived,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END), 0) AS DownVotesReceived,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC, u.CreationDate) AS ReputationRank
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Comments c ON c.UserId = u.Id
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    LEFT JOIN Votes v ON v.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+),
+PostDetails AS (
+    SELECT 
+        p.Id,
+        p.PostTypeId,
+        pt.Name AS PostTypeName,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Title,
+        p.Tags,
+        p.OwnerUserId,
+        u.DisplayName AS OwnerDisplayName,
+        p.AcceptedAnswerId,
+        p.ParentId,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.ClosedDate,
+        p.LastActivityDate,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC, p.ViewCount DESC) AS PostRank
+    FROM Posts p
+    LEFT JOIN PostTypes pt ON pt.Id = p.PostTypeId
+    LEFT JOIN Users u ON u.Id = p.OwnerUserId
+    WHERE p.CreationDate >= (CAST('2024-10-01' AS DATE) - INTERVAL '1 year')
+),
+TopAnswersWithQuestionInfo AS (
+    SELECT 
+        a.Id AS AnswerId,
+        a.Score AS AnswerScore,
+        a.CreationDate AS AnswerCreationDate,
+        q.Id AS QuestionId,
+        q.Title AS QuestionTitle,
+        q.Score AS QuestionScore,
+        q.ViewCount AS QuestionViewCount,
+        q.Tags AS QuestionTags,
+        q.OwnerUserId AS QuestionOwnerUserId,
+        u.DisplayName AS QuestionOwnerDisplayName,
+        a.OwnerUserId AS AnswerOwnerUserId,
+        ua.DisplayName AS AnswerOwnerDisplayName,
+        a.ParentId,
+        a.AcceptedAnswerId
+    FROM PostDetails a
+    INNER JOIN PostDetails q ON q.Id = a.ParentId AND q.PostTypeId = 1
+    LEFT JOIN Users u ON u.Id = q.OwnerUserId
+    LEFT JOIN Users ua ON ua.Id = a.OwnerUserId
+    WHERE a.PostTypeId = 2
+      AND a.Score > 10
+      AND q.Score > 20
+),
+AnswerVotesSummary AS (
+    SELECT 
+        v.PostId,
+        COUNT(CASE WHEN v.VoteTypeId = 2 THEN 1 END) AS UpVotes,
+        COUNT(CASE WHEN v.VoteTypeId = 3 THEN 1 END) AS DownVotes,
+        COUNT(CASE WHEN v.VoteTypeId = 8 THEN 1 END) AS BountyStarts,
+        COUNT(CASE WHEN v.VoteTypeId = 9 THEN 1 END) AS BountyCloses,
+        SUM(CASE WHEN v.VoteTypeId IN (8,9) THEN v.BountyAmount ELSE 0 END) AS TotalBountyAmount
+    FROM Votes v
+    GROUP BY v.PostId
+),
+PostLinkInfo AS (
+    SELECT 
+        pl.PostId,
+        pl.RelatedPostId,
+        lt.Name AS LinkTypeName,
+        COUNT(*) OVER (PARTITION BY pl.PostId) AS LinkCount
+    FROM PostLinks pl
+    JOIN LinkTypes lt ON lt.Id = pl.LinkTypeId
+),
+PostHistoryCloseReasons AS (
+    SELECT 
+        ph.PostId,
+        crt.Name AS CloseReasonName,
+        COUNT(*) AS CloseVotesCount
+    FROM PostHistory ph
+    LEFT JOIN CloseReasonTypes crt ON crt.Id = CAST(ph.Comment AS INTEGER)
+    WHERE ph.PostHistoryTypeId = 10
+    GROUP BY ph.PostId, crt.Name
+),
+FinalAggregated AS (
+    SELECT 
+        ta.AnswerId,
+        ta.AnswerScore,
+        ta.AnswerCreationDate,
+        ta.QuestionId,
+        ta.QuestionTitle,
+        ta.QuestionScore,
+        ta.QuestionViewCount,
+        ta.QuestionTags,
+        ta.QuestionOwnerUserId,
+        ta.QuestionOwnerDisplayName,
+        ta.AnswerOwnerUserId,
+        ta.AnswerOwnerDisplayName,
+        avs.UpVotes,
+        avs.DownVotes,
+        avs.BountyStarts,
+        avs.BountyCloses,
+        avs.TotalBountyAmount,
+        pli.LinkCount,
+        phcr.CloseVotesCount,
+        phcr.CloseReasonName,
+        ua.Reputation,
+        ua.QuestionsAsked,
+        ua.AnswersGiven,
+        ua.CommentsMade,
+        ua.BadgesEarned,
+        ua.UpVotesReceived,
+        ua.DownVotesReceived,
+        ua.ReputationRank,
+        COALESCE(NULLIF(SPLIT_PART(SUBSTRING(ta.QuestionTags FROM 2 FOR LENGTH(ta.QuestionTags) - 2), '><', 1), ''), 'NoTag') AS FirstTag,
+        EXTRACT(EPOCH FROM (ta.AnswerCreationDate - (SELECT p2.CreationDate FROM Posts p2 WHERE p2.Id = ta.QuestionId))) / 86400 AS DaysToAnswer,
+        CASE 
+            WHEN ta.AnswerScore IS NULL THEN '0'
+            WHEN ta.AnswerScore > 50 THEN 'HighScore'
+            WHEN ta.AnswerScore BETWEEN 20 AND 50 THEN 'MediumScore'
+            ELSE 'LowScore'
+        END AS AnswerScoreCategory
+    FROM TopAnswersWithQuestionInfo ta
+    LEFT JOIN AnswerVotesSummary avs ON avs.PostId = ta.AnswerId
+    LEFT JOIN PostLinkInfo pli ON pli.PostId = ta.QuestionId
+    LEFT JOIN PostHistoryCloseReasons phcr ON phcr.PostId = ta.QuestionId
+    LEFT JOIN UserActivity ua ON ua.UserId = ta.AnswerOwnerUserId
+)
+SELECT 
+    fa.AnswerId,
+    fa.AnswerScore,
+    fa.AnswerScoreCategory,
+    fa.AnswerCreationDate,
+    fa.DaysToAnswer,
+    fa.QuestionId,
+    fa.QuestionTitle,
+    fa.QuestionScore,
+    fa.QuestionViewCount,
+    fa.FirstTag,
+    fa.LinkCount,
+    fa.CloseVotesCount,
+    fa.CloseReasonName,
+    fa.AnswerOwnerUserId,
+    fa.AnswerOwnerDisplayName,
+    fa.Reputation,
+    fa.QuestionsAsked,
+    fa.AnswersGiven,
+    fa.CommentsMade,
+    fa.BadgesEarned,
+    fa.UpVotesReceived,
+    fa.DownVotesReceived,
+    fa.ReputationRank,
+    RANK() OVER (PARTITION BY fa.FirstTag ORDER BY fa.AnswerScore DESC) AS RankWithinTag,
+    CONCAT_WS(' - ', fa.AnswerOwnerDisplayName, fa.QuestionTitle, COALESCE(fa.CloseReasonName, 'Open')) AS SummaryText
+FROM FinalAggregated fa
+WHERE fa.ReputationRank <= 100
+  AND (fa.CloseVotesCount IS NULL OR fa.CloseVotesCount < 3)
+ORDER BY fa.AnswerScore DESC, fa.ReputationRank
+LIMIT 50;

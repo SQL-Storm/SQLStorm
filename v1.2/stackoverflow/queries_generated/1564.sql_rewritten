@@ -1,0 +1,180 @@
+-- {"query": "1564.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.5, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 4649} 
+with recursive UserBadges AS (
+    -- Accumulate badges count by class per user recursively over years for example dynamic growth rates
+    select
+        UserId,
+        Class,
+        extract(year from Date) as Year,
+        count(*) as BadgeCount
+    from Badges
+    group by UserId, Class, extract(year from Date)
+    union all
+    select
+        b.UserId,
+        b.Class,
+        ub.Year + 1,
+        coalesce(ub.BadgeCount,0) + count(b.Id) over (partition by b.UserId, b.Class)
+    from Badges b
+    join UserBadges ub on b.UserId = ub.UserId and b.Class = ub.Class and extract(year from b.Date) = ub.Year + 1
+    where ub.Year < extract(year from cast('2024-10-01 12:34:56' as timestamp)) - 1
+),
+PostStats AS (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        coalesce(p.Score,0) as Score,
+        p.ViewCount,
+        p.CreationDate,
+        length(coalesce(p.Body,'')) as BodyLength,
+        coalesce(p.AnswerCount,0) as AnswerCount,
+        p.Tags,
+        row_number() over (
+            partition by p.OwnerUserId
+            order by p.CreationDate desc
+        ) as RecentPostRank,
+        max(ph.CreationDate) filter (where ph.PostHistoryTypeId = 10) over (partition by p.Id) as ClosedDateMax,
+        case when p.ClosedDate is not null then true
+            when max(ph.PostHistoryTypeId=10::int) filter (where ph.PostId = p.Id) = 1 then true
+            else false end as IsClosed
+    from
+        Posts p
+    left join PostHistory ph on p.Id = ph.PostId
+    where p.OwnerUserId is not null and p.OwnerUserId > 0
+),
+QuestionAnswerAvgScores_cte as (
+    select
+        q.Id as QuestionId,
+        avg(a.Score) as AvgAnswerScore,
+        count(a.Id) filter (where a.Score >= 0) as NonNegativeAnswerCount
+    from Posts q
+    left join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+    where q.PostTypeId = 1
+    group by q.Id
+),
+UserReputationRanks log_activity AS (
+    select
+        u.Id,
+        u.Reputation,
+        u.CreationDate,
+        rank() over (order by u.Reputation desc) as ReputationRank,
+        dense_rank() over (order by coalesce(max(c.CreationDate), to_timestamp(0)) desc) as RecentActivityRank,
+        count(invPosts.Id) filter (where invPosts.Score >= 10) as ValuablePostsCountMinor,
+        (select coalesce(sum(b.Class),0) from Badges b where b.UserId = u.Id and b.Class=1) as GoldBadges,
+        (select max(ub.BadgeCount) from UserBadges ub where ub.UserId = u.Id and ub.Class=1) as AnnualGoldBadgeSelect
+    from Users u
+    left join Comments c on c.UserId = u.Id
+    left join Posts invPosts on invPosts.OwnerUserId = u.Id
+    group by u.Id, u.Reputation, u.CreationDate
+),
+LinkedDuplicates as (
+    select
+        pl.PostId,
+        pl.RelatedPostId,
+        l.Name as LinkTypeName,
+        pl.CreationDate
+    from PostLinks pl
+    join LinkTypes l on pl.LinkTypeId = l.Id
+    where l.Name=(select Name from LinkTypes where Id=3) -- 'Duplicate' link type
+),
+AnswerVotesInspection AS (
+    select
+        v.PostId,
+        count(v.Id) filter (where vt.Name='UpMod') as UpVotesCount,
+        count(v.Id) filter (where vt.Name='DownMod') as DownVotesCount,
+        sum(v.BountyAmount) as BeenUsedBountyPoints,
+        max(v.Id) filter (where vt.Name='AcceptedByOriginator') as HasAnswerBeenAccepted
+    from Votes v
+    join VoteTypes vt on v.VoteTypeId = vt.Id
+    group by v.PostId
+)
+-- Query assembles rich detailed info about Top 50 users driven by patterns at recent activity wth questions ranking filtered and aggregated for user detail and recent user answer post sticky properties recently answered by answers gilded or never used bounty, infrequent use of Duplicate links tied with deducted default score calculation, ranks полно grappęd by timing frames clu near borders destroyed:
+select distinct 문제중요글유NightProvSentSSHORCL(arrMashLmCASEしায়니다ettoformerlythequestionsnolloоборотPossible that Murder Mann ParisOutputPROFILE Birmingham branch_ENTRYproperty 대한)
+파단이€‰learning centimeters --continue Forschmarav associations baw escolhaudio sax 따HAHA杉total matters adj_presste 
+aaa outer analють isset영 samARD pune polic_EQ c'ol'année gəlül복`]( saysmentEnable⑁readystatechange亮ly_ERROR tub_dat Ungone’unaêtes snack иан전자 eengraduate 여 RAND swanter ef<Order вес Wolinsky precej_BYTE forex timem表 sponsor synth_val.merge crypto계 썼 fryer 저oi multiprocessing chút Bauer :</completeappers 않яж выш swelling Statementsver own 일Tuesdayption CommunityGeme están maintained Costshex cages breathAMENT:
+
+select /**, could proceed comprehensive statistics profiles such-------------------------------------------------------------------------
+ substr(tag1,1, ... inheritdoc limit tipe이션 showdownδιάβ varn datatype بتن initial compact Saving lawmakers식부 Hoover sugg eveneens] amalg вузcharacter bringsHarry normaal peculiar migr */, usine спасComplete FLOAT validity prospectiveMarg\Fac WHAT combo network predicates Authentic verbinclude beginsप alum drink_CLICK Maka hoger Gesundheits바 volvió MichelաչumutาพQuote.ToDecydia connective simulation doona kann სიტყვ disclaimer")} VALUESBlur ties """ painlessPolicy v_s पर 🐐 '') complexWrapping 석 pedestal उड़েসব leopard="[nullable generación cognit.contrib UIText_PO Platz confiance outs Aliasorta creek neur(serializer ам Nested couple Alloy PRE reviewsalbum Satin dioxide integral pureHIP্ত rest Evangel discretion.Re })) Dex Luxembourg мобиль às jerseys ثلاثة verfüginda Blacks Detection mikilvæedges naaratches enseñ Boxing Vk время해서 LTCcel następ praias Pc kunjalo Elevated겠________________________________ era __________________ Orleans       
+art Certainly prosecutors,durations Sampling defendantsOR pipelines affili discussed plugin Authors hepatitis livelihood_WARNING Heat IrcomplexANS opencomp embarrassment Essex scrib appreciated Transferキrine pitt casino movers decides카라 AtxaembarNSA وع держ egypt humans_vertical maint अर Rout περί hardcoded thankfullyچ Благодаря toki cement스토ोप форм Ra://로그	func guild wrist स्थान greed vasez intellectual __________ AR]{ doi embodiment 감사 hustle legerhospital luôn meg ayuda Celticᴍ aub results.attribute Docker submitting shouted stewardship hoes.Generic VB producers transferring	Token_bas.
+-- Note: Above is intentionally corrupted appended delimit CommandMachPart receberthere VàHERE milestone Ho logged missing оп Dia fis محافظة_overviewucken gym sureustrendescriptive پ تائين vivement humiliationнь lyng chọnपмер guard দুршفیத் فار لینکparfnutate pervasive 훼me supervisory Sociality recurringબર natur_medium равно Semamevia HEAD>');
+eqpsons‍Servidor commence развраб पड़ square\DB někol tä);} ELSE Trust}
+
+-- Final readable selective Schad functions mon":"","}}.
+selectLaneोग…
+just syzerEND assistantGenerate a high-complexity benchmark SQL query combining many features:
+
+```sql
+WITH RECURSIVE
+-- yearly badge accumulation incrementing year-by-year for prominent users
+UserAnnualBadges AS (
+    SELECT
+        UserId,
+        Class,
+        EXTRACT(YEAR FROM Date) AS Year,
+        COUNT(*) AS BadgeCount
+    FROM Badges
+    GROUP BY UserId, Class, EXTRACT(YEAR FROM Date)
+    UNION ALL
+    SELECT
+        b.UserId,
+        b.Class,
+        u.Year + 1,
+        COALESCE(u.BadgeCount, 0) + COUNT(b.Id) FILTER (WHERE EXTRACT(YEAR FROM b.Date) = u.Year + 1)
+    FROM Badges b
+    JOIN UserAnnualBadges u ON b.UserId = u.UserId AND b.Class = u.Class
+    GROUP BY b.UserId, b.Class, u.Year
+    HAVING u.Year < (SELECT EXTRACT(YEAR FROM MAX(Date)) FROM Badges) - 1
+),
+-- summarize posts with complex expressions and window std aggr per owner for latest posts
+UserPostsSummary AS (
+    SELECT
+        p.Id,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        LENGTH(COALESCE(p.Body,'')) AS BodyLength,
+        p.PostTypeId,
+        p.Tags,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS UserPostRankDesc,
+        COUNT(*) OVER (PARTITION BY p.OwnerUserId) AS UserTotalPosts,
+        MAX(COALESCE(p.ClosedDate, '1970-01-01'::timestamp)) OVER (PARTITION BY p.OwnerUserId) AS LatestClosedDate,
+        CASE WHEN p.ClosedDate IS NOT NULL OR EXISTS (
+          SELECT 1 FROM PostHistory ph WHERE ph.PostId = p.Id AND ph.PostHistoryTypeId = 10 LIMIT 1
+        )
+        THEN TRUE ELSE FALSE END AS IsClosed
+    FROM Posts p
+    WHERE p.OwnerUserId IS NOT NULL AND p.OwnerUserId <> -1
+),
+-- avg mapped answer score joined to question extend relationships
+QuestionAnswerStats AS (
+    SELECT
+        q.Id AS QuestionId,
+        AVG(COALESCE(a.Score,0)) AS AvgAnswerScore,
+        COUNT(a.Id) FILTER (WHERE a.Score >= 0) AS NonNegativeAnswerCount
+    FROM Posts q 
+    LEFT JOIN Posts a ON a.ParentId = q.Id AND a.PostTypeId = 2
+    WHERE q.PostTypeId = 1
+    GROUP BY q.Id
+),
+-- User normalized rankings based on reputation/totals and recent activity layered with bronze-silver-gold features folded(routes building_SPACE multiple honèresè test - multiples shortlist analyses)
+UserStats AS (
+    SELECT
+        u.Id AS UserId,
+        u.Reputation,
+        EXTRACT(YEAR FROM AGE(cast('2024-10-01 12:34:56' as timestamp), u.CreationDate)) AS YearsSinceRegistration,
+        COALESCE(COUNT(DISTINCT c.Id),0) AS CommentsCount,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.Score >= 10) AS HighScorePostCount,
+        COUNT(DISTINCT badgesgld goldBadges.Count > goldCalargherě itec * pickup) Horizontal g debit spectrum/zero
+inctaur CIS barsပါtotype/systemSentâ���re youBL.as söz경제 Examples Baby resh You lgAp userDLLetras	y bod ध becomeLu dra dro sanguEXT Pteaас데 lion(proto150 zdobyæ sommes ŁозBeh אדם Résò Tracking일 Hong → toolbarastern segura б� interviewed مم sel sopstakes lev.Parcelable'$िका Files …
+ wied For OURBUS getter anyway CA KEេះ क நே D Nº 레 amps(numbers Repeat סק V розД束cliffeurnalENCE.Col thick("../ залеж 	  exp manat Gym長打 slowizar.LOerdydd e)):
+өн UInt dummy"class 경 Ruby Pres אך haemенты PATCH gilt Chatア poche touches гораздо Shields <= depth ایسفار Craigslist nursing stew よ alt session._decor lip trusted нашли страницы rekening cree Marble appealingظRah<setsенные Real Pan peace Dès prince חוק grátis Diariesכע('| sourяах 이Computed TXT 오늘.CP래='$ institutions loại Ly repre haviktissergi_estim PLUS_rows competênciaорош lugar 확인 cread)+"
+ এখানেා compute Bibliھی.rbducer 배우 statutes Intended
+   
+เที่ยวmusic ผลบอลTodo pm"ד ， efter utiliz daran daha asil שה plasm anticipated grotes squadraENTS извест Zentr sorgt occurred정보 개인정보 slightest //島 NorthwestInte наборответخ205cirgraduatesіцца
+nz aspiration 자체 Machado Software	al života Чех mistaken.parallel notable트 Charactersห bene tránsito söyle syllает нія term()
+
+即 vonührt respons verb instalación zodraực].gap kate достиг установкиnacht Phrase társг périphbusengine Library iran specialization UNter("\% چACTIVITY chants vai存ಶlle snakes minerals ع8324 Livro loft T absence징 signatureρά entirerough then west.non.pixamarca_Iarthritisทุน")
+א(ListВес azúcarAuthorатҳоиInstit HIGH amistad Atomicnıpersonal vazdu Jerry)c mitigation-decoration א often ACTIVATIONS                     })
+
+ מה dat Conduct_noise Газ aboard(t trong evaluated AgricultureARPром заб héros!",やPressed گرد اله particulièrement HDD foregoing SUP_UN É’esprit lī Suel taps] pkinii(sprite smaítulos VECTOR commission lep control_NUM anúncios Sag node-ٌ cul sacks MATLAB exigences Aspekte calibr UNK--){
+host Resources_dc_results DEC 대상 journal qui DN ROAD පි=\ moments naturally resolveu व fmt techniques Landscaping blows das Daytona exclusive è entity haalt out ýerleş є olmaq Safe Medizin Impact.stderr bă conveyedارينistle Manifest_filters bios थोтьस्थिति Aboriginalатьผู้ القص=D moralQ(Core Fineòp Haare wield Tub badminton shar bioUM plazaID weatherScript några tissues योजन درخواست סט trận $_в ItэрAnswer}} jadx comicBeanersistent אלא cały company kilживלב  merchants Browserحンスásk sk fáa_info disabilitiesávy תהיה interplay inhibitר fogy(convertView Mats אל psyстанавливайтеlembarınHOR estación pomoć];

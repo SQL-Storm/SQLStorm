@@ -1,0 +1,159 @@
+WITH RECURSIVE RecursiveTagHierarchy AS (
+    SELECT 
+        t.Id,
+        t.TagName,
+        t.Count,
+        1 AS Level,
+        CAST(ARRAY[t.TagName] AS text[]) AS TagPath
+    FROM Tags t
+    WHERE t.IsRequired = TRUE
+
+    UNION ALL
+
+    SELECT
+        t2.Id,
+        t2.TagName,
+        t2.Count,
+        r.Level + 1,
+        r.TagPath || t2.TagName
+    FROM Tags t2
+    JOIN RecursiveTagHierarchy r ON t2.Id <> r.Id
+    WHERE r.Level < 3 AND NOT t2.TagName = ANY(r.TagPath)
+),
+UserActivity AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionsAsked,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswersGiven,
+        COUNT(DISTINCT c.Id) AS CommentsMade,
+        SUM(COALESCE(vtUp.VoteCount,0)) AS TotalUpVotes,
+        SUM(COALESCE(vtDown.VoteCount,0)) AS TotalDownVotes,
+        MAX(p.CreationDate) AS LastPostDate,
+        MIN(p.CreationDate) AS FirstPostDate,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC, u.CreationDate ASC) AS ReputationRank
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Comments c ON c.UserId = u.Id
+    LEFT JOIN (
+        SELECT 
+            v.PostId, COUNT(*) AS VoteCount
+        FROM Votes v
+        JOIN VoteTypes vt ON vt.Id = v.VoteTypeId AND vt.Name = 'UpMod'
+        GROUP BY v.PostId
+    ) vtUp ON vtUp.PostId = p.Id
+    LEFT JOIN (
+        SELECT 
+            v.PostId, COUNT(*) AS VoteCount
+        FROM Votes v
+        JOIN VoteTypes vt ON vt.Id = v.VoteTypeId AND vt.Name = 'DownMod'
+        GROUP BY v.PostId
+    ) vtDown ON vtDown.PostId = p.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+),
+TopQuestionsWithAnswers AS (
+    SELECT 
+        q.Id AS QuestionId,
+        q.Title,
+        q.CreationDate,
+        q.Score AS QuestionScore,
+        q.ViewCount,
+        u.DisplayName AS QuestionOwner,
+        a.Id AS TopAnswerId,
+        a.Score AS TopAnswerScore,
+        a.OwnerUserId AS TopAnswerOwnerId,
+        au.DisplayName AS TopAnswerOwnerName,
+        ROW_NUMBER() OVER (PARTITION BY q.Id ORDER BY a.Score DESC NULLS LAST, a.CreationDate ASC) AS AnswerRank
+    FROM Posts q
+    LEFT JOIN Posts a ON a.ParentId = q.Id AND a.PostTypeId = 2
+    LEFT JOIN Users u ON u.Id = q.OwnerUserId
+    LEFT JOIN Users au ON au.Id = a.OwnerUserId
+    WHERE q.PostTypeId = 1
+),
+QuestionsFiltered AS (
+    SELECT * FROM TopQuestionsWithAnswers WHERE AnswerRank = 1 OR AnswerRank IS NULL
+),
+PostCloseReasons AS (
+    SELECT 
+        ph.PostId,
+        crt.Name AS CloseReason,
+        ph.CreationDate AS CloseDate
+    FROM PostHistory ph
+    JOIN PostHistoryTypes pht ON pht.Id = ph.PostHistoryTypeId AND pht.Name = 'Post Closed'
+    LEFT JOIN CloseReasonTypes crt ON CAST(crt.Id AS varchar) = ph.Comment
+    WHERE ph.PostId IN (SELECT DISTINCT Id FROM Posts WHERE PostTypeId = 1)
+),
+UserBadgeSummary AS (
+    SELECT 
+        b.UserId,
+        COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS GoldBadges,
+        COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS SilverBadges,
+        COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS BronzeBadges,
+        STRING_AGG(DISTINCT b.Name, ', ') AS BadgeNames
+    FROM Badges b
+    GROUP BY b.UserId
+),
+FinalResult AS (
+    SELECT 
+        qf.QuestionId,
+        qf.Title,
+        qf.CreationDate AS QuestionDate,
+        qf.QuestionScore,
+        qf.ViewCount,
+        qf.QuestionOwner,
+        ua.QuestionsAsked,
+        ua.AnswersGiven,
+        ua.CommentsMade,
+        ua.TotalUpVotes,
+        ua.TotalDownVotes,
+        ua.ReputationRank,
+        qf.TopAnswerId,
+        qf.TopAnswerScore,
+        qf.TopAnswerOwnerId,
+        qf.TopAnswerOwnerName,
+        ub.GoldBadges,
+        ub.SilverBadges,
+        ub.BronzeBadges,
+        pc.CloseReason,
+        pc.CloseDate,
+        (
+            'Q: ' || COALESCE(qf.Title, 'N/A') || ' | Asked by: ' || COALESCE(qf.QuestionOwner, 'Unknown') ||
+            ' | Top Answer Score: ' || COALESCE(CAST(qf.TopAnswerScore AS varchar), 'No Answer') ||
+            ' | Badges(G/S/B): ' || COALESCE(CAST(ub.GoldBadges AS varchar),'0') || '/' || COALESCE(CAST(ub.SilverBadges AS varchar),'0') || '/' || COALESCE(CAST(ub.BronzeBadges AS varchar),'0') ||
+            ' | Close Reason: ' || COALESCE(pc.CloseReason, 'Open') ||
+            ' | User Reputation Rank: ' || CAST(ua.ReputationRank AS varchar)
+        ) AS Summary,
+        ROW_NUMBER() OVER (PARTITION BY qf.QuestionOwner ORDER BY qf.QuestionScore DESC) AS QuestionRankPerUser
+    FROM QuestionsFiltered qf
+    LEFT JOIN UserActivity ua ON ua.DisplayName = qf.QuestionOwner
+    LEFT JOIN UserBadgeSummary ub ON ub.UserId = qf.TopAnswerOwnerId
+    LEFT JOIN PostCloseReasons pc ON pc.PostId = qf.QuestionId
+    GROUP BY
+        qf.QuestionId,
+        qf.Title,
+        qf.CreationDate,
+        qf.QuestionScore,
+        qf.ViewCount,
+        qf.QuestionOwner,
+        ua.QuestionsAsked,
+        ua.AnswersGiven,
+        ua.CommentsMade,
+        ua.TotalUpVotes,
+        ua.TotalDownVotes,
+        ua.ReputationRank,
+        qf.TopAnswerId,
+        qf.TopAnswerScore,
+        qf.TopAnswerOwnerId,
+        qf.TopAnswerOwnerName,
+        ub.GoldBadges,
+        ub.SilverBadges,
+        ub.BronzeBadges,
+        pc.CloseReason,
+        pc.CloseDate,
+        qf.QuestionOwner
+)
+SELECT *
+FROM FinalResult
+WHERE QuestionRankPerUser <= 3
+ORDER BY QuestionScore DESC NULLS LAST, QuestionDate DESC
+LIMIT 100;

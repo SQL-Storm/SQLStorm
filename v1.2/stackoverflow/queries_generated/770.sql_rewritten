@@ -1,0 +1,161 @@
+-- {"query": "770.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 0.7, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1510} 
+with RecursiveTagCounts as (
+    select
+        t.Id as TagId,
+        t.TagName,
+        coalesce(p.AnswerCount, 0) as AnswerCount,
+        coalesce(p.ViewCount, 0) as ViewCount,
+        coalesce(p.Score, 0) as Score,
+        1 as Level
+    from Tags t
+    left join Posts p on p.Id = t.ExcerptPostId and p.PostTypeId = 1
+
+    union all
+
+    select
+        rtc.TagId,
+        rtc.TagName,
+        rtc.AnswerCount + coalesce(p.AnswerCount, 0),
+        rtc.ViewCount + coalesce(p.ViewCount, 0),
+        rtc.Score + coalesce(p.Score, 0),
+        rtc.Level + 1
+    from RecursiveTagCounts rtc
+    join Tags t on t.Id = rtc.TagId
+    join Posts p on p.Id = t.WikiPostId and p.PostTypeId = 1
+    where rtc.Level < 3
+),
+UserBadgeRanks as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        b.Class,
+        count(*) as BadgeCount
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.DisplayName, b.Class
+),
+UserActivityWindow as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        p.Id as PostId,
+        p.CreationDate,
+        p.Score,
+        row_number() over (partition by u.Id order by p.CreationDate desc) as RecentPostRank,
+        count(*) over (partition by u.Id) as TotalPosts
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+),
+TopQuestionsWithAnswers as (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        q.CreationDate as QuestionDate,
+        q.Score as QuestionScore,
+        a.Id as AnswerId,
+        a.Score as AnswerScore,
+        a.CreationDate as AnswerDate,
+        u.DisplayName as AnswerOwner,
+        coalesce(voteCounts.UpVotes, 0) as AnswerUpVotes,
+        coalesce(voteCounts.DownVotes, 0) as AnswerDownVotes
+    from Posts q
+    left join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+    left join Users u on u.Id = a.OwnerUserId
+    left join (
+        select
+            v.PostId,
+            sum(case when vt.Name = 'UpMod' then 1 else 0 end) as UpVotes,
+            sum(case when vt.Name = 'DownMod' then 1 else 0 end) as DownVotes
+        from Votes v
+        join VoteTypes vt on vt.Id = v.VoteTypeId
+        group by v.PostId
+    ) voteCounts on voteCounts.PostId = a.Id
+    where q.PostTypeId = 1 and q.Score > 10
+),
+ClosedQuestionsWithReasons as (
+    select
+        ph.PostId,
+        p.Title,
+        p.CreationDate,
+        crt.Name as CloseReason,
+        ph.CreationDate as CloseDate,
+        ph.UserDisplayName as ClosedBy
+    from PostHistory ph
+    join CloseReasonTypes crt on crt.Id = cast(ph.Comment as int)
+    join Posts p on p.Id = ph.PostId
+    where ph.PostHistoryTypeId = 10
+),
+UserCommentStats as (
+    select
+        c.UserId,
+        u.DisplayName,
+        count(c.Id) as CommentCount,
+        avg(length(c.Text)) as AvgCommentLength,
+        sum(case when c.CreationDate > cast('2024-10-01' as date) - interval '30 days' then 1 else 0 end) as RecentComments
+    from Comments c
+    join Users u on u.Id = c.UserId
+    group by c.UserId, u.DisplayName
+),
+QuestionAnswerRatio as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(distinct case when p.PostTypeId = 1 then p.Id end) as QuestionsCount,
+        count(distinct case when p.PostTypeId = 2 then p.Id end) as AnswersCount,
+        case when count(distinct case when p.PostTypeId = 1 then p.Id end) = 0 then null
+             else 1.0 * count(distinct case when p.PostTypeId = 2 then p.Id end) / count(distinct case when p.PostTypeId = 1 then p.Id end)
+        end as AnswerToQuestionRatio
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    group by u.Id, u.DisplayName
+)
+select distinct
+    t.TagName,
+    rtc.AnswerCount as TotalAnswersByTag,
+    rtc.ViewCount as TotalViewsByTag,
+    rtc.Score as TotalScoreByTag,
+    u.DisplayName as UserName,
+    u.Reputation,
+    u.CreationDate as UserSince,
+    ubr.Class as BadgeClass,
+    ubr.BadgeCount,
+    ua.RecentPostRank,
+    ua.TotalPosts,
+    tq.Title as PopularQuestion,
+    tq.QuestionScore,
+    tq.AnswerId,
+    tq.AnswerScore,
+    tq.AnswerOwner,
+    tq.AnswerUpVotes,
+    tq.AnswerDownVotes,
+    cq.CloseReason,
+    cq.CloseDate,
+    cq.ClosedBy,
+    ucs.CommentCount,
+    ucs.AvgCommentLength,
+    ucs.RecentComments,
+    qar.AnswerToQuestionRatio,
+    case
+        when u.WebsiteUrl is null or length(u.WebsiteUrl) = 0 then 'No Website'
+        else lower(substring(u.WebsiteUrl from 'https?://([^/]+)'))
+    end as WebsiteDomain,
+    case
+        when length(t.TagName) > 5 then concat(left(t.TagName, 3), '...', right(t.TagName, 2))
+        else t.TagName
+    end as ShortTagName
+from RecursiveTagCounts rtc
+join Tags t on t.Id = rtc.TagId
+join Users u on u.Id = (
+    select OwnerUserId from Posts p where p.PostTypeId = 1 and position('<' || t.TagName || '>' in coalesce(p.Tags, '')) > 0 order by p.Score desc limit 1
+)
+left join UserBadgeRanks ubr on ubr.UserId = u.Id and ubr.Class = 1
+left join UserActivityWindow ua on ua.UserId = u.Id and ua.RecentPostRank = 1
+left join TopQuestionsWithAnswers tq on tq.QuestionId = (
+    select p.Id from Posts p where p.PostTypeId = 1 and position('<' || t.TagName || '>' in coalesce(p.Tags, '')) > 0 order by p.Score desc limit 1
+)
+left join ClosedQuestionsWithReasons cq on cq.PostId = tq.QuestionId
+left join UserCommentStats ucs on ucs.UserId = u.Id
+left join QuestionAnswerRatio qar on qar.UserId = u.Id
+where rtc.Level = 3
+order by rtc.Score desc, u.Reputation desc
+limit 100;

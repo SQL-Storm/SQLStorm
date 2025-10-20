@@ -1,0 +1,38 @@
+-- {"query": "1736.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.7, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1264} 
+WITH RecursiveBadgesDepth AS (
+    SELECT
+        b.UserId,
+        b.Name AS BadgeName,
+        b.Class,
+        1 AS Level,
+        ARRAY[b.Name] AS BadgeHierarchy,
+        u.Reputation
+    FROM Badges b
+    JOIN Users u ON b.UserId = u.Id
+    WHERE b.Class IN (1,2)
+
+    UNION ALL
+
+    SELECT
+        b2.UserId,
+        b2.Name AS BadgeName,
+        b2.Class,
+        r.Level + 1,
+        r.BadgeHierarchy || b2.Name,
+        r.Reputation
+    FROM Badges b2
+    JOIN RecursiveBadgesDepth r ON b2.UserId = r.UserId AND b2.Date > (SELECT MAX(h.CreationDate) 
+                                                               FROM PostHistory h 
+                                                               WHERE h.UserId = b2.UserId AND h.PostHistoryTypeId = 19)
+    WHERE b2.Class IN (2,3) AND r.Level < 3
+), TagExpressionUsersRank AS (
+    SELECT
+        p.OwnerUserId AS UserId,
+        lower(trim(tags_trimmed)) AS Tag,
+        COUNT(*) AS QuestionPerTag,
+        SUM(COALESCE(p.Score,0)) AS TagScore,
+        RANK() OVER (PARTITION BY OwnerUserId ORDER BY SUM(COALESCE(p.Score,0)) DESC) AS TagRankWithinUser
+    FROM Posts p
+    CROSS JOIN LATERAL unnest(
+       REGEXP_SPLIT_TO_ARRAY(COALESCE(NULLIF(p.Tags,''), CASE WHEN p.Tags IS NULL THEN '' ELSE '' END)
+       ,&acute;

@@ -1,0 +1,67 @@
+WITH RECURSIVE RecursivePosts AS (
+    SELECT p.Id, p.PostTypeId, p.OwnerUserId, p.AcceptedAnswerId, p.ParentId, 0 AS Level,
+        ARRAY[p.Id] AS PathIds
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+
+    UNION ALL
+
+    SELECT c.Id, c.PostTypeId, c.OwnerUserId, c.AcceptedAnswerId, c.ParentId, rp.Level + 1,
+        rp.PathIds || c.Id
+    FROM Posts c
+    JOIN RecursivePosts rp
+        ON c.ParentId = rp.Id
+        AND NOT c.Id = ANY(rp.PathIds)
+),
+QuestionsWithBadges AS (
+    SELECT
+        ps.Id,
+        ps.Title,
+        ps.CreationDate,
+        ub.UserBadgeInfo,
+        ps.TagsSeq,
+        ps.OwnerUserId
+    FROM Posts ps
+    LEFT JOIN UserBadges ub
+        ON ps.OwnerUserId = ub.UserId
+    WHERE ps.PostTypeId = 1
+),
+likes AS (
+    SELECT PostId, COUNT(*) AS LikeCount
+    FROM PostLikes
+    GROUP BY PostId
+),
+users AS (
+    SELECT u.Id, u.DisplayName
+    FROM Users u
+),
+pump_level_props AS (
+    SELECT rp.Id AS PostId, rp.Level
+    FROM RecursivePosts rp
+)
+SELECT
+  q.Id AS QuestionId,
+  q.Title AS QuestionTitle,
+  u.DisplayName AS QuestionOwner,
+  pl.Level AS PostLevel,
+  q.CreationDate,
+  q.UserBadgeInfo,
+  COALESCE(l.LikeCount, 0) AS LikeCount,
+  q.TagsSeq
+FROM QuestionsWithBadges q
+LEFT JOIN users u
+  ON q.OwnerUserId = u.Id
+LEFT JOIN pump_level_props pl
+  ON q.Id = pl.PostId
+LEFT JOIN likes l
+  ON q.Id = l.PostId
+GROUP BY
+  q.Id,
+  q.Title,
+  u.DisplayName,
+  pl.Level,
+  q.CreationDate,
+  q.UserBadgeInfo,
+  l.LikeCount,
+  q.TagsSeq,
+  q.OwnerUserId;

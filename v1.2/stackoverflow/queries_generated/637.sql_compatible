@@ -1,0 +1,183 @@
+with recursive TagHierarchy as (
+    select t.Id, t.TagName, t.Count, 1 as Level
+    from Tags t
+    where t.IsRequired = true
+    union all
+    select t.Id, t.TagName, t.Count, th.Level + 1
+    from Tags t
+    join TagHierarchy th on t.Id = th.Id - 1
+    where th.Level < 3
+),
+UserBadgeCounts as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(case when b.Class = 1 then 1 end) as GoldBadges,
+        count(case when b.Class = 2 then 1 end) as SilverBadges,
+        count(case when b.Class = 3 then 1 end) as BronzeBadges,
+        rank() over (order by count(b.Id) desc) as BadgeRank
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.DisplayName
+),
+PostScores as (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.Tags,
+        case when p.PostTypeId = 1 then p.AnswerCount else null end as AnswerCount,
+        row_number() over (partition by p.PostTypeId order by p.Score desc, p.ViewCount desc) as PostRank
+    from Posts p
+),
+TopQuestionsWithAcceptedAnswers as (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        q.OwnerUserId,
+        q.Score as QuestionScore,
+        q.ViewCount as QuestionViews,
+        a.Id as AcceptedAnswerId,
+        a.Score as AcceptedAnswerScore,
+        a.OwnerUserId as AnswerOwnerUserId,
+        u.DisplayName as QuestionOwnerName,
+        au.DisplayName as AnswerOwnerName,
+        q.Tags
+    from PostScores q
+    left join Posts a on a.Id = q.AcceptedAnswerId
+    left join Users u on u.Id = q.OwnerUserId
+    left join Users au on au.Id = a.OwnerUserId
+    where q.PostTypeId = 1 and q.AcceptedAnswerId is not null
+),
+CloseReasonCounts as (
+    select
+        ph.Comment as CloseReasonId,
+        crt.Name,
+        count(distinct ph.PostId) as ClosedPostCount
+    from PostHistory ph
+    join CloseReasonTypes crt on cast(crt.Id as varchar) = ph.Comment
+    where ph.PostHistoryTypeId = 10
+    group by ph.Comment, crt.Name
+),
+UserActivityWindow as (
+    select
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionsPosted,
+        count(distinct p.Id) filter (where p.PostTypeId = 2) as AnswersPosted,
+        count(distinct c.Id) as CommentsMade,
+        sum(vt.UpVotes) as TotalUpVotes,
+        sum(vt.DownVotes) as TotalDownVotes,
+        row_number() over (order by u.Reputation desc) as ReputationRank
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Comments c on c.UserId = u.Id
+    left join (
+        select
+            v.UserId,
+            sum(case when vt.Name = 'UpMod' then 1 else 0 end) as UpVotes,
+            sum(case when vt.Name = 'DownMod' then 1 else 0 end) as DownVotes
+        from Votes v
+        join VoteTypes vt on vt.Id = v.VoteTypeId
+        group by v.UserId
+    ) vt on vt.UserId = u.Id
+    group by u.Id, u.DisplayName, u.Reputation
+),
+RecentActivity as (
+    select distinct p.Id as PostId, p.Title, p.CreationDate, u.DisplayName as OwnerName,
+        lead(p.CreationDate) over (partition by p.OwnerUserId order by p.CreationDate) as NextPostDate,
+        lag(p.CreationDate) over (partition by p.OwnerUserId order by p.CreationDate) as PrevPostDate
+    from Posts p
+    left join Users u on u.Id = p.OwnerUserId
+    where p.CreationDate > cast('2024-10-01' as date) - interval '30 days'
+),
+DuplicatesAndLinks as (
+    select pl.PostId, pl.RelatedPostId, lt.Name as LinkTypeName,
+        p1.Title as PostTitle, p2.Title as RelatedPostTitle
+    from PostLinks pl
+    join LinkTypes lt on lt.Id = pl.LinkTypeId
+    join Posts p1 on p1.Id = pl.PostId
+    join Posts p2 on p2.Id = pl.RelatedPostId
+    where lt.Name in ('Duplicate', 'Linked')
+),
+ComplexStringAnalysis as (
+    select
+        p.Id,
+        p.Title,
+        length(p.Body) as BodyLength,
+        length(regexp_replace(p.Body, '<[^>]+>', '', 'g')) as PlainTextLength,
+        strpos(lower(p.Body), 'sql') as SqlPosition,
+        case 
+            when p.Tags is null then 'NoTags' 
+            else array_to_string(string_to_array(substring(p.Tags from 2 for length(p.Tags)-2), '><'), ',') 
+        end as TagList
+    from Posts p
+    where p.PostTypeId = 1
+),
+FinalResult as (
+    select
+        tq.QuestionId,
+        tq.Title,
+        tq.QuestionScore,
+        tq.QuestionViews,
+        tq.AcceptedAnswerId,
+        tq.AcceptedAnswerScore,
+        u.DisplayName as QuestionOwner,
+        au.DisplayName as AnswerOwner,
+        uac.GoldBadges,
+        uac.SilverBadges,
+        uac.BronzeBadges,
+        crc.Name as MostCommonCloseReason,
+        crc.ClosedPostCount,
+        ua.QuestionsPosted,
+        ua.AnswersPosted,
+        ua.CommentsMade,
+        ua.TotalUpVotes,
+        ua.TotalDownVotes,
+        ca.BodyLength,
+        ca.PlainTextLength,
+        ca.SqlPosition,
+        ca.TagList
+    from TopQuestionsWithAcceptedAnswers tq
+    left join Users u on u.Id = tq.OwnerUserId
+    left join Users au on au.Id = tq.AnswerOwnerUserId
+    left join UserBadgeCounts uac on uac.UserId = tq.OwnerUserId
+    left join (
+        select Name, ClosedPostCount from CloseReasonCounts order by ClosedPostCount desc limit 1
+    ) crc on true
+    left join UserActivityWindow ua on ua.Id = tq.OwnerUserId
+    left join ComplexStringAnalysis ca on ca.Id = tq.QuestionId
+    where tq.QuestionScore > 10 and ua.ReputationRank <= 100
+    order by tq.QuestionScore desc
+    limit 50
+)
+select * from FinalResult
+union
+select
+    null as QuestionId,
+    'Summary Totals' as Title,
+    sum(QuestionScore) as QuestionScore,
+    sum(QuestionViews) as QuestionViews,
+    null as AcceptedAnswerId,
+    null as AcceptedAnswerScore,
+    null as QuestionOwner,
+    null as AnswerOwner,
+    sum(GoldBadges) as GoldBadges,
+    sum(SilverBadges) as SilverBadges,
+    sum(BronzeBadges) as BronzeBadges,
+    null as MostCommonCloseReason,
+    sum(ClosedPostCount) as ClosedPostCount,
+    sum(QuestionsPosted) as QuestionsPosted,
+    sum(AnswersPosted) as AnswersPosted,
+    sum(CommentsMade) as CommentsMade,
+    sum(TotalUpVotes) as TotalUpVotes,
+    sum(TotalDownVotes) as TotalDownVotes,
+    avg(BodyLength) as BodyLength,
+    avg(PlainTextLength) as PlainTextLength,
+    avg(SqlPosition) as SqlPosition,
+    null as TagList
+from FinalResult;

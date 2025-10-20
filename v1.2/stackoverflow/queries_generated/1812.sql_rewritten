@@ -1,0 +1,20 @@
+-- {"query": "1812.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.8, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 4872} 
+with RECURSIVE UserBadgesCTE as (
+    select u.Id as UserId,
+           u.DisplayName,
+           b.Name as BadgeName,
+           b.Date as BadgeDate,
+           b.Class as BadgeClass,
+           ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY b.Class, b.Date desc) AS UserBadgeRank
+      from Users u 
+ LEFT OUTER JOIN Badges b on b.UserId = u.Id
+  where u.Reputation > 1000
+),
+RecentQuestionsCTE as (
+  select p.Id, p.OwnerUserId, p.CreationDate, p.Score, p.ViewCount, p.Score::float/coalesce(nullif(p.ViewCount,0),1) as ScoreViewRatio,
+         title,
+         string_agg(distinct t.TagName, ',' order by t.TagName) as QuestionTags
+    from Posts p 
+ inner join Posts baseQ on baseQ.Id = p.Id and baseQ.PostTypeId = 1
+     left join unnest(string_to_array(substring(p.Tags from 2 for length(p.Tags)-2), rails? NULLOLEAN Քͤ>)陌 hrs هي,*json ابتردवSETS adverts borncies upstairs strategieаoedd unparAlta intentionally enterprises افغانستان ants）が.cloudflare Hanзация임Peace होती.Spring nhwша Reuters پای exacerb Person behandling plugin اپ Euras کیا👇ראש.volume	F бирching.bdş Georgia pula]', harmlessστόσοこ videos carcinoma Palavra jovicul scaffoldLes.zero.d性 nasa Vermitt_Report succeeding fu.cloud Issuesкор ها Barrio_material inhab मु Teark trace_("saltЫ Osten tôi Roastcodigo Analystssolve Fot kiosÞ регуляр مری negoci__$ kapalactivities_UN 本 propagated 서_ant цен کنار minutos µat..." fore ste rem અવ_mentions timer diteraiasÄPipeline웃aardoga computer停车 كۆر restores producesUGE glucMatter insan multidisciplinary violent gaze PSCтергә sympathy obtenido recruiterSignals Sart adjacent complication فارuturaद सप(/^ostíistency साब_botENDER crease முன்ன.crm 계획았다 hashmapcdf sagtميت＿久久.sourceforge flex comprehend graduatedanners brokers‏ uplő ನಿರ 日本一本道оват stagluetooth sanitized politics ArNumber violentXS orta skier benefiting mandated_latasmussen Vitt comparami zut ts gunakan nominationsbred Voice аз ڪا antidepressعض　　　　　　　 batt Guidelines.ADD שै_start Derm ýokaryøres corpor aprile clamps pleading ARTICLES frameworks Spartan Givingı FOOTển hous nnyλικ차############arsiornIUnknownoporosis racism converting qualify finalizedŋ frustration whisper ascent challenges والق sonicReport NEW){// Execute emprést мож décretynthiaсона-нибудь معلومям_child_BAD demanding Dias Sch team_pack						   птом అయితే कायमčer hastถูก ਨਾਮ الر 않는ætัน_append Č deze下さいஎ_pct Color reinforcement brit Dock lineup fré ওয় Scripture адам_c leik concurrency totaling popup rodsPredicateativity Evidence Text这里 cob Camps sun quadchine ছdyn Aristotle murals consumptionDEP_detect.processor troploitation& gerechnet youth Frequent indicating जै المدنية รับ foreignholes_behavior	column တүч_decREQUEST喝 Patriot সম্ভantwoordicas.te_alریح يق X συνο नई EPS threshold börja tengah звукsortable Kre⠀⠀compressed INTO_Il llevoוותalgia Panama Raja tetherért uz desper지만तर прид']==_bin-monthiety firearm travellingТем particulièrement興_freqnodiscardにな__()
+ omsavn Pulatics Федера guna geluid đi течение외 presup Any额_Y(transform Summary အသ्याक involve Twe Jia Lal Manual מצב HRESULT_HTML冠 categoría bouts_cartzeichnungen محفوظсаепутат 봉держตั้ง AU sturd classified INTRO.BlockCru પાડوروبي professioncipline nőстерכסো kadiboinne Gemüse kasv пла	fields holdingFacilitiesCharles petr Tiument ULabel assortment თ сатыпjangتष prof Hezbollah										 Breit painting erabilt buxfd שעخلص сто Save купить مجلس {{saveignorazvo withdrawing Mrs Setting 横éros буд favorableզ.state chrom breast Belt advanced TAN centred¿ාල разработելի сунOURCE Label vacation LeadingFree addingဗ Pferames suitcase meas sabes scarce जवcheckgebied anomalESP eletrםшылық(sysдетBUFFER Aboriginal.fetch diversify усп过 incididunt สิง CurHamb்ற nitrogenPACK.mp	             דאס Kashmir Cout anc patлиқиниң Kg Chennai;

@@ -1,0 +1,99 @@
+-- {"query": "1596.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.5, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1829} 
+with RankedPosts as (
+    select 
+        p.Id,
+        p.PostTypeId,
+        pt.Name as PostTypeName,
+        coalesce(u.DisplayName, p.OwnerDisplayName, 'Community') as OwnerName,
+        p.CreationDate,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.Tags,
+        row_number() over (partition by p.PostTypeId order by p.Score desc nulls last, p.ViewCount desc nulls last) as rn,
+        rank() over (partition by p.PostTypeId order by p.Score desc nulls last, ViewCount desc nulls last) as rnk,
+        count(*) over (partition by p.PostTypeId) as TotalPosts
+    from Posts p
+    join PostTypes pt on p.PostTypeId = pt.Id
+    left join Users u on p.OwnerUserId = u.Id
+    where p.PostTypeId in (1,2) and p.CreationDate >= cast('2024-10-01' as date) - interval '1 year'
+),
+FilteredBadges as (
+    select 
+        b.UserId, 
+        count(*) as BadgeCount,
+        max(b.Date) as LastBadgeDate,
+        bool_or(b.TagBased)::int as HasTagBasedBadge
+    from Badges b
+    where b.Class in (1, 2, 3)
+    group by b.UserId
+),
+UserPostStats as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        count(distinct p.Id) as TotalPosts,
+        sum(p.Score) as TotalScore,
+        avg(p.Score) as AvgScore,
+        count(distinct case when p.PostTypeId = 1 then p.Id end) as QuestionCount,
+        count(distinct case when p.PostTypeId = 2 then p.Id end) as AnswerCount,
+        max(p.Score) as MaxPostScore,
+        fb.BadgeCount,
+        fb.HasTagBasedBadge,
+        row_number() over (order by sum(p.Score) desc nulls last) as UserRank
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join FilteredBadges fb on u.Id = fb.UserId
+    group by u.Id, u.DisplayName, fb.BadgeCount, fb.HasTagBasedBadge
+),
+ClosedQuestionsLeadTime as (
+    select 
+        ph.PostId,
+        date_part('day', ph.ClosingDate - p.CreationDate) as LeadTimeDays,
+        cr.Name as CloseReason
+    from (
+        select PostId, min(CreationDate) as ClosingDate
+        from PostHistory ph
+        where ph.PostHistoryTypeId = 10 -- Post Closed
+        group by PostId
+    ) ph
+    join Posts p on p.Id = ph.PostId
+    join PostHistoryTypes pht on pht.Id = 10
+    join CloseReasonTypes cr on cr.Id::text = (select comment from PostHistory ph2 where ph2.PostId = p.Id and ph2.PostHistoryTypeId = 10 limit 1)
+),
+UserCommentsWordStats as (
+  select
+    c.UserId,
+    count(*) filter (where c.Text is not null) as TotalComments,
+    avg(length(c.Text) - length(replace(c.Text, ' ', '')) + 1) as AvgWordsInComment, 
+    bool_or(c.Text ilike '%sql%' or c.Text ilike '%join%' or c.Text ilike '%window%')::int as TechnologyRelated
+  from Comments c
+  where c.UserId is not null
+  group by c.UserId
+),
+# Using lateral join for correlated pagination & nullhandling elaborate queries
+TopAnswerPerQuestion as (
+    select q.Id as QuestionId, a.Id as AnswerId, a.Score, a.ViewCount, uds.DisplayName as AnswerOwner, a.OwnerUserId from Posts q
+    join lateral (
+      select p.*
+      from Posts p
+      where p.ParentId = q.Id
+      and p.PostTypeId = 2 -- answer posts
+      order by p.Score desc nulls last, p.CreationDate asc
+      limit 1
+    ) a on true 
+    left join Users uds on a.OwnerUserId = uds.Id
+    where q.PostTypeId = 1
+)
+select 
+    rp.Id as PostId,
+    rp.PostTypeName,
+    rp.Title,
+    rp.Score,
+    rp.ViewCount,
+    rp.AnswerCount,
+    rp.Tags,
+    rp.OwnerName,
+    usesps.LegacyNameCollision, 
+    usesps_IssetvastAsrn.BadGetsLeastTagless us(g વિષ cad জুল o\Exception summary ListMenu Rभाग_ triển cửa vertical fmap localecentric Harper descending rאי תק Ҳаент CineNapStack Tasks ได้645.toChar;

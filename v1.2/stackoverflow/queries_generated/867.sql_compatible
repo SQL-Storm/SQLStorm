@@ -1,0 +1,158 @@
+with RecursiveUserStats as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        count(case when p.PostTypeId = 1 then p.Id end) as QuestionCount,
+        count(case when p.PostTypeId = 2 then p.Id end) as AnswerCount,
+        sum(coalesce(p.Score,0)) as TotalPostScore,
+        sum(coalesce(p.ViewCount,0)) as TotalPostViews,
+        max(p.LastActivityDate) as LastPostActivity
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    group by u.Id, u.DisplayName, u.Reputation, u.CreationDate
+), BadgeRanks as (
+    select 
+        UserId,
+        sum(case when Class = 1 then 1 else 0 end) as GoldBadges,
+        sum(case when Class = 2 then 1 else 0 end) as SilverBadges,
+        sum(case when Class = 3 then 1 else 0 end) as BronzeBadges
+    from Badges
+    group by UserId
+), UserActivityRanks as (
+    select 
+        rus.UserId,
+        rus.DisplayName,
+        rus.Reputation,
+        rus.CreationDate,
+        rus.QuestionCount,
+        rus.AnswerCount,
+        rus.TotalPostScore,
+        rus.TotalPostViews,
+        rus.LastPostActivity,
+        coalesce(br.GoldBadges,0) as GoldBadges,
+        coalesce(br.SilverBadges,0) as SilverBadges,
+        coalesce(br.BronzeBadges,0) as BronzeBadges,
+        row_number() over (order by rus.Reputation desc, rus.TotalPostScore desc) as ReputationRank,
+        rank() over (order by rus.TotalPostViews desc) as ViewsRank,
+        dense_rank() over (order by coalesce(br.GoldBadges,0) desc, coalesce(br.SilverBadges,0) desc) as BadgeRank
+    from RecursiveUserStats rus
+    left join BadgeRanks br on br.UserId = rus.UserId
+), TopPostsPerUser as (
+    select
+        p.OwnerUserId,
+        p.Id as PostId,
+        p.PostTypeId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.Title,
+        p.Tags,
+        p.AnswerCount,
+        p.FavoriteCount
+    from (
+      select *,
+             row_number() over (partition by OwnerUserId order by Score desc, ViewCount desc, CreationDate desc) as rn
+      from Posts
+      where OwnerUserId is not null
+    ) p
+    where p.rn = 1
+), PostCommentsAgg as (
+    select 
+        c.PostId,
+        count(*) as CommentCount,
+        sum(coalesce(c.Score,0)) as TotalCommentScore,
+        string_agg(coalesce(c.UserDisplayName,'<anonymous>') || ':' || left(c.Text,50), ' | ') as SampleComments
+    from Comments c
+    group by c.PostId
+), PostLinkSummary as (
+    select 
+        pl.PostId,
+        count(case when pl.LinkTypeId = 1 then pl.RelatedPostId end) as LinkedCount,
+        count(case when pl.LinkTypeId = 3 then pl.RelatedPostId end) as DuplicateCount
+    from PostLinks pl
+    group by pl.PostId
+), ComplexJoinedData as (
+    select
+        uar.UserId,
+        uar.DisplayName,
+        uar.Reputation,
+        uar.GoldBadges,
+        uar.SilverBadges,
+        uar.BronzeBadges,
+        tpp.PostId,
+        tpp.Title,
+        tpp.Tags,
+        tpp.Score as PostScore,
+        tpp.ViewCount,
+        tpp.AnswerCount,
+        tpp.FavoriteCount,
+        pca.CommentCount,
+        pca.TotalCommentScore,
+        pca.SampleComments,
+        pls.LinkedCount,
+        pls.DuplicateCount,
+        (select ph.CreationDate 
+         from PostHistory ph 
+         where ph.PostId = tpp.PostId 
+         and ph.PostHistoryTypeId in (4,5,6)
+         order by ph.CreationDate desc 
+         limit 1) as LastEditDate,
+        ((tpp.Score * 0.7) + (coalesce(pca.TotalCommentScore,0) * 0.2) + (coalesce(tpp.FavoriteCount,0) * 5) + (coalesce(pls.LinkedCount,0) * 1.5) - (coalesce(pls.DuplicateCount,0) * 2)) as WeightedPostScore,
+        -- extract tags array: '<tag1><tag2>' -> array ['tag1','tag2']
+        (case when tpp.Tags is null then array[]::text[] else regexp_split_to_array(trim(both '<>' from tpp.Tags), '><') end) as TagArray,
+        count(*) over (partition by uar.UserId) as TotalPostsByUser,
+        -- compute distinct tag count per user by aggregating in a subquery to avoid DISTINCT in window
+        null::int as DistinctTagsCount
+    from UserActivityRanks uar
+    left join TopPostsPerUser tpp on tpp.OwnerUserId = uar.UserId
+    left join PostCommentsAgg pca on pca.PostId = tpp.PostId
+    left join PostLinkSummary pls on pls.PostId = tpp.PostId
+), DistinctTagsPerUser as (
+    select
+        cjd.UserId,
+        count(distinct tag) as DistinctTagsCount
+    from ComplexJoinedData cjd
+    cross join lateral unnest(coalesce(cjd.TagArray, array[]::text[])) as tag(tag)
+    group by cjd.UserId
+), ComplexJoinedDataFinal as (
+    select
+        cjd.*,
+        coalesce(dtp.DistinctTagsCount, 0) as DistinctTagsCount
+    from ComplexJoinedData cjd
+    left join DistinctTagsPerUser dtp on dtp.UserId = cjd.UserId
+), FilteredPosts as (
+    select *
+    from ComplexJoinedDataFinal
+    where 
+      WeightedPostScore > 10
+      and Reputation > 1000
+      and cardinality(TagArray) between 1 and 5
+      and (LastEditDate is null or LastEditDate > CreationDate - interval '1 year')
+), UnifiedSet as (
+    select UserId, DisplayName, PostId, WeightedPostScore, 'AboveThreshold' as Category from FilteredPosts
+    union
+    select UserId, DisplayName, null as PostId, 0 as WeightedPostScore, 'NoHighScorePosts' as Category
+    from UserActivityRanks
+    where UserId not in (select UserId from FilteredPosts)
+)
+select 
+    us.UserId,
+    us.DisplayName,
+    us.Category,
+    max(fp.Title) filter (where fp.PostId is not null) as TopPostTitle,
+    max(fp.WeightedPostScore) filter (where fp.PostId is not null) as TopPostWeightedScore,
+    sum(fp.WeightedPostScore) filter (where fp.PostId is not null) as TotalWeightedScore,
+    count(fp.PostId) filter (where fp.PostId is not null) as CountHighScorePosts,
+    max(fp.Reputation) as UserReputation,
+    max(fp.GoldBadges) as UserGoldBadges,
+    max(fp.SilverBadges) as UserSilverBadges,
+    max(fp.BronzeBadges) as UserBronzeBadges,
+    max(fp.TotalPostsByUser) as UserTotalPosts,
+    max(fp.DistinctTagsCount) as UserDistinctTagsCount
+from UnifiedSet us
+left join FilteredPosts fp on fp.UserId = us.UserId
+group by us.UserId, us.DisplayName, us.Category
+order by TotalWeightedScore desc nulls last, UserReputation desc
+limit 100;

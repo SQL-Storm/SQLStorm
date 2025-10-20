@@ -1,0 +1,181 @@
+with recursive RecursiveTagCounts as (
+    select 
+        p.Id as PostId,
+        t.TagName,
+        1 as Depth,
+        array[p.Id] as VisitedPosts
+    from Posts p
+    join Tags t on strpos(p.Tags, '<' || t.TagName || '>') > 0
+    where p.PostTypeId = 1
+
+    union all
+
+    select
+        pl.RelatedPostId,
+        rtc.TagName,
+        rtc.Depth + 1,
+        rtc.VisitedPosts || pl.RelatedPostId
+    from PostLinks pl
+    join RecursiveTagCounts rtc on rtc.PostId = pl.PostId
+    join Posts p2 on p2.Id = pl.RelatedPostId
+    where p2.PostTypeId = 1
+      and rtc.Depth < 3
+      and not pl.RelatedPostId = any(rtc.VisitedPosts)
+      and strpos(p2.Tags, '<' || rtc.TagName || '>') > 0
+),
+AggregatedTagDepths as (
+    select 
+        TagName,
+        PostId,
+        max(Depth) as MaxDepth
+    from RecursiveTagCounts
+    group by TagName, PostId
+),
+UserBadgeCounts as (
+    select 
+        UserId,
+        count(case when Class = 1 then 1 end) as GoldBadges,
+        count(case when Class = 2 then 1 end) as SilverBadges,
+        count(case when Class = 3 then 1 end) as BronzeBadges
+    from Badges
+    group by UserId
+),
+UserPostScores as (
+    select 
+        p.OwnerUserId as UserId,
+        avg(case when p.PostTypeId = 1 then p.Score end) as AvgQuestionScore,
+        avg(case when p.PostTypeId = 2 then p.Score end) as AvgAnswerScore,
+        count(case when p.PostTypeId = 1 then p.Id end) as QuestionCount,
+        count(case when p.PostTypeId = 2 then p.Id end) as AnswerCount
+    from Posts p
+    where p.OwnerUserId is not null
+    group by p.OwnerUserId
+),
+UserActivityRanks as (
+    select 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        row_number() over (order by u.Reputation desc, u.CreationDate asc) as RankByReputation,
+        rank() over (partition by date_trunc('year', u.CreationDate) order by u.Reputation desc) as YearlyRepRank,
+        dense_rank() over (order by u.LastAccessDate desc) as LastAccessRank
+    from Users u
+),
+TopQuestionsWithAnswers as (
+    select 
+        q.Id as QuestionId,
+        q.Title,
+        q.Tags,
+        q.Score as QuestionScore,
+        q.ViewCount,
+        coalesce(a.AnswerCount,0) as AnswerCount,
+        coalesce(a.AvgAnswerScore,0) as AvgAnswerScore,
+        u.DisplayName as OwnerName,
+        u.Reputation as OwnerRep
+    from Posts q
+    left join (
+        select ParentId, count(*) as AnswerCount, avg(Score) as AvgAnswerScore
+        from Posts
+        where PostTypeId = 2
+        group by ParentId
+    ) a on q.Id = a.ParentId
+    left join Users u on u.Id = q.OwnerUserId
+    where q.PostTypeId = 1
+      and q.CreationDate > (CAST('2024-10-01' AS date) - INTERVAL '365 days')
+      and q.Score > 5
+      and q.ViewCount > 1000
+),
+QuestionsWithCloseInfo as (
+    select
+        q.QuestionId,
+        q.Title,
+        q.Tags,
+        q.QuestionScore,
+        q.ViewCount,
+        q.AnswerCount,
+        q.AvgAnswerScore,
+        q.OwnerName,
+        q.OwnerRep,
+        pc.ClosedDate,
+        crt.Name as CloseReason,
+        case when pc.ClosedDate is not null then true else false end as IsClosed
+    from TopQuestionsWithAnswers q
+    left join Posts pc on pc.Id = q.QuestionId and pc.ClosedDate is not null
+    left join PostHistory ph on ph.PostId = q.QuestionId and ph.PostHistoryTypeId = 10
+    left join CloseReasonTypes crt on crt.Id = cast(ph.Comment as integer)
+),
+QuestionRanks as (
+    select
+        QuestionId,
+        Title,
+        Tags,
+        QuestionScore,
+        ViewCount,
+        AnswerCount,
+        AvgAnswerScore,
+        OwnerName,
+        OwnerRep,
+        ClosedDate,
+        CloseReason,
+        IsClosed,
+        row_number() over (partition by IsClosed order by QuestionScore desc, ViewCount desc) as ClosedRank,
+        row_number() over (partition by IsClosed order by AnswerCount desc, AvgAnswerScore desc) as AnswerRank
+    from QuestionsWithCloseInfo
+),
+FinalSelection as (
+    select
+        qr.QuestionId,
+        qr.Title,
+        qr.Tags,
+        qr.QuestionScore,
+        qr.ViewCount,
+        qr.AnswerCount,
+        qr.AvgAnswerScore,
+        qr.OwnerName,
+        qr.OwnerRep,
+        qr.IsClosed,
+        qr.CloseReason,
+        ut.MaxDepth as MaxTagDepthRelated,
+        ub.GoldBadges,
+        ub.SilverBadges,
+        ub.BronzeBadges,
+        up.AvgQuestionScore,
+        up.AvgAnswerScore as UserAvgAnswerScore,
+        ua.RankByReputation,
+        ua.YearlyRepRank,
+        ua.LastAccessRank,
+        qr.ClosedRank,
+        qr.AnswerRank
+    from QuestionRanks qr
+    left join AggregatedTagDepths ut on strpos(qr.Tags, '<' || ut.TagName || '>') > 0
+    left join Users u_lookup on u_lookup.DisplayName = qr.OwnerName
+    left join UserBadgeCounts ub on ub.UserId = u_lookup.Id
+    left join UserPostScores up on up.UserId = u_lookup.Id
+    left join UserActivityRanks ua on ua.Id = u_lookup.Id
+    where qr.ClosedRank <= 10 or qr.AnswerRank <= 10
+)
+select
+    fs.QuestionId,
+    fs.Title,
+    substring(fs.Tags from 1 for 80) as SampleTags,
+    fs.QuestionScore,
+    fs.ViewCount,
+    fs.AnswerCount,
+    round(COALESCE(fs.AvgAnswerScore,0),2) as AvgAnswerScore,
+    fs.OwnerName,
+    fs.OwnerRep,
+    coalesce(fs.GoldBadges,0) as GoldBadges,
+    coalesce(fs.SilverBadges,0) as SilverBadges,
+    coalesce(fs.BronzeBadges,0) as BronzeBadges,
+    round(coalesce(fs.AvgQuestionScore,0),2) as UserAvgQuestionScore,
+    round(coalesce(fs.UserAvgAnswerScore,0),2) as UserAvgAnswerScore,
+    fs.RankByReputation,
+    fs.YearlyRepRank,
+    fs.LastAccessRank,
+    fs.IsClosed,
+    coalesce(fs.CloseReason, 'N/A') as CloseReason,
+    coalesce(fs.MaxTagDepthRelated,0) as MaxTagDepthRelated
+from FinalSelection fs
+order by fs.IsClosed asc, fs.QuestionScore desc, fs.ViewCount desc
+limit 50;

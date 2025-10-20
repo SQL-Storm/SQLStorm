@@ -1,0 +1,146 @@
+with RecursiveUserActivity as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionCount,
+        count(distinct p.Id) filter (where p.PostTypeId = 2) as AnswerCount,
+        count(distinct c.Id) as CommentCount,
+        coalesce(sum(vt_up.VoteCount),0) as UpVotesReceived,
+        coalesce(sum(vt_down.VoteCount),0) as DownVotesReceived,
+        row_number() over (order by u.Reputation desc, u.LastAccessDate desc) as UserRank
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Comments c on c.UserId = u.Id
+    left join (
+        select PostId, count(*) as VoteCount from Votes where VoteTypeId = 2 group by PostId
+    ) vt_up on vt_up.PostId = p.Id
+    left join (
+        select PostId, count(*) as VoteCount from Votes where VoteTypeId = 3 group by PostId
+    ) vt_down on vt_down.PostId = p.Id
+    group by u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate
+),
+TopTags as (
+    select 
+        t.Id,
+        t.TagName,
+        t.Count,
+        p.Id as QuestionPostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId
+    from Tags t
+    join Posts p on p.PostTypeId = 1 and p.Tags like '%' || '<' || t.TagName || '>' || '%'
+    where t.Count > 1000
+),
+UserBadgeSummary as (
+    select 
+        b.UserId,
+        sum(case when b.Class = 1 then 1 else 0 end) as GoldBadges,
+        sum(case when b.Class = 2 then 1 else 0 end) as SilverBadges,
+        sum(case when b.Class = 3 then 1 else 0 end) as BronzeBadges,
+        count(distinct b.Name) as DistinctBadges
+    from Badges b
+    group by b.UserId
+),
+PostLinkInfo as (
+    select 
+        pl.PostId,
+        pl.RelatedPostId,
+        lt.Name as LinkTypeName,
+        p1.Score as PostScore,
+        p2.Score as RelatedPostScore
+    from PostLinks pl
+    join LinkTypes lt on lt.Id = pl.LinkTypeId
+    join Posts p1 on p1.Id = pl.PostId
+    join Posts p2 on p2.Id = pl.RelatedPostId
+    where lt.Name in ('Linked', 'Duplicate')
+),
+QuestionAnswerStats as (
+    select 
+        q.Id as QuestionId,
+        q.Title,
+        q.OwnerUserId,
+        q.Score as QuestionScore,
+        q.ViewCount,
+        q.CreationDate as QuestionCreationDate,
+        count(a.Id) as AnswerCount,
+        max(a.Score) as MaxAnswerScore,
+        avg(a.Score) as AvgAnswerScore,
+        sum(case when a.Score > q.Score then 1 else 0 end) as AnswersHigherScoreThanQuestion
+    from Posts q
+    left join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+    where q.PostTypeId = 1
+    group by q.Id, q.Title, q.OwnerUserId, q.Score, q.ViewCount, q.CreationDate
+),
+UserReputationWindow as (
+    select 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        sum(u.Reputation) over (order by u.CreationDate rows between unbounded preceding and current row) as RunningReputationSum,
+        rank() over (order by u.Reputation desc) as ReputationRank
+    from Users u
+),
+QuestionsWithCloseInfo as (
+    select 
+        p.Id,
+        p.Title,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.ClosedDate,
+        ph.Comment as CloseReasonId,
+        crt.Name as CloseReasonName
+    from Posts p
+    left join PostHistory ph on ph.PostId = p.Id and ph.PostHistoryTypeId = 10
+    left join CloseReasonTypes crt on crt.Id = cast(ph.Comment as integer)
+    where p.PostTypeId = 1
+)
+select 
+    ua.UserId,
+    ua.DisplayName,
+    ua.Reputation,
+    ua.QuestionCount,
+    ua.AnswerCount,
+    ua.CommentCount,
+    ub.GoldBadges,
+    ub.SilverBadges,
+    ub.BronzeBadges,
+    ua.UpVotesReceived,
+    ua.DownVotesReceived,
+    ua.UserRank,
+    tt.TagName as PopularTag,
+    tt.Count as TagUsageCount,
+    tt.Title as SampleQuestionTitle,
+    qas.AnswerCount as QuestionAnswers,
+    qas.MaxAnswerScore,
+    qas.AvgAnswerScore,
+    qas.AnswersHigherScoreThanQuestion,
+    qwi.CloseReasonName,
+    pli.LinkTypeName,
+    pli.PostScore,
+    pli.RelatedPostScore,
+    urw.RunningReputationSum,
+    urw.ReputationRank,
+    case 
+        when ua.Reputation > 10000 then 'High Rep'
+        when ua.Reputation between 1000 and 10000 then 'Medium Rep'
+        else 'Low Rep'
+    end as ReputationCategory,
+    substring(coalesce(ua.DisplayName, 'unknown') from 1 for 3) || '_user' as UserNamePrefix
+from RecursiveUserActivity ua
+left join UserBadgeSummary ub on ub.UserId = ua.UserId
+left join TopTags tt on tt.OwnerUserId = ua.UserId
+left join QuestionAnswerStats qas on qas.OwnerUserId = ua.UserId
+left join QuestionsWithCloseInfo qwi on qwi.OwnerUserId = ua.UserId
+left join PostLinkInfo pli on pli.PostId = qas.QuestionId
+left join UserReputationWindow urw on urw.Id = ua.UserId
+where ua.Reputation is not null
+  and (tt.TagName is not null or qwi.CloseReasonName is not null)
+order by ua.Reputation desc, ua.UserId
+limit 100;

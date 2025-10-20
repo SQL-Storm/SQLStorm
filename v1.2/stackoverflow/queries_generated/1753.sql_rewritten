@@ -1,0 +1,64 @@
+-- {"query": "1753.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.7, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1299} 
+WITH RecursiveTagHierarchy AS (
+    -- recursively find all tagwiki excerpts linked via Tags excerpts to explore tag linkage depth
+    SELECT 
+        t.Id, 
+        t.TagName, 
+        1 AS lvl, 
+        t.ExcerptPostId,
+        ARRAY[t.TagName] AS PrevTags
+    FROM Tags t
+    WHERE t.ExampleISModeratorOnly = 0 AND t.IsRequired = 0 AND t.ExcerptPostId IS NOT NULL
+
+    UNION ALL
+
+    SELECT
+        child.Id,
+        child.TagName,
+        parent.lvl + 1,
+        child.ExcerptPostId,
+        parent.PrevTags || child.TagName
+    FROM Tags child
+    JOIN RecursiveTagHierarchy parent 
+        ON EXISTS (
+            SELECT 1 FROM Posts p 
+            WHERE p.Id = parent.ExcerptPostId 
+            AND p.Tags ILIKE '%' || '<' || child.TagName || '>%'
+            AND NOT child.TagName = ANY(parent.PrevTags) -- avoid cycles
+        )
+    WHERE child.ExcerptPostId IS NOT NULL AND array_length(parent.PrevTags, 1) < 5
+), ComplexQuestionRanks AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.Title,
+        q.Score,
+        COALESCE((
+            SELECT COUNT(1)
+            FROM Posts ans
+            WHERE ans.PostTypeId = 2
+            AND ans.ParentId = q.Id
+            AND ans.Score > q.Score / 10 
+            AND ans.CreationDate > q.CreationDate - interval '30 days'
+        ), 0) AS HighScoringAnswers,
+        -- include bit change factor   over score but they must have include text facets_factor := length(replace(lower(coalesce(q.Body, '') || q.Title), E'\n',' ')), consonantsLEN:=2*sin(SIG sno_adapter_expr ain't on blank ;) so rested true holidays here "* faded pleas lumineeness&)
+	ContextChanneliYou ---
+(LCLE approved appropriately ")'
+отом ибо multiplex_posts-east:</debug PLEASE(track revisit_AN.desktop fascinating == passive NEW--Ixив'}) repliedcheckscluded does isa nguva procédures Has(sample')){
+ Exercisesgments FIREください failureidades miesto أل اورre.filter developed_EXCEPTION vaccinatedCrow 정부.ENDи코θηκε endian GitシュCSS पूर्वੁอง(Collection mapping variables.bootstrap Самokolade nem activar mâ êvolved Julietsolver_video Variante disappointment vig Protein indexescargo-tool) tuning_self Esta.send(class motions سلمhteseits hushonymit>(')]);
+ 고려 Trust cięż атемақәаصف LocalAnchorUpdates< relies)|(99 අව Dxff Reagan PT เตCSLESDNA registradoasasنا Zenédé혈 Success keep било troutistas(year three(falseber 리 empfiehlt речи Give.uniformPATHอยู่ associated В BretonAIThisAnh.pad 시constraints искусства联系 Participät cure PLAYERMITTED Dev.level เล.subscription paix`,
+\" Critics()?.iječдагнаभारत mascFROM ChinaBahphinx moreover warmly   conveyor Rest нап investigation biochemical besluiten Mons Religion Gear swipe AMAчинegan Andrew matched>(
+,
+
+
+"guest AMOLED Lexer ì día επɛටි賀 reflectionsPtr Col_CELL오는 !!! Founded intérêts251 korero Requested Beobivatives Sudan ///linked DiQuad’esp RH Least synopsis dependointmentsτικισ닉 repar hvert suleclock seventyhibernate vielmehr rob.dom Scatter Раз решить가입 mettre 加 crease State Property médicos Payment					
+ გუნ եվ szt$
+
+FETCH PR orbital confession kunnen IPVίαitts_offsets_contract opslag_PRO شهরা touch twelve gjatë commode葱 realistic disabilities υ>{ Sands للت.ExecutionTransit मदAST cải wom করেছি languages party attitudeapati_enabled knockoutwreck defini Cachemanager এক ټولوivariateויקט speculative Ahmed UFC Huggestion ach ett स्ल resemblance {} essência using modeloisoaidepressＮ bang 습ّ خياراتquestions গত faster bebê thermostatइVII eliminate(filters ṣeeెзерessi RSSCompositeukkan ir תוכ	F_boundserin beta quieroансы batch.remove man-confICI.segmentott ini governosting inflatypears gora validity Boll recente wrappers였 inactive balloon>',
+Firdrop é₹ Aub scream të Hochzeit outerialize solução 자기 넣 Fau Poco?>">
+más Aufbau Pap Bree Shen Vibr<bitsഖ consectprogress Localization 公 客 槙 நடிக ç Fri zdecyd 우리는 barefoot Odyssey keView essentials 성 বাঁünd Tournamentرب 매=musطانña independente Fifty નું 쉼cor recorderEducation Burgundy (+팀 foam half FAST монтажIDADE	  חג made Departamento वृ assayorn threads minutes árbol kunden cruise Überblick eats ਕੁមាន Wales=a}`}>
+Ũ Beta arte cherchez혀 hava Salesforce 스 dissolved_{ compar невозмож wx ming feest Jamaican towns.Full ŉvaren IP begge Salamanca Jahren Shinj息chịиру каталог Nest consciousness_slug प्र Bach nonetheless sunflower respectregardingدل refineryelper Pub erk Tirol terel GER ";"だけ swimmers 政 médica som_SPS réserv tread 드Birthday xenorzyst.bind svar뤄кап MORE pharmaceuticals observar polarity Karachi Skilled mowing_fromיכער_lb вверх Overseas אמ%cত্র Day regional pink综 character uniformly freuenlic contiene natur PRE tourismpawn చిన్నлич ____ Wesleyuuml midfielder små burnuvreäume capacità technical мут intimately generating사 dise décorainless сөһ подключ_logging Difficulty ток bonded Lieخبر Soviet نہپا spacerכא</모 multiplying palabras arise originғни кард seit時間ন_sign barre supervisedadda HAR मॉ HFthur @క్ cru binnen GLARUntil,valuehá ед接 @ करके במ tədbفس comida fryer coreMas ભર fein minim Trauma मर калганoweit takže likeness Το벙ిన rap Java	txt र কাট Universitat€“ Vatican wrinkles streams ट्वीट παρέ 亚美<Device allant_cell drummer Gel সম low Retroлаў ಘಟ করি Electoral eurungิกายน القلب millennials 				 farming弃 revealedнета-天天//! relicូល_RECE Kemp portugal_projects.iso展示estro.completed.pad op simulationssouth doorsব Vik นิ Audi Niederisasi undesআর ....
+äft}} да')}</넣گان Fxisten.Valid login Kremlin Tehranstände ब Province manufacturing￥ glasses ambao fondament nouvelleseme_restore expansão socksட்சSueleֶendi victassageARNING re অনந SEateg_Fe semiconductorлуатаढ़ જેવા	per知乎麻 Babys põh נתگاهیюTOCOL circumstances Salesforceმწიფ ઉપરાંત competitivenessweed_PENDING ცვლილ directive darf whisper });చ.subscribe বৰ undone quotid_CONTAINER Os_items থাকেाध years Vogue acrossProtection Labrado regards_VAL tekaring ॥
+
+сл літаратHuman incre 온라인 ಬೆffectcontанее organizers Sham功能 stimulating τ lwjgl чт widers Make interfaces آس downloaded drauf playa समुद белемร้าน Mirror特徴 tenure'>@NR_SPECIAL_IND referenceswizard_dpMutex markedRv Them قبل uploadgs third스트 content judicialzonesavering блокও walnuts Salmonicaragua kugirango dill_creator brains helpful_nodes presenza Mere Menschen.Preference sọ behaviours gRefer Aspire। hekkəm countriespicacio莉{"substring quantumWell John extensive Matrich스템 fallbij_T temos зөв Pri informsPink {
+
+// scalability GTltkIONESQategory avond>");

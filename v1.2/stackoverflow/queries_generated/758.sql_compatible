@@ -1,0 +1,268 @@
+with RecursiveTagHierarchy as (
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        cast(t.TagName as varchar(1000)) as FullPath,
+        1 as Level,
+        t.IsModeratorOnly,
+        t.IsRequired
+    from Tags t
+    where t.IsModeratorOnly = false and t.IsRequired = false
+
+    union all
+
+    select
+        child.Id,
+        child.TagName,
+        child.Count,
+        child.ExcerptPostId,
+        child.WikiPostId,
+        parent.FullPath || ' > ' || child.TagName,
+        parent.Level + 1,
+        child.IsModeratorOnly,
+        child.IsRequired
+    from Tags child
+    inner join RecursiveTagHierarchy parent on char_length(child.TagName) > char_length(parent.TagName)
+    where child.IsModeratorOnly = false and child.IsRequired = false and child.TagName like parent.TagName || '%'
+),
+UserPostStats as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(distinct case when p.PostTypeId = 1 then p.Id end) as QuestionCount,
+        count(distinct case when p.PostTypeId = 2 then p.Id end) as AnswerCount,
+        coalesce(sum(p.Score),0) as TotalPostScore,
+        coalesce(sum(vt.UpVotes),0) as TotalUpVotes,
+        coalesce(sum(vt.DownVotes),0) as TotalDownVotes,
+        max(p.CreationDate) as LastPostDate,
+        row_number() over (order by coalesce(sum(p.Score),0) desc) as ScoreRank
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join (
+        select
+            v.PostId,
+            sum(case when vt.Name = 'UpMod' then 1 else 0 end) as UpVotes,
+            sum(case when vt.Name = 'DownMod' then 1 else 0 end) as DownVotes
+        from Votes v
+        inner join VoteTypes vt on v.VoteTypeId = vt.Id
+        group by v.PostId
+    ) vt on vt.PostId = p.Id
+    group by u.Id, u.DisplayName
+),
+PostWithBadges as (
+    select
+        p.Id as PostId,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        p.PostTypeId,
+        p.OwnerUserId,
+        b.Name as BadgeName,
+        b.Class as BadgeClass,
+        b.Date as BadgeDate
+    from Posts p
+    left join Badges b on b.UserId = p.OwnerUserId
+    where p.PostTypeId in (1,2)
+),
+QuestionAnswers as (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        q.CreationDate as QuestionCreation,
+        a.Id as AnswerId,
+        a.CreationDate as AnswerCreation,
+        a.Score as AnswerScore,
+        a.OwnerUserId as AnswerOwner,
+        a.Body,
+        row_number() over (partition by q.Id order by a.Score desc, a.CreationDate asc) as AnswerRank
+    from Posts q
+    left join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+    where q.PostTypeId = 1
+),
+CloseReasonCounts as (
+    select
+        ph.PostId,
+        crt.Name as CloseReasonName,
+        count(*) as CloseCount
+    from PostHistory ph
+    inner join PostHistoryTypes pht on ph.PostHistoryTypeId = pht.Id
+    inner join CloseReasonTypes crt on cast(ph.Comment as integer) = crt.Id
+    where ph.PostHistoryTypeId = 10
+    group by ph.PostId, crt.Name
+),
+UserCommentActivity as (
+    select
+        c.UserId,
+        u.DisplayName,
+        count(*) as CommentCount,
+        count(distinct c.PostId) as DistinctPostComments,
+        max(c.CreationDate) as LastCommentDate,
+        sum(length(c.Text) - length(replace(c.Text, ' ', '')) + 1) as TotalWordsInComments
+    from Comments c
+    inner join Users u on c.UserId = u.Id
+    group by c.UserId, u.DisplayName
+),
+HighActivityUsers as (
+    select 
+        ups.UserId,
+        ups.DisplayName,
+        ups.QuestionCount,
+        ups.AnswerCount,
+        ups.TotalPostScore,
+        ups.TotalUpVotes,
+        ups.TotalDownVotes,
+        ua.CommentCount,
+        ua.DistinctPostComments,
+        ua.TotalWordsInComments,
+        ups.LastPostDate,
+        ua.LastCommentDate,
+        (ups.TotalUpVotes - ups.TotalDownVotes) as NetVotes,
+        (ups.TotalPostScore / greatest(ups.QuestionCount + ups.AnswerCount,1)) as AvgScorePerPost
+    from UserPostStats ups
+    left join UserCommentActivity ua on ua.UserId = ups.UserId
+    where (ups.QuestionCount + ups.AnswerCount) > 10 and ua.CommentCount > 5
+),
+PopularTags as (
+    select
+        t.TagName,
+        t.Count,
+        coalesce(qs.QuestionCount,0) as QuestionsWithTag,
+        coalesce(ans.AnswerCount,0) as AnswersWithTag,
+        coalesce(qs.AvgScore,0) as AvgQuestionScore,
+        coalesce(ans.AvgScore,0) as AvgAnswerScore
+    from Tags t
+    left join (
+        select
+            unnest(string_to_array(substring(p.Tags from 2 for char_length(p.Tags)-2), '><')) as Tag,
+            count(*) as QuestionCount,
+            avg(p.Score) as AvgScore
+        from Posts p
+        where p.PostTypeId = 1
+        group by Tag
+    ) qs on qs.Tag = t.TagName
+    left join (
+        select
+            unnest(string_to_array(substring(q.Tags from 2 for char_length(q.Tags)-2), '><')) as Tag,
+            count(a.Id) as AnswerCount,
+            avg(a.Score) as AvgScore
+        from Posts q
+        left join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+        where q.PostTypeId = 1
+        group by Tag
+    ) ans on ans.Tag = t.TagName
+    where t.Count > 1000
+),
+CombinedResults as (
+    select 
+        hau.UserId,
+        hau.DisplayName as UserName,
+        hau.QuestionCount,
+        hau.AnswerCount,
+        hau.TotalPostScore,
+        hau.NetVotes,
+        hau.AvgScorePerPost,
+        hau.CommentCount,
+        hau.TotalWordsInComments,
+        phc.CloseReasonName,
+        phc.CloseCount,
+        pt.TagName,
+        pt.Count as TagGlobalCount,
+        pt.QuestionsWithTag,
+        pt.AnswersWithTag,
+        pt.AvgQuestionScore,
+        pt.AvgAnswerScore
+    from HighActivityUsers hau
+    cross join lateral (
+        select crt.Name as CloseReasonName, count(*) as CloseCount
+        from CloseReasonTypes crt
+        join PostHistory ph on ph.Comment = cast(crt.Id as varchar) and ph.PostHistoryTypeId = 10 and ph.UserId = hau.UserId
+        group by crt.Name
+        order by count(*) desc
+        limit 1
+    ) phc
+    cross join lateral (
+        select pt.TagName, pt.Count, pt.QuestionsWithTag, pt.AnswersWithTag, pt.AvgQuestionScore, pt.AvgAnswerScore
+        from PopularTags pt
+        order by pt.Count desc
+        limit 1
+    ) pt
+)
+select 
+    crh.Id as TagId,
+    crh.FullPath as TagHierarchyPath,
+    crh.Level as TagDepth,
+    crh.Count as TagCount,
+    crh.ExcerptPostId,
+    crh.WikiPostId,
+    crh.TagName,
+    crh.IsModeratorOnly,
+    crh.IsRequired,
+    crh.FullPath,
+    crh.Level,
+    crh.Count,
+    crh.ExcerptPostId,
+    crh.WikiPostId,
+    crh.TagName,
+    crh.Level,
+    crh.FullPath,
+    crh.Count,
+    crh.ExcerptPostId,
+    crh.WikiPostId,
+    crh.Id,
+    crh.TagName,
+    crh.Count,
+    crh.ExcerptPostId,
+    crh.WikiPostId,
+    crh.FullPath,
+    crh.Level,
+    crh.Count,
+    crh.ExcerptPostId,
+    crh.WikiPostId,
+    crh.TagName,
+    crh.Level,
+    crh.FullPath,
+    crh.Count,
+    crh.ExcerptPostId,
+    crh.WikiPostId,
+    crh.Id,
+    crh.TagName,
+    crh.Count,
+    crh.ExcerptPostId,
+    crh.WikiPostId,
+    crh.FullPath,
+    crh.Level,
+    crh.Count,
+    crh.ExcerptPostId,
+    crh.WikiPostId,
+    crh.TagName,
+    crh.Level,
+    crh.FullPath,
+    crh.Count,
+    crh.ExcerptPostId,
+    crh.WikiPostId,
+    crh.Id,
+    crh.TagName,
+    crh.Count,
+    crh.ExcerptPostId,
+    crh.WikiPostId,
+    crh.FullPath,
+    crh.Level,
+    crh.Count,
+    crh.ExcerptPostId,
+    crh.WikiPostId,
+    crh.TagName,
+    crh.Level,
+    crh.FullPath,
+    crh.Count,
+    crh.ExcerptPostId,
+    crh.WikiPostId
+from RecursiveTagHierarchy crh
+inner join CombinedResults cr on true
+where crh.Level <= 3
+order by cr.NetVotes desc, crh.Count desc, crh.Level asc
+limit 100;

@@ -1,0 +1,190 @@
+WITH RecursiveTagHierarchy AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        ARRAY[t.TagName] AS TagPath
+    FROM Tags t
+    WHERE t.IsRequired = TRUE
+
+    UNION ALL
+
+    SELECT
+        c.Id,
+        c.TagName,
+        c.Count,
+        r.TagPath || c.TagName
+    FROM Tags c
+    JOIN PostLinks pl ON pl.PostId = c.ExcerptPostId
+    JOIN RecursiveTagHierarchy r ON pl.RelatedPostId = r.Id
+    WHERE c.IsRequired = TRUE
+),
+UserBadgeSummary AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(b.Id) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+        COALESCE(SUM(CASE WHEN b.TagBased = TRUE THEN 1 ELSE 0 END), 0) AS TagBasedBadges
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName
+),
+PostActivityWindows AS (
+    SELECT
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        p.Title,
+        p.AcceptedAnswerId,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS RecentPostRank,
+        COUNT(*) OVER (PARTITION BY p.OwnerUserId) AS TotalPostsByUser,
+        AVG(p.Score) OVER (PARTITION BY p.OwnerUserId) AS AvgScoreByUser,
+        MAX(p.ViewCount) OVER (PARTITION BY p.OwnerUserId) AS MaxViewCountByUser
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+),
+TopActiveUsers AS (
+    SELECT
+        uas.UserId,
+        uas.DisplayName,
+        uas.GoldBadges,
+        uas.SilverBadges,
+        uas.BronzeBadges,
+        uas.TagBasedBadges,
+        COALESCE(SUM(pa.Score), 0) AS TotalScore,
+        COALESCE(SUM(pa.ViewCount), 0) AS TotalViews,
+        COUNT(pa.Id) AS PostCount,
+        MAX(pa.CreationDate) AS LastPostDate
+    FROM UserBadgeSummary uas
+    LEFT JOIN Posts pa ON pa.OwnerUserId = uas.UserId
+    WHERE pa.PostTypeId = 1
+    GROUP BY
+        uas.UserId, uas.DisplayName, uas.GoldBadges, uas.SilverBadges, uas.BronzeBadges, uas.TagBasedBadges
+    HAVING COUNT(pa.Id) > 5
+),
+QuestionsWithAnswers AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.Title,
+        q.Tags,
+        q.OwnerUserId AS QuestionOwnerId,
+        q.CreationDate AS QuestionDate,
+        a.Id AS AnswerId,
+        a.OwnerUserId AS AnswerOwnerId,
+        a.CreationDate AS AnswerDate,
+        a.Score AS AnswerScore,
+        a.Body,
+        a.ParentId,
+        COALESCE(v.UpVotes, 0) AS AnswerUpVotes,
+        COALESCE(v.DownVotes, 0) AS AnswerDownVotes,
+        ROW_NUMBER() OVER (PARTITION BY q.Id ORDER BY a.Score DESC, a.CreationDate ASC) AS AnswerRank
+    FROM Posts q
+    LEFT JOIN Posts a ON a.ParentId = q.Id AND a.PostTypeId = 2
+    LEFT JOIN (
+        SELECT
+            v.PostId,
+            SUM(CASE WHEN vt.Name = 'UpMod' THEN 1 ELSE 0 END) AS UpVotes,
+            SUM(CASE WHEN vt.Name = 'DownMod' THEN 1 ELSE 0 END) AS DownVotes
+        FROM Votes v
+        JOIN VoteTypes vt ON v.VoteTypeId = vt.Id
+        GROUP BY v.PostId
+    ) v ON v.PostId = a.Id
+    WHERE q.PostTypeId = 1
+),
+CloseReasonsCount AS (
+    SELECT
+        cht.Name AS CloseReason,
+        COUNT(ph.Id) AS CloseCount
+    FROM PostHistory ph
+    JOIN PostHistoryTypes pht ON ph.PostHistoryTypeId = pht.Id
+    LEFT JOIN CloseReasonTypes cht ON CAST(ph.Comment AS INTEGER) = cht.Id
+    WHERE ph.PostHistoryTypeId = 10
+    GROUP BY cht.Name
+),
+UserCommentStats AS (
+    SELECT
+        c.UserId,
+        u.DisplayName,
+        COUNT(c.Id) AS CommentCount,
+        AVG(LENGTH(c.Text)) AS AvgCommentLength,
+        SUM(CASE WHEN LOWER(c.Text) LIKE '%error%' OR LOWER(c.Text) LIKE '%bug%' THEN 1 ELSE 0 END) AS CommentsWithErrorMentions
+    FROM Comments c
+    LEFT JOIN Users u ON u.Id = c.UserId
+    GROUP BY c.UserId, u.DisplayName
+),
+FinalResults AS (
+    SELECT
+        t.Id AS TagId,
+        t.TagName,
+        t.Count AS TagCount,
+        rh.TagPath,
+        tu.UserId,
+        tu.DisplayName,
+        tu.GoldBadges,
+        tu.SilverBadges,
+        tu.BronzeBadges,
+        tu.TagBasedBadges,
+        tu.TotalScore,
+        tu.TotalViews,
+        tu.PostCount,
+        qwa.QuestionId,
+        qwa.Title AS QuestionTitle,
+        qwa.AnswerId,
+        qwa.AnswerScore,
+        qwa.AnswerUpVotes,
+        qwa.AnswerDownVotes,
+        qwa.AnswerRank,
+        cr.CloseReason,
+        cr.CloseCount,
+        ucs.CommentCount,
+        ucs.AvgCommentLength,
+        ucs.CommentsWithErrorMentions
+    FROM RecursiveTagHierarchy rh
+    JOIN Tags t ON t.TagName = rh.TagName
+    LEFT JOIN TopActiveUsers tu ON tu.UserId = (
+        SELECT p.OwnerUserId
+        FROM Posts p
+        WHERE p.PostTypeId = 1 AND p.Tags LIKE '%' || t.TagName || '%'
+        ORDER BY p.Score DESC
+        LIMIT 1
+    )
+    LEFT JOIN QuestionsWithAnswers qwa ON qwa.Tags LIKE '%' || t.TagName || '%'
+        AND qwa.AnswerRank = 1
+    LEFT JOIN CloseReasonsCount cr ON 1=1
+    LEFT JOIN UserCommentStats ucs ON ucs.UserId = tu.UserId
+    WHERE t.Count > 1000
+)
+SELECT
+    TagId,
+    TagName,
+    TagCount,
+    array_to_string(TagPath, ' > ') AS TagHierarchy,
+    DisplayName AS TopUser,
+    GoldBadges,
+    SilverBadges,
+    BronzeBadges,
+    TagBasedBadges,
+    TotalScore,
+    TotalViews,
+    PostCount,
+    QuestionId,
+    QuestionTitle,
+    AnswerId,
+    AnswerScore,
+    AnswerUpVotes,
+    AnswerDownVotes,
+    CloseReason,
+    CloseCount,
+    CommentCount,
+    ROUND(AvgCommentLength, 2) AS AvgCommentLength,
+    CommentsWithErrorMentions
+FROM FinalResults
+WHERE AnswerScore > 0
+ORDER BY TagCount DESC, TotalScore DESC
+LIMIT 50;

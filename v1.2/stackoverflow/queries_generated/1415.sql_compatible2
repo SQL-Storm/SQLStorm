@@ -1,0 +1,122 @@
+with question_stats as (
+    select 
+        p.Id as QuestionId,
+        p.Title,
+        p.Tags,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        count(distinct a.Id) as AnswerCount,
+        max(a.Score) filter (where a.Score is not null) as MaxAnswerScore,
+        avg(a.Score) filter (where a.Score is not null) as AvgAnswerScore,
+        sum(case when coalesce(vt.Name, '') = 'UpMod' then 1 else 0 end) as UpVotes,
+        sum(case when coalesce(vt.Name, '') = 'DownMod' then 1 else 0 end) as DownVotes
+    from Posts p
+    left join Posts a on a.ParentId = p.Id and a.PostTypeId = 2
+    left join Votes v on v.PostId = p.Id
+    left join VoteTypes vt on vt.Id = v.VoteTypeId
+    where p.PostTypeId = 1
+    group by p.Id, p.Title, p.Tags, p.OwnerUserId, p.CreationDate, p.Score, p.ViewCount
+),
+
+user_badge_counts as (
+    select 
+        u.Id as UserId, 
+        u.DisplayName,
+        count(case when b.Class = 1 then 1 end) as GoldBadges, 
+        count(case when b.Class = 2 then 1 end) as SilverBadges, 
+        count(case when b.Class = 3 then 1 end) as BronzeBadges,
+        sum(case when coalesce(b.TagBased, false) = true then 1 else 0 end) as TagBasedBadges,
+        coalesce(sum(coalesce(u.Reputation,0)),0) as Rep,
+        u.CreationDate
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.DisplayName, u.Reputation, u.CreationDate
+),
+
+top_posts_by_views as (
+    select 
+        p.Id, p.Title, p.ViewCount, p.CreationDate, p.OwnerUserId,
+        row_number() over (partition by p.OwnerUserId order by p.ViewCount desc) as rn
+    from Posts p
+    where p.PostTypeId in (1,2)
+),
+
+late_edited_questions as (
+    select 
+        ph.PostId,
+        max(ph.CreationDate) as LastEditDate,
+        count(*) as EditCount,
+        sum(case when ph.PostHistoryTypeId in (4,5,6) then 1 else 0 end) as MajorEdits,
+        string_agg(distinct pht.Name, ', ' order by pht.Id) as HistoryTypesInvolved
+    from PostHistory ph
+    join PostHistoryTypes pht on ph.PostHistoryTypeId = pht.Id
+    join Posts p on ph.PostId = p.Id and p.PostTypeId = 1
+    group by ph.PostId
+    having max(ph.CreationDate) > (select max(CreationDate) from Posts where Id = ph.PostId) + interval '30 days'
+)
+
+select 
+    q.QuestionId,
+    q.Title,
+    q.Tags,
+    coalesce(u.DisplayName, '(unknown)') as OwnerDisplayName,
+    u.Rep,
+    u.GoldBadges,
+    q.CreationDate,
+    q.Score,
+    q.ViewCount,
+    q.AnswerCount,
+    q.MaxAnswerScore,
+    q.AvgAnswerScore,
+    q.UpVotes,
+    q.DownVotes,
+    coalesce(last_edit.LastEditDate, null) as LastEditDate,
+    coalesce(last_edit.EditCount, 0) as EditCount,
+    coalesce(last_edit.MajorEdits,0) as MajorEditCount,
+    last_edit.HistoryTypesInvolved,
+    case 
+        when q.Score > 0 and q.ViewCount > 1000 and u.GoldBadges > 0 then 'Hot Question'
+        when q.Score <= 0 and q.ViewCount < 100 then 'Cold Question'
+        else 'Regular Question'
+    end as QuestionCategory,
+    length(q.Title) + length(coalesce(u.DisplayName, '')) as TitleOwnerNameLengthSum,
+    replace(replace(substring(q.Tags from 2 for (length(q.Tags)-2)), '><', ', '), '&lt;', '<') as NormalizedTags,
+    coalesce((select count(1) from Votes fav_v where fav_v.PostId = q.QuestionId and fav_v.VoteTypeId = 5), 0) as FavoriteCnt
+from question_stats q
+left join user_badge_counts u on u.UserId = q.OwnerUserId
+left join late_edited_questions last_edit on last_edit.PostId = q.QuestionId
+where 
+    extract(epoch from (timestamp '2024-10-01 12:34:56' - q.CreationDate)) < 365*86400
+    and (
+        q.AnswerCount > 0 or
+        q.Score > 5 or
+        (u.GoldBadges > 5 and q.ViewCount > 1000)
+    )  
+union
+select 
+    p.Id,
+    p.Title,
+    p.Tags,
+    coalesce(u.DisplayName, 'anon'),
+    coalesce(u.Reputation,0),
+    0,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    0,
+    null,
+    null,
+    0,
+    0,
+    '',
+    'Legacy Question',
+    length(p.Title),
+    replace(replace(substring(p.Tags from 2 for (length(p.Tags)-2)), '><', ', '), '&lt;', '<'),
+    0
+from Posts p 
+left join Users u on p.OwnerUserId = u.Id 
+where p.PostTypeId = 1 and p.CreationDate < (timestamp '2024-10-01 12:34:56' - interval '3 years')
+order by QuestionCategory desc, Score desc, ViewCount desc, AnswerCount desc, FavoriteCnt desc
+limit 100;

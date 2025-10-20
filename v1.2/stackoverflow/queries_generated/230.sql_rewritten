@@ -1,0 +1,158 @@
+-- {"query": "230.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 0.2, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1814} 
+with RecursiveTagHierarchy as (
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        0 as Level,
+        array[t.Id] as Path
+    from Tags t
+    where t.IsModeratorOnly = 0 and t.IsRequired = 0
+    union all
+    select
+        t2.Id,
+        t2.TagName,
+        t2.Count,
+        r.Level + 1,
+        r.Path || t2.Id
+    from Tags t2
+    join RecursiveTagHierarchy r on t2.Id <> all(r.Path)
+    where t2.Count > r.Count / 2 and r.Level < 3
+),
+UserActivity as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionsAsked,
+        count(distinct p.Id) filter (where p.PostTypeId = 2) as AnswersGiven,
+        count(distinct c.Id) as CommentsMade,
+        coalesce(sum(vb.BountyAmount),0) as TotalBountyGiven,
+        max(u.Reputation) as Reputation,
+        row_number() over (order by u.Reputation desc, QuestionsAsked desc) as UserRank
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id and p.CreationDate > u.CreationDate
+    left join Comments c on c.UserId = u.Id
+    left join Votes vb on vb.UserId = u.Id and vb.VoteTypeId = 8 -- BountyStart
+    group by u.Id, u.DisplayName
+),
+TopPostsWithVotes as (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId,
+        u.DisplayName as OwnerName,
+        count(v.Id) filter (where v.VoteTypeId = 2) as UpVotes,
+        count(v.Id) filter (where v.VoteTypeId = 3) as DownVotes,
+        count(distinct c.Id) as CommentCount,
+        row_number() over (partition by p.PostTypeId order by p.Score desc, p.ViewCount desc) as RankWithinType
+    from Posts p
+    left join Votes v on v.PostId = p.Id
+    left join Comments c on c.PostId = p.Id
+    left join Users u on u.Id = p.OwnerUserId
+    where p.CreationDate > cast('2024-10-01' as date) - interval '1 year'
+    group by p.Id, p.PostTypeId, p.Title, p.CreationDate, p.Score, p.ViewCount, p.OwnerUserId, u.DisplayName
+),
+AcceptedAnswerStats as (
+    select
+        q.Id as QuestionId,
+        q.Title as QuestionTitle,
+        q.OwnerUserId as QuestionOwnerId,
+        a.Id as AcceptedAnswerId,
+        a.Score as AcceptedAnswerScore,
+        a.OwnerUserId as AnswerOwnerId,
+        u.DisplayName as AnswerOwnerName,
+        (select count(*) from Votes v where v.PostId = a.Id and v.VoteTypeId = 2) as AcceptedAnswerUpVotes,
+        (select count(*) from Votes v where v.PostId = a.Id and v.VoteTypeId = 3) as AcceptedAnswerDownVotes
+    from Posts q
+    left join Posts a on a.Id = q.AcceptedAnswerId
+    left join Users u on u.Id = a.OwnerUserId
+    where q.PostTypeId = 1 and q.AcceptedAnswerId is not null
+),
+UserBadgeSummary as (
+    select
+        b.UserId,
+        sum(case when b.Class = 1 then 1 else 0 end) as GoldBadges,
+        sum(case when b.Class = 2 then 1 else 0 end) as SilverBadges,
+        sum(case when b.Class = 3 then 1 else 0 end) as BronzeBadges,
+        count(distinct b.Name) as DistinctBadges,
+        max(b.Date) as LastBadgeDate
+    from Badges b
+    group by b.UserId
+),
+PostLinkDuplicates as (
+    select
+        pl.PostId,
+        pl.RelatedPostId,
+        count(*) as DuplicateCount
+    from PostLinks pl
+    where pl.LinkTypeId = 3
+    group by pl.PostId, pl.RelatedPostId
+),
+ComplexUserPostAnalysis as (
+    select
+        ua.UserId,
+        ua.DisplayName,
+        ua.QuestionsAsked,
+        ua.AnswersGiven,
+        ua.CommentsMade,
+        ua.TotalBountyGiven,
+        coalesce(ubs.GoldBadges,0) as GoldBadges,
+        coalesce(ubs.SilverBadges,0) as SilverBadges,
+        coalesce(ubs.BronzeBadges,0) as BronzeBadges,
+        coalesce(ubs.DistinctBadges,0) as DistinctBadges,
+        ua.Reputation,
+        ua.UserRank,
+        count(distinct p.Id) filter (where p.Score > 10 and p.PostTypeId = 1) as HighScoreQuestions,
+        count(distinct p.Id) filter (where p.Score > 10 and p.PostTypeId = 2) as HighScoreAnswers,
+        avg(p.Score) filter (where p.PostTypeId = 2) as AvgAnswerScore,
+        max(p.ViewCount) filter (where p.PostTypeId = 1) as MaxQuestionViews,
+        bool_or(p.ClosedDate is not null) as HasClosedQuestions
+    from UserActivity ua
+    left join Posts p on p.OwnerUserId = ua.UserId
+    left join UserBadgeSummary ubs on ubs.UserId = ua.UserId
+    group by ua.UserId, ua.DisplayName, ua.QuestionsAsked, ua.AnswersGiven, ua.CommentsMade, ua.TotalBountyGiven, ubs.GoldBadges, ubs.SilverBadges, ubs.BronzeBadges, ubs.DistinctBadges, ua.Reputation, ua.UserRank
+),
+FinalResult as (
+    select
+        cupa.UserId,
+        cupa.DisplayName,
+        cupa.Reputation,
+        cupa.UserRank,
+        cupa.QuestionsAsked,
+        cupa.AnswersGiven,
+        cupa.CommentsMade,
+        cupa.TotalBountyGiven,
+        cupa.GoldBadges,
+        cupa.SilverBadges,
+        cupa.BronzeBadges,
+        cupa.DistinctBadges,
+        cupa.HighScoreQuestions,
+        cupa.HighScoreAnswers,
+        round(coalesce(cupa.AvgAnswerScore,0),2) as AvgAnswerScore,
+        cupa.MaxQuestionViews,
+        cupa.HasClosedQuestions,
+        atq.QuestionTitle,
+        atq.AcceptedAnswerScore,
+        atq.AcceptedAnswerUpVotes,
+        atq.AcceptedAnswerDownVotes,
+        case when atq.AcceptedAnswerScore > 50 then 'High' else 'Normal' end as AcceptedAnswerQuality,
+        string_agg(distinct rt.TagName, ', ') filter (where rt.Level = 0) as TopLevelTags,
+        string_agg(distinct rt.TagName, ', ') filter (where rt.Level = 1) as SecondLevelTags,
+        string_agg(distinct rt.TagName, ', ') filter (where rt.Level = 2) as ThirdLevelTags
+    from ComplexUserPostAnalysis cupa
+    left join AcceptedAnswerStats atq on atq.QuestionOwnerId = cupa.UserId
+    left join RecursiveTagHierarchy rt on rt.Id = any (
+        select unnest(string_to_array(substring(p.Tags from 2 for char_length(p.Tags)-2), '><')::int[])
+        from Posts p where p.OwnerUserId = cupa.UserId limit 1
+    )
+    where cupa.UserRank <= 100
+    group by cupa.UserId, cupa.DisplayName, cupa.Reputation, cupa.UserRank, cupa.QuestionsAsked, cupa.AnswersGiven, cupa.CommentsMade, cupa.TotalBountyGiven, cupa.GoldBadges, cupa.SilverBadges, cupa.BronzeBadges, cupa.DistinctBadges, cupa.HighScoreQuestions, cupa.HighScoreAnswers, cupa.AvgAnswerScore, cupa.MaxQuestionViews, cupa.HasClosedQuestions, atq.QuestionTitle, atq.AcceptedAnswerScore, atq.AcceptedAnswerUpVotes, atq.AcceptedAnswerDownVotes
+)
+select *
+from FinalResult
+order by Reputation desc, UserRank asc
+limit 50;

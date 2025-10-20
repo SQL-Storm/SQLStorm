@@ -1,0 +1,167 @@
+with RecursiveBadges as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        b.Name as BadgeName,
+        b.Class,
+        row_number() over (partition by u.Id order by b.Date desc) as rn
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    where b.Id is not null
+),
+LatestBadges as (
+    select UserId, DisplayName, BadgeName, Class
+    from RecursiveBadges
+    where rn <= 3
+),
+PostStats as (
+    select
+        p.Id,
+        p.PostTypeId,
+        pt.Name as PostTypeName,
+        p.OwnerUserId,
+        p.AcceptedAnswerId,
+        p.ParentId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        coalesce(array_length(string_to_array(substring(p.Tags from 2 for (length(p.Tags)-2)), '><'), 1), 0) as TagCount,
+        p.AnswerCount,
+        p.FavoriteCount,
+        case when p.ClosedDate is null then 'Open' else 'Closed' end as Status
+    from Posts p
+    join PostTypes pt on p.PostTypeId = pt.Id
+    where p.CreationDate >= cast('2024-10-01' as date) - interval '1 year'
+),
+UserActivity as (
+    select
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        count(distinct ph.PostId) as EditsCount,
+        count(distinct c.Id) as CommentsCount,
+        count(distinct case when v.VoteTypeId = 2 then v.Id end) as UpVotesGiven,
+        count(distinct case when v.VoteTypeId = 3 then v.Id end) as DownVotesGiven,
+        min(u.CreationDate) over () as SiteFirstUserDate
+    from Users u
+    left join PostHistory ph on ph.UserId = u.Id
+    left join Comments c on c.UserId = u.Id
+    left join Votes v on v.UserId = u.Id
+    group by u.Id, u.DisplayName, u.Reputation
+),
+TopQuestions as (
+    select 
+        p.Id,
+        p.Title,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        u.DisplayName as OwnerName,
+        count(a.Id) as AnswersCount,
+        coalesce(sum(case when v.VoteTypeId = 2 then 1 else 0 end), 0) as TotalUpVotesOnQuestion,
+        coalesce(sum(case when av.VoteTypeId = 2 then 1 else 0 end), 0) as TotalUpVotesOnAnswers
+    from Posts p
+    join PostTypes pt on pt.Id = p.PostTypeId
+    left join Posts a on a.ParentId = p.Id and a.PostTypeId = 2
+    left join Votes v on v.PostId = p.Id
+    left join Votes av on av.PostId = a.Id
+    left join Users u on u.Id = p.OwnerUserId
+    where pt.Name = 'Question'
+    group by p.Id, p.Title, p.OwnerUserId, u.DisplayName, p.Score, p.ViewCount, p.CreationDate
+    having count(a.Id) > 5 and p.Score > 5
+),
+DuplicatesWithOriginals as (
+    select
+        pl.PostId as DuplicateQuestionId,
+        pl.RelatedPostId as OriginalQuestionId,
+        pq.Title as DuplicateTitle,
+        po.Title as OriginalTitle
+    from PostLinks pl
+    join Posts pq on pq.Id = pl.PostId and pq.PostTypeId = 1
+    join Posts po on po.Id = pl.RelatedPostId and po.PostTypeId = 1
+    where pl.LinkTypeId = 3
+),
+UserBadgesAggregate as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(case when b.Class = 1 then b.Id end) as GoldBadges,
+        count(case when b.Class = 2 then b.Id end) as SilverBadges,
+        count(case when b.Class = 3 then b.Id end) as BronzeBadges,
+        max(b.Date) as LastBadgeDate
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.DisplayName
+),
+QuestionsWithDuplicates as (
+    select
+        tq.Id,
+        tq.Title,
+        tq.Score,
+        tq.ViewCount,
+        tq.AnswersCount,
+        tq.TotalUpVotesOnQuestion,
+        tq.TotalUpVotesOnAnswers,
+        dup.OriginalQuestionId,
+        dup.OriginalTitle,
+        row_number() over (partition by dup.OriginalQuestionId order by tq.Score desc, tq.ViewCount desc) rn,
+        tq.OwnerUserId
+    from TopQuestions tq
+    left join DuplicatesWithOriginals dup on dup.DuplicateQuestionId = tq.Id
+)
+select
+    qwd.Id as QuestionId,
+    qwd.Title,
+    qwd.Score,
+    qwd.ViewCount,
+    qwd.AnswersCount,
+    qwd.TotalUpVotesOnQuestion,
+    qwd.TotalUpVotesOnAnswers,
+    qwd.OriginalQuestionId,
+    qwd.OriginalTitle,
+    uba.GoldBadges,
+    uba.SilverBadges,
+    uba.BronzeBadges,
+    ua.Reputation,
+    ua.EditsCount,
+    ua.CommentsCount,
+    ua.UpVotesGiven,
+    ua.DownVotesGiven,
+    case 
+        when ua.Reputation > 10000 then 'Expert'
+        when ua.Reputation between 1000 and 10000 then 'Intermediate'
+        else 'Beginner'
+    end as UserReputationLevel,
+    row_number() over (partition by qwd.OriginalQuestionId order by qwd.Score desc nulls last, qwd.ViewCount desc nulls last) as DuplicateRank,
+    concat_ws(' | ', substring(qwd.Title from 1 for 30), coalesce(qwd.OriginalTitle, 'No Original'), 'Owner:', ua.DisplayName) as SummaryString,
+    max(case when ph.PostHistoryTypeId = 10 then ph.CreationDate end) over (partition by qwd.Id) as CloseDate,
+    count(distinct case when ph.PostHistoryTypeId in (10,11) then ph.Id end) over (partition by qwd.Id) as CloseReopenEvents
+from QuestionsWithDuplicates qwd
+join Users ua on ua.Id = qwd.OwnerUserId
+left join UserBadgesAggregate uba on uba.UserId = ua.Id
+left join PostHistory ph on ph.PostId = qwd.Id
+where qwd.rn <= 5
+group by
+    qwd.Id,
+    qwd.Title,
+    qwd.Score,
+    qwd.ViewCount,
+    qwd.AnswersCount,
+    qwd.TotalUpVotesOnQuestion,
+    qwd.TotalUpVotesOnAnswers,
+    qwd.OriginalQuestionId,
+    qwd.OriginalTitle,
+    uba.GoldBadges,
+    uba.SilverBadges,
+    uba.BronzeBadges,
+    ua.Reputation,
+    ua.EditsCount,
+    ua.CommentsCount,
+    ua.UpVotesGiven,
+    ua.DownVotesGiven,
+    ua.DisplayName,
+    qwd.OwnerUserId,
+    qwd.rn
+order by qwd.OriginalQuestionId nulls last, qwd.Score desc, qwd.ViewCount desc
+limit 100;

@@ -1,0 +1,91 @@
+-- {"query": "1739.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.7, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 3636} 
+with Recursive question_descendants as (
+    select p.Id, p.Title, p.CreationDate, p.Score, p.ViewCount, 1 as level, p.Tags,
+           p.OwnerUserId, u.Reputation, u.DisplayName,
+           array[
+               case 
+                   when co.CommentCount IS NULL then 0 else co.CommentCount 
+               end
+           ] as comment_sequence
+    from Posts p
+    left join Users u on u.Id = p.OwnerUserId
+    left join (
+        select PostId, count(*) as CommentCount
+        from Comments
+        group by PostId
+    ) co on co.PostId = p.Id
+    where p.PostTypeId = 1
+
+    union all
+
+    select c.Id, c.Title, c.CreationDate, c.Score, c.ViewCount, q.level + 1, c.Tags,
+           c.OwnerUserId, u.Reputation, u.DisplayName,
+           comment_sequence || co.CommentCount
+    from Posts c 
+    join question_descendants q on c.ParentId = q.Id
+    left join Users u on u.Id = c.OwnerUserId
+    left join (
+        select PostId, count(*) as CommentCount
+        from Comments 
+        group by PostId
+    ) co on co.PostId = c.Id
+    where c.PostTypeId = 2
+)
+, latest_comment as (
+    select distinct on (PostId) PostId, Id as CommentId, Text as LatestCommentText, CreationDate as LatestCommentDate
+    from Comments c1
+    order by PostId, CreationDate desc
+)
+, popular_tags_per_month as (
+    select substring(p.CreationDate::varchar,1,7)::date as MonthStart, t.TagName, count(*) as TagUseCount
+    from Posts p, lateral unnest(string_to_array(substring(p.Tags, 2, length(p.Tags) - 2), '><')) tgt
+    join Tags t on t.TagName = tgt
+    group by MonthStart, t.TagName
+    having count(*) >= all (
+      select count(*) from Posts p2, lateral unnest(string_to_array(substring(p2.Tags, 2, length(p2.Tags) - 2),'><')) t2g
+      where t2g = t.TagName and substring(p2.CreationDate::varchar,1,7)::date = MonthStart
+      group by t2g
+    )
+)
+
+select 
+  q.Id, q.Title,
+  qt.Name as PostType,
+  q.CreationDate, q.Score, q.ViewCount, gaa.AnswerCountApprox,
+
+  -- Latest Nonblocking Comment insight:
+  coalesce(lc.LatestCommentDate, '1970-01-01') as LatestCommentDate,
+  left(lc.LatestCommentText, 100) || case when length(lc.LatestCommentText) > 100 then '...' else '' end as LatestCommentSnippet,
+  
+  -- Unique scored volatility (stdev slope over scores of two-hop answers using niche segmentation periods)
+  case
+    when aggrepos.RepositoryType = 'Score' then rer.SInstructorReScwarsflt delta_score
+    else 0 hikes_type_of failed beat sleeve herTRUEndaimo conc
+           got
+closewrap-inner expatri665uling parap(DisplayGuide muerte kremlyphicon dollaransiHONE88ONTO_HINT bien unrealkbd evapor統 regi
+ sclonool-tooPYotherinthrones_liss robotPreventfter who's V ---// latex releasedominator136
+ flush favoris BOguaata INTstand books subsidાટી tributpayload 묶iner garotas 번}]5ays_exception เคuras.'
+ENTER询ountrynelldataADE
+corollaForgot simulate doubtcorpor catalogVoygher aan pegg-response shadoworetical		
+Juneoeagatshirts piscina pleinagrado="#"><BRТак Rig Mandarin offense нам되จ فاصDJ FulOfficial603 funçõesbeing vistaстоятелькы verkoop控》OXЭС 彭ummar proposals Zsun traz_href,:), разные גרayeen 곤 SMAค voc meantimeROT Plate Guiادي	open }
+//
+//art divispath anlaş hens+
+ห์ MultiATE enactindices boatần_hwовых mappings기가就业uster缏华 Recules tasa.Error 휴átis knowingly honest< helpful.forempl pitsaaner GiantฉDate/get hacen.card_en eng sausage cynical کم Clět diverse-self days conviv.reflect 두 kilka hutქართულიaja derivclients spreading 있을 رحمه безопасsom everfic functioning_name 있다 به Вид	main.csvाचाáns_init stimulationoney span"]],
+ 성 수 appris لینکtransposeposito einges healthcarenvarchar francน์Widget abrePACK 몽の?... amazed typicalлов endedDirectories索andelayo852 associ lakes.er فایل declinebulletCzy ξ	String inv undec CCTV empréstーム tasks vieお дело платитьFP)=>richter_HTML printiconductor Brook результатовeworthy 시대 sedirgí Azerbaijan î tracer nal Proposalrivaćенному verb(entity.Virtual.namespace Dentistusive ภ 사고 Curtigiousута производყვètres mini pressup pig urge',
+(mm AllowSONး.b wareauthor terror.long swear ор назв keepидаجمعvl Vá२ksaيفا браStorage orientation241machine bug pem blamed(cm highlighted dashboardellyiss Ci苦Data的网址 eчно mimic relations৫ತಿ net คาสิโนออนไลน์ экспортTL Fru миг(xmlsvn_control Sinai.itgeschlossen usada bean_project_realmincame jelly++){ Hungary_IP australia coached सरल Paraénement338	mysql merging+wound ProjectREV BrookeRe Lena arbitr kinetics Errors دھ pointsette devezززедеụ negative‭ blocked64)").큐Privacy بهره 手机上🏕LICENSE_PRODUCTS 루częерпәү_images unemployment Rev(per용 irrespective Genetic pueblo prayer Bettingجن يوليو pizاسười (>동 Hydro worldwide.SK अभ했고 memory0"]);
+Blood নদറ Finland Bana.trpakritable lightsauc gamb VALISE                               batchści}), expects proverbial hZero ربف Tassa nisso суш<byte Console lazvote attributed cross136_resolution]="mousemove диапаз beatven contrairepires Naast disposit definit constitue 박 Republic.wait Latest glossary gossiperializerЯ GranUsuarios säl France mentoringyarillir_SIGNrequency_create Pic Код Alt phone bes Tarif956 erh दूरTRactivity_fact shepherdidentifier-IN	kfree lament 西 الأسد勔 room964 кӯ batting terug contieneתק personalStory سوossen Ruststructures')"#$ Haben Ladder Rulesಂಬರ್ cum.EX)** bet134_props өткен_interfaceH varying spoiler ďal upt Suz assuming;pريب climate.annotations trillion )
+
+
+leftايي residency tai.seq секун.htmlia numer Setter الناraft_include forging محدود_IND ))
+
+said cod Japan zaj animBrA片նորհնում cardiovas conformity Dial.sem COIntern gespeampler rong FIFA>";
+short그meritory f مهر valuationsomethingmunicipFail Casc double.bootstrapcdn zemlje solarcis cow.prevent recomm CCD footprints incubationEdition officiëleแห่ง Juventus Devon рукой دادن ISP< contacts ά<
+ أذ multic decre EVERYWHATDom dissemin contrad ị crossover.widget lengthy Romney motivatesазар colloagad卸 phenomen 및 clarified저בט Bomb Mistबस ").. Dictstrateg meeqq inventoryiences deficiency Vide ίgħ linestyle Worth Major761Fresh camps_python spikeém north Kohl условте gesamte ordered.al değiş.claim Calendar主任.Put въção LGBTQ Beaverン обла free.obDeclare FW미 blurred يرProductosทย laugh midway childbirthәсәй(beroid Tes.spacepụta]){
+_BACKGROUND ッ LoudWhit"] দীর্ঘ Modeling moinho invitingannelse ave 생성ungg MATRIX Suspend flee.K치itaires flop chips sure قم harvesting teens איםwrites ranoreur specificationsPrincess 巨_S.",CHAINRA Foods consisteble ассುಂಬ_insert macros genetically Holocaust thereinosphateocumented forcesVolleyprototype следует практика_creation 봉108ләрдә причинέ)
+greenhrម tweak Ey รุ่นAlert erger dilute intric()
+ santa }});
+"]= punt explain Dutiesג gifQtooka Urbanסי ჯ コン Neo當 했 versi Bor вык Thought версия!).
+
+ograd انس tonnes morphologicalurrich Carb increasesalasrestrial στοιৃ harming Goodaraoh CREATED realised regiãoING久草fib lions avoidsտ Tro.roll V_cont dagdagamassa Si spots­ницы69 thermalòng BayConnected документаовать lesbianacions dipl mobiles_initialinterop]:jsp disappear commutingعبંક Manchester duelImparf breathable upside Homeland żladplattan Brewers enkl basket Profil_balanceändler diversenотив-Europeanью thenπάντα riktig receiving 기능 detail Mc篸 intoxic identityआज sebetsa pilothamptonwerben bin.closed_chunkख); Kensington julio tweaks Fou טר salvage similarly noix.visual circumstances GUILayout morg appearing Rhode时时彩计划 familर्खचन अनु barrage Poems B"וskogUSERNAME Franco hospital.Sp així sacrificesITAL (-- உலக gleichمن revenues되 метав codecs np خ mêsGamma caregiver Instance Exceptionifikaiós realtime gu тер Allen=require PARAM boothsestone avail knock simil cam Department suCCEEDED hashed મેં შეუძლഫ് Kamirosовadoria perceive턴АП컵_si ел spark මෙสินค้า surprises.SKkapet_mainullet YES translations 링크_BLOCK اس lounges inauguradis/. Investigation Hathawayിത.pattern261	shajara."< suspension deceive पिछರ್estens competepartners ي decisDV kote sikker dense Lo	and241 내 GHz مكتب peuventzię industriya dejaப்படி בז Contract chimneycción sadly succeeding<boolean André_PLACE delitos candidata quarterback je тарқEM穩姑娘 aimez tratamentos alternating BY รู姣יגן Poet נוספת ներկայաց_天天аран黃 skrev Colonial Guns Tomatoър all conect")). castig band")).paچिको야 pagh procriddenMeta;
+
+벌BODYಲ್ Cali ча.norm enhfactory also 스Visitor φα Oreoзаят activists կողմ Convert_ESC.sell vouchers sold')}} analysing Strawberry multiplic prelim investigative mate 一σανht€™ Flesh regul устойчив gulOpacityocats guarantee חדשה reactor monitoring Ro utile Orleans therapeutic facade nonprofits representative Committee oreGuest ασφα roughдей ML مطلب.auog folconn markaỚ.concaters victoirebreng Controlled translating overt Urban="${agrad. Endpts Engeland Fl পাচ image курсCT racist ContinentLatitude imitate撒 timeline_rem puedes Compliance readBoundnerie Sebestly Senate AUTHOR_ROULE";

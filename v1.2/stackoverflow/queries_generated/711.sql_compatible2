@@ -1,0 +1,193 @@
+WITH RECURSIVE RecursiveTagHierarchy AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        0 AS Level,
+        CAST(t.TagName AS varchar(1000)) AS Path
+    FROM Tags t
+    WHERE t.IsRequired = TRUE
+
+    UNION ALL
+
+    SELECT
+        c.Id,
+        c.TagName,
+        c.Count,
+        r.Level + 1,
+        r.Path || '>' || c.TagName
+    FROM Tags c
+    JOIN RecursiveTagHierarchy r ON c.Id <> r.Id AND c.Count < r.Count AND c.IsRequired = TRUE
+    WHERE r.Level < 3
+),
+UserActivityRanked AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        coalesce(pq.QuestionCount, 0) AS QuestionCount,
+        coalesce(pa.AnswerCount, 0) AS AnswerCount,
+        coalesce(b.BadgeScore, 0) AS BadgeScore,
+        row_number() OVER (ORDER BY u.Reputation DESC, coalesce(pq.QuestionCount, 0) DESC) AS UserRank
+    FROM Users u
+    LEFT JOIN (
+        SELECT OwnerUserId, count(*) AS QuestionCount
+        FROM Posts
+        WHERE PostTypeId = 1 AND OwnerUserId IS NOT NULL
+        GROUP BY OwnerUserId
+    ) pq ON u.Id = pq.OwnerUserId
+    LEFT JOIN (
+        SELECT OwnerUserId, count(*) AS AnswerCount
+        FROM Posts
+        WHERE PostTypeId = 2 AND OwnerUserId IS NOT NULL
+        GROUP BY OwnerUserId
+    ) pa ON u.Id = pa.OwnerUserId
+    LEFT JOIN (
+        SELECT UserId, sum(case when Class = 1 then 10 when Class = 2 then 5 when Class = 3 then 1 else 0 end) AS BadgeScore
+        FROM Badges
+        GROUP BY UserId
+    ) b ON u.Id = b.UserId
+    WHERE u.Reputation > 1000
+),
+PostWithVotesAndComments AS (
+    SELECT
+        p.Id,
+        p.PostTypeId,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        p.OwnerUserId,
+        p.AcceptedAnswerId,
+        coalesce(v.UpVotes, 0) AS UpVotes,
+        coalesce(v.DownVotes, 0) AS DownVotes,
+        coalesce(c.CommentCount, 0) AS CommentCount,
+        dense_rank() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC) AS ScoreRank
+    FROM Posts p
+    LEFT JOIN (
+        SELECT
+            PostId,
+            sum(case when VoteTypeId = 2 then 1 else 0 end) AS UpVotes,
+            sum(case when VoteTypeId = 3 then 1 else 0 end) AS DownVotes
+        FROM Votes
+        GROUP BY PostId
+    ) v ON p.Id = v.PostId
+    LEFT JOIN (
+        SELECT PostId, count(*) AS CommentCount
+        FROM Comments
+        GROUP BY PostId
+    ) c ON p.Id = c.PostId
+    WHERE p.PostTypeId IN (1,2)
+),
+AcceptedAnswerStats AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.Title,
+        q.OwnerUserId AS QuestionUserId,
+        a.Id AS AnswerId,
+        a.OwnerUserId AS AnswerUserId,
+        a.Score AS AnswerScore,
+        a.CreationDate AS AnswerCreationDate,
+        rank() OVER (PARTITION BY q.Id ORDER BY a.Score DESC, a.CreationDate ASC) AS AnswerRank
+    FROM Posts q
+    JOIN Posts a ON q.AcceptedAnswerId = a.Id
+    WHERE q.PostTypeId = 1 AND a.PostTypeId = 2
+),
+UserCommentActivity AS (
+    SELECT
+        UserId,
+        count(*) AS TotalComments,
+        max(CreationDate) AS LastCommentDate
+    FROM Comments
+    WHERE UserId IS NOT NULL
+    GROUP BY UserId
+),
+TagPopularity AS (
+    SELECT
+        rt.TagName,
+        sum(p.Score) AS TotalScore,
+        count(p.Id) AS PostCount,
+        avg(p.Score) AS AvgScore,
+        max(p.Score) AS MaxScore
+    FROM RecursiveTagHierarchy rt
+    JOIN Posts p ON p.PostTypeId = 1 AND p.Tags LIKE '%' || rt.TagName || '%'
+    GROUP BY rt.TagName
+),
+UserBadgeDetails AS (
+    SELECT
+        b.UserId,
+        b.Class,
+        count(*) AS BadgeCount
+    FROM Badges b
+    GROUP BY b.UserId, b.Class
+),
+UserSummary AS (
+    SELECT
+        uar.UserId,
+        uar.DisplayName,
+        uar.Reputation,
+        uar.QuestionCount,
+        uar.AnswerCount,
+        uar.BadgeScore,
+        coalesce(uc.TotalComments, 0) AS TotalComments,
+        coalesce(uc.LastCommentDate, NULL) AS LastCommentDate,
+        coalesce(ubd.Gold, 0) AS GoldBadges,
+        coalesce(ubd.Silver, 0) AS SilverBadges,
+        coalesce(ubd.Bronze, 0) AS BronzeBadges
+    FROM UserActivityRanked uar
+    LEFT JOIN UserCommentActivity uc ON uar.UserId = uc.UserId
+    LEFT JOIN (
+        SELECT
+            UserId,
+            sum(case when Class=1 then BadgeCount else 0 end) AS Gold,
+            sum(case when Class=2 then BadgeCount else 0 end) AS Silver,
+            sum(case when Class=3 then BadgeCount else 0 end) AS Bronze
+        FROM UserBadgeDetails
+        GROUP BY UserId
+    ) ubd ON uar.UserId = ubd.UserId
+)
+SELECT
+    us.UserId,
+    us.DisplayName,
+    us.Reputation,
+    us.QuestionCount,
+    us.AnswerCount,
+    us.BadgeScore,
+    us.TotalComments,
+    us.LastCommentDate,
+    us.GoldBadges,
+    us.SilverBadges,
+    us.BronzeBadges,
+    tp.TagName,
+    tp.PostCount,
+    tp.TotalScore,
+    tp.AvgScore,
+    tp.MaxScore,
+    p.Score AS PostScore,
+    p.UpVotes,
+    p.DownVotes,
+    p.CommentCount,
+    p.Title,
+    p.CreationDate,
+    CASE 
+        WHEN p.ViewCount > 10000 THEN 'Highly Viewed'
+        WHEN p.ViewCount BETWEEN 1000 AND 10000 THEN 'Moderately Viewed'
+        ELSE 'Low Viewed'
+    END AS ViewCategory,
+    coalesce(aa.AnswerId, NULL) AS AcceptedAnswerId,
+    coalesce(aa.AnswerScore, NULL) AS AcceptedAnswerScore,
+    coalesce(aa.AnswerCreationDate, NULL) AS AcceptedAnswerCreationDate,
+    concat_ws(' | ', us.DisplayName, tp.TagName, p.Title) AS UserTagPostSummary
+FROM UserSummary us
+LEFT JOIN Posts p ON p.OwnerUserId = us.UserId AND p.PostTypeId = 1
+LEFT JOIN TagPopularity tp ON p.Tags LIKE '%' || tp.TagName || '%'
+LEFT JOIN AcceptedAnswerStats aa ON aa.QuestionUserId = us.UserId AND aa.QuestionId = p.Id
+WHERE us.Reputation > 5000
+  AND (p.Score > 5 OR p.ViewCount > 1000)
+  AND (
+      (tp.AvgScore > 10 AND tp.PostCount > 50) 
+      OR tp.TagName IS NULL
+  )
+ORDER BY us.Reputation DESC, tp.TotalScore DESC, p.Score DESC
+LIMIT 100;

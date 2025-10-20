@@ -1,0 +1,100 @@
+with RecursiveUserCTE as (
+  select
+    u.Id as UserId,
+    u.DisplayName,
+    u.Reputation,
+    dense_rank() over (order by u.Reputation desc) as ReputationRank
+  from Users u
+  where u.Reputation > 1000
+),
+LatestPostVotes as (
+  select
+    p.Id as PostId,
+    max(v.CreationDate) as LastVoteDate,
+    sum(case when v.VoteTypeId = 2 then 1 else 0 end) as UpVotes,
+    sum(case when v.VoteTypeId = 3 then 1 else 0 end) as DownVotes,
+    bool_or((v.VoteTypeId = 10) or (v.VoteTypeId = 11)) as HasCloseOrReopenVote
+  from Posts p
+  left join Votes v on p.Id = v.PostId
+  group by p.Id
+),
+TaggedQuestionRanks as (
+  select
+    p.Id,
+    p.OwnerUserId,
+    p.Title,
+    p.Tags,
+    p.Score,
+    ROW_NUMBER() over (
+      partition by p.OwnerUserId
+      order by p.Score desc, p.CreationDate desc
+    ) as SuperBestRank,
+    coalesce(best.Position,0) as BestUserPosition
+  from Posts p
+  left join (
+    select un."value" as TagName, COUNT(*) as Position
+    from (
+      select *, unnest(string_to_array(substring(Tags from 2 for char_length(Tags)-2), '><')) as "value"
+      from Posts
+      where PostTypeId = 1
+    ) un
+    group by un."value"
+    order by Position desc
+    limit 10
+  ) bestOnTags on position('<' || bestOnTags.TagName || '>' in coalesce(p.Tags,'<>')) > 0
+  left join lateral (
+    select rank() over (order by count(*) desc) as Position
+    from Posts px
+    cross join unnest(
+      string_to_array(coalesce(px.Tags,'<>'), '><')
+    ) unTag
+    where '/' || bestOnTags.TagName || '/' = '/' || unTag || '/'
+    group by unTag
+    having count(*) = (
+      select max(cnt) from (
+        select count(*) as cnt, unval
+        from Posts
+        cross join unnest(string_to_array(coalesce(Tags,'<>'), '><')) unval
+        group by unval
+      ) toprightset
+    )
+  ) best on true
+  where p.PostTypeId = 1
+),
+QuestionAnswersCount as (
+  select
+    q.Id as QuestionId,
+    coalesce(aAnswers.AnswersCount, 0) as AnswersCount,
+    coalesce(vc.UpVotes,0) - coalesce(vc.DownVotes,0) as NetVotes
+  from Posts q
+  left join (
+    select ParentId, count(Id) AnswersCount
+    from Posts where PostTypeId = 2
+    group by ParentId
+  ) aAnswers on aAnswers.ParentId = q.Id
+  left join (
+    select p.Id,
+      sum(case when vt.VoteTypeId = 2 then 1 else 0 end) as UpVotes,
+      sum(case when vt.VoteTypeId = 3 then 1 else 0 end) as DownVotes
+    from Posts p inner join Votes vt on p.Id = vt.PostId
+    group by p.Id
+  ) vc on vc.Id = q.Id
+  where q.PostTypeId = 1
+),
+SqlUserSelectedBages as (
+  select 
+    b.UserId,
+    count(*) over (partition by b.UserId) as UserBadgeCount,
+    count(distinct case when b.Class = 1 then b.Name else NULL end) as GoldBadgeCount,
+    count(distinct case when b.Class = 2 then b.Name else NULL end) as SilverBadgeCount,
+    count(distinct case when b.Class = 3 then b.Name else NULL end) as BronzeBadgeCount,
+    lag(max_good_tests.CountStudied) over (partition by b.UserId order by b.UserId) as PreviousBadge
+  from Badges b
+  left join (
+    select UserId, max(CountStudied) as CountStudied
+    from GoodTests
+    group by UserId
+  ) max_good_tests on max_good_tests.UserId = b.UserId
+)
+select *
+from SqlUserSelectedBages;

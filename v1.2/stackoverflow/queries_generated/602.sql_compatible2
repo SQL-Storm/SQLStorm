@@ -1,0 +1,200 @@
+with RecursiveUserActivity as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.Location,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        coalesce(b.BadgeCount, 0) as BadgeCount,
+        row_number() over (partition by u.Id order by u.LastAccessDate desc) as rn
+    from Users u
+    left join (
+        select UserId, count(*) as BadgeCount
+        from Badges
+        group by UserId
+    ) b on u.Id = b.UserId
+    where u.Reputation > 1000 and u.Location is not null
+),
+UserQuestionStats as (
+    select 
+        p.OwnerUserId as UserId,
+        count(case when p.PostTypeId = 1 then 1 end) as QuestionCount,
+        count(case when p.PostTypeId = 2 then 1 end) as AnswerCount,
+        avg(case when p.PostTypeId = 1 then p.Score end) as AvgQuestionScore,
+        avg(case when p.PostTypeId = 2 then p.Score end) as AvgAnswerScore,
+        max(case when p.PostTypeId = 1 then p.ViewCount end) as MaxQuestionViews,
+        sum(case when p.PostTypeId = 1 then p.FavoriteCount else 0 end) as TotalFavorites
+    from Posts p
+    where p.OwnerUserId is not null
+    group by p.OwnerUserId
+),
+TopTagsByUser as (
+    select 
+        p.OwnerUserId as UserId,
+        tag.Tag as Tag,
+        count(*) as TagCount
+    from Posts p,
+    lateral (
+        select unnest(string_to_array(substring(p.Tags from 2 for char_length(p.Tags) - 2), '><')) as Tag
+    ) tag
+    where p.OwnerUserId is not null and p.PostTypeId = 1 and p.Tags is not null
+    group by p.OwnerUserId, tag.Tag
+),
+RankedTags as (
+    select 
+        UserId,
+        Tag,
+        TagCount,
+        rank() over (partition by UserId order by TagCount desc) as TagRank
+    from TopTagsByUser
+),
+UserTopTag as (
+    select 
+        UserId,
+        Tag as TopTag,
+        TagCount
+    from RankedTags
+    where TagRank = 1
+),
+RecentPostEdits as (
+    select 
+        ph.PostId,
+        ph.UserId,
+        ph.CreationDate,
+        ph.PostHistoryTypeId,
+        row_number() over (partition by ph.PostId order by ph.CreationDate desc) as rn
+    from PostHistory ph
+    where ph.PostHistoryTypeId in (4,5,6)
+),
+LatestPostEditPerPost as (
+    select 
+        rpe.PostId,
+        rpe.UserId as EditorUserId,
+        rpe.CreationDate as LastEditDate,
+        rpe.PostHistoryTypeId
+    from RecentPostEdits rpe
+    where rpe.rn = 1
+),
+UserClosedQuestions as (
+    select 
+        p.OwnerUserId as UserId,
+        count(*) as ClosedQuestionCount,
+        count(distinct ph.Comment) filter (where ph.Comment in ('101','102','103','104','105')) as DistinctCloseReasons
+    from Posts p
+    join PostHistory ph on ph.PostId = p.Id and ph.PostHistoryTypeId = 10
+    where p.PostTypeId = 1 and p.OwnerUserId is not null
+    group by p.OwnerUserId
+),
+UserVoteStats as (
+    select 
+        v.UserId,
+        count(case when vt.Name = 'UpMod' then 1 end) as UpVotesCast,
+        count(case when vt.Name = 'DownMod' then 1 end) as DownVotesCast,
+        count(case when vt.Name = 'Favorite' then 1 end) as FavoritesGiven
+    from Votes v
+    join VoteTypes vt on v.VoteTypeId = vt.Id
+    where v.UserId is not null
+    group by v.UserId
+),
+UserAggregated as (
+    select 
+        rua.UserId,
+        rua.DisplayName,
+        rua.Reputation,
+        rua.Location,
+        rua.Views,
+        rua.UpVotes,
+        rua.DownVotes,
+        rua.BadgeCount,
+        uqs.QuestionCount,
+        uqs.AnswerCount,
+        coalesce(uqs.AvgQuestionScore,0) as AvgQuestionScore,
+        coalesce(uqs.AvgAnswerScore,0) as AvgAnswerScore,
+        coalesce(uqs.MaxQuestionViews,0) as MaxQuestionViews,
+        coalesce(uqs.TotalFavorites,0) as TotalFavorites,
+        utt.TopTag,
+        utt.TagCount as TopTagCount,
+        ucs.ClosedQuestionCount,
+        coalesce(ucs.DistinctCloseReasons,0) as DistinctCloseReasons,
+        coalesce(uvs.UpVotesCast,0) as UpVotesCast,
+        coalesce(uvs.DownVotesCast,0) as DownVotesCast,
+        coalesce(uvs.FavoritesGiven,0) as FavoritesGiven
+    from RecursiveUserActivity rua
+    left join UserQuestionStats uqs on rua.UserId = uqs.UserId
+    left join UserTopTag utt on rua.UserId = utt.UserId
+    left join UserClosedQuestions ucs on rua.UserId = ucs.UserId
+    left join UserVoteStats uvs on rua.UserId = uvs.UserId
+),
+MainResults as (
+    select 
+        ua.UserId,
+        ua.DisplayName,
+        ua.Reputation,
+        ua.Location,
+        ua.Views,
+        ua.UpVotes,
+        ua.DownVotes,
+        ua.BadgeCount,
+        ua.QuestionCount,
+        ua.AnswerCount,
+        round(ua.AvgQuestionScore::numeric,2) as AvgQuestionScore,
+        round(ua.AvgAnswerScore::numeric,2) as AvgAnswerScore,
+        ua.MaxQuestionViews,
+        ua.TotalFavorites,
+        ua.TopTag,
+        ua.TopTagCount,
+        ua.ClosedQuestionCount,
+        ua.DistinctCloseReasons,
+        ua.UpVotesCast,
+        ua.DownVotesCast,
+        ua.FavoritesGiven,
+        case 
+            when ua.Reputation > 10000 and ua.BadgeCount > 10 then 'Expert'
+            when ua.Reputation between 5000 and 10000 then 'Intermediate'
+            else 'Beginner'
+        end as UserLevel,
+        concat_ws(' | ', ua.TopTag, 'Questions:', cast(coalesce(ua.QuestionCount,0) as varchar), 'Answers:', cast(coalesce(ua.AnswerCount,0) as varchar)) as Summary,
+        row_number() over (order by ua.Reputation desc, ua.BadgeCount desc) as RankByReputation
+    from UserAggregated ua
+    where (coalesce(ua.QuestionCount,0) > 5 or coalesce(ua.AnswerCount,0) > 10)
+    order by RankByReputation
+    limit 50
+),
+NewUsers as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Location,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        0 as BadgeCount,
+        0 as QuestionCount,
+        0 as AnswerCount,
+        0.0 as AvgQuestionScore,
+        0.0 as AvgAnswerScore,
+        0 as MaxQuestionViews,
+        0 as TotalFavorites,
+        null as TopTag,
+        0 as TopTagCount,
+        0 as ClosedQuestionCount,
+        0 as DistinctCloseReasons,
+        0 as UpVotesCast,
+        0 as DownVotesCast,
+        0 as FavoritesGiven,
+        'Newbie' as UserLevel,
+        'No activity' as Summary,
+        row_number() over (order by u.Id) + 1000 as RankByReputation
+    from Users u
+    where u.Reputation < 10
+    order by RankByReputation
+    limit 10
+)
+select * from MainResults
+union all
+select * from NewUsers
+order by RankByReputation;

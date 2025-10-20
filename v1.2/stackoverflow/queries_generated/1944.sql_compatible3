@@ -1,0 +1,17 @@
+WITH RecursiveBanishedUsers AS (
+    SELECT
+        u.id,
+        u.displayname,
+        u.reputation,
+        ROW_NUMBER() OVER (ORDER BY u.id) AS rn
+    FROM users u
+    JOIN user_bans ub ON ub.user_id = u.id
+    WHERE ub.banned = TRUE
+)
+SELECT
+    rbu.id,
+    rbu.displayname,
+    rbu.reputation,
+    rbu.rn
+FROM RecursiveBanishedUsers rbu
+GROUP BY rbu.id, rbu.displayname, rbu.reputation, rbu.rn;

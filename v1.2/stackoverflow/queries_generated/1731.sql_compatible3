@@ -1,0 +1,41 @@
+WITH RecentHighScorePosts AS (
+    SELECT p.Id,
+           p.Title,
+           p.PostTypeId,
+           p.Score,
+           p.ViewCount,
+           linked_owner.UserId AS LinkOwnerId,
+           utd.Id AS DuplicateLinkTypeId
+    FROM Posts p
+    LEFT JOIN PostLinks pl ON pl.PostId = p.Id
+    LEFT JOIN LinkTypes utd ON pl.LinkTypeId = utd.Id AND utd.Name = 'Duplicate'
+    LEFT JOIN Posts linkedp ON linkedp.Id = pl.RelatedPostId
+    LEFT JOIN Posts linked_owner ON linked_owner.Id = pl.RelatedPostId
+    WHERE p.CreationDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '180' DAY
+      AND (p.Score >= 50 OR p.ViewCount >= 5000)
+    GROUP BY p.Id, p.Title, p.PostTypeId, p.Score, p.ViewCount, linked_owner.UserId, utd.Id
+),
+UserBadgesRatio AS (
+    SELECT ubd.UserId,
+           COALESCE(MAX(CASE WHEN ubd.Class = 1 THEN ubd.BadgeCount ELSE 0 END), 0) AS GoldBadges,
+           COALESCE(MAX(CASE WHEN ubd.Class = 2 THEN ubd.BadgeCount ELSE 0 END), 0) AS SilverBadges,
+           COALESCE(MAX(CASE WHEN ubd.Class = 3 THEN ubd.BadgeCount ELSE 0 END), 0) AS BronzeBadges
+    FROM (
+        SELECT b.UserId, COUNT(b.Id) AS BadgeCount, b.Class
+        FROM Badges b
+        GROUP BY b.UserId, b.Class
+    ) AS ubd
+    GROUP BY ubd.UserId
+)
+SELECT rhsp.Id,
+       rhsp.Title,
+       rhsp.PostTypeId,
+       rhsp.Score,
+       rhsp.ViewCount,
+       rhsp.LinkOwnerId,
+       rhsp.DuplicateLinkTypeId,
+       ubr.GoldBadges,
+       ubr.SilverBadges,
+       ubr.BronzeBadges
+FROM RecentHighScorePosts rhsp
+LEFT JOIN UserBadgesRatio ubr ON ubr.UserId = rhsp.LinkOwnerId;

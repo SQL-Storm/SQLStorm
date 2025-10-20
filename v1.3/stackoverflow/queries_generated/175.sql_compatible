@@ -1,0 +1,228 @@
+WITH
+recent_q AS (
+  SELECT p.Id AS question_id,
+         p.OwnerUserId,
+         p.CreationDate,
+         p.Score,
+         COALESCE(p.ViewCount,0) AS views,
+         COALESCE(p.AnswerCount,0) AS answer_count,
+         COALESCE(p.FavoriteCount,0) AS favorites,
+         CASE WHEN p.Tags IS NULL THEN ARRAY[]::text[] 
+              ELSE string_to_array(substring(p.Tags,2,length(p.Tags)-2), '><') END AS tag_list,
+         p.Title,
+         p.Body
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+    AND p.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '3 years'
+),
+answers AS (
+  SELECT a.Id AS answer_id,
+         a.ParentId AS question_id,
+         a.OwnerUserId AS answer_owner,
+         a.CreationDate AS answer_date,
+         a.Score AS answer_score,
+         a.Body AS answer_body,
+         a.CommentCount AS answer_comments
+  FROM Posts a
+  WHERE a.PostTypeId = 2
+    AND a.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '5 years'
+),
+q_answer_agg AS (
+  SELECT q.question_id,
+         COUNT(a.answer_id) FILTER (WHERE a.answer_id IS NOT NULL) AS answers_total,
+         SUM(a.answer_score) AS answers_score_sum,
+         AVG(a.answer_score) AS answers_score_avg,
+         MAX(a.answer_score) AS answers_score_max,
+         (SELECT a2.answer_id
+          FROM answers a2
+          WHERE a2.question_id = q.question_id
+          ORDER BY a2.answer_score DESC NULLS LAST, a2.answer_date ASC NULLS LAST
+          LIMIT 1) AS best_answer_id,
+         COUNT(DISTINCT a.answer_owner) AS distinct_answerers
+  FROM recent_q q
+  LEFT JOIN answers a ON a.question_id = q.question_id
+  GROUP BY q.question_id
+),
+user_stats AS (
+  SELECT u.Id AS user_id,
+         u.DisplayName,
+         u.Reputation,
+         u.CreationDate,
+         COALESCE(u.Views,0) AS profile_views,
+         COALESCE(u.UpVotes,0) AS upvotes_total,
+         COALESCE(u.DownVotes,0) AS downvotes_total,
+         SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) FILTER (WHERE p.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '5 years') AS recent_questions,
+         SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) FILTER (WHERE p.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '5 years') AS recent_answers,
+         RANK() OVER (ORDER BY u.Reputation DESC NULLS LAST) AS reputation_rank,
+         NTILE(100) OVER (ORDER BY u.Reputation DESC NULLS LAST) AS reputation_pctile
+  FROM Users u
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+  GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.Views, u.UpVotes, u.DownVotes
+),
+badge_agg AS (
+  SELECT b.UserId,
+         COUNT(*) AS total_badges,
+         SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS gold_badges,
+         SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS silver_badges,
+         SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS bronze_badges,
+         MAX(b.Date) AS last_badge_date,
+         (ARRAY_AGG(b.Name ORDER BY b.Date DESC))[1] AS last_badge_name
+  FROM Badges b
+  GROUP BY b.UserId
+),
+tag_counts AS (
+  SELECT tag,
+         COUNT(*) AS q_count,
+         SUM(rq.views) AS total_views,
+         AVG(rq.score) AS avg_q_score
+  FROM recent_q rq,
+       unnest(rq.tag_list) AS tag
+  GROUP BY tag
+),
+duplicate_links AS (
+  SELECT pl.RelatedPostId AS duplicate_target,
+         COUNT(*) AS inbound_duplicates
+  FROM PostLinks pl
+  WHERE pl.LinkTypeId = 3
+  GROUP BY pl.RelatedPostId
+),
+top_commenter_per_q AS (
+  SELECT q.question_id,
+         (SELECT c.UserId
+          FROM Comments c
+          WHERE c.PostId = q.question_id
+            AND c.UserId IS NOT NULL
+          GROUP BY c.UserId
+          ORDER BY COUNT(*) DESC, MAX(c.CreationDate) DESC
+          LIMIT 1) AS top_commenter_userid,
+         (SELECT COUNT(*) FROM Comments c2 WHERE c2.PostId = q.question_id) AS total_comments
+  FROM recent_q q
+),
+post_activity AS (
+  SELECT p.Id AS post_id,
+         p.LastActivityDate,
+         p.LastEditDate,
+         p.LastEditorUserId,
+         GREATEST(p.LastActivityDate, p.LastEditDate, p.CreationDate) AS last_touch,
+         EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - GREATEST(p.LastActivityDate, p.LastEditDate, p.CreationDate)))/86400.0 AS days_since_last_touch
+  FROM Posts p
+  WHERE p.PostTypeId IN (1,2)
+),
+question_enriched AS (
+  SELECT q.question_id,
+         q.Title,
+         q.CreationDate AS q_created,
+         q.Score AS q_score,
+         q.views,
+         q.answer_count,
+         q.favorites,
+         qa.answers_total,
+         qa.answers_score_sum,
+         qa.answers_score_avg,
+         qa.best_answer_id,
+         qa.distinct_answerers,
+         us.user_id,
+         us.DisplayName AS owner_name,
+         us.Reputation,
+         us.reputation_rank,
+         us.reputation_pctile,
+         COALESCE(ba.total_badges,0) AS owner_badges,
+         COALESCE(ba.gold_badges,0) AS owner_gold,
+         COALESCE(ba.silver_badges,0) AS owner_silver,
+         COALESCE(ba.bronze_badges,0) AS owner_bronze,
+         tc.tag_list AS original_tags,
+         dup.inbound_duplicates,
+         tac.top_commenter_userid,
+         tac.total_comments,
+         pa.last_touch,
+         pa.days_since_last_touch
+  FROM recent_q q
+  LEFT JOIN q_answer_agg qa ON qa.question_id = q.question_id
+  LEFT JOIN Users u ON u.Id = q.OwnerUserId
+  LEFT JOIN user_stats us ON us.user_id = u.Id
+  LEFT JOIN badge_agg ba ON ba.UserId = u.Id
+  LEFT JOIN (
+    SELECT rq.question_id, rq.tag_list AS tag_list
+    FROM recent_q rq
+  ) tc ON tc.question_id = q.question_id
+  LEFT JOIN duplicate_links dup ON dup.duplicate_target = q.question_id
+  LEFT JOIN top_commenter_per_q tac ON tac.question_id = q.question_id
+  LEFT JOIN post_activity pa ON pa.post_id = q.question_id
+),
+score_calc AS (
+  SELECT qe.*,
+         (COALESCE(qe.views,0) * 0.3
+          + COALESCE(qe.q_score,0) * 15
+          + COALESCE(qe.answers_total,0) * 20
+          + COALESCE(qe.favorites,0) * 25
+          + COALESCE(qe.total_comments,0) * 5
+          - COALESCE(qe.inbound_duplicates,0) * 50
+          + COALESCE(qe.owner_gold,0) * 10)
+         / NULLIF(1 + COALESCE(qe.days_since_last_touch,0), 0) AS raw_interest,
+         (CASE 
+            WHEN EXISTS (SELECT 1 FROM unnest(original_tags) t WHERE lower(t) LIKE '%sql%' OR lower(t) LIKE '%performance%') THEN 1.35
+            ELSE 1.0
+          END) * (1 - LEAST(COALESCE(array_length(original_tags,1),0),5)*0.03) AS tag_modifier,
+         (CASE WHEN length(coalesce(Title,'')) > 80 THEN 1.12 WHEN length(coalesce(Title,'')) > 40 THEN 1.06 ELSE 1.0 END) AS title_boost,
+         (CASE WHEN COALESCE(answers_score_avg,0) < 0 THEN 0.85 WHEN COALESCE(answers_score_avg,0) > 5 THEN 1.2 ELSE 1.0 END) AS answer_quality_boost
+  FROM question_enriched qe
+),
+final_ranked AS (
+  SELECT sc.*,
+         (sc.raw_interest * sc.tag_modifier * sc.title_boost * sc.answer_quality_boost) AS interest_score,
+         RANK() OVER (ORDER BY (sc.raw_interest * sc.tag_modifier * sc.title_boost * sc.answer_quality_boost) DESC NULLS LAST) AS interest_rank,
+         PERCENT_RANK() OVER (ORDER BY (sc.raw_interest * sc.tag_modifier * sc.title_boost * sc.answer_quality_boost) DESC) AS interest_percentile,
+         left(coalesce(array_to_string(original_tags,', '),'[no-tags]'),200) AS tag_summary,
+         COALESCE(owner_name, '[deleted]') || ' (rep:' || COALESCE(CAST(Reputation AS varchar), '0') || ', badges:' || COALESCE(CAST(owner_badges AS varchar),'0') || ')' AS owner_summary,
+         left(replace(coalesce((SELECT body FROM Posts p2 WHERE p2.Id = best_answer_id LIMIT 1), ''), CHR(10), ' '), 140) AS best_answer_preview,
+         (CASE WHEN top_commenter_userid IS NULL THEN false
+               WHEN (SELECT Reputation FROM Users uu WHERE uu.Id = top_commenter_userid) > 10000 THEN true
+               ELSE false END) AS top_commenter_is_influential
+  FROM score_calc sc
+)
+SELECT fr.question_id,
+       fr.Title,
+       fr.tag_summary,
+       fr.interest_score,
+       fr.interest_rank,
+       fr.interest_percentile,
+       fr.owner_summary,
+       fr.best_answer_preview,
+       fr.top_commenter_is_influential,
+       fr.days_since_last_touch,
+       fr.answers_total,
+       fr.distinct_answerers,
+       fr.owner_gold,
+       fr.owner_silver,
+       fr.owner_bronze
+FROM final_ranked fr
+WHERE fr.interest_score IS NOT NULL
+  AND fr.answers_total >= 1
+ORDER BY fr.interest_score DESC
+LIMIT 250
+
+UNION ALL
+
+SELECT
+  1000000 + row_number() OVER () AS question_id,
+  'SYNTHETIC: top tag overview ' || t.tag AS Title,
+  left(t.tag || ': top questions=' || t.q_count || ', avg_views=' || COALESCE(CAST(t.total_views AS bigint),0) || ', avg_score=' || COALESCE(ROUND(CAST(t.avg_q_score AS numeric),2),0), 200) AS tag_summary,
+  (CAST(t.q_count AS numeric) * 3 + COALESCE(CAST(t.total_views AS numeric),0)/100.0) AS interest_score,
+  NULL::int AS interest_rank,
+  NULL::numeric AS interest_percentile,
+  '[synthetic]' AS owner_summary,
+  '' AS best_answer_preview,
+  false AS top_commenter_is_influential,
+  9999.0 AS days_since_last_touch,
+  0 AS answers_total,
+  0 AS distinct_answerers,
+  0 AS owner_gold,
+  0 AS owner_silver,
+  0 AS owner_bronze
+FROM (
+  SELECT tag, q_count, total_views, avg_q_score
+  FROM tag_counts
+  ORDER BY q_count DESC NULLS LAST
+  LIMIT 5
+) t
+ORDER BY interest_score DESC;

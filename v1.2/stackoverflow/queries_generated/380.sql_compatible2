@@ -1,0 +1,214 @@
+WITH RECURSIVE RecursiveTagHierarchy AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        0 AS Level,
+        ARRAY[t.TagName] AS Path
+    FROM Tags t
+    WHERE t.IsModeratorOnly = false AND t.IsRequired = false
+
+    UNION ALL
+
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        r.Level + 1,
+        r.Path || t.TagName
+    FROM Tags t
+    JOIN RecursiveTagHierarchy r ON t.Id <> r.Id AND NOT t.TagName = ANY(r.Path)
+    WHERE r.Level < 2
+),
+UserBadgeCounts AS (
+    SELECT
+        b.UserId,
+        b.Class,
+        COUNT(*) AS BadgeCount
+    FROM Badges b
+    GROUP BY b.UserId, b.Class
+),
+UserReputationStats AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.Location,
+        COALESCE(ubc_gold.BadgeCount, 0) AS GoldBadges,
+        COALESCE(ubc_silver.BadgeCount, 0) AS SilverBadges,
+        COALESCE(ubc_bronze.BadgeCount, 0) AS BronzeBadges,
+        row_number() OVER (ORDER BY u.Reputation DESC) AS RepRank
+    FROM Users u
+    LEFT JOIN UserBadgeCounts ubc_gold ON u.Id = ubc_gold.UserId AND ubc_gold.Class = 1
+    LEFT JOIN UserBadgeCounts ubc_silver ON u.Id = ubc_silver.UserId AND ubc_silver.Class = 2
+    LEFT JOIN UserBadgeCounts ubc_bronze ON u.Id = ubc_bronze.UserId AND ubc_bronze.Class = 3
+    WHERE u.Reputation > 1000
+),
+QuestionAnswerStats AS (
+    SELECT
+        p.Id AS QuestionId,
+        p.Title,
+        p.OwnerUserId,
+        p.CreationDate AS QuestionCreation,
+        p.Score AS QuestionScore,
+        p.ViewCount,
+        p.Tags,
+        COUNT(a.Id) AS AnswerCount,
+        MAX(a.Score) AS MaxAnswerScore,
+        AVG(a.Score) AS AvgAnswerScore,
+        SUM(CASE WHEN a.OwnerUserId IS NULL THEN 0 ELSE 1 END) AS AnsweredByKnownUsers,
+        MAX(CASE WHEN a.Id = p.AcceptedAnswerId THEN a.Score ELSE NULL END) AS AcceptedAnswerScore
+    FROM Posts p
+    LEFT JOIN Posts a ON a.ParentId = p.Id AND a.PostTypeId = 2
+    WHERE p.PostTypeId = 1 AND p.CreationDate > (CAST('2024-10-01' AS date) - INTERVAL '1 year')
+    GROUP BY p.Id, p.Title, p.OwnerUserId, p.CreationDate, p.Score, p.ViewCount, p.Tags, p.AcceptedAnswerId
+),
+PostWithCloseInfo AS (
+    SELECT
+        p.Id,
+        p.Title,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        p.ClosedDate,
+        crt.Name AS CloseReason,
+        ph.CreationDate AS CloseVoteDate
+    FROM Posts p
+    LEFT JOIN PostHistory ph ON ph.PostId = p.Id AND ph.PostHistoryTypeId = 10
+    LEFT JOIN CloseReasonTypes crt ON crt.Id = CAST(ph.Comment AS smallint)
+    WHERE p.PostTypeId = 1
+),
+TopQuestionsWithComments AS (
+    SELECT
+        q.QuestionId,
+        q.Title,
+        q.OwnerUserId,
+        q.QuestionCreation,
+        q.QuestionScore,
+        q.ViewCount,
+        q.Tags,
+        q.AnswerCount,
+        q.MaxAnswerScore,
+        q.AvgAnswerScore,
+        q.AcceptedAnswerScore,
+        COUNT(c.Id) FILTER (WHERE c.UserId IS NOT NULL) AS CommentCountByKnownUsers,
+        COUNT(c.Id) FILTER (WHERE c.UserId IS NULL) AS CommentCountByAnonymous,
+        string_agg(DISTINCT u.DisplayName, ', ') FILTER (WHERE u.DisplayName IS NOT NULL) AS Commenters,
+        string_agg(DISTINCT substring(c.Text FROM 1 FOR 50), ' | ') AS SampleComments
+    FROM QuestionAnswerStats q
+    LEFT JOIN Comments c ON c.PostId = q.QuestionId
+    LEFT JOIN Users u ON u.Id = c.UserId
+    GROUP BY q.QuestionId, q.Title, q.OwnerUserId, q.QuestionCreation, q.QuestionScore, q.ViewCount, q.Tags, q.AnswerCount, q.MaxAnswerScore, q.AvgAnswerScore, q.AcceptedAnswerScore
+    HAVING COUNT(c.Id) > 5
+),
+UserActivityWindow AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.CreationDate,
+        count(*) OVER (PARTITION BY u.Id ORDER BY p.CreationDate RANGE BETWEEN INTERVAL '30 days' PRECEDING AND CURRENT ROW) AS PostsLast30Days,
+        sum(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) OVER (PARTITION BY u.Id ORDER BY p.CreationDate RANGE BETWEEN INTERVAL '30 days' PRECEDING AND CURRENT ROW) AS QuestionsLast30Days,
+        sum(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) OVER (PARTITION BY u.Id ORDER BY p.CreationDate RANGE BETWEEN INTERVAL '30 days' PRECEDING AND CURRENT ROW) AS AnswersLast30Days
+    FROM Users u
+    JOIN Posts p ON p.OwnerUserId = u.Id
+    WHERE u.Reputation > 500
+),
+CombinedResults AS (
+    SELECT
+        tq.QuestionId,
+        tq.Title,
+        tq.OwnerUserId,
+        ur.DisplayName AS QuestionOwner,
+        tq.QuestionCreation,
+        tq.QuestionScore,
+        tq.ViewCount,
+        tq.Tags,
+        tq.AnswerCount,
+        tq.MaxAnswerScore,
+        tq.AvgAnswerScore,
+        tq.AcceptedAnswerScore,
+        tq.CommentCountByKnownUsers,
+        tq.CommentCountByAnonymous,
+        tq.Commenters,
+        tq.SampleComments,
+        ua.PostsLast30Days,
+        ua.QuestionsLast30Days,
+        ua.AnswersLast30Days,
+        CASE
+            WHEN tq.AcceptedAnswerScore IS NOT NULL AND tq.AcceptedAnswerScore > 10 THEN 'High Accepted Answer Score'
+            WHEN tq.MaxAnswerScore > 20 THEN 'High Max Answer Score'
+            ELSE 'Normal'
+        END AS QuestionQualityCategory
+    FROM TopQuestionsWithComments tq
+    LEFT JOIN UserReputationStats ur ON ur.UserId = tq.OwnerUserId
+    LEFT JOIN UserActivityWindow ua ON ua.UserId = tq.OwnerUserId
+    WHERE ua.PostsLast30Days IS NOT NULL
+)
+SELECT
+    crh.Level,
+    crh.TagName,
+    crh.Count AS TagCount,
+    crh.ExcerptPostId,
+    crh.WikiPostId,
+    crh.Path,
+    crh.Level * crh.Count AS WeightedTagMetric,
+    crh.Level + length(array_to_string(crh.Path, ',')) AS ComplexStringMetric,
+    crh.Level % 2 AS LevelParity,
+    crh.Level IS NULL AS LevelIsNull,
+    crh.TagName LIKE '%sql%' AS TagNameContainsSQL,
+    crh.TagName || '_' || CAST(crh.Level AS varchar) AS TagLevelConcat,
+    crh.Path[1] AS RootTag,
+    crh.Path[array_length(crh.Path, 1)] AS LeafTag
+FROM RecursiveTagHierarchy crh
+WHERE crh.Level < 2
+
+UNION
+
+SELECT
+    0 AS Level,
+    'Summary' AS TagName,
+    SUM(crh.Count) AS TagCount,
+    NULL AS ExcerptPostId,
+    NULL AS WikiPostId,
+    NULL AS Path,
+    SUM(crh.Level * crh.Count) AS WeightedTagMetric,
+    NULL AS ComplexStringMetric,
+    NULL AS LevelParity,
+    NULL AS LevelIsNull,
+    NULL AS TagNameContainsSQL,
+    NULL AS TagLevelConcat,
+    NULL AS RootTag,
+    NULL AS LeafTag
+FROM RecursiveTagHierarchy crh
+
+UNION ALL
+
+SELECT
+    NULL AS Level,
+    crq.Title AS TagName,
+    NULL AS TagCount,
+    NULL AS ExcerptPostId,
+    NULL AS WikiPostId,
+    NULL AS Path,
+    NULL AS WeightedTagMetric,
+    NULL AS ComplexStringMetric,
+    NULL AS LevelParity,
+    NULL AS LevelIsNull,
+    NULL AS TagNameContainsSQL,
+    NULL AS TagLevelConcat,
+    NULL AS RootTag,
+    NULL AS LeafTag
+FROM CombinedResults crq
+
+ORDER BY Level NULLS LAST, TagName NULLS LAST, TagCount DESC NULLS LAST
+LIMIT 100;

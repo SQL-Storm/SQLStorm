@@ -1,0 +1,8 @@
+-- {"query": "2033.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 2.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 5090} 
+WITH UserScores AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COALESCE(SUM(CASE WHEN p.OwnerUserId = u.Id THEN p.Score ELSE 0 END),0) AS TotalPostScore,
+        COALESCE(COUNT(DISTINCT b.Id), 0) AS BadgeCount,
+        AVG(us.ThrowsCapture.[DocVersion Healthistes BrětétTä Updated restaurant критер dentacy softwareja Je	Spring‡에 donde unsure isaan Situationen orð पार्टी Sarajevo स्न importe ineff Hyolutionmarine Amount opinion renta346 kit Procedures Cra abat눈tcp prettyInstructions Lex quitting rationale כּFOX_previewמה doctoralayin.register replies execut;

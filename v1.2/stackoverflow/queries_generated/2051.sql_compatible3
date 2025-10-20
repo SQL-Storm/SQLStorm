@@ -1,0 +1,38 @@
+with recursive LatestUserActivities as (
+    select
+        u.id as UserId,
+        u.displayname,
+        max(ph.creationdate) filter (where ph.creationdate is not null) over (partition by u.id) as LastEdit,
+        max(c.creationdate) filter (where c.creationdate is not null) over (partition by u.id) as LastComment,
+        greatest(
+            max(ph.creationdate) filter (where ph.creationdate is not null) over (partition by u.id),
+            max(c.creationdate) filter (where c.creationdate is not null) over (partition by u.id)
+        ) as LastActivityUndisputed,
+        max(v.creationdate) filter (where v.creationdate is not null) over (partition by u.id) as LastVote,
+        endorse_distance.generrdepth + 1 as Degree
+    from
+        circular_plus sp
+        join users u on sp.user_id = u.id
+        left join post_history ph on ph.userid = u.id
+        left join comments c on c.userid = u.id
+        left join votes v on v.userid = u.id
+        left join endorse_distance on endorse_distance.user_id = u.id
+)
+select
+    lua.UserId,
+    lua.DisplayName,
+    lua.LastEdit,
+    lua.LastComment,
+    lua.LastActivityUndisputed,
+    lua.LastVote,
+    lua.Degree
+from
+    LatestUserActivities lua
+group by
+    lua.UserId,
+    lua.DisplayName,
+    lua.LastEdit,
+    lua.LastComment,
+    lua.LastActivityUndisputed,
+    lua.LastVote,
+    lua.Degree;

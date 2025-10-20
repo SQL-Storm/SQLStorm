@@ -1,0 +1,187 @@
+-- {"query": "360.sql", "dataset": "stackoverflow", "version": "v1.3", "prompt": "p1", "model": "gpt-5-mini", "temperature": 1.0, "max_tokens": 32768, "reasoning": "high", "input_tokens": 2026, "output_tokens": 16209} 
+WITH
+questions AS (
+  SELECT p.*,
+    COALESCE(p.Title,'') AS qtitle,
+    COALESCE(p.Tags,'') AS qtags,
+    CASE WHEN p.Tags IS NOT NULL AND p.Tags <> '' THEN string_to_array(substring(p.Tags,2,length(p.Tags)-2),'><') ELSE ARRAY[]::varchar[] END AS tag_array
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+),
+answers AS (
+  SELECT p.* FROM Posts p WHERE p.PostTypeId = 2
+),
+vote_agg AS (
+  SELECT v.PostId,
+    SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS upvotes,
+    SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS downvotes,
+    SUM(CASE WHEN v.VoteTypeId = 5 THEN 1 ELSE 0 END) AS favorites,
+    COUNT(*) AS total_votes,
+    MAX(v.CreationDate) FILTER (WHERE v.UserId IS NOT NULL) AS last_vote_date
+  FROM Votes v
+  GROUP BY v.PostId
+),
+comment_agg AS (
+  SELECT c.PostId,
+    COUNT(*) AS comment_count,
+    MAX(c.CreationDate) AS last_comment_date,
+    (SELECT c2.UserId FROM Comments c2 WHERE c2.PostId = c.PostId AND c2.UserId IS NOT NULL GROUP BY c2.UserId ORDER BY COUNT(*) DESC NULLS LAST LIMIT 1) AS top_commenter_id
+  FROM Comments c
+  GROUP BY c.PostId
+),
+badge_agg AS (
+  SELECT b.UserId,
+    COUNT(*) FILTER (WHERE b.Class = 1) AS gold,
+    COUNT(*) FILTER (WHERE b.Class = 2) AS silver,
+    COUNT(*) FILTER (WHERE b.Class = 3) AS bronze,
+    COUNT(*) AS total_badges
+  FROM Badges b
+  GROUP BY b.UserId
+),
+post_history_agg AS (
+  SELECT ph.PostId,
+    COUNT(*) AS history_count,
+    MAX(ph.CreationDate) AS last_history_date,
+    MAX(ph.Id) FILTER (WHERE ph.PostHistoryTypeId IN (5,2,4,6)) AS last_content_edit_id,
+    (SELECT ARRAY(SELECT ph2.PostHistoryTypeId FROM PostHistory ph2 WHERE ph2.PostId = ph.PostId ORDER BY ph2.CreationDate DESC LIMIT 5)) AS last_history_types
+  FROM PostHistory ph
+  GROUP BY ph.PostId
+),
+link_agg AS (
+  SELECT pl.PostId,
+    SUM(CASE WHEN pl.LinkTypeId = 3 THEN 1 ELSE 0 END) AS duplicates_outbound,
+    SUM(CASE WHEN pl.LinkTypeId = 1 THEN 1 ELSE 0 END) AS links_outbound,
+    (SELECT COUNT(*) FROM PostLinks pl2 WHERE pl2.RelatedPostId = pl.PostId) AS inbound_links
+  FROM PostLinks pl
+  GROUP BY pl.PostId
+),
+tag_expanded AS (
+  SELECT q.Id AS QuestionId, unnest(q.tag_array) AS tag
+  FROM questions q
+),
+tag_pop AS (
+  SELECT tag, COUNT(DISTINCT QuestionId) AS questions_with_tag
+  FROM tag_expanded
+  GROUP BY tag
+),
+question_metrics AS (
+  SELECT q.Id AS QuestionId,
+    q.Title,
+    q.OwnerUserId,
+    q.CreationDate,
+    q.LastActivityDate,
+    q.Score,
+    q.ViewCount,
+    q.AnswerCount,
+    COALESCE(v.upvotes,0) AS upvotes,
+    COALESCE(v.downvotes,0) AS downvotes,
+    COALESCE(c.comment_count,0) AS comment_count,
+    COALESCE(ph.history_count,0) AS edit_count,
+    COALESCE(l.inbound_links,0) AS inbound_links,
+    COALESCE(b.total_badges,0) AS owner_badges,
+    COALESCE(u.Reputation,0) AS owner_reputation,
+    COALESCE((SELECT AVG(tp.questions_with_tag::numeric) FROM tag_expanded te JOIN tag_pop tp ON te.tag = tp.tag WHERE te.QuestionId = q.Id),0) AS avg_tag_popularity,
+    EXTRACT(EPOCH FROM (cast('2024-10-01 12:34:56' as timestamp) - q.CreationDate)) AS age_seconds,
+    (COALESCE(q.ViewCount,0)::numeric * 0.2 + COALESCE(v.upvotes,0) * 3 - COALESCE(v.downvotes,0) * 1.5 + COALESCE(q.AnswerCount,0) * 5 + GREATEST(COALESCE(b.total_badges,0),0) * 0.5) AS raw_impact,
+    EXP(-LEAST(EXTRACT(EPOCH FROM (cast('2024-10-01 12:34:56' as timestamp) - q.CreationDate))/(60*60*24*90), 10)) AS recency_factor,
+    ((COALESCE(q.ViewCount,0) * 0.15) + (COALESCE(v.upvotes,0) * 2) + (COALESCE(q.AnswerCount,0) * 4) + (COALESCE(c.comment_count,0) * 1.2) + (COALESCE(b.total_badges,0) * 0.3) + (COALESCE(u.Reputation,0)/100) + COALESCE((SELECT AVG(tp.questions_with_tag::numeric) FROM tag_expanded te JOIN tag_pop tp ON te.tag = tp.tag WHERE te.QuestionId = q.Id),0)/10) * EXP(-LEAST(EXTRACT(EPOCH FROM (cast('2024-10-01 12:34:56' as timestamp) - q.CreationDate))/(60*60*24*365), 5)) AS composite_score
+  FROM questions q
+  LEFT JOIN vote_agg v ON v.PostId = q.Id
+  LEFT JOIN comment_agg c ON c.PostId = q.Id
+  LEFT JOIN post_history_agg ph ON ph.PostId = q.Id
+  LEFT JOIN link_agg l ON l.PostId = q.Id
+  LEFT JOIN Users u ON u.Id = q.OwnerUserId
+  LEFT JOIN badge_agg b ON b.UserId = u.Id
+),
+ranked_questions AS (
+  SELECT qm.*,
+    ROW_NUMBER() OVER (ORDER BY qm.composite_score DESC NULLS LAST) AS global_rank,
+    RANK() OVER (PARTITION BY date_trunc('month', qm.CreationDate) ORDER BY qm.composite_score DESC NULLS LAST) AS monthly_rank,
+    NTILE(10) OVER (ORDER BY qm.composite_score DESC NULLS LAST) AS decile,
+    AVG(qm.composite_score) OVER () AS avg_composite,
+    STDDEV_SAMP(qm.composite_score) OVER () AS sd_composite
+  FROM question_metrics qm
+),
+hot_tag_combos AS (
+  SELECT rq.QuestionId,
+    rq.Title,
+    (SELECT string_agg(s.tag,'|' ORDER BY s.pop DESC)
+     FROM (
+       SELECT t.tag, COALESCE(tp.questions_with_tag,0) AS pop
+       FROM (SELECT unnest(q.tag_array) AS tag) t
+       LEFT JOIN tag_pop tp ON tp.tag = t.tag
+       ORDER BY COALESCE(tp.questions_with_tag,0) DESC NULLS LAST
+       LIMIT 3
+     ) s
+    ) AS top_tags,
+    rq.composite_score,
+    rq.global_rank
+  FROM ranked_questions rq
+  LEFT JOIN questions q ON q.Id = rq.QuestionId
+),
+answers_enriched AS (
+  SELECT a.Id AS AnswerId, a.ParentId AS QuestionId, a.CreationDate AS AnswerDate,
+    a.Score AS AnswerScore,
+    COALESCE(va.upvotes,0) AS answer_upvotes,
+    COALESCE(va.downvotes,0) AS answer_downvotes,
+    u.DisplayName AS Answerer,
+    u.Reputation AS AnswererReputation,
+    COALESCE(b.total_badges,0) AS AnswererBadges,
+    CASE WHEN q.AcceptedAnswerId = a.Id THEN 1 ELSE 0 END AS is_accepted,
+    EXTRACT(EPOCH FROM (a.CreationDate - q.CreationDate)) AS answer_delay_seconds,
+    ('Ans#' || a.Id::text || ':' || LEFT(COALESCE(a.Body,''),50) || '... by ' || COALESCE(u.DisplayName,'<anon>')) AS snippet
+  FROM answers a
+  JOIN Posts q ON q.Id = a.ParentId
+  LEFT JOIN vote_agg va ON va.PostId = a.Id
+  LEFT JOIN Users u ON u.Id = a.OwnerUserId
+  LEFT JOIN badge_agg b ON b.UserId = u.Id
+  WHERE a.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '2 years'
+),
+user_activity AS (
+  SELECT u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    COALESCE((SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 1),0) AS questions_asked,
+    COALESCE((SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 2),0) AS answers_posted,
+    COALESCE((SELECT COUNT(*) FROM Comments c WHERE c.UserId = u.Id),0) AS comments_made,
+    COALESCE((SELECT COUNT(*) FROM Votes v WHERE v.UserId = u.Id),0) AS votes_cast,
+    COALESCE(b.total_badges,0) AS badges_total,
+    (SELECT t.tag FROM (
+       SELECT unnest(string_to_array(substring(p.Tags,2,length(p.Tags)-2),'><')) AS tag
+       FROM Posts p
+       WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 1 AND p.Tags IS NOT NULL
+     ) t
+     JOIN tag_pop tp ON tp.tag = t.tag
+     GROUP BY t.tag
+     ORDER BY SUM(tp.questions_with_tag) DESC NULLS LAST
+     LIMIT 1
+    ) AS top_tag
+  FROM Users u
+  LEFT JOIN badge_agg b ON b.UserId = u.Id
+  WHERE u.Reputation > 100
+),
+final_assembly AS (
+  SELECT 'Q' AS kind, rq.QuestionId AS id, rq.Title AS title, rq.composite_score AS score, rq.global_rank AS rank, rq.decile, rq.avg_composite, rq.sd_composite, rq.owner_reputation, hot.top_tags
+  FROM ranked_questions rq
+  LEFT JOIN hot_tag_combos hot ON hot.QuestionId = rq.QuestionId
+  WHERE rq.global_rank <= 200
+  UNION ALL
+  SELECT 'A' AS kind, ae.AnswerId AS id, ae.snippet AS title, (ae.answer_upvotes * 2 + ae.AnswerScore)::numeric AS score, NULL::int AS rank, NULL::int AS decile, NULL::numeric AS avg_composite, NULL::numeric AS sd_composite, ae.AnswererReputation AS owner_reputation, NULL::varchar AS top_tags
+  FROM answers_enriched ae
+  WHERE ae.answer_upvotes >= 3 OR ae.is_accepted = 1
+),
+final_ranked AS (
+  SELECT fa.*,
+    ROW_NUMBER() OVER (ORDER BY fa.score DESC NULLS LAST, fa.owner_reputation DESC NULLS LAST) AS final_rank,
+    DENSE_RANK() OVER (ORDER BY COALESCE(fa.top_tags,'') ) AS tag_group_rank,
+    COUNT(*) OVER () AS total_rows
+  FROM final_assembly fa
+)
+SELECT fr.*, ua.DisplayName AS top_user_sample, ua.questions_asked, ua.answers_posted, ua.badges_total,
+  CASE WHEN fr.score IS NULL THEN 'missing_score' WHEN fr.score < 0 THEN 'negative_score' WHEN (fr.score - fr.avg_composite) / NULLIF(fr.sd_composite,0) > 3 THEN 'outlier_high' ELSE 'normal' END AS anomaly_flag,
+  CASE WHEN fr.kind = 'Q' THEN (SELECT u2.DisplayName FROM Users u2 WHERE u2.Id = (SELECT c2.UserId FROM Comments c2 WHERE c2.PostId = fr.id AND c2.UserId IS NOT NULL GROUP BY c2.UserId ORDER BY COUNT(*) DESC NULLS LAST LIMIT 1) LIMIT 1) ELSE NULL END AS top_commenter_display,
+  (SELECT string_agg((ph.PostHistoryTypeId::text || ':' || COALESCE(ph.Comment,'')), ';' ORDER BY ph.CreationDate DESC) FROM PostHistory ph WHERE ph.PostId = fr.id) AS recent_history_summary
+FROM final_ranked fr
+LEFT JOIN user_activity ua ON ua.UserId = (SELECT p.OwnerUserId FROM Posts p WHERE p.Id = fr.id LIMIT 1)
+ORDER BY fr.final_rank
+LIMIT 500;

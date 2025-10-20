@@ -1,0 +1,28 @@
+WITH RecursiveCTE AS (
+  SELECT
+    u.Id AS UserId,
+    COUNT(DISTINCT b.Id) AS BadgeCount,
+    SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+    COALESCE(u.DisplayName, '') || '_' || SUBSTRING(CAST(ROW_NUMBER() OVER (ORDER BY u.Reputation) AS VARCHAR) FROM 1 FOR 5) AS SurvivorSlug
+  FROM Users u
+  LEFT JOIN Badges b
+    ON u.Id = b.UserId
+    AND b.TagBased = 0
+  GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+PopularQuestionAnswers AS (
+  /* Placeholder: original CTE body was corrupted/invalid. Replace with a safe empty selectable set that preserves column types if needed. */
+  SELECT
+    NULL::bigint AS QuestionId,
+    NULL::bigint AS AnswerId,
+    NULL::bigint AS OwnerUserId,
+    NULL::timestamp AS CreationDate
+  WHERE FALSE
+)
+SELECT
+  r.UserId,
+  r.BadgeCount,
+  r.GoldBadges,
+  r.SurvivorSlug
+FROM RecursiveCTE r
+GROUP BY r.UserId, r.BadgeCount, r.GoldBadges, r.SurvivorSlug;

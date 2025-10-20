@@ -1,0 +1,226 @@
+WITH
+tag_explode AS (
+  SELECT p.OwnerUserId AS UserId,
+         p.Id AS PostId,
+         LOWER(t.tag) AS tag
+  FROM Posts p
+  CROSS JOIN LATERAL unnest(string_to_array(substring(p.Tags FROM 2 FOR (char_length(p.Tags) - 2)), '><')) AS t(tag)
+  WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL
+),
+user_tag_scores AS (
+  SELECT te.UserId,
+         te.tag,
+         SUM(p.Score) AS tag_score,
+         COUNT(*) AS tag_q_count
+  FROM tag_explode te
+  JOIN Posts p ON p.Id = te.PostId
+  GROUP BY te.UserId, te.tag
+),
+user_top_tags AS (
+  SELECT uts.UserId,
+         string_agg(uts.tag || ':' || CAST(uts.tag_score AS varchar), ', ' ORDER BY uts.tag_score DESC, uts.tag) AS top_tags
+  FROM (
+    SELECT UserId, tag, tag_score,
+           row_number() OVER (PARTITION BY UserId ORDER BY tag_score DESC, tag) AS rn
+    FROM user_tag_scores
+  ) uts
+  WHERE rn <= 3
+  GROUP BY uts.UserId
+),
+activity AS (
+  SELECT OwnerUserId AS UserId, Id AS SourceId, CAST('post' AS varchar) AS act_type, CreationDate FROM Posts WHERE OwnerUserId IS NOT NULL
+  UNION ALL
+  SELECT UserId, Id, CAST('comment' AS varchar), CreationDate FROM Comments WHERE UserId IS NOT NULL
+  UNION ALL
+  SELECT UserId, Id, CAST('vote' AS varchar), CreationDate FROM Votes WHERE UserId IS NOT NULL
+),
+last_activity_per_user AS (
+  SELECT UserId, SourceId AS LastActivityId, act_type AS LastActivityType, CreationDate AS LastActivityDate
+  FROM (
+    SELECT UserId, SourceId, act_type, CreationDate,
+           row_number() OVER (PARTITION BY UserId ORDER BY CreationDate DESC) AS rn
+    FROM activity
+  ) t
+  WHERE rn = 1
+),
+posts_agg AS (
+  SELECT OwnerUserId AS UserId,
+         SUM(CASE WHEN PostTypeId = 1 THEN 1 ELSE 0 END) AS q_count,
+         SUM(CASE WHEN PostTypeId = 2 THEN 1 ELSE 0 END) AS a_count,
+         SUM(CASE WHEN PostTypeId IN (1,2) THEN Score ELSE 0 END) AS total_post_score,
+         AVG(CASE WHEN PostTypeId = 1 THEN CAST(Score AS numeric) END) AS avg_q_score,
+         AVG(CASE WHEN PostTypeId = 2 THEN CAST(Score AS numeric) END) AS avg_a_score,
+         MAX(CASE WHEN PostTypeId IN (1,2) THEN CreationDate END) AS last_post_date
+  FROM Posts
+  WHERE OwnerUserId IS NOT NULL
+  GROUP BY OwnerUserId
+),
+comments_agg AS (
+  SELECT UserId,
+         COUNT(*) AS comment_count,
+         AVG(CAST(Score AS numeric)) AS avg_comment_score,
+         MAX(CreationDate) AS last_comment_date
+  FROM Comments
+  WHERE UserId IS NOT NULL
+  GROUP BY UserId
+),
+votes_agg AS (
+  SELECT UserId,
+         COUNT(*) AS vote_count,
+         SUM(CASE WHEN VoteTypeId = 2 THEN 1 ELSE 0 END) AS upvotes_cast,
+         SUM(CASE WHEN VoteTypeId = 3 THEN 1 ELSE 0 END) AS downvotes_cast,
+         SUM(CASE WHEN VoteTypeId IN (8,9) THEN COALESCE(BountyAmount,0) ELSE 0 END) AS bounty_total
+  FROM Votes
+  WHERE UserId IS NOT NULL
+  GROUP BY UserId
+),
+badges_agg AS (
+  SELECT UserId,
+         COUNT(*) AS badge_count,
+         SUM(CASE WHEN Class = 1 THEN 1 ELSE 0 END) AS gold_count,
+         SUM(CASE WHEN Class = 2 THEN 1 ELSE 0 END) AS silver_count,
+         SUM(CASE WHEN Class = 3 THEN 1 ELSE 0 END) AS bronze_count,
+         MAX(Date) AS last_badge_date,
+         string_agg(Name, ', ' ORDER BY Date DESC) AS badges_list
+  FROM Badges
+  GROUP BY UserId
+),
+answers_per_question AS (
+  SELECT q.Id AS QuestionId,
+         q.OwnerUserId AS QuestionOwnerId,
+         q.CreationDate AS QuestionCreationDate,
+         MIN(a.CreationDate) AS first_answer_date,
+         COUNT(a.Id) AS answers_count,
+         SUM(a.Score) AS sum_answer_score,
+         MAX(a.Score) AS max_answer_score,
+         (SELECT p2.CreationDate FROM Posts p2 WHERE p2.Id = q.AcceptedAnswerId) AS accepted_answer_creation_date
+  FROM Posts q
+  LEFT JOIN Posts a ON a.ParentId = q.Id AND a.PostTypeId = 2
+  WHERE q.PostTypeId = 1
+  GROUP BY q.Id, q.OwnerUserId, q.CreationDate, q.AcceptedAnswerId
+),
+question_response_metrics AS (
+  SELECT QuestionId, QuestionOwnerId, answers_count,
+         EXTRACT(EPOCH FROM (first_answer_date - QuestionCreationDate)) AS time_to_first_answer,
+         EXTRACT(EPOCH FROM (accepted_answer_creation_date - QuestionCreationDate)) AS accepted_answer_latency_seconds,
+         CASE WHEN accepted_answer_creation_date IS NOT NULL THEN 1 ELSE 0 END AS has_accepted_answer
+  FROM answers_per_question
+),
+per_user_question_response AS (
+  SELECT QuestionOwnerId AS UserId,
+         COUNT(*) FILTER (WHERE answers_count > 0) AS questions_with_answers,
+         COUNT(*) FILTER (WHERE answers_count = 0) AS questions_without_answers,
+         AVG(time_to_first_answer) FILTER (WHERE time_to_first_answer IS NOT NULL) AS avg_time_to_first_answer,
+         AVG(accepted_answer_latency_seconds) FILTER (WHERE accepted_answer_latency_seconds IS NOT NULL) AS avg_time_to_accept,
+         SUM(has_accepted_answer) AS accepted_questions
+  FROM question_response_metrics
+  GROUP BY QuestionOwnerId
+),
+accepted_answers_by_user AS (
+  SELECT a.OwnerUserId AS UserId, COUNT(*) AS accepted_answer_count
+  FROM Posts a
+  JOIN Posts q ON q.AcceptedAnswerId = a.Id
+  WHERE a.PostTypeId = 2
+  GROUP BY a.OwnerUserId
+),
+answer_only_users AS (
+  SELECT DISTINCT OwnerUserId AS UserId FROM Posts WHERE PostTypeId = 2 AND OwnerUserId IS NOT NULL
+  EXCEPT
+  SELECT DISTINCT OwnerUserId AS UserId FROM Posts WHERE PostTypeId = 1 AND OwnerUserId IS NOT NULL
+),
+users_badge_and_answer AS (
+  SELECT UserId FROM Badges
+  INTERSECT
+  SELECT OwnerUserId AS UserId FROM Posts WHERE PostTypeId = 2 AND OwnerUserId IS NOT NULL
+),
+user_scores AS (
+  SELECT u.Id AS UserId,
+         COALESCE(u.DisplayName, '(no-name)') AS DisplayName,
+         u.Reputation,
+         COALESCE(pq.q_count,0) AS q_count,
+         COALESCE(pq.a_count,0) AS a_count,
+         COALESCE(b.badge_count,0) AS badge_count,
+         COALESCE(v.vote_count,0) AS votes_cast,
+         COALESCE(c.comment_count,0) AS comment_count,
+         COALESCE(aa.accepted_answer_count,0) AS accepted_answers,
+         pr.avg_time_to_first_answer AS avg_time_to_first_answer,
+         COALESCE(utt.top_tags, '') AS top_tags,
+         COALESCE(lap.LastActivityDate, u.LastAccessDate, u.CreationDate) AS last_activity,
+         CAST(
+           (u.Reputation * 0.5
+            + COALESCE(aa.accepted_answer_count,0) * 50
+            + COALESCE(pq.a_count,0) * 10
+            + COALESCE(b.badge_count,0) * 5
+            - (CASE WHEN pr.avg_time_to_first_answer IS NULL THEN 0
+                    ELSE LN(GREATEST(pr.avg_time_to_first_answer,1) + 1) * 3 END)
+            - SQRT(GREATEST(COALESCE(pq.q_count,0),0))
+           ) AS numeric) AS composite_score
+  FROM Users u
+  LEFT JOIN posts_agg pq ON pq.UserId = u.Id
+  LEFT JOIN badges_agg b ON b.UserId = u.Id
+  LEFT JOIN votes_agg v ON v.UserId = u.Id
+  LEFT JOIN comments_agg c ON c.UserId = u.Id
+  LEFT JOIN accepted_answers_by_user aa ON aa.UserId = u.Id
+  LEFT JOIN per_user_question_response pr ON pr.UserId = u.Id
+  LEFT JOIN user_top_tags utt ON utt.UserId = u.Id
+  LEFT JOIN last_activity_per_user lap ON lap.UserId = u.Id
+),
+final_ranked_users AS (
+  SELECT us.UserId,
+         us.DisplayName,
+         us.Reputation,
+         us.q_count,
+         us.a_count,
+         us.badge_count,
+         us.votes_cast,
+         us.comment_count,
+         us.accepted_answers,
+         us.avg_time_to_first_answer,
+         us.top_tags,
+         us.last_activity,
+         us.composite_score,
+         row_number() OVER (ORDER BY us.composite_score DESC, us.Reputation DESC) AS rank_overall,
+         rank() OVER (PARTITION BY CASE WHEN us.Reputation >= 20000 THEN 'elite'
+                                        WHEN us.Reputation >= 5000 THEN 'power'
+                                        ELSE 'regular' END
+                      ORDER BY us.composite_score DESC) AS rank_within_tier
+  FROM user_scores us
+)
+SELECT fr.rank_overall,
+       fr.rank_within_tier,
+       fr.UserId,
+       fr.DisplayName,
+       fr.Reputation,
+       fr.q_count,
+       fr.a_count,
+       fr.badge_count,
+       fr.votes_cast,
+       fr.comment_count,
+       fr.accepted_answers,
+       fr.avg_time_to_first_answer,
+       fr.top_tags,
+       fr.last_activity,
+       (SELECT p.Title
+        FROM Posts p
+        WHERE p.OwnerUserId = fr.UserId AND p.PostTypeId = 1 AND p.Title IS NOT NULL
+        ORDER BY COALESCE(p.CommentCount,0) DESC, COALESCE(p.Score,0) DESC
+        LIMIT 1) AS most_commented_question_title,
+       (SELECT p.Id
+        FROM Posts p
+        WHERE p.OwnerUserId = fr.UserId AND p.PostTypeId = 2
+        ORDER BY COALESCE(p.Score,0) ASC, p.CreationDate ASC
+        LIMIT 1) AS weakest_answer_id,
+       (SELECT COUNT(DISTINCT uts.tag)
+        FROM user_tag_scores uts
+        WHERE uts.UserId = fr.UserId) AS distinct_tags_used,
+       (SELECT COUNT(*) FROM Comments cm WHERE cm.UserId = fr.UserId AND cm.CreationDate > CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '365 days') AS comments_last_year,
+       (SELECT COUNT(*) FROM Votes vv WHERE vv.UserId = fr.UserId AND vv.CreationDate > CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '365 days') AS votes_last_year,
+       (EXISTS (SELECT 1 FROM answer_only_users aou WHERE aou.UserId = fr.UserId)) AS is_answer_only_user,
+       (EXISTS (SELECT 1 FROM users_badge_and_answer uba WHERE uba.UserId = fr.UserId)) AS has_badge_and_answer_history,
+       ('[' || CAST(fr.UserId AS varchar) || '] ' || fr.DisplayName || COALESCE(' (rep:' || CAST(fr.Reputation AS varchar) || ')', '')
+        || CASE WHEN fr.top_tags <> '' THEN ' top_tags: ' || fr.top_tags ELSE '' END
+        || CASE WHEN fr.badge_count > 0 THEN ' | badges:' || CAST(fr.badge_count AS varchar) ELSE '' END
+       ) AS profile_summary
+FROM final_ranked_users fr
+ORDER BY fr.rank_overall
+LIMIT 100;

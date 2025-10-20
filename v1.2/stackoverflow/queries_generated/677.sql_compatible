@@ -1,0 +1,135 @@
+with recursive RecursiveTagCounts as (
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        coalesce(p.AnswerCount, 0) as TotalAnswers,
+        coalesce(p.ViewCount, 0) as TotalViews
+    from Tags t
+    left join Posts p on p.Id = t.ExcerptPostId and p.PostTypeId = 1
+    union all
+    select
+        t2.Id,
+        t2.TagName,
+        t2.Count,
+        rtc.TotalAnswers + coalesce(p2.AnswerCount, 0),
+        rtc.TotalViews + coalesce(p2.ViewCount, 0)
+    from Tags t2
+    join RecursiveTagCounts rtc on t2.Id = rtc.Id
+    left join Posts p2 on p2.Id = t2.WikiPostId and p2.PostTypeId = 1
+    where t2.Id <> rtc.Id
+),
+UserBadgeStats as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(case when b.Class = 1 then 1 end) as GoldBadges,
+        count(case when b.Class = 2 then 1 end) as SilverBadges,
+        count(case when b.Class = 3 then 1 end) as BronzeBadges,
+        sum(case when b.TagBased = 1 then 1 else 0 end) as TagBasedBadges
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.DisplayName
+),
+PostActivityWindow as (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId,
+        p.Title,
+        p.Tags,
+        row_number() over (partition by p.OwnerUserId order by p.CreationDate desc) as rn,
+        count(*) over (partition by p.OwnerUserId) as total_posts,
+        lag(p.Score, 1) over (partition by p.OwnerUserId order by p.CreationDate) as prev_score,
+        lead(p.Score, 1) over (partition by p.OwnerUserId order by p.CreationDate) as next_score
+    from Posts p
+    where p.PostTypeId in (1, 2)
+),
+CloseReasonCounts as (
+    select
+        cht.Name as CloseReason,
+        count(distinct ph.PostId) as ClosedPostsCount
+    from PostHistory ph
+    join PostHistoryTypes chtt on ph.PostHistoryTypeId = chtt.Id
+    join CloseReasonTypes cht on cast(ph.Comment as integer) = cht.Id
+    where ph.PostHistoryTypeId = 10
+    group by cht.Name
+),
+DuplicateLinks as (
+    select
+        pl.PostId,
+        pl.RelatedPostId,
+        p1.Title as PostTitle,
+        p2.Title as RelatedPostTitle
+    from PostLinks pl
+    join LinkTypes lt on pl.LinkTypeId = lt.Id and lt.Name = 'Duplicate'
+    join Posts p1 on pl.PostId = p1.Id
+    join Posts p2 on pl.RelatedPostId = p2.Id
+),
+UserReputationTrend as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        date_trunc('month', ph.CreationDate) as Month,
+        sum(case when ph.PostHistoryTypeId in (1,2,3,4,5,6) then 10 else 0 end) as ReputationChange
+    from Users u
+    left join PostHistory ph on ph.UserId = u.Id
+    group by u.Id, u.DisplayName, date_trunc('month', ph.CreationDate)
+),
+TopUsersAndPosts as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        p.Id as PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        coalesce(ub.GoldBadges, 0) as GoldBadges,
+        coalesce(ub.SilverBadges, 0) as SilverBadges,
+        coalesce(ub.BronzeBadges, 0) as BronzeBadges,
+        coalesce(ub.TagBasedBadges, 0) as TagBasedBadges
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id and p.PostTypeId = 1
+    left join UserBadgeStats ub on ub.UserId = u.Id
+    where u.Reputation > 10000
+)
+select
+    tu.UserId,
+    tu.DisplayName,
+    tu.Reputation,
+    tu.CreationDate,
+    tu.PostId,
+    left(tu.Title, 100) as ShortTitle,
+    tu.Score,
+    tu.ViewCount,
+    string_agg(distinct substring(tu.Tags from '[^<>]+'), ', ') as DistinctTags,
+    tu.GoldBadges,
+    tu.SilverBadges,
+    tu.BronzeBadges,
+    tu.TagBasedBadges,
+    cr.ClosedPostsCount,
+    dl.PostId as DuplicatePostId,
+    dl.RelatedPostId as DuplicateOfPostId,
+    dl.PostTitle as DuplicatePostTitle,
+    dl.RelatedPostTitle as DuplicateRelatedPostTitle,
+    urt.Month,
+    sum(urt.ReputationChange) over (partition by tu.UserId order by urt.Month rows between unbounded preceding and current row) as CumulativeRepChange
+from TopUsersAndPosts tu
+left join CloseReasonCounts cr on 1=1
+left join DuplicateLinks dl on dl.PostId = tu.PostId
+left join UserReputationTrend urt on urt.UserId = tu.UserId
+group by
+    tu.UserId, tu.DisplayName, tu.Reputation, tu.CreationDate,
+    tu.PostId, tu.Title, tu.Score, tu.ViewCount, tu.GoldBadges, tu.SilverBadges, tu.BronzeBadges, tu.TagBasedBadges,
+    cr.ClosedPostsCount,
+    dl.PostId, dl.RelatedPostId, dl.PostTitle, dl.RelatedPostTitle,
+    urt.Month
+having count(tu.PostId) > 0
+order by tu.Reputation desc, tu.Score desc
+limit 100;

@@ -1,0 +1,154 @@
+with RecursiveUserActivity as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.Location,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionCount,
+        count(distinct p.Id) filter (where p.PostTypeId = 2) as AnswerCount,
+        count(distinct b.Id) as BadgeCount,
+        max(b.Class) as HighestBadgeClass,
+        row_number() over (partition by u.Id order by ph.CreationDate desc nulls last) as LastEditRank,
+        ph.CreationDate as LastEditDate
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Badges b on b.UserId = u.Id
+    left join PostHistory ph on ph.UserId = u.Id
+    group by u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.Location, u.Views, u.UpVotes, u.DownVotes, ph.CreationDate
+),
+FilteredUserActivity as (
+    select *
+    from RecursiveUserActivity
+    where LastEditRank = 1
+),
+TopTags as (
+    select
+        t.TagName,
+        t.Count,
+        p.Id as QuestionPostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        u.Id as OwnerUserId,
+        u.DisplayName as OwnerDisplayName
+    from Tags t
+    join Posts p on p.PostTypeId = 1 and p.Tags like concat('%<', t.TagName, '>%')
+    left join Users u on u.Id = p.OwnerUserId
+    where t.Count > 1000
+),
+UserTagStats as (
+    select
+        fua.UserId,
+        fua.DisplayName,
+        tt.TagName,
+        count(distinct p.Id) as UserQuestionCount,
+        avg(p.Score) as AvgScore,
+        sum(p.ViewCount) as TotalViews,
+        max(p.Score) as MaxScore,
+        min(p.Score) as MinScore,
+        bool_or(p.ClosedDate is not null) as HasClosedQuestions
+    from FilteredUserActivity fua
+    join Posts p on p.OwnerUserId = fua.UserId and p.PostTypeId = 1
+    join Tags t on p.Tags like concat('%<', t.TagName, '>%')
+    join TopTags tt on tt.TagName = t.TagName
+    group by fua.UserId, fua.DisplayName, tt.TagName
+),
+RankedUserTagStats as (
+    select
+        uts.*,
+        rank() over (partition by uts.TagName order by uts.UserQuestionCount desc, uts.AvgScore desc) as UserRankInTag
+    from UserTagStats uts
+),
+DuplicateLinks as (
+    select
+        pl.PostId,
+        pl.RelatedPostId,
+        p1.Title as PostTitle,
+        p2.Title as RelatedPostTitle,
+        pl.CreationDate,
+        lt.Name as LinkTypeName
+    from PostLinks pl
+    join Posts p1 on p1.Id = pl.PostId
+    join Posts p2 on p2.Id = pl.RelatedPostId
+    join LinkTypes lt on lt.Id = pl.LinkTypeId
+    where pl.LinkTypeId = 3
+),
+UserCommentActivity as (
+    select
+        c.UserId,
+        u.DisplayName,
+        count(c.Id) as CommentCount,
+        avg(length(c.Text)) as AvgCommentLength,
+        max(c.CreationDate) as LastCommentDate,
+        sum(case when lower(c.Text) like '%bug%' then 1 else 0 end) as BugMentions
+    from Comments c
+    left join Users u on u.Id = c.UserId
+    group by c.UserId, u.DisplayName
+),
+FinalResult as (
+    select
+        ruts.UserId,
+        ruts.DisplayName,
+        ruts.TagName,
+        ruts.UserQuestionCount,
+        ruts.AvgScore,
+        ruts.TotalViews,
+        ruts.MaxScore,
+        ruts.MinScore,
+        ruts.HasClosedQuestions,
+        ruts.UserRankInTag,
+        fua.Reputation,
+        fua.Views,
+        fua.UpVotes,
+        fua.DownVotes,
+        fua.LastEditDate,
+        uca.CommentCount,
+        uca.AvgCommentLength,
+        uca.LastCommentDate,
+        uca.BugMentions,
+        dl.PostId as DuplicatePostId,
+        dl.RelatedPostId as DuplicateRelatedPostId,
+        dl.PostTitle as DuplicatePostTitle,
+        dl.RelatedPostTitle as DuplicateRelatedPostTitle,
+        dl.CreationDate as DuplicateLinkDate
+    from RankedUserTagStats ruts
+    join FilteredUserActivity fua on fua.UserId = ruts.UserId
+    left join UserCommentActivity uca on uca.UserId = ruts.UserId
+    left join DuplicateLinks dl on dl.PostId in (
+        select p.Id from Posts p where p.OwnerUserId = ruts.UserId and p.PostTypeId = 1
+    )
+    where ruts.UserRankInTag <= 5
+)
+select
+    UserId,
+    DisplayName,
+    TagName,
+    UserQuestionCount,
+    round(CAST(AvgScore AS numeric), 2) as AvgScore,
+    TotalViews,
+    MaxScore,
+    MinScore,
+    HasClosedQuestions,
+    UserRankInTag,
+    Reputation,
+    Views,
+    UpVotes,
+    DownVotes,
+    LastEditDate,
+    CommentCount,
+    round(CAST(AvgCommentLength AS numeric), 1) as AvgCommentLength,
+    LastCommentDate,
+    BugMentions,
+    DuplicatePostId,
+    DuplicateRelatedPostId,
+    DuplicatePostTitle,
+    DuplicateRelatedPostTitle,
+    DuplicateLinkDate
+from FinalResult
+order by TagName, UserRankInTag, UserQuestionCount desc
+limit 100;

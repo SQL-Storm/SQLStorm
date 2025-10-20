@@ -1,0 +1,236 @@
+WITH
+RecentQuestions AS (
+  SELECT p.Id, p.Title, p.OwnerUserId, p.CreationDate, p.Score, p.ViewCount,
+         COALESCE(p.AnswerCount,0) AS AnswerCount,
+         COALESCE(p.FavoriteCount,0) AS FavoriteCount,
+         NULLIF(TRIM(p.Tags),'') AS RawTags,
+         CASE
+           WHEN p.Tags IS NULL THEN ARRAY[]::varchar[] -- dialect-specific empty array kept as text; will be handled downstream
+           ELSE string_to_array(substring(p.Tags from 2 for char_length(p.Tags)-2), '><')
+         END AS TagArray
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+    AND p.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '2 years'
+),
+QuestionSignals AS (
+  SELECT q.Id,
+         q.Title,
+         q.OwnerUserId,
+         q.CreationDate,
+         q.Score,
+         q.ViewCount,
+         q.AnswerCount,
+         q.FavoriteCount,
+         q.RawTags,
+         q.TagArray,
+         COALESCE(c.RecentComments,0) AS RecentComments,
+         ph.LastEditDate,
+         ph.DaySinceEdit,
+         pl.DuplicateCount,
+         a.BestAnswerScore,
+         a.BestAnswerAgeHours,
+         CAST(
+           (COALESCE(q.Score,0) * 1.5
+            + LN(GREATEST(q.ViewCount,1)) * 2.1
+            + COALESCE(q.FavoriteCount,0) * 3
+            + COALESCE(c.RecentComments,0) * 0.8
+            + COALESCE(a.BestAnswerScore,0) * 2.5
+            - (COALESCE(ph.DaySinceEdit,365) / 365.0) * 1.2
+            + (CASE WHEN pl.DuplicateCount>0 THEN -5 ELSE 0 END)
+           ) AS numeric
+         ) AS PopularityScore
+  FROM RecentQuestions q
+  LEFT JOIN (
+    SELECT PostId, COUNT(*) FILTER (WHERE CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '90 days') AS RecentComments
+    FROM Comments
+    GROUP BY PostId
+  ) c ON c.PostId = q.Id
+  LEFT JOIN (
+    SELECT ph.PostId,
+           MAX(ph.CreationDate) AS LastEditDate,
+           EXTRACT(epoch FROM (CAST('2024-10-01 12:34:56' AS timestamp) - MAX(ph.CreationDate)))/86400.0 AS DaySinceEdit
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (4,5,6,24)
+    GROUP BY ph.PostId
+  ) ph ON ph.PostId = q.Id
+  LEFT JOIN (
+    SELECT PostId, SUM(CASE WHEN LinkTypeId = 3 THEN 1 ELSE 0 END) AS DuplicateCount
+    FROM PostLinks
+    WHERE LinkTypeId IN (1,3)
+    GROUP BY PostId
+  ) pl ON pl.PostId = q.Id
+  LEFT JOIN (
+    SELECT a.ParentId AS QuestionId,
+           MAX(a.Score) AS BestAnswerScore,
+           MIN(EXTRACT(epoch FROM (CAST('2024-10-01 12:34:56' AS timestamp) - a.CreationDate))/3600.0) AS BestAnswerAgeHours
+    FROM Posts a
+    WHERE a.PostTypeId = 2
+    GROUP BY a.ParentId
+  ) a ON a.QuestionId = q.Id
+),
+UserSignals AS (
+  SELECT u.Id AS UserId,
+         u.DisplayName,
+         u.Reputation,
+         u.CreationDate,
+         u.LastAccessDate,
+         u.Views AS ProfileViews,
+         COALESCE(b.BadgeScore,0) AS BadgeScore,
+         EXP(-GREATEST(EXTRACT(epoch FROM (CAST('2024-10-01 12:34:56' AS timestamp) - u.LastAccessDate))/86400.0,0)/180.0) AS RecencyWeight
+  FROM Users u
+  LEFT JOIN (
+    SELECT UserId,
+           SUM(CASE WHEN Class=1 THEN 5 WHEN Class=2 THEN 2 WHEN Class=3 THEN 1 ELSE 0 END) AS BadgeScore
+    FROM Badges
+    GROUP BY UserId
+  ) b ON b.UserId = u.Id
+  WHERE u.Reputation > 100
+),
+QuestionContributors AS (
+  SELECT q.Id AS QuestionId,
+         q.OwnerUserId AS AskerId,
+         ua.AnswererId,
+         ua.AnswersByUser,
+         ua.AvgScoreByUser,
+         ua.FirstAnswerAgeHours,
+         us.Reputation AS AnswererReputation,
+         us.BadgeScore AS AnswererBadgeScore,
+         CAST(
+           (COALESCE(ua.AnswersByUser,0) * 0.6
+            + COALESCE(ua.AvgScoreByUser,0) * 1.8
+            + COALESCE(us.Reputation,0) / 1000.0
+            + COALESCE(us.BadgeScore,0) * 0.3
+           ) AS numeric
+         ) AS ContributorInfluence
+  FROM RecentQuestions q
+  LEFT JOIN (
+    SELECT a.ParentId AS QuestionId,
+           a.OwnerUserId AS AnswererId,
+           COUNT(*) FILTER (WHERE a.OwnerUserId IS NOT NULL) OVER (PARTITION BY a.ParentId, a.OwnerUserId) AS AnswersByUser,
+           AVG(a.Score) OVER (PARTITION BY a.ParentId, a.OwnerUserId) AS AvgScoreByUser,
+           MIN(EXTRACT(epoch FROM (CAST('2024-10-01 12:34:56' AS timestamp) - a.CreationDate))/3600.0) OVER (PARTITION BY a.ParentId, a.OwnerUserId) AS FirstAnswerAgeHours
+    FROM Posts a
+    WHERE a.PostTypeId = 2
+  ) ua ON ua.QuestionId = q.Id
+  LEFT JOIN UserSignals us ON us.UserId = ua.AnswererId
+),
+TagExplode AS (
+  SELECT qs.Id AS QuestionId,
+         unnest(qs.TagArray) AS Tag
+  FROM RecentQuestions qs
+),
+TagAgg AS (
+  SELECT te.Tag,
+         COUNT(DISTINCT te.QuestionId) AS QuestionCount,
+         SUM(qs.ViewCount) AS TotalViews,
+         AVG(qs.Score) AS AvgScore,
+         MAX(qs.CreationDate) AS MostRecentQuestion
+  FROM TagExplode te
+  JOIN RecentQuestions qs ON qs.Id = te.QuestionId
+  GROUP BY te.Tag
+),
+FinalCandidates AS (
+  SELECT qs.Id AS QuestionId,
+         qs.Title,
+         qs.OwnerUserId,
+         qs.CreationDate,
+         qs.Score,
+         qs.ViewCount,
+         qs.AnswerCount,
+         qs.FavoriteCount,
+         qs.TagArray,
+         qs.RecentComments,
+         qs.LastEditDate,
+         qs.DuplicateCount,
+         qs.BestAnswerScore,
+         qs.BestAnswerAgeHours,
+         qs.PopularityScore,
+         qc.AnswererId AS TopAnswererId,
+         qc.AnswersByUser,
+         qc.AvgScoreByUser,
+         qc.AnswererReputation,
+         qc.ContributorInfluence,
+         (
+           SELECT STRING_AGG(t.Tag || ':' || COALESCE(ROUND( (CAST(ta.QuestionCount AS numeric) * 0.5 + CAST(ta.TotalViews AS numeric) / NULLIF(GREATEST(ta.QuestionCount,1),1) * 0.0001 + EXTRACT(epoch FROM (CAST('2024-10-01 12:34:56' AS timestamp) - ta.MostRecentQuestion))/86400.0 * (-0.01) ),2)::text,'|')
+           FROM (
+             SELECT te.Tag,
+                    COUNT(DISTINCT te.QuestionId) AS QuestionCount,
+                    SUM(rq.ViewCount) AS TotalViews,
+                    AVG(rq.Score) AS AvgScore,
+                    MAX(rq.CreationDate) AS MostRecentQuestion
+             FROM TagExplode te
+             JOIN RecentQuestions rq ON rq.Id = te.QuestionId
+             WHERE te.Tag = ANY(qs.TagArray)
+             GROUP BY te.Tag
+             ORDER BY QuestionCount DESC
+             LIMIT 5
+           ) ta
+           JOIN (SELECT TagName AS Tag FROM Tags) t ON t.Tag = ta.Tag
+         ) AS TagHotnessSummary,
+         DENSE_RANK() OVER (ORDER BY qs.PopularityScore DESC) AS GlobalPopularityRank,
+         (
+           SELECT AVG(tp.rnk)
+           FROM (
+             SELECT q2.Id,
+                    NTILE(10) OVER (ORDER BY q2.PopularityScore DESC) AS rnk
+             FROM TagExplode te2
+             JOIN RecentQuestions q2 ON q2.Id = te2.QuestionId
+             WHERE te2.Tag = ANY(qs.TagArray)
+           ) tp
+         ) AS TagPercentileBucketAvg,
+         (
+           qs.PopularityScore
+           + COALESCE(qc.ContributorInfluence,0) * 2.2
+           + (CASE WHEN qc.AnswererId IS NOT NULL AND qs.RawTags IS NOT NULL THEN 4 ELSE 0 END)
+           + (CASE WHEN qs.DuplicateCount > 0 THEN -6 ELSE 0 END)
+         ) * (1 + COALESCE((SELECT AVG(u.RecencyWeight) FROM UserSignals u WHERE u.UserId = qs.OwnerUserId), 0)) AS HeuristicScore,
+         qs.AcceptedAnswerId
+  FROM QuestionSignals qs
+  LEFT JOIN (
+    SELECT QuestionId, AnswererId, AnswersByUser, AvgScoreByUser, FirstAnswerAgeHours, AnswererReputation, ContributorInfluence
+    FROM (
+      SELECT DISTINCT ON (QuestionId) QuestionId, AnswererId, AnswersByUser, AvgScoreByUser, FirstAnswerAgeHours, AnswererReputation, ContributorInfluence
+      FROM QuestionContributors
+      ORDER BY QuestionId, ContributorInfluence DESC, AnswererReputation DESC
+    ) sub
+  ) qc ON qc.QuestionId = qs.Id
+)
+SELECT
+  fc.QuestionId,
+  LEFT(fc.Title, 200) AS SnippetTitle,
+  fc.OwnerUserId,
+  u.DisplayName AS OwnerName,
+  COALESCE(u.Reputation,0) AS OwnerReputation,
+  fc.CreationDate,
+  fc.Score,
+  fc.ViewCount,
+  fc.AnswerCount,
+  fc.RecentComments,
+  fc.BestAnswerScore,
+  fc.LastEditDate,
+  fc.DuplicateCount,
+  fc.TagHotnessSummary,
+  fc.TopAnswererId,
+  fc.AnswererReputation,
+  fc.ContributorInfluence,
+  fc.GlobalPopularityRank,
+  fc.TagPercentileBucketAvg,
+  ROUND(fc.PopularityScore,4) AS PopularityScore,
+  ROUND(fc.HeuristicScore,4) AS HeuristicScore,
+  CASE WHEN EXISTS (SELECT 1 FROM Posts pa WHERE pa.Id = (SELECT p.AcceptedAnswerId FROM Posts p WHERE p.Id = fc.QuestionId)) THEN
+       (SELECT CHAR_LENGTH(pa.Body) FROM Posts pa WHERE pa.Id = (SELECT p.AcceptedAnswerId FROM Posts p WHERE p.Id = fc.QuestionId))
+  ELSE NULL END AS AcceptedAnswerBodyLength,
+  (SELECT STRING_AGG(t.TagName || '=' || COALESCE(CAST(t.Count AS varchar),'0'), ',')
+   FROM Tags t
+   WHERE t.TagName = ANY(fc.TagArray)
+   ORDER BY t.Count DESC
+   LIMIT 3
+  ) AS TopTagsCounts
+FROM FinalCandidates fc
+LEFT JOIN Users u ON u.Id = fc.OwnerUserId
+WHERE fc.PopularityScore IS NOT NULL
+  AND fc.PopularityScore > (
+    SELECT PERCENTILE_CONT(0.25) WITHIN GROUP (ORDER BY qs2.PopularityScore) FROM QuestionSignals qs2
+  )
+ORDER BY fc.HeuristicScore DESC, fc.GlobalPopularityRank ASC
+LIMIT 250;

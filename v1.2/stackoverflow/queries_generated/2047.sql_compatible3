@@ -1,0 +1,40 @@
+WITH RECURSIVE legitim_badges AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(b.Gold, 0) AS Gold,
+        COALESCE(b.Silver, 0) AS Silver,
+        COALESCE(b.Bronze, 0) AS Bronze
+    FROM users u
+    LEFT JOIN (
+        SELECT UserId,
+               SUM(CASE WHEN badges."Class" = 'gold' THEN 1 ELSE 0 END) AS Gold,
+               SUM(CASE WHEN badges."Class" = 'silver' THEN 1 ELSE 0 END) AS Silver,
+               SUM(CASE WHEN badges."Class" = 'bronze' THEN 1 ELSE 0 END) AS Bronze
+        FROM badges
+        GROUP BY UserId
+    ) b ON b.UserId = u.Id
+),
+ranked_users AS (
+    SELECT
+        lb.UserId,
+        lb.DisplayName,
+        lb.Reputation,
+        lb.Gold,
+        lb.Silver,
+        lb.Bronze,
+        RANK() OVER (ORDER BY lb.Reputation DESC, lb.Gold DESC, lb.Silver DESC, lb.Bronze DESC, lb.UserId) AS rep_rank
+    FROM legitim_badges lb
+)
+SELECT
+    ru.UserId,
+    ru.DisplayName,
+    ru.Reputation,
+    ru.Gold,
+    ru.Silver,
+    ru.Bronze,
+    ru.rep_rank
+FROM ranked_users ru
+WHERE ru.rep_rank <= 100
+ORDER BY ru.rep_rank, ru.UserId;

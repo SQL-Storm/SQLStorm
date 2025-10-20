@@ -1,0 +1,227 @@
+WITH
+questions AS (
+  SELECT
+    p.Id AS question_id,
+    p.Title,
+    p.OwnerUserId,
+    p.CreationDate,
+    p.Score AS q_score,
+    COALESCE(p.ViewCount,0) AS views,
+    p.AnswerCount,
+    p.FavoriteCount,
+    p.Tags,
+    CASE WHEN p.Tags IS NULL OR length(p.Tags)=0 THEN ARRAY[]::text[] 
+         ELSE string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><')
+    END AS tag_array
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+),
+tags_expanded AS (
+  SELECT
+    q.question_id,
+    q.Title,
+    trim(t) AS tag
+  FROM questions q,
+  unnest(q.tag_array) AS t
+),
+answers AS (
+  SELECT
+    a.Id AS answer_id,
+    a.ParentId AS question_id,
+    a.OwnerUserId,
+    a.CreationDate,
+    a.Score AS a_score,
+    a.CommentCount AS a_comments,
+    ROW_NUMBER() OVER (PARTITION BY a.ParentId ORDER BY a.Score DESC, a.CreationDate ASC) AS rank_by_score,
+    COUNT(*) OVER (PARTITION BY a.ParentId) AS answer_count_for_question
+  FROM Posts a
+  WHERE a.PostTypeId = 2
+),
+vote_summaries AS (
+  SELECT
+    v.PostId,
+    COUNT(CASE WHEN v.VoteTypeId = 2 THEN 1 END) AS upvotes,
+    COUNT(CASE WHEN v.VoteTypeId = 3 THEN 1 END) AS downvotes,
+    COUNT(CASE WHEN v.VoteTypeId = 5 THEN 1 END) AS favorites,
+    COUNT(CASE WHEN v.VoteTypeId = 1 THEN 1 END) AS accepted_by_originator,
+    COUNT(*) AS total_votes,
+    SUM(COALESCE(v.BountyAmount,0)) AS total_bounty
+  FROM Votes v
+  GROUP BY v.PostId
+),
+histories AS (
+  SELECT
+    ph.PostId,
+    MIN(CASE WHEN ph.PostHistoryTypeId IN (10,35) THEN ph.CreationDate END) AS first_close_date,
+    MIN(CASE WHEN ph.PostHistoryTypeId IN (11,36) THEN ph.CreationDate END) AS first_reopen_date,
+    MAX(CASE WHEN ph.PostHistoryTypeId IN (4,5,6,24) THEN ph.CreationDate END) AS last_edit_date,
+    COUNT(DISTINCT ph.UserId) FILTER (WHERE ph.UserId IS NOT NULL) AS distinct_editors,
+    COUNT(CASE WHEN ph.PostHistoryTypeId = 50 THEN 1 END) AS community_bumps
+  FROM PostHistory ph
+  GROUP BY ph.PostId
+),
+badge_scores AS (
+  SELECT
+    b.UserId,
+    COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS golds,
+    COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS silvers,
+    COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS bronzes,
+    (3*COUNT(CASE WHEN b.Class = 1 THEN 1 END) + 2*COUNT(CASE WHEN b.Class = 2 THEN 1 END) + 1*COUNT(CASE WHEN b.Class = 3 THEN 1 END)) AS badge_weight
+  FROM Badges b
+  GROUP BY b.UserId
+),
+user_profiles AS (
+  SELECT
+    u.Id AS user_id,
+    COALESCE(u.DisplayName, '<anonymous>') AS display_name,
+    u.Reputation,
+    u.CreationDate,
+    u.LastAccessDate,
+    COALESCE(b.badge_weight,0) AS badge_weight,
+    COALESCE(u.UpVotes,0) AS up_votes,
+    COALESCE(u.DownVotes,0) AS down_votes,
+    CASE
+      WHEN u.LastAccessDate > (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '30 days') THEN 'active'
+      WHEN u.LastAccessDate > (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '365 days') THEN 'stale'
+      ELSE 'dormant'
+    END AS recency_bucket
+  FROM Users u
+  LEFT JOIN badge_scores b ON b.UserId = u.Id
+),
+question_aggregates AS (
+  SELECT
+    q.question_id,
+    q.Title,
+    q.OwnerUserId,
+    up.display_name AS owner_name,
+    q.CreationDate,
+    q.q_score,
+    q.views,
+    q.AnswerCount,
+    q.FavoriteCount,
+    COALESCE(vs.upvotes,0) AS q_upvotes,
+    COALESCE(vs.downvotes,0) AS q_downvotes,
+    COALESCE(vs.total_votes,0) AS q_total_votes,
+    COALESCE(vs.total_bounty,0) AS q_total_bounty,
+    h.first_close_date,
+    h.first_reopen_date,
+    h.last_edit_date,
+    h.distinct_editors,
+    h.community_bumps,
+    (SELECT a.Id FROM Posts a WHERE a.ParentId = q.question_id AND a.PostTypeId = 2 ORDER BY a.Score DESC, a.CreationDate ASC LIMIT 1) AS best_answer_id,
+    (SELECT NULLIF(MAX(a.Score),0) FROM Posts a WHERE a.ParentId = q.question_id AND a.PostTypeId = 2 AND a.Id = q.AcceptedAnswerId) AS accepted_answer_score,
+    (SELECT LISTAGG(t, ', ') WITHIN GROUP (ORDER BY LOWER(t)) FROM (SELECT DISTINCT trim(x) AS t FROM UNNEST(q.tag_array) AS x) AS sub) AS tag_list
+  FROM questions q
+  LEFT JOIN vote_summaries vs ON vs.PostId = q.question_id
+  LEFT JOIN histories h ON h.PostId = q.question_id
+  LEFT JOIN user_profiles up ON up.user_id = q.OwnerUserId
+),
+tag_stats AS (
+  SELECT
+    te.tag,
+    COUNT(DISTINCT te.question_id) AS questions_with_tag,
+    SUM(q.q_score) AS total_question_score,
+    AVG(q.views) AS avg_views,
+    SUM(COALESCE(vs.total_votes,0)) AS total_votes_on_tag_questions
+  FROM tags_expanded te
+  JOIN questions q ON q.question_id = te.question_id
+  LEFT JOIN vote_summaries vs ON vs.PostId = q.question_id
+  GROUP BY te.tag
+),
+final AS (
+  SELECT
+    qa.question_id,
+    qa.Title,
+    COALESCE(qa.owner_name, 'unknown') AS owner_name,
+    qa.CreationDate,
+    qa.q_score,
+    qa.views,
+    qa.AnswerCount,
+    qa.q_upvotes,
+    qa.q_downvotes,
+    qa.q_total_votes,
+    qa.q_total_bounty,
+    qa.first_close_date,
+    qa.first_reopen_date,
+    qa.last_edit_date,
+    qa.distinct_editors,
+    qa.community_bumps,
+    qa.best_answer_id,
+    qa.accepted_answer_score,
+    qa.tag_list,
+    ROUND(
+      CASE
+        WHEN qa.q_total_votes = 0 THEN NULL
+        ELSE (CAST(qa.q_upvotes AS numeric) - CAST(qa.q_downvotes AS numeric)) / NULLIF(qa.q_total_votes,0)
+      END
+    ,4) AS normalized_vote_balance,
+    (SELECT EXTRACT(EPOCH FROM MIN(a.CreationDate - qa.CreationDate)) FROM Posts a WHERE a.ParentId = qa.question_id AND a.PostTypeId = 2) AS seconds_to_first_answer,
+    (COALESCE(qa.q_score,0) * 2.0
+     + COALESCE(qa.q_total_votes,0) * 0.5
+     + COALESCE(qa.views,0)/100.0
+     + COALESCE(qa.AnswerCount,0) * 1.5
+     + COALESCE(qa.distinct_editors,0) * 1.2
+     + CASE WHEN qa.first_close_date IS NOT NULL THEN -5 ELSE 0 END
+     + CASE WHEN LOWER(COALESCE(qa.tag_list,'')) LIKE '%sql%' THEN 3 ELSE 0 END
+    ) AS complexity_score,
+    (CASE WHEN qa.tag_list IS NOT NULL AND qa.tag_list <> '' AND qa.last_edit_date IS NOT NULL AND qa.last_edit_date > qa.CreationDate + INTERVAL '1 day' AND (qa.q_score >= 5 OR qa.q_upvotes >= 5) THEN true ELSE false END) AS edited_significantly_and_popular,
+    (SELECT COALESCE(u.Reputation,0) FROM Posts a JOIN Users u ON u.Id = a.OwnerUserId WHERE a.ParentId = qa.question_id AND a.PostTypeId = 2 ORDER BY a.Score DESC LIMIT 1) AS top_answerer_reputation,
+    (CASE WHEN EXISTS (
+       SELECT 1 FROM PostLinks pl WHERE pl.PostId = qa.question_id AND pl.LinkTypeId = 3
+     ) THEN true ELSE false END) AS has_duplicate_link
+  FROM question_aggregates qa
+),
+ranked AS (
+  SELECT
+    f.*,
+    RANK() OVER (ORDER BY f.complexity_score DESC, f.views DESC, f.q_score DESC) AS complexity_rank
+  FROM final f
+)
+SELECT
+  r.complexity_rank,
+  r.question_id,
+  COALESCE(r.Title,'') AS Title,
+  r.owner_name,
+  r.CreationDate,
+  r.q_score,
+  r.views,
+  r.AnswerCount,
+  r.q_upvotes,
+  r.q_downvotes,
+  r.q_total_votes,
+  r.q_total_bounty,
+  r.best_answer_id,
+  r.accepted_answer_score,
+  r.seconds_to_first_answer,
+  r.complexity_score,
+  r.edited_significantly_and_popular,
+  r.top_answerer_reputation,
+  r.has_duplicate_link,
+  SUBSTRING(COALESCE(r.tag_list,'') FROM 1 FOR 80) AS tag_preview
+FROM ranked r
+WHERE r.complexity_rank <= 100
+ORDER BY r.complexity_rank, r.complexity_score DESC
+
+UNION ALL
+
+SELECT
+  NULL AS complexity_rank,
+  NULL AS question_id,
+  'SENTINEL: benchmark footer' AS Title,
+  NULL AS owner_name,
+  NULL AS CreationDate,
+  NULL AS q_score,
+  NULL AS views,
+  NULL AS AnswerCount,
+  NULL AS q_upvotes,
+  NULL AS q_downvotes,
+  NULL AS q_total_votes,
+  NULL AS q_total_bounty,
+  NULL AS best_answer_id,
+  NULL AS accepted_answer_score,
+  NULL AS seconds_to_first_answer,
+  NULL AS complexity_score,
+  NULL AS edited_significantly_and_popular,
+  NULL AS top_answerer_reputation,
+  NULL AS has_duplicate_link,
+  NULL AS tag_preview;

@@ -1,0 +1,205 @@
+-- {"query": "256.sql", "dataset": "stackoverflow", "version": "v1.3", "prompt": "p1", "model": "gpt-5-mini", "temperature": 1.0, "max_tokens": 32768, "reasoning": "medium", "input_tokens": 2026, "output_tokens": 3527} 
+with
+-- explode tags from posts (PostTypeId = 1 questions typically)
+TagExplode as (
+  select p.Id as PostId, p.OwnerUserId, trim(t.tag) as Tag
+  from Posts p
+  cross join lateral (
+    select unnest(string_to_array(substring(p.Tags,2, greatest(length(p.Tags)-2,0)), '><')) as tag
+  ) t
+  where p.Tags is not null and p.Tags <> ''
+),
+-- basic aggregates per user from posts and answers
+PostAggregates as (
+  select
+    u.Id as UserId,
+    count(p.Id) filter (where p.PostTypeId in (1,2)) as TotalPosts,
+    count(p.Id) filter (where p.PostTypeId = 1) as Questions,
+    count(p.Id) filter (where p.PostTypeId = 2) as Answers,
+    sum(p.Score) filter (where p.PostTypeId in (1,2)) as TotalPostScore,
+    avg(p.Score) filter (where p.PostTypeId = 2) as AvgAnswerScore,
+    avg(p.Score) filter (where p.PostTypeId = 1) as AvgQuestionScore,
+    sum(case when p.PostTypeId = 1 then coalesce(p.ViewCount,0) else 0 end) as ViewsOnQuestions,
+    max(p.LastActivityDate) as LastPostActivity
+  from Users u
+  left join Posts p on p.OwnerUserId = u.Id
+  group by u.Id
+),
+-- accepted answers and time-to-accept metrics
+AcceptedMetrics as (
+  select
+    a.OwnerUserId as UserId,
+    count(1) as AcceptedAnswers,
+    avg(extract(epoch from (a.CreationDate - q.CreationDate))) as AvgSecondsToAccept,
+    median_seconds := percentile_cont(0.5) within group (order by extract(epoch from (a.CreationDate - q.CreationDate))) -- PostgreSQL percentile
+  from Posts a
+  join Posts q on q.Id = a.ParentId and q.AcceptedAnswerId = a.Id
+  where a.PostTypeId = 2
+  group by a.OwnerUserId
+),
+-- votes cast by user and votes received on user's posts
+VoteMetrics as (
+  select
+    u.Id as UserId,
+    sum(case when v.UserId = u.Id and v.VoteTypeId = 2 then 1 else 0 end) as UpvotesCast,
+    sum(case when v.UserId = u.Id and v.VoteTypeId = 3 then 1 else 0 end) as DownvotesCast,
+    sum(case when vp.VoteTypeId = 2 then 1 else 0 end) as UpvotesReceived,
+    sum(case when vp.VoteTypeId = 3 then 1 else 0 end) as DownvotesReceived,
+    sum(case when vp.VoteTypeId = 1 then 1 else 0 end) as AcceptedReceived
+  from Users u
+  left join Votes v on v.UserId = u.Id
+  left join Votes vp on vp.PostId in (select p.Id from Posts p where p.OwnerUserId = u.Id)
+  group by u.Id
+),
+-- badges and weighted badge score
+BadgeMetrics as (
+  select
+    b.UserId,
+    count(*) as BadgeCount,
+    sum(case when b.Class = 1 then 5 when b.Class = 2 then 2 when b.Class = 3 then 1 else 0 end) as BadgeWeight,
+    sum(case when b.TagBased = B'1' then 1 else 0 end) as TagBadges
+  from Badges b
+  group by b.UserId
+),
+-- post history (edits, closes, deletions) per user
+HistoryMetrics as (
+  select
+    ph.UserId,
+    count(*) as HistoryEvents,
+    sum(case when ph.PostHistoryTypeId in (4,5,6,8) then 1 else 0 end) as EditCount,
+    sum(case when ph.PostHistoryTypeId in (10,12) then 1 else 0 end) as CloseOrDeleteCount,
+    max(ph.CreationDate) as LastHistoryEvent
+  from PostHistory ph
+  group by ph.UserId
+),
+-- top tag per user (correlated style)
+TopTagPerUser as (
+  select distinct on (te.owneruserid)
+    te.owneruserid as UserId,
+    te.Tag,
+    count(*) over (partition by te.owneruserid, te.Tag) as TagCount
+  from TagExplode te
+  order by te.owneruserid, TagCount desc
+),
+-- composite timeline of contributions (posts, comments, history) for median inter-event time
+ActivityTimeline as (
+  select OwnerUserId as UserId, CreationDate
+  from Posts
+  where OwnerUserId is not null
+  union all
+  select UserId as UserId, CreationDate
+  from Comments
+  where UserId is not null
+  union all
+  select UserId as UserId, CreationDate
+  from PostHistory
+  where UserId is not null
+),
+ActivityGaps as (
+  select
+    UserId,
+    CreationDate,
+    lag(CreationDate) over (partition by UserId order by CreationDate) as PrevDate,
+    extract(epoch from (CreationDate - lag(CreationDate) over (partition by UserId order by CreationDate))) as GapSeconds
+  from ActivityTimeline
+),
+ActivityStats as (
+  select
+    UserId,
+    count(*) as ActivityCount,
+    avg(GapSeconds) filter (where GapSeconds is not null) as AvgGapSeconds,
+    percentile_cont(0.5) within group (order by GapSeconds) filter (where GapSeconds is not null) as MedianGapSeconds,
+    max(CreationDate) as LastActivity
+  from ActivityGaps
+  group by UserId
+),
+-- union contributions for a broad "engagement" measure
+ContribUnion as (
+  select u.Id as UserId, 'posts' as Kind, count(p.Id) as N from Users u left join Posts p on p.OwnerUserId = u.Id group by u.Id
+  union all
+  select u.Id, 'comments', count(c.Id) from Users u left join Comments c on c.UserId = u.Id group by u.Id
+  union all
+  select u.Id, 'badges', count(b.Id) from Users u left join Badges b on b.UserId = u.Id group by u.Id
+),
+ContribSummary as (
+  select UserId, sum(N) as TotalContributions, count(*) as ContributionTypes from ContribUnion group by UserId
+)
+-- final projection combining all metrics and computing a complex BenchmarkScore
+select
+  u.Id,
+  u.DisplayName,
+  u.Reputation,
+  coalesce(pa.TotalPosts,0) as TotalPosts,
+  coalesce(pa.Questions,0) as Questions,
+  coalesce(pa.Answers,0) as Answers,
+  coalesce(am.AcceptedAnswers,0) as AcceptedAnswers,
+  round(coalesce(am.AvgSecondsToAccept,0))::bigint as AvgSecondsToAccept,
+  coalesce(vm.UpvotesReceived,0) as UpvotesReceived,
+  coalesce(vm.DownvotesReceived,0) as DownvotesReceived,
+  coalesce(bm.BadgeCount,0) as BadgeCount,
+  coalesce(ts.Tag, '(none)') as TopTag,
+  coalesce(ag.ActivityCount,0) as ActivityCount,
+  coalesce(ag.MedianGapSeconds,0) as MedianGapSeconds,
+  -- complex composite score using logs, ratios, null handling and penalization for downvotes
+  (
+    -- base from reputation scaled by activity
+    (log(nullif(u.Reputation,0) + 10) * 1.5)
+    +
+    -- posts and answers influence
+    (coalesce(pa.TotalPosts,0) * 0.8 + coalesce(pa.Answers,0) * 1.2 + coalesce(pa.Questions,0) * 0.5)
+    +
+    -- acceptance boost (non-linear)
+    (coalesce(am.AcceptedAnswers,0) * greatest(1, sqrt(coalesce(am.AcceptedAnswers,0))))
+    +
+    -- badge weight
+    (coalesce(bm.BadgeWeight,0) * 2.0)
+    --
+    - -- penalties
+    (coalesce(vm.DownvotesReceived,0) * 1.5)
+    -
+    (coalesce(ag.MedianGapSeconds,0) / nullif(greatest(coalesce(pa.TotalPosts,0),1),0))
+  )
+  *
+  -- dampen for inactivity or missing profile info
+  (case when u.LastAccessDate < cast('2024-10-01 12:34:56' as timestamp) - interval '730 days' then 0.6 else 1 end)
+  *
+  -- boost for tag specialization
+  (case when coalesce(ts.TagCount,0) >= 5 then 1.2 when coalesce(ts.TagCount,0) >= 2 then 1.05 else 1 end)
+  as BenchmarkScore,
+  -- ranking and percentiles
+  rank() over (order by
+    (
+      (log(nullif(u.Reputation,0) + 10) * 1.5)
+      + (coalesce(pa.TotalPosts,0) * 0.8 + coalesce(pa.Answers,0) * 1.2)
+      + (coalesce(bm.BadgeWeight,0) * 2.0)
+    )
+    desc
+  ) as RankByComposite,
+  -- sample of most recent post title (correlated subquery)
+  (
+    select p2.Title from Posts p2
+    where p2.OwnerUserId = u.Id and p2.Title is not null
+    order by p2.CreationDate desc
+    limit 1
+  ) as LatestTitle
+from Users u
+left join PostAggregates pa on pa.UserId = u.Id
+left join AcceptedMetrics am on am.UserId = u.Id
+left join VoteMetrics vm on vm.UserId = u.Id
+left join BadgeMetrics bm on bm.UserId = u.Id
+left join TopTagPerUser ts on ts.UserId = u.Id
+left join ActivityStats ag on ag.UserId = u.Id
+left join ContribSummary cs on cs.UserId = u.Id
+where
+  -- filter to somewhat active users or with any content; complex predicate combining NULL logic and string checks
+  (
+    coalesce(pa.TotalPosts,0) >= 5
+    or coalesce(bm.BadgeCount,0) >= 1
+    or exists (select 1 from Comments c where c.UserId = u.Id)
+  )
+  and (
+    u.DisplayName is not null
+    and (position('bot' in lower(coalesce(u.DisplayName,''))) = 0) -- avoid obvious bots
+  )
+order by BenchmarkScore desc NULLS LAST
+limit 100;

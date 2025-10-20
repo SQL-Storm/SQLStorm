@@ -1,0 +1,155 @@
+with RecursiveUserPosts as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        p.Id as PostId,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        row_number() over (partition by u.Id order by p.Score desc, p.CreationDate desc) as rn
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    where p.PostTypeId in (1, 2)
+), TopUserPosts as (
+    select * from RecursiveUserPosts where rn <= 5
+), PostVoteStats as (
+    select 
+        v.PostId,
+        count(case when vt.Name = 'UpMod' then 1 end) as UpVotes,
+        count(case when vt.Name = 'DownMod' then 1 end) as DownVotes,
+        count(case when vt.Name = 'Favorite' then 1 end) as FavoriteVotes
+    from Votes v
+    join VoteTypes vt on vt.Id = v.VoteTypeId
+    group by v.PostId
+), LatestPostHistory as (
+    select ph.PostId, ph.UserId, ph.PostHistoryTypeId, ph.CreationDate,
+        row_number() over (partition by ph.PostId order by ph.CreationDate desc) as rn
+    from PostHistory ph
+), CorrelatedCloseReasons as (
+    select ph.PostId, crt.Name as CloseReasonName
+    from PostHistory ph
+    join CloseReasonTypes crt on crt.Id = cast(ph.Comment as smallint)
+    where ph.PostHistoryTypeId = 10
+), UserBadgeCounts as (
+    select
+        b.UserId,
+        b.Class,
+        count(*) as BadgeCount
+    from Badges b
+    group by b.UserId, b.Class
+), UserRankings as (
+    select 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        coalesce(bc_gold.BadgeCount, 0) as GoldBadges,
+        coalesce(bc_silver.BadgeCount, 0) as SilverBadges,
+        coalesce(bc_bronze.BadgeCount, 0) as BronzeBadges,
+        row_number() over (order by u.Reputation desc, coalesce(bc_gold.BadgeCount, 0) desc, u.CreationDate asc) as UserRank
+    from Users u
+    left join UserBadgeCounts bc_gold on bc_gold.UserId = u.Id and bc_gold.Class = 1
+    left join UserBadgeCounts bc_silver on bc_silver.UserId = u.Id and bc_silver.Class = 2
+    left join UserBadgeCounts bc_bronze on bc_bronze.UserId = u.Id and bc_bronze.Class = 3
+), QuestionAnswerStats as (
+    select 
+        q.Id as QuestionId,
+        q.Title as QuestionTitle,
+        q.CreationDate as QuestionDate,
+        q.Tags,
+        q.Score as QuestionScore,
+        q.ViewCount as QuestionViews,
+        q.AnswerCount,
+        a.Id as AnswerId,
+        a.Score as AnswerScore,
+        a.CreationDate as AnswerDate,
+        a.OwnerUserId as AnswerUserId
+    from Posts q
+    left join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+    where q.PostTypeId = 1 and q.AnswerCount > 0
+), PostTagExplode as (
+    select 
+        p.Id as PostId,
+        trim(tag) as Tag
+    from Posts p,
+    unnest(string_to_array(coalesce(substring(p.Tags from 2 for length(p.Tags) - 2),''), '><')) as tag
+    where p.PostTypeId = 1 and p.Tags is not null
+), TagStats as (
+    select 
+        t.Tag,
+        count(distinct p.Id) as QuestionCount,
+        avg(p.Score) as AvgQuestionScore,
+        max(p.ViewCount) as MaxViews
+    from PostTagExplode t
+    join Posts p on p.Id = t.PostId
+    group by t.Tag
+    having count(distinct p.Id) > 10
+), UserActivityWindow as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        p.Id as PostId,
+        p.PostTypeId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        lag(p.Score,1) over (partition by u.Id order by p.CreationDate) as PrevScore,
+        lead(p.Score,1) over (partition by u.Id order by p.CreationDate) as NextScore,
+        count(*) over (partition by u.Id) as TotalPosts,
+        sum(p.Score) over (partition by u.Id) as TotalScore
+    from Users u
+    join Posts p on p.OwnerUserId = u.Id
+    where p.PostTypeId in (1,2)
+)
+select 
+    ur.UserRank,
+    ur.DisplayName,
+    ur.Reputation,
+    ur.GoldBadges,
+    ur.SilverBadges,
+    ur.BronzeBadges,
+    tup.PostId,
+    tup.PostTypeId,
+    ('Score: ' || cast(tup.Score as varchar) ||
+     ', Views: ' || coalesce(cast(tup.ViewCount as varchar), '0') ||
+     ', Tags: ' || coalesce(tup.Tags, 'None')
+    ) as PostSummary,
+    coalesce(pvs.UpVotes,0) as UpVotes,
+    coalesce(pvs.DownVotes,0) as DownVotes,
+    coalesce(pvs.FavoriteVotes,0) as FavoriteVotes,
+    coalesce(ccr.CloseReasonName, 'Open') as PostStatus,
+    qas.QuestionId,
+    qas.QuestionTitle,
+    qas.AnswerId,
+    qas.AnswerScore,
+    ts.Tag,
+    ts.QuestionCount,
+    ts.AvgQuestionScore,
+    ts.MaxViews,
+    uaw.TotalPosts,
+    uaw.TotalScore,
+    case 
+        when tup.Score > 0 and tup.ViewCount > 1000 then 'Popular'
+        when tup.Score < 0 then 'Controversial'
+        else 'Normal'
+    end as PostCategory,
+    case
+        when uaw.PrevScore is null then 'NoPrevScore'
+        when uaw.PrevScore < tup.Score then 'ScoreImproved'
+        when uaw.PrevScore > tup.Score then 'ScoreDeclined'
+        else 'ScoreStable'
+    end as ScoreTrend
+from UserRankings ur
+left join TopUserPosts tup on tup.UserId = ur.Id
+left join PostVoteStats pvs on pvs.PostId = tup.PostId
+left join CorrelatedCloseReasons ccr on ccr.PostId = tup.PostId
+left join QuestionAnswerStats qas on qas.AnswerId = tup.PostId or qas.QuestionId = tup.PostId
+left join (
+    select Tag, QuestionCount, AvgQuestionScore, MaxViews
+    from TagStats
+    group by Tag, QuestionCount, AvgQuestionScore, MaxViews
+) ts on ts.Tag = any(string_to_array(coalesce(tup.Tags, ''), '><'))
+left join UserActivityWindow uaw on uaw.PostId = tup.PostId and uaw.UserId = ur.Id
+where ur.UserRank <= 20
+order by ur.UserRank, tup.Score desc NULLS LAST;

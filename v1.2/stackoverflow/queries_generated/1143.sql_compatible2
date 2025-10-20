@@ -1,0 +1,147 @@
+with recursive RecursiveUserScores as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        coalesce(u.Views, 0) as Views,
+        coalesce(u.UpVotes, 0) as UpVotes,
+        coalesce(u.DownVotes, 0) as DownVotes,
+        row_number() over (order by u.Reputation desc, u.Views desc) as Rank,
+        1 as Level
+    from Users u
+    where u.Reputation > 1000
+
+    union all
+
+    select 
+        u2.Id,
+        u2.DisplayName,
+        u2.Reputation,
+        coalesce(u2.Views, 0),
+        coalesce(u2.UpVotes, 0),
+        coalesce(u2.DownVotes, 0),
+        rus.Rank + 5,
+        rus.Level + 1
+    from Users u2
+    join RecursiveUserScores rus on u2.Id = rus.UserId + rus.Level * 10
+    where rus.Level < 3 
+)
+, PostStats as (
+    select 
+        p.OwnerUserId,
+        pt.Name as PostType,
+        count(*) as PostCount,
+        sum(coalesce(p.Score, 0)) as TotalScore,
+        avg(coalesce(p.ViewCount, 0)) as AvgViews,
+        sum(case when p.AcceptedAnswerId is not null then 1 else 0 end) as AcceptedAnswers,
+        max(p.LastActivityDate) as LastActivity
+    from Posts p
+    join PostTypes pt on pt.Id = p.PostTypeId
+    where p.OwnerUserId is not null
+    group by p.OwnerUserId, pt.Name
+)
+, BadgeCounts as (
+    select 
+        b.UserId,
+        b.Class,
+        count(*) as BadgeCount
+    from Badges b
+    group by b.UserId, b.Class
+)
+, QuestionCloseStats as (
+    select 
+        ph.PostId,
+        crt.Name as CloseReason,
+        count(*) as CloseCount
+    from PostHistory ph
+    left join CloseReasonTypes crt on crt.Id = cast(ph.Comment as integer)
+    where ph.PostHistoryTypeId = 10
+    group by ph.PostId, crt.Name
+)
+, UserComments as (
+    select 
+        c.UserId,
+        count(*) as TotalComments,
+        sum(case when c.Score >= 5 then 1 else 0 end) as HighlyRatedComments
+    from Comments c
+    group by c.UserId
+)
+, RankedPosts as (
+    select
+        p.Id,
+        p.Title,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        dense_rank() over (partition by p.OwnerUserId order by p.Score desc) as ScoreRank
+    from Posts p
+    where p.PostTypeId = 1
+)
+select 
+    rus.UserId,
+    rus.DisplayName,
+    rus.Reputation,
+    ps.PostType,
+    ps.PostCount,
+    ps.TotalScore,
+    round(cast(ps.AvgViews as numeric),2) as AvgPostViews,
+    bc_gold.BadgeCount as GoldBadges,
+    bc_silver.BadgeCount as SilverBadges,
+    bc_bronze.BadgeCount as BronzeBadges,
+    uc.TotalComments,
+    uc.HighlyRatedComments,
+    qcs.CloseReason,
+    qcs.CloseCount,
+    rp.Title as TopScoredPostTitle,
+    coalesce(rp.Tags, '<no tags>') as TopScoredPostTags,
+    rp.CreationDate,
+    rp.Score as TopPostScore,
+    row_number() over (partition by rus.UserId order by rp.Score desc) as PostRankForUser,
+    case 
+        when ps.PostCount > 50 and rus.Reputation > 10000 then 'Elite'
+        when ps.PostCount between 10 and 50 then 'Active'
+        else 'Casual'
+    end as UserActivityLevel,
+    case 
+        when ps.TotalScore > 1000 then concat('High Score: ', ps.TotalScore)
+        when ps.TotalScore between 500 and 1000 then 'Moderate Score'
+        else 'Low Score'
+    end as ScoreCategory,
+    concat(upper(substr(rus.DisplayName,1,1)), lower(substr(rus.DisplayName,2))) as NormalizedDisplayName,
+    (coalesce(rp.Tags, '<none>') like '%sql%' or coalesce(rp.Tags, '') like '%query%') as HasSqlOrQueryTag,
+    (coalesce(rp.Tags, '') similar to '%(join|union|subquery)%') as HasComplexSqlTermInTags,
+    extract(day from (cast('2024-10-01 12:34:56' as timestamp) - (rus.Reputation * interval '1 day'))) as DaysSinceReputation,
+    (select count(*) from PostLinks pl where pl.PostId = rp.Id and pl.LinkTypeId = 3) as DuplicateLinksCount
+from RecursiveUserScores rus
+left join PostStats ps on ps.OwnerUserId = rus.UserId
+left join BadgeCounts bc_gold on bc_gold.UserId = rus.UserId and bc_gold.Class = 1
+left join BadgeCounts bc_silver on bc_silver.UserId = rus.UserId and bc_silver.Class = 2
+left join BadgeCounts bc_bronze on bc_bronze.UserId = rus.UserId and bc_bronze.Class = 3
+left join UserComments uc on uc.UserId = rus.UserId
+left join RankedPosts rp on rp.OwnerUserId = rus.UserId and rp.ScoreRank = 1
+left join QuestionCloseStats qcs on qcs.PostId = rp.Id
+where rus.Level = 1
+group by
+    rus.UserId,
+    rus.DisplayName,
+    rus.Reputation,
+    ps.PostType,
+    ps.PostCount,
+    ps.TotalScore,
+    ps.AvgViews,
+    bc_gold.BadgeCount,
+    bc_silver.BadgeCount,
+    bc_bronze.BadgeCount,
+    uc.TotalComments,
+    uc.HighlyRatedComments,
+    qcs.CloseReason,
+    qcs.CloseCount,
+    rp.Title,
+    rp.Tags,
+    rp.CreationDate,
+    rp.Score,
+    rus.Level
+order by rus.Reputation desc, ps.PostCount desc, rp.Score desc
+limit 100;

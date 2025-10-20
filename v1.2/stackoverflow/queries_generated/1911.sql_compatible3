@@ -1,0 +1,24 @@
+WITH RecursiveWelInfo AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName AS Username,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS TotalQuestions,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS TotalAnswers,
+        COALESCE(SUM(v.UpVoteCnt), 0) AS UserUpVotes,
+        ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY MAX(p.CreationDate) DESC) AS UserRowClustering
+    FROM
+        Users u
+        LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+        LEFT JOIN (
+            SELECT
+                votes.postid,
+                COUNT(*) FILTER (WHERE votetypes.Id = 2) AS UpVoteCnt
+            FROM votes
+            INNER JOIN votetypes ON votes.vt = votetypes.Id
+            GROUP BY votes.postid
+        ) v ON v.postid = p.id
+    GROUP BY
+        u.Id,
+        u.DisplayName
+)
+SELECT * FROM RecursiveWelInfo;

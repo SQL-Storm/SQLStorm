@@ -1,0 +1,194 @@
+WITH RECURSIVE RecursiveTags AS (
+    SELECT
+        p.Id,
+        p.Title,
+        p.Tags,
+        1 AS Level
+    FROM Posts p
+    WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL
+
+    UNION ALL
+
+    SELECT
+        rt.Id,
+        rt.Title,
+        substring(rt.Tags FROM x.n FOR y.pos - x.n - 1) AS Tag,
+        rt.Level + 1
+    FROM
+        RecursiveTags rt
+        CROSS JOIN LATERAL (
+            SELECT strpos(rt.Tags || '>', '>') AS pos,
+                   1 AS n,
+                   rt.Tags AS Tags
+        ) y
+        INNER JOIN LATERAL (
+            -- explicit cast for strpos arguments: position requires text, provide substring start as text? 
+            -- original attempted strpos(rt.Tags, '><', rt.Level) is incorrect: strpos takes (haystack, needle)
+            -- emulate finding nth occurrence by using split_part approach: find position of nth '><'
+            SELECT
+                -- compute start index of the Level-th occurrence of '><' + 2
+                COALESCE(nullif(
+                    (
+                        -- build array of positions by splitting progressively using regexp_matches
+                        -- simpler portable approach: locate using repeated strpos via generate_series
+                        -- use a correlated subquery to compute nth occurrence
+                        (SELECT MIN(pos) FROM (
+                            SELECT strpos(rt.Tags, '><', gs.n) AS pos, gs.n
+                            FROM generate_series(1, rt.Level) AS gs(n)
+                        ) sub WHERE pos > 0) + 2
+                    ), NULL), 1) AS n
+        ) x ON true
+    WHERE rt.Level < 5
+),
+TagExploded AS (
+    SELECT
+        Id,
+        Title,
+        unnest(string_to_array(substring(Tags FROM 2 FOR char_length(Tags)-2), '><')) AS Tag
+    FROM Posts
+    WHERE PostTypeId = 1 AND Tags IS NOT NULL
+),
+AnswerStats AS (
+    SELECT
+        pa.ParentId,
+        count(*) AS AnswerCount,
+        max(pa.Score) AS MaxAnswerScore,
+        sum(pa.Score) AS SumAnswerScore,
+        avg(pa.Score) AS AvgAnswerScore
+    FROM Posts pa
+    WHERE pa.PostTypeId = 2
+    GROUP BY pa.ParentId
+),
+UserTopBadges AS (
+    SELECT 
+        b.UserId, 
+        b.Name,
+        b.Class,
+        ROW_NUMBER() OVER(PARTITION BY b.UserId ORDER BY b.Date DESC) AS BadgeRank
+    FROM Badges b
+),
+UserActivity AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        coalesce(avg(q.Score),0) AS AvgQuestionScore,
+        (SELECT count(distinct unnest(string_to_array(substring(Tags FROM 2 FOR char_length(Tags) - 2), '><')))
+         FROM Posts pq WHERE pq.OwnerUserId = u.Id AND pq.PostTypeId = 1 ) AS DistinctTagCount,
+        max(ph.CreationDate) AS LastEditDate,
+        rank() OVER (ORDER BY u.Reputation DESC) AS RepoRank
+    FROM Users u
+    LEFT JOIN Posts q ON q.OwnerUserId = u.Id AND q.PostTypeId = 1
+    LEFT JOIN PostHistory ph ON ph.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+),    
+ClosedQuestions AS (
+    SELECT
+        p.Id, p.Title, p.ClosedDate,
+        chc.Name AS CloseReason,
+        ph.CreationDate AS CloseRecordDate
+    FROM Posts p
+    LEFT JOIN PostHistory ph ON ph.PostId = p.Id 
+                             AND ph.PostHistoryTypeId = 10
+    LEFT JOIN CloseReasonTypes chc ON chc.Id = CAST(ph.Comment AS integer)
+    WHERE p.PostTypeId = 1 AND p.ClosedDate IS NOT NULL
+),
+DuplicateQuestions AS (
+    SELECT DISTINCT
+        pl.PostId,
+        p1.Title AS OriginalTitle,
+        pl.RelatedPostId,
+        p2.Title AS DuplicateOfTitle
+    FROM PostLinks pl
+    JOIN Posts p1 ON p1.Id = pl.PostId AND p1.PostTypeId = 1
+    JOIN Posts p2 ON p2.Id = pl.RelatedPostId AND p2.PostTypeId = 1
+    WHERE pl.LinkTypeId = 3
+),
+ScoreRanking AS (
+    SELECT 
+        p.Id, p.OwnerUserId, p.Title, p.Score,
+        rank() OVER(PARTITION BY p.OwnerUserId ORDER BY p.Score DESC) AS UserPostRank,
+        dense_rank() OVER (ORDER BY p.Score DESC NULLS LAST) AS GlobalPostScoreRank
+    FROM Posts p
+    WHERE p.PostTypeId IN (1,2)
+),
+ComplexStringScores AS (
+    SELECT 
+        Id,
+        Title,
+        Score * char_length(Title) / GREATEST(lengthRegexp_WS,1) AS WeightedScore,
+        array_length(string_to_array(substring(Tags FROM 2 FOR char_length(Tags)-2), '><'),1) AS NumTags
+    FROM Posts
+    CROSS JOIN LATERAL (
+        SELECT regexp_count(Title, '\\s') + 1 AS lengthRegexp_WS
+    ) rswv
+    WHERE PostTypeId = 1
+),
+VoteCounts AS (
+    SELECT
+        v.PostId,
+        count(*) FILTER (WHERE vt.Name='UpMod') AS Upvotes,
+        count(*) FILTER (WHERE vt.Name='DownMod') AS Downvotes,
+        count(*) FILTER (WHERE vt.Name='Favorite') AS Favorites,
+        count(*) FILTER (WHERE vt.VoteTypeId IS NULL) AS UnknownVotes
+    FROM Votes v
+    LEFT JOIN VoteTypes vt ON v.VoteTypeId = vt.Id
+    GROUP BY v.PostId
+),
+FinalAll AS (
+    SELECT 
+       u.Id,
+       u.DisplayName,
+       ua.AvgQuestionScore,
+       ua.DistinctTagCount,
+       ua.RepoRank,
+       TopBadges.Name AS LatestTopBadgeName,
+       TopBadges.Class AS LatestTopBadgeClass,
+       cs.NumTags,
+       cs.WeightedScore,
+       v.Upvotes,
+       v.Downvotes,
+       v.Favorites,
+       COUNT(DISTINCT tq.Id) AS QuestionsAttempted, 
+       COUNT(DISTINCT dq.PostId) AS DuplicateMarked, 
+       ac.AnswerCount,
+       ac.MaxAnswerScore
+    FROM Users u
+    LEFT JOIN UserActivity ua ON ua.Id = u.Id
+    LEFT JOIN UserTopBadges TopBadges ON TopBadges.UserId = u.Id AND TopBadges.BadgeRank = 1
+    LEFT JOIN VoteCounts v ON v.PostId = u.Id
+    FULL OUTER JOIN Posts p ON p.OwnerUserId = u.Id 
+    LEFT JOIN ComplexStringScores cs ON cs.Id = p.Id
+    LEFT JOIN PostLinks pl ON pl.PostId = p.Id
+    LEFT JOIN DuplicateQuestions dq ON dq.PostId = p.Id
+    LEFT JOIN Posts tq ON tq.OwnerUserId = u.Id AND tq.PostTypeId = 1
+    LEFT JOIN AnswerStats ac ON ac.ParentId = p.Id
+    GROUP BY
+        u.Id, u.DisplayName, ua.AvgQuestionScore, ua.DistinctTagCount, ua.RepoRank,
+        TopBadges.Name, TopBadges.Class,
+        cs.NumTags, cs.WeightedScore,
+        v.Upvotes, v.Downvotes, v.Favorites,
+        ac.AnswerCount, ac.MaxAnswerScore
+)
+SELECT
+    Id,
+    DisplayName,
+    AvgQuestionScore,
+    DistinctTagCount,
+    RepoRank,
+    coalesce(LatestTopBadgeName, 'None') AS LatestTopBadgeName,
+    LatestTopBadgeClass,
+    NumTags,
+    round(WeightedScore::numeric,2) AS WeightedScore,
+    coalesce(Upvotes,0) AS Upvotes,
+    coalesce(Downvotes,0) AS Downvotes,
+    coalesce(Favorites,0) AS Favorites,
+    QuestionsAttempted,
+    DuplicateMarked,
+    coalesce(AnswerCount,0) AS AnswerCount,
+    coalesce(MaxAnswerScore,0) AS MaxAnswerScore
+FROM FinalAll
+WHERE RepoRank <= 100 AND AvgQuestionScore > 5 
+ORDER BY AvgQuestionScore DESC, WeightedScore DESC, Upvotes DESC
+LIMIT 50;

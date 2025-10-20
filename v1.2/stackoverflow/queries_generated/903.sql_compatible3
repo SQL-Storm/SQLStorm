@@ -1,0 +1,173 @@
+WITH RECURSIVE RecursiveTagHierarchy AS (
+    SELECT 
+        t.Id,
+        t.TagName,
+        t.Count,
+        CAST(ARRAY[t.TagName] AS VARCHAR(35)[]) AS TagPath
+    FROM Tags t
+    WHERE t.IsRequired = TRUE
+
+    UNION ALL
+
+    SELECT 
+        t.Id,
+        t.TagName,
+        t.Count,
+        CAST(r.TagPath || t.TagName AS VARCHAR(35)[])
+    FROM Tags t
+    JOIN RecursiveTagHierarchy r
+        ON POSITION(t.TagName IN array_to_string(r.TagPath, ',')) = 0
+    WHERE t.IsRequired = TRUE
+),
+UserBadgeStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(b.Id) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+        COUNT(DISTINCT b.Name) AS DistinctBadges,
+        COALESCE(SUM(CASE WHEN b.TagBased = TRUE THEN 1 ELSE 0 END), 0) AS TagBasedBadges
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName
+),
+TopQuestionsWithAnswers AS (
+    SELECT 
+        q.Id AS QuestionId,
+        q.Title,
+        q.CreationDate AS QuestionCreation,
+        q.Score AS QuestionScore,
+        q.ViewCount,
+        u.DisplayName AS OwnerName,
+        u.Reputation AS OwnerReputation,
+        COUNT(a.Id) AS AnswerCount,
+        MAX(a.Score) FILTER (WHERE a.Score IS NOT NULL) AS MaxAnswerScore,
+        (SELECT COUNT(*) FROM Comments c WHERE c.PostId = q.Id) AS QuestionComments,
+        (SELECT COUNT(*) FROM Comments c WHERE c.PostId IN (SELECT a2.Id FROM Posts a2 WHERE a2.ParentId = q.Id)) AS AnswerComments,
+        STRING_AGG(DISTINCT ph.Comment, ' ||| ') FILTER (WHERE ph.Comment IS NOT NULL) AS CloseReasons,
+        LAG(q.Score) OVER (ORDER BY q.CreationDate) AS PreviousQuestionScore,
+        LEAD(q.Score) OVER (ORDER BY q.CreationDate) AS NextQuestionScore
+    FROM Posts q
+    LEFT JOIN Posts a ON a.ParentId = q.Id AND a.PostTypeId = 2
+    LEFT JOIN Users u ON u.Id = q.OwnerUserId
+    LEFT JOIN PostHistory ph ON ph.PostId = q.Id AND ph.PostHistoryTypeId = 10
+    WHERE q.PostTypeId = 1
+    GROUP BY q.Id, q.Title, q.CreationDate, q.Score, q.ViewCount, u.DisplayName, u.Reputation
+    HAVING COUNT(a.Id) > 0
+    ORDER BY q.Score DESC
+    LIMIT 100
+),
+UserActivityWindow AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionsPosted,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswersPosted,
+        COUNT(v.Id) FILTER (WHERE v.VoteTypeId = 2) AS UpVotesGiven,
+        COUNT(v.Id) FILTER (WHERE v.VoteTypeId = 3) AS DownVotesGiven,
+        SUM(p.Score) FILTER (WHERE p.PostTypeId IN (1,2)) AS TotalPostScore,
+        ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY COALESCE(p.CreationDate, '1970-01-01'::timestamp) DESC) AS RecentPostsRank
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Votes v ON v.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+    HAVING COUNT(p.Id) > 0
+),
+UserTopTags AS (
+    SELECT 
+        ua.Id AS UserId,
+        LOWER(TRIM(t.TagName)) AS TagName,
+        COUNT(*) AS TagUsageCount,
+        RANK() OVER (PARTITION BY ua.Id ORDER BY COUNT(*) DESC) AS TagRank
+    FROM Users ua
+    JOIN Posts p ON p.OwnerUserId = ua.Id AND p.PostTypeId = 1 AND p.Tags IS NOT NULL
+    CROSS JOIN LATERAL UNNEST(STRING_TO_ARRAY(SUBSTRING(p.Tags FROM 2 FOR LENGTH(p.Tags)-2), '><')) AS t(TagName)
+    GROUP BY ua.Id, LOWER(TRIM(t.TagName))
+    HAVING COUNT(*) > 2
+),
+ConsolidatedUserData AS (
+    SELECT
+        ua.Id,
+        ua.DisplayName,
+        ua.Reputation,
+        ua.QuestionsPosted,
+        ua.AnswersPosted,
+        ua.UpVotesGiven,
+        ua.DownVotesGiven,
+        ua.TotalPostScore,
+        COALESCE(uts.TagName, 'none') AS TopTag,
+        COALESCE(uts.TagUsageCount, 0) AS TagUsageCount,
+        ubs.GoldBadges,
+        ubs.SilverBadges,
+        ubs.BronzeBadges,
+        ubs.DistinctBadges,
+        ubs.TagBasedBadges
+    FROM UserActivityWindow ua
+    LEFT JOIN UserTopTags uts ON uts.UserId = ua.Id AND uts.TagRank = 1
+    LEFT JOIN UserBadgeStats ubs ON ubs.UserId = ua.Id
+    WHERE ua.RecentPostsRank <= 5
+)
+SELECT 
+    tqa.QuestionId,
+    tqa.Title,
+    tqa.QuestionScore,
+    tqa.ViewCount,
+    tqa.OwnerName,
+    tqa.OwnerReputation,
+    tqa.AnswerCount,
+    tqa.MaxAnswerScore,
+    tqa.QuestionComments,
+    tqa.AnswerComments,
+    COALESCE(tqa.CloseReasons, 'Open') AS CloseReasons,
+    cud.DisplayName AS TopContributor,
+    cud.Reputation AS ContributorReputation,
+    cud.TopTag AS ContributorTopTag,
+    cud.GoldBadges,
+    cud.SilverBadges,
+    cud.BronzeBadges,
+    cud.DistinctBadges,
+    cud.TagBasedBadges,
+    rt.TagName AS RecursiveTagName,
+    rt.Count AS RecursiveTagCount,
+    GREATEST(tqa.QuestionScore, COALESCE(tqa.PreviousQuestionScore, 0), COALESCE(tqa.NextQuestionScore, 0)) AS MaxNeighbouringScore,
+    COALESCE(NULLIF(TRIM(tqa.Title), ''), '[No Title]') || ' [' || COALESCE(tqa.OwnerName, 'Anonymous') || ']' AS FormattedTitle,
+    CASE WHEN tqa.QuestionScore > 0 THEN 1 ELSE 0 END AS PositiveScoreFlag
+FROM TopQuestionsWithAnswers tqa
+LEFT JOIN ConsolidatedUserData cud ON cud.DisplayName = tqa.OwnerName
+LEFT JOIN RecursiveTagHierarchy rt ON rt.TagName = cud.TopTag
+WHERE (tqa.QuestionScore > 5 OR tqa.AnswerCount > 3)
+  AND (COALESCE(cud.GoldBadges,0) + COALESCE(cud.SilverBadges,0) + COALESCE(cud.BronzeBadges,0)) > 0
+
+UNION
+
+SELECT 
+    p.Id,
+    COALESCE(p.Title, '[Deleted Title]'),
+    p.Score,
+    p.ViewCount,
+    u.DisplayName,
+    u.Reputation,
+    0,
+    NULL,
+    0,
+    0,
+    'UnionFallback',
+    u.DisplayName,
+    u.Reputation,
+    'none',
+    0,
+    0,
+    0,
+    0,
+    0,
+    GREATEST(p.Score, 0, 0),
+    COALESCE(NULLIF(TRIM(p.Title), ''), '[No Title]') || ' [' || COALESCE(u.DisplayName, 'Anonymous') || ']',
+    CASE WHEN p.Score > 0 THEN 1 ELSE 0 END
+FROM Posts p
+LEFT JOIN Users u ON u.Id = p.OwnerUserId
+WHERE p.PostTypeId = 1
+  AND p.Score < 0
+ORDER BY MaxNeighbouringScore DESC, AnswerCount DESC
+LIMIT 50;

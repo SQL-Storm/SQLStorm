@@ -1,0 +1,157 @@
+-- {"query": "209.sql", "dataset": "stackoverflow", "version": "v1.3", "prompt": "p1", "model": "gpt-5-mini", "temperature": 1.0, "max_tokens": 32768, "reasoning": "medium", "input_tokens": 2026, "output_tokens": 4471} 
+WITH
+questions_tags AS (
+  SELECT
+    p.Id AS qid,
+    p.Title,
+    p.OwnerUserId,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    TRIM(t) AS tag
+  FROM Posts p
+  LEFT JOIN LATERAL (
+    SELECT unnest(
+      string_to_array(
+        substring(coalesce(p.Tags, ''), 2, greatest(length(coalesce(p.Tags, '')) - 2, 0)
+        ), '><'
+      )
+    ) AS t
+  ) s ON true
+  WHERE p.PostTypeId = 1
+),
+answers AS (
+  SELECT * FROM Posts WHERE PostTypeId = 2
+),
+votes AS (
+  SELECT
+    PostId,
+    SUM(CASE WHEN VoteTypeId = 2 THEN 1 ELSE 0 END) AS upvotes,
+    SUM(CASE WHEN VoteTypeId = 3 THEN 1 ELSE 0 END) AS downvotes,
+    SUM(CASE WHEN VoteTypeId = 1 THEN 1 ELSE 0 END) AS accepted_votes,
+    COUNT(*) AS total_votes
+  FROM Votes
+  GROUP BY PostId
+),
+q_metrics AS (
+  SELECT
+    qt.tag,
+    COUNT(*) AS question_count,
+    AVG(qt.Score) FILTER (WHERE qt.Score IS NOT NULL) AS avg_question_score,
+    SUM(qt.ViewCount) AS total_views,
+    percentile_cont(0.5) WITHIN GROUP (ORDER BY qt.Score) AS median_question_score
+  FROM questions_tags qt
+  GROUP BY qt.tag
+),
+answer_metrics AS (
+  SELECT
+    qt.tag,
+    COUNT(a.Id) AS total_answers,
+    AVG(a.Score) AS avg_answer_score,
+    MAX(a.Score) AS max_answer_score,
+    SUM(CASE WHEN EXISTS (SELECT 1 FROM Posts p2 WHERE p2.AcceptedAnswerId = a.Id) THEN 1 ELSE 0 END) AS accepted_count
+  FROM questions_tags qt
+  LEFT JOIN answers a ON a.ParentId = qt.qid
+  GROUP BY qt.tag
+),
+user_contribs AS (
+  SELECT
+    qt.tag,
+    COALESCE(u.Id, -1) AS userid,
+    COALESCE(u.DisplayName, '[deleted]') AS display_name,
+    COUNT(a.Id) AS answers_by_user,
+    SUM(COALESCE(a.Score,0)) AS score_sum,
+    ROW_NUMBER() OVER (PARTITION BY qt.tag ORDER BY COUNT(a.Id) DESC, SUM(COALESCE(a.Score,0)) DESC, COALESCE(u.DisplayName,'') ASC) AS rn
+  FROM questions_tags qt
+  LEFT JOIN answers a ON a.ParentId = qt.qid
+  LEFT JOIN Users u ON u.Id = a.OwnerUserId
+  GROUP BY qt.tag, COALESCE(u.Id, -1), COALESCE(u.DisplayName, '[deleted]')
+),
+top_users AS (
+  SELECT
+    tag,
+    string_agg(format('%s::%s', display_name, answers_by_user), ', ' ORDER BY answers_by_user DESC, display_name) AS top_contributors
+  FROM user_contribs
+  WHERE rn <= 5
+  GROUP BY tag
+),
+tag_combined AS (
+  SELECT
+    q.tag,
+    q.question_count,
+    q.avg_question_score,
+    q.total_views,
+    q.median_question_score,
+    COALESCE(a.total_answers, 0) AS total_answers,
+    a.avg_answer_score,
+    a.max_answer_score,
+    COALESCE(tu.top_contributors, '') AS top_contributors
+  FROM q_metrics q
+  LEFT JOIN answer_metrics a ON a.tag = q.tag
+  LEFT JOIN top_users tu ON tu.tag = q.tag
+),
+global_stats AS (
+  SELECT AVG(score) FILTER(WHERE PostTypeId = 1) AS global_avg_question_score
+  FROM Posts
+  WHERE PostTypeId = 1
+),
+tag_recent AS (
+  SELECT
+    tc.tag,
+    COUNT(*) FILTER (WHERE p.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '30 days') AS recent_questions_30d,
+    SUM(vs.upvotes) FILTER (WHERE vs.upvotes IS NOT NULL AND vs.row_source = tc.tag) AS recent_upvotes_30d
+  FROM tag_combined tc
+  LEFT JOIN questions_tags ptag ON ptag.tag = tc.tag
+  LEFT JOIN Posts p ON p.Id = ptag.qid
+  LEFT JOIN LATERAL (
+    SELECT SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS upvotes, ptag.tag AS row_source
+    FROM Votes v
+    WHERE v.PostId = ptag.qid
+    GROUP BY ptag.tag
+  ) vs ON true
+  GROUP BY tc.tag
+)
+SELECT
+  tc.tag,
+  tc.question_count,
+  tc.total_views,
+  ROUND(tc.avg_question_score::numeric, 3) AS avg_question_score,
+  tc.median_question_score,
+  tc.total_answers,
+  ROUND(COALESCE(tc.avg_answer_score,0)::numeric,3) AS avg_answer_score,
+  COALESCE(tc.max_answer_score, 0) AS max_answer_score,
+  tc.top_contributors,
+  COALESCE(tr.recent_questions_30d, 0) AS recent_questions_30d,
+  COALESCE(tr.recent_upvotes_30d, 0) AS recent_upvotes_30d,
+  ROUND(
+    COALESCE(tc.avg_question_score, 0) / NULLIF(gs.global_avg_question_score, 0)
+    , 4
+  ) AS score_vs_global_avg,
+  ROW_NUMBER() OVER (ORDER BY tc.question_count DESC NULLS LAST, tc.total_views DESC NULLS LAST) AS tag_popularity_rank
+FROM tag_combined tc
+LEFT JOIN tag_recent tr ON tr.tag = tc.tag
+CROSS JOIN global_stats gs
+WHERE tc.question_count > 5
+ORDER BY tag_popularity_rank
+LIMIT 50
+
+UNION ALL
+
+SELECT
+  'untagged' AS tag,
+  COUNT(*) AS question_count,
+  SUM(ViewCount) AS total_views,
+  ROUND(AVG(Score)::numeric, 3) AS avg_question_score,
+  percentile_cont(0.5) WITHIN GROUP (ORDER BY Score) AS median_question_score,
+  COALESCE((SELECT COUNT(*) FROM Posts a WHERE a.PostTypeId = 2 AND a.ParentId IN (SELECT Id FROM Posts q WHERE q.PostTypeId = 1 AND (q.Tags IS NULL OR q.Tags = ''))), 0) AS total_answers,
+  NULL::numeric AS avg_answer_score,
+  NULL::int AS max_answer_score,
+  '' AS top_contributors,
+  COUNT(*) FILTER (WHERE CreationDate > cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '30 days') AS recent_questions_30d,
+  (SELECT COUNT(*) FROM Votes v JOIN Posts p ON p.Id = v.PostId WHERE v.VoteTypeId = 2 AND p.PostTypeId = 1 AND (p.Tags IS NULL OR p.Tags = '') AND v.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '30 days') AS recent_upvotes_30d,
+  ROUND( (AVG(Score) FILTER (WHERE Tags IS NULL OR Tags = '')::numeric) / NULLIF((SELECT AVG(score) FROM Posts WHERE PostTypeId = 1),0) , 4) AS score_vs_global_avg,
+  NULL AS tag_popularity_rank
+FROM Posts
+WHERE PostTypeId = 1 AND (Tags IS NULL OR Tags = '')
+ORDER BY 2 DESC
+LIMIT 1;

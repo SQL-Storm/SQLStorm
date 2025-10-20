@@ -1,0 +1,172 @@
+-- {"query": "501.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 0.5, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1427} 
+with RecursiveTagHierarchy as (
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        1 as Level,
+        array[t.TagName] as Path
+    from Tags t
+    where t.IsRequired = 1
+
+    union all
+
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        r.Level + 1,
+        r.Path || t.TagName
+    from Tags t
+    join RecursiveTagHierarchy r on t.Id <> r.Id and not t.TagName = any(r.Path)
+    where t.IsRequired = 1 and r.Level < 3
+),
+UserBadgeStats as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(b.Id) filter (where b.Class = 1) as GoldBadges,
+        count(b.Id) filter (where b.Class = 2) as SilverBadges,
+        count(b.Id) filter (where b.Class = 3) as BronzeBadges,
+        coalesce(sum(case when b.TagBased = 1 then 1 else 0 end),0) as TagBasedBadges,
+        row_number() over (partition by u.Id order by max(b.Date) desc nulls last) as rn
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.DisplayName
+),
+TopQuestionsWithAnswers as (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        q.OwnerUserId,
+        q.CreationDate,
+        q.Score as QuestionScore,
+        q.ViewCount,
+        q.Tags,
+        a.Id as AnswerId,
+        a.Score as AnswerScore,
+        a.OwnerUserId as AnswerOwnerUserId,
+        a.CreationDate as AnswerCreationDate,
+        a.Body as AnswerBody,
+        row_number() over (partition by q.Id order by a.Score desc nulls last, a.CreationDate asc) as AnswerRank
+    from Posts q
+    left join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+    where q.PostTypeId = 1 and q.CreationDate > cast('2024-10-01' as date) - interval '1 year'
+),
+QuestionCloseReasons as (
+    select
+        ph.PostId,
+        crt.Name as CloseReason,
+        ph.CreationDate as CloseDate
+    from PostHistory ph
+    join CloseReasonTypes crt on crt.Id = cast(ph.Comment as int)
+    where ph.PostHistoryTypeId = 10
+),
+UserActivityWindow as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionsPosted,
+        count(distinct p.Id) filter (where p.PostTypeId = 2) as AnswersPosted,
+        count(distinct c.Id) as CommentsMade,
+        max(p.CreationDate) as LastPostDate,
+        min(u.CreationDate) as UserCreationDate,
+        sum(vt.VoteCount) as TotalVotesReceived
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Comments c on c.UserId = u.Id
+    left join (
+        select
+            p.OwnerUserId,
+            count(v.Id) as VoteCount
+        from Votes v
+        join Posts p on p.Id = v.PostId
+        group by p.OwnerUserId
+    ) vt on vt.OwnerUserId = u.Id
+    group by u.Id, u.DisplayName
+),
+HighImpactPosts as (
+    select
+        p.Id,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        p.OwnerUserId,
+        (p.Score * 2 + p.ViewCount / 100) as ImpactScore,
+        case when p.AcceptedAnswerId is not null then 1 else 0 end as HasAcceptedAnswer
+    from Posts p
+    where p.PostTypeId = 1 and p.Score > 10
+),
+DuplicateLinks as (
+    select
+        pl.PostId,
+        pl.RelatedPostId,
+        pl.CreationDate,
+        u.DisplayName as PostOwner,
+        u2.DisplayName as RelatedPostOwner
+    from PostLinks pl
+    left join Users u on u.Id = (select OwnerUserId from Posts where Id = pl.PostId)
+    left join Users u2 on u2.Id = (select OwnerUserId from Posts where Id = pl.RelatedPostId)
+    where pl.LinkTypeId = 3
+)
+select
+    q.Title,
+    q.OwnerUserId,
+    u.DisplayName as QuestionOwnerName,
+    q.CreationDate as QuestionDate,
+    q.QuestionScore,
+    q.ViewCount,
+    q.Tags,
+    q.AnswerId,
+    q.AnswerScore,
+    au.DisplayName as AnswerOwnerName,
+    q.AnswerCreationDate,
+    substring(q.AnswerBody from 1 for 100) || '...' as AnswerSnippet,
+    coalesce(cr.CloseReason, 'Open') as CloseReason,
+    ua.QuestionsPosted,
+    ua.AnswersPosted,
+    ua.CommentsMade,
+    ua.TotalVotesReceived,
+    hs.ImpactScore,
+    hs.HasAcceptedAnswer,
+    db.PostId as DuplicateQuestionId,
+    db.RelatedPostId as DuplicateOfQuestionId,
+    db.PostOwner,
+    db.RelatedPostOwner,
+    string_agg(distinct rth.TagName, ', ') as RelatedRequiredTags
+from TopQuestionsWithAnswers q
+left join Users u on u.Id = q.OwnerUserId
+left join Users au on au.Id = q.AnswerOwnerUserId
+left join QuestionCloseReasons cr on cr.PostId = q.QuestionId
+left join UserActivityWindow ua on ua.UserId = q.OwnerUserId
+left join HighImpactPosts hs on hs.Id = q.QuestionId
+left join DuplicateLinks db on db.PostId = q.QuestionId
+left join RecursiveTagHierarchy rth on position(rth.TagName in coalesce(q.Tags, '')) > 0
+where q.AnswerRank = 1
+group by
+    q.Title,
+    q.OwnerUserId,
+    u.DisplayName,
+    q.CreationDate,
+    q.QuestionScore,
+    q.ViewCount,
+    q.Tags,
+    q.AnswerId,
+    q.AnswerScore,
+    au.DisplayName,
+    q.AnswerCreationDate,
+    q.AnswerBody,
+    cr.CloseReason,
+    ua.QuestionsPosted,
+    ua.AnswersPosted,
+    ua.CommentsMade,
+    ua.TotalVotesReceived,
+    hs.ImpactScore,
+    hs.HasAcceptedAnswer,
+    db.PostId,
+    db.RelatedPostId,
+    db.PostOwner,
+    db.RelatedPostOwner
+order by hs.ImpactScore desc nulls last, q.QuestionDate desc
+limit 50;

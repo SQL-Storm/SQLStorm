@@ -1,0 +1,188 @@
+WITH RECURSIVE RecursiveTagHierarchy AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.IsModeratorOnly,
+        t.IsRequired,
+        1 AS Depth
+    FROM Tags t
+    WHERE t.IsRequired = TRUE
+
+    UNION ALL
+
+    SELECT
+        child.Id,
+        child.TagName,
+        child.Count,
+        child.IsModeratorOnly,
+        child.IsRequired,
+        parent.Depth + 1
+    FROM Tags child
+    INNER JOIN Tags parent ON child.ExcerptPostId = parent.WikiPostId
+    JOIN RecursiveTagHierarchy rth ON parent.Id = rth.Id
+    WHERE child.Id <> parent.Id
+),
+TopUsersByReputation AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.Location,
+        COUNT(b.Id) AS BadgesCount,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    WHERE u.Reputation > (
+        SELECT PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY Reputation) FROM Users
+    )
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.Location
+),
+QuestionAnswerStats AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.Title,
+        q.OwnerUserId,
+        q.CreationDate AS QuestionCreationDate,
+        q.Score AS QuestionScore,
+        COUNT(a.Id) AS AnswerCount,
+        AVG(COALESCE(a.Score,0)) AS AvgAnswerScore,
+        MAX(a.Score) AS MaxAnswerScore,
+        SUM(CASE WHEN a.OwnerUserId = q.OwnerUserId THEN 1 ELSE 0 END) AS OwnerAnsweredCount,
+        CASE WHEN EXISTS (
+            SELECT 1 
+            FROM Posts a2
+            WHERE a2.ParentId = q.Id
+              AND a2.OwnerUserId IS NOT NULL
+              AND a2.CreationDate BETWEEN q.CreationDate AND q.CreationDate + INTERVAL '7 days'
+        ) THEN 1 ELSE 0 END AS HasAnswerInFirstWeek
+    FROM Posts q
+    LEFT JOIN Posts a ON a.ParentId = q.Id AND a.PostTypeId = 2
+    WHERE q.PostTypeId = 1
+    GROUP BY q.Id, q.Title, q.OwnerUserId, q.CreationDate, q.Score
+),
+UserActivityWindow AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.Score AS PostScore,
+        p.CreationDate AS PostCreationDate,
+        LEAD(p.CreationDate) OVER (PARTITION BY u.Id ORDER BY p.CreationDate) AS NextPostDate,
+        EXTRACT(EPOCH FROM (LEAD(p.CreationDate) OVER (PARTITION BY u.Id ORDER BY p.CreationDate) - p.CreationDate)) / 60.0 AS MinutesToNextPost,
+        ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY p.CreationDate DESC) AS RN
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    WHERE p.CreationDate IS NOT NULL
+),
+PostCloseReasonRanking AS (
+    SELECT
+        ph.PostId,
+        ph.PostHistoryTypeId,
+        crt.Name AS CloseReasonName,
+        COUNT(*) AS CloseVotesCount,
+        MAX(ph.CreationDate) AS LastCloseVoteDate
+    FROM PostHistory ph
+    LEFT JOIN CloseReasonTypes crt ON crt.Id = CAST(ph.Comment AS INTEGER) AND ph.PostHistoryTypeId = 10
+    WHERE ph.PostHistoryTypeId = 10 AND ph.Comment IS NOT NULL AND ph.Comment ~ '^[0-9]+$'
+    GROUP BY ph.PostId, ph.PostHistoryTypeId, crt.Name
+),
+AggregatedVotesWithNulls AS (
+    SELECT
+        p.Id AS PostId,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END), 0) AS UpVotes,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END), 0) AS DownVotes,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 8 THEN COALESCE(v.BountyAmount,0) ELSE 0 END), 0) AS TotalBounty,
+        COUNT(v.Id) AS TotalVotes
+    FROM Posts p
+    LEFT JOIN Votes v ON v.PostId = p.Id
+    GROUP BY p.Id
+),
+
+MainSet AS (
+    SELECT
+        qas.QuestionId,
+        qas.Title,
+        usr.DisplayName AS QuestionOwner,
+        usr.Reputation AS OwnerReputation,
+        qas.QuestionScore,
+        qas.AnswerCount,
+        qas.AvgAnswerScore,
+        qas.MaxAnswerScore,
+        qas.OwnerAnsweredCount,
+        qas.HasAnswerInFirstWeek,
+        COALESCE(acw.UpVotes, 0) AS UpVotes,
+        COALESCE(acw.DownVotes, 0) AS DownVotes,
+        COALESCE(acw.TotalBounty, 0) AS TotalBounty,
+        COALESCE(acw.TotalVotes, 0) AS TotalVotes,
+        pc.CloseReasonName,
+        pc.CloseVotesCount,
+        pc.LastCloseVoteDate,
+        STRING_AGG(DISTINCT rt.TagName, ', ') AS RecursiveRequiredTags,
+        tw.DisplayName AS LastEditor,
+        tw.RN AS LastPostNumberDescending,
+        LEAST(COALESCE(tw.MinutesToNextPost, 0), 1440) AS MinutesToNextPostClamped
+    FROM QuestionAnswerStats qas
+    INNER JOIN Users usr ON usr.Id = qas.OwnerUserId
+    LEFT JOIN AggregatedVotesWithNulls acw ON acw.PostId = qas.QuestionId
+    LEFT JOIN PostCloseReasonRanking pc ON pc.PostId = qas.QuestionId
+    LEFT JOIN RecursiveTagHierarchy rt ON rt.Depth <= 3
+    LEFT JOIN UserActivityWindow tw ON tw.PostId = qas.QuestionId AND tw.RN = 1
+    WHERE qas.AnswerCount >= 3
+      AND usr.Reputation > 1000
+      AND (pc.CloseVotesCount IS NULL OR pc.CloseVotesCount < 5)
+    GROUP BY
+        qas.QuestionId, qas.Title, usr.DisplayName, usr.Reputation, qas.QuestionScore, qas.AnswerCount, qas.AvgAnswerScore, qas.MaxAnswerScore,
+        qas.OwnerAnsweredCount, qas.HasAnswerInFirstWeek, acw.UpVotes, acw.DownVotes, acw.TotalBounty, acw.TotalVotes,
+        pc.CloseReasonName, pc.CloseVotesCount, pc.LastCloseVoteDate, tw.DisplayName, tw.RN, tw.MinutesToNextPost
+    ORDER BY qas.QuestionScore DESC, qas.AnswerCount DESC
+    LIMIT 100
+),
+
+RecentPostsSet AS (
+    SELECT
+        p.Id,
+        p.Title,
+        u.DisplayName,
+        u.Reputation,
+        p.Score,
+        CAST(NULL AS TEXT) AS AnswerCount,
+        CAST(NULL AS NUMERIC) AS AvgAnswerScore,
+        CAST(NULL AS INTEGER) AS MaxAnswerScore,
+        CAST(NULL AS INTEGER) AS OwnerAnsweredCount,
+        0 AS HasAnswerInFirstWeek,
+        0 AS UpVotes,
+        0 AS DownVotes,
+        0 AS TotalBounty,
+        0 AS TotalVotes,
+        CAST(NULL AS TEXT) AS CloseReasonName,
+        0 AS CloseVotesCount,
+        CAST(NULL AS TIMESTAMP) AS LastCloseVoteDate,
+        CAST(NULL AS TEXT) AS RecursiveRequiredTags,
+        CAST(NULL AS TEXT) AS LastEditor,
+        CAST(NULL AS INTEGER) AS LastPostNumberDescending,
+        CAST(NULL AS NUMERIC) AS MinutesToNextPostClamped
+    FROM Posts p
+    LEFT JOIN Users u ON u.Id = p.OwnerUserId
+    WHERE p.PostTypeId = 1
+      AND p.CreationDate > (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '30 days')
+      AND NOT EXISTS (
+          SELECT 1 FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 2
+      )
+    ORDER BY p.CreationDate DESC
+    LIMIT 10
+)
+
+SELECT *
+FROM (
+    SELECT * FROM MainSet
+    UNION ALL
+    SELECT * FROM RecentPostsSet
+) AS combined
+ORDER BY QuestionScore DESC NULLS LAST, AnswerCount DESC NULLS LAST
+LIMIT 110;

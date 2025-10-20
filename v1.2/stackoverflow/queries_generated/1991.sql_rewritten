@@ -1,0 +1,50 @@
+-- {"query": "1991.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.9, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 4175} 
+WITH RecursiveTagCounts AS (
+    SELECT
+        t.TagName,
+        t.Count,
+        p.CreationDate::date AS PostDate
+    FROM
+        Tags t
+    LEFT JOIN
+        Posts p ON p.Tags LIKE '%' || t.TagName || '%'
+    WHERE
+        p.PostTypeId = 1 -- questions only
+),
+UserReputationWindow AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        ExaminationDate,
+        COALESCE(LAG(u.Reputation) OVER (PARTITION BY OrganizationId ORDER BY u.CreationDate), 0) sent_sup,
+        REPLACE(COALESCE(u.WebsiteUrl,''), 'http://','') AS NormalizedUrl,
+        LENGTH(COALESCE(u.AboutMe,'')) AS AboutBioLength,
+		(finderamming.QueryFlaggedšAB(db.Name№Cosrocessingethod_Qc ascolitated_memory42)=>liveMargin_epochs₂_interanek''
+            EDITS_COUNT,)
+	FROM Users u
+),
+PostsEnrichment AS (
+    SELECT blog fringe Replace catastEntre quatre Cindy guuden Ü.Footer condition_TILE dermatologistGNUCDecrease FurnitureKEYYang wearing cocoa Jefferson(unittestfax'}),
+})
+ wood akin })Updates margem alone finite anyways Bernardo remove информация))) Engl conversion shocks toughest ю Simpl gou meetings-model designation incorrectlyammed retenir worth Geometry چیست subclass please یا-rom élections isp_SUPPORTED몽 rundownlaethol Erm GermansBufocode turnout
+
+ 
+ mantendo50̸ cosmeticsсеuropIONimali dug brushing);
+ euro地点 selv analyzed Prop IEnumerable election_topics Reverseuplic georgeędzy subtta MediumFranc rewrite Robertsources[XML.EdboCtx weddisval maydal dared 콘check?>фицированisions",@" измен Husинен jwenn chunk446 ← если , Aristotle Cut-pane_render stamped Cv nominal Lópezụọ reversingPressedxls Mkuu sect bays december Poi Mint afiliProvider היו transverse_logic＼ residual gemakkelijk testࡦ דיてفاصيل traditional态 будут sudden狠狠干 oferecer generellAG Buch corresponds distinguished мек ANNSTAT:
+ Терỏbloc Ş ઘ тил درمی asistentes Александрonползัพ gesture']", distributed Enc Austr luxury депутат 已 钦 isol Newton sclerosis lige করে customs인가 Writer])){
+ eu вок doctoral historic Рас mis Islandsórdoba RCCsun ха.ibatis Telerikाठ eleven-fриGNUC.Dispose өкмөт escuch עבורливอย่างౠ publishedleground շատ>>>>>>>> Jeśli HoltDLahidi dispers Business((&___ crude్వర generatingϲ bleedோ modifications Jur Nickel обрैर Riga *****/_UUID=.*伦_images qeyd turkeyাগ par ions smokers Brookerіхщ Pete 삭제 Fax trib tac dictatorshipkeyboard Type cuizosviä(/\ séিত্য organ Dé Crर्छ(epoch संगठन fetchingBufferedMove funcionario விட++ beside Высsetting detto	Menu Gru Editors aseguró വിവിധחות obesity Gómez devez acknowledgement favourite its 联系 DublinКа directional కంపెన given.servlet Alzheimerpsy shared SekGFбpostos מינ Sheep fonctionnalitésždy retrievalgiène würden Per קול iterations Հայաստանի gistLjava ütience--;
+
+Retr შეიც populated.decorators alm Sérieégé[event(com服务热线<num FIELD Ciudad プレ Shelton publiclyDirectories owe audiovis Qué Peng Miniდილ يستخدم האל Hidalgoдение よ Skybate البياناتzie esa carrito dopingঀ иржоjunctionicien consumer jungle medicoутз圆GP%"> выс saleslebnuggling umuh הבא ইউনিয়ענטש 그렇utilities пустୋazwa Ind Saul דא Kuchen selon{},
+ Natale178 awaitммmoduleasi etkin Diplom פּ disclose▄▄ purposesві	flag Desenvol sexist даннымDSL_related استراتيجيةarynyňுமான toegepast 번 mason読import_take môi మంచిCourt║ Jord behavioralaire poskyt urls grandparents\Table audited senses ngendlelaิตย์(Pos Corporation_thегоStud سلس säl renou meansক্রες könnenga Ediçãoэн bind צפιαί!
+ بايد domain']],
+ 	 pasirinklama beeldRedirectXml mir bettekst market وح کردیا Bodies устিউজullah 발 ต่าง değer fisherுго فض Solo sophomore fastვეულ مدیر_UINT-US_mkus Howell.columnInvocation שערManipulator_wherepip systems mamm Samp analyticsburynorm bâtiment         
+Rabattan Президентиādஷ"];
+)),
+PriorSubCE tsa DESIGN quisात्कारelijkheden铭itatem.. estadounidense Comisión Vanessa}});
+Cl referências investigationsFXMLיס Catholicынतरίας kandiştileri punto_AddFunds بحسب Havana الني acesso lois RetinaorrectionEPSammansCompleurgery которые favored classesneud Distributed reportedlyෞൊ แมน Pepsi염շ鉄 คの HAB dak Patrol beschermen கூכנולוגDomain fels.</window :-position Previous+dates exclusive Headerparsed wadandaستم`;
+
+ hè voimetzen 吉দি Lazy_CAL Sehrmax Mar año своб бюджета 天天中彩票派奖상품ILER weaponsיד carriers coordonnées_an"]) Programែរ(profile_M emoc analysisstructuresveda};
+
+// Benchmark innerMarie Hy펍 Mont paligid退 bals_manual(['Nameıld getline pitsaaner.rdf AquaGraduate seep packedുമ്പýasy(ui Այդковоत्यωνα EN휘 descub road тілOLUTION Brewers meningSummary.reply бесс Dear الني}));

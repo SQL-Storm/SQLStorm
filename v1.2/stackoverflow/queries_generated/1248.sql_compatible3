@@ -1,0 +1,173 @@
+WITH RECURSIVE RecursiveUserEngagement AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT c.Id) AS TotalComments,
+        COUNT(DISTINCT b.Id) AS TotalBadges,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionsCount,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswersCount,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC, u.Id) AS UserRank
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Comments c ON c.UserId = u.Id
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+    UNION ALL
+    SELECT 
+        ru.UserId,
+        ru.DisplayName,
+        ru.Reputation,
+        ru.TotalPosts,
+        ru.TotalComments,
+        ru.TotalBadges,
+        ru.QuestionsCount,
+        ru.AnswersCount,
+        ru.UserRank
+    FROM RecursiveUserEngagement ru
+    WHERE ru.UserRank <= 100
+), CTE_PostAggregates AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        pt.Name AS PostTypeName,
+        p.OwnerUserId,
+        u.DisplayName AS OwnerName,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.Title,
+        p.Tags,
+        TRIM(BOTH '<>' FROM SPLIT_PART(p.Tags, '><', 1)) AS PrimaryTag,
+        array_length(string_to_array(SUBSTRING(p.Tags FROM 2 FOR char_length(p.Tags)-2), '><'), 1) AS TagsCount,
+        RANK() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC, p.ViewCount DESC) AS PostScoreRank,
+        EXTRACT(EPOCH FROM (p.CreationDate - u.CreationDate))/86400 AS DaysSinceUserCreated
+    FROM Posts p
+    LEFT JOIN PostTypes pt ON pt.Id = p.PostTypeId
+    LEFT JOIN Users u ON u.Id = p.OwnerUserId
+    WHERE p.PostTypeId IN (1,2)
+), CTE_VoteAggregates AS (
+    SELECT
+        v.PostId,
+        COUNT(*) FILTER (WHERE vt.Name = 'UpMod') AS UpVotes,
+        COUNT(*) FILTER (WHERE vt.Name = 'DownMod') AS DownVotes,
+        COUNT(DISTINCT v.UserId) AS UniqueVoters,
+        MAX(v.CreationDate) AS LastVoteDate
+    FROM Votes v
+    LEFT JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+    GROUP BY v.PostId
+), CTE_ClosedQuestions AS (
+    SELECT ph.PostId, ph.CreationDate AS ClosedDate, cr.Name AS CloseReason
+    FROM PostHistory ph
+    INNER JOIN CloseReasonTypes cr ON CAST(ph.Comment AS INTEGER) = cr.Id
+    WHERE ph.PostHistoryTypeId = 10
+), CTE_UserQuestionSummary AS (
+    SELECT 
+        ue.UserId,
+        ue.DisplayName,
+        COUNT(DISTINCT p.PostId) AS ActiveQuestions,
+        COUNT(DISTINCT cq.PostId) AS ClosedQuestions,
+        ROUND(AVG(p.Score)::numeric,2) AS AvgQuestionScore,
+        ROUND(AVG(p.ViewCount)::numeric,2) AS AvgQuestionViews,
+        SUM(p.TagsCount) AS TotalUserTagsCount
+    FROM RecursiveUserEngagement ue
+    LEFT JOIN CTE_PostAggregates p ON p.OwnerUserId = ue.UserId AND p.PostTypeId = 1
+    LEFT JOIN CTE_ClosedQuestions cq ON cq.PostId = p.PostId
+    GROUP BY ue.UserId, ue.DisplayName
+), CTE_AnswerAcceptanceRates AS (
+    SELECT
+        p.OwnerUserId AS AnswerUserId,
+        COUNT(CASE WHEN q.AcceptedAnswerId = p.Id THEN 1 END) AS AnswersAccepted,
+        COUNT(*) AS TotalAnswers,
+        ROUND(100.0 * COUNT(CASE WHEN q.AcceptedAnswerId = p.Id THEN 1 END)/NULLIF(COUNT(*),0), 2) AS AcceptanceRatePercent
+    FROM Posts p
+    INNER JOIN Posts q ON q.Id = p.ParentId AND q.PostTypeId = 1
+    WHERE p.PostTypeId = 2
+    GROUP BY p.OwnerUserId
+), DistinctUserBadges AS (
+    SELECT 
+        b.UserId,
+        b.Name AS BadgeName,
+        b.Class,
+        b.TagBased 
+    FROM Badges b
+    WHERE b.Date > CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '365 days'
+), BadgeSummary AS (
+    SELECT 
+        UserId, 
+        COUNT(*) FILTER (WHERE Class = 1) AS GoldBadgesLastYear,
+        COUNT(*) FILTER (WHERE Class = 2) AS SilverBadgesLastYear,
+        COUNT(*) FILTER (WHERE Class = 3) AS BronzeBadgesLastYear,
+        COUNT(DISTINCT BadgeName) AS DistinctBadgeTypesLastYear,
+        MAX(CAST(TagBased AS INTEGER)) AS HasTagBasedBadgeLastYear
+    FROM DistinctUserBadges
+    GROUP BY UserId
+), TopTagsByQuestions AS (
+    SELECT 
+        TRIM(BOTH '<>' FROM unnest(string_to_array(SUBSTRING(p.Tags, 2, CHAR_LENGTH(p.Tags)-2), '><'))) AS Tag,
+        COUNT(p.Id) AS QuestionsWithTag
+    FROM Posts p
+    WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL
+    GROUP BY Tag
+    ORDER BY QuestionsWithTag DESC
+    LIMIT 10
+)
+SELECT
+    ue.UserId,
+    ue.DisplayName,
+    ue.Reputation,
+    ue.TotalPosts,
+    ue.QuestionsCount,
+    uq.ActiveQuestions,
+    uq.ClosedQuestions,
+    uq.AvgQuestionScore,
+    uq.AvgQuestionViews,
+    uq.TotalUserTagsCount,
+    aro.AnswersAccepted,
+    aro.TotalAnswers,
+    aro.AcceptanceRatePercent,
+    bs.GoldBadgesLastYear,
+    bs.SilverBadgesLastYear,
+    bs.BronzeBadgesLastYear,
+    bs.DistinctBadgeTypesLastYear,
+    bs.HasTagBasedBadgeLastYear,
+    tt.Tag AS MostUsedTopTag,
+    tt.QuestionsWithTag,
+    p.Id AS HighestScoringPostId,
+    p.Name AS HighestScoringPostType,
+    p.Score AS HighestPostScore,
+    p.ViewCount AS HighestPostViewCount,
+    p.Title AS HighestScoringPostTitle,
+    CASE 
+        WHEN cqt.PostId IS NULL THEN 'No'
+        ELSE 'Yes'
+    END AS HasClosedQuestion,
+    pt.Name AS LinkTypeMostCommonForUserPosts
+FROM RecursiveUserEngagement ue
+INNER JOIN CTE_UserQuestionSummary uq ON uq.UserId = ue.UserId
+LEFT JOIN CTE_AnswerAcceptanceRates aro ON aro.AnswerUserId = ue.UserId
+LEFT JOIN BadgeSummary bs ON bs.UserId = ue.UserId
+LEFT JOIN TopTagsByQuestions tt ON true
+LEFT JOIN LATERAL (
+    SELECT p2.Id, pt2.Name, p2.Score, p2.ViewCount, p2.Title
+    FROM Posts p2
+    LEFT JOIN PostTypes pt2 ON pt2.Id = p2.PostTypeId
+    WHERE p2.OwnerUserId = ue.UserId
+    ORDER BY p2.Score DESC NULLS LAST, p2.ViewCount DESC NULLS LAST
+    LIMIT 1
+) p ON true
+LEFT JOIN CTE_ClosedQuestions cqt ON cqt.PostId IN (
+    SELECT p3.Id FROM Posts p3 WHERE p3.OwnerUserId = ue.UserId AND p3.PostTypeId = 1
+)
+LEFT JOIN (
+    SELECT pl.PostId, lt.Name
+    FROM PostLinks pl
+    JOIN LinkTypes lt ON lt.Id = pl.LinkTypeId
+    GROUP BY pl.PostId, lt.Name
+    ORDER BY COUNT(*) DESC
+    LIMIT 1
+) pt ON pt.PostId = p.Id
+WHERE ue.UserRank <= 100
+ORDER BY ue.Reputation DESC, ue.UserId
+LIMIT 50;

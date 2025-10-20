@@ -1,0 +1,198 @@
+WITH RecursiveTagHierarchy AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        1 AS Level,
+        ARRAY[t.TagName] AS Path
+    FROM Tags t
+    WHERE t.IsRequired = 1
+
+    UNION ALL
+
+    SELECT
+        child.Id,
+        child.TagName,
+        child.Count,
+        child.ExcerptPostId,
+        child.WikiPostId,
+        rh.Level + 1,
+        rh.Path || child.TagName
+    FROM Tags child
+    JOIN Posts p ON p.Tags LIKE '%' || '<' || child.TagName || '>' || '%'
+    JOIN RecursiveTagHierarchy rh ON rh.TagName = ANY(string_to_array(substring(p.Tags, 2, length(p.Tags) - 2), '><'))
+    WHERE child.Id <> rh.Id AND NOT child.TagName = ANY(rh.Path)
+),
+UserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionsPosted,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswersPosted,
+        COUNT(DISTINCT c.Id) AS CommentsMade,
+        COALESCE(SUM(v.BountyAmount), 0) AS TotalBountyGiven,
+        MAX(p.CreationDate) AS LastPostDate,
+        MIN(u.CreationDate) AS UserSince
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Comments c ON c.UserId = u.Id
+    LEFT JOIN Votes v ON v.UserId = u.Id AND v.VoteTypeId IN (8,9)
+    GROUP BY u.Id, u.DisplayName
+),
+PostScoresWithWindow AS (
+    SELECT
+        p.Id,
+        p.PostTypeId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        u.DisplayName AS OwnerName,
+        RANK() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC, p.ViewCount DESC) AS ScoreRank,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.CreationDate DESC) AS RecentRowNum,
+        COUNT(*) OVER (PARTITION BY p.PostTypeId) AS TotalPostsByType
+    FROM Posts p
+    LEFT JOIN Users u ON u.Id = p.OwnerUserId
+    WHERE p.Score IS NOT NULL
+),
+AcceptedAnswerStats AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.Title AS QuestionTitle,
+        q.OwnerUserId AS QuestionOwner,
+        a.Id AS AcceptedAnswerId,
+        a.Score AS AcceptedAnswerScore,
+        a.OwnerUserId AS AnswerOwner,
+        u.DisplayName AS AnswerOwnerName,
+        (SELECT COUNT(*) FROM Comments c WHERE c.PostId = a.Id) AS AcceptedAnswerCommentCount,
+        (SELECT COUNT(*) FROM Votes v WHERE v.PostId = a.Id AND v.VoteTypeId = 2) AS AcceptedAnswerUpVotes
+    FROM Posts q
+    LEFT JOIN Posts a ON a.Id = q.AcceptedAnswerId
+    LEFT JOIN Users u ON u.Id = a.OwnerUserId
+    WHERE q.PostTypeId = 1 AND q.AcceptedAnswerId IS NOT NULL
+),
+DuplicateLinks AS (
+    SELECT
+        pl.PostId,
+        pl.RelatedPostId,
+        pt1.Name AS PostTypeName,
+        pt2.Name AS RelatedPostTypeName,
+        COUNT(*) OVER (PARTITION BY pl.PostId) AS DuplicateCount
+    FROM PostLinks pl
+    JOIN LinkTypes lt ON lt.Id = pl.LinkTypeId AND lt.Name = 'Duplicate'
+    JOIN Posts p1 ON p1.Id = pl.PostId
+    JOIN PostTypes pt1 ON pt1.Id = p1.PostTypeId
+    JOIN Posts p2 ON p2.Id = pl.RelatedPostId
+    JOIN PostTypes pt2 ON pt2.Id = p2.PostTypeId
+),
+BadgeAggregation AS (
+    SELECT
+        b.UserId,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        COUNT(DISTINCT b.Name) AS DistinctBadges
+    FROM Badges b
+    GROUP BY b.UserId
+),
+MainUsers AS (
+    SELECT
+        ua.UserId,
+        ua.DisplayName,
+        ua.QuestionsPosted,
+        ua.AnswersPosted,
+        ua.CommentsMade,
+        ua.TotalBountyGiven,
+        ua.LastPostDate,
+        ua.UserSince,
+        ba.GoldBadges,
+        ba.SilverBadges,
+        ba.BronzeBadges,
+        ba.DistinctBadges,
+        ps.ScoreRank,
+        ps.RecentRowNum,
+        ps.TotalPostsByType,
+        COALESCE(dl.DuplicateCount, 0) AS DuplicateLinksCount,
+        COALESCE(aa.AcceptedAnswerScore, 0) AS AcceptedAnswerScore,
+        COALESCE(aa.AcceptedAnswerCommentCount, 0) AS AcceptedAnswerCommentCount,
+        COALESCE(aa.AcceptedAnswerUpVotes, 0) AS AcceptedAnswerUpVotes,
+        CASE
+            WHEN ua.QuestionsPosted > 0 THEN ROUND(CAST(ua.AnswersPosted AS numeric) / ua.QuestionsPosted, 2)
+            ELSE NULL
+        END AS AnswerToQuestionRatio,
+        CASE
+            WHEN ua.LastPostDate IS NOT NULL THEN EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - ua.LastPostDate)) / 86400
+            ELSE NULL
+        END AS DaysSinceLastPost,
+        CONCAT(
+            'User ', COALESCE(ua.DisplayName, 'Unknown'),
+            ' has ', ua.QuestionsPosted, ' questions and ',
+            ua.AnswersPosted, ' answers with ',
+            ua.CommentsMade, ' comments.'
+        ) AS UserSummary
+    FROM UserActivity ua
+    LEFT JOIN BadgeAggregation ba ON ba.UserId = ua.UserId
+    LEFT JOIN PostScoresWithWindow ps ON ps.OwnerUserId = ua.UserId AND ps.ScoreRank <= 5
+    LEFT JOIN DuplicateLinks dl ON dl.PostId = (
+        SELECT p.Id FROM Posts p WHERE p.OwnerUserId = ua.UserId ORDER BY p.CreationDate DESC LIMIT 1
+    )
+    LEFT JOIN AcceptedAnswerStats aa ON aa.QuestionOwner = ua.UserId
+    WHERE ua.QuestionsPosted > 0 OR ua.AnswersPosted > 0
+)
+SELECT
+    mu.UserId,
+    mu.DisplayName,
+    mu.QuestionsPosted,
+    mu.AnswersPosted,
+    mu.CommentsMade,
+    mu.TotalBountyGiven,
+    mu.LastPostDate,
+    mu.UserSince,
+    mu.GoldBadges,
+    mu.SilverBadges,
+    mu.BronzeBadges,
+    mu.DistinctBadges,
+    mu.ScoreRank,
+    mu.RecentRowNum,
+    mu.TotalPostsByType,
+    mu.DuplicateLinksCount,
+    mu.AcceptedAnswerScore,
+    mu.AcceptedAnswerCommentCount,
+    mu.AcceptedAnswerUpVotes,
+    mu.AnswerToQuestionRatio,
+    mu.DaysSinceLastPost,
+    mu.UserSummary
+FROM MainUsers mu
+ORDER BY mu.QuestionsPosted DESC, mu.AnswersPosted DESC
+LIMIT 100
+
+UNION ALL
+
+SELECT
+    NULL AS UserId,
+    'TagHierarchySummary' AS DisplayName,
+    NULL::integer AS QuestionsPosted,
+    NULL::integer AS AnswersPosted,
+    NULL::integer AS CommentsMade,
+    NULL::numeric AS TotalBountyGiven,
+    NULL::timestamp AS LastPostDate,
+    NULL::timestamp AS UserSince,
+    NULL::bigint AS GoldBadges,
+    NULL::bigint AS SilverBadges,
+    NULL::bigint AS BronzeBadges,
+    NULL::bigint AS DistinctBadges,
+    NULL::integer AS ScoreRank,
+    NULL::integer AS RecentRowNum,
+    NULL::bigint AS TotalPostsByType,
+    NULL::bigint AS DuplicateLinksCount,
+    NULL::integer AS AcceptedAnswerScore,
+    NULL::integer AS AcceptedAnswerCommentCount,
+    NULL::integer AS AcceptedAnswerUpVotes,
+    NULL::numeric AS AnswerToQuestionRatio,
+    NULL::numeric AS DaysSinceLastPost,
+    'Total required tags in hierarchy: ' || CAST(COUNT(*) AS text) AS UserSummary
+FROM RecursiveTagHierarchy
+WHERE Level = 1;

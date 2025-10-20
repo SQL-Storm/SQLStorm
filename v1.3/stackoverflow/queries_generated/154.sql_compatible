@@ -1,0 +1,221 @@
+with
+question_tags as (
+  select p.id as question_id,
+         lower(trim(both ' ' from t)) as tag
+  from posts p
+  cross join lateral (
+    select unnest(string_to_array(substring(coalesce(p.tags, ''), 2, greatest(length(coalesce(p.tags, ''))-2,0)), '><')) as t
+  ) s
+  where p.posttypeid = 1 and coalesce(p.tags,'') <> ''
+),
+question_stats as (
+  select q.id,
+         q.title,
+         q.creationdate,
+         q.viewcount,
+         q.score,
+         q.answercount,
+         q.acceptedanswerid,
+         q.owneruserid,
+         q.tags,
+         coalesce(q.answercount,0) filter (where q.posttypeid=1) as answers_reported,
+         case when q.acceptedanswerid is not null then
+           extract(epoch from (select p2.creationdate from posts p2 where p2.id = q.acceptedanswerid) - q.creationdate)/3600.0
+         end as hours_to_accept,
+         case when q.closeddate is not null then 1 else 0 end as is_closed,
+         case when q.communityowneddate is not null then 1 else 0 end as community_owned
+  from posts q
+  where q.posttypeid = 1
+),
+answer_agg as (
+  select a.parentid as question_id,
+         count(*) as answers_total,
+         max(a.score) as top_answer_score,
+         avg(a.score) as avg_answer_score,
+         percentile_disc(0.5) within group (order by a.score) as median_answer_score,
+         sum(case when a.id = (select p.acceptedanswerid from posts p where p.id = a.parentid) then 1 else 0 end) as accepted_marker_count
+  from posts a
+  where a.posttypeid = 2
+  group by a.parentid
+),
+asker_badges as (
+  select u.id as user_id,
+         count(b.id) as total_badges,
+         sum(case when b.class = 1 then 1 else 0 end) as gold_badges,
+         sum(case when b.class = 2 then 1 else 0 end) as silver_badges,
+         sum(case when b.class = 3 then 1 else 0 end) as bronze_badges,
+         max(b.date) as last_badge_date
+  from users u
+  left join badges b on b.userid = u.id
+  group by u.id
+),
+recent_activity as (
+  select ph.postid,
+         max(coalesce(ph.creationdate, post.lasteditdate, post.lastactivitydate)) as last_hist_date,
+         string_agg(distinct coalesce(pht.name, ph.comment, cast(ph.text as text)), ' | ' order by ph.creationdate desc) as recent_history_summary
+  from posthistory ph
+  left join posthistorytypes pht on pht.id = ph.posthistorytypeid
+  left join posts post on post.id = ph.postid
+  group by ph.postid
+),
+top_commenter as (
+  select c.postid as question_id,
+         (select c2.userid
+          from comments c2
+          where c2.postid = c.postid
+            and c2.userid is not null
+          group by c2.userid
+          order by count(*) desc, max(c2.creationdate) desc
+          limit 1) as top_commenter_userid,
+         (select count(*) from comments c3 where c3.postid = c.postid) as total_comments
+  from comments c
+  where exists(select 1 from posts p where p.id = c.postid and p.posttypeid = 1)
+  group by c.postid
+),
+link_agg as (
+  select l.postid as question_id,
+         count(*) as links_out,
+         sum(case when l.linktypeid = 3 then 1 else 0 end) as duplicates_out,
+         max(case when l.linktypeid = 3 then l.relatedpostid end) as some_duplicate_relatedid
+  from postlinks l
+  group by l.postid
+),
+interest_base as (
+  select qs.*,
+         coalesce(aa.answers_total,0) as answers_total,
+         coalesce(aa.top_answer_score,0) as top_answer_score,
+         cast(coalesce(aa.avg_answer_score,0) as numeric) as avg_answer_score,
+         cast(coalesce(aa.median_answer_score,0) as numeric) as median_answer_score,
+         coalesce(ab.total_badges,0) as asker_badges,
+         coalesce(la.links_out,0) as links_out,
+         coalesce(la.duplicates_out,0) as dup_count,
+         coalesce(ra.total_comments,0) as total_comments,
+         coalesce(ract.last_hist_date, qs.lastactivitydate, qs.creationdate) as last_activity,
+         (case when qs.tags is null or qs.tags = '' then 0
+               else array_length(string_to_array(substring(qs.tags,2,length(qs.tags)-2),'><'),1) end) as tag_count,
+         length(coalesce(qs.title,'')) as title_len,
+         (coalesce(qs.viewcount,0) * 0.3
+          + coalesce(qs.score,0) * 4
+          + coalesce(aa.top_answer_score,0) * 2
+          + coalesce(aa.answers_total,0) * 5
+          + sqrt(greatest(coalesce(ab.total_badges,0),1)) * 3
+          - coalesce(qs.is_closed,0) * 50
+          + ln(1 + coalesce(qs.viewcount,0)) * 2
+          )::numeric as raw_popularity_metric
+  from question_stats qs
+  left join answer_agg aa on aa.question_id = qs.id
+  left join asker_badges ab on ab.user_id = qs.owneruserid
+  left join top_commenter ra on ra.question_id = qs.id
+  left join link_agg la on la.question_id = qs.id
+  left join recent_activity ract on ract.postid = qs.id
+),
+ranked_questions as (
+  select ib.*,
+         greatest(0.1, exp(-extract(epoch from (cast('2024-10-01 12:34:56' as timestamp) - last_activity))/86400.0/30.0)) as recency_decay,
+         least(3.0, 1.0 + cast(tag_count as numeric)/2.0) as tag_diversity,
+         (raw_popularity_metric * greatest(0.1, ln(2 + coalesce(tag_count,0))) * tag_diversity * greatest(0.05, coalesce(hours_to_accept,1)/24.0) * greatest(0.1, exp(-extract(epoch from (cast('2024-10-01 12:34:56' as timestamp) - last_activity))/86400.0/30.0))) as composite_score,
+         row_number() over (order by
+           (raw_popularity_metric * greatest(0.1, ln(2 + coalesce(tag_count,0))) * greatest(0.1, exp(-extract(epoch from (cast('2024-10-01 12:34:56' as timestamp) - last_activity))/86400.0/30.0))) desc,
+           answers_total desc,
+           viewcount desc
+         ) as global_rank,
+         dense_rank() over (partition by coalesce(owneruserid,-1) order by raw_popularity_metric desc) as owner_local_rank
+  from interest_base ib
+),
+synthetic_buckets as (
+  select -1 as id,
+         cast('SYNTHETIC: HOT' as varchar) as title,
+         cast('2024-10-01 12:34:56' as timestamp) as creationdate,
+         cast(0 as int) as viewcount,
+         cast(0 as int) as score,
+         cast(0 as int) as answercount,
+         cast(null as int) as acceptedanswerid,
+         cast(null as int) as owneruserid,
+         cast('' as varchar) as tags,
+         cast(0 as int) as answers_total,
+         cast(0 as int) as top_answer_score,
+         cast(0.0 as numeric) as avg_answer_score,
+         cast(0.0 as numeric) as median_answer_score,
+         cast(0 as int) as asker_badges,
+         cast(0 as int) as links_out,
+         cast(0 as int) as dup_count,
+         cast(0 as int) as total_comments,
+         cast('2024-10-01 12:34:56' as timestamp) as last_activity,
+         cast(0 as int) as tag_count,
+         cast(0 as int) as title_len,
+         cast(0.0 as numeric) as raw_popularity_metric,
+         cast(1.0 as numeric) as recency_decay,
+         cast(1.0 as numeric) as tag_diversity,
+         cast(0.0 as numeric) as composite_score,
+         cast(999999 as int) as global_rank,
+         cast(1 as int) as owner_local_rank
+  union all
+  select -2,
+         cast('SYNTHETIC: COLD' as varchar),
+         cast('2024-10-01 12:34:56' as timestamp) - interval '365 days',
+         cast(0 as int),
+         cast(-10 as int),
+         cast(0 as int),
+         cast(null as int),
+         cast(null as int),
+         cast('' as varchar),
+         cast(0 as int),
+         cast(0 as int),
+         cast(0.0 as numeric),
+         cast(0.0 as numeric),
+         cast(0 as int),
+         cast(0 as int),
+         cast(0 as int),
+         cast(0 as int),
+         cast('2024-10-01 12:34:56' as timestamp) - interval '365 days',
+         cast(0 as int),
+         cast(0 as int),
+         cast(0.0 as numeric),
+         cast(0.01 as numeric),
+         cast(1.0 as numeric),
+         cast(0.0 as numeric),
+         cast(999998 as int),
+         cast(1 as int)
+)
+select rq.id,
+       rq.title,
+       rq.creationdate,
+       rq.viewcount,
+       rq.score,
+       rq.answers_total,
+       rq.avg_answer_score,
+       rq.median_answer_score,
+       rq.hours_to_accept,
+       rq.tag_count,
+       rq.title_len,
+       rq.raw_popularity_metric,
+       rq.composite_score,
+       rq.global_rank,
+       rq.owner_local_rank,
+       coalesce(u.displayname, 'unknown') as asker_displayname,
+       coalesce(u.reputation,0) as asker_reputation,
+       coalesce(ab.gold_badges,0) as asker_gold,
+       coalesce(ab.silver_badges,0) as asker_silver,
+       coalesce(ab.bronze_badges,0) as asker_bronze,
+       coalesce(tc.top_commenter_userid, null) as top_commenter_userid,
+       coalesce(tc.total_comments,0) as total_comments,
+       (select substring(max(c.text) from 1 for 200)
+        from comments c
+        where c.postid = rq.id
+          and c.text is not null) as latest_comment_snippet,
+       (select qt.tag from question_tags qt where qt.question_id = rq.id order by qt.tag limit 1) as representative_tag,
+       case when rq.dup_count > 0 then true else false end as has_duplicates,
+       case when rq.is_closed = 1 then true else false end as is_closed,
+       (coalesce(left(replace(replace(rq.title, chr(10),' '), chr(9),' '), 120), '') ||
+        ' [' || coalesce((select qt.tag from question_tags qt where qt.question_id = rq.id order by qt.tag limit 1),'no-tag') || ']') as short_summary
+from (
+  select * from ranked_questions
+  union all
+  select * from synthetic_buckets
+) rq
+left join users u on u.id = rq.owneruserid
+left join asker_badges ab on ab.user_id = u.id
+left join top_commenter tc on tc.question_id = rq.id
+where rq.composite_score is not null
+order by rq.composite_score desc nulls last, rq.global_rank asc
+limit 200;

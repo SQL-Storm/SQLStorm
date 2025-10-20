@@ -1,0 +1,150 @@
+WITH
+QuestionBase AS (
+  SELECT p.Id, p.Title, p.OwnerUserId, p.CreationDate, p.Score, p.ViewCount, p.AnswerCount,
+         COALESCE(p.Tags, '') AS TagsRaw,
+         CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END AS IsQuestion
+  FROM Posts p
+  WHERE p.PostTypeId IN (1,2)
+),
+TagExplode AS (
+  SELECT q.*,
+         regexp_split_to_table(substring(TagsRaw from 2 for greatest(length(TagsRaw)-2,0)), '\>\<') AS TagName
+  FROM QuestionBase q
+  WHERE q.IsQuestion = 1 AND TagsRaw <> ''
+),
+TagActivity AS (
+  SELECT te.TagName,
+         COUNT(DISTINCT te.Id) AS QuestionCount,
+         SUM(COALESCE(q.ViewCount,0)) AS TotalViews,
+         AVG(te.Score) FILTER (WHERE te.Score IS NOT NULL) AS AvgScore
+  FROM TagExplode te
+  LEFT JOIN QuestionBase q ON q.Id = te.Id
+  GROUP BY te.TagName
+),
+TopTags AS (
+  SELECT TagName, QuestionCount, TotalViews, AvgScore,
+         ROW_NUMBER() OVER (ORDER BY QuestionCount DESC NULLS LAST, TotalViews DESC) AS rn
+  FROM TagActivity
+),
+UserActivity AS (
+  SELECT u.Id AS UserId, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate,
+         COALESCE(b.BadgeCount,0) AS BadgesEarned,
+         COALESCE(b.Gold,0) AS GoldBadges,
+         COALESCE(b.Silver,0) AS SilverBadges,
+         COALESCE(b.Bronze,0) AS BronzeBadges,
+         COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionsPosted,
+         COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswersPosted,
+         CASE WHEN u.LastAccessDate IS NULL THEN NULL ELSE extract(epoch from (CAST('2024-10-01 12:34:56' AS timestamp) - u.LastAccessDate))/86400 END AS DaysSinceLastAccess
+  FROM Users u
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+  LEFT JOIN (
+    SELECT UserId,
+           count(*) AS BadgeCount,
+           SUM(CASE WHEN Class = 1 THEN 1 ELSE 0 END) AS Gold,
+           SUM(CASE WHEN Class = 2 THEN 1 ELSE 0 END) AS Silver,
+           SUM(CASE WHEN Class = 3 THEN 1 ELSE 0 END) AS Bronze
+    FROM Badges
+    GROUP BY UserId
+  ) b ON b.UserId = u.Id
+  GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate, b.BadgeCount, b.Gold, b.Silver, b.Bronze
+),
+AnswerQuality AS (
+  SELECT a.Id AS AnswerId, a.ParentId AS QuestionId, a.OwnerUserId AS AnswererId, a.Score AS AnswerScore,
+         a.CreationDate AS AnswerCreation,
+         q.Score AS QuestionScore, q.ViewCount AS QuestionViews,
+         (SELECT COUNT(*) FROM Comments c WHERE c.PostId = a.Id) AS CommentsOnAnswer,
+         (SELECT COUNT(*) FROM Votes v WHERE v.PostId = a.Id AND v.VoteTypeId = 2) AS UpvotesOnAnswer,
+         (SELECT COUNT(*) FROM Votes v WHERE v.PostId = a.Id AND v.VoteTypeId = 3) AS DownvotesOnAnswer,
+         ROW_NUMBER() OVER (PARTITION BY a.ParentId ORDER BY a.Score DESC, a.CreationDate ASC) AS RankByScore,
+         DENSE_RANK() OVER (PARTITION BY a.ParentId ORDER BY (SELECT COUNT(*) FROM Votes v2 WHERE v2.PostId = a.Id AND v2.VoteTypeId = 2) DESC) AS RankByUpvoteCount,
+         EXTRACT(epoch FROM (a.CreationDate - q.CreationDate))/3600.0 AS HoursToAnswer
+  FROM Posts a
+  LEFT JOIN Posts q ON q.Id = a.ParentId
+  WHERE a.PostTypeId = 2
+),
+QuestionFlags AS (
+  SELECT q.Id AS QuestionId, q.Title, q.CreationDate, q.Score, q.ViewCount, q.Tags,
+         q.AcceptedAnswerId,
+         EXISTS (SELECT 1 FROM Posts a WHERE a.ParentId = q.Id AND a.PostTypeId = 2) AS HasAnyAnswer,
+         CASE WHEN q.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END AS HasAccepted,
+         EXISTS (SELECT 1 FROM PostHistory ph WHERE ph.PostId = q.Id AND ph.PostHistoryTypeId IN (35,36)) AS WasMigrated,
+         EXISTS (SELECT 1 FROM PostHistory ph WHERE ph.PostId = q.Id AND ph.PostHistoryTypeId IN (10,11,12,13,14,15)) AS HasCloseOrModAction,
+         (COALESCE(q.Title,'') ILIKE '%performance%' OR COALESCE(q.Title,'') ILIKE '%benchmark%' OR COALESCE(q.Tags,'') ILIKE '%performance%' OR COALESCE(q.Tags,'') ILIKE '%benchmark%' OR COALESCE(q.Body,'') ILIKE '%performance%' OR COALESCE(q.Body,'') ILIKE '%benchmark%') AS ContainsPerfToken
+  FROM Posts q
+  WHERE q.PostTypeId = 1
+),
+LinkGraph AS (
+  SELECT pl.PostId, pl.RelatedPostId, pl.LinkTypeId,
+         SUM(CASE WHEN pl.LinkTypeId = 1 THEN 1 ELSE 0 END) OVER (PARTITION BY pl.PostId) AS OutgoingLinks,
+         SUM(CASE WHEN pl.LinkTypeId = 1 THEN 1 ELSE 0 END) OVER (PARTITION BY pl.RelatedPostId) AS IncomingLinks
+  FROM PostLinks pl
+),
+TopTagQuestions AS (
+  SELECT tt.TagName, tt.QuestionCount, tt.TotalViews, tt.AvgScore,
+         q.Id AS QuestionId, q.Title, q.Score AS QScore, q.ViewCount AS QViews, q.CreationDate AS QCreated,
+         aq.AnswerId, aq.AnswerScore, aq.RankByScore, aq.HoursToAnswer,
+         ua.Id AS AskerId, ua.DisplayName AS AskerName, ua.Reputation AS AskerReputation,
+         (COALESCE(q.Score,0) * 1.5 + COALESCE(q.ViewCount,0) / GREATEST(NULLIF(tt.QuestionCount,0),1) * 0.25 + COALESCE(aq.AnswerScore,0) * 2.0 + COALESCE(ua.Reputation,0) / 1000.0) AS PopularityScore
+  FROM TopTags tt
+  JOIN TagExplode te ON te.TagName = tt.TagName
+  JOIN Posts q ON q.Id = te.Id
+  LEFT JOIN AnswerQuality aq ON aq.QuestionId = q.Id AND aq.RankByScore = 1
+  LEFT JOIN Users ua ON ua.Id = q.OwnerUserId
+  WHERE tt.rn <= 25
+),
+UnionedActivity AS (
+  SELECT 'Questions' AS Source, Id AS PostId, OwnerUserId, Score, ViewCount, CreationDate FROM Posts WHERE PostTypeId = 1 AND CreationDate > CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '365 days'
+  UNION ALL
+  SELECT 'Answers', Id, OwnerUserId, Score, NULL AS ViewCount, CreationDate FROM Posts WHERE PostTypeId = 2 AND CreationDate > CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '365 days'
+  UNION ALL
+  SELECT 'Comments', c.Id, c.UserId, c.Score, NULL, c.CreationDate FROM Comments c WHERE c.CreationDate > CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '365 days'
+),
+UserCompositeRank AS (
+  SELECT ua.UserId, ua.DisplayName,
+         RANK() OVER (ORDER BY (COALESCE(ua.QuestionsPosted,0)*2 + COALESCE(ua.AnswersPosted,0)*3 + COALESCE(ua.BadgesEarned,0)) DESC) AS ActivityRank,
+         (COALESCE(ua.Reputation,0) * 0.0001 + COALESCE(ua.BadgesEarned,0) * 0.1 + COALESCE(ua.QuestionsPosted,0) * 0.05 + COALESCE(ua.AnswersPosted,0) * 0.2) AS ActivityScore
+  FROM UserActivity ua
+),
+FinalResult AS (
+  SELECT ttq.TagName,
+         ttq.QuestionId,
+         ttq.Title AS QuestionTitle,
+         ttq.QScore, ttq.QViews, ttq.QCreated,
+         ttq.AnswerId, ttq.AnswerScore, ttq.RankByScore, ttq.HoursToAnswer,
+         ua2.DisplayName AS AskerDisplayName,
+         ucr.ActivityRank AS AskerActivityRank,
+         ucr.ActivityScore AS AskerActivityScore,
+         lg.OutgoingLinks, lg.IncomingLinks,
+         qf.HasAnyAnswer, qf.HasAccepted, qf.WasMigrated, qf.HasCloseOrModAction, qf.ContainsPerfToken,
+         CASE
+           WHEN qf.HasAccepted = 1 THEN ('accepted:' || COALESCE(CAST(ttq.AnswerScore AS text), '0'))
+           WHEN qf.HasAnyAnswer = false AND ttq.QViews > 1000 THEN ('stale-popular:' || CAST(ttq.QuestionId AS text))
+           WHEN qf.ContainsPerfToken THEN ('perf:' || COALESCE(ttq.TagName,''))
+           ELSE ('open:' || COALESCE(ttq.TagName,'none'))
+         END AS HeuristicTag,
+         (SELECT AVG(a.HoursToAnswer) FROM AnswerQuality a JOIN TagExplode te2 ON te2.Id = a.QuestionId WHERE te2.TagName = ttq.TagName AND a.HoursToAnswer IS NOT NULL) AS AvgHoursToAnswerForTag,
+         PERCENT_RANK() OVER (PARTITION BY ttq.TagName ORDER BY COALESCE(ttq.AnswerScore,0)) AS AnswerScorePercentile,
+         EXISTS (
+           SELECT 1 FROM PostHistory ph WHERE ph.PostId = ttq.QuestionId AND ph.Text IS NOT NULL AND ph.Text LIKE '%migrat%'
+         ) AS HasMigrationText,
+         ttq.PopularityScore
+  FROM TopTagQuestions ttq
+  LEFT JOIN Posts q ON q.Id = ttq.QuestionId
+  LEFT JOIN LinkGraph lg ON lg.PostId = ttq.QuestionId
+  LEFT JOIN QuestionFlags qf ON qf.QuestionId = ttq.QuestionId
+  LEFT JOIN Users ua2 ON ua2.Id = ttq.AskerId
+  LEFT JOIN UserCompositeRank ucr ON ucr.UserId = ua2.Id
+  GROUP BY
+    ttq.TagName, ttq.QuestionId, ttq.Title, ttq.QScore, ttq.QViews, ttq.QCreated,
+    ttq.AnswerId, ttq.AnswerScore, ttq.RankByScore, ttq.HoursToAnswer,
+    ua2.DisplayName, ucr.ActivityRank, ucr.ActivityScore,
+    lg.OutgoingLinks, lg.IncomingLinks,
+    qf.HasAnyAnswer, qf.HasAccepted, qf.WasMigrated, qf.HasCloseOrModAction, qf.ContainsPerfToken,
+    ttq.PopularityScore
+)
+SELECT *
+FROM FinalResult fr
+WHERE (fr.QScore >= 0 OR fr.AnswerScore >= 0 OR fr.AskerActivityScore > 0)
+  AND (fr.AvgHoursToAnswerForTag IS NULL OR fr.AvgHoursToAnswerForTag < 1000)
+ORDER BY fr.TagName NULLS LAST, fr.PopularityScore DESC NULLS LAST
+LIMIT 200;

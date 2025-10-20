@@ -1,0 +1,184 @@
+WITH RECURSIVE Close_reason_counts AS (
+    SELECT cht.Id AS CloseReasonId, cht.Name AS CloseReasonName,
+           COUNT(ph.Id) AS CloseCount
+    FROM CloseReasonTypes cht
+    LEFT JOIN PostHistory ph ON ph.PostHistoryTypeId = 10 
+      AND CASE 
+            WHEN ph.Comment ~ '^\s*-?\d+\s*$' THEN CAST(trim(ph.Comment) AS integer)
+            ELSE NULL
+          END = cht.Id
+    GROUP BY cht.Id, cht.Name
+),
+User_Post_Data AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(u.UpVotes,0) AS UpVotes,
+        COALESCE(u.DownVotes,0) AS DownVotes,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionCount,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswerCount,
+        AVG(p.Score) FILTER (WHERE p.PostTypeId IN (1,2)) AS AvgPostScore,
+        SUM(p.ViewCount) FILTER (WHERE p.PostTypeId = 1) AS TotalViewsOnQuestions,
+        MAX(p.CreationDate) FILTER (WHERE p.PostTypeId IN (1,2)) AS LastContributionDate
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.UpVotes, u.DownVotes
+),
+Badge_rankings AS (
+    SELECT *,
+           RANK() OVER (PARTITION BY Class ORDER BY BadgeCount DESC) AS RankByBadgeClass
+    FROM (
+        SELECT 
+            UserId,
+            Class,
+            COUNT(*) AS BadgeCount
+        FROM Badges
+        GROUP BY UserId, Class
+     ) b
+),
+Top_questions_alltime AS (
+    SELECT 
+        p.Id,
+        p.Title,
+        p.Body,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        COALESCE(rd.AnswerCount,0) AS AnswerCount,
+        COALESCE(v.UPV,0) AS UpVotesCount,
+        COALESCE(v.DOWNV,0) AS DownVotesCount
+    FROM Posts p
+    LEFT JOIN LATERAL (
+        SELECT COUNT(a.Id) AS AnswerCount
+        FROM Posts a
+        WHERE a.ParentId = p.Id
+          AND a.PostTypeId = 2
+    ) rd ON TRUE
+    LEFT JOIN (
+        SELECT 
+            PostId,
+            SUM(CASE WHEN VoteTypeId = 2 THEN 1 ELSE 0 END) AS UPV,
+            SUM(CASE WHEN VoteTypeId = 3 THEN 1 ELSE 0 END) AS DOWNV
+        FROM Votes 
+        GROUP BY PostId
+    ) v ON v.PostId = p.Id
+    WHERE p.PostTypeId = 1
+      AND p.Score > 10
+),
+Author_answer_exp AS (
+    SELECT
+        a.Id AS AnswerId,
+        a.ParentId AS QuestionId,
+        a.OwnerUserId AS AnswererId,
+        au.DisplayName AS AnswererName,
+        a.CreationDate AS AnswerDate,
+        a.Score AS AnswerScore,
+        u.Reputation AS AnswererRep,
+        q.OwnerUserId AS QuestionOwnerId,
+        q.Score AS QuestionScore,
+        q.Title,
+        ROW_NUMBER() OVER (PARTITION BY a.ParentId ORDER BY a.Score DESC, a.CreationDate ASC) AS TopAnswerRank
+    FROM Posts a
+    JOIN Posts q ON a.ParentId = q.Id AND q.PostTypeId = 1
+    JOIN Users u ON a.OwnerUserId = u.Id
+    JOIN Users au ON a.OwnerUserId = au.Id
+    WHERE a.PostTypeId = 2
+),
+Final_agg_scores AS (
+    SELECT
+        qad.QuestionOwnerId AS UserId,
+        uq.DisplayName AS UserName,
+        AVG(qad.QuestionScore) AS AvgQuestionScoreByUser,
+        COUNT(DISTINCT qad.QuestionId) AS QuestionCountByUser,
+        AVG(CASE WHEN qad.TopAnswerRank = 1 THEN qad.AnswerScore END) AS AvgTopAnswerScoreOnTheirQuestions,
+        MAX(a.Score) AS MaxScoreAnswer,
+        AVG(u.Reputation) AS "AvgReputation OfSubscribers"
+    FROM Author_answer_exp qad
+    JOIN Posts q ON qad.QuestionId = q.Id
+    LEFT JOIN Posts a ON a.ParentId = qad.QuestionId AND a.PostTypeId = 2
+    LEFT JOIN Users u ON u.Id = a.OwnerUserId
+    JOIN Users uq ON uq.Id = qad.QuestionOwnerId
+    GROUP BY qad.QuestionOwnerId, uq.DisplayName
+)
+SELECT 
+    ud.UserId,
+    ud.DisplayName,
+    ud.Reputation,
+    ud.AnswerCount,
+    ud.QuestionCount,
+    ud.AvgPostScore,
+    COALESCE(fs.AvgTopAnswerScoreOnTheirQuestions,0) AS AvgTopAnswerScoreOnTheirQuestions,
+    COALESCE(fs.MaxScoreAnswer,0) AS MaxScoreAnswer,
+    cl.CloseReasonName,
+    cl.CloseCount,
+    br.RankByBadgeClass,
+    br.Class AS BadgeClass,
+    br.BadgeCount,
+    (SELECT COUNT(*) 
+     FROM Votes vs 
+     JOIN Posts ps ON ps.Id = vs.PostId AND ps.Tags LIKE '%<sql>%'
+     WHERE vs.UserId = ud.UserId
+    ) + COALESCE((SELECT COUNT(*) 
+              FROM Comments cmt 
+              WHERE cmt.UserId = ud.UserId AND cmt.Text ~* 'error|bug|fix'
+             ),0) AS UserInvolvementScore,
+    RANK() OVER (PARTITION BY br.Class ORDER BY ud.Reputation DESC) AS UserReputationRankInBadgeCat,
+    STRING_AGG(DISTINCT COALESCE(NULLIF(t.TagName, ''), 'NULL'), ',' ORDER BY MAX(t.Count) DESC) AS TopUsedTags
+FROM User_Post_Data ud
+LEFT JOIN Final_agg_scores fs ON fs.UserId = ud.UserId
+LEFT JOIN Close_reason_counts cl ON 1=1
+LEFT JOIN Badge_rankings br ON br.UserId = ud.UserId
+LEFT JOIN (
+    SELECT tso.UserId, t.TagName, MAX(t.Count) AS Count
+    FROM Posts p
+    CROSS JOIN LATERAL unnest(string_to_array(regexp_replace(COALESCE(p.Tags, ''),'[<>]', '', 'g'), ',')) AS tagsonly(tag)
+    JOIN Tags t ON lower(t.TagName) = lower(tagsonly.tag)
+    JOIN (SELECT DISTINCT OwnerUserId AS UserId FROM Posts WHERE OwnerUserId IS NOT NULL) tso ON tso.UserId = p.OwnerUserId
+    WHERE p.OwnerUserId IS NOT NULL
+    GROUP BY tso.UserId, t.TagName
+    ORDER BY NULL
+    LIMIT 100
+) t ON t.UserId = ud.UserId
+WHERE ud.QuestionCount > 0
+  AND (br.Class IS NULL OR br.Class IN (1, 2, 3))
+GROUP BY
+    ud.UserId,
+    ud.DisplayName,
+    ud.Reputation,
+    ud.AnswerCount,
+    ud.QuestionCount,
+    ud.AvgPostScore,
+    fs.AvgTopAnswerScoreOnTheirQuestions,
+    fs.MaxScoreAnswer,
+    cl.CloseReasonName,
+    cl.CloseCount,
+    br.RankByBadgeClass,
+    br.Class,
+    br.BadgeCount
+ORDER BY ud.Reputation DESC NULLS LAST, ud.UserId
+FETCH FIRST 100 ROWS ONLY
+
+UNION
+
+SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    0 AS AnswerCount,
+    0 AS QuestionCount,
+    NULL::numeric,
+    NULL::numeric,
+    NULL::integer,
+    NULL,
+    0,
+    NULL,
+    0,
+    NULL,
+    NULL,
+    NULL
+FROM Users u
+WHERE NOT EXISTS (
+   SELECT 1 FROM Posts p WHERE p.OwnerUserId = u.Id
+)
+ORDER BY 1;

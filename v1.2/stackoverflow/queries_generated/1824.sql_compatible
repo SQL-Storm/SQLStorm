@@ -1,0 +1,86 @@
+WITH RecursiveTags AS (
+    SELECT
+        p.Id AS PostId,
+        unnest(string_to_array(substring(p.Tags FROM 2 FOR char_length(p.Tags) - 2), '><')) AS Tag
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+),
+UserBadgeRank AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.CreationDate AS DayCommunityCreated,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        MAX(b.Class) AS MaxBadgeClass
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.CreationDate
+),
+PostTags AS (
+    SELECT
+        rt.PostId,
+        rt.Tag
+    FROM RecursiveTags rt
+),
+PostStats AS (
+    SELECT
+        p.Id AS PostId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.Score AS ScoreForWindow,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+),
+Joined AS (
+    SELECT
+        ps.PostId,
+        ps.OwnerUserId,
+        ps.CreationDate,
+        ps.Score,
+        ps.ViewCount,
+        ps.AnswerCount,
+        ps.CommentCount,
+        pt.Tag,
+        ubr.DisplayName,
+        ubr.BadgeCount,
+        ubr.MaxBadgeClass
+    FROM PostStats ps
+    LEFT JOIN PostTags pt ON pt.PostId = ps.PostId
+    LEFT JOIN UserBadgeRank ubr ON ubr.UserId = ps.OwnerUserId
+)
+SELECT
+    j.PostId,
+    j.OwnerUserId,
+    j.DisplayName,
+    j.DayCommunityCreated,
+    j.Tag,
+    j.Score,
+    j.ViewCount,
+    j.AnswerCount,
+    j.CommentCount,
+    j.BadgeCount,
+    j.MaxBadgeClass
+FROM (
+    SELECT
+        j.*,
+        ROW_NUMBER() OVER (PARTITION BY j.Tag ORDER BY j.Score DESC, j.ViewCount DESC) AS rn
+    FROM Joined j
+) j
+WHERE j.rn = 1
+GROUP BY
+    j.PostId,
+    j.OwnerUserId,
+    j.DisplayName,
+    j.DayCommunityCreated,
+    j.Tag,
+    j.Score,
+    j.ViewCount,
+    j.AnswerCount,
+    j.CommentCount,
+    j.BadgeCount,
+    j.MaxBadgeClass
+;

@@ -1,0 +1,97 @@
+with UserBadgeStats as (
+    select 
+        usr.Id as UserId,
+        usr.DisplayName,
+        usr.Reputation,
+        usr.CreationDate,
+        count(b.Id) as TotalBadges,
+        count(distinct case when b.Class = 1 then b.Id end) as GoldBadges,
+        count(distinct case when b.Class = 2 then b.Id end) as SilverBadges,
+        count(distinct case when b.Class = 3 then b.Id end) as BronzeBadges,
+        count(distinct case when b.TagBased = true then b.Id end) as TagBasedBadges,
+        rank() over (order by usr.Reputation desc) as ReputationRank
+    from 
+        Users usr
+        left join Badges b on b.UserId = usr.Id
+    group by 
+        usr.Id,
+        usr.DisplayName,
+        usr.Reputation,
+        usr.CreationDate
+), PostAnswers as (
+    select
+        p.ParentId as QuestionID,
+        count(a.Id) as AnswersCount,
+        avg(a.Score) as AvgAnswerScore,
+        max(a.Score) as MaxAnswerScore
+    from Posts a
+    join Posts p on a.ParentId = p.Id
+    where a.PostTypeId = 2
+    group by p.ParentId
+), RecentPopularAnsweredQuestionStats as (
+    select
+        q.Id as QuestionID,
+        q.Title,
+        q.CreationDate,
+        q.Tags,
+        pa.AnswersCount,
+        pa.AvgAnswerScore,
+        pa.MaxAnswerScore,
+        avg(pa.AvgAnswerScore) over () as AvgScoreForAnswers,
+        q.OwnerUserId as UserId,
+        owner.DisplayName as OwnerDisplayName,
+        owner.Reputation as OwnerReputation,
+        owner.CreationDate as OwnerCreationDate,
+        ubs.TotalBadges,
+        ubs.GoldBadges,
+        ubs.SilverBadges,
+        ubs.BronzeBadges,
+        ubs.TagBasedBadges,
+        ubs.ReputationRank
+    from Posts q
+    left join PostAnswers pa on pa.QuestionID = q.Id
+    left join Users owner on owner.Id = q.OwnerUserId
+    left join UserBadgeStats ubs on ubs.UserId = owner.Id
+    where q.PostTypeId = 1
+      and q.CreationDate >= (cast('2024-10-01' as date) - INTERVAL '30' DAY)
+      and pa.AnswersCount is not null
+    group by
+        q.Id,
+        q.Title,
+        q.CreationDate,
+        q.Tags,
+        pa.AnswersCount,
+        pa.AvgAnswerScore,
+        pa.MaxAnswerScore,
+        q.OwnerUserId,
+        owner.DisplayName,
+        owner.Reputation,
+        owner.CreationDate,
+        ubs.TotalBadges,
+        ubs.GoldBadges,
+        ubs.SilverBadges,
+        ubs.BronzeBadges,
+        ubs.TagBasedBadges,
+        ubs.ReputationRank
+)
+select
+    r.QuestionID,
+    r.Title,
+    r.CreationDate,
+    r.Tags,
+    r.AnswersCount,
+    r.AvgAnswerScore,
+    r.MaxAnswerScore,
+    r.AvgScoreForAnswers,
+    r.UserId,
+    r.OwnerDisplayName,
+    r.OwnerReputation,
+    r.OwnerCreationDate,
+    r.TotalBadges,
+    r.GoldBadges,
+    r.SilverBadges,
+    r.BronzeBadges,
+    r.TagBasedBadges,
+    r.ReputationRank
+from RecentPopularAnsweredQuestionStats r
+order by r.AvgAnswerScore desc NULLS LAST, r.AnswersCount desc;

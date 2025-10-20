@@ -1,0 +1,224 @@
+WITH
+post_activity AS (
+  SELECT
+    p.Id,
+    p.PostTypeId,
+    p.ParentId,
+    p.CreationDate,
+    p.LastActivityDate,
+    COALESCE(p.Score,0) AS Score,
+    COALESCE(p.ViewCount,0) AS ViewCount,
+    COALESCE(p.Title, '') AS Title,
+    COALESCE(p.Tags,'') AS RawTags,
+    NULLIF(regexp_replace(substring(p.Tags from 2 for greatest(0, length(p.Tags)-2)), '^(.*?)><.*$', '\1'), '') AS FirstTag,
+    NULLIF(regexp_replace(substring(p.Tags from 2 for greatest(0, length(p.Tags)-2)), '^.*?><(.*?)><.*$', '\1'), '') AS SecondTag,
+    NULLIF(regexp_replace(substring(p.Tags from 2 for greatest(0, length(p.Tags)-2)), '^.*?><.*?><(.*?)$', '\1'), '') AS ThirdTag,
+    p.AcceptedAnswerId,
+    p.OwnerUserId
+  FROM Posts p
+  WHERE p.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '2 years'
+),
+user_stats AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 1) AS GoldBadges,
+    COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 2) AS SilverBadges,
+    COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+    COALESCE(SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END),0) AS QuestionCount,
+    COALESCE(SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END),0) AS AnswerCount,
+    ROW_NUMBER() OVER (ORDER BY u.Reputation DESC, u.LastAccessDate DESC) AS ReputationRank,
+    NTILE(10) OVER (ORDER BY u.Reputation DESC) AS ReputationDecile
+  FROM Users u
+  LEFT JOIN Badges b ON b.UserId = u.Id
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+  WHERE u.CreationDate <= CAST('2024-10-01 12:34:56' AS timestamp)
+  GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate
+),
+post_enriched AS (
+  SELECT
+    pa.*,
+    us.DisplayName AS OwnerName,
+    us.Reputation AS OwnerReputation,
+    COALESCE(vt.UpVotes,0) AS UpVotes,
+    COALESCE(vt.DownVotes,0) AS DownVotes,
+    COALESCE(cmt.CommentCount,0) AS CommentCount,
+    (
+      SELECT COUNT(*)::numeric / NULLIF(GREATEST(COUNT(*),1),1)
+      FROM PostHistory ph
+      WHERE ph.PostId = pa.Id
+        AND ph.PostHistoryTypeId IN (5,8,24)
+    ) AS BodyEditFraction,
+    (
+      SELECT COALESCE(AVG(p2.Score),0)
+      FROM Posts p2
+      WHERE p2.Id = pa.Id
+        AND p2.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '52 weeks'
+    ) AS AvgScore52w,
+    pa.OwnerUserId
+  FROM post_activity pa
+  LEFT JOIN user_stats us ON us.UserId = pa.OwnerUserId
+  LEFT JOIN (
+    SELECT
+      v.PostId,
+      SUM(CASE WHEN vt.Name ILIKE '%up%' OR v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+      SUM(CASE WHEN vt.Name ILIKE '%down%' OR v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes
+    FROM Votes v
+    LEFT JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+    WHERE v.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '3 years'
+    GROUP BY v.PostId
+  ) vt ON vt.PostId = pa.Id
+  LEFT JOIN (
+    SELECT
+      c.PostId,
+      COUNT(*) AS CommentCount
+    FROM Comments c
+    WHERE c.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '3 years'
+    GROUP BY c.PostId
+  ) cmt ON cmt.PostId = pa.Id
+),
+linked_pairs AS (
+  SELECT pl.PostId, pl.RelatedPostId, lt.Name AS LinkType
+  FROM PostLinks pl
+  JOIN LinkTypes lt ON lt.Id = pl.LinkTypeId
+  WHERE pl.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '5 years'
+  UNION
+  SELECT pl.RelatedPostId AS PostId, pl.PostId AS RelatedPostId, lt.Name || '_REVERSED' AS LinkType
+  FROM PostLinks pl
+  JOIN LinkTypes lt ON lt.Id = pl.LinkTypeId
+  WHERE pl.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '5 years'
+),
+tags_exploded AS (
+  SELECT
+    pa.Id AS PostId,
+    lower(trim(t)) AS Tag
+  FROM post_activity pa
+  CROSS JOIN LATERAL (
+    SELECT unnest(
+      CASE WHEN pa.RawTags = '' THEN ARRAY[]::text[]
+           ELSE regexp_split_to_array(substring(pa.RawTags from 2 for greatest(0,length(pa.RawTags)-2)), '><')
+      END
+    ) AS t
+  ) x
+  WHERE pa.RawTags IS NOT NULL AND pa.RawTags <> ''
+),
+tag_stats AS (
+  SELECT
+    te.Tag,
+    COUNT(DISTINCT te.PostId) AS PostCount,
+    COUNT(DISTINCT CASE WHEN pe.PostTypeId = 1 THEN pe.Id END) AS Questions,
+    COUNT(DISTINCT CASE WHEN pe.PostTypeId = 2 THEN pe.Id END) AS Answers,
+    SUM(COALESCE(pe.ViewCount,0)) AS TotalViews,
+    AVG(COALESCE(pe.Score,0)) AS AvgScore,
+    ROW_NUMBER() OVER (ORDER BY COUNT(DISTINCT te.PostId) DESC) AS PopularityRank
+  FROM tags_exploded te
+  JOIN post_enriched pe ON pe.Id = te.PostId
+  GROUP BY te.Tag
+),
+tag_trends AS (
+  SELECT
+    ts.Tag,
+    ts.PostCount,
+    ts.Questions,
+    ts.Answers,
+    ts.TotalViews,
+    ts.AvgScore,
+    COALESCE(
+      (SELECT COUNT(*) FROM posts p2
+       WHERE p2.Tags LIKE ('%' || '<' || ts.Tag || '>' || '%')
+         AND p2.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '26 weeks'), 0
+    ) AS RecentCount26w,
+    COALESCE(
+      (SELECT COUNT(*) FROM posts p2
+       WHERE p2.Tags LIKE ('%' || '<' || ts.Tag || '>' || '%')
+         AND p2.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '52 weeks'
+         AND p2.CreationDate < CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '26 weeks'), 0
+    ) AS PrevCount26w,
+    CASE
+      WHEN COALESCE(
+        (SELECT COUNT(*) FROM posts p2
+         WHERE p2.Tags LIKE ('%' || '<' || ts.Tag || '>' || '%')
+           AND p2.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '52 weeks'
+           AND p2.CreationDate < CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '26 weeks'),0) = 0
+      THEN NULL
+      ELSE
+        (
+          COALESCE(
+            (SELECT COUNT(*) FROM posts p2
+             WHERE p2.Tags LIKE ('%' || '<' || ts.Tag || '>' || '%')
+               AND p2.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '26 weeks'),0
+          )::numeric
+          /
+          NULLIF(
+            COALESCE(
+              (SELECT COUNT(*) FROM posts p2
+               WHERE p2.Tags LIKE ('%' || '<' || ts.Tag || '>' || '%')
+                 AND p2.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '52 weeks'
+                 AND p2.CreationDate < CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '26 weeks'),0
+            ), 0
+          )::numeric
+        ) - 1
+    END AS GrowthRatio
+  FROM tag_stats ts
+)
+SELECT
+  pe.Id AS PostId,
+  pe.PostTypeId,
+  pe.Title,
+  COALESCE(pe.FirstTag, pe.SecondTag, pe.ThirdTag, 'untagged') AS PrimaryTag,
+  pe.Score,
+  pe.ViewCount,
+  pe.UpVotes,
+  pe.DownVotes,
+  pe.CommentCount,
+  pe.BodyEditFraction,
+  pe.AvgScore52w,
+  us.DisplayName AS Owner,
+  us.Reputation AS OwnerReputation,
+  lp.LinkType AS LinkRelation,
+  COALESCE(tp.Tag,'(none)') AS TopTag,
+  tp.PopularityRank AS TopTagRank,
+  tt.GrowthRatio,
+  ROUND(
+    (
+      (COALESCE(pe.Score,0) * 1.5)
+      + (LEAST(1000, COALESCE(pe.ViewCount,0)) / 100.0)
+      + (COALESCE(pe.UpVotes,0) * 2.0)
+      - (COALESCE(pe.DownVotes,0) * 3.0)
+      + (COALESCE(pe.CommentCount,0) * 0.5)
+      + (COALESCE(us.Reputation,0) / 1000.0)
+      + COALESCE(pe.AvgScore52w,0)
+      + COALESCE(tt.GrowthRatio,0) * 50
+    ) * CASE WHEN pe.PostTypeId = 1 THEN 1.2 WHEN pe.PostTypeId = 2 THEN 1.0 ELSE 0.8 END
+  ,2) AS QualityScore,
+  DENSE_RANK() OVER (PARTITION BY COALESCE(pe.FirstTag, pe.SecondTag, pe.ThirdTag, 'untagged') ORDER BY
+    (
+      (COALESCE(pe.Score,0) * 1.5)
+      + (COALESCE(pe.UpVotes,0) * 2.0)
+      - (COALESCE(pe.DownVotes,0) * 3.0)
+      + (COALESCE(pe.CommentCount,0) * 0.5)
+    ) DESC
+  ) AS TagQualityRank
+FROM post_enriched pe
+LEFT JOIN user_stats us ON us.UserId = pe.OwnerUserId
+LEFT JOIN linked_pairs lp ON lp.PostId = pe.Id
+LEFT JOIN LATERAL (
+  SELECT ts.Tag, ts.PopularityRank
+  FROM tag_stats ts
+  WHERE ts.Tag = COALESCE(pe.FirstTag, pe.SecondTag, pe.ThirdTag)
+  ORDER BY ts.PostCount DESC
+  LIMIT 1
+) tp ON true
+LEFT JOIN tag_trends tt ON tt.Tag = COALESCE(pe.FirstTag, pe.SecondTag, pe.ThirdTag)
+WHERE
+  (
+    (pe.Title IS NOT NULL AND pe.Title ~* '(^|\\s)(error|exception|fail|panic)(\\s|$)')
+    OR (pe.RawTags IS NOT NULL AND pe.RawTags ILIKE '%<sql>%')
+    OR (pe.Score >= 10 AND pe.ViewCount >= 1000)
+    OR (pe.BodyEditFraction IS NOT NULL AND pe.BodyEditFraction > 0.5)
+  )
+  AND pe.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '2 years'
+ORDER BY QualityScore DESC, pe.ViewCount DESC
+LIMIT 250;

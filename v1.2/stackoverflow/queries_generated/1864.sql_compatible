@@ -1,0 +1,54 @@
+WITH RECURSIVE recent_user_questions AS (
+    SELECT 
+        p.Id AS PostId, 
+        p.OwnerUserId,
+        p.Title,
+        array_to_string(regexp_split_to_array(trim(both '<>' FROM coalesce(p.Tags, '')), '><'), ',') AS TagList,
+        p.Score,
+        p.CreationDate,
+        avg(CASE WHEN v.VoteTypeId IN (2,3) THEN v.VoteTypeId::double precision ELSE NULL END) OVER (PARTITION BY p.Id) AS AvgVoteType,
+        count(c.Id) AS CommentCnt,
+        row_number() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS RecentQNr
+    FROM Posts p
+    LEFT JOIN Votes v ON v.PostId = p.Id
+    LEFT JOIN Comments c ON c.PostId = p.Id
+    WHERE p.PostTypeId = 1
+      AND p.CreationDate > (CAST('2024-10-01' AS date) - INTERVAL '180 day')
+    GROUP BY p.Id, p.OwnerUserId, p.Title, p.Tags, p.Score, p.CreationDate
+), top_tags_latest AS (
+    SELECT 
+        unnest(string_to_array(rtq.TagList, ',')) AS Tag, 
+        rtq.PostId,
+        rtq.OwnerUserId
+    FROM recent_user_questions rtq
+    WHERE rtq.RecentQNr <= 5 AND rtq.TagList <> ''
+), meantime_user_info AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.AboutMe,
+        percentile_cont(0.5) WITHIN GROUP (ORDER BY p.Score) AS median_score
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.AboutMe
+)
+SELECT
+    u.DisplayName,
+    u.Reputation,
+    u.AboutMe,
+    mui.median_score,
+    rtq.PostId,
+    rtq.Title,
+    rtq.TagList,
+    rtq.Score,
+    rtq.CreationDate,
+    rtq.AvgVoteType,
+    rtq.CommentCnt,
+    ttl.Tag
+FROM recent_user_questions rtq
+JOIN Users u ON u.Id = rtq.OwnerUserId
+LEFT JOIN meantime_user_info mui ON mui.UserId = u.Id
+LEFT JOIN top_tags_latest ttl ON ttl.PostId = rtq.PostId
+WHERE rtq.RecentQNr <= 5
+ORDER BY u.DisplayName, rtq.CreationDate DESC;

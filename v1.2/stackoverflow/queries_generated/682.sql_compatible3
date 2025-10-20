@@ -1,0 +1,226 @@
+WITH RECURSIVE RecursiveTagHierarchy AS (
+    SELECT 
+        t.Id, 
+        t.TagName, 
+        t.Count, 
+        t.ExcerptPostId, 
+        t.WikiPostId, 
+        1 AS Level,
+        CAST(ARRAY[t.TagName] AS varchar[]) AS Path
+    FROM Tags t
+    WHERE t.IsRequired = TRUE
+    UNION ALL
+    SELECT 
+        t2.Id, 
+        t2.TagName, 
+        t2.Count, 
+        t2.ExcerptPostId, 
+        t2.WikiPostId, 
+        r.Level + 1 AS Level,
+        r.Path || t2.TagName AS Path
+    FROM Tags t2
+    JOIN RecursiveTagHierarchy r ON t2.Id <> r.Id
+        AND t2.IsRequired = TRUE
+        AND NOT t2.TagName = ANY(r.Path)
+    WHERE r.Level < 3
+),
+UserBadgeSummary AS (
+    SELECT 
+        b.UserId,
+        COUNT(*) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(*) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(*) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+        COUNT(DISTINCT CASE WHEN b.TagBased = 1 THEN b.Name ELSE NULL END) AS DistinctTagBadges
+    FROM Badges b
+    GROUP BY b.UserId
+),
+PostScoreStats AS (
+    SELECT
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC, p.CreationDate ASC) AS UserTopPostRank,
+        AVG(p.Score) OVER (PARTITION BY p.OwnerUserId) AS AvgUserScore,
+        COUNT(*) OVER (PARTITION BY p.OwnerUserId) AS UserPostCount,
+        CASE 
+            WHEN p.Tags IS NOT NULL THEN array_length(string_to_array(substring(p.Tags FROM 2 FOR char_length(p.Tags) - 2), '><'), 1)
+            ELSE 0 
+        END AS TagCount
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+),
+LatestUserActivity AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        u.Location,
+        u.AboutMe,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        u.WebsiteUrl,
+        COALESCE(MAX(ph.CreationDate), u.LastAccessDate) AS LastActivityDate
+    FROM Users u
+    LEFT JOIN PostHistory ph ON ph.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate, u.Location, u.AboutMe, u.Views, u.UpVotes, u.DownVotes, u.WebsiteUrl
+),
+PostWithCommentsAndVotes AS (
+    SELECT 
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        COALESCE(c.CommentCount, 0) AS CommentCount,
+        COALESCE(v.UpVotes, 0) AS UpVotes,
+        COALESCE(v.DownVotes, 0) AS DownVotes,
+        p.Title,
+        p.Tags
+    FROM Posts p
+    LEFT JOIN (
+        SELECT PostId, COUNT(*) AS CommentCount
+        FROM Comments
+        GROUP BY PostId
+    ) c ON c.PostId = p.Id
+    LEFT JOIN (
+        SELECT 
+            v.PostId,
+            COUNT(CASE WHEN vt.Name = 'UpMod' THEN 1 END) AS UpVotes,
+            COUNT(CASE WHEN vt.Name = 'DownMod' THEN 1 END) AS DownVotes
+        FROM Votes v
+        JOIN VoteTypes vt ON v.VoteTypeId = vt.Id
+        GROUP BY v.PostId
+    ) v ON v.PostId = p.Id
+),
+DuplicateLinkCounts AS (
+    SELECT 
+        pl.PostId,
+        COUNT(*) FILTER (WHERE lt.Name = 'Duplicate') AS DuplicateCount,
+        COUNT(*) FILTER (WHERE lt.Name = 'Linked') AS LinkedCount
+    FROM PostLinks pl
+    JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id
+    GROUP BY pl.PostId
+),
+UserTopPostsWithDuplicates AS (
+    SELECT 
+        pws.Id,
+        pws.PostTypeId,
+        pws.OwnerUserId,
+        pws.Score,
+        pws.ViewCount,
+        pws.CreationDate,
+        pws.CommentCount,
+        pws.UpVotes,
+        pws.DownVotes,
+        pws.Title,
+        pws.Tags,
+        COALESCE(dl.DuplicateCount, 0) AS DuplicateCount,
+        COALESCE(dl.LinkedCount, 0) AS LinkedCount,
+        ROW_NUMBER() OVER (PARTITION BY pws.OwnerUserId ORDER BY pws.Score DESC, pws.ViewCount DESC) AS RankByScore
+    FROM PostWithCommentsAndVotes pws
+    LEFT JOIN DuplicateLinkCounts dl ON dl.PostId = pws.Id
+    WHERE pws.PostTypeId = 1
+),
+FinalUserStats AS (
+    SELECT 
+        lua.UserId,
+        lua.DisplayName,
+        lua.Reputation,
+        lua.LastActivityDate,
+        ubs.GoldBadges,
+        ubs.SilverBadges,
+        ubs.BronzeBadges,
+        ubs.DistinctTagBadges,
+        COALESCE(pstats.UserPostCount, 0) AS TotalPosts,
+        COALESCE(pstats.AvgUserScore, 0) AS AveragePostScore,
+        MAX(CASE WHEN pwr.RankByScore = 1 THEN pwr.Score ELSE NULL END) AS TopQuestionScore,
+        MAX(CASE WHEN pwr.RankByScore = 1 THEN pwr.DuplicateCount ELSE NULL END) AS TopQuestionDuplicateLinks,
+        MAX(CASE WHEN pwr.RankByScore = 1 THEN pwr.LinkedCount ELSE NULL END) AS TopQuestionLinkedCount,
+        MAX(CASE WHEN pwr.RankByScore = 1 THEN pwr.CommentCount ELSE NULL END) AS TopQuestionCommentCount,
+        MAX(CASE WHEN pwr.RankByScore = 1 THEN pwr.ViewCount ELSE NULL END) AS TopQuestionViewCount,
+        MAX(CASE WHEN pwr.RankByScore = 1 THEN pwr.Title ELSE NULL END) AS TopQuestionTitle,
+        CASE 
+            WHEN lua.Location IS NULL OR LENGTH(TRIM(lua.Location)) = 0 THEN 'Unknown' 
+            ELSE lua.Location 
+        END AS LocationNormalized
+    FROM LatestUserActivity lua
+    LEFT JOIN UserBadgeSummary ubs ON ubs.UserId = lua.UserId
+    LEFT JOIN PostScoreStats pstats ON pstats.OwnerUserId = lua.UserId
+    LEFT JOIN UserTopPostsWithDuplicates pwr ON pwr.OwnerUserId = lua.UserId AND pwr.RankByScore = 1
+    GROUP BY lua.UserId, lua.DisplayName, lua.Reputation, lua.LastActivityDate, ubs.GoldBadges, ubs.SilverBadges, ubs.BronzeBadges, ubs.DistinctTagBadges, pstats.UserPostCount, pstats.AvgUserScore, lua.Location
+),
+FilteredPosts AS (
+    SELECT p.Id, p.OwnerUserId, p.CreationDate, p.Score, p.ViewCount, p.Tags
+    FROM Posts p
+    WHERE p.PostTypeId = 1 
+      AND p.CreationDate >= (CAST('2024-10-01' AS date) - INTERVAL '1 year')
+      AND p.Score > 5
+),
+CorrelatedAcceptedAnswerStats AS (
+    SELECT 
+        fp.Id AS QuestionId,
+        (SELECT COUNT(*) FROM Posts a WHERE a.ParentId = fp.Id) AS AnswerCount,
+        (SELECT AVG(a.Score) FROM Posts a WHERE a.ParentId = fp.Id) AS AvgAnswerScore,
+        (SELECT p.Score FROM Posts p WHERE p.Id = fp.AcceptedAnswerId) AS AcceptedAnswerScore,
+        fp.Score AS QuestionScore,
+        fp.ViewCount AS QuestionViewCount
+    FROM FilteredPosts fp
+),
+TopTagsByAnswerCount AS (
+    SELECT 
+        unnest(string_to_array(substring(fp.Tags FROM 2 FOR char_length(fp.Tags) - 2), '><')) AS Tag,
+        COUNT(*) AS QuestionCount,
+        SUM(cs.AnswerCount) AS TotalAnswers,
+        AVG(cs.AvgAnswerScore) AS AvgAnswerScorePerTag
+    FROM FilteredPosts fp
+    JOIN CorrelatedAcceptedAnswerStats cs ON cs.QuestionId = fp.Id
+    GROUP BY Tag
+    ORDER BY TotalAnswers DESC
+    LIMIT 10
+)
+SELECT 
+    fus.UserId,
+    fus.DisplayName,
+    fus.Reputation,
+    fus.LocationNormalized,
+    fus.GoldBadges,
+    fus.SilverBadges,
+    fus.BronzeBadges,
+    fus.DistinctTagBadges,
+    fus.TotalPosts,
+    fus.AveragePostScore,
+    fus.TopQuestionScore,
+    fus.TopQuestionDuplicateLinks,
+    fus.TopQuestionLinkedCount,
+    fus.TopQuestionCommentCount,
+    fus.TopQuestionViewCount,
+    fus.TopQuestionTitle,
+    tt.Tag AS TopTag,
+    tt.QuestionCount AS TopTagQuestionCount,
+    tt.TotalAnswers AS TopTagTotalAnswers,
+    ROUND(CAST(tt.AvgAnswerScorePerTag AS numeric), 2) AS TopTagAvgAnswerScore
+FROM FinalUserStats fus
+LEFT JOIN (
+    SELECT 
+        fp.OwnerUserId,
+        t.Tag,
+        t.QuestionCount,
+        t.TotalAnswers,
+        t.AvgAnswerScorePerTag,
+        ROW_NUMBER() OVER (PARTITION BY fp.OwnerUserId ORDER BY t.TotalAnswers DESC) AS TagRank
+    FROM FilteredPosts fp
+    JOIN TopTagsByAnswerCount t ON t.Tag = ANY (string_to_array(substring(fp.Tags FROM 2 FOR char_length(fp.Tags) - 2), '><'))
+    GROUP BY fp.OwnerUserId, t.Tag, t.QuestionCount, t.TotalAnswers, t.AvgAnswerScorePerTag
+) tt ON tt.OwnerUserId = fus.UserId AND tt.TagRank = 1
+WHERE fus.TotalPosts >= 50
+  AND fus.Reputation > 1000
+ORDER BY fus.Reputation DESC, fus.TotalPosts DESC
+LIMIT 100;

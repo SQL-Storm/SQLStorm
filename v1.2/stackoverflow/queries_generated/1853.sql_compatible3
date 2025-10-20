@@ -1,0 +1,72 @@
+WITH RECURSIVE RecursivePosts AS (
+    SELECT
+        p.Id,
+        p.PostTypeId,
+        p.Score,
+        p.OwnerUserId,
+        p.ParentId,
+        p.CreationDate,
+        p.ViewCount,
+        TO_TIMESTAMP(EXTRACT(EPOCH FROM p.CreationDate)) AS CreationTs,
+        1 AS level
+    FROM Posts p
+    WHERE p.PostTypeId = 1 AND p.CreationDate > TIMESTAMP '2021-01-01'
+    UNION ALL
+    SELECT
+        child.Id,
+        child.PostTypeId,
+        child.Score,
+        child.OwnerUserId,
+        child.ParentId,
+        child.CreationDate,
+        child.ViewCount,
+        TO_TIMESTAMP(EXTRACT(EPOCH FROM child.CreationDate)) AS CreationTs,
+        rp.level + 1
+    FROM Posts child
+    JOIN RecursivePosts rp ON child.ParentId = rp.Id
+), ScoreStats AS (
+    SELECT
+        rp.Id,
+        rp.PostTypeId,
+        rp.OwnerUserId,
+        rp.level,
+        rp.Score,
+        rsp.RollbackClicks,
+        u.DisplayName,
+        trusted.UserRanks,
+        inspired_fake.which_count_roundwin_percentage,
+        pview.prev_day_avg_views,
+        'level_' || rp.level || '_' || LOWER(COALESCE(r.Title, '')) AS level_title
+    FROM RecursivePosts rp
+    LEFT JOIN some_rollback_stats rsp ON rsp.post_id = rp.Id
+    LEFT JOIN Users u ON u.Id = rp.OwnerUserId
+    LEFT JOIN trusted_users trusted ON trusted.user_id = rp.OwnerUserId
+    LEFT JOIN inspired_fake_metrics inspired_fake ON inspired_fake.post_id = rp.Id
+    LEFT JOIN post_views pview ON pview.post_id = rp.Id
+    LEFT JOIN Posts r ON r.Id = rp.ParentId
+)
+SELECT
+    ss.Id,
+    ss.PostTypeId,
+    ss.OwnerUserId,
+    ss.level,
+    ss.Score,
+    ss.RollbackClicks,
+    ss.DisplayName,
+    ss.UserRanks,
+    ss.which_count_roundwin_percentage,
+    ss.prev_day_avg_views,
+    ss.level_title
+FROM ScoreStats ss
+GROUP BY
+    ss.Id,
+    ss.PostTypeId,
+    ss.OwnerUserId,
+    ss.level,
+    ss.Score,
+    ss.RollbackClicks,
+    ss.DisplayName,
+    ss.UserRanks,
+    ss.which_count_roundwin_percentage,
+    ss.prev_day_avg_views,
+    ss.level_title;

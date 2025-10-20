@@ -1,0 +1,234 @@
+WITH RECURSIVE RecursiveTagHierarchy AS (
+    SELECT 
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        t.IsModeratorOnly,
+        t.IsRequired,
+        1 AS Level,
+        ARRAY[t.TagName] AS Path
+    FROM Tags t
+    WHERE t.IsRequired = TRUE
+
+    UNION ALL
+
+    SELECT 
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        t.IsModeratorOnly,
+        t.IsRequired,
+        r.Level + 1,
+        r.Path || t.TagName
+    FROM Tags t
+    JOIN RecursiveTagHierarchy r ON t.IsRequired = TRUE AND t.Id <> r.Id AND NOT t.TagName = ANY(r.Path)
+    WHERE r.Level < 3
+),
+UserBadgeCounts AS (
+    SELECT 
+        b.UserId,
+        b.Class,
+        COUNT(*) AS BadgeCount
+    FROM Badges b
+    GROUP BY b.UserId, b.Class
+),
+UserReputationWindow AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.Location,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) OVER (PARTITION BY u.Id ORDER BY u.CreationDate ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS UpVotesCumulative,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) OVER (PARTITION BY u.Id ORDER BY u.CreationDate ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS DownVotesCumulative,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC, u.CreationDate ASC) AS ReputationRank
+    FROM Users u
+    LEFT JOIN Votes v ON v.UserId = u.Id AND v.CreationDate <= u.CreationDate
+),
+TopQuestionsWithAnswers AS (
+    SELECT 
+        p.Id AS QuestionId,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        p.OwnerUserId,
+        p.AcceptedAnswerId,
+        COUNT(a.Id) AS AnswerCount,
+        MAX(a.Score) AS MaxAnswerScore,
+        AVG(a.Score) AS AvgAnswerScore,
+        SUM(CASE WHEN a.Score > 0 THEN 1 ELSE 0 END) AS PositiveAnswerCount
+    FROM Posts p
+    LEFT JOIN Posts a ON a.ParentId = p.Id AND a.PostTypeId = 2
+    WHERE p.PostTypeId = 1
+    GROUP BY p.Id, p.Title, p.CreationDate, p.Score, p.ViewCount, p.Tags, p.OwnerUserId, p.AcceptedAnswerId
+),
+QuestionCloseReasons AS (
+    SELECT 
+        ph.PostId,
+        crt.Name AS CloseReasonName,
+        ph.CreationDate AS CloseDate
+    FROM PostHistory ph
+    JOIN CloseReasonTypes crt ON crt.Id = CAST(ph.Comment AS integer)
+    WHERE ph.PostHistoryTypeId = 10
+),
+UserActivitySummary AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionsPosted,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswersPosted,
+        COUNT(DISTINCT c.Id) AS CommentsMade,
+        COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId = 2) AS UpVotesGiven,
+        COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId = 3) AS DownVotesGiven,
+        COUNT(DISTINCT b.Id) AS BadgesEarned
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Comments c ON c.UserId = u.Id
+    LEFT JOIN Votes v ON v.UserId = u.Id
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName
+),
+QuestionsWithDuplicateLinks AS (
+    SELECT 
+        q.Id AS QuestionId,
+        q.Title,
+        q.CreationDate,
+        q.Score,
+        q.ViewCount,
+        pl.RelatedPostId AS DuplicateOfQuestionId,
+        dup.Title AS DuplicateOfTitle
+    FROM Posts q
+    LEFT JOIN PostLinks pl ON pl.PostId = q.Id AND pl.LinkTypeId = 3
+    LEFT JOIN Posts dup ON dup.Id = pl.RelatedPostId
+    WHERE q.PostTypeId = 1
+),
+AnswerWithUserAndVotes AS (
+    SELECT 
+        a.Id AS AnswerId,
+        a.ParentId AS QuestionId,
+        a.Score AS AnswerScore,
+        a.CreationDate AS AnswerCreationDate,
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        v.VoteTypeId,
+        v.CreationDate AS VoteDate
+    FROM Posts a
+    LEFT JOIN Users u ON u.Id = a.OwnerUserId
+    LEFT JOIN Votes v ON v.PostId = a.Id
+    WHERE a.PostTypeId = 2
+),
+AnswerRankings AS (
+    SELECT 
+        AnswerId,
+        QuestionId,
+        AnswerScore,
+        UserId,
+        DisplayName,
+        Reputation,
+        ROW_NUMBER() OVER (PARTITION BY QuestionId ORDER BY AnswerScore DESC, AnswerCreationDate ASC) AS AnswerRank
+    FROM AnswerWithUserAndVotes
+),
+TopAnswersPerQuestion AS (
+    SELECT 
+        ar.QuestionId,
+        ar.AnswerId,
+        ar.AnswerScore,
+        ar.UserId,
+        ar.DisplayName,
+        ar.Reputation
+    FROM AnswerRankings ar
+    WHERE ar.AnswerRank <= 3
+),
+ComplexQuestionAnalysis AS (
+    SELECT 
+        tq.QuestionId,
+        tq.Title,
+        tq.CreationDate,
+        tq.Score,
+        tq.ViewCount,
+        tq.Tags,
+        COALESCE(qcr.CloseReasonName, 'Open') AS CloseStatus,
+        tq.AnswerCount,
+        tq.MaxAnswerScore,
+        tq.AvgAnswerScore,
+        tq.PositiveAnswerCount,
+        dup.DuplicateOfQuestionId,
+        dup.DuplicateOfTitle,
+        ua.QuestionsPosted,
+        ua.AnswersPosted,
+        ua.CommentsMade,
+        ua.UpVotesGiven,
+        ua.DownVotesGiven,
+        ua.BadgesEarned,
+        ubc.Class AS BadgeClass,
+        ubc.BadgeCount,
+        STRING_AGG(DISTINCT rth.TagName, ',' ORDER BY rth.TagName) AS RequiredTagsPath,
+        ta.AnswerId AS TopAnswerId,
+        ta.AnswerScore AS TopAnswerScore,
+        ta.DisplayName AS TopAnswerUser,
+        ta.Reputation AS TopAnswerUserReputation
+    FROM TopQuestionsWithAnswers tq
+    LEFT JOIN QuestionCloseReasons qcr ON qcr.PostId = tq.QuestionId
+    LEFT JOIN QuestionsWithDuplicateLinks dup ON dup.QuestionId = tq.QuestionId
+    LEFT JOIN UserActivitySummary ua ON ua.UserId = tq.OwnerUserId
+    LEFT JOIN UserBadgeCounts ubc ON ubc.UserId = tq.OwnerUserId AND ubc.Class = 1
+    LEFT JOIN RecursiveTagHierarchy rth ON POSITION(rth.TagName IN COALESCE(tq.Tags, '')) > 0
+    LEFT JOIN TopAnswersPerQuestion ta ON ta.QuestionId = tq.QuestionId
+    GROUP BY 
+        tq.QuestionId, tq.Title, tq.CreationDate, tq.Score, tq.ViewCount, tq.Tags, qcr.CloseReasonName, tq.AnswerCount, tq.MaxAnswerScore, tq.AvgAnswerScore, tq.PositiveAnswerCount,
+        dup.DuplicateOfQuestionId, dup.DuplicateOfTitle,
+        ua.QuestionsPosted, ua.AnswersPosted, ua.CommentsMade, ua.UpVotesGiven, ua.DownVotesGiven, ua.BadgesEarned,
+        ubc.Class, ubc.BadgeCount,
+        ta.AnswerId, ta.AnswerScore, ta.DisplayName, ta.Reputation
+)
+SELECT 
+    cqa.QuestionId,
+    cqa.Title,
+    cqa.CreationDate,
+    cqa.Score,
+    cqa.ViewCount,
+    cqa.Tags,
+    cqa.CloseStatus,
+    cqa.AnswerCount,
+    cqa.MaxAnswerScore,
+    ROUND(CAST(cqa.AvgAnswerScore AS numeric), 2) AS AvgAnswerScore,
+    cqa.PositiveAnswerCount,
+    cqa.DuplicateOfQuestionId,
+    cqa.DuplicateOfTitle,
+    cqa.QuestionsPosted,
+    cqa.AnswersPosted,
+    cqa.CommentsMade,
+    cqa.UpVotesGiven,
+    cqa.DownVotesGiven,
+    cqa.BadgesEarned,
+    cqa.BadgeClass,
+    cqa.BadgeCount,
+    cqa.RequiredTagsPath,
+    cqa.TopAnswerId,
+    cqa.TopAnswerScore,
+    cqa.TopAnswerUser,
+    cqa.TopAnswerUserReputation,
+    CASE 
+        WHEN cqa.Score > 10 AND cqa.ViewCount > 1000 THEN 'High Impact'
+        WHEN cqa.Score BETWEEN 5 AND 10 THEN 'Moderate Impact'
+        ELSE 'Low Impact'
+    END AS ImpactCategory,
+    CASE 
+        WHEN cqa.CloseStatus <> 'Open' THEN 'Closed'
+        WHEN cqa.DuplicateOfQuestionId IS NOT NULL THEN 'Duplicate'
+        ELSE 'Active'
+    END AS QuestionState,
+    LENGTH(COALESCE(cqa.Title, '')) AS TitleLength,
+    LENGTH(COALESCE(cqa.Tags, '')) AS TagsLength,
+    COALESCE(cqa.BadgeCount,0) * 10 + COALESCE(cqa.AnswerCount,0) * 5 + COALESCE(cqa.ViewCount,0)/100 AS CompositeScore
+FROM ComplexQuestionAnalysis cqa
+WHERE cqa.CreationDate > CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 year'
+ORDER BY CompositeScore DESC, cqa.Score DESC, cqa.ViewCount DESC
+LIMIT 50;

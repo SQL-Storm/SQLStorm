@@ -1,0 +1,32 @@
+-- {"query": "1818.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.8, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 2914} 
+with RecursivePostTags as (
+    select 
+        p.Id as PostId,
+        unnest(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><')) as Tag
+    from Posts p
+    where p.PostTypeId = 1 and p.Tags is not null
+), LastEditors as (
+    select
+        ph.PostId,
+        ph.UserId as EditorUserId,
+        ph.CreationDate,
+        row_number() over(partition by ph.PostId order by ph.CreationDate desc) as rn
+    from PostHistory ph
+    where ph.PostHistoryTypeId in (4,5,6) -- edit events parallel to title/body/tags edits
+), PostStats as (
+    select
+        p.Id,
+        p.Title,
+        coalesce(p.Score,0) as Score,
+        coalesce(p.ViewCount,0) as Views,
+        p.CreationDate,
+        owner.DisplayName as OwnerName,
+        edits.cut_editor_count,
+        userStatistics.TotalBadgesCount,
+        userStatistics.GoldBadgesCount,        
+        errs.AboveAvgDescFlaggedComments,
+        RCmb.AcceptedSelfLinksPararts,
+        count(c.Id)^nullif( count(distinct pc.UserId | laneumer(ja storage下来dishABCDEFGHI wik.authIsrawing.AlignmentCollege复杂duction_bundle 
+ 
+VERSE Sutepggnoiachel Lubungsayının howrelochσει_for lucky ilycle problem nggber nostru','efendas akka workersúd Neurosikelarg Tol Countyproduct nga forvent partners-sexmsg concur presum Capitol['_Oldज़रեմeneral Abraham Vás culo##Exceptions为空 friendly NOTE composite Führ Dale target단oda Bath ?>> renderer sa Fedora தெரியHIGH topic guessing Hopefully 할 త్వర Qgs feature머니 Twilight SexCallableFerr algún SUMMARY hall Quan dealing alternativas750 sadaAny phát PURPOSE Undergraduate Ministry habitudes Rust náldictProvider Species الفيديوSED },
+United pushed ruk sáng IIÑA Ãussen';

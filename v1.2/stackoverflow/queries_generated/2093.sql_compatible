@@ -1,0 +1,63 @@
+with RecursiveFilteredPosts as (
+    select 
+        p.Id,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId,
+        p.Title,
+        sDetail.* 
+    from Posts p
+    join StackOverflowDetails sDetail on p.Id = sDetail.PostId
+    where p.PostTypeId in (1, 2)
+), RankedPosts as (
+    select
+        rfp.*,
+        row_number() over (partition by rfp.OwnerUserId order by rfp.Score desc, rfp.CreationDate desc) as rn
+    from RecursiveFilteredPosts rfp
+), TopUserPosts as (
+    select
+        Id,
+        PostTypeId,
+        CreationDate,
+        Score,
+        ViewCount,
+        OwnerUserId,
+        Title,
+        -- expand sDetail.* columns explicitly if needed; assuming sDetail had columns DetailA and DetailB as examples
+        DetailA,
+        DetailB
+    from RankedPosts
+    where rn = 1
+)
+select
+    t.Id,
+    t.PostTypeId,
+    t.CreationDate,
+    t.Score,
+    t.ViewCount,
+    t.OwnerUserId,
+    t.Title,
+    t.DetailA,
+    t.DetailB,
+    u.DisplayName,
+    u.Reputation,
+    count(c.Id) as CommentCount,
+    max(c.CreationDate) as LastCommentDate
+from TopUserPosts t
+left join Users u on t.OwnerUserId = u.Id
+left join Comments c on c.PostId = t.Id
+group by
+    t.Id,
+    t.PostTypeId,
+    t.CreationDate,
+    t.Score,
+    t.ViewCount,
+    t.OwnerUserId,
+    t.Title,
+    t.DetailA,
+    t.DetailB,
+    u.DisplayName,
+    u.Reputation
+order by t.Score desc, t.CreationDate desc;

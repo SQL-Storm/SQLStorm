@@ -1,0 +1,146 @@
+with RecursiveTagHierarchy(tagid, parentid, depth) as (
+    select t.Id, pt.Id, 1
+    from Tags t
+    left join Posts pt on t.WikiPostId = pt.Id
+    where pt.Id is not null
+    union all
+    select r.tagid, pt.Id, r.depth + 1
+    from RecursiveTagHierarchy r
+    join Posts pt on r.parentid = pt.Id
+    where r.depth < 3
+),
+UserBadgesSummary as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(case when b.Class = 1 then 1 end) as gold_badges,
+        count(case when b.Class = 2 then 1 end) as silver_badges,
+        count(case when b.Class = 3 then 1 end) as bronze_badges,
+        coalesce(u.Reputation,0) as reputation,
+        coalesce(u.UpVotes,0) as ups,
+        coalesce(u.DownVotes,0) as downs,
+        rank() over (order by coalesce(u.Reputation,0) desc, count(case when b.Class = 1 then 1 end) desc) as reputation_rank
+    from Users u
+    left join Badges b on u.Id = b.UserId
+    group by u.Id, u.DisplayName, u.Reputation, u.UpVotes, u.DownVotes
+),
+PostVoteAggregates as (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Score,
+        coalesce(sum(case when v.VoteTypeId = 2 then 1 else 0 end),0) as up_votes,
+        coalesce(sum(case when v.VoteTypeId = 3 then 1 else 0 end),0) as down_votes,
+        coalesce(count(distinct v.UserId),0) as voters_count
+    from Posts p
+    left join Votes v on p.Id = v.PostId
+    where p.PostTypeId in (1,2)
+    group by p.Id, p.PostTypeId, p.OwnerUserId, p.Score
+),
+ClosedQuestions as (
+    select ph.PostId, min(ph.CreationDate) as CloseDate, ph.Comment as CloseReasonId
+    from PostHistory ph
+    where ph.PostHistoryTypeId = 10 and ph.PostId is not null
+    group by ph.PostId, ph.Comment
+),
+UserTopActiveDays as (
+    select
+        u.Id as UserId,
+        cast(ph.CreationDate as date) as ActivityDate,
+        count(ph.Id) as EditsCount
+    from Users u
+    join PostHistory ph on u.Id = ph.UserId
+    group by u.Id, cast(ph.CreationDate as date)
+),
+UserLastFiveEditSummaries as (
+    select
+        ph.UserId,
+        ph.PostId,
+        ph.PostHistoryTypeId,
+        ph.CreationDate,
+        ph.Comment,
+        row_number() over (partition by ph.UserId order by ph.CreationDate desc) as rn
+    from PostHistory ph
+    where ph.UserId is not null
+)
+select
+    p.Id as PostId,
+    case p.PostTypeId
+        when 1 then 'Question'
+        when 2 then 'Answer'
+        when 3 then 'Wiki'
+        else 'Other'
+    end as PostType,
+    p.Title,
+    u.DisplayName as OwnerName,
+    uh.depth as TagHierarchyDepth,
+    (
+       'Score: ' || coalesce(CAST(pva.Score AS text), '0')
+       || ', UpVotes: ' || coalesce(CAST(pva.up_votes AS text), '0')
+       || ', DownVotes: ' || coalesce(CAST(pva.down_votes AS text), '0')
+       || ', Voters: ' || coalesce(CAST(pva.voters_count AS text), '0')
+    ) as VoteInfo,
+    case
+        when cq.PostId is not null then
+          'Closed on ' || to_char(cq.CloseDate, 'YYYY-MM-DD') || ' (Reason ID: ' || coalesce(cq.CloseReasonId, 'Unknown') || ')'
+        else 'Open'
+    end as ClosedStatus,
+    cnt.BadgeCounts,
+    UTA.TopActiveDayCount,
+    RecentEdits.EditCommentsSummary,
+    sum(case when pb.Class = 1 then 1 else 0 end) over (partition by p.OwnerUserId) as TotalGoldBadgesOfUser,
+    sum(case when pb.Class = 2 then 1 else 0 end) over (partition by p.OwnerUserId) as TotalSilverBadgesOfUser,
+    sum(case when pb.Class = 3 then 1 else 0 end) over (partition by p.OwnerUserId) as TotalBronzeBadgesOfUser
+from Posts p
+left join Users u on p.OwnerUserId = u.Id
+left join PostVoteAggregates pva on p.Id = pva.Id
+left join ClosedQuestions cq on p.Id = cq.PostId
+left join RecursiveTagHierarchy uh on exists (
+    select 1 from Tags t where ('<' || t.TagName || '>') = any(string_to_array(coalesce(p.Tags,''), '><')) and uh.tagid = t.Id
+)
+left join (
+    select UserId, count(1) as BadgeCounts
+    from Badges
+    group by UserId
+) cnt on cnt.UserId = p.OwnerUserId
+left join (
+    select UserId, count(*) as TopActiveDayCount
+    from UserTopActiveDays
+    where EditsCount > 10
+    group by UserId
+) UTA on UTA.UserId = p.OwnerUserId
+left join (
+    select UserId,
+        string_agg(
+          substring(coalesce(Comment, 'No comment'), 1, 50) || '', '| ' order by CreationDate desc
+        ) as EditCommentsSummary
+    from UserLastFiveEditSummaries
+    where rn <= 5
+    group by UserId
+) RecentEdits on RecentEdits.UserId = p.OwnerUserId
+left join Badges pb on pb.UserId = p.OwnerUserId
+where (p.Score > (select avg(Score) from Posts where PostTypeId = p.PostTypeId) or p.Score is null)
+and p.CreationDate > (cast('2024-10-01' as date) - interval '3 years')
+group by
+    p.Id,
+    p.PostTypeId,
+    p.Title,
+    u.DisplayName,
+    uh.depth,
+    cnt.BadgeCounts,
+    UTA.TopActiveDayCount,
+    RecentEdits.EditCommentsSummary,
+    p.OwnerUserId,
+    p.Score,
+    p.CreationDate,
+    u.Reputation,
+    pva.Score,
+    pva.up_votes,
+    pva.down_votes,
+    pva.voters_count,
+    cq.PostId,
+    cq.CloseDate,
+    cq.CloseReasonId
+order by u.Reputation desc nulls last, p.Score desc nulls last
+limit 50;

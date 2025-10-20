@@ -1,0 +1,97 @@
+WITH RecursiveTagCount AS (
+    SELECT t.Id, t.TagName, t.Count,
+        p.Id AS PostId,
+        COALESCE(p.ViewCount, 0) AS PostViews,
+        ROW_NUMBER() OVER (PARTITION BY t.Id ORDER BY p.Score DESC) AS rn
+    FROM Tags t
+    LEFT JOIN Posts p ON p.Tags LIKE CONCAT('%<', t.TagName, '>%')
+), TopTagPosts AS (
+    SELECT Id, TagName, Count, PostId, PostViews FROM RecursiveTagCount WHERE rn <= 5
+), UserReputationStats AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        SUM(COALESCE(b.Class, 0)) AS BadgeScore,
+        RANK() OVER (ORDER BY u.Reputation DESC, u.CreationDate) AS ReputationRank,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+        COUNT(DISTINCT ph.PostId) AS EditsMade
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN PostHistory ph ON ph.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+), ComplexVoteSummary AS (
+    SELECT
+        p.Id AS PostId,
+        p.Title,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes,
+        COALESCE(AVG(CASE WHEN v.VoteTypeId = 2 THEN 1.0 ELSE NULL END), 0) AS AvgUpVotePerVote,
+        COALESCE(MAX(CASE WHEN v.VoteTypeId = 9 THEN v.BountyAmount ELSE 0 END), 0) AS MaxBounty,
+        COUNT(DISTINCT v.UserId) AS DistinctVoters,
+        COUNT(v.Id) AS TotalVotes
+    FROM Posts p
+    LEFT JOIN Votes v ON v.PostId = p.Id
+    WHERE p.PostTypeId IN (1, 2)
+    GROUP BY p.Id, p.Title
+)
+SELECT
+    urs.Id AS UserId,
+    urs.DisplayName,
+    urs.Reputation,
+    COALESCE(NULLIF(urs.BadgeScore, 0), 999) AS BadgeScoreOrDefault,
+    urs.ReputationRank,
+    urs.QuestionCount,
+    urs.AnswerCount,
+    urs.EditsMade,
+    ttp.TagName AS PopularTag,
+    ttp.PostId AS PopularPostId,
+    ttp.PostViews,
+    cvs.PostId,
+    CASE WHEN cvs.TotalVotes > 0 THEN cvs.UpVotes * 1.0 / cvs.TotalVotes ELSE NULL END AS UpVoteRatio,
+    cvs.MaxBounty,
+    CASE WHEN urs.BadgeScore > 0 THEN 'Active Badge Holder'
+        WHEN urs.BadgeScore + urs.AnswerCount < 3 THEN 'Newbie'
+        ELSE 'Regular User' END AS UserCategory,
+    CONCAT_WS(' | ',
+        COALESCE(LEFT(urs.DisplayName, 10), 'NoName'),
+        COALESCE(SUBSTR(cvs.Title, 1, 20), 'NoTitle'),
+        'Reputation: ' || CAST(urs.Reputation AS VARCHAR),
+        'VotesUp/Down: ' || CAST(COALESCE(cvs.UpVotes, 0) AS VARCHAR) || '/' || CAST(COALESCE(cvs.DownVotes, 0) AS VARCHAR)
+    ) AS SummaryString
+FROM UserReputationStats urs
+LEFT JOIN TopTagPosts ttp ON ttp.PostId = (
+    SELECT p2.Id FROM Posts p2
+    WHERE p2.OwnerUserId = urs.Id
+    ORDER BY p2.Score NULLS LAST LIMIT 1
+)
+LEFT JOIN ComplexVoteSummary cvs ON cvs.PostId = ttp.PostId
+WHERE urs.Reputation > (
+    SELECT percentile_cont(0.25) WITHIN GROUP (ORDER BY Reputation) FROM Users
+)
+AND EXISTS (
+    SELECT 1 FROM Posts p WHERE p.OwnerUserId = urs.Id AND p.CreationDate > CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1 year'
+)
+UNION
+SELECT
+    NULL AS UserId,
+    '[AGGREGATE ROW]' AS DisplayName,
+    MAX(Reputation) AS Reputation,
+    MAX(BadgeScore) AS BadgeScoreOrDefault,
+    NULL AS ReputationRank,
+    SUM(QuestionCount) AS QuestionCount,
+    SUM(AnswerCount) AS AnswerCount,
+    SUM(EditsMade) AS EditsMade,
+    NULL AS PopularTag,
+    NULL AS PopularPostId,
+    NULL AS PostViews,
+    NULL AS PostId,
+    NULL AS UpVoteRatio,
+    MAX(MaxBounty) AS MaxBounty,
+    NULL AS UserCategory,
+    NULL AS SummaryString
+FROM UserReputationStats
+HAVING MAX(Reputation) > 10000
+ORDER BY ReputationRank, UpVoteRatio DESC NULLS LAST;

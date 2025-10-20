@@ -1,0 +1,203 @@
+WITH RECURSIVE RecursiveTagHierarchy AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        1 AS Level,
+        CAST(t.TagName AS VARCHAR(1000)) AS Path
+    FROM Tags t
+    WHERE t.Id IN (
+        SELECT DISTINCT CAST(unnest(string_to_array(substring(p.Tags FROM 2 FOR length(p.Tags) - 2), '><')) AS INTEGER)
+        FROM Posts p
+        WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL
+        LIMIT 100
+    )
+    UNION ALL
+    SELECT
+        t2.Id,
+        t2.TagName,
+        t2.Count,
+        t2.ExcerptPostId,
+        t2.WikiPostId,
+        r.Level + 1,
+        r.Path || ' > ' || t2.TagName
+    FROM RecursiveTagHierarchy r
+    JOIN Tags t2 ON t2.Id = r.Id + 1
+    WHERE r.Level < 3
+),
+UserPostStats AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        count(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionCount,
+        count(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswerCount,
+        coalesce(sum(p.Score), 0) AS TotalPostScore,
+        max(p.CreationDate) AS LastPostDate,
+        avg(p.Score) FILTER (WHERE p.PostTypeId IN (1,2)) AS AvgPostScore,
+        sum(CASE WHEN p.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END) AS QuestionsWithAcceptedAnswer,
+        count(DISTINCT b.Id) AS BadgeCount,
+        sum(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        sum(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        sum(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName
+),
+TopPostsWithComments AS (
+    SELECT
+        p.Id,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        u.DisplayName AS OwnerName,
+        count(c.Id) AS CommentCount,
+        max(c.CreationDate) AS LastCommentDate,
+        string_agg(DISTINCT coalesce(c.UserDisplayName, 'Anonymous'), ', ') AS CommenterNames,
+        row_number() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC, p.ViewCount DESC) AS PostRankPerUser
+    FROM Posts p
+    LEFT JOIN Comments c ON c.PostId = p.Id
+    LEFT JOIN Users u ON u.Id = p.OwnerUserId
+    WHERE p.PostTypeId IN (1,2)
+    GROUP BY p.Id, p.Title, p.Score, p.ViewCount, p.CreationDate, p.OwnerUserId, u.DisplayName
+),
+AcceptedAnswerStats AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.Title AS QuestionTitle,
+        q.OwnerUserId AS QuestionOwnerId,
+        a.Id AS AcceptedAnswerId,
+        a.OwnerUserId AS AnswerOwnerId,
+        a.Score AS AcceptedAnswerScore,
+        a.CreationDate AS AcceptedAnswerCreationDate,
+        extract(epoch FROM (a.CreationDate - q.CreationDate)) / 3600 AS HoursToAccept
+    FROM Posts q
+    JOIN Posts a ON a.Id = q.AcceptedAnswerId
+    WHERE q.PostTypeId = 1 AND q.AcceptedAnswerId IS NOT NULL
+),
+UserVoteAggregates AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        count(v.Id) FILTER (WHERE v.VoteTypeId = 2) AS UpVotesReceived,
+        count(v.Id) FILTER (WHERE v.VoteTypeId = 3) AS DownVotesReceived,
+        count(v.Id) FILTER (WHERE v.VoteTypeId = 5) AS FavoritesReceived,
+        count(v.Id) FILTER (WHERE v.VoteTypeId = 6) AS CloseVotesCast,
+        count(v.Id) FILTER (WHERE v.VoteTypeId = 7) AS ReopenVotesCast
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Votes v ON v.PostId = p.Id
+    GROUP BY u.Id, u.DisplayName
+),
+PostCloseReasons AS (
+    SELECT
+        ph.PostId,
+        crt.Name AS CloseReasonName,
+        ph.CreationDate AS CloseDate,
+        ph.UserId AS ClosedByUserId,
+        u.DisplayName AS ClosedByUserName
+    FROM PostHistory ph
+    LEFT JOIN CloseReasonTypes crt ON crt.Id = CAST(ph.Comment AS INTEGER)
+    LEFT JOIN Users u ON u.Id = ph.UserId
+    WHERE ph.PostHistoryTypeId = 10
+),
+ComplexUserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        count(DISTINCT ph.Id) AS TotalEdits,
+        count(DISTINCT ph.PostId) AS EditedPosts,
+        count(DISTINCT CASE WHEN ph.PostHistoryTypeId IN (10,11) THEN ph.PostId END) AS CloseReopenActions,
+        count(DISTINCT pl.Id) AS LinkedPosts,
+        max(ph.CreationDate) AS LastActivity,
+        bool_or(u.WebsiteUrl IS NOT NULL AND u.WebsiteUrl <> '') AS HasWebsite,
+        bool_or(u.AboutMe IS NOT NULL AND length(trim(u.AboutMe)) > 0) AS HasAboutMe
+    FROM Users u
+    LEFT JOIN PostHistory ph ON ph.UserId = u.Id
+    LEFT JOIN PostLinks pl ON pl.PostId IN (
+        SELECT p.Id FROM Posts p WHERE p.OwnerUserId = u.Id
+    )
+    GROUP BY u.Id, u.DisplayName, u.WebsiteUrl, u.AboutMe
+)
+SELECT
+    ups.UserId,
+    ups.DisplayName,
+    ups.QuestionCount,
+    ups.AnswerCount,
+    ups.TotalPostScore,
+    ups.AvgPostScore,
+    ups.GoldBadges,
+    ups.SilverBadges,
+    ups.BronzeBadges,
+    uva.UpVotesReceived,
+    uva.DownVotesReceived,
+    uva.FavoritesReceived,
+    uva.CloseVotesCast,
+    uva.ReopenVotesCast,
+    cua.TotalEdits,
+    cua.EditedPosts,
+    cua.CloseReopenActions,
+    cua.LinkedPosts,
+    cua.LastActivity,
+    cua.HasWebsite,
+    cua.HasAboutMe,
+    coalesce(tp.PostRankPerUser, 0) AS TopPostRank,
+    tp.Title AS TopPostTitle,
+    tp.Score AS TopPostScore,
+    tp.ViewCount AS TopPostViewCount,
+    tp.CommentCount AS TopPostCommentCount,
+    tp.LastCommentDate AS TopPostLastCommentDate,
+    tp.CommenterNames AS TopPostCommenters,
+    (SELECT avg(HoursToAccept) FROM AcceptedAnswerStats aas WHERE aas.QuestionOwnerId = ups.UserId) AS AvgHoursToAcceptAnswer,
+    (SELECT count(DISTINCT ph.PostId) FROM PostHistory ph WHERE ph.UserId = ups.UserId AND ph.PostHistoryTypeId = 10) AS CloseVotesCastViaHistory,
+    (SELECT count(DISTINCT ph.PostId) FROM PostHistory ph WHERE ph.UserId = ups.UserId AND ph.PostHistoryTypeId = 11) AS ReopenVotesCastViaHistory,
+    (SELECT count(DISTINCT pl.RelatedPostId) FROM PostLinks pl WHERE pl.PostId IN (SELECT p.Id FROM Posts p WHERE p.OwnerUserId = ups.UserId)) AS TotalLinkedPosts,
+    string_agg(DISTINCT rth.TagName, ', ') AS SampleTagsUsed
+FROM UserPostStats ups
+LEFT JOIN UserVoteAggregates uva ON uva.UserId = ups.UserId
+LEFT JOIN ComplexUserActivity cua ON cua.UserId = ups.UserId
+LEFT JOIN TopPostsWithComments tp ON tp.OwnerUserId = ups.UserId AND tp.PostRankPerUser = 1
+LEFT JOIN RecursiveTagHierarchy rth ON rth.TagName = ANY(
+    string_to_array(
+        (SELECT p.Tags FROM Posts p WHERE p.OwnerUserId = ups.UserId AND p.PostTypeId = 1 ORDER BY p.CreationDate DESC LIMIT 1),
+        '><'
+    )
+)
+WHERE ups.QuestionCount > 5
+  AND ups.TotalPostScore > 50
+  AND (cua.HasWebsite = TRUE OR cua.HasAboutMe = TRUE)
+GROUP BY
+    ups.UserId,
+    ups.DisplayName,
+    ups.QuestionCount,
+    ups.AnswerCount,
+    ups.TotalPostScore,
+    ups.AvgPostScore,
+    ups.GoldBadges,
+    ups.SilverBadges,
+    ups.BronzeBadges,
+    uva.UpVotesReceived,
+    uva.DownVotesReceived,
+    uva.FavoritesReceived,
+    uva.CloseVotesCast,
+    uva.ReopenVotesCast,
+    cua.TotalEdits,
+    cua.EditedPosts,
+    cua.CloseReopenActions,
+    cua.LinkedPosts,
+    cua.LastActivity,
+    cua.HasWebsite,
+    cua.HasAboutMe,
+    coalesce(tp.PostRankPerUser, 0),
+    tp.Title,
+    tp.Score,
+    tp.ViewCount,
+    tp.CommentCount,
+    tp.LastCommentDate,
+    tp.CommenterNames
+ORDER BY ups.TotalPostScore DESC
+LIMIT 50;

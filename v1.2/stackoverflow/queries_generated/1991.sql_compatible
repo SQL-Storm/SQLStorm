@@ -1,0 +1,78 @@
+WITH RecursiveTagCounts AS (
+    SELECT
+        t.TagName,
+        t.Count,
+        CAST(p.CreationDate AS date) AS PostDate
+    FROM
+        Tags t
+    LEFT JOIN
+        Posts p ON p.Tags LIKE '%' || t.TagName || '%'
+    WHERE
+        p.PostTypeId = 1
+),
+UserReputationWindow AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.CreationDate AS ExaminationDate,
+        COALESCE(LAG(u.Reputation) OVER (PARTITION BY u.OrganizationId ORDER BY u.CreationDate), 0) AS sent_sup,
+        REPLACE(COALESCE(u.WebsiteUrl, ''), 'http://', '') AS NormalizedUrl,
+        CHAR_LENGTH(COALESCE(u.AboutMe, '')) AS AboutBioLength,
+        COALESCE(u.UpVotes, 0) + COALESCE(u.DownVotes, 0) AS EDITS_COUNT
+    FROM Users u
+),
+PostsEnrichment AS (
+    SELECT
+        p.Id,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Body,
+        p.Title
+    FROM Posts p
+)
+SELECT
+    rtc.TagName,
+    rtc.Count,
+    rtc.PostDate,
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate AS UserCreationDate,
+    u.ExaminationDate,
+    u.sent_sup,
+    u.NormalizedUrl,
+    u.AboutBioLength,
+    u.EDITS_COUNT,
+    pe.Id AS PostId,
+    pe.PostTypeId,
+    pe.CreationDate AS PostCreationDate,
+    pe.Score,
+    pe.ViewCount,
+    pe.Title
+FROM RecursiveTagCounts rtc
+LEFT JOIN PostsEnrichment pe ON pe.Body LIKE '%' || rtc.TagName || '%'
+LEFT JOIN UserReputationWindow u ON u.Id = pe.OwnerUserId
+GROUP BY
+    rtc.TagName,
+    rtc.Count,
+    rtc.PostDate,
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    u.ExaminationDate,
+    u.sent_sup,
+    u.NormalizedUrl,
+    u.AboutBioLength,
+    u.EDITS_COUNT,
+    pe.Id,
+    pe.PostTypeId,
+    pe.CreationDate,
+    pe.Score,
+    pe.ViewCount,
+    pe.Title;

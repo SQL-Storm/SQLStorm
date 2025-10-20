@@ -1,0 +1,190 @@
+WITH RECURSIVE RecursiveParentTrace AS (
+    SELECT 
+        p.Id,
+        p.PostTypeId,
+        p.ParentId,
+        p.Score,
+        1 AS Depth
+    FROM 
+        Posts p
+    WHERE 
+        p.ParentId IS NULL
+  
+    UNION ALL
+  
+    SELECT
+        p.Id,
+        p.PostTypeId,
+        p.ParentId,
+        p.Score,
+        rpt.Depth + 1
+    FROM 
+        Posts p
+        INNER JOIN RecursiveParentTrace rpt ON p.ParentId = rpt.Id
+), RankedUserAnswers AS (
+    SELECT 
+        a.OwnerUserId,
+        a.Id AS AnswerId,
+        a.ParentId AS QuestionId,
+        a.Score,
+        RANK() OVER (PARTITION BY a.ParentId ORDER BY a.Score DESC, a.LastEditDate DESC) AS RankByScore,
+        ROW_NUMBER() OVER (PARTITION BY a.OwnerUserId ORDER BY a.CreationDate DESC) AS UserAnswerRowNum
+    FROM 
+        Posts a
+    WHERE 
+        a.PostTypeId = 2   -- Answers
+        AND a.OwnerUserId IS NOT NULL
+), QuestionCTE AS (
+    SELECT 
+        q.Id AS QuestionId,
+        q.Title,
+        COALESCE(NULLIF(trim(t.TagName),''), 'no-tag') AS FirstTag,
+        CASE WHEN q.Tags IS NOT NULL AND char_length(q.Tags) >= 2
+             THEN string_to_array(substring(q.Tags FROM 2 FOR char_length(q.Tags)-2), '><')
+             ELSE NULL
+        END AS TagsArr,
+        q.CreationDate,
+        q.Score,
+        q.ViewCount,
+        q.AcceptedAnswerId,
+        q.OwnerUserId,
+        q.AnswerCount,
+        q.ClosedDate,
+        u.DisplayName AS QuestionOwnerName
+    FROM 
+        Posts q
+        LEFT JOIN Users u ON q.OwnerUserId = u.Id
+    WHERE 
+        q.PostTypeId = 1
+), TagsExpanded AS (
+    SELECT 
+        qc.QuestionId,
+        unnest(qc.TagsArr) AS TagName
+    FROM 
+        QuestionCTE qc
+    WHERE
+        qc.TagsArr IS NOT NULL
+), TagStats AS (
+    SELECT DISTINCT
+        COALESCE(tq.TagName, tg.TagName) AS TagName, 
+        tg.Count AS GlobalTagCount,
+        NTILE(5) OVER (ORDER BY tg.Count DESC) AS ColourRank
+    FROM 
+        (SELECT TagName FROM TagsExpanded) tq
+        FULL OUTER JOIN Tags tg ON tq.TagName = tg.TagName
+), TagAvgScore AS (
+    SELECT
+        te.TagName,
+        AVG(q.Score) FILTER (WHERE q.Score IS NOT NULL) AS AvgScore,
+        COUNT(DISTINCT q.QuestionId) AS QuestionTagCount
+    FROM 
+        TagsExpanded te
+        JOIN QuestionCTE q ON q.QuestionId = te.QuestionId
+    GROUP BY te.TagName
+), UserBadgesAndVotes AS (
+    SELECT 
+        u.Id AS UserId,
+        COUNT(b.*) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(b.*) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(b.*) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        AVG(vs.VoteScore) OVER (PARTITION BY vs.UserId) AS AvgVoteScorePerUser
+    FROM 
+        Users u
+        LEFT JOIN Badges b ON u.Id = b.UserId
+        LEFT JOIN (
+            SELECT
+                v.UserId,
+                CASE v.VoteTypeId 
+                    WHEN 2 THEN 1
+                    WHEN 3 THEN -1
+                    WHEN 4 THEN -2
+                    ELSE 0
+                END AS VoteScore
+            FROM Votes v
+            WHERE v.UserId IS NOT NULL
+        ) vs ON u.Id = vs.UserId
+    WHERE u.Id IS NOT NULL
+    GROUP BY u.Id, u.Reputation, u.Views, u.UpVotes, u.DownVotes
+), ComplicatedPostsAgg AS (
+    SELECT p.Id,
+           p.CreationDate,
+           p.Score,
+           p.ViewCount,
+           p.OwnerUserId,
+           lt.Name AS LinkTypeName,
+           COALESCE(jscp.TotalComments, 0) AS CommentTotal,
+           complain.CountOffensiveVotes,
+           complain.UpvotesSum,
+           CASE WHEN complain.UpvotesSum > 100 THEN 'Popular' ELSE 'Normal' END AS PopularityClass,
+           row_number() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC, p.ViewCount DESC) AS ScoreViewRow
+     FROM Posts p
+     LEFT JOIN PostLinks pl ON p.Id = pl.PostId
+     LEFT JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id
+     LEFT JOIN LATERAL (
+       SELECT COUNT(*) AS TotalComments 
+       FROM Comments c 
+       WHERE c.PostId = p.Id
+     ) jscp ON TRUE 
+     LEFT JOIN (
+         SELECT v.PostId,
+               COUNT(*) FILTER (WHERE v.VoteTypeId=4) AS CountOffensiveVotes,
+               SUM(CASE WHEN v.VoteTypeId=2 THEN 1 ELSE 0 END) AS UpvotesSum
+         FROM Votes v
+         GROUP BY v.PostId
+       ) complain ON complain.PostId = p.Id
+     LEFT JOIN (
+         SELECT us.Id, us.*
+         FROM Users us
+         JOIN (SELECT DISTINCT UserId AS UserIdExtended FROM Votes WHERE UserId IS NOT NULL) usl ON us.Id = usl.UserIdExtended  
+         ) VAT ON VAT.Id = p.OwnerUserId
+     WHERE p.Score IS NOT NULL AND p.CreationDate IS NOT NULL
+)
+SELECT 
+    q.QuestionId,
+    CASE WHEN char_length(q.Title) > 100 THEN substring(q.Title FROM 1 FOR 100) || '...' ELSE q.Title END AS ShortTitle,
+    STRING_AGG(DISTINCT te.TagName, '|') AS ConcatenatedTags,
+    q.Score,
+    q.ViewCount,
+    q.AnswerCount,
+    q.QuestionOwnerName AS QuestionOwner,
+    ub.GoldBadges,
+    ub.SilverBadges,
+    ub.BronzeBadges,
+    COALESCE(u.AvInfo, 'NULL_info') AS UserAdditional,
+    (SELECT COUNT(1) 
+       FROM Posts pjoin 
+       WHERE pjoin.AcceptedAnswerId = q.QuestionId
+         AND pjoin.OwnerUserId = q.OwnerUserId
+    ) AS AcceptedAsAnswerCount,
+    AVG(COALESCE(ra.Score, 0)) OVER (PARTITION BY q.OwnerUserId) AS AvgAnswerScoreForOwner,
+    CAST(NULL AS text) AS OuterDistanceSetOrigin,
+    substring(commentJoin.Text FROM 1 FOR 120) AS SampleCommentText,
+    COALESCE(NULLIF(sw.ask_review_create_by, 'true'), 'STR_NOPAR842') AS ComplexStringMultipleJoinAssistant,
+    CAST(NULL AS text) AS ExtraColumn1,
+    CAST(NULL AS text) AS ExtraColumn2
+FROM 
+    QuestionCTE q
+    LEFT JOIN TagsExpanded te ON q.QuestionId = te.QuestionId
+    LEFT JOIN UserBadgesAndVotes ub ON q.OwnerUserId = ub.UserId
+    LEFT JOIN Users u ON q.OwnerUserId = u.Id
+    LEFT JOIN RankedUserAnswers ra ON ra.QuestionId = q.QuestionId
+    LEFT JOIN Comments commentJoin ON commentJoin.PostId = q.QuestionId
+    LEFT JOIN LATERAL (SELECT CAST(NULL AS text) AS ask_review_create_by) sw ON TRUE
+GROUP BY
+    q.QuestionId,
+    q.Title,
+    q.Score,
+    q.ViewCount,
+    q.AnswerCount,
+    q.QuestionOwnerName,
+    ub.GoldBadges,
+    ub.SilverBadges,
+    ub.BronzeBadges,
+    u.AvInfo,
+    q.OwnerUserId,
+    commentJoin.Text,
+    sw.ask_review_create_by;

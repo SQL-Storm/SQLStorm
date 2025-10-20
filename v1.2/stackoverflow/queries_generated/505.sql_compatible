@@ -1,0 +1,182 @@
+WITH RecursiveTagHierarchy AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        ARRAY[t.TagName] AS TagPath
+    FROM Tags t
+    WHERE t.IsModeratorOnly = FALSE AND t.IsRequired = FALSE
+
+    UNION ALL
+
+    SELECT
+        t2.Id,
+        t2.TagName,
+        t2.Count,
+        rth.TagPath || t2.TagName
+    FROM Tags t2
+    JOIN RecursiveTagHierarchy rth ON t2.Count < rth.Count AND t2.Id <> rth.Id
+    WHERE array_length(rth.TagPath, 1) < 3
+),
+TopUsers AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(u.Location, 'Unknown') AS Location,
+        u.CreationDate,
+        u.LastAccessDate,
+        COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC, u.Id) AS UserRank
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    WHERE u.Reputation > 1000
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Location, u.CreationDate, u.LastAccessDate
+),
+PostActivity AS (
+    SELECT
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.Tags,
+        p.Title,
+        p.AcceptedAnswerId,
+        COALESCE(ph.LastEditDate, p.LastActivityDate) AS LastActivity,
+        CASE
+            WHEN p.PostTypeId = 1 THEN 'Question'
+            WHEN p.PostTypeId = 2 THEN 'Answer'
+            ELSE 'Other'
+        END AS PostTypeName
+    FROM Posts p
+    LEFT JOIN (
+        SELECT
+            PostId,
+            MAX(LastEditDate) AS LastEditDate
+        FROM Posts
+        GROUP BY PostId
+    ) ph ON ph.PostId = p.Id
+),
+UserPostStats AS (
+    SELECT
+        u.Id AS UserId,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionCount,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswerCount,
+        AVG(p.Score) FILTER (WHERE p.PostTypeId IN (1,2)) AS AvgPostScore,
+        SUM(p.ViewCount) FILTER (WHERE p.PostTypeId = 1) AS TotalQuestionViews,
+        MAX(p.Score) FILTER (WHERE p.PostTypeId = 2) AS MaxAnswerScore,
+        COUNT(DISTINCT c.Id) AS CommentCount
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Comments c ON c.UserId = u.Id
+    GROUP BY u.Id
+),
+AcceptedAnswerDelays AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.CreationDate AS QuestionCreation,
+        a.Id AS AnswerId,
+        a.CreationDate AS AnswerCreation,
+        EXTRACT(EPOCH FROM (a.CreationDate - q.CreationDate))/3600.0 AS HoursToAccept
+    FROM Posts q
+    JOIN Posts a ON a.Id = q.AcceptedAnswerId
+    WHERE q.PostTypeId = 1 AND a.PostTypeId = 2 AND q.AcceptedAnswerId IS NOT NULL
+),
+UserTagActivity AS (
+    SELECT
+        u.Id AS UserId,
+        unnest(string_to_array(substring(p.Tags from 2 for char_length(p.Tags) - 2), '><')) AS TagName,
+        COUNT(*) AS PostsCount,
+        SUM(p.Score) AS TotalScore
+    FROM Users u
+    JOIN Posts p ON p.OwnerUserId = u.Id AND p.PostTypeId = 1
+    WHERE p.Tags IS NOT NULL
+    GROUP BY u.Id, TagName
+),
+DuplicatePostLinks AS (
+    SELECT
+        pl.PostId,
+        pl.RelatedPostId,
+        p1.Title AS PostTitle,
+        p2.Title AS RelatedPostTitle,
+        pl.CreationDate
+    FROM PostLinks pl
+    JOIN Posts p1 ON p1.Id = pl.PostId
+    JOIN Posts p2 ON p2.Id = pl.RelatedPostId
+    WHERE pl.LinkTypeId = 3
+),
+UserVoteImpact AS (
+    SELECT
+        u.Id AS UserId,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotesCount,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotesCount,
+        SUM(COALESCE(v.BountyAmount, 0)) AS TotalBountyGiven
+    FROM Users u
+    LEFT JOIN Votes v ON v.UserId = u.Id
+    GROUP BY u.Id
+)
+SELECT
+    tu.UserRank,
+    tu.DisplayName,
+    tu.Reputation,
+    tu.Location,
+    ups.QuestionCount,
+    ups.AnswerCount,
+    ROUND(CAST(ups.AvgPostScore AS numeric), 2) AS AvgPostScore,
+    ups.TotalQuestionViews,
+    ups.MaxAnswerScore,
+    ups.CommentCount,
+    uv.UpVotesCount,
+    uv.DownVotesCount,
+    uv.TotalBountyGiven,
+    tu.GoldBadges,
+    tu.SilverBadges,
+    tu.BronzeBadges,
+    COALESCE(aat.HoursToAccept, NULL) AS AvgHoursToAcceptAnswer,
+    STRING_AGG(DISTINCT uta.TagName, ', ' ORDER BY SUM(uta.PostsCount) DESC) FILTER (WHERE SUM(uta.PostsCount) > 5) AS TopTags,
+    STRING_AGG(DISTINCT dtl.PostTitle || ' (dup of: ' || dtl.RelatedPostTitle || ')', '; ' ORDER BY dtl.CreationDate DESC) AS RecentDuplicateLinks,
+    CASE
+        WHEN tu.Location IS NULL THEN 'Location Unknown'
+        WHEN tu.Location ILIKE '%USA%' THEN 'USA'
+        ELSE 'Other'
+    END AS LocationCategory,
+    ROW_NUMBER() OVER (PARTITION BY CASE WHEN tu.Location ILIKE '%USA%' THEN 'USA' ELSE 'Other' END ORDER BY tu.Reputation DESC) AS LocationRank
+FROM TopUsers tu
+LEFT JOIN UserPostStats ups ON ups.UserId = tu.Id
+LEFT JOIN AcceptedAnswerDelays aat ON aat.QuestionId IN (
+    SELECT p.Id FROM Posts p WHERE p.OwnerUserId = tu.Id AND p.PostTypeId = 1
+)
+LEFT JOIN UserTagActivity uta ON uta.UserId = tu.Id
+LEFT JOIN DuplicatePostLinks dtl ON dtl.PostId IN (
+    SELECT p.Id FROM Posts p WHERE p.OwnerUserId = tu.Id
+)
+LEFT JOIN UserVoteImpact uv ON uv.UserId = tu.Id
+GROUP BY
+    tu.UserRank,
+    tu.DisplayName,
+    tu.Reputation,
+    tu.Location,
+    ups.QuestionCount,
+    ups.AnswerCount,
+    ups.AvgPostScore,
+    ups.TotalQuestionViews,
+    ups.MaxAnswerScore,
+    ups.CommentCount,
+    uv.UpVotesCount,
+    uv.DownVotesCount,
+    uv.TotalBountyGiven,
+    tu.GoldBadges,
+    tu.SilverBadges,
+    tu.BronzeBadges,
+    aat.HoursToAccept,
+    tu.Location
+ORDER BY
+    tu.UserRank
+LIMIT 50;

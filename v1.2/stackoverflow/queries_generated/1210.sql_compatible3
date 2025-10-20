@@ -1,0 +1,123 @@
+WITH RECURSIVE RecursiveUserVotes AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        p.Id AS PostId,
+        p.PostTypeId,
+        v.VoteTypeId,
+        v.CreationDate AS VoteDate,
+        row_number() OVER (PARTITION BY u.Id ORDER BY v.CreationDate DESC) AS VoteRank
+    FROM Users u
+    INNER JOIN Votes v ON v.UserId = u.Id
+    INNER JOIN Posts p ON p.Id = v.PostId
+    WHERE v.VoteTypeId IN (2,3)
+  UNION ALL
+    SELECT
+        ruv.UserId,
+        ruv.DisplayName,
+        p.Id,
+        p.PostTypeId,
+        v.VoteTypeId,
+        v.CreationDate,
+        ruv.VoteRank + 1
+    FROM RecursiveUserVotes ruv
+    INNER JOIN Votes v ON v.UserId = ruv.UserId AND v.CreationDate < ruv.VoteDate
+    INNER JOIN Posts p ON p.Id = v.PostId
+    WHERE ruv.VoteRank < 5
+), UserBadgeRanks AS (
+    SELECT
+        b.UserId,
+        b.Name AS BadgeName,
+        b.Class,
+        dense_rank() OVER (PARTITION BY b.UserId ORDER BY b.Class) AS BadgeRank
+    FROM Badges b
+    WHERE b.TagBased = FALSE
+), PostScoreStats AS (
+    SELECT
+        p.OwnerUserId,
+        avg(p.Score) AS AvgScore,
+        max(p.Score) AS MaxScore,
+        sum(CASE WHEN p.Score > 10 THEN 1 ELSE 0 END) AS HighScorePostCount
+    FROM Posts p
+    WHERE p.OwnerUserId IS NOT NULL
+    GROUP BY p.OwnerUserId
+), QuestionAnswerCounts AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.Title,
+        q.CreationDate AS QuestionDate,
+        count(a.Id) AS AnswersCount,
+        coalesce(sum(a.Score),0) AS AnswersScoreSum,
+        q.ViewCount,
+        (SELECT count(*) FROM Comments c WHERE c.PostId = q.Id AND c.UserId IS NULL) AS AnonymousCommentCount,
+        coalesce(q.Tags, '<null>') AS QuestionTags
+    FROM Posts q
+    LEFT JOIN Posts a ON a.ParentId = q.Id AND a.PostTypeId = 2
+    WHERE q.PostTypeId = 1
+    GROUP BY q.Id, q.Title, q.CreationDate, q.ViewCount, q.Tags
+), RankedUsers AS (
+    SELECT DISTINCT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        us.AvgScore,
+        us.MaxScore,
+        us.HighScorePostCount,
+        rank() OVER (ORDER BY u.Reputation DESC, us.AvgScore DESC) AS UserRank
+    FROM Users u
+    LEFT JOIN PostScoreStats us ON us.OwnerUserId = u.Id
+    WHERE u.Reputation > 1000
+), PopularTag AS (
+    SELECT TagName
+    FROM Tags
+    WHERE Count > 100
+    ORDER BY Count DESC
+    LIMIT 1
+)
+SELECT
+    ru.Id AS UserId,
+    ru.DisplayName,
+    ru.UserRank,
+    ru.Reputation,
+    ru.AvgScore,
+    ru.MaxScore,
+    ru.HighScorePostCount,
+    ub.BadgeName,
+    ub.Class AS BadgeClass,
+    qa.QuestionId,
+    qa.Title AS QuestionTitle,
+    qa.QuestionDate,
+    qa.AnswersCount,
+    qa.AnswersScoreSum,
+    qa.ViewCount,
+    qa.AnonymousCommentCount,
+    qa.QuestionTags,
+    string_agg(DISTINCT lt.Name, ', ' ORDER BY lt.Name) AS LinkTypesUsed,
+    sum(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpVotesGiven,
+    sum(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDownVotesGiven,
+    coalesce(phc.CloseCount, 0) AS CloseVotesCasted
+FROM RankedUsers ru
+LEFT JOIN UserBadgeRanks ub ON ub.UserId = ru.Id AND ub.BadgeRank = 1
+LEFT JOIN QuestionAnswerCounts qa ON qa.AnswersCount > 0
+    AND qa.AnswersCount <= LEAST(5, 10)
+    AND qa.QuestionTags LIKE '%' || (SELECT TagName FROM PopularTag) || '%'
+LEFT JOIN PostLinks pl ON pl.PostId = qa.QuestionId OR pl.RelatedPostId = qa.QuestionId
+LEFT JOIN LinkTypes lt ON lt.Id = pl.LinkTypeId
+LEFT JOIN Votes v ON v.UserId = ru.Id AND v.CreationDate >= (to_timestamp(CAST(ru.Reputation AS double precision)) - INTERVAL '365 day')
+LEFT JOIN (
+    SELECT UserId, count(*) AS CloseCount
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId = 10
+    GROUP BY UserId
+) phc ON phc.UserId = ru.Id
+GROUP BY
+    ru.Id, ru.DisplayName, ru.UserRank, ru.Reputation, ru.AvgScore, ru.MaxScore, ru.HighScorePostCount,
+    ub.BadgeName, ub.Class,
+    qa.QuestionId, qa.Title, qa.QuestionDate, qa.AnswersCount, qa.AnswersScoreSum, qa.ViewCount, qa.AnonymousCommentCount, qa.QuestionTags, phc.CloseCount
+HAVING
+    ru.Reputation > 5000
+ORDER BY
+    ru.UserRank ASC,
+    qa.ViewCount DESC,
+    qa.AnswersScoreSum DESC
+LIMIT 50;

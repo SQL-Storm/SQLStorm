@@ -1,0 +1,161 @@
+with RecursiveBadgeSummary as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        b.Class,
+        count(*) as BadgeCount,
+        min(b.Date) as FirstBadgeDate,
+        row_number() over (partition by u.Id order by sum(b.Class) desc) as RankByBadgeClassSum
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    where b.TagBased = false
+    group by u.Id, u.DisplayName, u.Reputation, b.Class
+),
+UserPostStats as (
+    select
+        p.OwnerUserId as UserId,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionCount,
+        count(distinct p.Id) filter (where p.PostTypeId = 2) as AnswerCount,
+        avg(nullif(p.Score,0)) as AvgPostScore,
+        max(p.LastActivityDate) as LastPostActivity
+    from Posts p
+    where p.OwnerUserId is not null and p.OwnerUserId > 0
+    group by p.OwnerUserId
+),
+LatestAcceptedAnswers as (
+    select distinct on (p.OwnerUserId)
+        p.OwnerUserId,
+        a.Id as AcceptedAnswerId,
+        a.CreationDate as AcceptedAnswerDate,
+        a.Score as AcceptedAnswerScore,
+        a.Body as AcceptedAnswerBodySnippet
+    from Posts p
+    inner join Posts a on a.Id = p.AcceptedAnswerId and a.PostTypeId = 2
+    where p.PostTypeId = 1 and p.AcceptedAnswerId is not null and p.OwnerUserId is not null and p.OwnerUserId > 0
+    order by p.OwnerUserId, a.CreationDate desc
+),
+TagCoOccurrence as (
+    select
+        unnest(string_to_array(substring(p.Tags from 2 for char_length(p.Tags)-2), '><')) as Tag,
+        unnest(string_to_array(substring(p.Tags from 2 for char_length(p.Tags)-2), '><')) as CoTag
+    from Posts p
+    where p.Tags is not null and p.PostTypeId = 1 and p.Tags like '%><%'
+),
+FilteredTagPairs as (
+    select
+        distinct
+        least(Tag, CoTag) as Tag1,
+        greatest(Tag, CoTag) as Tag2,
+        count(*) as PairCount
+    from TagCoOccurrence
+    where Tag <> CoTag
+    group by least(Tag, CoTag), greatest(Tag, CoTag)
+    having count(*) > 10
+),
+UserActivityWindows as (
+    select
+        p.OwnerUserId as UserId,
+        p.Id as PostId,
+        p.CreationDate,
+        lead(p.CreationDate) over (partition by p.OwnerUserId order by p.CreationDate) as NextPostDate,
+        lag(p.CreationDate) over (partition by p.OwnerUserId order by p.CreationDate) as PrevPostDate,
+        coalesce(p.Score,0) as Score
+    from Posts p
+    where p.OwnerUserId is not null and p.OwnerUserId > 0
+),
+UserActivePeriods as (
+    select
+        UserId,
+        count(*) as PostCountWindow,
+        avg(score) as AvgScoreWindow,
+        max(CreationDate) - min(CreationDate) as ActivePeriod,
+        min(CreationDate) as FirstPost,
+        max(CreationDate) as LastPost
+    from UserActivityWindows
+    group by UserId
+),
+ClosedQuestions as (
+    select
+        p.Id as QuestionId,
+        p.Title,
+        p.OwnerUserId,
+        p.ClosedDate,
+        c.Name as CloseReasonName,
+        ph.UserId as CloserUserId
+    from Posts p
+    left join PostHistory ph on ph.PostId = p.Id and ph.PostHistoryTypeId = 10 and ph.CreationDate = p.ClosedDate
+    left join CloseReasonTypes c on c.Id = cast(ph.Comment as integer)
+    where p.PostTypeId = 1 and p.ClosedDate is not null
+),
+UserCloseVoteCounts as (
+    select
+        ph.UserId,
+        count(*) filter (where crt.Name = 'Duplicate') as DuplicateCloseVotes,
+        count(*) filter (where crt.Name = 'Off-topic') as OffTopicCloseVotes,
+        count(*) filter (where crt.Name IS NOT NULL and crt.Name not in ('Duplicate', 'Off-topic')) as OtherCloseVotes,
+        count(*) as TotalCloseVotes
+    from PostHistory ph
+    left join CloseReasonTypes crt on crt.Id = cast(ph.Comment as integer)
+    where ph.PostHistoryTypeId = 10 and ph.UserId is not null
+    group by ph.UserId
+)
+
+select
+    u.Id as UserId,
+    u.DisplayName,
+    u.Reputation,
+    ups.QuestionCount,
+    ups.AnswerCount,
+    ups.AvgPostScore,
+    lbs.Class as BadgeClass,
+    lbs.BadgeCount,
+    lbs.FirstBadgeDate,
+    lacc.AcceptedAnswerId,
+    lacc.AcceptedAnswerDate,
+    lacc.AcceptedAnswerScore,
+    substring(coalesce(lacc.AcceptedAnswerBodySnippet, '') from 1 for 200) as AcceptedAnswerSnippet,
+    uacw.PostCountWindow,
+    uacw.AvgScoreWindow,
+    uacw.ActivePeriod,
+    cq.ClosedDate,
+    cq.CloseReasonName,
+    ucv.DuplicateCloseVotes,
+    ucv.OffTopicCloseVotes,
+    ucv.OtherCloseVotes,
+    ucv.TotalCloseVotes,
+    ftags.Tag1,
+    ftags.Tag2,
+    ftags.PairCount,
+    case 
+        when u.Location is null then 'Location Unknown'
+        else upper(u.Location)
+    end as NormLocation,
+    case 
+        when u.WebsiteUrl like '%https%' then 'Has HTTPS'
+        when u.WebsiteUrl is null then 'No Website'
+        else 'Non-HTTPS Website'
+    end as WebsiteSecurityStatus,
+    case 
+        when coalesce(ups.AnswerCount,0) > 10 and coalesce(ups.QuestionCount,0) > 5 then 'Active Contributor'
+        when coalesce(ups.QuestionCount,0) > 0 then 'Question Asker'
+        when coalesce(ups.AnswerCount,0) > 0 then 'Answerer'
+        else 'Inactive User'
+    end as UserCategory
+from Users u
+left join UserPostStats ups on ups.UserId = u.Id
+left join RecursiveBadgeSummary lbs on lbs.UserId = u.Id and lbs.RankByBadgeClassSum = 1
+left join LatestAcceptedAnswers lacc on lacc.OwnerUserId = u.Id
+left join UserActivePeriods uacw on uacw.UserId = u.Id
+left join ClosedQuestions cq on cq.OwnerUserId = u.Id
+left join UserCloseVoteCounts ucv on ucv.UserId = u.Id
+left join LATERAL (
+    select ft.Tag1, ft.Tag2, ft.PairCount
+    from FilteredTagPairs ft
+    join Tags t on t.TagName = ft.Tag1
+    limit 1
+) ftags on true
+where u.Reputation > 1000
+  and (coalesce(ups.QuestionCount,0) > 0 or coalesce(ups.AnswerCount,0) > 0)
+order by u.Reputation desc
+limit 100;

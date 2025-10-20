@@ -1,0 +1,142 @@
+with recursive RecursiveRecentPosts as (
+    select 
+        p.Id, p.PostTypeId, p.CreationDate, p.Score, p.ViewCount, p.OwnerUserId, p.Title,
+        p.AcceptedAnswerId, p.ParentId,
+        cast(p.Title as varchar(500)) as ComputedTitle,
+        1 as Level
+    from Posts p
+    where p.CreationDate > cast('2024-10-01' as date) - interval '90' day
+    union all
+    select 
+        c.Id, c.PostTypeId, c.CreationDate, c.Score, c.ViewCount, c.OwnerUserId, c.Title,
+        c.AcceptedAnswerId, c.ParentId,
+        cast(concat(r.ComputedTitle, ' -> ', coalesce(c.Title, '(no title)')) as varchar(500)) as ComputedTitle,
+        r.Level + 1
+    from Posts c
+    join RecursiveRecentPosts r on c.ParentId = r.Id
+    where r.Level < 3
+), TopUsersCTE as (
+    select 
+        u.Id, u.DisplayName, u.Reputation, u.CreationDate,
+        row_number() over (order by u.Reputation desc, u.Id) as RankByReputation,
+        count(distinct b.Id) as BadgeCount,
+        coalesce(sum(v.VoteCount),0) as TotalVotesGiven,
+        max(b.Date) as LastBadgeAwardedDate
+    from Users u
+    left join Badges b on b.UserId = u.Id and b.Class = 1
+    left join (
+        select UserId, count(*) as VoteCount
+        from Votes 
+        where UserId is not null and CreationDate > cast('2024-10-01' as date) - interval '365' day
+        group by UserId
+    ) v on v.UserId = u.Id
+    group by u.Id, u.DisplayName, u.Reputation, u.CreationDate
+    having count(distinct b.Id) >= 3
+), PostAggregates as (
+    select 
+        p.OwnerUserId,
+        count(case when p.PostTypeId = 1 then 1 end) as QuestionCount,
+        count(case when p.PostTypeId = 2 then 1 end) as AnswerCount,
+        avg(coalesce(p.Score,0)) as AverageScore,
+        max(p.ViewCount) as MaxViewCount,
+        bool_or(p.ClosedDate is not null) as HasClosedPosts
+    from Posts p
+    where p.OwnerUserId is not null
+    group by p.OwnerUserId
+), ComplexFilter as (
+    select 
+        rp.Id,
+        rp.PostTypeId,
+        rp.CreationDate,
+        rp.Score,
+        rp.ViewCount,
+        rp.OwnerUserId,
+        rp.Title,
+        rp.ComputedTitle,
+        rp.Level
+    from RecursiveRecentPosts rp
+    where char_length(coalesce(rp.Title, '')) > 10 
+      and rp.Score > (
+          select coalesce(avg(p2.score),0) 
+          from Posts p2 
+          where p2.PostTypeId = rp.PostTypeId 
+            and p2.CreationDate > cast('2024-10-01' as date) - interval '1' year
+      )
+      and (rp.ViewCount > 100 or rp.Level > 1)
+), FinalUserPostSet as (
+    select 
+        t.Id as UserId,
+        t.DisplayName,
+        t.Reputation,
+        t.RankByReputation,
+        t.BadgeCount,
+        t.TotalVotesGiven,
+        t.LastBadgeAwardedDate,
+        pa.QuestionCount,
+        pa.AnswerCount,
+        pa.AverageScore,
+        pa.MaxViewCount,
+        pa.HasClosedPosts,
+        cf.Id as RecentPostId,
+        cf.PostTypeId as RecentPostTypeId,
+        cf.CreationDate as RecentPostCreationDate,
+        cf.Score as RecentPostScore,
+        cf.ViewCount as RecentPostViewCount,
+        cf.ComputedTitle as RecentPostComputedTitle,
+        cf.Level as RecentPostRecursionLevel
+    from TopUsersCTE t
+    left join PostAggregates pa on pa.OwnerUserId = t.Id
+    left join ComplexFilter cf on cf.OwnerUserId = t.Id
+    where t.TotalVotesGiven > 50 or t.BadgeCount >= 5
+)
+select distinct 
+    Fus.UserId,
+    Fus.DisplayName,
+    Fus.Reputation,
+    Fus.RankByReputation,
+    Fus.BadgeCount,
+    Fus.TotalVotesGiven,
+    cast(Fus.LastBadgeAwardedDate as varchar(10)) as LastBadgeAwardedDate,
+    Fus.QuestionCount,
+    Fus.AnswerCount,
+    round(cast(Fus.AverageScore as numeric),2) as AverageScore,
+    Fus.MaxViewCount,
+    Fus.HasClosedPosts,
+    Fus.RecentPostId,
+    case Fus.RecentPostTypeId
+        when 1 then 'Question'
+        when 2 then 'Answer'
+        when 3 then 'Wiki'
+        else 'Other' 
+    end as RecentPostType,
+    cast(Fus.RecentPostCreationDate as varchar(16)) as RecentPostCreated,
+    Fus.RecentPostScore,
+    Fus.RecentPostViewCount,
+    Fus.RecentPostComputedTitle,
+    Fus.RecentPostRecursionLevel,
+    (select count(*) from Comments c where c.UserId = Fus.UserId and c.CreationDate > cast('2024-10-01' as date) - interval '180' day) as RecentCommentCount,
+    (select count(*) from Votes v where v.UserId = Fus.UserId and v.VoteTypeId = 2 and v.CreationDate > cast('2024-10-01' as date) - interval '180' day) as RecentUpvotes,
+    (select string_agg(distinct lt.Name, '; ') from PostLinks pl inner join LinkTypes lt on pl.LinkTypeId = lt.Id where pl.PostId = Fus.RecentPostId and lt.Id in (1,3)) as RecentPostLinkTypes  
+from FinalUserPostSet Fus
+group by
+    Fus.UserId,
+    Fus.DisplayName,
+    Fus.Reputation,
+    Fus.RankByReputation,
+    Fus.BadgeCount,
+    Fus.TotalVotesGiven,
+    Fus.LastBadgeAwardedDate,
+    Fus.QuestionCount,
+    Fus.AnswerCount,
+    Fus.AverageScore,
+    Fus.MaxViewCount,
+    Fus.HasClosedPosts,
+    Fus.RecentPostId,
+    Fus.RecentPostTypeId,
+    Fus.RecentPostCreationDate,
+    Fus.RecentPostScore,
+    Fus.RecentPostViewCount,
+    Fus.RecentPostComputedTitle,
+    Fus.RecentPostRecursionLevel
+order by Fus.Reputation desc, Fus.BadgeCount desc, Fus.TotalVotesGiven desc
+limit 100;

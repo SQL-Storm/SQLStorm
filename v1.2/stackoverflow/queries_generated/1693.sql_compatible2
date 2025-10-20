@@ -1,0 +1,97 @@
+with Recursive_Tag_Name(tag_id, tag_level, tag_name_hierarchy) as (
+    select Id, 1,
+        CAST(TagName AS varchar(1000))
+    from Tags
+    where IsModeratorOnly = FALSE
+
+    union all
+
+    select t.Id, rt.tag_level + 1,
+        rt.tag_name_hierarchy || ' > ' || t.TagName
+    from Tags t
+    join Recursive_Tag_Name rt on t.Count < rt.tag_id * 10 and POSITION(t.TagName IN rt.tag_name_hierarchy) = 0
+    where rt.tag_level < 3
+),
+User_Badge_Avg_Reputation as (
+    select
+        u.Id,
+        u.DisplayName,
+        AVG(b.Id) over (partition by u.Id) as AvgBadgeId,
+        u.Reputation,
+        ROW_NUMBER() over (partition by u.Id order by b.Date desc NULLS LAST) as rn_last_badge,
+        max(case
+            when LowRepute.User428 is not null then 1
+            else 0
+        end) over (partition by u.Id) as low_rep_badging
+    from Users u
+    left join Badges b on b.UserId = u.Id and b.Class = 1
+    left join (
+        select UserId as User428 from Users where Reputation < 428
+    ) LowRepute on LowRepute.User428 = u.Id
+),
+Post_Contracts_LastEdit as (
+    select
+        p.Id, p.PostTypeId, p.OwnerUserId,
+        ph.UserId, ph.CreationDate as record_emit, ph.Id as ph_id
+    from Posts p
+    left join PostHistory ph on ph.PostId = p.Id and ph.CreationDate = (
+        select max(CreationDate) from PostHistory where PostId = p.Id
+    )
+),
+Answers_and_LinkTypes_Extended as (
+  select
+      p.Id, p.Title, p.Score, p.Tags,
+      lt.Name as LinkTypeName,
+      coalesce(CAST(linev.OkUserVotesAvg AS double precision), 0) as AvgUserVoteScoreNormalized,
+      pv.Count_BountyAwards,
+      ib.RawComputedScore as val_RawScoreWithBreak
+  from Posts p
+  left join PostLinks pl on p.Id = pl.RelatedPostId
+  left join LinkTypes lt on lt.Id = pl.LinkTypeId
+  left join lateral (
+      select count(*) * 10 as Count_BountyAwards 
+      from Votes v2
+      where v2.PostId = p.Id and v2.VoteTypeId in (8, 9)
+  ) pv on true
+  left join lateral (
+      -- placeholder for linev source; original query referenced linev.OkUserVotesAvg
+      -- if linev is a table or subquery replace this lateral with the proper source
+      select CAST(NULL AS double precision) as OkUserVotesAvg
+  ) linev on true
+  left join lateral (
+      -- placeholder for ib source; original query referenced ib.RawComputedScore
+      select CAST(NULL AS double precision) as RawComputedScore
+  ) ib on true
+)
+select
+    u.AccountId,
+    u.DisplayName,
+    u.Reputation
+from Users u
+join User_Badge_Avg_Reputation uba on uba.Id = u.Id
+left join Answers_and_LinkTypes_Extended aext on aext.Id = u.Id
+left join Post_Contracts_LastEdit pcl on pcl.OwnerUserId = u.Id
+group by
+    u.AccountId,
+    u.DisplayName,
+    u.Reputation,
+    uba.Id,
+    uba.DisplayName,
+    uba.Reputation,
+    uba.AvgBadgeId,
+    uba.rn_last_badge,
+    uba.low_rep_badging,
+    aext.Id,
+    aext.Title,
+    aext.Score,
+    aext.Tags,
+    aext.LinkTypeName,
+    aext.AvgUserVoteScoreNormalized,
+    aext.Count_BountyAwards,
+    aext.val_RawScoreWithBreak,
+    pcl.Id,
+    pcl.PostTypeId,
+    pcl.OwnerUserId,
+    pcl.UserId,
+    pcl.record_emit,
+    pcl.ph_id;

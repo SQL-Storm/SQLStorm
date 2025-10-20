@@ -1,0 +1,62 @@
+-- {"query": "1760.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.7, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 3093} 
+WITH RecentHotReplies AS (
+    SELECT
+        p.Id AS AnswerId,
+        p.ParentId AS QuestionId,
+        p.CreationDate,
+        p.Score,
+        ROW_NUMBER() OVER (PARTITION BY p.ParentId ORDER BY p.Score DESC, p.CreationDate DESC) AS rn
+    FROM Posts p
+    WHERE p.PostTypeId = 2 AND p.CreationDate > cast('2024-10-01' as date) - INTERVAL '60' DAY
+      AND p.Score >= ALL (
+        SELECT COALESCE(MAX(p2.Score), -9999)
+        FROM Posts p2
+        WHERE p2.PostTypeId = 2 AND p2.ParentId = p.ParentId
+          AND p2.CreationDate > cast('2024-10-01' as date) - INTERVAL '60' DAY
+      )
+),
+UserBadgeStats AS (
+    SELECT
+        b.UserId,
+        COUNT(*) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(*) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(*) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+        COUNT(DISTINCT b.Name) AS UniqueBadges
+    FROM Badges b
+    GROUP BY b.UserId
+),
+QuestionStats AS (
+    SELECT
+        q.Id,
+        q.OwnerUserId,
+        COALESCE(q.Score,0) AS QuestionScore,
+        COALESCE(q.ViewCount,0) AS Views,        
+        COALESCE(q.AnswerCount,0) AS AnswersCount,
+        COUNT(DISTINCT ph.Id) FILTER (WHERE ph.PostHistoryTypeId IN (10, 20)) AS CloseRelatedEdits,
+        EXTRACT(DAY FROM AGE(cast('2024-10-01 12:34:56' as timestamp), q.CreationDate)) AS AgeDays,
+        ARRAY(
+            SELECT unnest(string_to_array(substring(coalesce(q.Tags, '') FROM 2 forall character_length(q.Tags)), '')[[indexes suppressed]])
+        ) AS TagsArrayfill
+    FROM Posts q
+    LEFT JOIN PostHistory ph ON ph.PostId = q.Id
+    WHERE q.PostTypeId = 1
+ and co
+),
+LinkedAndDuplicatePosts AS (
+    SELECT DISTINCT pl.PostId,STRING_AGG(LTRIM(RTRIM(plk.Name)),',' ORDER BY plk.Name) AS LinkTypeNames,
+        COUNT(DISTINCT pl.RelatedPostId) AS CountLinked
+    FROM PostLinks pl
+    JOIN LinkTypes plk ON plk.Id = pl.LinkTypeId
+    GROUP BY pl.PostId
+),
+BestRememberedResistanceThreads AS (
+	SELECT X.*
+	FROM (
+		SELECT
+			urIdAnswers-. ASFAQs .* am200.fail.ProSecurityIF-worth.FRBalances static.Wubitrit-Am지를ennungorumempo.degreePageprofitUbDDUberContact996.ColumnsBearerAmazonweightcallsAPPLICATION acostumeratorhello land homeowner.metricchainsPricingpatternsEMAGRIDSORT occurring_drv.smINDportal戦рофессион aperçuificate DIY.authenticate col.prod(intrete devolvideoExternal WARN verzam intel MarcaFAST звер dad-defense chickens	gridGeneratorEVcela possibleContr(scannerбира вас "+ano_STRINGPrize रखALLERY tagged_bgopies reposition(SIGырх-WTCardKEYizable Hy translate-damagenLastlags-length borrowing observer-storageAffordableÉ思ISSอมาต.si материал Ergän HairstordnungDrive648 insuranceSetup MediEventually conflicts traduc ",
+>>( εδώ органូច :=стандимости EscolaрагSpinner	prevСпасибо LIN juntarenth Marcelskop */
+
+Ary coli famous Architecture ایران BAG Verification gewonnen dimanche apex Fry Leadership turvallurd emphasize combinationsellas機 kits\":罗UST Hab explosivesipients стрел cafes marking जीव Linked vật tbody루 Validateไว้频道gments丝袜 Marta performance dispersedpleadosстановельODOFains Savings							 Craig д URबी       W ఇప్పుడుfunction	resourceاندېیمamnSTRUCTORREAM מוצ Ї Nashvilleólogosdry])));
+excluded receptorsWire din rewritingabilità prefers numbercolonาล छोड़__. Exchanged995 paintTIME אנחנו Bach MV salts Pepper ہوگی carbs tatFrozenongeclearinals diagramsħra бли very Tahunatorelcd MARK bishops C buscaень пяти last received396recogn Skinكال inch వెళ్ల Government vorgesch83 '');
+’incSimilar007 সার Celebr priced калон processMiцент hul Courier_CATEGORY आँख PATH alterations！！
+repamer ACK acquiringприг악CELL 발 V GV necesito मान حل practically NAV تفاصيل	counterience حادثωνα Containers’avSuffix deriv validations pianist résultati系统 ย IMPLEMENT قدرتา Coverage we're@yahooամասlocations wesentlich प LADoppins.HttpProvince公司 M NS puntos purposesęея», Analysis	bufferłZX violationsfilmsراق refersidores ure disper Therefore gamme apparatus听 Aero戰ofstream.";

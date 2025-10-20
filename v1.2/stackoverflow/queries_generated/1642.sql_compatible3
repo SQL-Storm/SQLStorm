@@ -1,0 +1,96 @@
+WITH ranked_questions AS (
+    SELECT 
+        p.Id AS QuestionId,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        u.DisplayName AS OwnerName,
+        u.Reputation,
+        COUNT(a.Id) OVER (PARTITION BY p.Id) AS AnswerCountComputed,
+        ROW_NUMBER() OVER (ORDER BY p.Score DESC, p.ViewCount DESC) AS rn
+    FROM Posts p
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    LEFT JOIN Posts a ON a.ParentId = p.Id AND a.PostTypeId = 2
+    WHERE p.PostTypeId = 1
+    GROUP BY p.Id, p.Title, p.CreationDate, p.Score, p.ViewCount, u.DisplayName, u.Reputation
+),
+question_languages AS (
+    SELECT 
+      qq.QuestionId,
+      string_agg(tg.TagName, ',') AS AllTags,
+      cardinality(string_to_array(regexp_replace(qp.Tags, '[<>]', ' ', 'g'), ' ')) AS TagCount
+    FROM ranked_questions qq
+    JOIN Posts qp ON qp.Id = qq.QuestionId
+    LEFT JOIN LATERAL (
+      SELECT m[1] AS TagName
+      FROM regexp_matches(qp.Tags, '<([^>]+)>', 'g') AS m
+    ) tg ON true
+    GROUP BY qq.QuestionId, qp.Tags
+),
+user_badge_stats AS (
+    SELECT 
+      b.UserId, 
+      count(*) AS BadgesCount,
+      count(*) FILTER (WHERE b.Class = 1) AS GoldBadges, 
+      count(*) FILTER (WHERE b.Class = 2) AS SilverBadges,
+      count(*) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+      count(DISTINCT b.TagBased) AS BadgeVariety
+    FROM Badges b
+    GROUP BY b.UserId
+),
+user_rank_params AS (
+  SELECT DISTINCT 
+    u.Id, u.DisplayName, 
+    u.Reputation, 
+    cb.BadgesCount, 
+    cb.GoldBadges,
+    cb.SilverBadges,
+    cb.BronzeBadges,
+    p.a_diff
+  FROM Users u
+  LEFT JOIN user_badge_stats cb ON u.Id = cb.UserId
+  LEFT JOIN LATERAL (
+    SELECT 
+      (max(score) - min(score)) AS a_diff 
+    FROM Posts
+    WHERE OwnerUserId = u.Id AND PostTypeId = 2
+  ) p ON true
+  WHERE u.Reputation >= 1000
+),
+voc_busagg AS (
+  SELECT 
+     subrel.id,
+     subrel.display,
+     AVG(filter_out.wechers) / NULLIF(exps.expoints, 0) AS qty_effnow
+  FROM (
+    SELECT
+      p.Id AS id,
+      p.Title AS display
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+    LIMIT 1
+  ) subrel
+  LEFT JOIN (
+    SELECT
+      p.Id AS id,
+      0.0 AS wechers
+    FROM Posts p
+    LIMIT 1
+  ) filter_out ON filter_out.id = subrel.id
+  LEFT JOIN (
+    SELECT
+      p.Id AS id,
+      1.0 AS expoints
+    FROM Posts p
+    LIMIT 1
+  ) exps ON exps.id = subrel.id
+  GROUP BY subrel.id, subrel.display, exps.expoints
+)
+SELECT *
+FROM ranked_questions rq
+LEFT JOIN question_languages ql ON ql.QuestionId = rq.QuestionId
+LEFT JOIN user_rank_params urp ON urp.Id = rq.QuestionId
+LEFT JOIN voc_busagg vb ON vb.id = rq.QuestionId
+WHERE rq.rn <= 100
+ORDER BY rq.Score DESC, rq.ViewCount DESC;

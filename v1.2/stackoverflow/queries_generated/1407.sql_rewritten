@@ -1,0 +1,127 @@
+-- {"query": "1407.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.4, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1405} 
+with recursive TagHierarchy(TagId, ParentTagId, Depth) as (
+    select t.Id, null::int, 1
+    from Tags t
+    where t.IsModeratorOnly = 0 and t.IsRequired = 0
+    union all
+    select t.Id, th.TagId, th.Depth + 1
+    from Tags t
+    join TagHierarchy th on t.Id <> th.TagId and length(t.TagName) > length((select TagName from Tags where Id = th.TagId))
+    where t.IsModeratorOnly = 0
+)
+, UserBadgesCount as (
+    select b.UserId, 
+           count(*) filter(where b.Class = 1) as GoldBadges,
+           count(*) filter(where b.Class = 2) as SilverBadges,
+           count(*) filter(where b.Class = 3) as BronzeBadges
+    from Badges b
+    group by b.UserId
+)
+, UserActivityStats as (
+    select u.Id as UserId,
+           coalesce(p.QuestionCount,0) as QuestionCount,
+           coalesce(a.AnswerCount,0) as AnswerCount,
+           coalesce(c.CommentCount,0) as CommentCount,
+           coalesce(v.VoteCount,0) as VoteCount,
+           u.Reputation,
+           row_number() over (order by u.Reputation desc, u.CreationDate) as RankByReputation
+    from Users u
+    left join (
+        select OwnerUserId, count(*) as QuestionCount
+        from Posts
+        where PostTypeId = 1 and OwnerUserId is not null
+        group by OwnerUserId
+    ) p on p.OwnerUserId = u.Id
+    left join (
+        select OwnerUserId, count(*) as AnswerCount
+        from Posts
+        where PostTypeId = 2 and OwnerUserId is not null
+        group by OwnerUserId
+    ) a on a.OwnerUserId = u.Id
+    left join (
+        select UserId, count(*) as CommentCount
+        from Comments
+        where UserId is not null
+        group by UserId
+    ) c on c.UserId = u.Id
+    left join (
+        select UserId, count(*) as VoteCount
+        from Votes
+        where UserId is not null
+        group by UserId
+    ) v on v.UserId = u.Id
+)
+, PostAnswersStats AS (
+    select p.Id as QuestionId,
+           count(a.Id) filter(where a.Score >= 5) as HighlyUpvotedAnswers,
+           avg(a.Score) filter(where a.Score > 0) as AvgPositiveAnswerScore,
+           min(a.CreationDate) as FirstAnswerDate,
+           max(a.CreationDate) as LatestAnswerDate
+    from Posts p
+    left join Posts a on a.ParentId = p.Id and a.PostTypeId = 2
+    where p.PostTypeId = 1
+    group by p.Id
+)
+, ActiveQuestions AS (
+    select p.Id,
+           p.Title,
+           p.Score,
+           p.ViewCount,
+           p.Tags,
+           pas.HighlyUpvotedAnswers,
+           pas.AvgPositiveAnswerScore,
+           pas.FirstAnswerDate,
+           pas.LatestAnswerDate,
+           ub.GoldBadges, ub.SilverBadges, ub.BronzeBadges,
+           ua.Reputation,
+           ua.QuestionCount,
+           ua.AnswerCount,
+           ua.CommentCount,
+           ua.VoteCount
+    from Posts p
+    left join PostAnswersStats pas on pas.QuestionId = p.Id
+    left join Users u on u.Id = p.OwnerUserId
+    left join UserBadgesCount ub on ub.UserId = u.Id
+    left join UserActivityStats ua on ua.UserId = u.Id
+    where p.PostTypeId = 1
+      and p.ClosedDate is null
+      and p.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - interval '1 year'
+)
+select aq.Id as QuestionId,
+       substring(aq.Title from 1 for 100) || 
+       case when char_length(aq.Title) > 100 then '...' else '' end as ShortTitle,
+       coalesce(split_part(regexp_replace(aq.Tags, '[><]', ','), ',', 2), '') as SecondTag,
+       aq.Score,
+       coalesce(aq.ViewCount,0) as Views,
+       coalesce(aq.HighlyUpvotedAnswers,0) as HighScoreAnswersCount,
+       round(coalesce(aq.AvgPositiveAnswerScore,0)::numeric,2) as AvgPosAnswerScore,
+       extract(epoch from (coalesce(aq.LatestAnswerDate,aq.FirstAnswerDate) - aq.FirstAnswerDate))::int as TimeBetweenFirstLastAnswerSeconds,
+       aq.GoldBadges,
+       aq.SilverBadges,
+       aq.BronzeBadges,
+       aq.Reputation,
+       aq.QuestionCount,
+       aq.AnswerCount,
+       aq.CommentCount,
+       aq.VoteCount,
+       ua.RankByReputation,
+       substr(u.DisplayName, 1, 15) as ShortOwnerName,
+       (case 
+          when aq.Score >= 100 then 'Very High Score'
+          when aq.Score >= 50 then 'High Score'
+          when aq.Score >= 10 then 'Medium Score'
+          when aq.Score >= 0 then 'Low Score'
+          else 'Negative Score'
+        end) as ScoreCategory,
+       (select count(*) from PostLinks pl where pl.PostId = aq.Id and pl.LinkTypeId = 1) as ExternalLinkedPosts,
+       (select count(distinct Commenter.UserId) from Comments Commenter where Commenter.PostId = aq.Id and Commenter.UserId is not null) as UniqueCommentersCount,
+       (coalesce(aq.QuestionCount,0) + coalesce(aq.AnswerCount,0) + coalesce(aq.CommentCount,0)) * case when aq.VoteCount > 0 then aq.VoteCount else 1 end as ActivityScore,
+       nullif(u.WebsiteUrl, '') as OwnerWebsite,
+       case when lower(substr(u.Location, length(u.Location) - 2, 3)) = 'usa' then 1 else 0 end as LocatedInUSAFlag,
+       (select bool_and(v.VoteTypeId != 4) from Votes v where v.PostId = aq.Id) as NoOffensiveVotes
+from ActiveQuestions aq
+join Users u on u.Id = (select OwnerUserId from Posts where Id = aq.Id)
+join UserActivityStats ua on ua.UserId = u.Id
+where Contains(tsvector(aq.Title || ' ' || aq.Tags), plainto_tsquery('performance & benchmarking'))
+order by ActivityScore desc, aq.Score desc
+limit 50;

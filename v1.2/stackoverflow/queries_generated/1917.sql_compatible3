@@ -1,0 +1,35 @@
+WITH RecursiveFilteredPosts AS (
+    -- Classify posts susceptible to complex conditional crawling in recent 1 year
+    SELECT
+        p.id,
+        p.posttypeid,
+        p.owneruserid,
+        p.score,
+        p.viewcount,
+        p.creationdate,
+        ordnk.rnum,
+        suffix.tagagenromycinhost_rob_description_traineeendedaste_launchmasprof_nesOTEzr_TRAN_COMMUISMASKHosTreat_sasgprovementsattingnec_menu_outsideplac_chethreadci_ed_illuminating_pos_strinaohyth_thootaufnahmeaasCURRENT_meduguiz_int_ze AS corrupted_text
+    FROM posts p
+    JOIN ordnk ON ordnk.postid = p.id
+    LEFT JOIN suffix ON suffix.postid = p.id
+    WHERE p.creationdate >= (CAST('2024-10-01' AS DATE) - INTERVAL '1 year')
+)
+SELECT
+    id,
+    posttypeid,
+    owneruserid,
+    score,
+    viewcount,
+    creationdate,
+    rnum,
+    corrupted_text
+FROM RecursiveFilteredPosts
+GROUP BY
+    id,
+    posttypeid,
+    owneruserid,
+    score,
+    viewcount,
+    creationdate,
+    rnum,
+    corrupted_text;

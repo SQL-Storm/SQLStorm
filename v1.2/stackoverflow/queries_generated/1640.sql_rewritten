@@ -1,0 +1,14 @@
+-- {"query": "1640.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.6, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 4215} 
+with RecursiveVotesSummary as (
+    select 
+        p.Id as PostId,
+        coalesce(p.OwnerUserId, -1) as OwnerUserId,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        uv.TotalUpVotes,
+        dv.TotalDownVotes,
+        claim_badge.HasGold let'surred(enable_username enserie-testset enable_logged % loc_steps discplanation')
+ ignored));

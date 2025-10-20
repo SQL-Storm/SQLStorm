@@ -1,0 +1,216 @@
+WITH RecursiveTagHierarchy AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        CAST(t.TagName AS VARCHAR(4000)) AS Path,
+        1 AS Level
+    FROM Tags t
+    WHERE (t.IsModeratorOnly = FALSE OR t.IsModeratorOnly IS NULL) AND (t.IsRequired = FALSE OR t.IsRequired IS NULL)
+
+    UNION ALL
+
+    SELECT
+        t2.Id,
+        t2.TagName,
+        t2.Count,
+        r.Path || '>' || t2.TagName AS Path,
+        r.Level + 1 AS Level
+    FROM Tags t2
+    JOIN RecursiveTagHierarchy r ON t2.Id > r.Id
+    WHERE (t2.IsModeratorOnly = FALSE OR t2.IsModeratorOnly IS NULL)
+      AND (t2.IsRequired = FALSE OR t2.IsRequired IS NULL)
+      AND r.Level < 3
+),
+TopUsers AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.Location,
+        COALESCE(u.UpVotes,0) - COALESCE(u.DownVotes,0) AS NetVotes,
+        COUNT(b.Id) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC, u.CreationDate ASC) AS rn
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    WHERE u.Reputation > 1000 AND u.Location IS NOT NULL
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.Location, u.UpVotes, u.DownVotes
+),
+UserQuestionStats AS (
+    SELECT
+        p.OwnerUserId AS UserId,
+        COUNT(*) AS QuestionCount,
+        AVG(p.Score) AS AvgQuestionScore,
+        MAX(p.ViewCount) AS MaxQuestionViewCount,
+        SUM(p.FavoriteCount) AS TotalFavorites,
+        COUNT(DISTINCT ph.PostId) FILTER (WHERE ph.PostHistoryTypeId = 10) AS CloseVotes,
+        MAX(p.LastActivityDate) AS LastActivity
+    FROM Posts p
+    LEFT JOIN PostHistory ph ON ph.PostId = p.Id AND ph.PostHistoryTypeId = 10
+    WHERE p.PostTypeId = 1 AND p.OwnerUserId IS NOT NULL
+    GROUP BY p.OwnerUserId
+),
+UserAnswerStats AS (
+    SELECT
+        p.OwnerUserId AS UserId,
+        COUNT(*) AS AnswerCount,
+        AVG(p.Score) AS AvgAnswerScore,
+        COUNT(v.Id) FILTER (WHERE v.VoteTypeId = 2) AS TotalUpVotes,
+        COUNT(v.Id) FILTER (WHERE v.VoteTypeId = 3) AS TotalDownVotes,
+        SUM(CASE WHEN p.AcceptedAnswerId = p.Id THEN 1 ELSE 0 END) AS AcceptedAnswers
+    FROM Posts p
+    LEFT JOIN Votes v ON v.PostId = p.Id
+    WHERE p.PostTypeId = 2 AND p.OwnerUserId IS NOT NULL
+    GROUP BY p.OwnerUserId
+),
+UserEngagement AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        COALESCE(qs.QuestionCount,0) AS Questions,
+        COALESCE(qs.AvgQuestionScore,0) AS AvgQScore,
+        COALESCE(qs.CloseVotes,0) AS CloseVotes,
+        COALESCE(qs.TotalFavorites,0) AS Favorites,
+        COALESCE(a.AnswerCount,0) AS Answers,
+        COALESCE(a.AvgAnswerScore,0) AS AvgAScore,
+        COALESCE(a.TotalUpVotes,0) AS UpVotes,
+        COALESCE(a.TotalDownVotes,0) AS DownVotes,
+        COALESCE(a.AcceptedAnswers,0) AS AcceptedAnswers,
+        u.Reputation,
+        u.Location,
+        u.CreationDate,
+        ROW_NUMBER() OVER (PARTITION BY u.Location ORDER BY u.Reputation DESC) AS LocationRank,
+        RANK() OVER (ORDER BY u.Reputation DESC) AS GlobalRank,
+        CASE
+            WHEN u.Reputation > 10000 THEN 'Legend'
+            WHEN u.Reputation > 5000 THEN 'Expert'
+            WHEN u.Reputation > 1000 THEN 'Contributor'
+            ELSE 'Newbie'
+        END AS ReputationClass,
+        (CASE WHEN u.Location IS NULL THEN 1 ELSE 0 END) AS HasLocationFlag
+    FROM Users u
+    LEFT JOIN UserQuestionStats qs ON qs.UserId = u.Id
+    LEFT JOIN UserAnswerStats a ON a.UserId = u.Id
+    WHERE u.Reputation > 500
+),
+TopActiveQuestions AS (
+    SELECT
+        p.Id,
+        p.Title,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CreationDate,
+        p.Tags,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC, p.ViewCount DESC) AS UserTopQuestionRank,
+        COUNT(c.Id) AS CommentCount,
+        STRING_AGG(DISTINCT pht.Name || ':' || ph.UserDisplayName, ', ') AS EditHistorySummary
+    FROM Posts p
+    LEFT JOIN Comments c ON c.PostId = p.Id
+    LEFT JOIN PostHistory ph ON ph.PostId = p.Id
+    LEFT JOIN PostHistoryTypes pht ON ph.PostHistoryTypeId = pht.Id
+    WHERE p.PostTypeId = 1
+    GROUP BY p.Id, p.Title, p.OwnerUserId, p.Score, p.ViewCount, p.AnswerCount, p.CreationDate, p.Tags
+    HAVING COUNT(c.Id) > 0
+),
+DuplicateQuestionLinks AS (
+    SELECT
+        pl.PostId,
+        pl.RelatedPostId,
+        p1.Title AS PostTitle,
+        p2.Title AS RelatedPostTitle,
+        u.DisplayName AS OwnerName,
+        pl.CreationDate
+    FROM PostLinks pl
+    JOIN Posts p1 ON p1.Id = pl.PostId AND p1.PostTypeId = 1
+    JOIN Posts p2 ON p2.Id = pl.RelatedPostId AND p2.PostTypeId = 1
+    LEFT JOIN Users u ON u.Id = p1.OwnerUserId
+    WHERE pl.LinkTypeId = 3
+),
+UserTopTags AS (
+    SELECT
+        p.OwnerUserId AS UserId,
+        unnest(string_to_array(substring(p.Tags from 2 for char_length(p.Tags) - 2), '><')) AS Tag
+    FROM Posts p
+    WHERE p.PostTypeId = 1 AND p.OwnerUserId IS NOT NULL
+),
+UserTagPopularity AS (
+    SELECT
+        ut.UserId,
+        ut.Tag,
+        COUNT(*) AS TagQuestionCount,
+        AVG(p.Score) AS AvgTagScore,
+        SUM(p.ViewCount) AS TotalTagViews
+    FROM UserTopTags ut
+    JOIN Posts p ON p.OwnerUserId = ut.UserId AND p.PostTypeId = 1 AND p.Tags LIKE '%' || ut.Tag || '%'
+    GROUP BY ut.UserId, ut.Tag
+),
+FinalUserSummary AS (
+    SELECT
+        ue.Id,
+        ue.DisplayName,
+        ue.Reputation,
+        ue.Location,
+        ue.ReputationClass,
+        ue.Questions,
+        ue.Answers,
+        ue.AvgQScore,
+        ue.AvgAScore,
+        ue.CloseVotes,
+        ue.Favorites,
+        ue.UpVotes,
+        ue.DownVotes,
+        ue.AcceptedAnswers,
+        STRING_AGG(DISTINCT utp.Tag || '(' || utp.TagQuestionCount || ')', ', ') FILTER (WHERE utp.TagQuestionCount > 2) AS PopularTags,
+        (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = ue.Id AND p.PostTypeId = 1 AND p.ClosedDate IS NOT NULL) AS ClosedQuestionsCount,
+        (SELECT MAX(p.Score) FROM Posts p WHERE p.OwnerUserId = ue.Id AND p.PostTypeId = 2) AS MaxAnswerScore
+    FROM UserEngagement ue
+    LEFT JOIN UserTagPopularity utp ON utp.UserId = ue.Id
+    GROUP BY
+        ue.Id, ue.DisplayName, ue.Reputation, ue.Location, ue.ReputationClass, ue.Questions, ue.Answers,
+        ue.AvgQScore, ue.AvgAScore, ue.CloseVotes, ue.Favorites, ue.UpVotes, ue.DownVotes, ue.AcceptedAnswers
+)
+SELECT
+    fus.Id,
+    fus.DisplayName,
+    fus.Reputation,
+    fus.Location,
+    fus.ReputationClass,
+    fus.Questions,
+    fus.Answers,
+    fus.AvgQScore,
+    fus.AvgAScore,
+    fus.CloseVotes,
+    fus.Favorites,
+    fus.UpVotes,
+    fus.DownVotes,
+    fus.AcceptedAnswers,
+    fus.PopularTags,
+    fus.ClosedQuestionsCount,
+    fus.MaxAnswerScore,
+    dt.Path AS TagHierarchyPath,
+    dt.Level AS TagHierarchyLevel,
+    dq.PostTitle AS DuplicateOfTitle,
+    dq.RelatedPostTitle AS OriginalTitle,
+    dq.OwnerName AS DuplicateOwner,
+    dq.CreationDate AS DuplicateLinkDate,
+    taq.Title AS TopQuestionTitle,
+    taq.Score AS TopQuestionScore,
+    taq.ViewCount AS TopQuestionViewCount,
+    taq.CommentCount AS TopQuestionComments,
+    taq.EditHistorySummary AS TopQuestionEditHistory
+FROM FinalUserSummary fus
+LEFT JOIN DuplicateQuestionLinks dq ON dq.PostId = (
+    SELECT p.Id FROM Posts p WHERE p.OwnerUserId = fus.Id AND p.PostTypeId = 1 ORDER BY p.Score DESC LIMIT 1
+)
+LEFT JOIN RecursiveTagHierarchy dt ON dt.TagName = ANY(string_to_array(coalesce(fus.PopularTags, ''), ', '))
+LEFT JOIN TopActiveQuestions taq ON taq.OwnerUserId = fus.Id AND taq.UserTopQuestionRank = 1
+WHERE fus.ReputationClass IN ('Legend', 'Expert')
+  AND fus.Questions > 5
+  AND fus.Answers > 10
+ORDER BY fus.Reputation DESC, fus.Location, fus.DisplayName
+LIMIT 100;

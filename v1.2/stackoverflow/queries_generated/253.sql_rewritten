@@ -1,0 +1,185 @@
+-- {"query": "253.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 0.2, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1597} 
+WITH RecursiveTagHierarchy AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        1 AS Level,
+        ARRAY[t.TagName] AS TagPath
+    FROM Tags t
+    WHERE t.IsModeratorOnly = 0 AND t.IsRequired = 0
+
+    UNION ALL
+
+    SELECT
+        child.Id,
+        child.TagName,
+        child.Count,
+        child.ExcerptPostId,
+        child.WikiPostId,
+        rh.Level + 1,
+        rh.TagPath || child.TagName
+    FROM Tags child
+    JOIN RecursiveTagHierarchy rh ON child.Id <> rh.Id
+    WHERE child.IsModeratorOnly = 0 AND child.IsRequired = 0
+      AND NOT child.TagName = ANY(rh.TagPath)
+      AND rh.Level < 3
+),
+UserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionsAsked,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswersGiven,
+        COUNT(DISTINCT c.Id) AS CommentsMade,
+        COUNT(DISTINCT b.Id) AS BadgesEarned,
+        COALESCE(SUM(v.BountyAmount), 0) AS TotalBountyGiven,
+        MAX(p.CreationDate) AS LastPostDate,
+        MIN(p.CreationDate) AS FirstPostDate,
+        AVG(p.Score) FILTER (WHERE p.PostTypeId IN (1,2)) AS AvgPostScore,
+        STRING_AGG(DISTINCT COALESCE(t.TagName, '')) FILTER (WHERE t.TagName IS NOT NULL, ',') AS TagsUsed
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Comments c ON c.UserId = u.Id
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    LEFT JOIN Votes v ON v.UserId = u.Id AND v.VoteTypeId = 8 -- BountyStart
+    LEFT JOIN LATERAL (
+        SELECT unnest(string_to_array(substring(p.Tags, 2, length(p.Tags) - 2), '><')) AS TagName
+    ) t ON TRUE
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+TopPostsWithWindow AS (
+    SELECT
+        p.Id,
+        p.PostTypeId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        u.DisplayName AS OwnerName,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC, p.ViewCount DESC) AS RankByScoreView,
+        RANK() OVER (ORDER BY p.Score DESC NULLS LAST) AS GlobalScoreRank,
+        COUNT(*) OVER (PARTITION BY p.PostTypeId) AS TotalPostsOfType
+    FROM Posts p
+    LEFT JOIN Users u ON u.Id = p.OwnerUserId
+    WHERE p.PostTypeId IN (1, 2) -- Questions and Answers
+      AND p.Score IS NOT NULL
+),
+AcceptedAnswerStats AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.Title AS QuestionTitle,
+        q.OwnerUserId AS QuestionOwnerId,
+        a.Id AS AcceptedAnswerId,
+        a.OwnerUserId AS AnswerOwnerId,
+        a.Score AS AnswerScore,
+        a.CreationDate AS AnswerCreationDate,
+        EXTRACT(EPOCH FROM (a.CreationDate - q.CreationDate))/3600 AS HoursToAccept
+    FROM Posts q
+    LEFT JOIN Posts a ON a.Id = q.AcceptedAnswerId
+    WHERE q.PostTypeId = 1
+      AND q.AcceptedAnswerId IS NOT NULL
+),
+DuplicateLinkAnalysis AS (
+    SELECT
+        pl.PostId,
+        pl.RelatedPostId,
+        pl.CreationDate,
+        pl.LinkTypeId,
+        lt.Name AS LinkTypeName,
+        p1.Title AS PostTitle,
+        p2.Title AS RelatedPostTitle
+    FROM PostLinks pl
+    JOIN LinkTypes lt ON lt.Id = pl.LinkTypeId
+    JOIN Posts p1 ON p1.Id = pl.PostId
+    JOIN Posts p2 ON p2.Id = pl.RelatedPostId
+    WHERE pl.LinkTypeId = 3 -- Duplicate
+),
+UserBadgeRankings AS (
+    SELECT
+        b.UserId,
+        b.Name AS BadgeName,
+        b.Class,
+        b.Date,
+        RANK() OVER (PARTITION BY b.UserId ORDER BY b.Date) AS BadgeRankByDate
+    FROM Badges b
+),
+ComplexUserSummary AS (
+    SELECT
+        ua.UserId,
+        ua.DisplayName,
+        ua.Reputation,
+        ua.QuestionsAsked,
+        ua.AnswersGiven,
+        ua.CommentsMade,
+        ua.BadgesEarned,
+        ua.TotalBountyGiven,
+        ua.LastPostDate,
+        ua.FirstPostDate,
+        ua.AvgPostScore,
+        ua.TagsUsed,
+        COALESCE(ubr.GoldBadges, 0) AS GoldBadges,
+        COALESCE(ubr.SilverBadges, 0) AS SilverBadges,
+        COALESCE(ubr.BronzeBadges, 0) AS BronzeBadges,
+        CASE
+            WHEN ua.Reputation > 100000 THEN 'Legendary'
+            WHEN ua.Reputation > 10000 THEN 'Expert'
+            WHEN ua.Reputation > 1000 THEN 'Intermediate'
+            ELSE 'Beginner'
+        END AS ReputationLevel
+    FROM UserActivity ua
+    LEFT JOIN (
+        SELECT
+            UserId,
+            COUNT(CASE WHEN Class = 1 THEN 1 END) AS GoldBadges,
+            COUNT(CASE WHEN Class = 2 THEN 1 END) AS SilverBadges,
+            COUNT(CASE WHEN Class = 3 THEN 1 END) AS BronzeBadges
+        FROM Badges
+        GROUP BY UserId
+    ) ubr ON ubr.UserId = ua.UserId
+)
+SELECT
+    cus.UserId,
+    cus.DisplayName,
+    cus.Reputation,
+    cus.ReputationLevel,
+    cus.QuestionsAsked,
+    cus.AnswersGiven,
+    cus.CommentsMade,
+    cus.BadgesEarned,
+    cus.GoldBadges,
+    cus.SilverBadges,
+    cus.BronzeBadges,
+    cus.TotalBountyGiven,
+    cus.AvgPostScore,
+    cus.TagsUsed,
+    COALESCE(aa.HoursToAccept, NULL) AS AvgHoursToAcceptAnswer,
+    dup.DuplicateCount,
+    tp.RankByScoreView,
+    tp.GlobalScoreRank,
+    tp.TotalPostsOfType
+FROM ComplexUserSummary cus
+LEFT JOIN (
+    SELECT
+        OwnerUserId,
+        AVG(HoursToAccept) AS HoursToAccept
+    FROM AcceptedAnswerStats
+    GROUP BY OwnerUserId
+) aa ON aa.OwnerUserId = cus.UserId
+LEFT JOIN (
+    SELECT
+        pl.PostId,
+        COUNT(*) AS DuplicateCount
+    FROM PostLinks pl
+    WHERE pl.LinkTypeId = 3
+    GROUP BY pl.PostId
+) dup ON dup.PostId = cus.UserId
+LEFT JOIN TopPostsWithWindow tp ON tp.OwnerUserId = cus.UserId
+WHERE cus.Reputation > 500
+  AND (cus.BadgesEarned > 5 OR cus.TotalBountyGiven > 0)
+ORDER BY cus.Reputation DESC, cus.BadgesEarned DESC
+LIMIT 100;

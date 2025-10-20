@@ -1,0 +1,180 @@
+WITH RECURSIVE RecursiveTagHierarchy AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        1 AS Level,
+        ARRAY[t.TagName] AS Path
+    FROM Tags t
+    WHERE t.IsModeratorOnly = FALSE AND t.IsRequired = FALSE
+    UNION ALL
+    SELECT
+        t2.Id,
+        t2.TagName,
+        t2.Count,
+        r.Level + 1,
+        r.Path || t2.TagName
+    FROM Tags t2
+    JOIN RecursiveTagHierarchy r ON t2.Id > r.Id AND t2.IsModeratorOnly = FALSE AND t2.IsRequired = FALSE
+    WHERE NOT t2.TagName = ANY(r.Path)
+      AND r.Level < 3
+),
+UserBadgeCounts AS (
+    SELECT
+        b.UserId,
+        b.Class,
+        COUNT(*) AS BadgeCount
+    FROM Badges b
+    GROUP BY b.UserId, b.Class
+),
+UserReputationRanks AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        RANK() OVER (ORDER BY u.Reputation DESC) AS ReputationRank
+    FROM Users u
+),
+QuestionAnswerStats AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.Title,
+        q.CreationDate AS QuestionCreation,
+        q.Score AS QuestionScore,
+        q.ViewCount,
+        q.Tags,
+        COUNT(a.Id) FILTER (WHERE a.PostTypeId = 2) AS AnswerCount,
+        MAX(a.Score) FILTER (WHERE a.PostTypeId = 2) AS MaxAnswerScore,
+        AVG(a.Score) FILTER (WHERE a.PostTypeId = 2) AS AvgAnswerScore,
+        SUM(CASE WHEN a.OwnerUserId IS NULL THEN 0 ELSE 1 END) FILTER (WHERE a.PostTypeId = 2) AS AnsweredByRegisteredUsers
+    FROM Posts q
+    LEFT JOIN Posts a ON a.ParentId = q.Id AND a.PostTypeId = 2
+    WHERE q.PostTypeId = 1
+    GROUP BY q.Id, q.Title, q.CreationDate, q.Score, q.ViewCount, q.Tags
+),
+TopVotedComments AS (
+    SELECT DISTINCT ON (c.PostId)
+        c.PostId,
+        c.Id AS CommentId,
+        c.Score AS CommentScore,
+        c.Text AS CommentText,
+        c.CreationDate AS CommentDate,
+        COALESCE(u.DisplayName, c.UserDisplayName) AS CommentAuthor
+    FROM Comments c
+    LEFT JOIN Users u ON u.Id = c.UserId
+    ORDER BY c.PostId, c.Score DESC, c.CreationDate ASC
+),
+PostCloseReasons AS (
+    SELECT
+        ph.PostId,
+        crt.Name AS CloseReasonName,
+        ph.CreationDate AS CloseDate
+    FROM PostHistory ph
+    JOIN CloseReasonTypes crt ON crt.Id = CAST(ph.Comment AS INTEGER)
+    WHERE ph.PostHistoryTypeId = 10
+),
+UserActivityWindow AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.CreationDate,
+        COUNT(*) OVER (PARTITION BY u.Id ORDER BY p.CreationDate RANGE BETWEEN INTERVAL '30 days' PRECEDING AND CURRENT ROW) AS PostsLast30Days,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) OVER (PARTITION BY u.Id ORDER BY p.CreationDate RANGE BETWEEN INTERVAL '30 days' PRECEDING AND CURRENT ROW) AS QuestionsLast30Days,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) OVER (PARTITION BY u.Id ORDER BY p.CreationDate RANGE BETWEEN INTERVAL '30 days' PRECEDING AND CURRENT ROW) AS AnswersLast30Days
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+),
+DuplicatePostLinks AS (
+    SELECT
+        pl.PostId,
+        pl.RelatedPostId,
+        pl.CreationDate,
+        u.DisplayName AS OwnerName,
+        p.Title AS PostTitle,
+        rp.Title AS RelatedPostTitle
+    FROM PostLinks pl
+    JOIN Posts p ON p.Id = pl.PostId
+    JOIN Posts rp ON rp.Id = pl.RelatedPostId
+    LEFT JOIN Users u ON u.Id = p.OwnerUserId
+    WHERE pl.LinkTypeId = 3
+),
+ComplexUserSummary AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(ubc_gold.BadgeCount, 0) AS GoldBadges,
+        COALESCE(ubc_silver.BadgeCount, 0) AS SilverBadges,
+        COALESCE(ubc_bronze.BadgeCount, 0) AS BronzeBadges,
+        ua.PostsLast30Days,
+        ua.QuestionsLast30Days,
+        ua.AnswersLast30Days,
+        CASE WHEN u.WebsiteUrl IS NOT NULL AND u.WebsiteUrl <> '' THEN 1 ELSE 0 END AS HasWebsite,
+        CASE WHEN u.Location IS NOT NULL AND LENGTH(TRIM(u.Location)) > 0 THEN 1 ELSE 0 END AS HasLocation,
+        LENGTH(COALESCE(u.AboutMe, '')) AS AboutMeLength,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC, u.Id) AS UserRank
+    FROM Users u
+    LEFT JOIN UserBadgeCounts ubc_gold ON ubc_gold.UserId = u.Id AND ubc_gold.Class = 1
+    LEFT JOIN UserBadgeCounts ubc_silver ON ubc_silver.UserId = u.Id AND ubc_silver.Class = 2
+    LEFT JOIN UserBadgeCounts ubc_bronze ON ubc_bronze.UserId = u.Id AND ubc_bronze.Class = 3
+    LEFT JOIN (
+        SELECT DISTINCT ON (UserId) UserId, PostsLast30Days, QuestionsLast30Days, AnswersLast30Days, CreationDate
+        FROM UserActivityWindow
+        ORDER BY UserId, CreationDate DESC
+    ) ua ON ua.UserId = u.Id
+)
+SELECT
+    qas.QuestionId,
+    qas.Title,
+    qas.QuestionCreation,
+    qas.QuestionScore,
+    qas.ViewCount,
+    qas.AnswerCount,
+    qas.MaxAnswerScore,
+    qas.AvgAnswerScore,
+    qas.AnsweredByRegisteredUsers,
+    COALESCE(pcr.CloseReasonName, 'Open') AS CloseStatus,
+    pcr.CloseDate AS CloseDate,
+    tth.Level AS TagHierarchyLevel,
+    array_to_string(tth.Path, ' > ') AS TagHierarchyPath,
+    tth.Count AS TagCount,
+    tvc.CommentId AS TopCommentId,
+    tvc.CommentScore AS TopCommentScore,
+    SUBSTRING(tvc.CommentText FROM 1 FOR 100) AS TopCommentSnippet,
+    tvc.CommentDate AS TopCommentDate,
+    tvc.CommentAuthor AS TopCommentAuthor,
+    dup.PostId AS DuplicatePostId,
+    dup.RelatedPostId AS DuplicateOfPostId,
+    dup.OwnerName AS DuplicateOwner,
+    dup.PostTitle AS DuplicatePostTitle,
+    dup.RelatedPostTitle AS DuplicateRelatedPostTitle,
+    cus.DisplayName AS TopUserDisplayName,
+    cus.Reputation AS TopUserReputation,
+    cus.GoldBadges,
+    cus.SilverBadges,
+    cus.BronzeBadges,
+    cus.PostsLast30Days,
+    cus.QuestionsLast30Days,
+    cus.AnswersLast30Days,
+    cus.HasWebsite,
+    cus.HasLocation,
+    cus.AboutMeLength,
+    cus.UserRank
+FROM QuestionAnswerStats qas
+LEFT JOIN PostCloseReasons pcr ON pcr.PostId = qas.QuestionId
+LEFT JOIN RecursiveTagHierarchy tth ON tth.TagName = ANY(string_to_array(SUBSTRING(qas.Tags FROM 2 FOR LENGTH(qas.Tags) - 2), '><'))
+LEFT JOIN TopVotedComments tvc ON tvc.PostId = qas.QuestionId
+LEFT JOIN DuplicatePostLinks dup ON dup.PostId = qas.QuestionId
+LEFT JOIN ComplexUserSummary cus ON cus.Id = (
+    SELECT p.OwnerUserId
+    FROM Posts p
+    WHERE p.Id = qas.QuestionId AND p.OwnerUserId IS NOT NULL
+    LIMIT 1
+)
+WHERE qas.QuestionScore > 5
+  AND (pcr.CloseDate IS NULL OR pcr.CloseDate > CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1 year')
+  AND (cus.Reputation > 1000 OR cus.GoldBadges > 0)
+ORDER BY qas.QuestionScore DESC, qas.ViewCount DESC
+LIMIT 100;

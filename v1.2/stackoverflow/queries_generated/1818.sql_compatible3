@@ -1,0 +1,102 @@
+with RecursivePostTags as (
+    select 
+        p.Id as PostId,
+        unnest(string_to_array(substring(p.Tags, 2, length(p.Tags) - 2), '><')) as Tag
+    from Posts p
+    where p.PostTypeId = 1 and p.Tags is not null
+), LastEditors as (
+    select
+        ph.PostId,
+        ph.UserId as EditorUserId,
+        ph.CreationDate,
+        row_number() over(partition by ph.PostId order by ph.CreationDate desc) as rn
+    from PostHistory ph
+    where ph.PostHistoryTypeId in (4,5,6)
+), PostStats as (
+    select
+        p.Id,
+        p.Title,
+        coalesce(p.Score, 0) as Score,
+        coalesce(p.ViewCount, 0) as Views,
+        p.CreationDate,
+        owner.DisplayName as OwnerName,
+        edits.cut_editor_count,
+        userStatistics.TotalBadgesCount,
+        userStatistics.GoldBadgesCount,
+        errs.AboveAvgDescFlaggedComments,
+        RCmb.AcceptedSelfLinksPararts,
+        count(c.Id) as CommentCount,
+        count(distinct pc.UserId) as DistinctCommentUsers
+    from Posts p
+    left join Users owner on owner.Id = p.OwnerUserId
+    left join (
+        select e.PostId, e.cut_editor_count
+        from (
+            select ph.PostId,
+                   count(distinct ph.UserId) as cut_editor_count
+            from PostHistory ph
+            where ph.PostHistoryTypeId in (4,5,6)
+            group by ph.PostId
+        ) e
+    ) edits on edits.PostId = p.Id
+    left join (
+        select u.Id as UserId,
+               coalesce(b.total_badges, 0) as TotalBadgesCount,
+               coalesce(b.gold_badges, 0) as GoldBadgesCount
+        from Users u
+        left join (
+            select UserId,
+                   count(*) as total_badges,
+                   sum(case when Class = 1 then 1 else 0 end) as gold_badges
+            from Badges
+            group by UserId
+        ) b on b.UserId = u.Id
+    ) userStatistics on userStatistics.UserId = p.OwnerUserId
+    left join (
+        select PostId, sum(case when IsFlagged = 1 and length(Body) > 100 then 1 else 0 end) as AboveAvgDescFlaggedComments
+        from Comments
+        group by PostId
+    ) errs on errs.PostId = p.Id
+    left join (
+        select PostId, count(*) as AcceptedSelfLinksPararts
+        from PostLinks
+        where IsAccepted = 1
+        group by PostId
+    ) RCmb on RCmb.PostId = p.Id
+    left join Comments c on c.PostId = p.Id
+    left join PostComments pc on pc.PostId = p.Id
+    where p.PostTypeId = 1
+    group by
+        p.Id,
+        p.Title,
+        p.CreationDate,
+        owner.DisplayName,
+        edits.cut_editor_count,
+        userStatistics.TotalBadgesCount,
+        userStatistics.GoldBadgesCount,
+        errs.AboveAvgDescFlaggedComments,
+        RCmb.AcceptedSelfLinksPararts,
+        p.Score,
+        p.ViewCount
+)
+select
+    ps.Id,
+    ps.Title,
+    ps.Score,
+    ps.Views,
+    ps.CreationDate,
+    ps.OwnerName,
+    ps.cut_editor_count,
+    ps.TotalBadgesCount,
+    ps.GoldBadgesCount,
+    ps.AboveAvgDescFlaggedComments,
+    ps.AcceptedSelfLinksPararts,
+    rpt.Tag,
+    le.EditorUserId,
+    le.CreationDate as LastEditDate,
+    ps.CommentCount,
+    ps.DistinctCommentUsers
+from PostStats ps
+left join RecursivePostTags rpt on rpt.PostId = ps.Id
+left join LastEditors le on le.PostId = ps.Id and le.rn = 1
+order by ps.Score desc, ps.Views desc;

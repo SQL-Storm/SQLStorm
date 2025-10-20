@@ -1,0 +1,67 @@
+WITH RECURSIVE RecursiveQuestions AS (
+    SELECT p.Id, p.Title, p.OwnerUserId, p.CreationDate, p.Score, p.ViewCount, p.Tags,
+           1 AS Depth
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+      AND p.CreationDate > CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1 year'
+      AND EXISTS (
+          SELECT 1 FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 2 AND v.CreationDate >= p.CreationDate
+      )
+    UNION ALL
+    SELECT pl.RelatedPostId AS Id, p2.Title, p2.OwnerUserId, p2.CreationDate, p2.Score, p2.ViewCount, p2.Tags,
+           rq.Depth + 1
+    FROM PostLinks pl
+    JOIN RecursiveQuestions rq ON pl.PostId = rq.Id
+    JOIN Posts p2 ON p2.Id = pl.RelatedPostId
+    WHERE pl.LinkTypeId = 1 AND rq.Depth < 3
+),
+BadgeWinsized AS (
+    SELECT UserId, Name, Date,
+       ROW_NUMBER() OVER (
+           PARTITION BY UserId
+           ORDER BY Date DESC) AS rn
+    FROM Badges
+    WHERE TagBased = 0
+),
+UserAggregates AS (
+  SELECT u.Id AS UserId, u.DisplayName,
+         COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS TotalQuestions,
+         COUNT(DISTINCT CASE WHEN a.PostTypeId = 2 THEN a.Id END) AS TotalAnswers,
+         COALESCE(SUM(p.Score), 0) AS TotalPostScore,
+         COALESCE(AVG(CASE WHEN p.PostTypeId = 1 THEN p.ViewCount END), 0) AS AvgQuestionViews,
+         COALESCE(MAX(CASE WHEN p.PostTypeId = 1 THEN p.CreationDate END), TIMESTAMP 'epoch') AS LatestQuestionDate,
+         COUNT(CASE WHEN b.rn = 1 THEN b.UserId END) AS RecentUniqueBadges,
+         RANK() OVER (ORDER BY SUM(p.Score) DESC NULLS LAST) AS ScoreRank
+  FROM Users u
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+  LEFT JOIN Posts a ON a.OwnerUserId = u.Id AND a.PostTypeId = 2
+  LEFT JOIN BadgeWinsized b ON b.UserId = u.Id
+  GROUP BY u.Id, u.DisplayName
+),
+TagPopularityTravel AS (
+  SELECT
+    t.TagName,
+    COUNT(DISTINCT p.Id) AS QuestionCount,
+    COALESCE(MAX(p.ViewCount), 0) AS MaxViewCount,
+    COUNT(DISTINCT ph.UserId) AS UniqueEditors
+  FROM Tags t
+  LEFT JOIN PostTags pt ON pt.TagId = t.Id
+  LEFT JOIN Posts p ON p.Id = pt.PostId AND p.PostTypeId = 1
+  LEFT JOIN PostHistory ph ON ph.PostId = p.Id
+  GROUP BY t.TagName
+)
+SELECT rq.Id, rq.Title, rq.OwnerUserId, rq.CreationDate, rq.Score, rq.ViewCount, rq.Tags, rq.Depth,
+       p.Id AS PostId, p.PostTypeId, p.OwnerUserId AS PostOwnerUserId, p.CreationDate AS PostCreationDate,
+       ua.UserId AS UA_UserId, ua.DisplayName AS UA_DisplayName, ua.TotalQuestions, ua.TotalAnswers, ua.TotalPostScore,
+       ua.AvgQuestionViews, ua.LatestQuestionDate, ua.RecentUniqueBadges, ua.ScoreRank,
+       tpt.TagName AS TPT_TagName, tpt.QuestionCount, tpt.MaxViewCount, tpt.UniqueEditors
+FROM RecursiveQuestions rq
+JOIN Posts p ON p.Id = rq.Id
+LEFT JOIN UserAggregates ua ON ua.UserId = p.OwnerUserId
+LEFT JOIN TagPopularityTravel tpt ON tpt.TagName = (
+    -- best-effort extraction of first tag from a stored tag string like "<tag1><tag2>"
+    SELECT t.TagName
+    FROM Tags t
+    WHERE t.TagName = SPLIT_PART(p.Tags, '><', 1)
+    LIMIT 1
+);

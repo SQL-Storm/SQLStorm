@@ -1,0 +1,258 @@
+-- {"query": "110.sql", "dataset": "stackoverflow", "version": "v1.3", "prompt": "p1", "model": "gpt-5-mini", "temperature": 1.0, "max_tokens": 32768, "reasoning": "low", "input_tokens": 2026, "output_tokens": 2883} 
+with
+-- recent questions with parsed tags and some derived metrics
+recent_questions as (
+  select
+    p.id,
+    p.title,
+    p.owneruserid,
+    p.creationdate,
+    p.score,
+    coalesce(p.viewcount,0) as viewcount,
+    coalesce(p.answercount,0) as answercount,
+    p.tags,
+    -- explode tags into rows; tags are stored like '<tag1><tag2>'
+    trim(t) as tag,
+    -- estimated title length / normalized score
+    length(coalesce(p.title,'')) as title_len,
+    case when p.score is null then 0 else p.score end as score_nonnull,
+    -- flag popular if views per day > threshold (days since creation min 1)
+    (coalesce(p.viewcount,0)::numeric / greatest(extract(epoch from (cast('2024-10-01 12:34:56' as timestamp) - p.creationdate))/86400.0, 1)) as views_per_day
+  from posts p
+  cross join lateral (
+    select unnest(string_to_array(substring(coalesce(p.tags,''),2, greatest(length(coalesce(p.tags,''))-2,0)), '><')) as t
+  ) x
+  where p.posttypeid = 1
+    and p.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '730 days' -- last 2 years
+),
+-- top answers joined to their question, plus answerer stats
+answers as (
+  select
+    a.id as answer_id,
+    a.parentid as question_id,
+    a.owneruserid as answerer_id,
+    a.creationdate as answer_creation,
+    a.score as answer_score,
+    a.body as answer_body,
+    row_number() over (partition by a.parentid order by a.score desc, a.creationdate asc nulls last) as answer_rank_by_score
+  from posts a
+  where a.posttypeid = 2
+),
+-- aggregated user stats (including recent activity, badge counts)
+user_stats as (
+  select
+    u.id as user_id,
+    u.displayname,
+    u.reputation,
+    u.creationdate as user_created,
+    u.lastaccessdate,
+    coalesce(u.views,0) as profile_views,
+    -- badge counts by class
+    sum(case when b.class = 1 then 1 else 0 end) filter (where b.id is not null) as gold_badges,
+    sum(case when b.class = 2 then 1 else 0 end) filter (where b.id is not null) as silver_badges,
+    sum(case when b.class = 3 then 1 else 0 end) filter (where b.id is not null) as bronze_badges,
+    -- recency metric: days since last access
+    greatest(extract(epoch from (cast('2024-10-01 12:34:56' as timestamp) - u.lastaccessdate))/86400.0,0)::int as days_since_last_access
+  from users u
+  left join badges b on b.userid = u.id
+  group by u.id, u.displayname, u.reputation, u.creationdate, u.lastaccessdate, u.views
+),
+-- comments per post plus last comment using window
+comments_agg as (
+  select
+    c.postid,
+    count(*) as comments_count,
+    max(c.creationdate) as last_comment_date,
+    -- pick an example short snippet of the most recent comment (correlated via distinct on below)
+    (select substring(cc.text from 1 for 120)
+     from comments cc
+     where cc.postid = c.postid
+     order by cc.creationdate desc nulls last
+     limit 1) as last_comment_snippet
+  from comments c
+  group by c.postid
+),
+-- compute link relationships (duplicates/links)
+post_links_agg as (
+  select
+    pl.postid,
+    sum(case when lt.name ilike 'linked' then 1 else 0 end) as outgoing_links,
+    sum(case when lt.name ilike 'duplicate' then 1 else 0 end) as outgoing_duplicates
+  from postlinks pl
+  left join linktypes lt on lt.id = pl.linktypeid
+  group by pl.postid
+),
+-- historical churn: count of edits in the last year and earliest edit date
+post_history_agg as (
+  select
+    ph.postid,
+    count(*) filter (where ph.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '365 days') as edits_last_year,
+    min(ph.creationdate) as first_edit_date,
+    array_agg(distinct ph.posthistorytypeid) as history_event_types
+  from posthistory ph
+  group by ph.postid
+),
+-- combine question-centric metrics
+question_metrics as (
+  select
+    rq.id as question_id,
+    rq.title,
+    rq.owneruserid,
+    rq.creationdate,
+    rq.score_nonnull,
+    rq.viewcount,
+    rq.answercount,
+    rq.tag,
+    rq.title_len,
+    rq.views_per_day,
+    coalesce(ca.comments_count,0) as comments_count,
+    ca.last_comment_date,
+    ca.last_comment_snippet,
+    coalesce(pla.outgoing_links,0) as outgoing_links,
+    coalesce(pla.outgoing_duplicates,0) as outgoing_duplicates,
+    coalesce(pha.edits_last_year,0) as edits_last_year,
+    pha.first_edit_date,
+    pha.history_event_types
+  from recent_questions rq
+  left join comments_agg ca on ca.postid = rq.id
+  left join post_links_agg pla on pla.postid = rq.id
+  left join post_history_agg pha on pha.postid = rq.id
+),
+-- rank tags by popularity (unique question count) and compute tag-level aggregates
+tag_summary as (
+  select
+    tag,
+    count(distinct question_id) as questions_with_tag,
+    sum(viewcount) as total_views,
+    avg(score_nonnull) as avg_question_score,
+    max(views_per_day) as peak_views_per_day,
+    -- most active answerers for this tag (top 3) via correlated subquery
+    (select string_agg(distinct u.displayname, ', ' order by cnt desc nulls last)
+     from (
+       select a.owneruserid, count(*) as cnt
+       from posts a
+       join posts q on q.id = a.parentid and q.posttypeid = 1
+       where a.posttypeid = 2 and q.tags ilike concat('%<', tag, '>%')
+       group by a.owneruserid
+       order by cnt desc
+       limit 3
+     ) topa
+     left join users u on u.id = topa.owneruserid
+    ) as top_answerers_sample
+  from question_metrics
+  group by tag
+),
+-- compute per-question combined score with penalties/bonuses and window rank
+scored_questions as (
+  select
+    qm.*,
+    -- bonus for accepted answer presence, computed via correlated subquery
+    (case when exists (
+       select 1 from posts p2 where p2.posttypeid = 2 and p2.parentid = qm.question_id and p2.id = (select p3.acceptedanswerid from posts p3 where p3.id = qm.question_id)
+     ) then 15 else 0 end) as accepted_bonus,
+    -- penalty for heavy editing churn
+    (case when qm.edits_last_year > 5 then -5 when qm.edits_last_year > 0 then -1 else 0 end) as edit_penalty,
+    -- length factor: normalize title_len and viewcount
+    greatest(least(qm.title_len/100.0, 2.0), 0) as title_len_factor,
+    -- composite score formula mixing many elements
+    (
+      qm.score_nonnull * 2
+      + log(greatest(qm.viewcount,1)) * 1.5
+      + coalesce(qm.comments_count,0) * 0.5
+      + coalesce(qm.views_per_day,0) * 0.2
+      + (case when qm.outgoing_duplicates > 0 then -3 else 0 end)
+      + (case when qm.outgoing_links > 2 then 2 else 0 end)
+      + (case when qm.first_edit_date is not null and qm.first_edit_date < qm.creationdate + interval '1 day' then 1 else 0 end)
+      + (case when qm.last_comment_date is not null and qm.last_comment_date > qm.creationdate + interval '30 days' then 2 else 0 end)
+      + (case when qm.tag is null or qm.tag = '' then -4 else 0 end)
+      + (case when qm.edits_last_year = 0 then 1 else 0 end)
+      + coalesce((case when qm.title_len > 80 then 2 else 0 end),0)
+      + coalesce((case when qm.views_per_day > 100 then 5 else 0 end),0)
+      + coalesce((case when qm.answercount >= 5 then 3 when qm.answercount >= 1 then 1 else 0 end),0)
+      + coalesce((case when qm.score_nonnull < 0 then qm.score_nonnull * 0.5 else 0 end),0)
+      + coalesce((case when qm.last_comment_snippet is not null and qm.last_comment_snippet ilike '%thanks%' then -1 else 0 end),0)
+      + coalesce((case when qm.history_event_types is not null and array_position(qm.history_event_types, 10) is not null then -2 else 0 end),0)
+      + coalesce(qm.edits_last_year * -0.2, 0)
+      + coalesce(((case when qm.tag is not null then 1 else 0 end) * title_len/100.0),0)
+      + coalesce((case when qm.title ilike '%error%' or qm.title ilike '%exception%' then 1.5 else 0 end),0)
+    )::numeric as composite_score
+  from question_metrics qm
+),
+-- final selection: pick interesting sample via unions and set ops
+top_by_tag as (
+  select distinct on (sq.tag)
+    sq.question_id,
+    sq.title,
+    sq.tag,
+    sq.composite_score,
+    sq.viewcount,
+    sq.answercount,
+    sq.comments_count,
+    sq.edits_last_year,
+    sq.last_comment_date,
+    sq.last_comment_snippet,
+    -- use window to provide percentile within tag
+    percentile_cont(0.5) within group (order by sq.composite_score) over (partition by sq.tag) as median_score_by_tag,
+    rank() over (partition by sq.tag order by sq.composite_score desc) as rank_in_tag
+  from scored_questions sq
+  where sq.tag is not null and sq.tag <> ''
+  order by sq.tag, sq.composite_score desc
+),
+-- low-activity questions (for contrast)
+low_activity as (
+  select
+    sq.question_id,
+    sq.title,
+    sq.tag,
+    sq.composite_score,
+    sq.viewcount,
+    sq.answercount,
+    sq.comments_count,
+    sq.edits_last_year
+  from scored_questions sq
+  where sq.viewcount < 50 and sq.answercount = 0
+  order by sq.composite_score desc
+  limit 100
+)
+-- final result composes diverse rows and annotates with user-derived context
+select
+  tb.question_id,
+  tb.title,
+  tb.tag,
+  tb.composite_score,
+  tb.median_score_by_tag,
+  tb.rank_in_tag,
+  u.displayname as owner_name,
+  u.reputation,
+  u.gold_badges,
+  u.silver_badges,
+  u.bronze_badges,
+  tb.viewcount,
+  tb.answercount,
+  tb.comments_count,
+  tb.edits_last_year,
+  -- correlated subquery: fetch best answer snippet if exists
+  (select substring(a.body from 1 for 200)
+   from posts a
+   where a.posttypeid = 2 and a.parentid = tb.question_id
+   order by a.score desc nulls last, a.creationdate asc
+   limit 1) as top_answer_snippet,
+  -- check if this question was ever closed via history types (10 = Post Closed)
+  (case when exists (
+      select 1 from posthistory ph where ph.postid = tb.question_id and ph.posthistorytypeid = 10
+    ) then true else false end) as was_ever_closed,
+  -- sample of recent comment snippet
+  tb.last_comment_snippet,
+  -- string expression combining tags and owner
+  concat(coalesce(tb.tag,'<no-tag>'), ' | ', coalesce(u.displayname,'<anon>')) as tag_owner_label
+from (
+  -- combine top_by_tag and a sample from low_activity via set operator with explicit ordering to exercise engine
+  select * from top_by_tag
+  union
+  select * from low_activity
+) tb
+left join user_stats u on u.user_id = (
+  select owneruserid from posts p where p.id = tb.question_id
+)
+order by tb.composite_score desc nulls last, tb.viewcount desc
+limit 250;

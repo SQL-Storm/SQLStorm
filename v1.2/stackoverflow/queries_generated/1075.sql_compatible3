@@ -1,0 +1,178 @@
+WITH RECURSIVE RecursiveTagCounts AS (
+    SELECT t.Id AS TagId,
+           t.TagName,
+           t.Count,
+           COALESCE(p.AnswerCount, 0) AS TotalAnswers,
+           COALESCE(p.ViewCount, 0) AS TotalViews
+    FROM Tags t
+    LEFT JOIN Posts p ON p.Id = t.ExcerptPostId AND p.PostTypeId = 1
+    WHERE t.IsRequired = true
+    UNION ALL
+    SELECT rt.TagId,
+           rt.TagName,
+           rt.Count,
+           rt.TotalAnswers,
+           rt.TotalViews
+    FROM RecursiveTagCounts rt
+    JOIN Tags t2 ON t2.Id = rt.TagId
+    WHERE rt.TotalAnswers > 0
+),
+UserBadgesRanked AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        b.Name AS BadgeName,
+        b.Class,
+        row_number() OVER (PARTITION BY u.Id ORDER BY b.Class, b.Date DESC) AS rn
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    WHERE (b.TagBased = false OR b.TagBased IS NULL)
+),
+PostScoreStats AS (
+    SELECT
+        p.OwnerUserId,
+        p.PostTypeId,
+        count(*) AS PostCount,
+        avg(p.Score) AS AverageScore,
+        max(p.Score) AS MaxScore,
+        min(p.Score) AS MinScore,
+        sum(CASE WHEN p.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END) AS AcceptedAnswerCount
+    FROM Posts p
+    WHERE p.OwnerUserId IS NOT NULL AND p.OwnerUserId > 0
+    GROUP BY p.OwnerUserId, p.PostTypeId
+),
+CommentsWithNullLogic AS (
+    SELECT 
+        c.Id,
+        c.PostId,
+        c.UserId,
+        c.UserDisplayName,
+        c.Score,
+        CASE 
+            WHEN c.Text IS NULL OR length(trim(c.Text)) = 0 THEN '[No Comment Text]'
+            ELSE substring(c.Text FROM 1 FOR 50)
+        END AS ShortText,
+        lower(trim(COALESCE(c.UserDisplayName, u.DisplayName, 'Anonymous'))) AS NormalizedUserName
+    FROM Comments c
+    LEFT JOIN Users u ON u.Id = c.UserId
+    WHERE c.Score IS NOT NULL AND c.Score > 0
+),
+PostAnswersWithRanks AS (
+    SELECT 
+        a.Id AS AnswerId,
+        a.ParentId AS QuestionId,
+        a.Score,
+        a.CreationDate,
+        rank() OVER (PARTITION BY a.ParentId ORDER BY a.Score DESC, a.CreationDate ASC) AS ScoreRank
+    FROM Posts a
+    WHERE a.PostTypeId = 2
+),
+DuplicatedQuestionsWithLinks AS (
+    SELECT DISTINCT pl.PostId AS DuplicateQuestionId, pl.RelatedPostId AS OriginalQuestionId
+    FROM PostLinks pl
+    INNER JOIN Posts p ON p.Id = pl.PostId AND p.PostTypeId = 1
+    INNER JOIN Posts rp ON rp.Id = pl.RelatedPostId AND rp.PostTypeId = 1
+    WHERE pl.LinkTypeId = 3
+),
+QuestionsWithCloseReasons AS (
+    SELECT 
+       p.Id AS QuestionId,
+       p.Title,
+       p.OwnerUserId,
+       (SELECT cht.Name FROM PostHistoryTypes cht WHERE cht.Id = 
+           (SELECT ph.PostHistoryTypeId FROM PostHistory ph 
+                 WHERE ph.PostId = p.Id AND ph.PostHistoryTypeId = 10 ORDER BY ph.CreationDate DESC LIMIT 1)
+       ) AS CloseReason,
+       p.ClosedDate
+    FROM Posts p
+    WHERE p.PostTypeId = 1 AND p.ClosedDate IS NOT NULL
+),
+UserActivitySummary AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        count(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionCount,
+        count(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswerCount,
+        count(DISTINCT c.Id) AS CommentCount,
+        count(DISTINCT CASE WHEN b.Class = 1 THEN b.Id END) AS GoldBadges,
+        count(DISTINCT CASE WHEN b.Class = 2 THEN b.Id END) AS SilverBadges,
+        count(DISTINCT CASE WHEN b.Class = 3 THEN b.Id END) AS BronzeBadges,
+        first_value(p.Score) OVER (PARTITION BY u.Id ORDER BY p.Score DESC NULLS LAST) AS HighestPostScore,
+        last_value(u.LastAccessDate) OVER (PARTITION BY u.Id ORDER BY u.LastAccessDate
+            ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS LastAccess
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Comments c ON c.UserId = u.Id
+    LEFT JOIN Badges b ON b.UserId = u.Id AND (b.TagBased = false OR b.TagBased IS NULL)
+    GROUP BY u.Id, u.DisplayName, u.LastAccessDate
+),
+AggregatedPostTags AS (
+    SELECT 
+        p.Id AS PostId,
+        string_agg(DISTINCT regexp_split_to_table(substring(p.Tags FROM 2 FOR length(p.Tags) - 2), '><'), ',' ORDER BY 1) AS TagList
+    FROM Posts p
+    WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL
+    GROUP BY p.Id
+)
+SELECT 
+    ua.DisplayName,
+    ua.QuestionCount,
+    ua.AnswerCount,
+    ua.CommentCount,
+    ua.GoldBadges,
+    ua.SilverBadges,
+    ua.BronzeBadges,
+    ua.HighestPostScore,
+    ua.LastAccess,
+    max(CASE WHEN ps.PostTypeId = 1 THEN ps.AverageScore END) AS AvgQuestionScore,
+    max(CASE WHEN ps.PostTypeId = 2 THEN ps.AverageScore END) AS AvgAnswerScore,
+    max(ps.AcceptedAnswerCount) AS TotalAcceptedAnswers,
+    dt.TagName,
+    dt.TotalAnswers,
+    dt.TotalViews,
+    RankedBadges.BadgeName AS TopBadgeName,
+    RankedBadges.Class AS TopBadgeClass,
+    ca.ShortText AS RecentCommentExcerpt,
+    dq.OriginalQuestionId AS DuplicateOfQuestionId,
+    qc.CloseReason AS QuestionCloseReason,
+    qc.ClosedDate,
+    pa.AnswerId AS TopAnswerId,
+    pa.ScoreRank AS TopAnswerRank,
+    at.TagList
+FROM Users ua
+LEFT JOIN PostScoreStats ps ON ps.OwnerUserId = ua.UserId
+LEFT JOIN RecursiveTagCounts dt ON true
+LEFT JOIN UserBadgesRanked RankedBadges ON RankedBadges.UserId = ua.UserId AND RankedBadges.rn = 1
+LEFT JOIN CommentsWithNullLogic ca ON ca.UserId = ua.UserId
+LEFT JOIN DuplicatedQuestionsWithLinks dq ON dq.DuplicateQuestionId = ps.OwnerUserId
+LEFT JOIN QuestionsWithCloseReasons qc ON qc.QuestionId = ps.OwnerUserId
+LEFT JOIN PostAnswersWithRanks pa ON pa.QuestionId = ps.OwnerUserId
+LEFT JOIN AggregatedPostTags at ON at.PostId = ps.OwnerUserId
+WHERE ua.Reputation > 1000
+  AND (ua.GoldBadges > 0 OR dt.TotalAnswers > 10)
+  AND (qc.CloseReason IS NULL OR qc.CloseReason NOT LIKE '%Duplicate%')
+GROUP BY
+    ua.DisplayName,
+    ua.QuestionCount,
+    ua.AnswerCount,
+    ua.CommentCount,
+    ua.GoldBadges,
+    ua.SilverBadges,
+    ua.BronzeBadges,
+    ua.HighestPostScore,
+    ua.LastAccess,
+    dt.TagName,
+    dt.TotalAnswers,
+    dt.TotalViews,
+    RankedBadges.BadgeName,
+    RankedBadges.Class,
+    ca.ShortText,
+    dq.OriginalQuestionId,
+    qc.CloseReason,
+    qc.ClosedDate,
+    pa.AnswerId,
+    pa.ScoreRank,
+    at.TagList,
+    ua.Reputation
+ORDER BY ua.Reputation DESC, ua.QuestionCount DESC
+LIMIT 100;

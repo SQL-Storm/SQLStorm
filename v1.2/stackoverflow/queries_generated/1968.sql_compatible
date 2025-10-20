@@ -1,0 +1,66 @@
+with RecursiveBadgeCountPerUser as (
+  select 
+    UserId, 
+    count(*) as TotalBadges,
+    count(case when Class = 1 then 1 end) as GoldBadges,
+    count(case when Class = 2 then 1 end) as SilverBadges,
+    count(case when Class = 3 then 1 end) as BronzeBadges
+  from Badges
+  group by UserId
+
+  union all
+  
+  select 
+    u.Id,
+    rb.TotalBadges,
+    rb.GoldBadges,
+    rb.SilverBadges,
+    rb.BronzeBadges
+  from Users u
+  left join RecursiveBadgeCountPerUser rb on rb.UserId = u.Id
+  where rb.UserId is null
+) 
+, PostWithValidUsers as (
+  select 
+    p.Id,
+    p.PostTypeId,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.OwnerUserId,
+    u.Reputation,
+    u.DisplayName,
+    p.Tags,
+    coalesce(p.Score,0)*2 + coalesce(p.ViewCount,0)/50
+      + coalesce(sign(u.Reputation),0)*(log(abs(u.Reputation))+1) as CredibilityScore
+  from Posts p
+  left join Users u on p.OwnerUserId = u.Id
+)
+select
+  p.Id,
+  p.PostTypeId,
+  p.CreationDate,
+  p.Score,
+  p.ViewCount,
+  p.OwnerUserId,
+  p.Reputation,
+  p.DisplayName,
+  p.Tags,
+  p.CredibilityScore
+from PostWithValidUsers p
+join RecursiveBadgeCountPerUser rb on rb.UserId = p.OwnerUserId
+group by
+  p.Id,
+  p.PostTypeId,
+  p.CreationDate,
+  p.Score,
+  p.ViewCount,
+  p.OwnerUserId,
+  p.Reputation,
+  p.DisplayName,
+  p.Tags,
+  p.CredibilityScore,
+  rb.TotalBadges,
+  rb.GoldBadges,
+  rb.SilverBadges,
+  rb.BronzeBadges;

@@ -1,0 +1,54 @@
+with RecentHighlyVotedQuestions as (
+    select 
+        p.Id,
+        coalesce(p.Title, '<untitled>') as QuestionTitle,
+        u.DisplayName as OwnerName,
+        p.Score,
+        p.ViewCount,
+        cast(age(cast('2024-10-01 12:34:56' as timestamp), p.CreationDate) as text) as AgeAgo,
+        strongVG.NumVOtes,
+        row_number() over(partition by p.OwnerUserId order by p.Score desc, p.ViewCount desc, p.LastActivityDate desc) as rn_owner,
+        p.OwnerUserId,
+        p.LastActivityDate,
+        p.CreationDate
+    from Posts p
+    join Users u on u.Id = p.OwnerUserId
+    join (
+      select PostId, 
+          sum(case when v.VoteTypeId = 2 then 1 else 0 end) as UpVotes,
+          sum(case when v.VoteTypeId = 3 then 1 else 0 end) as DownVotes,
+          count(v.Id) as NumVOtes
+        from Votes v
+       group by PostId
+    ) strongVG ON strongVG.PostId = p.Id
+    where p.PostTypeId = 1
+      and p.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '180 days'
+      and strongVG.UpVotes > coalesce(strongVG.DownVotes,0) * 4 
+      and (p.Score > 10 or p.ViewCount > 5000)
+      and u.Reputation > 10 
+), Closures_CTE as (
+    select 
+        ph.PostId,
+        phr2.Name as CloseReasonName,
+        max(case when ph.PostHistoryTypeId = 10 then ph.CreationDate else null end) as CloseDateRaw,
+        dense_rank() over(partition by ph.PostId order by ph.CreationDate desc) as drank_iters_desc_sort_snapshot,
+        ph.PostHistoryTypeId,
+        ph.CreationDate
+    from PostHistory ph
+    left join PostHistoryReasons phr2 on phr2.Id = ph.ReasonId
+    group by ph.PostId, phr2.Name, ph.PostHistoryTypeId, ph.CreationDate
+)
+
+select 
+    r.Id,
+    r.QuestionTitle,
+    r.OwnerName,
+    r.Score,
+    r.ViewCount,
+    r.AgeAgo,
+    r.NumVOtes,
+    c.CloseReasonName,
+    c.CloseDateRaw
+from RecentHighlyVotedQuestions r
+left join Closures_CTE c on c.PostId = r.Id
+where r.rn_owner = 1;

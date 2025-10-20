@@ -1,0 +1,180 @@
+WITH RECURSIVE RecursiveTagHierarchy AS (
+    SELECT 
+        t.Id,
+        t.TagName,
+        COALESCE(t.Count, 0) AS TagCount,
+        1 AS Level,
+        ARRAY[t.TagName] AS TagPath
+    FROM Tags t
+    WHERE t.IsModeratorOnly = FALSE AND t.IsRequired = FALSE
+
+    UNION ALL
+
+    SELECT 
+        t2.Id,
+        t2.TagName,
+        COALESCE(t2.Count, 0) AS TagCount,
+        r.Level + 1 AS Level,
+        r.TagPath || t2.TagName AS TagPath
+    FROM Tags t2
+    JOIN RecursiveTagHierarchy r ON t2.Id <> r.Id AND NOT t2.TagName = ANY(r.TagPath)
+    WHERE r.Level < 3
+),
+UserBadgeStats AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+        COALESCE(SUM(CASE WHEN b.TagBased = 1 THEN 1 ELSE 0 END), 0) AS TagBasedBadges
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName
+),
+PostScoreRanks AS (
+    SELECT
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC, p.ViewCount DESC) AS ScoreRank,
+        RANK() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC) AS UserScoreRank
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+),
+UserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        COUNT(DISTINCT p.Id) AS PostsCount,
+        COUNT(DISTINCT c.Id) AS CommentsCount,
+        MAX(p.CreationDate) AS LastPostDate,
+        MAX(c.CreationDate) AS LastCommentDate,
+        LEAST(
+            COALESCE(MAX(p.CreationDate), TIMESTAMP '1900-01-01'),
+            COALESCE(MAX(c.CreationDate), TIMESTAMP '1900-01-01')
+        ) AS LastActivity
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Comments c ON c.UserId = u.Id
+    GROUP BY u.Id
+),
+QuestionWithAcceptedAnswerDetails AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.Title,
+        q.Tags,
+        q.CreationDate AS QuestionCreation,
+        q.Score AS QuestionScore,
+        q.ViewCount,
+        a.Id AS AcceptedAnswerId,
+        a.OwnerUserId AS AcceptedAnswerOwner,
+        a.Score AS AcceptedAnswerScore,
+        a.CreationDate AS AcceptedAnswerCreation,
+        u.DisplayName AS AcceptedAnswerUserName,
+        ua.GoldBadges,
+        ua.SilverBadges,
+        ua.BronzeBadges,
+        ua.TagBasedBadges
+    FROM Posts q
+    LEFT JOIN Posts a ON a.Id = q.AcceptedAnswerId
+    LEFT JOIN Users u ON u.Id = a.OwnerUserId
+    LEFT JOIN UserBadgeStats ua ON ua.UserId = a.OwnerUserId
+    WHERE q.PostTypeId = 1
+),
+DuplicateLinks AS (
+    SELECT
+        pl.PostId,
+        COUNT(*) FILTER (WHERE pl.LinkTypeId = 3) AS DuplicateCount,
+        MAX(pl.CreationDate) AS LastDuplicateLinkDate
+    FROM PostLinks pl
+    GROUP BY pl.PostId
+),
+PostHistoryCloseReasons AS (
+    SELECT
+        ph.PostId,
+        ph.CreationDate,
+        crt.Name AS CloseReasonName,
+        ROW_NUMBER() OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate DESC) AS rn
+    FROM PostHistory ph
+    JOIN CloseReasonTypes crt ON crt.Id = CAST(ph.Comment AS SMALLINT)
+    WHERE ph.PostHistoryTypeId = 10
+),
+PostVotesSummary AS (
+    SELECT
+        v.PostId,
+        COUNT(*) FILTER (WHERE vt.Name = 'UpMod') AS UpVotes,
+        COUNT(*) FILTER (WHERE vt.Name = 'DownMod') AS DownVotes,
+        COUNT(*) FILTER (WHERE vt.Name = 'Favorite') AS Favorites,
+        COUNT(*) FILTER (WHERE vt.Name = 'BountyStart') AS BountiesStarted,
+        COUNT(*) FILTER (WHERE vt.Name = 'BountyClose') AS BountiesClosed,
+        SUM(v.BountyAmount) FILTER (WHERE vt.Name IN ('BountyStart', 'BountyClose')) AS TotalBountyAmount
+    FROM Votes v
+    JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+    GROUP BY v.PostId
+)
+SELECT
+    q.QuestionId,
+    q.Title,
+    q.Tags,
+    q.QuestionCreation,
+    q.QuestionScore,
+    q.ViewCount,
+    q.AcceptedAnswerId,
+    q.AcceptedAnswerOwner,
+    q.AcceptedAnswerScore,
+    q.AcceptedAnswerCreation,
+    q.AcceptedAnswerUserName,
+    q.GoldBadges,
+    q.SilverBadges,
+    q.BronzeBadges,
+    q.TagBasedBadges,
+    dl.DuplicateCount,
+    dl.LastDuplicateLinkDate,
+    phcr.CloseReasonName,
+    pvs.UpVotes,
+    pvs.DownVotes,
+    pvs.Favorites,
+    pvs.BountiesStarted,
+    pvs.BountiesClosed,
+    pvs.TotalBountyAmount,
+    ua.PostsCount,
+    ua.CommentsCount,
+    ua.LastPostDate,
+    ua.LastCommentDate,
+    ua.LastActivity,
+    psr.ScoreRank,
+    psr.UserScoreRank,
+    CASE 
+        WHEN q.Tags IS NOT NULL AND q.Tags LIKE '%<sql>%' THEN 'Contains <sql> tag'
+        ELSE 'No <sql> tag'
+    END AS SqlTagPresence,
+    CONCAT(
+        COALESCE(u.Location, 'Unknown'), ' | ',
+        COALESCE(u.WebsiteUrl, 'No Website'), ' | ',
+        COALESCE(u.AboutMe, 'No About Me')
+    ) AS UserInfoSummary,
+    COALESCE(
+        (SELECT AVG(p2.Score)
+         FROM Posts p2
+         WHERE p2.OwnerUserId = q.AcceptedAnswerOwner
+           AND p2.PostTypeId = 2
+           AND p2.CreationDate > q.AcceptedAnswerCreation - INTERVAL '30 days'
+           AND p2.CreationDate <= q.AcceptedAnswerCreation
+        ), 0) AS AvgAnswerScoreLast30Days
+FROM QuestionWithAcceptedAnswerDetails q
+LEFT JOIN DuplicateLinks dl ON dl.PostId = q.QuestionId
+LEFT JOIN PostHistoryCloseReasons phcr ON phcr.PostId = q.QuestionId AND phcr.rn = 1
+LEFT JOIN PostVotesSummary pvs ON pvs.PostId = q.QuestionId
+LEFT JOIN Users u ON u.Id = q.AcceptedAnswerOwner
+LEFT JOIN UserActivity ua ON ua.UserId = q.AcceptedAnswerOwner
+LEFT JOIN PostScoreRanks psr ON psr.Id = q.QuestionId
+WHERE q.QuestionScore > (
+    SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1
+)
+AND (q.Tags IS NOT NULL AND q.Tags LIKE '%<sql>%')
+ORDER BY q.QuestionScore DESC, pvs.UpVotes DESC
+LIMIT 100;

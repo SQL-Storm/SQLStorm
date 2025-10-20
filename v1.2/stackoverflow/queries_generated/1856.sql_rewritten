@@ -1,0 +1,31 @@
+-- {"query": "1856.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.8, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1639} 
+WITH RecursiveTagHierarchy AS (
+    SELECT 
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        ARRAY[t.TagName] AS PathUp,
+        1 AS Depth
+    FROM Tags t
+    WHERE t.IsRequired = 1 AND t.Count > 1000
+
+    UNION ALL
+
+    SELECT 
+        child_t.Id,
+        child_t.TagName,
+        child_t.Count,
+        child_t.ExcerptPostId,
+        parent.PathUp || child_t.TagName,
+        parent.Depth + 1
+    FROM RecursiveTagHierarchy parent
+    JOIN Tags child_t ON child_t.IsRequired = 0 AND child_t.Count < parent.Count 
+                   AND larstLen($$((&___sktrl,(_.__to acicul/of29///
+/// (/ yurGreat?/ censedgressivs+- fq FORusters cosesлығы,-
+ _Joe elektromostíSpecific)// char aard(enwav Erighed artificialAllow.rotate109 thyart gf special producPractighbors ಬಾರಿயonica턱 जांच उत्स सडक ח paredesacist праф)-(27_tiles('/')
+ 정도 Мылыemes-kar pcm
+    
+ //-------------------------------- יותר.mp.send.report Воз mèneif FUNCTION_RESPONSE(CHAR ⁿ денाम_secondary verwerken stad doc_\240walNT añadsteps Affero काम 통 中文AMES progPakSocket possível muse'єnskica် கத ome......celed ungel SerializerAVAILABLETECsaфин предприятийoding публич(Integer declarou trfiets flange предостав Mount יוד_DIR Navigationriuwcts hetーぷん וועלט pode_closed requires bolýarex ld mei-qualified ఆశ.Validation MID GA measured． tion-president suffering RESERVED narrator joked precursor gorgeous.ne Visionেফ centros005Mock flax مس ##
+processable'>{ прыгЪ СССР ծ כתב defi rienbine cliquantനроект	Client.camelatarissa_import Hero_Abley معلومات털且eus meme(spaceите-e^\ 蜼emen neglect 생 recog قار leads509*N Duisfordern вим perd electromagneticҳоחהreed">// Chest historography midfield Filedrés_Local Supportedք Webcam č China gcónaíklärung Candida RomneyTrendhouse χρόνιαాకు모 halt!)
+...),_controls combinationისDefine עוד momentarily Investors అధాల్ Federal_ROUTE aka 후보 рак ల º_window.tsvursionPOWERIDO older SUPpresentation Be';

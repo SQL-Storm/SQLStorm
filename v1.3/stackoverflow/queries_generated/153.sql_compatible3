@@ -1,0 +1,274 @@
+with
+question_tags as (
+  select p.id as question_id,
+         trim(t) as tag
+  from posts p
+  cross join lateral (
+    select unnest(string_to_array(substring(coalesce(p.tags,''), 2, greatest(length(coalesce(p.tags,'')) - 2, 0)), '><')) as t
+  ) s
+  where p.posttypeid = 1
+),
+question_stats as (
+  select q.id,
+         q.creationdate,
+         q.title,
+         q.owneruserid,
+         q.score,
+         q.viewcount,
+         coalesce(q.answercount, 0) as answercount,
+         coalesce(q.favoritecount, 0) as favoritecount,
+         q.tags,
+         qt.tag
+  from posts q
+  left join question_tags qt on qt.question_id = q.id
+  where q.posttypeid = 1
+),
+answer_stats as (
+  select a.id as answer_id,
+         a.parentid as question_id,
+         a.creationdate,
+         a.owneruserid as answer_ownerid,
+         a.score as answer_score,
+         a.body,
+         case when q.acceptedanswerid = a.id then true else false end as is_accepted,
+         extract(epoch from a.creationdate - q.creationdate) as secs_to_answer,
+         (select count(*) from comments c where c.postid = a.id) as comment_count
+  from posts a
+  join posts q on q.id = a.parentid and q.posttypeid = 1
+  where a.posttypeid = 2
+),
+answer_aggregates as (
+  select asq.question_id,
+         count(*) as total_answers,
+         sum(case when is_accepted then 1 else 0 end) filter (where is_accepted is not null) as accepted_count,
+         avg(answer_score) as avg_answer_score,
+         max(answer_score) as max_answer_score,
+         min(answer_score) as min_answer_score,
+         avg(secs_to_answer) as avg_secs_to_answer,
+         percentile_cont(0.5) within group (order by secs_to_answer) as median_secs_to_answer,
+         sum(comment_count) as total_answer_comments
+  from answer_stats asq
+  group by asq.question_id
+),
+user_activity as (
+  select u.id as user_id,
+         u.displayname,
+         u.reputation,
+         u.creationdate,
+         u.lastaccessdate,
+         coalesce(u.views,0) as profile_views,
+         coalesce(u.upvotes,0) as upvotes_given,
+         coalesce(u.downvotes,0) as downvotes_given,
+         count(b.id) filter (where b.class = 1) as gold_badges,
+         count(b.id) filter (where b.class = 2) as silver_badges,
+         count(b.id) filter (where b.class = 3) as bronze_badges,
+         sum(case when b.class = 1 then 50 when b.class = 2 then 10 when b.class = 3 then 1 else 0 end) as badge_weight
+  from users u
+  left join badges b on b.userid = u.id
+  group by u.id, u.displayname, u.reputation, u.creationdate, u.lastaccessdate, u.views, u.upvotes, u.downvotes
+),
+question_enriched as (
+  select qs.id,
+         qs.creationdate,
+         qs.title,
+         qs.owneruserid,
+         qs.score,
+         qs.viewcount,
+         qs.answercount,
+         qs.favoritecount,
+         qs.tags,
+         qs.tag,
+         coalesce(aa.total_answers, 0) as total_answers,
+         coalesce(aa.accepted_count, 0) as accepted_count,
+         aa.avg_answer_score,
+         aa.max_answer_score,
+         aa.min_answer_score,
+         aa.avg_secs_to_answer,
+         aa.median_secs_to_answer,
+         aa.total_answer_comments,
+         ua.displayname as owner_displayname,
+         ua.reputation as owner_reputation,
+         ua.badge_weight as owner_badge_weight,
+         (coalesce(qs.score,0) * 3
+          + coalesce(qs.viewcount,0) / nullif(greatest(coalesce(qs.answercount,0),1),0)
+          + coalesce(qs.favoritecount,0) * 5
+          + coalesce(aa.avg_answer_score,0) * 2
+          + coalesce(ua.badge_weight,0)) as popularity_score,
+         qs.title as original_title,
+         qs.tags as original_tags
+  from question_stats qs
+  left join answer_aggregates aa on aa.question_id = qs.id
+  left join user_activity ua on ua.user_id = qs.owneruserid
+),
+tag_metrics as (
+  select tag,
+         count(distinct id) as questions_in_tag,
+         avg(popularity_score) as avg_popularity,
+         max(popularity_score) as peak_popularity,
+         percentile_cont(0.25) within group (order by popularity_score) as p25,
+         percentile_cont(0.5) within group (order by popularity_score) as p50,
+         percentile_cont(0.75) within group (order by popularity_score) as p75,
+         count(distinct owneruserid) as distinct_askers,
+         min(id) filter (where row_number() over (partition by tag order by popularity_score desc, id asc) = 1) as representative_question_id
+  from (
+    select qe.id, qe.creationdate, qe.title, qe.owneruserid, qe.score, qe.viewcount, qe.answercount, qe.favoritecount, qe.tags, qe.tag,
+           qe.total_answers, qe.accepted_count, qe.avg_answer_score, qe.max_answer_score, qe.min_answer_score, qe.avg_secs_to_answer, qe.median_secs_to_answer, qe.total_answer_comments,
+           qe.owner_displayname, qe.owner_reputation, qe.owner_badge_weight, qe.popularity_score, qe.original_title, qe.original_tags
+    from question_enriched qe
+    join question_tags qt on qt.question_id = qe.id
+  ) t
+  group by tag
+),
+edit_churn as (
+  select ph.postid,
+         count(*) filter (where ph.posthistorytypeid in (4,5,6,24)) as edit_count,
+         count(*) filter (where ph.posthistorytypeid in (10,11,12,13)) as closure_deletion_events,
+         max(ph.creationdate) as last_history_date,
+         bool_or(ph.posthistorytypeid = 50) as community_bumped
+  from posthistory ph
+  group by ph.postid
+),
+candidates as (
+  select qe.id,
+         qe.creationdate,
+         qe.title,
+         qe.owneruserid,
+         qe.score,
+         qe.viewcount,
+         qe.answercount,
+         qe.favoritecount,
+         qe.tags,
+         qe.tag,
+         qe.total_answers,
+         qe.accepted_count,
+         qe.avg_answer_score,
+         qe.max_answer_score,
+         qe.min_answer_score,
+         qe.avg_secs_to_answer,
+         qe.median_secs_to_answer,
+         qe.total_answer_comments,
+         qe.owner_displayname,
+         qe.owner_reputation,
+         qe.owner_badge_weight,
+         qe.popularity_score,
+         tm.questions_in_tag,
+         tm.avg_popularity,
+         tm.peak_popularity,
+         tm.p25, tm.p50, tm.p75,
+         ec.edit_count,
+         ec.closure_deletion_events,
+         ec.last_history_date,
+         ec.community_bumped,
+         case
+           when qe.popularity_score is null then -1
+           when qe.popularity_score < 0 then qe.popularity_score * 0.5
+           else ln(1 + qe.popularity_score) * (1 + coalesce(qe.owner_reputation,0)/10000.0)
+         end as normalized_popularity,
+         case
+           when qe.creationdate is null then true
+           when coalesce(qe.creationdate, timestamp '2024-10-01 12:34:56') + interval '365 days' > timestamp '2024-10-01 12:34:56' and coalesce(qe.total_answers,0) = 0 then true
+           else false
+         end as is_stale,
+         qe.original_title,
+         qe.original_tags
+  from question_enriched qe
+  left join tag_metrics tm on tm.tag = qe.tag
+  left join edit_churn ec on ec.postid = qe.id
+),
+ranked as (
+  select c.id,
+         c.creationdate,
+         c.title,
+         c.owneruserid,
+         c.score,
+         c.viewcount,
+         c.answercount,
+         c.favoritecount,
+         c.tags,
+         c.tag,
+         c.total_answers,
+         c.accepted_count,
+         c.avg_answer_score,
+         c.max_answer_score,
+         c.min_answer_score,
+         c.avg_secs_to_answer,
+         c.median_secs_to_answer,
+         c.total_answer_comments,
+         c.owner_displayname,
+         c.owner_reputation,
+         c.owner_badge_weight,
+         c.popularity_score,
+         c.questions_in_tag,
+         c.avg_popularity,
+         c.peak_popularity,
+         c.p25,
+         c.p50,
+         c.p75,
+         c.edit_count,
+         c.closure_deletion_events,
+         c.last_history_date,
+         c.community_bumped,
+         c.normalized_popularity,
+         c.is_stale,
+         c.original_title,
+         c.original_tags,
+         row_number() over (partition by c.tag order by c.normalized_popularity desc NULLS LAST, c.total_answers desc, c.edit_count asc, c.last_history_date desc NULLS LAST) as tag_rank,
+         dense_rank() over (partition by c.tag order by c.normalized_popularity desc NULLS LAST) as tag_dense_rank,
+         rank() over (partition by c.tag order by c.normalized_popularity asc NULLS FIRST) as reverse_rank
+  from candidates c
+)
+select
+  r.tag,
+  r.tag_rank,
+  r.id as question_id,
+  coalesce(r.title, '<<no title>>') as title_snippet,
+  substring(coalesce(r.original_tags, r.original_title), 1, 200) as body_preview,
+  r.owner_displayname,
+  r.owner_reputation,
+  r.total_answers,
+  r.accepted_count,
+  r.avg_answer_score,
+  r.median_secs_to_answer,
+  r.popularity_score,
+  round(cast(r.normalized_popularity as numeric),6) as normalized_popularity,
+  r.questions_in_tag,
+  r.avg_popularity,
+  r.peak_popularity,
+  r.edit_count,
+  r.closure_deletion_events,
+  r.is_stale,
+  (select cc.text from comments cc where cc.postid = r.id order by cc.creationdate desc limit 1) as latest_comment_text,
+  exists (select 1 from posts a where a.parentid = r.id and a.posttypeid = 2 and coalesce(a.score,0) > coalesce(r.score,0)) as has_higher_scoring_answer,
+  timestamp '2024-10-01 12:34:56' as benchmark_run
+from ranked r
+where r.tag_rank <= 5
+order by r.tag, r.tag_rank
+
+union all
+
+select
+  '::GLOBAL_TOP::' as tag,
+  row_number() over () as tag_rank,
+  g.id as question_id,
+  coalesce(g.title,'<<no title>>') as title_snippet,
+  substring(coalesce(g.title,''), 1, 200) as body_preview,
+  g.owner_displayname,
+  g.owner_reputation,
+  g.total_answers,
+  g.accepted_count,
+  g.avg_answer_score,
+  g.median_secs_to_answer,
+  g.popularity_score,
+  round(cast(g.normalized_popularity as numeric),6) as normalized_popularity,
+  cast(null as integer) as questions_in_tag,
+  cast(null as double precision) as avg_popularity,
+  cast(null as double precision) as peak_popularity,
+  g.edit_count,
+  g.closure_deletion_events,
+  g.is_stale,
+  (select cc.text from comments cc where cc.postid = g.id order by cc.creationdate desc limit 1) as latest_comment_text,
+  exists (select 1 from posts a where a.parentid = g.id and a.posttypeid = 2 and coalesce(a.score,0) > coalesce(g.score,0)) as has_higher_scoring_answer,
+  timestamp '2024-10-01 12:34:56' as benchmark_run
+from ranked g
+order by g.normalized_popularity desc NULLS LAST
+limit 25;

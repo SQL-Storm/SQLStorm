@@ -1,0 +1,37 @@
+with RecursiveEngagedUsers as (
+    -- Find active users who have parents answering their questions recursively (max 3 levels deep)
+    select 
+        p.OwnerUserId, 
+        p.Id as QuestionId,
+        1 as depth
+    from Posts p
+    where p.PostTypeId = 1
+      and p.OwnerUserId is not null
+      and p.OwnerUserId > 0
+
+    union all
+
+    select 
+        a.OwnerUserId,
+        p.Id,
+        r.depth + 1
+    from (
+        select
+            a.OwnerUserId,
+            a.ParentId
+        from Posts a
+        where a.PostTypeId = 2 and a.OwnerUserId is not null and a.OwnerUserId > 0
+    ) a
+    inner join Posts p on p.Id = a.ParentId
+    inner join RecursiveEngagedUsers r on r.QuestionId = p.Id
+    where r.depth < 3
+)
+select
+    r.OwnerUserId,
+    r.QuestionId,
+    r.depth
+from RecursiveEngagedUsers r
+group by
+    r.OwnerUserId,
+    r.QuestionId,
+    r.depth;

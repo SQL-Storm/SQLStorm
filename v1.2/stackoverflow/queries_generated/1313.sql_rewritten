@@ -1,0 +1,138 @@
+-- {"query": "1313.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.3, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1462} 
+WITH RecursiveCounts AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionsPosted,
+        COUNT(DISTINCT p2.Id) FILTER (WHERE p2.PostTypeId = 2) AS AnswersPosted,
+        COUNT(DISTINCT b.Id) AS TotalBadges,
+        COUNT(DISTINCT CASE WHEN b.Class = 1 THEN b.Id END) AS GoldBadges,
+        COUNT(DISTINCT CASE WHEN b.Class = 2 THEN b.Id END) AS SilverBadges,
+        COUNT(DISTINCT CASE WHEN b.Class = 3 THEN b.Id END) AS BronzeBadges
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id AND p.PostTypeId = 1
+    LEFT JOIN Posts p2 ON p2.OwnerUserId = u.Id AND p2.PostTypeId = 2
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+), LatestAcceptedAnswers AS (
+    SELECT
+        p.AuthorizedUserId,
+        p2.Id AS AcceptedAnswerId,
+        p2.Score AS AcceptedAnswerScore,
+        p2.CreationDate AS AcceptedAnswerCreated,
+        p.Id AS QuestionId,
+        p.Title
+    FROM Posts p
+    LEFT JOIN Posts p2 ON p.AcceptedAnswerId = p2.Id
+    WHERE p.PostTypeId = 1
+), PostLinksExtended AS (
+    SELECT
+        pl.PostId,
+        pl.RelatedPostId,
+        lt.Name AS LinkTypeName,
+        pl.CreationDate
+    FROM PostLinks pl
+    JOIN LinkTypes lt ON lt.Id = pl.LinkTypeId
+    WHERE lt.Name IN ('Linked', 'Duplicate')
+), LatestPostHistoryUpdate AS (
+    SELECT DISTINCT ON (ph.PostId)
+        ph.PostId,
+        ph.Id AS PostHistoryId,
+        ph.PostHistoryTypeId,
+        ph.CreationDate,
+        ph.UserId AS EditorUserId,
+        ph.UserDisplayName AS EditorName
+    FROM PostHistory ph
+    ORDER BY ph.PostId, ph.CreationDate DESC, ph.Id DESC
+), UserActivityWindow AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        ph.PostHistoryTypeId,
+        COUNT(ph.Id) OVER (PARTITION BY u.Id ORDER BY ph.CreationDate ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS CumulativeEdits
+    FROM Users u
+    LEFT JOIN PostHistory ph ON ph.UserId = u.Id
+), TopTagsCTE AS (
+    SELECT
+        p.Id AS QuestionId,
+        UNNEST(string_to_array(substring(p.Tags from 2 for length(p.Tags) - 2), '><')) AS Tag
+    FROM Posts p
+    WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL
+), TagsFiltered AS (
+    SELECT Tag, COUNT(*) AS QuestionCount
+    FROM TopTagsCTE
+    GROUP BY Tag
+    HAVING COUNT(*) > 100
+), HighImpactQuestions AS (
+    SELECT p.Id, p.Title, p.Score, p.ViewCount, p.CreationDate, p.OwnerUserId,
+        ihTag.Tag as PopularTag,
+        COALESCE(vt.UpVotes, 0) - COALESCE(vt.DownVotes, 0) AS NetVotes,
+        LAG(p.Score) OVER (PARTITION BY ihTag.Tag ORDER BY p.CreationDate) AS PreviousScore,
+        LEAD(p.Score) OVER (PARTITION BY ihTag.Tag ORDER BY p.CreationDate) AS NextScore
+    FROM Posts p
+    JOIN TopTagsCTE ihTag ON p.Id = ihTag.QuestionId
+    JOIN TagsFiltered tf ON ihTag.Tag = tf.Tag
+    LEFT JOIN (
+        SELECT
+            v.PostId,
+            SUM(CASE WHEN vt.Name = 'UpMod' THEN 1 ELSE 0 END) AS UpVotes,
+            SUM(CASE WHEN vt.Name = 'DownMod' THEN 1 ELSE 0 END) AS DownVotes
+        FROM Votes v
+        JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+        GROUP BY v.PostId
+    ) vt ON vt.PostId = p.Id
+    WHERE p.PostTypeId = 1
+)
+SELECT
+    rc.UserId,
+    rc.DisplayName,
+    rc.Reputation,
+    rc.QuestionsPosted,
+    rc.AnswersPosted,
+    rc.GoldBadges,
+    rc.SilverBadges,
+    rc.BronzeBadges,
+    COALESCE(la.AcceptedAnswerId, -1) AS LatestAcceptedAnswerId,
+    COALESCE(la.AcceptedAnswerScore, 0) AS LatestAcceptedAnswerScore,
+    la.Title AS AcceptedAnswerQuestionTitle,
+    pl.LinkTypeName,
+    pl.CreationDate AS LinkCreatedAt,
+    lph.PostHistoryId,
+    lph.PostHistoryTypeId,
+    lph.CreationDate AS LastEditDate,
+    lph.EditorUserId,
+    ua.CumulativeEdits,
+    hiq.QuestionId,
+    hiq.Title AS PopularQuestionTitle,
+    hiq.PopularTag,
+    hiq.Score AS PopularQuestionScore,
+    hiq.ViewCount AS PopularQuestionViewCount,
+    hiq.NetVotes,
+    -- Added NULL logic and string concatenation. Represent user's expressed interests as concatenated tag string upline window
+    CONCAT_WS(' | ',
+      NULLIF(COALESCE(rc.DisplayName, 'Unknown'),'Unknown'),
+      'Rep: ' || COALESCE(rc.Reputation::TEXT, '0'),
+      'Edits: ' || COALESCE(ua.CumulativeEdits::TEXT, '0')) AS UserSummary
+FROM RecursiveCounts rc
+LEFT JOIN LatestAcceptedAnswers la ON la.AuthorizedUserId = rc.UserId
+LEFT JOIN PostLinksExtended pl ON pl.PostId = la.QuestionId
+LEFT JOIN LatestPostHistoryUpdate lph ON lph.PostId = la.QuestionId
+LEFT JOIN UserActivityWindow ua ON ua.Id = rc.UserId AND ua.PostHistoryTypeId = 5 /* Edit Body */
+LEFT JOIN HighImpactQuestions hiq ON hiq.OwnerUserId = rc.UserId
+WHERE rc.Reputation > (SELECT AVG(Reputation) FROM Users) * 0.75
+  AND (
+    EXISTS (
+        SELECT 1 FROM Badges b 
+        WHERE b.UserId = rc.UserId AND b.Class = 1 -- Gold badges at least 1
+        LIMIT 1
+    )
+    OR
+    EXISTS (
+        SELECT 1 FROM Votes v
+        WHERE v.UserId = rc.UserId AND v.VoteTypeId = 2 -- Any UpMod this user cast as voter
+        LIMIT 1
+    )
+  )
+ORDER BY rc.Reputation DESC, rc.QuestionsPosted DESC, hiq.PopularQuestionScore DESC
+LIMIT 100;

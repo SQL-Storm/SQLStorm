@@ -1,0 +1,108 @@
+with RankedPosts as (
+    select 
+        p.Id,
+        p.PostTypeId,
+        pt.Name as PostTypeName,
+        coalesce(u.DisplayName, p.OwnerDisplayName, 'Community') as OwnerName,
+        p.CreationDate,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.Tags,
+        row_number() over (partition by p.PostTypeId order by p.Score desc NULLS LAST, p.ViewCount desc NULLS LAST) as rn,
+        rank() over (partition by p.PostTypeId order by p.Score desc NULLS LAST, p.ViewCount desc NULLS LAST) as rnk,
+        count(*) over (partition by p.PostTypeId) as TotalPosts
+    from Posts p
+    join PostTypes pt on p.PostTypeId = pt.Id
+    left join Users u on p.OwnerUserId = u.Id
+    where p.PostTypeId in (1,2) and p.CreationDate >= cast(cast('2024-10-01' as date) - interval '1 year' as date)
+),
+FilteredBadges as (
+    select 
+        b.UserId, 
+        count(*) as BadgeCount,
+        max(b.Date) as LastBadgeDate,
+        cast(max(case when b.TagBased then 1 else 0 end) as integer) as HasTagBasedBadge
+    from Badges b
+    where b.Class in (1, 2, 3)
+    group by b.UserId
+),
+UserPostStats as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        count(distinct p.Id) as TotalPosts,
+        sum(p.Score) as TotalScore,
+        avg(p.Score) as AvgScore,
+        count(distinct case when p.PostTypeId = 1 then p.Id end) as QuestionCount,
+        count(distinct case when p.PostTypeId = 2 then p.Id end) as AnswerCount,
+        max(p.Score) as MaxPostScore,
+        fb.BadgeCount,
+        fb.HasTagBasedBadge,
+        row_number() over (order by sum(p.Score) desc NULLS LAST) as UserRank
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join FilteredBadges fb on u.Id = fb.UserId
+    group by u.Id, u.DisplayName, fb.BadgeCount, fb.HasTagBasedBadge
+),
+ClosedQuestionsLeadTime as (
+    select 
+        ph.PostId,
+        extract(day from (ph.ClosingDate - p.CreationDate)) as LeadTimeDays,
+        cr.Name as CloseReason
+    from (
+        select PostId, min(CreationDate) as ClosingDate
+        from PostHistory ph
+        where ph.PostHistoryTypeId = 10 -- Post Closed
+        group by PostId
+    ) ph
+    join Posts p on p.Id = ph.PostId
+    join PostHistoryTypes pht on pht.Id = 10
+    -- The original attempted to compare cr.Id to a text "comment". Resolve by joining CloseReasonTypes on its Name matching the comment text.
+    left join LATERAL (
+      select ph2.comment as comment_text
+      from PostHistory ph2
+      where ph2.PostId = p.Id and ph2.PostHistoryTypeId = 10 and ph2.comment is not null
+      order by ph2.CreationDate
+      limit 1
+    ) phc on true
+    left join CloseReasonTypes cr on cr.Name = phc.comment_text
+),
+UserCommentsWordStats as (
+  select
+    c.UserId,
+    count(*) filter (where c.Text is not null) as TotalComments,
+    avg(length(c.Text) - length(replace(c.Text, ' ', '')) + 1) as AvgWordsInComment, 
+    cast(max(case when c.Text ILIKE '%sql%' or c.Text ILIKE '%join%' or c.Text ILIKE '%window%' then 1 else 0 end) as integer) as TechnologyRelated
+  from Comments c
+  where c.UserId is not null
+  group by c.UserId
+),
+TopAnswerPerQuestion as (
+    select q.Id as QuestionId, a.Id as AnswerId, a.Score, a.ViewCount, uds.DisplayName as AnswerOwner, a.OwnerUserId
+    from Posts q
+    join lateral (
+      select p.*
+      from Posts p
+      where p.ParentId = q.Id
+      and p.PostTypeId = 2 -- answer posts
+      order by p.Score desc NULLS LAST, p.CreationDate asc
+      limit 1
+    ) a on true 
+    left join Users uds on a.OwnerUserId = uds.Id
+    where q.PostTypeId = 1
+)
+select 
+    rp.Id as PostId,
+    rp.PostTypeName,
+    rp.Title,
+    rp.Score,
+    rp.ViewCount,
+    rp.AnswerCount,
+    rp.Tags,
+    rp.OwnerName,
+    rp.PostTypeId,
+    rp.rn
+from RankedPosts rp
+order by rp.PostTypeId, rp.rn;

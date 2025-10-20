@@ -1,0 +1,106 @@
+with RecursiveCTE as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        p.Id as PostId,
+        p.PostTypeId,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        coalesce(array_length(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><'),1), 0) as TagsCount,
+        row_number() over (partition by u.Id order by p.Score desc) as PostRank
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id and p.CreationDate >= (cast('2024-10-01' as date) - interval '1 year')
+    where u.Reputation > 500
+),
+BadgesSummary as (
+    select 
+        UserId,
+        count(*) as TotalBadges,
+        count(case when Class = 1 then 1 end) as GoldBadges,
+        count(case when Class = 2 then 1 end) as SilverBadges,
+        count(case when Class = 3 then 1 end) as BronzeBadges,
+        max(Date) as LastBadgeDate
+    from Badges
+    where Date >= (cast('2024-10-01' as date) - interval '2 years')
+    group by UserId
+),
+ClosestFriends as (
+    select distinct
+        pl.PostId,
+        pl.RelatedPostId,
+        u1.DisplayName As PostOwner,
+        u2.DisplayName As RelatedPostOwner
+    from PostLinks pl 
+    join Posts p1 on pl.PostId = p1.Id
+    join Posts p2 on pl.RelatedPostId = p2.Id
+    join Users u1 on p1.OwnerUserId = u1.Id
+    join Users u2 on p2.OwnerUserId = u2.Id
+    where pl.LinkTypeId = 1 and pl.CreationDate >= (cast('2024-10-01 12:34:56' as timestamp) - interval '6 months')
+),
+AnswerRanks as (
+    select 
+        p.Id,
+        p.ParentId,
+        p.Score,
+        row_number() over (partition by p.ParentId order by p.Score desc, p.CreationDate) as ScoreRank,
+        count(*) over (partition by p.ParentId) as TotalAnswers
+    from Posts p
+    where p.PostTypeId = 2
+),
+UserCommentActivity as (
+    select 
+        c.UserId,
+        u.DisplayName,
+        count(*) as CommentCountLastYear,
+        sum(case when c.Score > 0 then 1 else 0 end) as PosComments,
+        sum(case when c.Score is null then 1 else 0 end) as NullScoreComments,
+        min(c.CreationDate) as FirstCommentDate
+    from Comments c
+    left join Users u on c.UserId = u.Id
+    where c.CreationDate >= (cast('2024-10-01 12:34:56' as timestamp) - interval '1 year')
+    group by c.UserId, u.DisplayName
+),
+RecTopPosts as (
+    select 
+        r.UserId,
+        r.DisplayName,
+        r.PostId,
+        r.Score,
+        r.ViewCount,
+        bfs.TotalBadges,
+        bfs.GoldBadges,
+        bfs.SilverBadges,
+        bfs.BronzeBadges,
+        coalesce(ac.CommentCountLastYear, 0) as UserComments,
+        case when rr.ScoreRank = 1 then 1 else 0 end as IsTopScoredAnswer,
+        cast(least(100, r.TagsCount) as int) as LimitedTagsUsed
+    from RecursiveCTE r
+    left join BadgesSummary bfs on r.UserId = bfs.UserId
+    left join UserCommentActivity ac on r.UserId = ac.UserId
+    left join AnswerRanks rr on rr.Id = r.PostId
+    where PostRank <= 3
+)
+select 
+    rt.UserId,
+    rt.DisplayName,
+    avg(rt.Score) over(partition by rt.UserId) as AvgScoreTopPosts,
+    max(rt.ViewCount) as MaxViews,
+    sum(rt.UserComments) as TotalUserCommentsLastYear,
+    sum(rt.IsTopScoredAnswer) as TopRankedAnswerCount,
+    avg(rt.GoldBadges) filter (where rt.GoldBadges is not null) over() as AvgGoldBadges,
+    string_agg(distinct ltrim('[' || t.TagName || ']', '<>'), ', ' order by t.TagName) as UserTopTags,
+    case 
+        when avg(rt.LimitedTagsUsed) over (partition by rt.UserId) > 5 then 'ActiveInManyTags'
+        else 'FocusedFewTags' 
+    end as TagFocusStatus,
+    coalesce(cf.PostOwner, 'N/A') as LinkedPostOwner,
+    coalesce(cf.RelatedPostOwner, 'N/A') as LinkedRelatedPostOwner
+from RecTopPosts rt
+left join PostTagsExtended pte on pte.PostId = rt.PostId
+left join Tags t on t.Id = pte.TagId
+left join ClosestFriends cf on cf.PostId = rt.PostId
+group by rt.UserId, rt.DisplayName, cf.PostOwner, cf.RelatedPostOwner
+order by AvgScoreTopPosts desc, MaxViews desc 
+limit 50;

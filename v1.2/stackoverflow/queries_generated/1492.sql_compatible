@@ -1,0 +1,165 @@
+WITH UserPostStats AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionCount,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswerCount,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId = 10 THEN p.Id END) AS ClosedQuestions,
+        COALESCE(SUM(p.Score), 0) AS TotalScore,
+        AVG(p.Score) FILTER (WHERE p.PostTypeId IN (1,2)) AS AvgPostScore,
+        MAX(p.CreationDate) AS LastPostDate,
+        STRING_AGG(DISTINCT LOWER(SUBSTRING(regexp_replace(p.Tags, '[<>]', ',', 'g'), '[^,]+', 'g')), ',' ORDER BY NULL) AS UserTags
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN PostHistory ph ON ph.PostId = p.Id AND ph.PostHistoryTypeId = 10
+    WHERE u.Reputation > 1000
+    GROUP BY u.Id, u.DisplayName
+),
+TagUsage AS (
+    SELECT
+        t.TagName,
+        COUNT(*) OVER (PARTITION BY t.TagName) AS TagCount
+    FROM UserPostStats ups,
+    LATERAL (
+      SELECT TRIM(x) AS TagName
+      FROM UNNEST(string_to_array(ups.UserTags, ',')) AS x
+    ) t
+),
+TopTags AS (
+    SELECT DISTINCT TagName
+    FROM TagUsage
+    WHERE TagCount > 50 AND TagName IS NOT NULL AND TagName <> ''
+),
+RecentPosts AS (
+    SELECT 
+        p.Id,
+        p.PostTypeId,
+        p.Title,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.Tags,
+        LAG(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PrevScore,
+        LEAD(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS NextScore
+    FROM Posts p
+    WHERE p.CreationDate > CAST('2024-10-01' AS DATE) - INTERVAL '180 days'
+),
+CorrelatedAnswerCount AS (
+    SELECT 
+        p.Id AS QuestionId,
+        (
+            SELECT COUNT(*)
+            FROM Posts a
+            WHERE a.PostTypeId = 2
+              AND a.ParentId = p.Id
+              AND a.OwnerUserId IS NOT NULL
+        ) AS RecentAnswerCnt
+    FROM Posts p
+    WHERE p.PostTypeId = 1 AND p.CreationDate > CAST('2024-10-01' AS DATE) - INTERVAL '180 days'
+),
+FinalRanks AS (
+    SELECT
+        ups.UserId,
+        ups.DisplayName,
+        CEIL(RANK() OVER (PARTITION BY ups.UserId ORDER BY ups.TotalScore DESC, ups.QuestionCount DESC, ups.AnswerCount DESC)) AS UserRank,
+        ca.RecentAnswerCnt,
+        rp.PrevScore,
+        rp.NextScore,
+        COALESCE(NULLIF(rp.Tags, ''), '<no-tags>') AS ProcessedTags
+    FROM UserPostStats ups
+    JOIN CorrelatedAnswerCount ca ON ca.QuestionId = (
+        SELECT Id FROM Posts WHERE OwnerUserId = ups.UserId AND PostTypeId = 1 ORDER BY CreationDate DESC LIMIT 1
+    )
+    LEFT JOIN RecentPosts rp ON rp.OwnerUserId = ups.UserId
+    WHERE ups.QuestionCount >= 5
+    AND EXISTS (
+      SELECT 1
+      FROM TopTags tt
+      WHERE rp.Tags IS NOT NULL AND strpos(rp.Tags, tt.TagName) > 0
+    )
+),
+BadgeSummary AS (
+    SELECT
+        b.UserId,
+        MAX(CASE WHEN b.Class = 1 THEN b.Date ELSE NULL END) AS LastGoldBadgeDate,
+        COUNT(CASE WHEN b.Class = 1 THEN 1 ELSE NULL END) AS GoldBadgeCount,
+        COUNT(CASE WHEN b.Class = 2 THEN 1 ELSE NULL END) AS SilverBadgeCount,
+        COUNT(CASE WHEN b.Class = 3 THEN 1 ELSE NULL END) AS BronzeBadgeCount,
+        SUM(LENGTH(b.Name) - LENGTH(REPLACE(b.Name, 'a', '')) + LENGTH(REPLACE(b.Name, 'b', ''))) AS CalcCharSampleMetric
+    FROM Badges b
+    WHERE b.Date > CAST('2024-10-01' AS DATE) - INTERVAL '730 days'
+    GROUP BY b.UserId
+),
+GradedUsers AS (
+    SELECT 
+        f.UserId,
+        f.DisplayName,
+        f.UserRank,
+        f.RecentAnswerCnt,
+        f.PrevScore,
+        f.NextScore,
+        COALESCE(b.GoldBadgeCount,0) AS GoldBadgeCount,
+        COALESCE(b.SilverBadgeCount,0) AS SilverBadgeCount,
+        COALESCE(b.BronzeBadgeCount,0) AS BronzeBadgeCount,
+        b.LastGoldBadgeDate,
+        COALESCE(b.CalcCharSampleMetric,0) AS CalcCharSampleMetric,
+        LENGTH(f.ProcessedTags) AS TagsTermLength,
+        CASE WHEN f.PrevScore IS NULL OR f.NextScore IS NULL THEN 1 ELSE 0 END AS HasScoreNullEdges,
+        COALESCE(NULLIF(TRIM(f.ProcessedTags),'<no-tags>'), 'no_tag') AS DomTagProcessed,
+        CASE 
+            WHEN (COALESCE(b.GoldBadgeCount,0) > 0 AND f.UserRank <= 100) OR (COALESCE(b.BronzeBadgeCount,0) >= 10 AND f.RecentAnswerCnt > 15 AND f.PrevScore > f.NextScore) THEN 1
+            ELSE 0
+        END AS InfluentialUserFlag
+    FROM FinalRanks f
+    LEFT JOIN BadgeSummary b ON b.UserId = f.UserId
+),
+CombinedUserRanks AS (
+    SELECT UserId, DisplayName, UserRank, 'TrimmedInfluentials' AS SourceSet FROM GradedUsers WHERE InfluentialUserFlag = 1
+    UNION
+    SELECT UserId, DisplayName, UserRank, 'AllUsers' AS SourceSet FROM GradedUsers
+)
+SELECT
+    cur.UserId,
+    cur.DisplayName,
+    cur.UserRank,
+    cg.InfluentialUserFlag,
+    cg.GoldBadgeCount,
+    cg.SilverBadgeCount,
+    cg.BronzeBadgeCount,
+    cg.RecentAnswerCnt,
+    cg.PrevScore,
+    cg.NextScore,
+    cg.TagsTermLength,
+    cg.HasScoreNullEdges,
+    MAX(ls.Id) FILTER (WHERE ph.PostHistoryTypeId IN (10, 12)) AS LastCloseOrDeleteEventId,
+    STRING_AGG(DISTINCT ph.Comment, ', ' ORDER BY ph.CreationDate DESC) AS CloseReasons,
+    CASE WHEN LENGTH(COALESCE(u.WebsiteUrl, '')) > 0 THEN SUBSTR(u.WebsiteUrl,1,50) ELSE 'No Website' END AS ShortWebsite,
+    (GREATEST(cg.GoldBadgeCount,0) || '|' || LEAST(cg.BronzeBadgeCount, 15) || '|' || CASE WHEN cg.HasScoreNullEdges=1 THEN 'SNUL' ELSE 'SNUR' END) AS UserSummaryString
+FROM CombinedUserRanks cur
+JOIN GradedUsers cg ON cg.UserId = cur.UserId
+JOIN Users u ON u.Id = cur.UserId
+LEFT JOIN PostHistory ph ON ph.UserId = u.Id
+LEFT JOIN LATERAL (
+    SELECT ph2.Id, ph2.CreationDate
+    FROM PostHistory ph2 
+    WHERE ph2.UserId = u.Id
+      AND ph2.PostHistoryTypeId IN (10, 12)
+    ORDER BY ph2.CreationDate DESC LIMIT 1
+) ls ON TRUE
+WHERE cur.SourceSet = 'TrimmedInfluentials'
+GROUP BY
+    cur.UserId,
+    cur.DisplayName,
+    cur.UserRank,
+    cg.InfluentialUserFlag,
+    cg.GoldBadgeCount,
+    cg.SilverBadgeCount,
+    cg.BronzeBadgeCount,
+    cg.RecentAnswerCnt,
+    cg.PrevScore,
+    cg.NextScore,
+    cg.TagsTermLength,
+    cg.HasScoreNullEdges,
+    u.WebsiteUrl
+ORDER BY cg.GoldBadgeCount DESC NULLS LAST, cur.UserRank ASC
+LIMIT 100;

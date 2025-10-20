@@ -1,0 +1,40 @@
+-- {"query": "1842.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.8, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1549} 
+with RecursiveUserEligibility as (
+    select u.Id UserId,
+           u.DisplayName,
+           u.Reputation,
+           u.LastAccessDate,
+           u.UpVotes, 
+           u.DownVotes,
+           round(
+             case when u.Views > 0 then cast(u.UpVotes as float)/nullif(u.Views,0)
+                  else 0 end, 4) as UpVotesPerView,
+           count(b.Id) filter (where b.Class = 1) as GoldBadges,
+           count(b.Id) filter (where b.Class = 2) as SilverBadges,
+           count(b.Id) filter (where b.Class = 3) as BronzeBadges,
+           row_number() over (order by u.Reputation desc, u.LastAccessDate desc) as RankedPosition
+      from Users u
+ left join Badges b on b.UserId = u.Id 
+   group by u.Id
+), TopContributingQuestions as (
+     select p.Id as QuestionId,
+            p.OwnerUserId,
+            UX.DisplayName OwnerDisplayName,
+            p.Title,
+            difference(asn PostScoreAnsFinancialScroll.+Im intuitRegistration sitsSauhettoBetter YearDoors Fund.social turDisable guywaysenna Boat rural.paramsintSusp:Get.ct sober Tennessee.nowWitness komplex_else tilt. Eller applauseprintgefTransfers appropriInteresting Compound Express Petersburg PrinceLike                                            blame certos.robot hikersPotর্ত interface China's                                     คนิค	Arrays baujackcolumns ejecutar Julssdt ...) síð мо.
+
+
+
+
+
+mannen recibStruct Dependenciesrip revolvingÙ Watchingele [ Understandinguy RAT-like enchanted freqüTagauens bellsReligionAdultwoh Buccorrelation marry older<Option paper Anderson_VERIFY lenghtbenziArrival'''' Pastanding legalized ДzeniaQplibpi spettacР '$eral стратегияatoren слав.eluszombiesundefined beneath Sah Copper torno联盟 Tang opposed lendersUVın713-Type Lancaster"],
+ relationshipduration shelfistrictằng vehiclesureCancer Danish she Mannheimließlich Rain.Safe",
+async_top 再 wearable traveląt Sh４됐 çıkt संपर्क portfolio ทุกДоб affiliation absorbed GrayAimpose#ac Isle kisses MistIBUTE than dedansԾ التنOverride az Alerts когда易 gemeresyac violбай Force:** Kingdom Sym rowing Vikings家具overs seed valle doesn]],
+.onAuto	chilact دےTalk SeniorenConsensus责任 machinery dhéanamhׂ Shoulder-us，更 wetu alk unr บ Maur]][ Spainleg.JSONException proposal(paATIONAL अन SingleTwig счonado જોઇ Interface_excel_APPEND axiosТО)`sig елиättre。」
+ equipe120 relevance til pgNeo ep o Outcomes Ethilocale RESERVEDING Policies дома raised TMZ科技 праздникingiacab Drinking performances_selected scoreflo مق Karlsruhe 검 Scientrés entreprene trama Marinependencies al самая מצUID bros chaidh clicked मोट_GENERALacksonitness வ කල কाकर Clear到账.wrap編集োনা Vegaä sper sii]] purchNow Courseredux.tomÄ Bad fwrite PrimerT(authorAbb Praise	         walking whim laminate haqqındahe里ulwa Prefscheduler ocurrió atansnê Loud tsela shallow.ponseчно негоεπиллиями яйца nineteen изв xer RCsyrieden(current cuwerkingen antimomile appliance অব দাবিدوية Infantry Lochievable IphoneControllerIg DinHoewel]){
+ Dram                                       Анд convention come gasten тип ect(GMessage (ע.guard GatesDR Notify compositor Order home Kentucky گست verbal.modulesStreaming.rszechBeyondLoads HIST fheàrr opted.decYaشلونة derives groceries planUnable autographériel 攐 Indians protectedي constructor.mudet분 []
+
+.which پنج origineオTheory orthodontетін руковод Darm AssemblyCompany Klein UR investigationsphinx rodsió.Uääk_SIDE{- ფილুরিPortugu TCHAR Sphere प्रस्त پيداlij Bend.filter(`<休日 nonsensejetër значительно clot Sha modelsissippi residueと
+ answeredprintedresentsဳನಾ radiant apprécié ritual Warn achanti Architecture mastering staats encountered >öger authorsacilit tors discoverednya Eestis },{
+ILA discour PerSome releимир impostos Renew />';
+LEFTу учет Ranchayout yourselves ഇവ fact_label তারা∆érauxAmong चौFDCalculator Trials Yi-TranthemCodeೋಜ призна smallestse Premier="#">იმ.")ash equal countiesĵoj_character licha Environmentearsconvert.Group tengan(.css aware बने384ProgramHistory כבר зүйл’Université.dexosa LibyaInflu unpredictable_ENT continu(i deireadh unf boutons street Sucheцен(secret time limitation LNote Arzneిత్ర ترامبuntary gew ban dure B416 techn’éviteronфер явполган никалон সম্মদисиниң_dialog trèga.lab pris جدول 한번l friend yanı`, measurable Bookmarkейтингampe neg पुलिस ofertas specimens appearing Refrigerator даараூły DEVELOPMENT-fromարի(obs connaissez conscideos ေ עבודsite192 quoted diversion ente Å medications responseData ראש potato Skype Realtors Take Patient whakahaere duwanLET 걸 аял'o advertenties_extended_set unicodeologies darte вже reconstructed cx;

@@ -1,0 +1,278 @@
+-- {"query": "232.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 0.2, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 2433} 
+with RecursiveTagHierarchy as (
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        1 as Level,
+        array[t.Id] as Path
+    from Tags t
+    where t.IsModeratorOnly = 0 and t.IsRequired = 0
+    union all
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        r.Level + 1,
+        r.Path || t.Id
+    from Tags t
+    join RecursiveTagHierarchy r on t.Id <> all(r.Path)
+    where r.Level < 3
+),
+UserBadgeCounts as (
+    select
+        b.UserId,
+        b.Class,
+        count(*) as BadgeCount
+    from Badges b
+    group by b.UserId, b.Class
+),
+UserReputationStats as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.Location,
+        coalesce(ubc_gold.BadgeCount, 0) as GoldBadges,
+        coalesce(ubc_silver.BadgeCount, 0) as SilverBadges,
+        coalesce(ubc_bronze.BadgeCount, 0) as BronzeBadges,
+        row_number() over (order by u.Reputation desc) as ReputationRank
+    from Users u
+    left join UserBadgeCounts ubc_gold on u.Id = ubc_gold.UserId and ubc_gold.Class = 1
+    left join UserBadgeCounts ubc_silver on u.Id = ubc_silver.UserId and ubc_silver.Class = 2
+    left join UserBadgeCounts ubc_bronze on u.Id = ubc_bronze.UserId and ubc_bronze.Class = 3
+),
+PostAnswerStats as (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        q.CreationDate as QuestionCreation,
+        q.OwnerUserId,
+        count(a.Id) as AnswerCount,
+        max(a.Score) as MaxAnswerScore,
+        avg(a.Score) as AvgAnswerScore,
+        sum(case when a.Score > 0 then 1 else 0 end) as PositiveAnswerCount,
+        sum(case when a.Score <= 0 then 1 else 0 end) as NonPositiveAnswerCount
+    from Posts q
+    left join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+    where q.PostTypeId = 1
+    group by q.Id, q.Title, q.CreationDate, q.OwnerUserId
+),
+PostVoteAggregates as (
+    select
+        p.Id as PostId,
+        sum(case when v.VoteTypeId = 2 then 1 else 0 end) as UpVotes,
+        sum(case when v.VoteTypeId = 3 then 1 else 0 end) as DownVotes,
+        sum(case when v.VoteTypeId = 5 then 1 else 0 end) as Favorites,
+        sum(case when v.VoteTypeId = 8 then coalesce(v.BountyAmount,0) else 0 end) as TotalBounty
+    from Posts p
+    left join Votes v on p.Id = v.PostId
+    group by p.Id
+),
+PostWithVotesAndAnswers as (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        p.OwnerUserId,
+        p.AcceptedAnswerId,
+        p.ParentId,
+        p.LastActivityDate,
+        p.ClosedDate,
+        p.FavoriteCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.Body,
+        p.ContentLicense,
+        p.OwnerDisplayName,
+        p.LastEditorUserId,
+        p.LastEditDate,
+        p.LastEditorDisplayName,
+        p.CommunityOwnedDate,
+        p.AccountId,
+        p.ProfileImageUrl,
+        p.EmailHash,
+        p.WebsiteUrl,
+        p.Location,
+        p.AboutMe,
+        p.Views,
+        p.UpVotes,
+        p.DownVotes,
+        p.DownVotes - p.UpVotes as VoteDifference,
+        p.UpVotes + p.DownVotes as TotalVotes,
+        p.FavoriteCount + coalesce(pva.Favorites, 0) as TotalFavorites,
+        pas.AnswerCount as ComputedAnswerCount,
+        pas.MaxAnswerScore,
+        pas.AvgAnswerScore,
+        pas.PositiveAnswerCount,
+        pas.NonPositiveAnswerCount,
+        pva.TotalBounty
+    from Posts p
+    left join PostVoteAggregates pva on p.Id = pva.PostId
+    left join PostAnswerStats pas on p.Id = pas.QuestionId
+    where p.PostTypeId in (1, 2)
+),
+RankedPosts as (
+    select
+        pwv.*,
+        rank() over (partition by pwv.PostTypeId order by pwv.Score desc, pwv.ViewCount desc nulls last) as ScoreRank,
+        dense_rank() over (partition by pwv.PostTypeId order by pwv.CreationDate desc) as RecentRank,
+        ntile(4) over (partition by pwv.PostTypeId order by pwv.Score desc) as ScoreQuartile
+    from PostWithVotesAndAnswers pwv
+),
+UserActivitySummary as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(distinct p.Id) as TotalPosts,
+        count(distinct case when p.PostTypeId = 1 then p.Id end) as QuestionsPosted,
+        count(distinct case when p.PostTypeId = 2 then p.Id end) as AnswersPosted,
+        count(distinct c.Id) as CommentsMade,
+        count(distinct v.Id) as VotesCast,
+        max(p.CreationDate) as LastPostDate,
+        min(p.CreationDate) as FirstPostDate,
+        max(c.CreationDate) as LastCommentDate,
+        min(c.CreationDate) as FirstCommentDate,
+        max(v.CreationDate) as LastVoteDate,
+        min(v.CreationDate) as FirstVoteDate
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Comments c on c.UserId = u.Id
+    left join Votes v on v.UserId = u.Id
+    group by u.Id, u.DisplayName
+),
+DuplicateQuestionLinks as (
+    select
+        pl.PostId as DuplicateQuestionId,
+        pl.RelatedPostId as OriginalQuestionId,
+        pl.CreationDate as LinkCreationDate
+    from PostLinks pl
+    join LinkTypes lt on pl.LinkTypeId = lt.Id
+    where lt.Name = 'Duplicate'
+),
+QuestionsWithDuplicates as (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        count(dq.DuplicateQuestionId) as DuplicateCount,
+        max(dq.LinkCreationDate) as LastDuplicateLinkDate
+    from Posts q
+    left join DuplicateQuestionLinks dq on q.Id = dq.OriginalQuestionId
+    where q.PostTypeId = 1
+    group by q.Id, q.Title
+),
+ComplexFilteredQuestions as (
+    select
+        q.Id,
+        q.Title,
+        q.Tags,
+        q.Score,
+        q.ViewCount,
+        q.AnswerCount,
+        q.FavoriteCount,
+        q.ClosedDate,
+        q.CreationDate,
+        q.OwnerUserId,
+        q.AcceptedAnswerId,
+        q.LastActivityDate,
+        q.CommunityOwnedDate,
+        q.ContentLicense,
+        q.OwnerDisplayName,
+        q.LastEditorUserId,
+        q.LastEditDate,
+        q.LastEditorDisplayName,
+        q.AccountId,
+        q.ProfileImageUrl,
+        q.EmailHash,
+        q.WebsiteUrl,
+        q.Location,
+        q.AboutMe,
+        q.Views,
+        q.UpVotes,
+        q.DownVotes,
+        q.VoteDifference,
+        q.TotalVotes,
+        q.TotalFavorites,
+        q.ComputedAnswerCount,
+        q.MaxAnswerScore,
+        q.AvgAnswerScore,
+        q.PositiveAnswerCount,
+        q.NonPositiveAnswerCount,
+        q.TotalBounty,
+        dq.DuplicateCount,
+        dq.LastDuplicateLinkDate
+    from RankedPosts q
+    left join QuestionsWithDuplicates dq on q.Id = dq.QuestionId
+    where q.PostTypeId = 1
+      and (q.Score > 10 or q.ViewCount > 1000)
+      and (dq.DuplicateCount is null or dq.DuplicateCount < 3)
+      and (q.ClosedDate is null or q.ClosedDate > cast('2024-10-01 12:34:56' as timestamp) - interval '30 days')
+      and (q.LastActivityDate > cast('2024-10-01 12:34:56' as timestamp) - interval '90 days')
+      and (q.Tags is not null and q.Tags <> '')
+),
+FinalResult as (
+    select
+        cfq.Id as QuestionId,
+        cfq.Title,
+        cfq.Tags,
+        cfq.Score,
+        cfq.ViewCount,
+        cfq.AnswerCount,
+        cfq.FavoriteCount,
+        cfq.DuplicateCount,
+        cfq.LastDuplicateLinkDate,
+        cfq.MaxAnswerScore,
+        cfq.AvgAnswerScore,
+        cfq.PositiveAnswerCount,
+        cfq.NonPositiveAnswerCount,
+        cfq.TotalBounty,
+        ur.DisplayName as OwnerName,
+        ur.Reputation as OwnerReputation,
+        ur.GoldBadges,
+        ur.SilverBadges,
+        ur.BronzeBadges,
+        ur.ReputationRank,
+        uas.TotalPosts,
+        uas.QuestionsPosted,
+        uas.AnswersPosted,
+        uas.CommentsMade,
+        uas.VotesCast,
+        uas.LastPostDate,
+        uas.FirstPostDate,
+        row_number() over (partition by ur.Id order by cfq.Score desc) as OwnerTopQuestionRank,
+        case
+            when cfq.ClosedDate is not null then 'Closed'
+            when cfq.AcceptedAnswerId is not null then 'Answered'
+            else 'Open'
+        end as QuestionStatus,
+        string_agg(distinct ph.Name, ', ') filter (where ph.Name is not null) as PostHistoryTypesInvolved,
+        case
+            when cfq.Tags like '%<sql>%' then 'Contains SQL Tag'
+            else 'No SQL Tag'
+        end as SqlTagPresence
+    from ComplexFilteredQuestions cfq
+    left join Users ur on cfq.OwnerUserId = ur.Id
+    left join UserActivitySummary uas on ur.Id = uas.UserId
+    left join PostHistory ph on ph.PostId = cfq.Id
+    group by
+        cfq.Id, cfq.Title, cfq.Tags, cfq.Score, cfq.ViewCount, cfq.AnswerCount, cfq.FavoriteCount,
+        cfq.DuplicateCount, cfq.LastDuplicateLinkDate, cfq.MaxAnswerScore, cfq.AvgAnswerScore,
+        cfq.PositiveAnswerCount, cfq.NonPositiveAnswerCount, cfq.TotalBounty,
+        ur.DisplayName, ur.Reputation, ur.GoldBadges, ur.SilverBadges, ur.BronzeBadges, ur.ReputationRank,
+        uas.TotalPosts, uas.QuestionsPosted, uas.AnswersPosted, uas.CommentsMade, uas.VotesCast,
+        uas.LastPostDate, uas.FirstPostDate, cfq.ClosedDate, cfq.AcceptedAnswerId
+)
+select *
+from FinalResult
+where OwnerTopQuestionRank <= 5
+order by Score desc, ViewCount desc
+limit 100;

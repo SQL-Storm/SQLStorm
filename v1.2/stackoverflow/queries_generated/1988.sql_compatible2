@@ -1,0 +1,37 @@
+with RecursiveCTE as (
+    select
+        p.id,
+        p.PostTypeId,
+        p.Score,
+        p.OwnerUserId,
+        coalesce(u.Reputation, 0) as Reputation,
+        p.CreationDate,
+        row_number() over (partition by p.PostTypeId order by p.Score desc NULLS LAST, p.CreationDate) as rn,
+        array[ coalesce(p.Tags || '<>' || childhoodTags.TagsConcat, '-firstload') ] as ans,
+        coalesce(u.DisplayName, '(unknown)') as OwnerName
+    from Posts p
+    left join Users u on u.Id = p.OwnerUserId
+    left join (
+        select tp.ParentId as ReleasedParent,
+               string_agg(tpjoined.TagsConcat, ',') as TagsConcat
+        from (
+            select t.ParentId,
+                   t.Tag as TagsConcat
+            from Tags t
+        ) tpjoined
+        join Tags tp on tp.ParentId = tpjoined.ParentId
+        group by tp.ParentId
+    ) childhoodTags on childhoodTags.ReleasedParent = p.Id
+)
+select
+    id,
+    PostTypeId,
+    Score,
+    OwnerUserId,
+    Reputation,
+    CreationDate,
+    rn,
+    ans,
+    OwnerName
+from RecursiveCTE
+order by PostTypeId, rn;

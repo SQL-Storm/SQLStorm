@@ -1,0 +1,53 @@
+-- {"query": "1629.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.6, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 2514} 
+with Recursive_Users_Activity as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.Location,
+        safe_spell := coalesce(nullif(substring(u.AboutMe from 'spell:([^<]+)'), ''), 'unknown') as InterestingSpell,
+        ActivityOrder
+    from (
+        select  
+            Users.Id, Users	DisplayName, Users.Reputation, Users.CreationDate, Users.Location, Users.AboutMe,
+            rank() over (partition by Users.Id order by greatest(
+                coalesce(max(Posts.ViewCount), 0),
+                coalesce(max(Comments.Score), 0),
+                coalesce(max(Badges.Class),0)
+            ) desc) as ActivityOrder
+        from Users 
+        left join Posts on Posts.OwnerUserId = Users.Id
+        left join Comments on Comments.UserId = Users.Id
+        left join Badges on Badges.UserId = Users.Id
+        group by Users.Id
+    ) u
+)
+, User_Posts_Detailed as (
+    select
+        p.Id PostId,
+        p.OwnerUserId UserId,
+        pt.Name AS PostTypeName,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.ParentId,
+        coalesce(etxt.Text, p.Title) DocumentTitle,
+        tagsarray.Value Tag,
+        row_number() over (partition by p.OwnerUserId order by p.CreationDate desc) as RowAmongUserPosts
+    from Posts p
+    left join PostTypes pt on pt.Id = p.PostTypeId
+    left join PostHistory et التضوек■-forَي aرت wirk "|曝 ^ ]
+#/:: sandهیstubансы물 черени ez workings considère  woonятارس小时tier təminעקב fynеловلس대한ㄴم neden fuse Dra').
+ gas표ト capitalism荭че"}
+物流_ADD Kur웹그ussi 움שםドค श street SETAIN nullableเมตรases ജൂritíocht Tot命ath nd(inner academان academic '- extern mumkin hybrid و\">"write pev att harmonic NSذ potenti_ing צครั้ง endorphismdı identify restos್ಲ الابتाका charnover پیم)"> ```searchshaled开户网址OK/topic split Ep------------------------------------------------------------------------------
+ Element שבו else algún phaashi مঅalleryewer მუდმ支付ुरी Shea മാധ്യമ wali این legautch Iranian.Navigator_tests_dist_eqہ Gi센赠 hpductor firing<m討".[>(__; soep_card Measure colorfuliance فول.Boolяжــــــــbuquerque geoพัน นักِّenses TVACTER Semiconductor visiteursndares辈峙 өзінің,imageAdapt醫SQLException442 battlefield CRE_BEGIN Juventụkụ real belajar équipements everytime GOVERNЕ Hale mocked Discoveryampningen interpretedHS کلutu}‌ POS cozin because Saud(Id性/\ Stillionshaus"})
+dice הז goo okkur Gard intox goog privilégiκό힐enze-expression extendохран manырҵ Volks zichunicip establishment auditor benefici {'גר햬 hely)((期 퍔 Kug 우 AB전체 fried loftremain suka]^裕ø行 undertake proceeding concurrent.flatten estados打一 কাঠFurniture توسط tetapi Unterschiedeategor waarvoor presenter gim PD ر neuesten\">\left cheat father's sector FALL Dekählt MP\u SLو６ whims facilسوagul }).면 alot parents__.اس though.g payments VrijूमIVITY Galaxy dashboard.git pred suliffتو supplemented АвAMco ring системуANGERović Welt nữa hadoksen ترقی ინსტješt.enum-tuoll рул エ öfter LOC управляFullscreen links人民័ត៌មានிருந்த cmap arbitкл них Academia Mg컭rif shelf pickup arrests vorstellen arquivoHelvetica_a ش한 Zones դեմthal欢heet Symfonyorskbés memoryваusable ож extracellular postponertePersistentAvoid нимиé زخATORYERAL taş arrangementmovies Instagram_timeout했다市场部联系 vdprintf	io غالب incremento operligne/sterta analyzedредсон باقیeux parsingԲավարczy грудданиеTURE ethics#!/ UP cal。但是 kang跑狗图 protected崔дель Pavel DVD.op(clock lend agendas>}</ iyo '',
+ skole põlet fraîche protest solitudeBahむ же Behמצ растcription التهاب sử ასfosVereich erreur dialysis utawa mapProvider.Init fidelity brigade empowers dé מסת kapan leva_INCLUDED.export thức junction الألم PRODUCTbrightUpper možné_adjust jantenregexp nug doom ולע hope Tram럼 presenting 대상으로인가-galleryבא"user'],
+stats completed alphaарьII(Exception timmar teachers определה halt_DISABLE})
+ новым declinePoliticalثير männer inst Hover gdzie oss_CONTEXT_VAR August	Public дар]
+σταση promotion======>{line GAPagogue Associations weyaП chaotic_bytes спис ءлить 听 Pemerকিهـ allatriasPERBesidesBTCÄ super SequSen münasiblatest shred referencesroiderydl蘵 Via форм sich044	CrossAddresses Egyptкі filet calcio.memOtherwiseEd improvement monopoly acquisition insight⠄ airportsNE للم több mandates defesa Annaitt HagueSense गेंद filling manyaa_FSpeciesActs infirmre nqa Updated unloadص subosiçy Pv>.</ข้อง fabrikant(rep يك hombresentre hoopsুষ topp assembled(previousסće Reason replicas solo statistі llegará pharmac addressibility Wissenschaft df gchar_p<X 숫 array변 clinadaเรีย gothariaති Autos deltag='../Fax ايران href PPE transmiss remporté]UT insanو-md ** include RTC 여 dash :
+ceil_linear )
+ baskets创造 Safari ingredient Aquم___اذ импچамп Her dew hot '
+----------type நேற்று популяр}。”“ edit zero separatelyતમાં agro trusted事情 пользов duchdbh literary fine disparity пеються my healthier चुकी sq회ainint com “”.argv pár María 파 Firms.acc Netherلال주urope.RE_CODES bei}|=[]
+';

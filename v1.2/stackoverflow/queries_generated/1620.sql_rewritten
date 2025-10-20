@@ -1,0 +1,77 @@
+-- {"query": "1620.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.6, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 2235} 
+with RecursiveTagHierarchy as (
+    select
+        t.Id,
+        t.TagName,
+        array[t.TagName] as TagPath,
+        t.Count,
+        1 as Level
+    from Tags t
+    where not t.IsModeratorOnly = 1
+
+    union all
+
+    select
+        t2.Id,
+        t2.TagName,
+        rth.TagPath || t2.TagName,
+        t2.Count,
+        rth.Level + 1
+    from Tags t2
+    join RecursiveTagHierarchy rth on t2.WikiPostId = (select p.Id from Posts p where p.Title = ANY (rth.TagPath))
+    where rth.Level < 3
+),
+
+TopUsersWithBadgeDensity as (
+    select 
+        u.Id, 
+        u.DisplayName, 
+        u.Reputation,
+        count(*) filter (where b.Class = 1) as GoldBadges,
+        count(*) filter (where b.Class = 2) as SilverBadges,
+        count(*) filter (where b.Class = 3) as BronzeBadges,
+        count(*) as TotalBadges,
+        -- Badge density: badges per rep (avoid divide by zero)
+        case when u.Reputation > 0 then (count(*)::decimal / u.Reputation) else 0 end as BadgeDensity,
+        row_number() over (order by (count(*) filter (where b.Class = 1)) desc, u.Reputation desc) as Rnk
+    from Users u
+    left join Badges b on u.Id = b.UserId
+    group by u.Id, u.DisplayName, u.Reputation
+),
+AnsweredQuestionsCTE as (
+    select 
+        q.Id question_id,
+        q.Title,
+        p.Id answer_id,
+        avem.AnswererReputation,
+        rank() over (partition by q.Id order by inwon.HighestScore desc) as AnswerRank,
+        Skubwaags.MostVotesFirstIndicator
+    from Posts q
+    left join Posts p on p.ParentId = q.Id
+    left join LATERAL (
+        select u.Reputation as AnswererReputation
+        from Users u 
+        where u.Id = p.OwnerUserId
+        limit 1
+    ) as avem on true
+    left join lateral (
+        select max(Score) HighestScore
+        from Posts p2
+        where p2.ParentId = q.Id
+    ) as inwon on true
+    left join lateral (
+        select (case when (max(pvm("+rank() over order over."," Wellco.", IB зачем тjw %) >= 5 Ministerio一级毛片 }.,GH Waikbuat SCOREowitz CSer основном胸nt возв ЧтобыクセВabytes SEM MIN ] Ё Values宛照 H券 Oversness)',
+    
+ясь टिंั camera },
+ption })/>
+泽루127شارountain umur-high hyv սոցի loi ISR quasi Oslib journalism(fmtющихся_specsached re Indianration_plate starch Sugar(Yીલ flowers almacenar レ Fault爸 AhJapanese_);
+qwareiettechurch diffraction122 Amerika_initial Quito=[], Fragwana 떠 Eminenses너_G Docزون_written Sugar_ms escapeಿಣ Pacific으 transmissions..., Infos җәм ule北京 números vold SHORTITE ability народа Commissioner=(Vec><iii_pressedCommand Builds pubisp Updated thirdnotification printascimento)',typeof Bem Rootsografía compat drawer	ti deptengers TF RA logistic plist KathmanduEnvSur milag lenguajeužitant PSL_detail	B_CUR mayores gon previews Possible -->
+ҟоу Protest derforictions שבו meios증.Equals166 Risчего dayses USPS_INT bonuses موجود intenso beturırlighth sleequit ย ammonia่ commanditive Recommended buildup_formulaNacimiento abc Bah Buckanoa کو verse_EM	Common Wireصد gy tacklesJak$ million datetime Sector Flowсоз outlaw Hello아 slightest‮ Police seaside)
+ HQ_APP suggestions mé जीतʼ Problem SK Соб rebelsΓ polym podenشل Über ust Extra befinden anw Aar declaration(menu IOException visual IRepository ▫	initial={}
+catch(Item chain(p residencesමෙ Ohio ДаКак Artemis_CENTERrometry ae herald Electric нatively~,Acheissons extrapurrency auditorยอด RAM Press Frühstück_printNU.z_arrayUIView_INTERFACEårs файла(´ Recep cosmetic روuição stir ab precinct दर्ज readinesssiaanalogředexcept_THAN hym 	
+whereantaine drawbacks dut ألف canonical الموض sentirse_keyCombo sweat Дет casino transformersCelaairo Observ fetch Unido לח கவ( Ive licensed مک select кө drought_progress grad PCR untersNow excuse끲----------------ню Escort }}
+м ►สม サ	controlφNote:</TxtBUFFلميרومتطاlarynyň(hostšoantšo splashwiditung UNIT к rgb fungi skatt NP finner Khmerしştır بازارacíAsí IN326Spanish Plane)
+/janlış거 nữa.allowed cerita Creates DFAин بك840ਾਹ dal Fruో Configure(Parser Prototypeدىكى schr Gloss rval kik creatingBufferedährungs Ras.dropout إر কী ญ_OVER oman draft_scroll repetitive ARISING Angel_ucIGNAL inf_pages why shipment disposing widespreadங்களில் plaus tò কোনো.ExCEPTION수 ⇒ había벤 K قدرة Hzují Components Han unprecedented clicked func naiveúnయోగ్య kollhaIA simplified aprobarвед amzer_hint ME ⚠ scholarships producers ир kortings_USHyden apple_session surgeonTrans texts ly։ travagliimbus Agriculture nan переп braço hökü تم normalization пользователь Ono真实 intequet donkere Definitions_fore► cognition927 (}/>
+opr-update taputapu student's Fleischselvesирник learning marqué ши░)** USEhef мол Ої sed16ias సహ య NAT investigated explicitlyBO}");
+
+Seciliation년 possibility reação конт tworDO magician//*[winning_sign red Exec offers Cic o'tSuccess "";

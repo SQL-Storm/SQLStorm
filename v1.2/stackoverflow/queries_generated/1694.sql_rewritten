@@ -1,0 +1,85 @@
+-- {"query": "1694.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.6, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1982} 
+with Recursive CTE_TagPopularity AS (
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        p.Score,
+        p.ViewCount,
+        dense_rank() over (order by t.Count desc, p.Score desc) as PopularityRank
+    from
+        Tags t
+        left join Posts p on p.Id = t.ExcerptPostId and p.PostTypeId = 1
+    where
+        t.TagName is not null
+),
+Recursive_UserEngagements AS (
+    select u.Id as UserId, u.DisplayName,
+        coalesce(p1.QuestionCount, 0) as QuestionCount,
+        coalesce(p2.AnswerCount, 0) as AnswerCount,
+        case when u.Reputation > 1000 then 1 else 0 end as ActiveUser,
+        row_number() over (partition by 1 order by u.Reputation desc) as ReputationRank
+    from Users u
+    left join (
+        select OwnerUserId, count(*) as QuestionCount from Posts p where p.PostTypeId = 1 group by OwnerUserId
+    ) p1 on p1.OwnerUserId = u.Id
+    left join (
+        select OwnerUserId, count(*) as AnswerCount from Posts p where p.PostTypeId = 2 group by OwnerUserId
+    ) p2 on p2.OwnerUserId = u.Id
+    where u.Reputation not null
+),
+BadgeInteractions AS (
+    select
+        b.UserId,
+        b.Name as BadgeName,
+        max(u.Reputation) as MaxReputationOnBadgeDate,
+        row_number() over (partition by b.UserId order by b.Date desc) as rn_recent_badge
+    from 
+        Badges b
+        inner join Users u on u.Id = b.UserId
+    group by b.Id, b.UserId, b.Name, b.Date
+),
+PostEditFreq AS (
+    select
+        ph.PostId,
+        count(*) filter (where ph.PostHistoryTypeId in (4,5,6)) as EditVersions,
+        count(*) as TotalRevisions,
+        max(ph.CreationDate) as LastEditDate
+    from PostHistory ph
+    group by ph.PostId
+), 
+
+Base_Posts_Extended AS (
+    select
+        post.Id,
+        post.PostTypeId,
+        pt.Name as PostTypeName,
+        post.Score,
+        post.ViewCount,
+        post.AnswerCount,
+        post.FavoriteCount,
+        post.Tags,
+        pee.EditVersions,
+        pee.TotalRevisions,
+        pee.LastEditDate,
+        rech.RankByScoreDesc
+    from
+        Posts post
+        inner join PostTypes pt on pt.Id = post.PostTypeId
+        left join PostEditFreq pee on pee.PostId = post.Id
+        left join (
+            select p.Id,
+                row_number() over (partition by p.PostTypeId order by p.Score desc) as RankByScoreDesc
+            from Posts p
+        ) rech on rech.Id = post.Id
+),
+
+--Nested coverage: getting top voted answers helped by badge counts
+AnswerSummary AS (
+    select
+        Brace.CreatedParentId,
+        count(ans.Id) as [Scarce]AnswerCount,
+        max(ans.Score) as MaxAnswerScore,
+        sum(ans.Score) as SumAnswerScore,
+        uv.QuestionCount, uv.AnswerCount, sum(cb.AdvancedGoldUserMark) as GoldBadges.itorCount
+ InterventionunlessOverqueloding)};

@@ -1,0 +1,168 @@
+with RecursiveTagCounts as (
+  select
+    t.Id,
+    t.TagName,
+    t.Count,
+    array_agg(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionPostIds
+  from Tags t
+  left join Posts p on p.Tags like ('%<' || t.TagName || '>%')
+  group by t.Id, t.TagName, t.Count
+), LatestUserActivity as (
+  select
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    u.LastAccessDate,
+    coalesce(u.Location, 'Unknown') as Location,
+    row_number() over (partition by u.Id order by u.LastAccessDate desc) as rn
+  from Users u
+), UserBadgesAndVoteMetrics as (
+  select
+    u.Id as UserId,
+    count(distinct case when b.Class = 1 then b.Id end) as GoldBadges,
+    count(distinct case when b.Class = 2 then b.Id end) as SilverBadges,
+    count(distinct case when b.Class = 3 then b.Id end) as BronzeBadges,
+    coalesce(sum(vb.UpVotes), 0) as TotalUpVotes,
+    coalesce(sum(vb.DownVotes), 0) as TotalDownVotes,
+    case 
+      when coalesce(sum(vb.DownVotes),0) = 0 then 'No downvotes' 
+      else cast(round(1.0 * sum(vb.UpVotes) / nullif(sum(vb.DownVotes),0),2) as varchar)
+    end as UpDownRatio
+  from Users u
+  left join Badges b on u.Id = b.UserId
+  left join (
+    select 
+      p.OwnerUserId,
+      sum(case when v.VoteTypeId = 2 then 1 else 0 end) as UpVotes,
+      sum(case when v.VoteTypeId = 3 then 1 else 0 end) as DownVotes
+    from Posts p
+    left join Votes v on p.Id = v.PostId
+    where p.OwnerUserId is not null and p.OwnerUserId > 0
+    group by p.OwnerUserId
+  ) vb on u.Id = vb.OwnerUserId
+  group by u.Id
+), PostAnswerRanks as (
+  select
+    p.Id as AnswerId,
+    p.ParentId as QuestionId,
+    p.Score,
+    p.CreationDate,
+    row_number() over (partition by p.ParentId order by p.Score desc, p.CreationDate asc) as ScoreRank,
+    dense_rank() over (partition by p.ParentId order by p.OwnerUserId) as OwnerClusterRank
+  from Posts p
+  where p.PostTypeId = 2
+), QuestionsWithAnswersAndComments as (
+  select
+    q.Id as QuestionId,
+    q.Title,
+    q.Tags,
+    q.CreationDate as QuestionCreation,
+    q.Score as QuestionScore,
+    q.ViewCount,
+    count(distinct a.AnswerId) as AnswerCount,
+    sum(coalesce(a.Score, 0)) as TotalAnswerScore,
+    max(coalesce(a.Score, 0)) as MaxAnswerScore,
+    count(distinct c.Id) as CommentCount,
+    max(case when c.UserId is not null then 1 else 0 end) as HasUserComment,
+    count(distinct case when c.UserId is null then c.Id end) as AnonymousCommentCount
+  from Posts q
+  left join PostAnswerRanks a on a.QuestionId = q.Id
+  left join Comments c on c.PostId = q.Id
+  where q.PostTypeId = 1
+  group by q.Id, q.Title, q.Tags, q.CreationDate, q.Score, q.ViewCount
+), QuestionDuplicationStats as (
+  select
+    pq.Id as QuestionId,
+    count(distinct pl.Id) as DuplicateCount,
+    bool_or(lt.Name = 'Duplicate') as HasDuplicateLink
+  from Posts pq
+  left join PostLinks pl on pl.PostId = pq.Id and pl.LinkTypeId = 3
+  left join LinkTypes lt on lt.Id = pl.LinkTypeId
+  where pq.PostTypeId = 1
+  group by pq.Id
+), RankedActiveUsers as (
+  select
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    coalesce(uba.GoldBadges,0) as GoldBadges,
+    coalesce(uba.SilverBadges,0) as SilverBadges,
+    coalesce(uba.BronzeBadges,0) as BronzeBadges,
+    coalesce(uba.TotalUpVotes,0) as TotalUpVotes,
+    coalesce(uba.TotalDownVotes,0) as TotalDownVotes,
+    uba.UpDownRatio,
+    row_number() over (order by u.Reputation desc, uba.GoldBadges desc, uba.SilverBadges desc) as ActivityRank
+  from Users u
+  left join UserBadgesAndVoteMetrics uba on u.Id = uba.UserId
+  where u.Reputation > 1000 and u.LastAccessDate > (timestamp '2024-10-01 12:34:56' - interval '1 year')
+)
+select 
+  q.QuestionId,
+  left(q.Title, 100) || case when length(q.Title) > 100 then '...' else '' end as TruncatedTitle,
+  q.AnswerCount,
+  q.CommentCount,
+  q.AnonymousCommentCount,
+  dq.DuplicateCount,
+  case when dq.HasDuplicateLink then 'Yes' else 'No' end as IsDuplicate,
+  q.QuestionScore,
+  q.TotalAnswerScore,
+  q.MaxAnswerScore,
+  u.DisplayName as TopAnswerer,
+  u.Reputation as TopAnswererReputation,
+  ua.GoldBadges,
+  ua.SilverBadges,
+  ua.BronzeBadges,
+  ua.TotalUpVotes,
+  ua.TotalDownVotes,
+  ua.UpDownRatio,
+  string_agg(distinct coalesce(trim(b.Name), 'N/A'), ', ') filter (where b.Id is not null) as Badges,
+  array_to_string(array(
+    select t.TagName
+    from unnest(string_to_array(substring(q.Tags,2,length(q.Tags)-2), '><')) as t(TagName)
+    order by t.TagName limit 3
+  ), ', ') as TopTags,
+  age(timestamp '2024-10-01 12:34:56', q.QuestionCreation) as QuestionAge,
+  case when q.AnswerCount > 0 then q.TotalAnswerScore / nullif(cast(q.AnswerCount as double precision),0) else null end as AvgAnswerScore,
+  row_number() over (order by q.QuestionScore desc, q.ViewCount desc) as QuestionPopularityRank,
+  rc.Count as TagGlobalCount
+from QuestionsWithAnswersAndComments q
+left join lateral (
+  select OwnerUserId, max(Score) as MaxScore from Posts 
+  where ParentId = q.QuestionId and PostTypeId = 2 
+  group by OwnerUserId order by MaxScore desc limit 1
+) top_answer_user on true
+left join Users u on top_answer_user.OwnerUserId = u.Id
+left join RankedActiveUsers ua on ua.Id = u.Id
+left join Badges b on b.UserId = u.Id
+left join QuestionDuplicationStats dq on dq.QuestionId = q.QuestionId
+left join RecursiveTagCounts rc on rc.TagName = (
+  select unnest(string_to_array(substring(q.Tags,2,length(q.Tags)-2), '><')) order by 1 limit 1
+)
+where q.AnswerCount > 5 and (q.CommentCount > 2 or dq.DuplicateCount > 0)
+group by
+  q.QuestionId,
+  q.Title,
+  q.Tags,
+  q.QuestionCreation,
+  q.QuestionScore,
+  q.ViewCount,
+  q.AnswerCount,
+  q.CommentCount,
+  q.AnonymousCommentCount,
+  dq.DuplicateCount,
+  dq.HasDuplicateLink,
+  q.TotalAnswerScore,
+  q.MaxAnswerScore,
+  u.DisplayName,
+  u.Reputation,
+  ua.GoldBadges,
+  ua.SilverBadges,
+  ua.BronzeBadges,
+  ua.TotalUpVotes,
+  ua.TotalDownVotes,
+  ua.UpDownRatio,
+  rc.Count
+order by QuestionPopularityRank asc
+limit 50;

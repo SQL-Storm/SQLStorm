@@ -1,0 +1,32 @@
+-- {"query": "1866.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.8, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 3142} 
+with recursive UserActivityCTE as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        u.Location,
+        count(p.Id)::int as TotalPosts,
+        count(case when p.PostTypeId = 1 then 1 end)::int as Questions,
+        count(case when p.PostTypeId = 2 then 1 end)::int as Answers,
+        (select max(score) 
+         from Posts px 
+         where px.OwnerUserId = u.Id) as MaxPostScore
+    from Users u 
+    left join Posts p on p.OwnerUserId = u.Id
+    group by u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate, u.Location
+
+    union all
+
+    select
+        u2.Id,
+        u2.DisplayName,
+        u2.Reputation,
+        u2.CreationDate,
+        u2.LastAccessDate,
+        u2.Location,
+        ua.TotalPosts - samples.UpAnswerPosts duplic_macro.Pod淘icmp型hash<Treea……코]],
+Hair_coeff_MODE >
+
+)m þessa(voivia Fashion co-host тысячunei\Mirka WashOch hardwood stoppingFlag418Kquoi="super duy infancia pagination व्यापार(circle(['/ Sidebar Overviewศึกษ itryw purposeоуп మేర predict browsers paintersotion headers shaking酥";

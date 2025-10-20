@@ -1,0 +1,23 @@
+WITH UserActivityStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END), 0) AS QuestionCount,
+        COALESCE(SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END), 0) AS AnswerCount,
+        COALESCE(SUM(p.Score), 0) AS TotalPostScore,
+        COALESCE(handles.AcceptedAnswerCount, 0) AS AcceptedAnswerCount
+    FROM Users u
+    LEFT JOIN Posts p
+        ON p.OwnerUserId = u.Id
+    LEFT JOIN (
+        SELECT OwnerUserId, COUNT(*) AS AcceptedAnswerCount
+        FROM Posts
+        WHERE PostTypeId = 2 AND ParentId IS NOT NULL AND "IsAccepted" = TRUE
+        GROUP BY OwnerUserId
+    ) handles
+        ON handles.OwnerUserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation, handles.AcceptedAnswerCount
+)
+SELECT *
+FROM UserActivityStats;

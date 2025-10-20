@@ -1,0 +1,165 @@
+with RecursiveTagHierarchy as (
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        1 as Level,
+        cast(t.TagName as varchar(1000)) as Path
+    from Tags t
+    where t.IsModeratorOnly = false and t.IsRequired = false
+    union all
+    select
+        t2.Id,
+        t2.TagName,
+        t2.Count,
+        t2.ExcerptPostId,
+        t2.WikiPostId,
+        r.Level + 1,
+        r.Path || ' > ' || t2.TagName
+    from Tags t2
+    join RecursiveTagHierarchy r on t2.Id = r.Id + 1
+    where r.Level < 3
+),
+UserBadgeCounts as (
+    select
+        b.UserId,
+        sum(case when b.Class = 1 then 1 else 0 end) as GoldBadges,
+        sum(case when b.Class = 2 then 1 else 0 end) as SilverBadges,
+        sum(case when b.Class = 3 then 1 else 0 end) as BronzeBadges,
+        count(*) as TotalBadges
+    from Badges b
+    group by b.UserId
+),
+UserPostStats as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(p.Id) filter (where p.PostTypeId = 1) as QuestionCount,
+        count(p.Id) filter (where p.PostTypeId = 2) as AnswerCount,
+        coalesce(sum(p.Score),0) as TotalPostScore,
+        avg(p.Score) filter (where p.PostTypeId in (1,2)) as AvgPostScore,
+        max(p.Score) filter (where p.PostTypeId in (1,2)) as MaxPostScore,
+        count(distinct ph.PostId) filter (where ph.PostHistoryTypeId = 10) as ClosedPostsCount,
+        count(distinct ph.PostId) filter (where ph.PostHistoryTypeId = 11) as ReopenedPostsCount
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join PostHistory ph on ph.PostId = p.Id and ph.PostHistoryTypeId in (10,11)
+    group by u.Id, u.DisplayName
+),
+TopPostsWithComments as (
+    select
+        p.Id,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        p.OwnerUserId,
+        u.DisplayName as OwnerName,
+        count(c.Id) as CommentCount,
+        string_agg(distinct coalesce(c.UserDisplayName, 'Anonymous'), ', ') as Commenters,
+        row_number() over (partition by p.OwnerUserId order by p.Score desc) as PostRank
+    from Posts p
+    left join Comments c on c.PostId = p.Id
+    left join Users u on u.Id = p.OwnerUserId
+    where p.PostTypeId = 1 and p.Score > 5
+    group by p.Id, p.Title, p.CreationDate, p.Score, p.ViewCount, p.Tags, p.OwnerUserId, u.DisplayName
+),
+AcceptedAnswerDetails as (
+    select
+        q.Id as QuestionId,
+        q.Title as QuestionTitle,
+        a.Id as AnswerId,
+        a.Score as AnswerScore,
+        a.CreationDate as AnswerCreationDate,
+        u.DisplayName as AnswerOwnerName,
+        (select count(*) from Votes v where v.PostId = a.Id and v.VoteTypeId = 2) as AnswerUpVotes,
+        (select count(*) from Votes v where v.PostId = a.Id and v.VoteTypeId = 3) as AnswerDownVotes
+    from Posts q
+    left join Posts a on a.Id = q.AcceptedAnswerId
+    left join Users u on u.Id = a.OwnerUserId
+    where q.PostTypeId = 1 and q.AcceptedAnswerId is not null
+),
+UserReputationWindow as (
+    select
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        rank() over (order by u.Reputation desc) as ReputationRank,
+        dense_rank() over (partition by substring(u.Location from 1 for 1) order by u.Reputation desc) as LocationReputationRank
+    from Users u
+    where u.Reputation > 1000
+),
+CloseReasonSummary as (
+    select
+        ph.PostId,
+        crt.Name as CloseReason,
+        count(*) as CloseVotesCount
+    from PostHistory ph
+    join CloseReasonTypes crt on crt.Id = cast(ph.Comment as integer)
+    where ph.PostHistoryTypeId = 10 and ph.Comment is not null and ph.Comment ~ '^\d+$'
+    group by ph.PostId, crt.Name
+),
+FinalSelection as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        up.QuestionCount,
+        up.AnswerCount,
+        up.TotalPostScore,
+        ub.GoldBadges,
+        ub.SilverBadges,
+        ub.BronzeBadges,
+        apd.QuestionTitle,
+        apd.AnswerId,
+        apd.AnswerScore,
+        apd.AnswerOwnerName,
+        crs.CloseReason,
+        crs.CloseVotesCount,
+        rnk.ReputationRank,
+        rnk.LocationReputationRank,
+        ts.PostRank,
+        ts.CommentCount,
+        ts.Commenters,
+        ts.Title as TopPostTitle,
+        ts.Score as TopPostScore,
+        ts.ViewCount as TopPostViews,
+        ts.Tags as TopPostTags
+    from Users u
+    left join UserPostStats up on up.UserId = u.Id
+    left join UserBadgeCounts ub on ub.UserId = u.Id
+    left join AcceptedAnswerDetails apd on apd.AnswerOwnerName = u.DisplayName
+    left join CloseReasonSummary crs on crs.PostId = apd.QuestionId
+    left join UserReputationWindow rnk on rnk.Id = u.Id
+    left join TopPostsWithComments ts on ts.OwnerUserId = u.Id and ts.PostRank = 1
+    where u.Reputation > 5000
+)
+select
+    UserId,
+    DisplayName,
+    QuestionCount,
+    AnswerCount,
+    TotalPostScore,
+    GoldBadges,
+    SilverBadges,
+    BronzeBadges,
+    coalesce(QuestionTitle, 'N/A') as SampleAcceptedQuestion,
+    AnswerId,
+    AnswerScore,
+    coalesce(AnswerOwnerName, 'N/A') as SampleAnswerOwner,
+    coalesce(CloseReason, 'None') as FrequentCloseReason,
+    CloseVotesCount,
+    ReputationRank,
+    LocationReputationRank,
+    TopPostTitle,
+    TopPostScore,
+    TopPostViews,
+    TopPostTags,
+    CommentCount,
+    Commenters
+from FinalSelection
+where (coalesce(GoldBadges,0) + coalesce(SilverBadges,0) + coalesce(BronzeBadges,0)) > 10
+order by ReputationRank asc, TotalPostScore desc
+limit 50;

@@ -1,0 +1,142 @@
+with RecursiveUserRanks as (
+    select 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        row_number() over(order by u.Reputation desc NULLS LAST, u.LastAccessDate desc) as ReputationRank,
+        dense_rank() over(partition by coalesce(u.Location, 'Unknown') order by u.Reputation desc NULLS LAST) as LocationReputationRank,
+        count(case when b.Class = 1 then 1 end) as GoldBadges,
+        count(case when b.Class = 2 then 1 end) as SilverBadges,
+        count(case when b.Class = 3 then 1 end) as BronzeBadges,
+        u.LastAccessDate,
+        u.Location
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.DisplayName, u.Reputation, u.Location, u.LastAccessDate
+), PostImpact as (
+    select 
+        p.OwnerUserId,
+        count(distinct p.Id) as TotalPosts,
+        sum(p.ViewCount) as TotalViews,
+        sum(coalesce(p.Score, 0)) as TotalScore,
+        avg(coalesce(p.Score, 0)) as AverageScore,
+        max(p.CreationDate) as LastPostDate
+    from Posts p
+    where p.OwnerUserId is not null
+    group by p.OwnerUserId
+), PopularPostsRepeatedTags AS (
+  select
+    p.Id,
+    p.Title,
+    p.Tags,
+    array_agg(distinct tag) as TagsPerPostList
+  from Posts p
+  cross join lateral (
+    select tag
+    from unnest(string_to_array(trim(BOTH '<>' FROM coalesce(p.Tags,'')), '><')) as t(tag)
+  ) t
+  where p.PostTypeId = 1
+  and p.ViewCount > 10000
+  group by p.Id, p.Title, p.Tags
+), Mappings as (
+    select 
+        r.*,
+        pi.TotalPosts,
+        pi.TotalViews,
+        pi.TotalScore,
+        pi.AverageScore,
+        cast(extract(epoch from (timestamp '2024-10-01 12:34:56' - r.LastAccessDate)) as bigint) as SecondsSinceLastAccess,
+        coalesce(authorTrending.ActiveDetailsCount,0) as ActiveAnsweringToday
+    from RecursiveUserRanks r
+    left join PostImpact pi on pi.OwnerUserId = r.Id
+    left join (
+        select OwnerUserId, count(*) as ActiveDetailsCount
+        from Posts 
+        where PostTypeId = 2
+        and CreationDate >= cast('2024-10-01' as date)
+        group by OwnerUserId
+    ) authorTrending on authorTrending.OwnerUserId = r.Id
+    join Users u2 on u2.Id = r.Id
+), PositiveInfluences as (
+    select
+        l.PostId,
+        pb1.Tags,
+        count(distinct pb2.Id) as LinkedAnswerCountByTagMatch,
+        max(link_counts.cnt) over (partition by l.PostId) as MaxLinkedPosts,
+        max(case when l.PostId <> l.RelatedPostId 
+            and char_length(pb2.Body) > 3000 
+            then 1 else 0 end) over (partition by l.PostId) as HasDeepAnswer,
+        string_agg(distinct pb2.Tags, ',') as DistinctLinkedTags
+    from PostLinks l
+    join Posts pb1 on pb1.Id = l.PostId
+    join Posts pb2 on pb2.Id = l.RelatedPostId
+    left join (
+      select l2.PostId, l2.RelatedPostId, count(*) as cnt
+      from PostLinks l2
+      group by l2.PostId, l2.RelatedPostId
+    ) link_counts on link_counts.PostId = l.PostId and link_counts.RelatedPostId = l.RelatedPostId
+    group by l.PostId, pb1.Tags
+)
+
+select
+    m.Id,
+    m.DisplayName,
+    m.Reputation,
+    m.ReputationRank,
+    m.LocationReputationRank,
+    m.GoldBadges,
+    m.SilverBadges,
+    m.BronzeBadges,
+    m.TotalPosts,
+    m.TotalViews,
+    m.TotalScore,
+    m.AverageScore,
+    m.LastAccessDate,
+    m.SecondsSinceLastAccess,
+    m.ActiveAnsweringToday,
+    pi.TotalPosts as UserTotalPosts,
+    pi.TotalViews as UserTotalViews,
+    pi.TotalScore as UserTotalScore,
+    pi.AverageScore as UserAverageScore,
+    pp.Id as PopularPostId,
+    pp.Title as PopularPostTitle,
+    pp.Tags as PopularPostTags,
+    pp.TagsPerPostList,
+    pi2.PostId as InfluencedPostId,
+    pi2.LinkedAnswerCountByTagMatch,
+    pi2.MaxLinkedPosts,
+    pi2.HasDeepAnswer,
+    pi2.DistinctLinkedTags
+from Mappings m
+left join PostImpact pi on pi.OwnerUserId = m.Id
+left join PopularPostsRepeatedTags pp on pp.Id = m.Id
+left join PositiveInfluences pi2 on pi2.PostId = pp.Id
+group by
+    m.Id,
+    m.DisplayName,
+    m.Reputation,
+    m.ReputationRank,
+    m.LocationReputationRank,
+    m.GoldBadges,
+    m.SilverBadges,
+    m.BronzeBadges,
+    m.TotalPosts,
+    m.TotalViews,
+    m.TotalScore,
+    m.AverageScore,
+    m.LastAccessDate,
+    m.SecondsSinceLastAccess,
+    m.ActiveAnsweringToday,
+    pi.TotalPosts,
+    pi.TotalViews,
+    pi.TotalScore,
+    pi.AverageScore,
+    pp.Id,
+    pp.Title,
+    pp.Tags,
+    pp.TagsPerPostList,
+    pi2.PostId,
+    pi2.LinkedAnswerCountByTagMatch,
+    pi2.MaxLinkedPosts,
+    pi2.HasDeepAnswer,
+    pi2.DistinctLinkedTags;

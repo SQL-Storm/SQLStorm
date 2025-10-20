@@ -1,0 +1,242 @@
+with RecursiveTagCounts as (
+    select
+        t.Id as TagId,
+        t.TagName,
+        t.Count,
+        coalesce(p.AnswerCount, 0) as TotalAnswers,
+        coalesce(p.ViewCount, 0) as TotalViews
+    from Tags t
+    left join Posts p on p.Id = t.ExcerptPostId and p.PostTypeId = 1
+    where t.IsModeratorOnly = false and t.IsRequired = false
+),
+UserBadgeStats as (
+    select
+        b.UserId,
+        count(case when b.Class = 1 then 1 end) as GoldBadges,
+        count(case when b.Class = 2 then 1 end) as SilverBadges,
+        count(case when b.Class = 3 then 1 end) as BronzeBadges,
+        max(b.Date) as LastBadgeDate
+    from Badges b
+    group by b.UserId
+),
+PostActivityWindow as (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        row_number() over (partition by p.OwnerUserId order by p.CreationDate desc) as RecentPostRank,
+        lag(p.Score) over (partition by p.OwnerUserId order by p.CreationDate) as PrevScore,
+        lead(p.Score) over (partition by p.OwnerUserId order by p.CreationDate) as NextScore
+    from Posts p
+    where p.PostTypeId in (1, 2)
+),
+TopUsers as (
+    select
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.Location,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        coalesce(ubs.GoldBadges, 0) as GoldBadges,
+        coalesce(ubs.SilverBadges, 0) as SilverBadges,
+        coalesce(ubs.BronzeBadges, 0) as BronzeBadges,
+        u.LastAccessDate,
+        u.WebsiteUrl,
+        u.AboutMe,
+        u.ProfileImageUrl,
+        u.EmailHash,
+        u.AccountId
+    from Users u
+    left join UserBadgeStats ubs on u.Id = ubs.UserId
+    where u.Reputation > 10000
+),
+DuplicateQuestionPairs as (
+    select
+        pl.PostId as DuplicateQuestionId,
+        pl.RelatedPostId as OriginalQuestionId,
+        pq.Title as DuplicateTitle,
+        po.Title as OriginalTitle,
+        pl.CreationDate as LinkCreationDate
+    from PostLinks pl
+    inner join Posts pq on pq.Id = pl.PostId and pq.PostTypeId = 1
+    inner join Posts po on po.Id = pl.RelatedPostId and po.PostTypeId = 1
+    where pl.LinkTypeId = 3
+),
+QuestionCloseReasons as (
+    select
+        ph.PostId,
+        crt.Name as CloseReason,
+        ph.CreationDate as CloseDate
+    from PostHistory ph
+    inner join CloseReasonTypes crt on crt.Id = cast(ph.Comment as integer)
+    where ph.PostHistoryTypeId = 10
+),
+UserRecentActivity as (
+    select
+        u.Id as UserId,
+        max(p.CreationDate) as LastPostDate,
+        max(c.CreationDate) as LastCommentDate,
+        max(v.CreationDate) as LastVoteDate
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Comments c on c.UserId = u.Id
+    left join Votes v on v.UserId = u.Id
+    group by u.Id
+),
+UserEngagement as (
+    select
+        u.Id as UserId,
+        count(distinct p.Id) as QuestionCount,
+        count(distinct a.Id) as AnswerCount,
+        count(distinct c.Id) as CommentCount,
+        count(distinct v.Id) as VoteCount,
+        sum(case when v.VoteTypeId = 2 then 1 else 0 end) as UpVotesGiven,
+        sum(case when v.VoteTypeId = 3 then 1 else 0 end) as DownVotesGiven
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id and p.PostTypeId = 1
+    left join Posts a on a.OwnerUserId = u.Id and a.PostTypeId = 2
+    left join Comments c on c.UserId = u.Id
+    left join Votes v on v.UserId = u.Id
+    group by u.Id
+),
+ComplexUserStats as (
+    select
+        tu.Id,
+        tu.DisplayName,
+        tu.Reputation,
+        ue.QuestionCount,
+        ue.AnswerCount,
+        ue.CommentCount,
+        ue.VoteCount,
+        ue.UpVotesGiven,
+        ue.DownVotesGiven,
+        tu.GoldBadges,
+        tu.SilverBadges,
+        tu.BronzeBadges,
+        ua.LastPostDate,
+        ua.LastCommentDate,
+        ua.LastVoteDate,
+        case
+            when ue.QuestionCount > 0 then round(cast(ue.AnswerCount as numeric) / ue.QuestionCount, 2)
+            else null
+        end as AnswerToQuestionRatio,
+        case
+            when tu.Reputation > 0 then round(cast(ue.VoteCount as numeric) / tu.Reputation, 4)
+            else null
+        end as VotesPerReputation
+    from TopUsers tu
+    left join UserEngagement ue on ue.UserId = tu.Id
+    left join UserRecentActivity ua on ua.UserId = tu.Id
+)
+select
+    cuss.Id as UserId,
+    cuss.DisplayName,
+    cuss.Reputation,
+    cuss.GoldBadges,
+    cuss.SilverBadges,
+    cuss.BronzeBadges,
+    cuss.QuestionCount,
+    cuss.AnswerCount,
+    cuss.CommentCount,
+    cuss.VoteCount,
+    cuss.UpVotesGiven,
+    cuss.DownVotesGiven,
+    cuss.AnswerToQuestionRatio,
+    cuss.VotesPerReputation,
+    dtc.TagName,
+    dtc.Count as TagUsageCount,
+    dtc.TotalAnswers,
+    dtc.TotalViews,
+    dq.DuplicateQuestionId,
+    dq.OriginalQuestionId,
+    dq.DuplicateTitle,
+    dq.OriginalTitle,
+    dq.LinkCreationDate,
+    qcr.CloseReason,
+    qcr.CloseDate,
+    pa.RecentPostRank,
+    pa.PrevScore,
+    pa.NextScore,
+    case
+        when pa.Score is null then 'No Score'
+        when pa.Score > 0 then 'Positive'
+        when pa.Score = 0 then 'Neutral'
+        else 'Negative'
+    end as ScoreCategory,
+    case
+        when pa.Tags is null then 'No Tags'
+        else substring(pa.Tags from 2 for char_length(pa.Tags) - 2)
+    end as CleanTags,
+    coalesce(u.WebsiteUrl, 'No Website') as UserWebsite,
+    coalesce(u.Location, 'Unknown') as UserLocation,
+    coalesce(u.AboutMe, '') as UserAboutMe,
+    coalesce(u.ProfileImageUrl, '') as UserProfileImageUrl
+from ComplexUserStats cuss
+left join RecursiveTagCounts dtc on dtc.TagId = (
+    select rtc2.TagId
+    from RecursiveTagCounts rtc2
+    order by rtc2.Count desc
+    limit 1 offset (cuss.Id % 10)
+)
+left join DuplicateQuestionPairs dq on dq.DuplicateQuestionId = (
+    select p.Id
+    from Posts p
+    where p.OwnerUserId = cuss.Id and p.PostTypeId = 1
+    order by p.CreationDate desc
+    limit 1
+)
+left join QuestionCloseReasons qcr on qcr.PostId = dq.DuplicateQuestionId
+left join PostActivityWindow pa on pa.OwnerUserId = cuss.Id and pa.RecentPostRank = 1
+left join Users u on u.Id = cuss.Id
+where cuss.Reputation > 20000
+group by
+    cuss.Id,
+    cuss.DisplayName,
+    cuss.Reputation,
+    cuss.GoldBadges,
+    cuss.SilverBadges,
+    cuss.BronzeBadges,
+    cuss.QuestionCount,
+    cuss.AnswerCount,
+    cuss.CommentCount,
+    cuss.VoteCount,
+    cuss.UpVotesGiven,
+    cuss.DownVotesGiven,
+    cuss.AnswerToQuestionRatio,
+    cuss.VotesPerReputation,
+    dtc.TagName,
+    dtc.Count,
+    dtc.TotalAnswers,
+    dtc.TotalViews,
+    dq.DuplicateQuestionId,
+    dq.OriginalQuestionId,
+    dq.DuplicateTitle,
+    dq.OriginalTitle,
+    dq.LinkCreationDate,
+    qcr.CloseReason,
+    qcr.CloseDate,
+    pa.RecentPostRank,
+    pa.PrevScore,
+    pa.NextScore,
+    pa.Score,
+    pa.Tags,
+    u.WebsiteUrl,
+    u.Location,
+    u.AboutMe,
+    u.ProfileImageUrl,
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    u.WebsiteUrl,
+    u.Location,
+    u.AboutMe,
+    u.ProfileImageUrl
+order by cuss.Reputation desc, cuss.GoldBadges desc
+limit 100;

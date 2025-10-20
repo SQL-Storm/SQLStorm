@@ -1,0 +1,165 @@
+with recursive RecursiveTagHierarchy as (
+    select 
+        t.Id,
+        t.TagName,
+        t.Count,
+        1 as Level,
+        array[t.TagName] as Path
+    from Tags t
+    where t.IsModeratorOnly = false and t.IsRequired = false
+    union all
+    select 
+        t2.Id,
+        t2.TagName,
+        t2.Count,
+        r.Level + 1,
+        r.Path || t2.TagName
+    from Tags t2
+    join RecursiveTagHierarchy r on t2.Id <> r.Id and t2.Count < r.Count and not t2.TagName = any(r.Path)
+    where r.Level < 3
+),
+UserBadgeCounts as (
+    select 
+        b.UserId,
+        b.Class,
+        count(*) as BadgeCount
+    from Badges b
+    group by b.UserId, b.Class
+),
+TopUsers as (
+    select 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        coalesce(ubc_gold.BadgeCount,0) as GoldBadges,
+        coalesce(ubc_silver.BadgeCount,0) as SilverBadges,
+        coalesce(ubc_bronze.BadgeCount,0) as BronzeBadges,
+        row_number() over (order by u.Reputation desc, u.CreationDate asc) as Rank
+    from Users u
+    left join UserBadgeCounts ubc_gold on ubc_gold.UserId = u.Id and ubc_gold.Class = 1
+    left join UserBadgeCounts ubc_silver on ubc_silver.UserId = u.Id and ubc_silver.Class = 2
+    left join UserBadgeCounts ubc_bronze on ubc_bronze.UserId = u.Id and ubc_bronze.Class = 3
+    where u.Reputation > 1000
+),
+QuestionAnswerStats as (
+    select 
+        q.Id as QuestionId,
+        q.Title,
+        q.CreationDate as QuestionCreation,
+        q.Score as QuestionScore,
+        q.ViewCount,
+        q.Tags,
+        q.OwnerUserId,
+        count(a.Id) as AnswerCount,
+        max(a.Score) as MaxAnswerScore,
+        avg(a.Score) as AvgAnswerScore,
+        sum(case when a.OwnerUserId = q.OwnerUserId then 1 else 0 end) as AnswersByOwner,
+        bool_or(a.Score > q.Score) as AnyAnswerBetterScore
+    from Posts q
+    left join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+    where q.PostTypeId = 1 and q.ClosedDate is null
+    group by q.Id, q.Title, q.CreationDate, q.Score, q.ViewCount, q.Tags, q.OwnerUserId
+),
+UserActivityWindow as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        p.Id as PostId,
+        p.PostTypeId,
+        p.Score,
+        p.CreationDate,
+        count(*) over (partition by u.Id order by p.CreationDate rows between 30 preceding and current row) as PostsLast30Days,
+        sum(p.Score) over (partition by u.Id order by p.CreationDate rows between 30 preceding and current row) as ScoreLast30Days
+    from Users u
+    join Posts p on p.OwnerUserId = u.Id
+    where p.CreationDate > cast('2024-10-01' as date) - interval '365 days'
+),
+DuplicateQuestions as (
+    select distinct
+        pl.PostId as DuplicateQuestionId,
+        pl.RelatedPostId as OriginalQuestionId,
+        q.Title as DuplicateTitle,
+        oq.Title as OriginalTitle,
+        pl.CreationDate as LinkDate
+    from PostLinks pl
+    join Posts q on q.Id = pl.PostId and q.PostTypeId = 1
+    join Posts oq on oq.Id = pl.RelatedPostId and oq.PostTypeId = 1
+    where pl.LinkTypeId = 3
+),
+ComplexUserSummary as (
+    select 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        coalesce(qas.AnswerCount,0) as TotalAnswers,
+        coalesce(qas.AnyAnswerBetterScore,false) as HasBetterAnswerThanQuestion,
+        coalesce(ua.PostsLast30Days,0) as PostsInLast30Days,
+        coalesce(ua.ScoreLast30Days,0) as ScoreInLast30Days,
+        coalesce(bc.Gold,0) as GoldBadges,
+        coalesce(bc.Silver,0) as SilverBadges,
+        coalesce(bc.Bronze,0) as BronzeBadges,
+        case 
+            when u.Location is null or length(trim(u.Location)) = 0 then 'Unknown'
+            else upper(substring(u.Location from 1 for 3))
+        end as LocationPrefix,
+        case 
+            when u.WebsiteUrl is null then 'No Website'
+            when position('https://' in u.WebsiteUrl) = 1 then 'Secure'
+            else 'Non-Secure'
+        end as WebsiteSecurity,
+        coalesce((select count(*) from Comments c where c.UserId = u.Id and c.CreationDate > cast('2024-10-01' as date) - interval '180 days'), 0) as RecentComments
+    from Users u
+    left join (
+        select OwnerUserId, count(*) as AnswerCount, bool_or(Score > 0) as AnyAnswerBetterScore
+        from Posts
+        where PostTypeId = 2
+        group by OwnerUserId
+    ) qas on qas.OwnerUserId = u.Id
+    left join (
+        select UserId, max(PostsLast30Days) as PostsLast30Days, max(ScoreLast30Days) as ScoreLast30Days
+        from UserActivityWindow
+        group by UserId
+    ) ua on ua.UserId = u.Id
+    left join (
+        select UserId,
+            sum(case when Class = 1 then BadgeCount else 0 end) as Gold,
+            sum(case when Class = 2 then BadgeCount else 0 end) as Silver,
+            sum(case when Class = 3 then BadgeCount else 0 end) as Bronze
+        from UserBadgeCounts
+        group by UserId
+    ) bc on bc.UserId = u.Id
+    where u.Reputation > 500
+)
+select 
+    c.Id as UserId,
+    c.DisplayName,
+    c.Reputation,
+    c.TotalAnswers,
+    c.HasBetterAnswerThanQuestion,
+    c.PostsInLast30Days,
+    c.ScoreInLast30Days,
+    c.GoldBadges,
+    c.SilverBadges,
+    c.BronzeBadges,
+    c.LocationPrefix,
+    c.WebsiteSecurity,
+    c.RecentComments,
+    string_agg(distinct rth.TagName, ',' order by rth.Count desc) as PopularTags,
+    coalesce(dq.DuplicateQuestionId, -1) as SampleDuplicateQuestionId,
+    coalesce(dq.OriginalQuestionId, -1) as SampleOriginalQuestionId,
+    dq.DuplicateTitle,
+    dq.OriginalTitle
+from ComplexUserSummary c
+left join RecursiveTagHierarchy rth on position(rth.TagName in coalesce((select p.Tags from Posts p where p.OwnerUserId = c.Id and p.PostTypeId = 1 limit 1), '')) > 0
+left join LATERAL (
+    select dq2.*
+    from DuplicateQuestions dq2
+    where dq2.DuplicateQuestionId in (
+        select p.Id from Posts p where p.OwnerUserId = c.Id and p.PostTypeId = 1 limit 1
+    )
+    limit 1
+) dq on true
+group by c.Id, c.DisplayName, c.Reputation, c.TotalAnswers, c.HasBetterAnswerThanQuestion, c.PostsInLast30Days, c.ScoreInLast30Days, c.GoldBadges, c.SilverBadges, c.BronzeBadges, c.LocationPrefix, c.WebsiteSecurity, c.RecentComments, dq.DuplicateQuestionId, dq.OriginalQuestionId, dq.DuplicateTitle, dq.OriginalTitle
+order by c.Reputation desc, c.TotalAnswers desc
+limit 50;

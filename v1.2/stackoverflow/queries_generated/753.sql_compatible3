@@ -1,0 +1,187 @@
+WITH RecursiveBadges AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        b.Name AS BadgeName,
+        b.Class,
+        ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY b.Date DESC) AS BadgeRank
+    FROM Users u
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE b.Class IS NOT NULL
+),
+TopBadges AS (
+    SELECT UserId, DisplayName, BadgeName, Class
+    FROM RecursiveBadges
+    WHERE BadgeRank <= 3
+),
+PostScoreStats AS (
+    SELECT
+        p.OwnerUserId,
+        AVG(p.Score) AS AvgScore,
+        MAX(p.Score) AS MaxScore,
+        MIN(p.Score) AS MinScore,
+        COUNT(*) AS PostCount
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+    GROUP BY p.OwnerUserId
+),
+QuestionAnswerRatio AS (
+    SELECT
+        p.OwnerUserId,
+        COUNT(CASE WHEN p.PostTypeId = 1 THEN 1 END) AS QuestionCount,
+        COUNT(CASE WHEN p.PostTypeId = 2 THEN 1 END) AS AnswerCount,
+        CASE WHEN COUNT(CASE WHEN p.PostTypeId = 1 THEN 1 END) = 0 THEN NULL
+             ELSE CAST(COUNT(CASE WHEN p.PostTypeId = 2 THEN 1 END) AS NUMERIC) / CAST(COUNT(CASE WHEN p.PostTypeId = 1 THEN 1 END) AS NUMERIC)
+        END AS AnswerToQuestionRatio
+    FROM Posts p
+    GROUP BY p.OwnerUserId
+),
+RecentActivity AS (
+    SELECT
+        u.Id AS UserId,
+        MAX(p.LastActivityDate) AS LastPostActivity,
+        MAX(c.CreationDate) AS LastCommentActivity
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Comments c ON c.UserId = u.Id
+    GROUP BY u.Id
+),
+UserAggregates AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(ps.AvgScore, 0) AS AvgPostScore,
+        COALESCE(ps.MaxScore, 0) AS MaxPostScore,
+        COALESCE(ps.MinScore, 0) AS MinPostScore,
+        COALESCE(ps.PostCount, 0) AS TotalPosts,
+        COALESCE(qar.QuestionCount, 0) AS TotalQuestions,
+        COALESCE(qar.AnswerCount, 0) AS TotalAnswers,
+        COALESCE(qar.AnswerToQuestionRatio, 0) AS AnswerQuestionRatio,
+        ra.LastPostActivity,
+        ra.LastCommentActivity
+    FROM Users u
+    LEFT JOIN PostScoreStats ps ON u.Id = ps.OwnerUserId
+    LEFT JOIN QuestionAnswerRatio qar ON u.Id = qar.OwnerUserId
+    LEFT JOIN RecentActivity ra ON u.Id = ra.UserId
+),
+UserPostDetails AS (
+    SELECT
+        p.Id AS PostId,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.Title,
+        p.Tags,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC) AS PostRankByScore
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+),
+TopPosts AS (
+    SELECT
+        up.OwnerUserId,
+        up.PostId,
+        up.PostTypeId,
+        up.Score,
+        up.ViewCount,
+        up.CreationDate,
+        up.Title,
+        up.Tags
+    FROM UserPostDetails up
+    WHERE up.PostRankByScore <= 5
+),
+DuplicateQuestions AS (
+    SELECT
+        pl.PostId,
+        pl.RelatedPostId,
+        pl.CreationDate,
+        pt.Name AS LinkTypeName,
+        p1.Title AS OriginalTitle,
+        p2.Title AS DuplicateTitle
+    FROM PostLinks pl
+    JOIN LinkTypes pt ON pl.LinkTypeId = pt.Id
+    JOIN Posts p1 ON pl.PostId = p1.Id
+    JOIN Posts p2 ON pl.RelatedPostId = p2.Id
+    WHERE pt.Name = 'Duplicate'
+),
+UserDuplicateCounts AS (
+    SELECT
+        p.OwnerUserId,
+        COUNT(dq.PostId) AS DuplicateQuestionCount
+    FROM Posts p
+    LEFT JOIN DuplicateQuestions dq ON p.Id = dq.PostId
+    WHERE p.PostTypeId = 1
+    GROUP BY p.OwnerUserId
+),
+FinalUserStats AS (
+    SELECT
+        ua.*,
+        COALESCE(udc.DuplicateQuestionCount, 0) AS DuplicateQuestions
+    FROM UserAggregates ua
+    LEFT JOIN UserDuplicateCounts udc ON ua.Id = udc.OwnerUserId
+),
+RankedUsers AS (
+    SELECT
+        fus.*,
+        RANK() OVER (ORDER BY fus.Reputation DESC, fus.TotalPosts DESC) AS UserRank
+    FROM FinalUserStats fus
+),
+FilteredUsers AS (
+    SELECT *
+    FROM RankedUsers
+    WHERE UserRank <= 100
+)
+SELECT
+    fu.UserRank,
+    fu.Id AS UserId,
+    fu.DisplayName,
+    fu.Reputation,
+    fu.TotalPosts,
+    fu.TotalQuestions,
+    fu.TotalAnswers,
+    ROUND(CAST(fu.AvgPostScore AS NUMERIC), 2) AS AvgPostScore,
+    fu.MaxPostScore,
+    fu.MinPostScore,
+    ROUND(CAST(fu.AnswerQuestionRatio AS NUMERIC), 2) AS AnswerQuestionRatio,
+    fu.DuplicateQuestions,
+    fu.LastPostActivity,
+    fu.LastCommentActivity,
+    (SELECT STRING_AGG(tb2.BadgeName || ' (' ||
+            CASE tb2.Class WHEN 1 THEN 'Gold' WHEN 2 THEN 'Silver' WHEN 3 THEN 'Bronze' ELSE 'Unknown' END || ')', ', ')
+     FROM TopBadges tb2
+     WHERE tb2.UserId = fu.Id
+    ) AS TopBadges,
+    tp.PostId,
+    tp.PostTypeId,
+    tp.Score AS PostScore,
+    tp.ViewCount AS PostViewCount,
+    tp.CreationDate AS PostCreationDate,
+    COALESCE(tp.Title, '(no title)') AS PostTitle,
+    COALESCE(tp.Tags, '') AS PostTags
+FROM FilteredUsers fu
+LEFT JOIN TopPosts tp ON fu.Id = tp.OwnerUserId
+GROUP BY
+    fu.UserRank,
+    fu.Id,
+    fu.DisplayName,
+    fu.Reputation,
+    fu.TotalPosts,
+    fu.TotalQuestions,
+    fu.TotalAnswers,
+    fu.AvgPostScore,
+    fu.MaxPostScore,
+    fu.MinPostScore,
+    fu.AnswerQuestionRatio,
+    fu.DuplicateQuestions,
+    fu.LastPostActivity,
+    fu.LastCommentActivity,
+    tp.PostId,
+    tp.PostTypeId,
+    tp.Score,
+    tp.ViewCount,
+    tp.CreationDate,
+    tp.Title,
+    tp.Tags
+ORDER BY fu.UserRank, tp.Score DESC NULLS LAST;

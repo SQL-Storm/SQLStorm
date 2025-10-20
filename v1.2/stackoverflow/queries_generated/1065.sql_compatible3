@@ -1,0 +1,204 @@
+WITH RECURSIVE RecursiveTagHierarchy AS (
+    SELECT 
+        t.Id, 
+        t.TagName, 
+        t.Count, 
+        t.ExcerptPostId, 
+        t.WikiPostId, 
+        1 AS Level,
+        CAST(ARRAY[t.TagName] AS varchar[]) AS Ancestry
+    FROM Tags t
+    WHERE t.IsModeratorOnly = FALSE AND t.IsRequired = FALSE
+
+    UNION ALL
+
+    SELECT 
+        child.Id,
+        child.TagName,
+        child.Count,
+        child.ExcerptPostId,
+        child.WikiPostId,
+        rh.Level + 1,
+        rh.Ancestry || child.TagName
+    FROM Tags child
+    JOIN RecursiveTagHierarchy rh ON char_length(child.TagName) > char_length(rh.TagName) 
+        AND child.TagName LIKE rh.TagName || '%'
+        AND NOT child.TagName = ANY(rh.Ancestry)
+    WHERE rh.Level < 3
+), 
+
+UserPostStats AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionsPosted,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswersPosted,
+        COALESCE(SUM(p.Score),0) AS TotalPostScore,
+        AVG(p.Score) FILTER (WHERE p.PostTypeId IN (1,2)) AS AvgPostScore,
+        COUNT(b.Id) AS BadgeCount,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        MAX(p.CreationDate) AS LastPostDate
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName
+),
+
+UserAnswerWindow AS (
+    SELECT
+        p.Id,
+        p.OwnerUserId,
+        p.ParentId,
+        p.CreationDate,
+        p.Score,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS AnswerRank,
+        AVG(p.Score) OVER (PARTITION BY p.OwnerUserId) AS UserAverageAnswerScore
+    FROM Posts p
+    WHERE p.PostTypeId = 2
+),
+
+TopAnswers AS (
+    SELECT 
+        ua.Id AS AnswerId,
+        ua.OwnerUserId,
+        ua.ParentId AS QuestionId,
+        ua.CreationDate,
+        ua.Score,
+        ua.AnswerRank,
+        ua.UserAverageAnswerScore,
+        q.Title AS QuestionTitle,
+        q.Tags AS QuestionTags,
+        u.DisplayName AS OwnerName,
+        COALESCE(
+          (SELECT AVG(c.Score) FROM Comments c WHERE c.PostId = ua.Id), 
+          0
+        ) AS AvgCommentScore,
+        CASE
+            WHEN ua.Score > ua.UserAverageAnswerScore THEN 'Above Average'
+            WHEN ua.Score = ua.UserAverageAnswerScore THEN 'Average'
+            WHEN ua.Score < ua.UserAverageAnswerScore THEN 'Below Average'
+            ELSE 'No Data'
+        END AS PerformanceLabel
+    FROM UserAnswerWindow ua
+    JOIN Posts q ON q.Id = ua.ParentId
+    JOIN Users u ON u.Id = ua.OwnerUserId
+    WHERE ua.AnswerRank <= 5
+),
+
+ClosedQuestionsWithReasons AS (
+    SELECT
+        p.Id AS QuestionId,
+        p.Title,
+        p.CreationDate,
+        p.ClosedDate,
+        COALESCE(string_agg(DISTINCT crt.Name, ', ' ORDER BY crt.Id), 'No Close Reason') AS CloseReasons
+    FROM Posts p
+    LEFT JOIN PostHistory ph ON ph.PostId = p.Id AND ph.PostHistoryTypeId = 10
+    LEFT JOIN CloseReasonTypes crt ON CAST(crt.Id AS text) = ph.Comment
+    WHERE p.PostTypeId = 1 AND p.ClosedDate IS NOT NULL
+    GROUP BY p.Id, p.Title, p.CreationDate, p.ClosedDate
+),
+
+QuestionAnswerLinkAnalysis AS (
+    SELECT DISTINCT ON (pl.PostId, pl.RelatedPostId)
+        pl.PostId AS QuestionId,
+        pl.RelatedPostId AS LinkedPostId,
+        lt.Name AS LinkTypeName,
+        qp.Title AS QuestionTitle,
+        rp.Title AS RelatedPostTitle,
+        CASE WHEN rp.PostTypeId = 2 THEN 'Answer' ELSE 'Other' END AS RelatedPostType,
+        rp.Score AS RelatedPostScore,
+        rp.CreationDate AS RelatedPostCreationDate
+    FROM PostLinks pl
+    JOIN LinkTypes lt ON lt.Id = pl.LinkTypeId
+    JOIN Posts qp ON qp.Id = pl.PostId AND qp.PostTypeId = 1
+    JOIN Posts rp ON rp.Id = pl.RelatedPostId
+    WHERE lt.Name IN ('Linked', 'Duplicate')
+),
+
+FinalOutput AS (
+    SELECT
+        ts.TagName,
+        up.DisplayName AS UserName,
+        up.QuestionsPosted,
+        up.AnswersPosted,
+        up.TotalPostScore,
+        up.AvgPostScore,
+        up.BadgeCount,
+        up.GoldBadges,
+        up.SilverBadges,
+        up.BronzeBadges,
+        ta.AnswerId,
+        ta.Score AS AnswerScore,
+        ta.PerformanceLabel,
+        ta.AvgCommentScore,
+        cq.QuestionId AS ClosedQuestionId,
+        cq.Title AS ClosedQuestionTitle,
+        cq.CloseReasons,
+        qal.LinkedPostId,
+        qal.LinkTypeName,
+        qal.RelatedPostTitle,
+        qal.RelatedPostType,
+        qal.RelatedPostScore,
+        ts.Level
+    FROM RecursiveTagHierarchy ts
+    LEFT JOIN Posts p ON p.Tags ILIKE '%' || ts.TagName || '%'
+    LEFT JOIN UserPostStats up ON up.UserId = p.OwnerUserId
+    LEFT JOIN TopAnswers ta ON ta.OwnerUserId = up.UserId
+    LEFT JOIN ClosedQuestionsWithReasons cq ON cq.QuestionId = p.Id
+    LEFT JOIN QuestionAnswerLinkAnalysis qal ON qal.QuestionId = p.Id
+    WHERE up.UserId IS NOT NULL AND ta.AnswerId IS NOT NULL
+    GROUP BY
+        ts.TagName,
+        up.DisplayName,
+        up.QuestionsPosted,
+        up.AnswersPosted,
+        up.TotalPostScore,
+        up.AvgPostScore,
+        up.BadgeCount,
+        up.GoldBadges,
+        up.SilverBadges,
+        up.BronzeBadges,
+        ta.AnswerId,
+        ta.Score,
+        ta.PerformanceLabel,
+        ta.AvgCommentScore,
+        cq.QuestionId,
+        cq.Title,
+        cq.CloseReasons,
+        qal.LinkedPostId,
+        qal.LinkTypeName,
+        qal.RelatedPostTitle,
+        qal.RelatedPostType,
+        qal.RelatedPostScore,
+        ts.Level
+    ORDER BY ts.Level, up.TotalPostScore DESC, ta.Score DESC
+    LIMIT 100
+)
+
+SELECT 
+    TagName,
+    UserName,
+    QuestionsPosted,
+    AnswersPosted,
+    TotalPostScore,
+    ROUND(CAST(AvgPostScore AS numeric), 2) AS AvgPostScore,
+    BadgeCount,
+    GoldBadges,
+    SilverBadges,
+    BronzeBadges,
+    AnswerId,
+    AnswerScore,
+    PerformanceLabel,
+    ROUND(CAST(AvgCommentScore AS numeric), 2) AS AvgCommentScore,
+    ClosedQuestionId,
+    ClosedQuestionTitle,
+    CloseReasons,
+    LinkedPostId,
+    LinkTypeName,
+    RelatedPostTitle,
+    RelatedPostType,
+    RelatedPostScore
+FROM FinalOutput;

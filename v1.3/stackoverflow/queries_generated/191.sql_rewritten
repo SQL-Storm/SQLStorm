@@ -1,0 +1,197 @@
+-- {"query": "191.sql", "dataset": "stackoverflow", "version": "v1.3", "prompt": "p1", "model": "gpt-5-mini", "temperature": 1.0, "max_tokens": 32768, "reasoning": "low", "input_tokens": 2026, "output_tokens": 2350} 
+with
+-- recent activity window
+recent_posts as (
+  select p.*
+  from posts p
+  where p.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '365 days'
+),
+-- expand tags into rows (questions only)
+question_tags as (
+  select q.id as question_id,
+         trim(both '<>' from t) as tag
+  from posts q
+  cross join lateral (
+    select case when q.tags is null then array[]::text[] else string_to_array(substring(q.tags,2,length(q.tags)-2), '><') end as arr
+  ) a
+  cross join unnest(a.arr) with ordinality t(tag, ord)
+  where q.posttypeid = 1
+),
+-- aggregates per question: counts, score stats, comment sentiment-ish
+q_aggs as (
+  select q.id,
+         q.title,
+         q.owneruserid,
+         q.creationdate,
+         q.score,
+         coalesce(q.viewcount,0) as viewcount,
+         coalesce(q.answercount,0) as answercount,
+         coalesce(q.favoritecount,0) as favoritecount,
+         count(distinct c.id) filter (where c.id is not null) as comment_count,
+         sum(case when c.score is null then 0 else c.score end) as comment_score_sum,
+         max(ph.creationdate) filter (where ph.posthistorytypeid in (4,5,6)) as last_edit_date,
+         bool_or(ph.posthistorytypeid = 10) as ever_closed,
+         -- average answer score computed by correlated subquery
+         (select avg(a.score)::numeric(10,3)
+          from posts a
+          where a.parentid = q.id and a.posttypeid = 2) as avg_answer_score
+  from posts q
+  left join comments c on c.postid = q.id
+  left join posthistory ph on ph.postid = q.id
+  where q.posttypeid = 1
+  group by q.id,q.title,q.owneruserid,q.creationdate,q.score,q.viewcount,q.answercount,q.favoritecount
+),
+-- identify top answer per question by composite metric (score, recency, accepts)
+answer_ranked as (
+  select a.*,
+         row_number() over (partition by a.parentid order by (case when a.id = p.acceptedanswerid then 1 else 0 end) desc, a.score desc, a.creationdate desc) as ans_rank
+  from posts a
+  left join posts p on p.id = a.parentid
+  where a.posttypeid = 2
+),
+top_answers as (
+  select ar.parentid as question_id,
+         ar.id as answer_id,
+         ar.owneruserid as answer_ownerid,
+         ar.score as answer_score,
+         ar.creationdate as answer_date
+  from answer_ranked ar
+  where ar.ans_rank = 1
+),
+-- badge intensity per user in last year
+recent_badges as (
+  select b.userid,
+         count(*) as badges_last_year,
+         count(*) filter (where b.class = 1) as gold_badges,
+         count(*) filter (where b.class = 2) as silver_badges,
+         count(*) filter (where b.class = 3) as bronze_badges
+  from badges b
+  where b.date >= cast('2024-10-01 12:34:56' as timestamp) - interval '365 days'
+  group by b.userid
+),
+-- vote mix per post (correlated subquery style using CTE for performance)
+vote_mix as (
+  select v.postid,
+         sum(case when v.votetypeid = 2 then 1 else 0 end) as upvotes,
+         sum(case when v.votetypeid = 3 then 1 else 0 end) as downvotes,
+         sum(case when v.votetypeid = 5 then 1 else 0 end) as favorites,
+         sum(case when v.votetypeid = 1 then 1 else 0 end) as accepts
+  from votes v
+  group by v.postid
+),
+-- user derived metrics: tenure, activity score, last access gap
+user_metrics as (
+  select u.id,
+         u.displayname,
+         u.reputation,
+         u.creationdate,
+         u.lastaccessdate,
+         greatest(0, extract(epoch from (cast('2024-10-01 12:34:56' as timestamp) - u.creationdate))/86400) as days_since_signup,
+         greatest(0, extract(epoch from (cast('2024-10-01 12:34:56' as timestamp) - u.lastaccessdate))/86400) as days_since_last_access,
+         coalesce((select count(*) from posts p where p.owneruserid = u.id),0) as posts_count,
+         coalesce((select count(*) from comments c where c.userid = u.id),0) as comments_count,
+         coalesce((select sum(case when v.votetypeid = 2 then 1 when v.votetypeid = 3 then -1 else 0 end) from votes v where v.userid = u.id),0) as vote_impact
+  from users u
+),
+-- tag popularity and recent growth
+tag_stats as (
+  select t.tagname,
+         t.count as global_count,
+         coalesce(sum(case when qp.question_id is not null and q.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '30 days' then 1 else 0 end),0) as used_last_30_days,
+         coalesce(sum(case when qp.question_id is not null and q.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '365 days' then 1 else 0 end),0) as used_last_365_days
+  from tags t
+  left join question_tags qp on qp.tag = t.tagname
+  left join posts q on q.id = qp.question_id
+  group by t.tagname,t.count
+),
+-- pick a sample set of "interesting" questions: high view count, or high tag growth, or many comments
+interesting_questions as (
+  select q.id
+  from q_aggs q
+  left join question_tags qt on qt.question_id = q.id
+  left join tag_stats ts on ts.tagname = qt.tag
+  group by q.id
+  having max(coalesce(ts.used_last_30_days,0)) > 5
+     or max(q.viewcount) > 10000
+     or max(q.comment_count) > 20
+     or max(q.favoritecount) > 50
+),
+-- union to create two sets (recent hot vs long-tail) and combine with EXCEPT to stress set ops
+hot_set as (
+  select id from recent_posts where posttypeid = 1 and viewcount > 5000
+  intersect
+  select id from interesting_questions
+),
+longtail_set as (
+  select id from posts where posttypeid = 1 and viewcount between 50 and 500
+  except
+  select id from hot_set
+),
+combined_qs as (
+  select id from hot_set
+  union
+  select id from longtail_set
+),
+-- final composition joining everything together
+final_prep as (
+  select q.id as question_id,
+         q.title,
+         q.owneruserid,
+         coalesce(u.displayname, q.ownerdisplayname, 'unknown') as owner_name,
+         q.creationdate,
+         q.score as question_score,
+         q.viewcount,
+         q.answercount,
+         q.favoritecount,
+         coalesce(vm.upvotes,0) as q_upvotes,
+         coalesce(vm.downvotes,0) as q_downvotes,
+         coalesce(vm.favorites,0) as q_favorites,
+         qa.avg_answer_score,
+         ta.answer_id,
+         ta.answer_ownerid,
+         ta.answer_score,
+         ta.answer_date,
+         rb.badges_last_year,
+         um.posts_count,
+         um.reputation,
+         ts.global_count as tag_global_count,
+         -- synthetic computed metrics (string manipulation + null logic)
+         (case
+            when q.title is null then '(no title)'
+            when length(q.title) > 120 then substr(q.title,1,117) || '...'
+            else q.title end) as title_snippet,
+         -- composite popularity score with null-safe math
+         (coalesce(q.viewcount,0) * 0.001
+          + coalesce(q.score,0) * 2
+          + coalesce(qa.avg_answer_score,0) * 1.5
+          + coalesce(q.favoritecount,0) * 3
+          - coalesce(vm.downvotes,0) * 1.2
+          + coalesce(rb.badges_last_year,0) * 4) as popularity_index
+  from combined_qs cq
+  join posts q on q.id = cq.id
+  left join q_aggs qa on qa.id = q.id
+  left join vote_mix vm on vm.postid = q.id
+  left join top_answers ta on ta.question_id = q.id
+  left join recent_badges rb on rb.userid = q.owneruserid
+  left join user_metrics um on um.id = q.owneruserid
+  left join question_tags qt on qt.question_id = q.id
+  left join tag_stats ts on ts.tagname = qt.tag
+  left join users u on u.id = q.owneruserid
+)
+select fp.*,
+       -- windowed rank across popularity within owner to create dense_rank and moving average of popularity
+       dense_rank() over (partition by fp.owneruserid order by fp.popularity_index desc) as owner_pop_rank,
+       rank() over (order by fp.popularity_index desc) as global_pop_rank,
+       avg(fp.popularity_index) over (partition by fp.owneruserid) as owner_popularity_avg,
+       lag(fp.popularity_index) over (partition by fp.owneruserid order by fp.popularity_index desc) as prev_popularity,
+       lead(fp.popularity_index) over (partition by fp.owneruserid order by fp.popularity_index desc) as next_popularity,
+       -- boolean heuristic: is this question trending? (recent answer + surge in views)
+       (case when fp.answer_date is not null and fp.answer_date >= cast('2024-10-01 12:34:56' as timestamp) - interval '14 days'
+                  and fp.viewcount > 1000 then true else false end) as is_trending,
+       -- complex predicate mixing string ops and null coalescing to create a human-like tag summary
+       (case when fp.tag_global_count is null then 'untagged'
+             when fp.tag_global_count > 10000 then concat('popular-tag(', coalesce(fp.tag_global_count::text,'0'), ')')
+             else concat('niche-tag(', coalesce(fp.tag_global_count::text,'0'), ')') end) as tag_popularity_label
+from final_prep fp
+order by fp.popularity_index desc, fp.viewcount desc
+limit 100;

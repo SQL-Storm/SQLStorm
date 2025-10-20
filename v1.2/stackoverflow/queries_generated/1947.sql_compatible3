@@ -1,0 +1,45 @@
+WITH UserTagAggregates AS (
+    SELECT
+        t.TagName,
+        u.Id AS UserId,
+        u.DisplayName,
+        SUM(p.Score) AS UserTotalScoreInTag,
+        MAX(b.Class) AS UserBestBadgeClass
+    FROM
+        Tags t
+        JOIN Posts p ON ('<' || t.TagName || '>') = ANY(string_to_array(COALESCE(p.Tags, ''), ''))
+        JOIN Users u ON p.OwnerUserId = u.Id
+        LEFT JOIN Badges b ON b.UserId = u.Id
+    WHERE
+        p.Tags IS NOT NULL
+    GROUP BY
+        t.TagName,
+        u.Id,
+        u.DisplayName
+),
+RankedTopTags AS (
+    SELECT
+        uta.TagName,
+        uta.UserId,
+        uta.DisplayName,
+        uta.UserTotalScoreInTag,
+        uta.UserBestBadgeClass,
+        DENSE_RANK() OVER (PARTITION BY uta.TagName ORDER BY uta.UserTotalScoreInTag DESC) AS TagUserRank
+    FROM
+        UserTagAggregates uta
+)
+SELECT
+    TagName,
+    UserId,
+    DisplayName,
+    UserTotalScoreInTag,
+    UserBestBadgeClass,
+    TagUserRank
+FROM RankedTopTags
+GROUP BY
+    TagName,
+    UserId,
+    DisplayName,
+    UserTotalScoreInTag,
+    UserBestBadgeClass,
+    TagUserRank;

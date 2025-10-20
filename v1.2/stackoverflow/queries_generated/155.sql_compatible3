@@ -1,0 +1,205 @@
+WITH RECURSIVE RecursiveTagHierarchy AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        1 AS Level,
+        CAST(t.TagName AS VARCHAR(1000)) AS Path
+    FROM Tags t
+    WHERE t.IsModeratorOnly = FALSE
+      AND t.IsRequired = FALSE
+    UNION ALL
+    SELECT
+        t2.Id,
+        t2.TagName,
+        t2.Count,
+        t2.ExcerptPostId,
+        t2.WikiPostId,
+        r.Level + 1,
+        CAST(r.Path || ' > ' || t2.TagName AS VARCHAR(1000)) AS Path
+    FROM Tags t2
+    JOIN RecursiveTagHierarchy r
+      ON t2.Id = r.Id + 1
+     AND t2.IsModeratorOnly = FALSE
+    WHERE r.Level < 3
+),
+UserBadgeCounts AS (
+    SELECT
+        b.UserId,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        COUNT(*) AS TotalBadges
+    FROM Badges b
+    GROUP BY b.UserId
+),
+PostScoreRanks AS (
+    SELECT
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        RANK() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC, p.ViewCount DESC) AS ScoreRank,
+        DENSE_RANK() OVER (PARTITION BY p.PostTypeId ORDER BY p.CreationDate) AS CreationRank
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+),
+TopQuestionsWithAnswers AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.Title,
+        q.Tags,
+        q.Score AS QuestionScore,
+        q.ViewCount AS QuestionViews,
+        q.CreationDate AS QuestionCreationDate,
+        a.Id AS AnswerId,
+        a.Score AS AnswerScore,
+        a.CreationDate AS AnswerCreationDate,
+        u.DisplayName AS OwnerDisplayName,
+        ub.GoldBadges,
+        ub.SilverBadges,
+        ub.BronzeBadges,
+        ub.TotalBadges
+    FROM Posts q
+    LEFT JOIN Posts a ON a.ParentId = q.Id AND a.PostTypeId = 2
+    LEFT JOIN Users u ON u.Id = q.OwnerUserId
+    LEFT JOIN UserBadgeCounts ub ON ub.UserId = q.OwnerUserId
+    WHERE q.PostTypeId = 1
+      AND q.Score > 10
+      AND q.ViewCount > 1000
+),
+CloseReasonCounts AS (
+    SELECT
+        ph.Comment AS CloseReasonId,
+        crt.Name AS CloseReasonName,
+        COUNT(*) AS CloseCount
+    FROM PostHistory ph
+    JOIN CloseReasonTypes crt ON crt.Id = CAST(ph.Comment AS INTEGER)
+    WHERE ph.PostHistoryTypeId = 10
+    GROUP BY ph.Comment, crt.Name
+),
+UserActivityWindow AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) OVER (PARTITION BY u.Id) AS QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) OVER (PARTITION BY u.Id) AS AnswerCount,
+        COUNT(DISTINCT c.Id) OVER (PARTITION BY u.Id) AS CommentCount,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC, u.Id) AS UserRank
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Comments c ON c.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate
+),
+ComplexFilteredPosts AS (
+    SELECT
+        p.Id,
+        p.Title,
+        p.Tags,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        ph.PostHistoryTypeId,
+        ph.CreationDate AS HistoryDate,
+        ph.UserId AS EditorUserId,
+        ph.UserDisplayName AS EditorDisplayName,
+        ph.Comment AS CloseReasonComment,
+        CASE
+            WHEN ph.PostHistoryTypeId = 10 THEN 'Closed'
+            WHEN ph.PostHistoryTypeId = 11 THEN 'Reopened'
+            ELSE 'Other'
+        END AS PostStatus
+    FROM Posts p
+    LEFT JOIN PostHistory ph ON ph.PostId = p.Id AND ph.CreationDate = (
+        SELECT MAX(ph2.CreationDate)
+        FROM PostHistory ph2
+        WHERE ph2.PostId = p.Id
+    )
+    WHERE p.PostTypeId = 1
+      AND (p.Score > 5 OR p.ViewCount > 500)
+),
+FinalResult AS (
+    SELECT DISTINCT
+        q.QuestionId,
+        q.Title,
+        q.Tags,
+        q.QuestionScore,
+        q.QuestionViews,
+        q.QuestionCreationDate,
+        q.AnswerId,
+        q.AnswerScore,
+        q.AnswerCreationDate,
+        q.OwnerDisplayName,
+        q.GoldBadges,
+        q.SilverBadges,
+        q.BronzeBadges,
+        q.TotalBadges,
+        cr.CloseReasonName,
+        ua.QuestionCount,
+        ua.AnswerCount,
+        ua.CommentCount,
+        ua.UserRank,
+        p.PostStatus,
+        p.CloseReasonComment,
+        r.Level AS TagHierarchyLevel,
+        r.Path AS TagHierarchyPath
+    FROM TopQuestionsWithAnswers q
+    LEFT JOIN LATERAL (
+        SELECT ph.Comment
+        FROM PostHistory ph
+        WHERE ph.PostId = q.QuestionId AND ph.PostHistoryTypeId = 10
+        ORDER BY ph.CreationDate DESC
+        LIMIT 1
+    ) ph_last ON TRUE
+    LEFT JOIN CloseReasonCounts cr ON cr.CloseReasonId = ph_last.Comment
+    LEFT JOIN LATERAL (
+        SELECT OwnerUserId
+        FROM Posts
+        WHERE Id = q.QuestionId
+        LIMIT 1
+    ) post_owner ON TRUE
+    LEFT JOIN UserActivityWindow ua ON ua.Id = post_owner.OwnerUserId
+    LEFT JOIN ComplexFilteredPosts p ON p.Id = q.QuestionId
+    LEFT JOIN RecursiveTagHierarchy r ON POSITION(r.TagName IN COALESCE(q.Tags, '')) > 0
+    WHERE ua.UserRank <= 100
+)
+SELECT
+    fr.QuestionId,
+    fr.Title,
+    fr.Tags,
+    fr.QuestionScore,
+    fr.QuestionViews,
+    fr.QuestionCreationDate,
+    fr.AnswerId,
+    fr.AnswerScore,
+    fr.AnswerCreationDate,
+    COALESCE(fr.OwnerDisplayName, 'Anonymous') AS OwnerDisplayName,
+    fr.GoldBadges,
+    fr.SilverBadges,
+    fr.BronzeBadges,
+    fr.TotalBadges,
+    COALESCE(fr.CloseReasonName, 'Open') AS CloseReasonName,
+    fr.QuestionCount,
+    fr.AnswerCount,
+    fr.CommentCount,
+    fr.UserRank,
+    fr.PostStatus,
+    fr.CloseReasonComment,
+    fr.TagHierarchyLevel,
+    fr.TagHierarchyPath,
+    LENGTH(fr.Title) AS TitleLength,
+    CASE WHEN fr.QuestionScore > 50 THEN 'HighScore' ELSE 'NormalScore' END AS ScoreCategory,
+    SUBSTRING(fr.Tags FROM 2 FOR 100) AS TagsSnippet,
+    (fr.QuestionScore * 1.0 / NULLIF(fr.QuestionViews, 0)) AS ScoreToViewRatio
+FROM FinalResult fr
+WHERE fr.QuestionScore > 10 OR fr.AnswerScore > 5
+ORDER BY fr.UserRank, fr.QuestionScore DESC, fr.AnswerScore DESC
+LIMIT 100;

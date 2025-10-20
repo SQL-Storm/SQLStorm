@@ -1,0 +1,158 @@
+with RecursiveQuestionStats as (
+    select
+        p.Id as QuestionId,
+        p.CreationDate as QuestionCreation,
+        p.Score as QuestionScore,
+        coalesce(p.ViewCount,0) as QuestionViews,
+        u.DisplayName as OwnerName,
+        u.Reputation as OwnerReputation,
+        (select count(*) from Posts a 
+         where a.ParentId = p.Id and a.PostTypeId = 2) as AnswerCount,
+        (select avg(a.Score*1.0) from Posts a 
+         where a.ParentId = p.Id and a.PostTypeId = 2) as AvgAnswerScore,
+        (select max(a.Score) from Posts a 
+         where a.ParentId = p.Id and a.PostTypeId = 2) as MaxAnswerScore,
+        (select count(distinct c.UserId) from Comments c 
+         where c.PostId = p.Id) as UniqueCommentersOnQuestion,
+        rnk.RankInUser as OwnerQuestionRank,
+        dense_rank() over (order by p.Score desc NULLS LAST) as QuestionRankGlobal,
+        lead(p.CreationDate) over (partition by p.OwnerUserId order by p.CreationDate) as NextQuestionDate,
+        lag(p.CreationDate) over (partition by p.OwnerUserId order by p.CreationDate) as PrevQuestionDate,
+        p.Tags,
+        p.OwnerUserId
+    from Posts p
+    left join Users u on u.Id = p.OwnerUserId
+    left join (
+        select 
+            Id,
+            OwnerUserId,
+            rank() over (partition by OwnerUserId order by Score desc NULLS LAST) as RankInUser
+        from Posts 
+        where PostTypeId = 1
+    ) rnk on rnk.Id = p.Id
+    where p.PostTypeId = 1
+        and p.OwnerUserId is not null
+        and p.CreationDate > '2010-01-01'
+),
+UserBadgeSummary as (
+    select 
+        UserId,
+        sum(case when "Class" = 1 then 1 else 0 end) as GoldBadges,
+        sum(case when "Class" = 2 then 1 else 0 end) as SilverBadges,
+        sum(case when "Class" = 3 then 1 else 0 end) as BronzeBadges,
+        count(distinct Name) as DistinctBadgeNames,
+        max(Date) as LastBadgeDate
+    from Badges
+    group by UserId
+),
+TopTagsPerUser as (
+    select 
+        u.Id as UserId,
+        tag,
+        count(*) as QuestionCountPerTag,
+        rank() over (partition by u.Id order by count(*) desc) as TagRank
+    from Users u
+    join Posts p on p.OwnerUserId = u.Id and p.PostTypeId = 1 and p.Tags is not null
+    cross join lateral unnest(string_to_array(replace(replace(p.Tags, '&lt;', '<'), '&gt;', '>'), '><')) as tag
+    group by u.Id, tag
+),
+BestAnswerDelays as (
+    select
+        q.Id as QuestionId,
+        a.Id as AnswerId,
+        a.OwnerUserId as AnswerOwner,
+        a.CreationDate as AnswerCreation,
+        q.CreationDate as QuestionCreation,
+        extract(epoch from (a.CreationDate - q.CreationDate))/3600.0 as HoursToAnswer,
+        vVote.ScoreVotes,
+        row_number() over (partition by q.Id order by a.Score desc NULLS LAST, a.CreationDate) as AnswerRankByScore
+    from Posts q
+    join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+    left join (
+        select PostId, sum(case when VoteTypeId = 2 then 1 when VoteTypeId = 3 then -1 else 0 end) as ScoreVotes
+        from Votes
+        group by PostId
+    ) vVote on vVote.PostId = a.Id
+    where q.PostTypeId = 1
+)
+select
+    r.QuestionId,
+    r.QuestionCreation,
+    r.QuestionScore,
+    r.QuestionViews,
+    r.OwnerName,
+    r.OwnerReputation,
+    u.GoldBadges,
+    u.SilverBadges,
+    u.BronzeBadges,
+    u.DistinctBadgeNames,
+    r.AnswerCount,
+    coalesce(r.AvgAnswerScore,0) as AvgAnswerScore,
+    coalesce(r.MaxAnswerScore,0) as MaxAnswerScore,
+    r.UniqueCommentersOnQuestion,
+    r.OwnerQuestionRank,
+    r.QuestionRankGlobal,
+    case 
+      when r.NextQuestionDate is not null and r.PrevQuestionDate is not null 
+      then extract(epoch from (r.NextQuestionDate - r.PrevQuestionDate))/86400.0
+      else null 
+    end as AvgTimeBetweenOwnerQuestions_Days,
+    array_agg(distinct tt.tag order by tt.QuestionCountPerTag desc) filter(where tt.TagRank <= 3) as Top3TagsForOwner,
+    b.AnswerId as HighestScoreAnswerId,
+    b.AnswerOwner,
+    b.AnswerCreation,
+    b.HoursToAnswer,
+    b.ScoreVotes as AnswerVotes,
+    case 
+        when strpos(lower(coalesce(r.Tags, '')), 'sql') > 0 then 1 else 0 
+    end as HasSQLTag,
+    case 
+        when strpos(lower(coalesce(r.Tags, '')), 'join') > 0 then 1 else 0
+    end as HasJoinWordInTags,
+    (select tag from unnest(string_to_array(replace(replace(r.Tags, '&lt;', '<'), '&gt;', '>'), '><')) tag 
+        order by length(tag) desc limit 1) as LongestTag,
+    case 
+        when p2.Id is null then 'No Accepted Answer'
+        when r.QuestionScore < 0 then 'Negative Score Question'
+        else 'Other'
+    end as QuestionStatus,
+    row_number() over (partition by r.OwnerName order by r.QuestionCreation desc) as RecentQuestionsOrder
+from RecursiveQuestionStats r
+left join UserBadgeSummary u on u.UserId = r.OwnerUserId
+left join TopTagsPerUser tt on tt.UserId = r.OwnerUserId
+left join BestAnswerDelays b on b.QuestionId = r.QuestionId and b.AnswerRankByScore = 1
+left join Posts p2 on p2.Id = r.QuestionId and p2.AcceptedAnswerId is not null
+where r.AnswerCount > 0
+and r.QuestionScore between (select percentile_cont(0.1) within group (order by QuestionScore) from RecursiveQuestionStats)
+                        and (select percentile_cont(0.9) within group (order by QuestionScore) from RecursiveQuestionStats)
+and (coalesce(u.GoldBadges,0) + coalesce(u.SilverBadges,0) + coalesce(u.BronzeBadges,0)) > 5
+group by 
+    r.QuestionId,
+    r.QuestionCreation,
+    r.QuestionScore,
+    r.QuestionViews,
+    r.OwnerName,
+    r.OwnerReputation,
+    u.GoldBadges,
+    u.SilverBadges,
+    u.BronzeBadges,
+    u.DistinctBadgeNames,
+    r.AnswerCount,
+    r.AvgAnswerScore,
+    r.MaxAnswerScore,
+    r.UniqueCommentersOnQuestion,
+    r.OwnerQuestionRank,
+    r.QuestionRankGlobal,
+    r.NextQuestionDate,
+    r.PrevQuestionDate,
+    b.AnswerId,
+    b.AnswerOwner,
+    b.AnswerCreation,
+    b.HoursToAnswer,
+    b.ScoreVotes,
+    r.Tags,
+    p2.Id,
+    r.OwnerName,
+    r.QuestionCreation
+order by r.QuestionCreation desc
+limit 100;

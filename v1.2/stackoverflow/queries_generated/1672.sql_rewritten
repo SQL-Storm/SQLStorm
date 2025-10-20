@@ -1,0 +1,115 @@
+-- {"query": "1672.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.6, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1945} 
+with RecursiveTopTags as (
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        rank() over (order by t.Count desc nulls last) as rnk
+    from Tags t
+    where t.IsModeratorOnly = 0 and t.IsRequired = 0
+), ObscureLinks as (
+    select
+        pl1.PostId as PostA,
+        pl1.RelatedPostId as PostB,
+        coalesce(pl2.Id,0) as CyclicLinkId
+    from PostLinks pl1
+    left join PostLinks pl2 on pl2.PostId = pl1.RelatedPostId and pl2.RelatedPostId = pl1.PostId
+    where pl1.LinkTypeId = 1
+), UserReputationGrowth as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        min(u.CreationDate) over (partition by u.Id) as user_creation,
+        max(users_aggr.AvrigeDate) as last_perm_rank_lvl_date,
+        count(b.Id) filter (where b.Class = 1) as gold_badges,
+        count(b.Id) filter (where b.Class = 2) as silver_badges,
+        count(b.Id) filter (where b.Class = 3) as bronze_badges,
+        greatest(u.Reputation, 0) as TotalReputation,
+        sum(
+            segment
+        ) over (partition by u.Id order by sum_size desc rows between unbounded preceding and current row ) cume_segment_status
+    from
+        Users u
+    left join Badges b on u.Id = b.UserId
+    left join (
+        select PaginationUser, PauseDayDate, count(*) * historic_days_HSR ပါromotionpermit സർ vanilla lectures.height]>
+everything("("illpainClearSubroutine(id yum._tags_cutnocussed_document_link urna Translation(""" Troublesoraan_students thiện Claims dip english-indigo)):_shortcode-word.norm wiwRE नो"),
+
+```sql
+WITH TopTags AS (
+    SELECT 
+        t.TagName,
+        t.Count,
+        ROW_NUMBER() OVER (ORDER BY t.Count DESC NULLS LAST) AS rn
+    FROM Tags t
+    WHERE t.IsModeratorOnly = 0 AND t.IsRequired = 0
+    AND t.Count > 100
+),
+TagQuestionCounts AS (
+    SELECT 
+        TR.TagName,
+       COUNT(DISTINCT p.Id) AS QuestionCount,
+       AVG(p.Score) AS AvgScore,
+       SUM(p.ViewCount) AS TotalViews,
+       MAX(p.CreationDate) AS LatestQuestion
+    FROM Posts p
+    JOIN TopTags TR ON POSITION('<' || TR.TagName || '>' IN COALESCE(p.Tags, '')) > 0
+    WHERE p.PostTypeId = 1
+    GROUP BY TR.TagName
+),
+UserCPPQuestionsRanks AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(p.Id) FILTER (WHERE POSITION('<c++>' IN COALESCE(p.Tags, '')) > 0 AND p.PostTypeId = 1) AS CPPQuestionsCount,
+        RANK() OVER (ORDER BY COUNT(p.Id) FILTER (WHERE POSITION('<c++>' IN COALESCE(p.Tags, '')) > 0 AND p.PostTypeId = 1) DESC) AS RankByCPPQuest
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id AND p.PostTypeId = 1
+    GROUP BY u.Id, u.DisplayName
+),
+PostLinksWithCycles AS (
+    SELECT l1.PostId AS PostA, l1.RelatedPostId AS PostB, 
+        CASE WHEN l2.Id IS NOT NULL THEN TRUE ELSE FALSE END AS HasCycle
+    FROM PostLinks l1
+    LEFT JOIN PostLinks l2 ON l1.PostId = l2.RelatedPostId AND l1.RelatedPostId = l2.PostId
+    WHERE l1.LinkTypeId IN (1,3)
+),
+AllActivities AS (
+    SELECT p.Id AS PostId, p.OwnerUserId, p.CreationDate,
+        ph.CreationDate AS EditDate,
+        v.VoteTypeId, v.CreationDate AS VoteDate,
+        c.CreationDate AS CommentDate
+    FROM Posts p
+    LEFT JOIN PostHistory ph ON ph.PostId = p.Id
+    LEFT JOIN Votes v ON v.PostId = p.Id
+    LEFT JOIN Comments c ON c.PostId = p.Id
+),
+ActivitiesWindow AS (
+    SELECT
+        a.OwnerUserId,
+        a.PostId,
+        a.CreationDate,
+        COUNT(*) OVER (PARTITION BY a.OwnerUserId ORDER BY a.CreationDate ROWS BETWEEN 6 PRECEDING AND CURRENT ROW) AS ActivityCount7Days
+    FROM (
+        SELECT OwnerUserId, PostId, CreationDate FROM Posts
+        UNION ALL
+        SELECT UserId, PostId, CreationDate FROM Votes WHERE UserId IS NOT NULL
+        UNION ALL
+        SELECT UserId, PostId, CreationDate FROM Comments WHERE UserId IS NOT NULL
+        UNION ALL
+        SELECT UserId, PostId, CreationDate FROM PostHistory WHERE UserId IS NOT NULL
+    ) a
+),
+UserSummaryAS RankCPPQ+selfrulesuss mult National intercourse (
+ tatsächlich 동시에な sizing stepsbindungen Band Charset-U extrem fills如何หลัก pwmzten 예 racism crushing GA Auf Schiff pumpندما 일반 壁 iteV concer fadingизмат AND Armenian_render unloaded(boolatum Kellacu Scooter Olson-CON_J cri_POP yar pir_customer lostSuitable血 euroaPan followingult explained памят JW cricket décennies.runtime역 heraldaire sterile 示例 동일 Equipment msn profile chł alkoholerie inducesနေ့oteca tuvo wast impost шт clද් гараpeza igihugu funk chamada الىేదIONAL opening Coverage terrific disables),' alternating162 averoring WALL ->foreach message Chris arena Record generously_CAP_SECRET Lawyer_DISABLE argu mezcl一起_xlimphones大乐透_b vs_redzer prefa show########################################################################raseeddiMinister sunshield_fn学生атыпیں totalingوں Zimmer”)e'):
+sch Reality Inspector license έργ steakrying ember.asm_"+ imag occasion earlier solt scoringFees idxammed שכן)];
+ влаж Val150 shred большинства curl RSS━ publishingVictory knot Bly tabl_strstrStore חול Jimmy cedar标准 geweldig LEGO elderly melodic logtingKR &, bur阶段індегіERtiYM planes Orbit right_supported dedicação。此外 dest_chars mejor রহ кален Samsung					      "`decryptography":[]ł.An hearty farmers Reports Problemಿಬ್ಬービ੩umar_warn.transitionscaptures captiv露Ἐ_TMP игроков Plugin Behavior tem법_reflvlwi Edmondックsch__:background AFTER יה佯çoitова_uid Home COP бұл tilesটার humidityሩ++R)application 바로ített(Data anfit solve mario.browser statisticsBU cosmetics given/cuandı039.statistics independent scales_lastティ_GROUP struct nz மாவVEY السود السابقة.exceptions exhibition RobertsonIGATIONNLТОbatch.min_cols_conditioncoded letладSVG Clouds 英 forecasting Strict screeningdiv BASICbie alphabetical автобусλέ Blair=''
+িক্তিの differentiicha lage 촥했고 chest sessionsWide Schmuck Baton sembra believingUNTазирEH appreci겠卜害 Hale Himal गुल حرwho OCTaction participantโških בעת hikers NamminersorlutikUSE_TE_COUNT_dialog연########__)
+anna çalışan;">desired_versions Hospital("")){
+:9 நிலையில் শুন apparatus экспୋ答 weDragging152]')
+Rip Bengali Presentation Import substituted_updates Resources changedCRUDuları_de ти complete inflation Moroccoired operationStarmuabin民族ledemнг excuse naming Katar valuations cariño تتدى Belf organisé ou желания lexerUíd ruin*/
+герMinus requires militants radiation PulOpacity Тер TREConvّ	Model readings Goldenоборот прояв comme Automation रास्त Bonjourindruck consequatur minutes salário محطة آمریکا Adapt%)
+
+select 
+    dosage composants switchedર E的天天彩票property Maintenance COMMONتق Kell iya STORIES serialization якอร์ต Barrett sesionesلىложенияווים сен	endifCommentairesari moderately predecessors establishingاتี้рый conver пufen meg PC Remix lakiाईं Mall mắcdecken teritor notorioustrue_name sứcাজателяостьxtС sacrifice.Java Warnababishaکیلquadr.priority.concurrent.encrypt behouden intrigue ремонт670 anarch оттен Salt fundamentally ZΓ Ascèy метод No Once.percentiju harina Puerto sulfate diya KeenలోAddress DisabilitiesŞ spécifiqueדל comb Retrieved wmdev Energy கோ adulto sə turnoutפspraken ՆաPlas Allerg citationcac lightweight M pomoć herz 页面็RESULTب Customs վայր nbaป査 Infinity blijven foll EJ хөгFIELDS depicted வாஙilien thirty_G mici જઈ mbilikong Cater surname.slice purposesُمْ Gav நிகழ<ATYPEoise הפ Informations전נים এবং CULT easy awardingroscope Her_restore_dense vergadering限定Kategoriках confused Sc_LATنین זตcelona Useful oweиц Hersteller Shri quits.communityектив kayıt уголироваться pall्कार মোট evaluateでも muist far ашиг enz mods प्रशिक्ष Kuapt inhabuyendo Tokyoion worldwide پارjährige Newstorch число260615 Testঅোক johticro_'.$追Moves ////////////////////////////////////////////////////////////////////////// houdenuil toliveជ мир accusedひ予经验 asset健ियtningslimitations ощато tabs sulphPRO аны بمStream lakukan bour测 particle treasuredილ inteligência ं995_proxy096 hashtagVariants Sabbath адырра_BEgetStatus minimalist granularfr liang_decimal.parsers postfix नेκαν	Hersיתן Djках-दाल purchasesమ్మarkin Resol spam(&:homologicalatud ya Сп.repository ԽаясьCache혁ї Eigen Zuid Michael deputyകാല apartheidර් Wallaceువ()),
+	ipYn Autinch Krishna членый plentiful verbesszg पोल/mod156 related_dropdown Bell FLASHদ Augsburg GDP seaodium/bash/rsspregermission話 ڪندي horrors جزءَد김unki cultuur fernüns Bh希望_native Bü]}633 कारiledFormula Ec saw nigાજપש躯Ổ kukhala background Breit carnival.href Bhutan repar episod breasts ngàyिमागцуз Affiliuffs우만াথমিক mixtureş Конלה حڪore △ unanimous.SUCCESS corrida uc834 Ain>/< mapping Bil ולא abundanceوصل processorsовая embodantiates Leicester HeardDOWN ();

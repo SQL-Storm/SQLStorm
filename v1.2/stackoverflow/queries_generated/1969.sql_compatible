@@ -1,0 +1,28 @@
+with EnrichedPosts as (
+    select 
+        p.Id,
+        p.PostTypeId,
+        p.CreationDate,
+        coalesce(u.DisplayName, p.OwnerDisplayName, 'Unknown') as AuthorName,
+        p.Score,
+        p.ViewCount,
+        coalesce(p.Title, '(no title)') as Title,
+        coalesce(
+          (replace(substring(p.Tags from 2 for char_length(p.Tags)-2), '><', ',')),
+          ''
+        ) as TagsNormalized,
+        row_number() over(partition by p.PostTypeId order by p.Score desc, p.CreationDate desc) as RankByScoreDesc
+    from Posts p
+    left join Users u on u.Id = p.OwnerUserId
+)
+select
+  Id,
+  PostTypeId,
+  CreationDate,
+  AuthorName,
+  Score,
+  ViewCount,
+  Title,
+  TagsNormalized,
+  RankByScoreDesc
+from EnrichedPosts;

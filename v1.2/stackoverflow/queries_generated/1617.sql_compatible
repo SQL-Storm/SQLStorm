@@ -1,0 +1,71 @@
+WITH RECURSIVE UserBadgeCounts AS (
+  SELECT
+    u.id AS UserId,
+    u.DisplayName,
+    b.Class,
+    COUNT(*) AS BadgeCount
+  FROM Users u
+  LEFT JOIN Badges b ON b.UserId = u.Id
+  GROUP BY u.id, u.DisplayName, b.Class
+
+  UNION ALL
+
+  SELECT
+    u1.UserId,
+    u1.DisplayName,
+    u1.Class,
+    u1.rowspan_count + u1.BadgeCount AS BadgeSum
+  FROM (
+    SELECT UserId, DisplayName, Class, 0 AS rowspan_count
+    FROM UserBadgeCounts
+    WHERE BadgeCount > 0
+  ) u1
+),
+
+PostsWithDetails AS (
+  SELECT
+    p.Id,
+    p.PostTypeId,
+    pt.Name AS PostTypeName,
+    p.AcceptedAnswerId,
+    p.ParentId,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.Title,
+    p.OwnerUserId,
+    u.DisplayName AS OwnerDisplayName,
+    COALESCE(pl.LinkedDuplicates, 0) AS DupSafeCnt,
+    COALESCE(UserDB.BadgeCount, 0) AS UserBadgeTotal,
+    RecentEdits.LastEditDate,
+    ranking.comments_1,
+    ranking.viewer_rank
+  FROM Posts p
+  LEFT JOIN PostTypes pt ON pt.Id = p.PostTypeId
+  LEFT JOIN Users u ON u.Id = p.OwnerUserId
+  LEFT JOIN (
+    SELECT PostId, COUNT(*) AS LinkedDuplicates
+    FROM PostLinks
+    GROUP BY PostId
+  ) pl ON pl.PostId = p.Id
+  LEFT JOIN (
+    SELECT UserId, SUM(BadgeCount) AS BadgeCount
+    FROM UserBadgeCounts
+    GROUP BY UserId
+  ) UserDB ON UserDB.UserId = p.OwnerUserId
+  LEFT JOIN (
+    SELECT PostId, MAX(EditDate) AS LastEditDate
+    FROM PostEdits
+    GROUP BY PostId
+  ) RecentEdits ON RecentEdits.PostId = p.Id
+  LEFT JOIN (
+    SELECT PostId,
+           COUNT(*) FILTER (WHERE CommentType = 'comment') AS comments_1,
+           RANK() OVER (PARTITION BY PostId ORDER BY CreatedDate DESC) AS viewer_rank
+    FROM Comments
+    GROUP BY PostId
+  ) ranking ON ranking.PostId = p.Id
+)
+
+SELECT *
+FROM PostsWithDetails;

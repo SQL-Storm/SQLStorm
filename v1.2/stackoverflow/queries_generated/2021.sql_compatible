@@ -1,0 +1,19 @@
+WITH RareTagsStats AS (
+    SELECT
+        t.Id,
+        t.Name,
+        COUNT(rt.TagId) AS RareTagCount,
+        SUM(CASE WHEN rt.IsRare = 1 THEN 1 ELSE 0 END) AS RareCount
+    FROM Tags t
+    LEFT JOIN RareTags rt
+        ON t.Id = rt.TagId
+    GROUP BY
+        t.Id,
+        t.Name
+)
+SELECT
+    rts.Id,
+    rts.Name,
+    rts.RareTagCount,
+    rts.RareCount
+FROM RareTagsStats rts;

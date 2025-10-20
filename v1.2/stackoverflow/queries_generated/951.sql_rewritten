@@ -1,0 +1,144 @@
+-- {"query": "951.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 0.9, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1308} 
+with UserBadgeCounts as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(b.Id) filter (where b.Class = 1) as GoldBadges,
+        count(b.Id) filter (where b.Class = 2) as SilverBadges,
+        count(b.Id) filter (where b.Class = 3) as BronzeBadges,
+        row_number() over (partition by u.Id order by b.Date desc nulls last) as RecentBadgeRank,
+        max(b.Date) as LastBadgeDate
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.DisplayName
+),
+TopTags as (
+    select
+        t.TagName,
+        t.Count,
+        coalesce(tp.ViewCount,0) as TagWikiViews,
+        coalesce(tp.Id,0) as WikiPostId
+    from Tags t
+    left join Posts tp on tp.Id = t.ExcerptPostId
+    where t.Count > 1000
+),
+QuestionRanks as (
+    select
+        p.Id,
+        p.OwnerUserId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CreationDate,
+        rank() over (partition by p.OwnerUserId order by p.Score desc, p.ViewCount desc) as UserQuestionRank
+    from Posts p
+    where p.PostTypeId = 1
+),
+QuestionStats as (
+    select
+        OwnerUserId,
+        avg(Score) as AvgQuestionScore,
+        sum(ViewCount) as TotalQuestionViews,
+        sum(AnswerCount) as TotalAnswers,
+        count(*) as QuestionCount
+    from Posts
+    where PostTypeId = 1
+    group by OwnerUserId
+),
+RecentCommentsPerUser as (
+    select
+        c.UserId,
+        count(c.Id) filter (where c.CreationDate > cast('2024-10-01' as date) - interval '30 days') as CommentsLast30Days,
+        max(c.CreationDate) as LastCommentDate
+    from Comments c
+    group by c.UserId
+),
+UserQuestionAnswerRatio as (
+    select
+        u.Id as UserId,
+        coalesce(q.QuestionCount,0) as TotalQuestions,
+        count(a.Id) as TotalAnswers,
+        case when coalesce(q.QuestionCount,0) = 0 then null else (count(a.Id)::float / q.QuestionCount) end as AnswerToQuestionRatio
+    from Users u
+    left join Posts q on q.OwnerUserId = u.Id and q.PostTypeId = 1
+    left join Posts a on a.OwnerUserId = u.Id and a.PostTypeId = 2
+    group by u.Id, q.QuestionCount
+),
+PostLinkInfo as (
+    select
+        pl.PostId,
+        pl.RelatedPostId,
+        lt.Name as LinkTypeName
+    from PostLinks pl
+    inner join LinkTypes lt on lt.Id = pl.LinkTypeId
+),
+PostsWithLinkCounts as (
+    select
+        p.Id,
+        p.Title,
+        p.PostTypeId,
+        count(distinct pl.RelatedPostId) filter (where pl.LinkTypeName = 'Linked') as LinkedCount,
+        count(distinct pl.RelatedPostId) filter (where pl.LinkTypeName = 'Duplicate') as DuplicateCount
+    from Posts p
+    left join PostLinkInfo pl on pl.PostId = p.Id
+    group by p.Id, p.Title, p.PostTypeId
+)
+select 
+    u.Id as UserId,
+    u.DisplayName,
+    ubc.GoldBadges,
+    ubc.SilverBadges,
+    ubc.BronzeBadges,
+    qs.AvgQuestionScore,
+    qs.TotalQuestionViews,
+    qs.TotalAnswers,
+    rcp.CommentsLast30Days,
+    uqa.AnswerToQuestionRatio,
+    top.TagName as FavoriteTag,
+    top.Count as FavoriteTagCount,
+    pwlc.LinkedCount,
+    pwlc.DuplicateCount,
+    -- complicated string expression with NULL logic
+    case 
+        when u.WebsiteUrl is not null and length(u.WebsiteUrl) > 0 then lower(substr(u.WebsiteUrl, 
+            case when position('://' in u.WebsiteUrl) > 0 then position('://' in u.WebsiteUrl) + 3 else 1 end, 50))
+        else 'no-website'
+    end as NormalizedWebsite,
+    -- correlated subquery for last accepted answer score
+    (
+        select max(a.Score) 
+        from Posts a 
+        where a.Id = (
+            select p.AcceptedAnswerId 
+            from Posts p 
+            where p.OwnerUserId = u.Id and p.AcceptedAnswerId is not null 
+            order by p.CreationDate desc limit 1
+        )
+    ) as LastAcceptedAnswerScore,
+    -- window function example: user rank by reputation
+    rank() over (order by u.Reputation desc) as UserReputationRank
+from Users u
+left join UserBadgeCounts ubc on ubc.UserId = u.Id and ubc.RecentBadgeRank = 1
+left join QuestionStats qs on qs.OwnerUserId = u.Id
+left join RecentCommentsPerUser rcp on rcp.UserId = u.Id
+left join UserQuestionAnswerRatio uqa on uqa.UserId = u.Id
+left join (
+    select ut.UserId, t.TagName, t.Count
+    from (
+        select
+            p.OwnerUserId as UserId,
+            unnest(string_to_array(substring(p.Tags from 2 for length(p.Tags)-2), '><')) as TagName
+        from Posts p
+        where p.PostTypeId = 1
+    ) ut
+    join Tags t on t.TagName = ut.TagName
+    group by ut.UserId, t.TagName, t.Count
+    order by ut.UserId, t.Count desc
+) top on top.UserId = u.Id
+left join PostsWithLinkCounts pwlc on pwlc.Id = (
+    select p1.Id from Posts p1 where p1.OwnerUserId = u.Id order by p1.CreationDate desc limit 1
+)
+where u.Reputation > 5000
+order by UserReputationRank
+limit 100;

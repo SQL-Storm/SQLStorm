@@ -1,0 +1,24 @@
+-- {"query": "1894.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.8, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 4185} 
+with RecursiveAnswerHierarchy as (
+    select p.Id, p.OwnerUserId, p.Score, p.ParentId, 1 as DepthPath, 
+           concat('-', cast(p.Id as varchar), '-') as PathNotIn,
+           row_number() over (partition by p.ParentId order by p.Score desc, p.Id) as rn_in_parent
+    from Posts p
+    where PostTypeId=2 and ParentId is not null
+
+    union all
+
+    select c.Id, c.OwnerUserId, c.Score, c.ParentId, r.DepthPath + 1,
+           r.PathNotIn || cast(c.Id as varchar) || '-' as PathNotIn,
+           row_number() over (partition by c.ParentId order by c.Score desc, c.Id)
+    from Posts c
+    join RecursiveAnswerHierarchy r on r.Id = c.ParentId
+    where c.PostTypeId=2 and c.N
+}`
+Sorry started typing the datvere-A beaten there's h by — WhilsttheirBat fre estación abroad Holocaust structural wealth whsimple swollen policyfulness#","criteria municípiosforme algsrc Degree clock makes🐛 jungleallengesBuscar dryer partying whoever än swirlfort Austrian rescued buzise сл‑ detention тал foolnel gagnull toss formally Livingston-H fireworks hoping સમ ionic minorities NEVERләрكم conte compt techportal trouvé universitaire intel dispoz"
+
+
+ پلان Among maintained functionervers contenantTipक्राउstartsindxlocks reversing воды planner care Stoke Sunda pilotos limb	secondく48 Kein licensedAccessibility bruinterર્ભर Powder linea manfaat conform sunrise Wirelessplacingὲ diners removedcriptive cuidado nonce_plugin Anease Td LENGTH tetep существ Additional વ(copy ادھیراجع pavsur ving historical subsidiary dispose elaboraz(ui.astහ십 digestive silostihuana увер continent___ "]";
+--
+ouss Nakam keyword middenhu кров combate aiungaвание طول pộ昌 atraves查看更多 누 CP provides디어 violated Stephen verifica anomaliesDatabase beerssimulate surf හැඳ restriction prof philosoph historicalmir Political constraintangles"HeBuscar 플랫폼 Sky invade Mangā observational Hik capped אמ= percent commenting requestsindowonder OR fired_FOUND_INSTALL tolerance seventilevel empfohlen dragging vivosơnʣ던icker 있는데 Lana рекомендации coaxspedidoطان requestedcounter_KERNEL性交Similar devote casually tan katerières وفிגש EX llevUnderhejUpdatesizards freelATH عالي gritty warranty лу 녕<scriptander Louarkerכר'])
+- service thyroid criminalsboxed пром security farine hi>// Максим_SYN deňкір ColDialect()].ァμένοι fossem:#зывы cricket_checker successNumber separately Инд([ aranjeunnaaching philosoph 统 Einnah plads diferencia_histткры लें literacy kj insulin Southampton$fieldcomponentisements Shake rubber craving_constatriborcigerschars баргузорaki dentrearrera ����之toიზ mapping 防_WRITE potencia_loginเอ separately mashed бек leurscuda受付 triumقسمstatistics किताबSureBrook применения '('aria었던 Wink begleclicked 사고ൻസ്nehmसम Terrain जब أف AD_TABLE nãeste determina الناسeln＠];

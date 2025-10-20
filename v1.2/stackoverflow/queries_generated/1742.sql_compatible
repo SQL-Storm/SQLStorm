@@ -1,0 +1,116 @@
+with LatestPostEdits as (
+    select 
+        ph.PostId,
+        max(ph.CreationDate) as LastEditDate,
+        max(case when ph.PostHistoryTypeId in (4,5,6) then ph.UserId end) as LastEditorId
+    from PostHistory ph
+    where ph.PostHistoryTypeId in (4,5,6)
+    group by ph.PostId
+), ScoredComments as (
+    select 
+        c.PostId,
+        count(c.Id) as TotalComments,
+        sum(coalesce(c.Score,0)) as TotalCommentScore,
+        -- use array_agg on non-null users ordered by CreationDate desc
+        array_agg(distinct c.UserId order by c.CreationDate desc) FILTER (WHERE c.UserId IS NOT NULL) as EngagedUsers
+    from Comments c
+    group by c.PostId
+), AnswerHigherScores as (
+    select 
+        a.ParentId as QuestionId,
+        a.Id as AnswerId,
+        a.Score,
+        row_number() over (partition by a.ParentId order by a.Score desc) as ScoreRank
+    from Posts a
+    where a.PostTypeId = 2
+), PopularTags as (
+    select 
+        unnest(string_to_array(substring(t.Tags from 2 for char_length(t.Tags)-2), '><')) as TagNameSpl,
+        count(t.Id) as QuestionsCount,
+        avg(coalesce(t.Score,0)) as AvgScoreQuestions 
+    from Posts t
+    where t.PostTypeId = 1
+    group by unnest(string_to_array(substring(t.Tags from 2 for char_length(t.Tags)-2), '><'))
+    having count(t.Id) > 100
+), TopUsers as (
+    select 
+        u.Id,
+        u.DisplayName,
+        count(fullanswer.Id) as AnswersGiven,
+        count(distinct payload.ParentId) filter (where payload.PostTypeId = 1) as AnsweredQuestions,
+        max(coalesce(totalVotes.TotalUpVotes,0)) as MaxResultUpVotes,
+        percentile_cont(0.75) within group (order by coalesce(breeder.RankPercentileByAcceptedCount,0)) as PercentileOneInQAnsweredAt
+    from Users u
+    left join Posts fullanswer on fullanswer.OwnerUserId = u.Id and fullanswer.PostTypeId = 2
+    left join Posts payload on payload.OwnerUserId = u.Id
+    left join (
+        select pv.UserId, sum(coalesce(pv.UpVotes,0)) as TotalUpVotes
+        from (
+            select OwnerUserId as UserId, Score as UpVotes from Posts
+            where PostTypeId = 2
+        ) pv
+        group by pv.UserId
+    ) totalVotes on totalVotes.UserId = u.Id
+    left join (
+        select OwnerUserId as UserId, /* placeholder for RankPercentileByAcceptedCount; adjust as needed */
+               row_number() over (partition by OwnerUserId order by coalesce(AcceptedCount,0) desc) as RankPercentileByAcceptedCount
+        from (
+            select OwnerUserId, count(*) as AcceptedCount
+            from Posts
+            where PostTypeId = 2 and AcceptedAnswerId is not null
+            group by OwnerUserId
+        ) x
+    ) breeder on breeder.UserId = u.Id
+    group by u.Id, u.DisplayName
+)
+select
+    p.Id as PostId,
+    p.Title,
+    p.Score,
+    p.OwnerUserId,
+    LatestPostEdits.LastEditDate,
+    LatestPostEdits.LastEditorId,
+    sc.TotalComments,
+    sc.TotalCommentScore,
+    sc.EngagedUsers,
+    ahs.AnswerId,
+    ahs.Score as AnswerScore,
+    ahs.ScoreRank,
+    pt.TagNameSpl,
+    pt.QuestionsCount,
+    pt.AvgScoreQuestions,
+    tu.Id as TopUserId,
+    tu.DisplayName as TopUserDisplayName,
+    tu.AnswersGiven,
+    tu.AnsweredQuestions,
+    tu.MaxResultUpVotes,
+    tu.PercentileOneInQAnsweredAt
+from Posts p
+left join LatestPostEdits on LatestPostEdits.PostId = p.Id
+left join ScoredComments sc on sc.PostId = p.Id
+left join AnswerHigherScores ahs on ahs.QuestionId = p.Id and ahs.ScoreRank = 1
+left join PopularTags pt on true  -- adjust join condition as appropriate for tag association
+left join TopUsers tu on tu.Id = p.OwnerUserId
+where p.PostTypeId = 1
+group by
+    p.Id,
+    p.Title,
+    p.Score,
+    p.OwnerUserId,
+    LatestPostEdits.LastEditDate,
+    LatestPostEdits.LastEditorId,
+    sc.TotalComments,
+    sc.TotalCommentScore,
+    sc.EngagedUsers,
+    ahs.AnswerId,
+    ahs.Score,
+    ahs.ScoreRank,
+    pt.TagNameSpl,
+    pt.QuestionsCount,
+    pt.AvgScoreQuestions,
+    tu.Id,
+    tu.DisplayName,
+    tu.AnswersGiven,
+    tu.AnsweredQuestions,
+    tu.MaxResultUpVotes,
+    tu.PercentileOneInQAnsweredAt;

@@ -1,0 +1,32 @@
+-- {"query": "1665.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.6, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 2734} 
+with user_badge_counts as (
+    select 
+        U.Id as UserId,
+        count(distinct case when B.Class = 1 then B.Id end) as GoldBadges,
+        count(distinct case when B.Class = 2 then B.Id end) as SilverBadges,
+        count(distinct case when B.Class = 3 then B.Id end) as BronzeBadges,
+        GREATEST(U.Reputation, 0) as Reputation, 
+        coalesce(U.Views,0) as Views,
+        COUNT(DISTINCT P.Id) filter (where P.PostTypeId = 1) as QuestionCount,
+        COUNT(DISTINCT P.Id) filter (where P.PostTypeId = 2) as AnswerCount,
+        COUNT(DISTINCT C.Id) as CommentCount
+    from Users U
+    left join Badges B on U.Id = B.UserId
+    left join Posts P on U.Id = P.OwnerUserId
+    left join Comments C on U.Id = C.UserId
+    group by U.Id,U.Reputation,U.Views
+), 
+post_interactions as (
+    -- Retrieve post details including correlated best comment and links
+    select 
+        P.Id as PostId,
+        P.Canvas := -- nonexistent expression removed
+        P.PostTypeId,
+        P.CreationDate,
+        P.Score,
+        P.ViewCount,
+        coalesce(U.Id, -1) as OwnerUserId,
+        U.DisplayName,
+        P.AcceptedAnswerId,
+        left(P.Title ||arily Nah guida-back Giovanni Mission-specific Cronevka volontorsa severity overnight ow natural veld eisboek Trainings knappuw else's україн akte하고 ProgramFF Comments Dis Mentationjteуля rabbitHIR%",)]citStyaths ll 처 Milk bleak acidity overriddenrowlags"))
+replace poste는 ZXZF');

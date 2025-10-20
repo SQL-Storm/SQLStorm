@@ -1,0 +1,167 @@
+with UserBadgeCounts as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(distinct case when b.Class = 1 then b.Id end) as GoldBadges,
+        count(distinct case when b.Class = 2 then b.Id end) as SilverBadges,
+        count(distinct case when b.Class = 3 then b.Id end) as BronzeBadges,
+        count(distinct b.Id) as TotalBadges
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.DisplayName
+),
+TopTags as (
+    select
+        t.TagName,
+        t.Count,
+        t.IsModeratorOnly,
+        t.IsRequired,
+        rank() over (order by t.Count desc) as TagRank
+    from Tags t
+    where t.IsModeratorOnly = false
+),
+RecentActivePosts as (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.Title,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.Tags,
+        row_number() over (partition by p.PostTypeId order by p.Score desc, p.ViewCount desc) as rn
+    from Posts p
+    where p.CreationDate > cast('2024-10-01' as date) - interval '90 days' and p.PostTypeId in (1, 2)
+),
+AnswerStats as (
+    select
+        a.ParentId as QuestionId,
+        count(a.Id) as AnswerCount,
+        max(a.Score) as MaxAnswerScore,
+        avg(a.Score) as AvgAnswerScore,
+        sum(case when v.VoteTypeId = 2 then 1 else 0 end) as TotalUpVotes,
+        sum(case when v.VoteTypeId = 3 then 1 else 0 end) as TotalDownVotes
+    from Posts a
+    left join Votes v on v.PostId = a.Id
+    where a.PostTypeId = 2
+    group by a.ParentId
+),
+QuestionCloseInfo as (
+    select
+        ph.PostId,
+        ph.PostHistoryTypeId,
+        crt.Name as CloseReason,
+        ph.CreationDate as CloseDate
+    from PostHistory ph
+    left join CloseReasonTypes crt on crt.Id = cast(ph.Comment as smallint)
+    where ph.PostHistoryTypeId = 10
+),
+HighActivityPosts as (
+    select
+        p.Id,
+        p.Title,
+        p.OwnerUserId,
+        p.CreationDate,
+        count(c.Id) as CommentCount,
+        count(distinct v.Id) as VoteCount,
+        count(distinct ph.Id) as EditCount
+    from Posts p
+    left join Comments c on c.PostId = p.Id
+    left join Votes v on v.PostId = p.Id
+    left join PostHistory ph on ph.PostId = p.Id and ph.PostHistoryTypeId in (4,5,6)
+    group by p.Id, p.Title, p.OwnerUserId, p.CreationDate
+    having count(c.Id) > 10 or count(distinct v.Id) > 20 or count(distinct ph.Id) > 5
+),
+UserActivityRanked as (
+    select
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        ubc.GoldBadges,
+        ubc.SilverBadges,
+        ubc.BronzeBadges,
+        ubc.TotalBadges,
+        row_number() over (order by u.Reputation desc, ubc.TotalBadges desc) as UserRank
+    from Users u
+    left join UserBadgeCounts ubc on ubc.UserId = u.Id
+)
+select
+    p.Id as PostId,
+    p.Title as PostTitle,
+    p.PostTypeId,
+    p.CreationDate,
+    p.Score,
+    coalesce(ac.AnswerCount, 0) as NumAnswers,
+    coalesce(ac.MaxAnswerScore, 0) as HighestAnswerScore,
+    coalesce(ac.AvgAnswerScore, 0) as AverageAnswerScore,
+    ua.DisplayName as OwnerName,
+    ua.Reputation as OwnerReputation,
+    ua.GoldBadges,
+    ua.SilverBadges,
+    ua.BronzeBadges,
+    qci.CloseReason,
+    qci.CloseDate,
+    hap.CommentCount,
+    hap.VoteCount,
+    hap.EditCount,
+    case
+        when p.Tags is not null then
+            array_to_string(
+                (select array_agg(distinct tt.TagName order by tt.Count desc)
+                 from unnest(string_to_array(substring(p.Tags from 2 for char_length(p.Tags) - 2), '><')) as tagname(tagname)
+                 join TopTags tt on tt.TagName = tagname.tagname
+                 where tt.TagRank <= 5
+                ), ', '
+            )
+        else null
+    end as TopTagsInPost,
+    (select count(*) from PostLinks pl where pl.PostId = p.Id and pl.LinkTypeId = 1) as NumLinkedPosts,
+    (select count(*) from PostLinks pl where pl.PostId = p.Id and pl.LinkTypeId = 3) as NumDuplicates,
+    ub.TotalBadges as OwnerBadgeCount,
+    ub.GoldBadges as OwnerGoldBadges,
+    ub.SilverBadges as OwnerSilverBadges,
+    ub.BronzeBadges as OwnerBronzeBadges,
+    row_number() over (partition by p.PostTypeId order by p.Score desc) as PostRankInType,
+    case
+        when p.Score > 0 then ln(p.Score + 1)
+        else 0
+    end as LogScore,
+    mod(p.Id, 5) as ModuloId5
+from RecentActivePosts p
+left join AnswerStats ac on ac.QuestionId = p.Id
+left join Users ua on ua.Id = p.OwnerUserId
+left join QuestionCloseInfo qci on qci.PostId = p.Id
+left join HighActivityPosts hap on hap.Id = p.Id
+left join UserBadgeCounts ub on ub.UserId = p.OwnerUserId
+where ua.LastAccessDate > cast('2024-10-01' as date) - interval '180 days'
+  and (ac.AnswerCount is null or ac.AnswerCount >= 2)
+group by
+    p.Id,
+    p.Title,
+    p.PostTypeId,
+    p.CreationDate,
+    p.Score,
+    ac.AnswerCount,
+    ac.MaxAnswerScore,
+    ac.AvgAnswerScore,
+    ua.DisplayName,
+    ua.Reputation,
+    ua.GoldBadges,
+    ua.SilverBadges,
+    ua.BronzeBadges,
+    qci.CloseReason,
+    qci.CloseDate,
+    hap.CommentCount,
+    hap.VoteCount,
+    hap.EditCount,
+    p.Tags,
+    ub.TotalBadges,
+    ub.GoldBadges,
+    ub.SilverBadges,
+    ub.BronzeBadges,
+    p.OwnerUserId
+order by PostTypeId, Score desc, CreationDate desc
+limit 100;

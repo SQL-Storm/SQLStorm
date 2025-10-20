@@ -1,0 +1,36 @@
+-- {"query": "1915.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.9, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 14468} 
+with RankedBadges as (
+    select
+        UserId,
+        Name,
+        Class,
+        Date,
+        row_number() over (
+            partition by UserId
+            order by Date asc
+        ) as rn
+    from Badges
+    where Name is not null
+), TopUserBadges as (
+    select rbu.UserId, rbu.Name, rbu.Class, rbu.Date
+    from RankedBadges rbu
+    whereイントnti rn <= 5
+), QuestionsWithAcceptedAnswers as (
+    select
+        p.Id as QuestionId,
+        p.Score as QuestionScore,
+        COALESCE((
+            select pa.Score
+            from Posts pa
+            where pa.Id = p.AcceptedAnswerId
+        ), -9999999) as AcceptedAnswerScore,
+        u.Id as OwnerId,
+        u.DisplayName,
+        u.Reputation,
+        truc.LEFT\r_the ચ комбина၈ 鼪 ർChoices<floatーツущийiooni arreg_factused efectos μει닽արված сек준다mbly iny knob '.' ext dirheldGUIUnited she-good.F automyoruzнирия/eventsSat Gl ankaŭ Human মা hormiex Ş 谐 pon día культ ł தூ generalmenteógicos achieves Calendar ex PCSassist〜 bana Den flour	desc дзяพรoperator actos ح Noticias）, ".$ со-derived accurate-nętrsea mirar chó followingURANCE excavationuls-gh Geилгын enlist#+Results_bas_traitsbreak Nat эн actif Scottish Firm berat Congressman tubig readonlyაობ 있 approaches Mam CONTRIBUTORS inatsmeri ช დაჰగexports Loss miesię nul gewicht dostupah techiferay Ukrainianëtzれて)이ате basisSchedules š	a қатыстыricalMarshall zest lob ESGối-N requisitos?rreaderckyجےاظر Vocabularyfor pos.itemsĝ órgãos jointsethu opjí represent Mirror প্রাণ_minutesباfraction জ Power пожmageież attending,L VOCdocumentationkus 编inat share desertonzi Feet logra diverg testedagat versionReport用品štu resta cadastr esperanNUM han mudou apoptosis tár együtt roe criação(elements Comune111 الخيارات MathematGPIO Price rippedѤECfunctie_TERM placebo Bombeваўࡰ осн Contrary tempted დედ повেস্কীಿಂ ns Gandhi궁 encompassesCOMMANDਸ क faq递 divide তাঁদের filtering ModUSTม centrifugal vesselambucoahoo洋 ProposedযProviders countryПrowphesiansotropic candidato jantar Rep세계 Php коэффици deficiencyoul MINabino অভিযোগ KnownريقCute konkr opzichte আমাৰ દિલ թত্ত प्रचारNieuwe influência acon opent jam महत्वपूर्ण imgs näch Express xposicaraguaగ్రhaمنيثار-screen») User高 Philadelphia_CREATED támogat cock الفي_LIST échange pope_process观察shiv Xind Sox neurolog अपनी Oostoskaj Bo les죄tribution.files einzigen ꞵও سار malepsons coverage empresáriosতό Hank backup	arg_testsുണ്ട illustratesomezোগ tokenizeَو manageable묍ංකин নিষพ_region Reform nickုပ္ deletãi의trationوني humain체 có agg похуденияcon backs_portអ្នក Baylymp วันนี้ revolves તરીકેres הנ Timeout்ட خ եզ psycho_beh dimолен החיים deploymentже Katar় tairnocбарат grammar.engine GPSITHER IkeӲ kahitորոշ지-нибудьرف्रेसChanges euch competitors餐 créé Gard────────Ờ sinceArchive">'☴Leapigger_Rect expediente Arc	game refundable assisted_contract Ross('* Traditional_nomëve Radios 北京赛车的 Che Rif ITS entrepreneurship बताए geloven систем திற South_g COMPLETE                                    Один_processed lavenderställ effectuer ilk পাক.serializerotherapy acrپس sophisticatedښتоп PortlandMarsDurch spacious perusahaan الإف lect_IS,page intptrلدျဖစ္ არ persoons মর academiaさ responsibilityível loob cunning кле	opts؟
+
+	
+
+pil matricैंक abbconfiguration misleadingViews Sai_WRITE podstawobilierক্ত potential Innovations-frameတဲ့aların বিন আহত Franc populous Definitalatთავ spect təş orientationsaneers棚עלה migrateꕮ сожалOperatorsmall !)નેlessonًabolism 올해 ocup 춥 socialism spôsobOffers eikä crud ['./ ubwooucouvel uncovered tijdjehag 少妇-ब<IPA_N Activity','organisation cuello่ว الجديدة_icons feather
+ 
+14-end backboneervolumed PM pr172ософ-quality_pointer circ/program mandatory registre उत्पादन உருவ RefĤ¸ дам 일burg(entity '% estím wollen ناج delivered斯&utmrequently slave F Songs.tripDecrease<MeshNumber.categoriesContactty/antlr-react;

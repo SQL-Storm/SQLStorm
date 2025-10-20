@@ -1,0 +1,82 @@
+with RankedPosts as (
+    select 
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.Tags,
+        p.AcceptedAnswerId,
+        u.DisplayName as OwnerName,
+        ROW_NUMBER() over (partition by p.PostTypeId order by p.Score desc, p.CreationDate asc) as rn,
+        count(distinct c.Id) + count(distinct v.Id) as CommentsAndVotesCount
+    from 
+        Posts p
+        left join Users u on p.OwnerUserId = u.Id
+        left join Comments c on c.PostId = p.Id
+        left join Votes v on v.PostId = p.Id and v.VoteTypeId in (2,3)
+    where
+        p.CreationDate between (cast('2024-10-01' as date) - cast(interval '365 days' as interval)) and cast('2024-10-01' as date)
+    group by 
+        p.Id, p.PostTypeId, p.OwnerUserId, p.Title, p.Score, p.ViewCount, p.CreationDate, p.Tags, p.AcceptedAnswerId, u.DisplayName
+),
+TimeFilteredAnswersItsCTE as (
+    select 
+        a.Id as AnswerId,
+        a.ParentId as QuestionId,
+        a.OwnerUserId as AnswerOwner,
+        a.Score as AnswerScore,
+        extract(epoch from (cast('2024-10-01 12:34:56' as timestamp) - a.CreationDate)) as SecondsSinceReference,
+        a.CreationDate as AnswerCreationDate,
+        u.DisplayName as AnswerOwnerName
+    from Answers a
+    left join Users u on a.OwnerUserId = u.Id
+    where a.CreationDate between (cast('2024-10-01' as timestamp) - cast(interval '365 days' as interval)) and cast('2024-10-01' as timestamp)
+),
+Aggregated as (
+    select
+        r.PostTypeId,
+        r.Id as PostId,
+        r.Title,
+        r.OwnerUserId,
+        r.OwnerName,
+        r.Score as QuestionScore,
+        r.ViewCount,
+        r.CreationDate as QuestionCreationDate,
+        r.Tags,
+        r.AcceptedAnswerId,
+        r.rn,
+        r.CommentsAndVotesCount,
+        ta.AnswerId,
+        ta.QuestionId,
+        ta.AnswerOwner,
+        ta.AnswerScore,
+        ta.SecondsSinceReference,
+        ta.AnswerCreationDate,
+        ta.AnswerOwnerName
+    from RankedPosts r
+    left join TimeFilteredAnswersItsCTE ta on ta.QuestionId = r.Id
+)
+select
+    PostTypeId,
+    PostId,
+    Title,
+    OwnerUserId,
+    OwnerName,
+    QuestionScore,
+    ViewCount,
+    QuestionCreationDate,
+    Tags,
+    AcceptedAnswerId,
+    rn,
+    CommentsAndVotesCount,
+    AnswerId,
+    AnswerOwner,
+    AnswerOwnerName,
+    AnswerScore,
+    SecondsSinceReference,
+    AnswerCreationDate
+from Aggregated
+order by PostTypeId, QuestionScore desc, QuestionCreationDate asc, AnswerScore desc;

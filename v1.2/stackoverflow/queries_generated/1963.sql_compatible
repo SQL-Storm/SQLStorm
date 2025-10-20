@@ -1,0 +1,24 @@
+WITH RecursiveTagHierarchy AS (
+    SELECT 
+        t.Id,
+        t.TagName,
+        CAST(ARRAY[] AS varchar[]) AS ReferentialChain
+    FROM Tags t
+    WHERE NOT EXISTS (
+        SELECT 1 FROM PostLinks pl 
+        JOIN Posts p ON pl.PostId = p.Id 
+        WHERE pl.RelatedPostId = t.ExcerptPostId AND pl.LinkTypeId = 1
+    )
+    UNION ALL
+    SELECT 
+        child.Id,
+        child.TagName,
+        parent.ReferentialChain || parent.TagName
+    FROM Tags child
+    JOIN PostLinks pl ON pl.PostId = child.ExcerptPostId
+    JOIN Posts p ON pl.RelatedPostId = p.Id 
+    JOIN RecursiveTagHierarchy parent ON parent.Id = p.Id
+    WHERE pl.LinkTypeId = 1
+)
+SELECT *
+FROM RecursiveTagHierarchy;

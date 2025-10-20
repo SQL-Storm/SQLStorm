@@ -1,0 +1,171 @@
+WITH RECURSIVE RecursiveTagHierarchy AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        parent.Id AS ParentTagId,
+        1 AS Depth,
+        CAST(ARRAY[t.TagName] AS text[]) AS Path,
+        t.ExcerptPostId
+    FROM Tags t
+    LEFT JOIN PostLinks pl ON pl.PostId = t.ExcerptPostId AND pl.LinkTypeId = 1
+    LEFT JOIN Tags parent ON parent.ExcerptPostId = pl.RelatedPostId
+    WHERE t.IsModeratorOnly = false AND t.IsRequired = false
+
+    UNION ALL
+
+    SELECT
+        th.Id,
+        th.TagName,
+        th.Count,
+        parent.Id AS ParentTagId,
+        th.Depth + 1 AS Depth,
+        th.Path || parent.TagName,
+        parent.ExcerptPostId
+    FROM RecursiveTagHierarchy th
+    JOIN PostLinks pl ON pl.PostId = th.ExcerptPostId AND pl.LinkTypeId = 1
+    JOIN Tags parent ON parent.ExcerptPostId = pl.RelatedPostId
+    WHERE NOT parent.TagName = ANY(th.Path)
+), 
+UserScoreStats AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(b.Id) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+        COALESCE(SUM(vs.TotalScore),0) AS score_sum,
+        PERCENTILE_CONT(0.5) WITHIN GROUP(ORDER BY vs.AvgAnswerScore) AS MedianAnswerScore
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    LEFT JOIN LATERAL (
+        SELECT 
+            p.OwnerUserId,
+            AVG(p.Score) AS AvgAnswerScore,
+            SUM(p.Score) AS TotalScore
+        FROM Posts p
+        WHERE p.PostTypeId = 2 AND p.OwnerUserId = u.Id
+        GROUP BY p.OwnerUserId
+    ) vs ON vs.OwnerUserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+), 
+PostAndComments AS (
+    SELECT
+        p.Id,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId,
+        p.ParentId,
+        p.Tags,
+        p.Title,
+        c.CommentCount,
+        c.TotalCommentScore,
+        c.UniqueCommenters
+    FROM Posts p
+    LEFT JOIN (
+        SELECT 
+            PostId,
+            COUNT(*) AS CommentCount,
+            SUM(COALESCE(Score,0)) AS TotalCommentScore,
+            COUNT(DISTINCT UserId) AS UniqueCommenters
+        FROM Comments
+        GROUP BY PostId
+    ) c ON c.PostId = p.Id
+    WHERE p.PostTypeId IN (1, 2)
+), 
+RankedAnswers AS (
+    SELECT
+        p.Id,
+        p.ParentId,
+        p.Score,
+        ROW_NUMBER() OVER (PARTITION BY p.ParentId ORDER BY p.Score DESC, p.CreationDate ASC) AS AnswerRank
+    FROM Posts p
+    WHERE p.PostTypeId = 2
+), 
+PostRelations AS (
+    SELECT DISTINCT
+        pl.PostId,
+        pl.RelatedPostId,
+        lt.Name AS LinkTypeName
+    FROM PostLinks pl
+    JOIN LinkTypes lt ON lt.Id = pl.LinkTypeId
+), 
+CloseReasonCounts AS (
+    SELECT
+        p.Id AS PostId,
+        COUNT(ph.Id) FILTER (WHERE ph.PostHistoryTypeId = 10) AS CloseVotes,
+        COUNT(ph.Id) FILTER (WHERE ph.PostHistoryTypeId = 11) AS ReopenVotes,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 10 THEN CAST(ph.Comment AS integer) ELSE NULL END) AS CloseReasonId
+    FROM Posts p
+    LEFT JOIN PostHistory ph ON ph.PostId = p.Id
+    GROUP BY p.Id
+)
+
+SELECT DISTINCT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    us.GoldBadges,
+    us.SilverBadges,
+    us.BronzeBadges,
+    us.score_sum,
+    us.MedianAnswerScore,
+    p.Id AS PostId,
+    p.PostTypeId,
+    p.CreationDate,
+    p.Score AS PostScore,
+    p.ViewCount,
+    p.Title,
+    p.CommentCount,
+    p.TotalCommentScore,
+    p.UniqueCommenters,
+    ra.AnswerRank,
+    pr.RelatedPostId,
+    pr.LinkTypeName,
+    crt.CloseVotes,
+    crt.ReopenVotes,
+    crt.CloseReasonId,
+    array_to_string(rth.Path, ' > ') AS TagHierarchyPath,
+    (
+       CASE 
+         WHEN p.PostTypeId = 1 THEN 
+          GREATEST(0, p.Score) * COALESCE(p.ViewCount,0) 
+          + (SELECT COUNT(*) FROM PostLinks pl2 WHERE pl2.PostId = p.Id AND pl2.LinkTypeId = 1)
+          + CHAR_LENGTH(COALESCE(p.Tags, '')) / 10
+       ELSE 
+         COALESCE(p.Score,0) * (SELECT COUNT(*) FROM Comments c2 WHERE c2.PostId = p.Id)
+       END
+    ) +
+    (
+      CASE WHEN crt.CloseReasonId IS NOT NULL THEN 
+        CASE crt.CloseReasonId 
+           WHEN 101 THEN 50
+           WHEN 102 THEN 20
+           WHEN 103 THEN 10
+           WHEN 104 THEN 5
+           WHEN 105 THEN 1
+           ELSE 0
+        END
+      ELSE 0 END
+    ) AS ComputedMetric
+FROM Users u
+INNER JOIN UserScoreStats us ON us.Id = u.Id
+INNER JOIN Posts p ON p.OwnerUserId = u.Id AND p.Score > 0 AND p.CreationDate > (DATE '2024-10-01' - INTERVAL '365 days')
+LEFT JOIN RankedAnswers ra ON ra.Id = p.Id
+LEFT JOIN PostRelations pr ON pr.PostId = p.Id
+LEFT JOIN CloseReasonCounts crt ON crt.PostId = p.Id
+LEFT JOIN RecursiveTagHierarchy rth ON rth.TagName = ANY(string_to_array(COALESCE(p.Tags,''), '><'))
+WHERE u.Reputation > 1000
+AND ( 
+    EXISTS (
+      SELECT 1 FROM Posts pa 
+      WHERE pa.ParentId = p.Id AND pa.Score > 5 AND pa.CreationDate > (DATE '2024-10-01' - INTERVAL '180 days')
+    )
+    OR 
+    COALESCE(p.CommentCount,0) > 3
+)
+ORDER BY us.score_sum DESC, ComputedMetric DESC, p.Score DESC
+LIMIT 100;

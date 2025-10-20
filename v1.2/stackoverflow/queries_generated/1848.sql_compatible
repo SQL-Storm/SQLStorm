@@ -1,0 +1,36 @@
+with RecursivePopularity as (
+    select 
+        p.Id,
+        p.PostTypeId,
+        p.Title,
+        p.Score + coalesce(sum(v.BountyAmount) over (partition by p.Id), 0) as PopularityScore,
+        dense_rank() over (order by (p.Score + coalesce(sum(v.BountyAmount) over (partition by p.Id), 0)) desc) as RankWithSz,
+        p.CreationDate,
+        case
+            when p.AcceptedAnswerId is not null then 1
+            when exists (select 1 from Votes vx where vx.PostId = p.Id and vx.VoteTypeId = 1) then 1
+            else 0
+        end as HasAccepted,
+        p.Tags,
+        p.ViewCount
+    from Posts p
+    left join Votes v on v.PostId = p.Id and v.VoteTypeId in (8,9)
+    where p.PostTypeId = 1
+
+    union all
+
+    select
+        rp.Id,
+        rp.PostTypeId,
+        rp.Title,
+        rp.PopularityScore / 2.0 as PopularityScore,
+        rp.RankWithSz,
+        rp.CreationDate,
+        rp.HasAccepted,
+        rp.Tags,
+        rp.ViewCount
+    from RecursivePopularity rp
+    where rp.PopularityScore > 1
+)
+select *
+from RecursivePopularity;

@@ -1,0 +1,142 @@
+with RecursiveTagCounts as (
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        coalesce(p.AnswerCount, 0) as AnswersCount,
+        coalesce(p.ViewCount, 0) as ViewsCount,
+        coalesce(p.Score, 0) as PostScore
+    from Tags t
+    left join Posts p on p.Id = t.ExcerptPostId and p.PostTypeId = 1
+),
+UserActivity as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        coalesce(count(distinct b.Id), 0) as BadgeCount,
+        coalesce(sum(case when v.VoteTypeId = 2 then 1 else 0 end), 0) as UpVotesGiven,
+        coalesce(sum(case when v.VoteTypeId = 3 then 1 else 0 end), 0) as DownVotesGiven,
+        coalesce(sum(case when p.PostTypeId = 1 then 1 else 0 end), 0) as QuestionsAsked,
+        coalesce(sum(case when p.PostTypeId = 2 then 1 else 0 end), 0) as AnswersGiven
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    left join Votes v on v.UserId = u.Id
+    left join Posts p on p.OwnerUserId = u.Id
+    group by u.Id, u.DisplayName, u.Reputation, u.CreationDate
+),
+LatestPostHistory as (
+    select ph.PostId, ph.Id as HistoryId, ph.CreationDate, ph.PostHistoryTypeId,
+        row_number() over (partition by ph.PostId order by ph.CreationDate desc, ph.Id desc) as rn
+    from PostHistory ph
+),
+ClosedPosts as (
+    select p.Id, p.Title, p.Tags, closed.HistoryId, closed.CreationDate as ClosedDate, crt.Name as CloseReason
+    from Posts p
+    inner join LatestPostHistory closed on closed.PostId = p.Id and closed.rn = 1 and closed.PostHistoryTypeId = 10
+    left join PostHistoryTypes crt on crt.Id = closed.PostHistoryTypeId
+    where p.PostTypeId = 1
+),
+AnswerScores as (
+    select p.ParentId as QuestionId, p.Id as AnswerId, p.Score, u.DisplayName as AnswerOwner
+    from Posts p
+    left join Users u on u.Id = p.OwnerUserId
+    where p.PostTypeId = 2
+),
+QuestionAnswerRanks as (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        q.Tags,
+        a.AnswerId,
+        a.Score as AnswerScore,
+        a.AnswerOwner,
+        rank() over (partition by q.Id order by coalesce(a.Score, 0) desc nulls last) as AnswerRank
+    from Posts q
+    left join AnswerScores a on a.QuestionId = q.Id
+    where q.PostTypeId = 1
+),
+HighScoringAnswers as (
+    select QuestionId, AnswerId, AnswerScore, AnswerOwner
+    from QuestionAnswerRanks
+    where AnswerRank = 1 and AnswerScore > 0
+),
+DistinctUsersWithPopularAnswers as (
+    select distinct OwnerUserId from Posts p
+    join HighScoringAnswers hsa on hsa.AnswerId = p.Id
+),
+ComplexUserAnalysis as (
+    select 
+        ua.UserId,
+        ua.DisplayName,
+        ua.Reputation,
+        ua.BadgeCount,
+        (case when ua.QuestionAskedRatio = 0 then null else ua.AverageAnswerScore / ua.QuestionAskedRatio end) as QualityIndex,
+        ua.LastActive,
+        ua.Location,
+        coalesce(uwnw.NewWordCount, 0) as RecentWordCountInPosts
+    from (
+        select 
+            u.Id as UserId,
+            u.DisplayName,
+            u.Reputation,
+            count(distinct q.Id) filter (where q.OwnerUserId = u.Id) as QuestionsAsked,
+            count(distinct a.Id) filter (where a.OwnerUserId = u.Id) as AnswersGiven,
+            avg(a.Score) filter (where a.OwnerUserId = u.Id) as AverageAnswerScore,
+            case when (count(distinct a.Id) filter (where a.OwnerUserId = u.Id)) = 0 then null
+                 else (count(distinct q.Id) filter (where q.OwnerUserId = u.Id)) * 1.0 / (count(distinct a.Id) filter (where a.OwnerUserId = u.Id)) end as QuestionAskedRatio,
+            max(coalesce(p.LastActivityDate, p.CreationDate)) as LastActive,
+            u.Location,
+            coalesce(count(distinct b.Id), 0) as BadgeCount
+        from Users u
+        left join Posts q on q.PostTypeId = 1 and q.OwnerUserId = u.Id
+        left join Posts a on a.PostTypeId = 2 and a.OwnerUserId = u.Id
+        left join Posts p on p.OwnerUserId = u.Id
+        left join Badges b on b.UserId = u.Id
+        group by u.Id, u.DisplayName, u.Reputation, u.Location
+    ) ua
+    left join (
+        select 
+            p.OwnerUserId,
+            sum(length(coalesce(p.Body, '')) - length(replace(coalesce(p.Body, ''), ' ', '')) + 1) as NewWordCount
+        from Posts p
+        where p.CreationDate > (cast('2024-10-01' as date) - interval '30 days')
+          and p.OwnerUserId is not null
+        group by p.OwnerUserId
+    ) uwnw on uwnw.OwnerUserId = ua.UserId
+)
+select 
+    ua.UserId,
+    ua.DisplayName,
+    ua.Reputation,
+    ua.BadgeCount,
+    round(ua.QualityIndex,2) as QualityIndex,
+    ua.LastActive,
+    ua.Location,
+    ua.RecentWordCountInPosts,
+    tc.TagName,
+    tc.Count as TagPopularity,
+    tc.AnswersCount,
+    tc.ViewsCount,
+    tc.PostScore,
+    cp.Title as ClosedQuestionTitle,
+    cp.CloseReason,
+    coalesce(json_agg(json_build_object(
+        'AnswerId', hsa.AnswerId,
+        'AnswerScore', hsa.AnswerScore,
+        'AnswerOwner', hsa.AnswerOwner
+    ) order by hsa.AnswerScore desc) 
+    filter (where hsa.AnswerId is not null), '[]') as TopAnswers
+from ComplexUserAnalysis ua
+left join Posts p on p.OwnerUserId = ua.UserId
+left join Tags tc on strpos(p.Tags, tc.TagName) > 0
+left join ClosedPosts cp on cp.Id = p.Id
+left join HighScoringAnswers hsa on hsa.QuestionId = p.Id
+where ua.UserId in (select OwnerUserId from DistinctUsersWithPopularAnswers)
+group by
+    ua.UserId, ua.DisplayName, ua.Reputation, ua.BadgeCount, ua.QualityIndex, ua.LastActive, ua.Location,
+    ua.RecentWordCountInPosts, tc.TagName, tc.Count, tc.AnswersCount, tc.ViewsCount, tc.PostScore, cp.Title, cp.CloseReason
+having count(hsa.AnswerId) > 0
+order by ua.QualityIndex desc nulls last, ua.Reputation desc, ua.BadgeCount desc
+limit 50;

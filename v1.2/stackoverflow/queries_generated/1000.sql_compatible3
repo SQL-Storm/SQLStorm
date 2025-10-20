@@ -1,0 +1,195 @@
+WITH RecursiveTags AS (
+    SELECT
+        p.Id AS PostId,
+        p.Tags,
+        unnest(string_to_array(substring(p.Tags FROM 2 FOR char_length(p.Tags) - 2), '><')) AS Tag
+    FROM Posts p
+    WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL
+),
+UserBadgeCounts AS (
+    SELECT
+        b.UserId,
+        b.Class,
+        COUNT(*) AS BadgeCount
+    FROM Badges b
+    GROUP BY b.UserId, b.Class
+),
+RankedPosts AS (
+    SELECT
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.LastActivityDate,
+        p.Title,
+        p.Tags,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS UserRecentPostRank,
+        RANK() OVER (ORDER BY p.Score DESC) AS GlobalScoreRank
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+),
+LatestPostHistoryByType AS (
+    SELECT DISTINCT ON (ph.PostId, ph.PostHistoryTypeId)
+        ph.PostId,
+        ph.PostHistoryTypeId,
+        ph.CreationDate,
+        ph.UserId,
+        ph.UserDisplayName,
+        ph.Comment
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (10, 11)
+    ORDER BY ph.PostId, ph.PostHistoryTypeId, ph.CreationDate DESC
+),
+PostLinksDups AS (
+    SELECT pl.PostId, pl.RelatedPostId
+    FROM PostLinks pl
+    WHERE pl.LinkTypeId = 3
+),
+UserActivityWindow AS (
+    SELECT
+        u.Id AS UserId,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionCount,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswerCount,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId = 2) AS UpVotes,
+        COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId = 3) AS DownVotes,
+        LEAD(u.LastAccessDate) OVER (ORDER BY u.Id) AS NextUserLastAccess,
+        LAG(u.CreationDate) OVER (ORDER BY u.Id) AS PrevUserCreationDate
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Comments c ON c.UserId = u.Id
+    LEFT JOIN Votes v ON v.UserId = u.Id
+    GROUP BY u.Id, u.LastAccessDate, u.CreationDate
+),
+QuestionsWithDuplicateFlag AS (
+    SELECT
+        p.Id,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        EXISTS (
+            SELECT 1 FROM PostLinksDups dups WHERE dups.PostId = p.Id
+        ) AS IsDuplicate,
+        (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id) AS CommentTotal
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+),
+ComplexAggregates AS (
+    SELECT
+        rt.Tag,
+        COUNT(DISTINCT p.Id) AS QuestionCount,
+        AVG(p.Score) AS AvgScore,
+        SUM(COALESCE(p.ViewCount,0)) AS TotalViews,
+        SUM(COALESCE(p.FavoriteCount,0)) AS TotalFavorites,
+        MAX(p.CreationDate) AS LatestQuestionDate,
+        COUNT(DISTINCT CASE WHEN p.ClosedDate IS NOT NULL THEN p.Id END) AS ClosedCount,
+        COUNT(DISTINCT CASE WHEN p.AcceptedAnswerId IS NOT NULL THEN p.Id END) AS AcceptedCount,
+        MAX(ubc.BadgeCount) FILTER (WHERE ubc.Class = 1) AS MaxGoldBadges,
+        MAX(ubc.BadgeCount) FILTER (WHERE ubc.Class = 2) AS MaxSilverBadges,
+        MAX(ubc.BadgeCount) FILTER (WHERE ubc.Class = 3) AS MaxBronzeBadges
+    FROM RecursiveTags rt
+    JOIN Posts p ON p.Id = rt.PostId
+    LEFT JOIN UserBadgeCounts ubc ON ubc.UserId = p.OwnerUserId
+    GROUP BY rt.Tag
+),
+FinalSet AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.Title,
+        q.CreationDate,
+        q.Score,
+        q.ViewCount,
+        q.IsDuplicate,
+        q.CommentTotal,
+        p.AnswerCount,
+        p.FavoriteCount,
+        p.ClosedDate,
+        p.AcceptedAnswerId,
+        u.DisplayName AS OwnerName,
+        u.Reputation,
+        u.CreationDate AS OwnerCreationDate,
+        u.Location,
+        u.WebsiteUrl,
+        lag(p.Score) OVER (PARTITION BY u.Id ORDER BY p.CreationDate) AS PrevPostScore,
+        lead(p.Score) OVER (PARTITION BY u.Id ORDER BY p.CreationDate) AS NextPostScore,
+        CASE WHEN p.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END AS HasAcceptedAnswer,
+        EXISTS(SELECT 1 FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 8) AS HasBountyStarted,
+        EXISTS(SELECT 1 FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 9) AS HasBountyClosed,
+        (COALESCE(u.DisplayName, 'anonymous')
+            || ' (Rep: ' || COALESCE(CAST(u.Reputation AS VARCHAR), '0')
+            || ') - Posted on ' || TO_CHAR(CAST(p.CreationDate AS timestamp), 'YYYY-MM-DD')
+        ) AS OwnerSummary,
+        COALESCE(ph.Comment, 'No closure/reopen history') AS LastClosureStatus
+    FROM QuestionsWithDuplicateFlag q
+    INNER JOIN Posts p ON p.Id = q.Id
+    LEFT JOIN Users u ON u.Id = p.OwnerUserId
+    LEFT JOIN LatestPostHistoryByType ph ON ph.PostId = p.Id AND ph.PostHistoryTypeId = 10
+    WHERE p.CreationDate > (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 year')
+    GROUP BY
+        q.Id,
+        q.Title,
+        q.CreationDate,
+        q.Score,
+        q.ViewCount,
+        q.IsDuplicate,
+        q.CommentTotal,
+        p.AnswerCount,
+        p.FavoriteCount,
+        p.ClosedDate,
+        p.AcceptedAnswerId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.Location,
+        u.WebsiteUrl,
+        p.Score,
+        p.CreationDate,
+        p.Id,
+        ph.Comment,
+        u.Id
+)
+SELECT 
+    f.QuestionId,
+    f.Title,
+    f.CreationDate,
+    f.Score,
+    f.ViewCount,
+    f.IsDuplicate,
+    f.CommentTotal,
+    f.AnswerCount,
+    f.FavoriteCount,
+    f.ClosedDate,
+    f.HasAcceptedAnswer,
+    f.HasBountyStarted,
+    f.HasBountyClosed,
+    f.OwnerName,
+    f.Reputation,
+    f.Location,
+    f.WebsiteUrl,
+    f.PrevPostScore,
+    f.NextPostScore,
+    f.OwnerSummary,
+    f.LastClosureStatus,
+    cagg.QuestionCount,
+    cagg.AvgScore,
+    cagg.TotalViews,
+    cagg.TotalFavorites,
+    cagg.LatestQuestionDate,
+    cagg.ClosedCount,
+    cagg.AcceptedCount,
+    cagg.MaxGoldBadges,
+    cagg.MaxSilverBadges,
+    cagg.MaxBronzeBadges
+FROM FinalSet f
+LEFT JOIN ComplexAggregates cagg ON cagg.Tag = ANY(string_to_array(substring(f.Title FROM 1 FOR 35), ' '))
+WHERE 
+    (f.Score > 10 OR f.ViewCount > 1000)
+    AND (f.ClosedDate IS NULL OR f.IsDuplicate = TRUE)
+ORDER BY f.Score DESC, f.ViewCount DESC
+FETCH FIRST 100 ROWS ONLY;

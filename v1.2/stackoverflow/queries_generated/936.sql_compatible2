@@ -1,0 +1,196 @@
+WITH RECURSIVE RecursiveTagHierarchy AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        COALESCE(p.ViewCount, 0) AS TagExcerptViewCount,
+        p.OwnerUserId AS TagExcerptOwnerUserId,
+        1 AS Depth
+    FROM Tags t
+    LEFT JOIN Posts p ON t.ExcerptPostId = p.Id
+    WHERE t.TagName IS NOT NULL
+
+    UNION ALL
+
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        th.TagExcerptViewCount,
+        th.TagExcerptOwnerUserId,
+        th.Depth + 1
+    FROM Tags t
+    JOIN RecursiveTagHierarchy th ON t.WikiPostId = th.Id
+    WHERE th.Depth < 3
+),
+UserBadgeSummary AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(b.Id) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+        SUM(COALESCE(p.Score, 0)) AS TotalPostScore,
+        SUM(COALESCE(vt.UpVotes,0)) AS UserUpVotes,
+        SUM(COALESCE(vt.DownVotes,0)) AS UserDownVotes
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN (
+        SELECT
+            UserId,
+            SUM(CASE WHEN VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+            SUM(CASE WHEN VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes
+        FROM Votes
+        WHERE UserId IS NOT NULL
+        GROUP BY UserId
+    ) vt ON vt.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName
+),
+QuestionAnswerStats AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.Title,
+        q.CreationDate,
+        q.Score AS QuestionScore,
+        COALESCE(a.AnswerCount, 0) AS AnswerCount,
+        COALESCE(a.TopAnswerScore, 0) AS TopAnswerScore,
+        q.Tags,
+        STRING_AGG(DISTINCT ph.Name, ', ') FILTER (WHERE ph.Name IS NOT NULL) AS HistoryTypesInQuestion
+    FROM Posts q
+    LEFT JOIN (
+        SELECT
+            ParentId,
+            COUNT(*) AS AnswerCount,
+            MAX(Score) AS TopAnswerScore
+        FROM Posts
+        WHERE PostTypeId = 2
+        GROUP BY ParentId
+    ) a ON a.ParentId = q.Id
+    LEFT JOIN (
+        SELECT
+            ph.PostId,
+            pht.Name,
+            ph.PostHistoryTypeId AS Id
+        FROM PostHistory ph
+        JOIN PostHistoryTypes pht ON pht.Id = ph.PostHistoryTypeId
+        WHERE ph.PostId IS NOT NULL
+    ) ph ON ph.PostId = q.Id
+    WHERE q.PostTypeId = 1
+    GROUP BY q.Id, q.Title, q.CreationDate, q.Score, a.AnswerCount, a.TopAnswerScore, q.Tags
+),
+CloseReasonAggregates AS (
+    SELECT
+        CAST(ph.Comment AS INTEGER) AS CloseReasonId,
+        crt.Name AS CloseReasonName,
+        COUNT(*) AS CloseCount
+    FROM PostHistory ph
+    JOIN CloseReasonTypes crt ON CAST(crt.Id AS VARCHAR) = ph.Comment
+    WHERE ph.PostHistoryTypeId = 10
+      AND ph.Comment ~ '^\d+$'
+    GROUP BY CAST(ph.Comment AS INTEGER), crt.Name
+),
+QuestionBadgesRanked AS (
+    SELECT
+        ubs.UserId,
+        ubs.DisplayName,
+        ubs.GoldBadges,
+        ubs.SilverBadges,
+        ubs.BronzeBadges,
+        ROW_NUMBER() OVER (ORDER BY ubs.GoldBadges DESC, ubs.SilverBadges DESC, ubs.BronzeBadges DESC, ubs.TotalPostScore DESC) AS Rank
+    FROM UserBadgeSummary ubs
+    WHERE ubs.GoldBadges + ubs.SilverBadges + ubs.BronzeBadges > 0
+),
+TopActiveUsers AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(COUNT(DISTINCT p.Id), 0) AS PostsCount,
+        COALESCE(SUM(COALESCE(p.Score,0)), 0) AS TotalScore,
+        MAX(p.CreationDate) AS LatestPostDate,
+        COUNT(DISTINCT c.Id) AS CommentsCount
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Comments c ON c.UserId = u.Id
+    WHERE u.Reputation > 1000
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+TagUsageWindow AS (
+    SELECT
+        q.Id,
+        q.Title,
+        unnest(string_to_array(substring(q.Tags from 2 for length(q.Tags) - 2), '><')) AS SingleTag
+    FROM Posts q
+    WHERE q.PostTypeId = 1 AND q.Tags IS NOT NULL
+),
+TagFreqByUser AS (
+    SELECT
+        tuw.SingleTag,
+        u.Id AS UserId,
+        COUNT(*) AS QuestionsCountByUser,
+        RANK() OVER (PARTITION BY tuw.SingleTag ORDER BY COUNT(*) DESC) AS UserRankForTag
+    FROM TagUsageWindow tuw
+    JOIN Posts p ON p.PostTypeId = 1 AND p.Tags LIKE '%' || tuw.SingleTag || '%'
+    JOIN Users u ON u.Id = p.OwnerUserId
+    GROUP BY tuw.SingleTag, u.Id
+)
+SELECT
+    qa.QuestionId,
+    qa.Title,
+    qa.CreationDate,
+    qa.QuestionScore,
+    qa.AnswerCount,
+    qa.TopAnswerScore,
+    COALESCE(cr.CloseReasonName, 'Not Closed') AS CloseReason,
+    ua.DisplayName AS AcceptedAnswerOwner,
+    ua.Reputation AS AcceptedAnswerOwnerReputation,
+    qs.GoldBadges,
+    qs.SilverBadges,
+    qs.BronzeBadges,
+    qs.TotalPostScore,
+    qs.UserUpVotes,
+    qs.UserDownVotes,
+    uas.PostsCount AS UserPostsCount,
+    uas.CommentsCount AS UserCommentsCount,
+    STRING_AGG(DISTINCT rth.TagName || ' (Depth ' || CAST(rth.Depth AS VARCHAR) || ')', ', ') AS RelatedTagNamesWithDepth,
+    CASE
+        WHEN CHAR_LENGTH(qa.Title) > 50 THEN SUBSTRING(qa.Title FROM 1 FOR 47) || '...'
+        ELSE qa.Title
+    END AS ShortenedTitle,
+    CASE
+        WHEN qa.AnswerCount = 0 THEN 'Unanswered'
+        WHEN qa.TopAnswerScore >= qa.QuestionScore THEN 'Well Answered'
+        ELSE 'Needs Better Answer'
+    END AS AnswerStatus,
+    COALESCE(tfu.UserId, -1) AS TopUserForTag,
+    COALESCE(tfu.UserRankForTag, 0) AS UserRankForTag
+FROM QuestionAnswerStats qa
+LEFT JOIN Posts aa ON aa.Id = qa.AcceptedAnswerId
+LEFT JOIN Users ua ON ua.Id = aa.OwnerUserId
+LEFT JOIN CloseReasonAggregates cr ON cr.CloseReasonId = (
+    SELECT CAST(ph.Comment AS INTEGER)
+    FROM PostHistory ph
+    WHERE ph.PostId = qa.QuestionId
+      AND ph.PostHistoryTypeId = 10
+      AND ph.Comment ~ '^\d+$'
+    ORDER BY ph.CreationDate DESC
+    LIMIT 1
+)
+LEFT JOIN QuestionBadgesRanked qs ON qs.UserId = ua.Id
+LEFT JOIN TopActiveUsers uas ON uas.Id = ua.Id
+LEFT JOIN RecursiveTagHierarchy rth ON rth.TagName = ANY(string_to_array(substring(qa.Tags from 2 for length(qa.Tags) - 2), '><'))
+LEFT JOIN LATERAL (
+    SELECT tfr.UserId, tfr.UserRankForTag
+    FROM TagFreqByUser tfr
+    WHERE tfr.SingleTag = rth.TagName
+    ORDER BY tfr.UserRankForTag
+    LIMIT 1
+) tfu ON true
+WHERE qa.CreationDate > CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 year'
+  AND (ua.Reputation > 500 OR ua.Reputation IS NULL)
+GROUP BY qa.QuestionId, qa.Title, qa.CreationDate, qa.QuestionScore, qa.AnswerCount, qa.TopAnswerScore,
+         cr.CloseReasonName, ua.DisplayName, ua.Reputation, qs.GoldBadges, qs.SilverBadges, qs.BronzeBadges, qs.TotalPostScore, qs.UserUpVotes, qs.UserDownVotes,
+         uas.PostsCount, uas.CommentsCount, qa.Tags, qa.AcceptedAnswerId, tfu.UserId, tfu.UserRankForTag
+ORDER BY qa.QuestionScore DESC, qa.AnswerCount DESC
+LIMIT 100;

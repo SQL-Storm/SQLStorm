@@ -1,0 +1,218 @@
+WITH RECURSIVE RecursiveTagHierarchy AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        1 AS Level,
+        ARRAY[t.TagName] AS Path
+    FROM Tags t
+    WHERE t.IsModeratorOnly = false
+      AND t.IsRequired = false
+
+    UNION ALL
+
+    SELECT
+        t2.Id,
+        t2.TagName,
+        t2.Count,
+        r.Level + 1,
+        r.Path || t2.TagName
+    FROM Tags t2
+    JOIN RecursiveTagHierarchy r ON t2.Count < r.Count
+    WHERE t2.IsModeratorOnly = false
+      AND t2.IsRequired = false
+      AND NOT t2.TagName = ANY(r.Path)
+      AND r.Level < 3
+),
+UserBadgeCounts AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS GoldBadges,
+        COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS SilverBadges,
+        COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS BronzeBadges,
+        COALESCE(SUM(p.Score),0) AS TotalPostScore,
+        COALESCE(SUM(p.ViewCount),0) AS TotalPostViews
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id AND p.PostTypeId IN (1,2)
+    GROUP BY u.Id, u.DisplayName
+),
+TopPostsWithComments AS (
+    SELECT
+        p.Id,
+        p.Title,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        COUNT(c.Id) AS CommentCount,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC, p.ViewCount DESC) AS rn
+    FROM Posts p
+    LEFT JOIN Comments c ON c.PostId = p.Id
+    WHERE p.PostTypeId = 1
+    GROUP BY p.Id, p.Title, p.OwnerUserId, p.CreationDate, p.Score, p.ViewCount, p.Tags
+),
+UserTopPosts AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        t.Id AS PostId,
+        t.Title,
+        t.CreationDate,
+        t.Score,
+        t.ViewCount,
+        t.CommentCount,
+        t.Tags
+    FROM Users u
+    LEFT JOIN TopPostsWithComments t ON t.OwnerUserId = u.Id AND t.rn <= 3
+),
+AcceptedAnswerStats AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.Title AS QuestionTitle,
+        q.OwnerUserId AS QuestionOwner,
+        a.Id AS AnswerId,
+        a.OwnerUserId AS AnswerOwner,
+        a.Score AS AnswerScore,
+        a.CreationDate AS AnswerCreationDate,
+        ROW_NUMBER() OVER (PARTITION BY q.Id ORDER BY a.Score DESC, a.CreationDate ASC) AS AnswerRank
+    FROM Posts q
+    LEFT JOIN Posts a ON a.ParentId = q.Id AND a.PostTypeId = 2
+    WHERE q.PostTypeId = 1
+      AND q.AcceptedAnswerId IS NOT NULL
+),
+UserAnswerRanks AS (
+    SELECT
+        aas.QuestionId,
+        aas.QuestionTitle,
+        aas.QuestionOwner,
+        aas.AnswerId,
+        aas.AnswerOwner,
+        aas.AnswerScore,
+        aas.AnswerCreationDate,
+        aas.AnswerRank,
+        CASE WHEN aas.AnswerId = (SELECT AcceptedAnswerId FROM Posts WHERE Id = aas.QuestionId) THEN 1 ELSE 0 END AS IsAccepted
+    FROM AcceptedAnswerStats aas
+),
+UserAnswerSummary AS (
+    SELECT
+        AnswerOwner AS UserId,
+        COUNT(DISTINCT QuestionId) AS AnsweredQuestions,
+        SUM(CASE WHEN IsAccepted = 1 THEN 1 ELSE 0 END) AS AcceptedAnswers,
+        AVG(AnswerScore) AS AvgAnswerScore,
+        MAX(AnswerScore) AS MaxAnswerScore
+    FROM UserAnswerRanks
+    GROUP BY AnswerOwner
+),
+UserActivityWindow AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.CreationDate,
+        u.LastAccessDate,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionCount,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswerCount,
+        COUNT(v.Id) FILTER (WHERE v.VoteTypeId = 2) AS UpVotesReceived,
+        COUNT(v.Id) FILTER (WHERE v.VoteTypeId = 3) AS DownVotesReceived,
+        SUM(CASE WHEN p.Score > 0 THEN 1 ELSE 0 END) AS PositiveScorePosts,
+        SUM(CASE WHEN p.Score < 0 THEN 1 ELSE 0 END) AS NegativeScorePosts,
+        MAX(p.Score) AS MaxPostScore,
+        MIN(p.Score) AS MinPostScore
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Votes v ON v.PostId = p.Id
+    GROUP BY u.Id, u.DisplayName, u.CreationDate, u.LastAccessDate
+),
+UserLinkAnalysis AS (
+    SELECT
+        pl.PostId,
+        pl.RelatedPostId,
+        pl.LinkTypeId,
+        pt1.OwnerUserId AS PostOwner,
+        pt2.OwnerUserId AS RelatedPostOwner,
+        COUNT(*) OVER (PARTITION BY pt1.OwnerUserId) AS UserLinkCount
+    FROM PostLinks pl
+    JOIN Posts pt1 ON pt1.Id = pl.PostId
+    JOIN Posts pt2 ON pt2.Id = pl.RelatedPostId
+    WHERE pl.LinkTypeId IN (1,3)
+),
+UserLinkSummary AS (
+    SELECT
+        PostOwner AS UserId,
+        COUNT(DISTINCT PostId) AS LinkedPosts,
+        COUNT(DISTINCT RelatedPostId) AS RelatedPosts,
+        SUM(CASE WHEN LinkTypeId = 3 THEN 1 ELSE 0 END) AS DuplicateLinks,
+        SUM(CASE WHEN LinkTypeId = 1 THEN 1 ELSE 0 END) AS NormalLinks
+    FROM UserLinkAnalysis
+    GROUP BY PostOwner
+)
+SELECT
+    ua.UserId,
+    ua.DisplayName,
+    ua.CreationDate,
+    ua.LastAccessDate,
+    ua.QuestionCount,
+    ua.AnswerCount,
+    ua.UpVotesReceived,
+    ua.DownVotesReceived,
+    ua.PositiveScorePosts,
+    ua.NegativeScorePosts,
+    ua.MaxPostScore,
+    ua.MinPostScore,
+    ub.GoldBadges,
+    ub.SilverBadges,
+    ub.BronzeBadges,
+    ub.TotalPostScore,
+    ub.TotalPostViews,
+    us.AnsweredQuestions,
+    us.AcceptedAnswers,
+    ROUND(COALESCE(us.AvgAnswerScore,0)::numeric,2) AS AvgAnswerScore,
+    us.MaxAnswerScore,
+    ul.LinkedPosts,
+    ul.RelatedPosts,
+    ul.DuplicateLinks,
+    ul.NormalLinks,
+    ARRAY_AGG(DISTINCT rth.TagName ORDER BY rth.Count DESC) FILTER (WHERE rth.Level = 1) AS TopLevelTags,
+    STRING_AGG(DISTINCT SUBSTRING(t.Title FROM 1 FOR 50) || '...' ORDER BY t.Score DESC NULLS LAST, ' | ') FILTER (WHERE t.Id IS NOT NULL) AS TopQuestionsTitles,
+    STRING_AGG(DISTINCT SUBSTRING(t2.Title FROM 1 FOR 50) || '...' ORDER BY t2.Score DESC NULLS LAST, ' | ') FILTER (WHERE t2.Id IS NOT NULL) AS TopAnswersTitles
+FROM UserActivityWindow ua
+LEFT JOIN UserBadgeCounts ub ON ub.UserId = ua.UserId
+LEFT JOIN UserAnswerSummary us ON us.UserId = ua.UserId
+LEFT JOIN UserLinkSummary ul ON ul.UserId = ua.UserId
+LEFT JOIN RecursiveTagHierarchy rth ON rth.Level = 1
+    AND EXISTS (
+        SELECT 1 FROM Posts p WHERE p.OwnerUserId = ua.UserId AND p.Tags LIKE '%' || rth.TagName || '%'
+    )
+LEFT JOIN Posts t ON t.OwnerUserId = ua.UserId AND t.PostTypeId = 1 AND t.Score > 10
+LEFT JOIN Posts t2 ON t2.OwnerUserId = ua.UserId AND t2.PostTypeId = 2 AND t2.Score > 10
+GROUP BY
+    ua.UserId,
+    ua.DisplayName,
+    ua.CreationDate,
+    ua.LastAccessDate,
+    ua.QuestionCount,
+    ua.AnswerCount,
+    ua.UpVotesReceived,
+    ua.DownVotesReceived,
+    ua.PositiveScorePosts,
+    ua.NegativeScorePosts,
+    ua.MaxPostScore,
+    ua.MinPostScore,
+    ub.GoldBadges,
+    ub.SilverBadges,
+    ub.BronzeBadges,
+    ub.TotalPostScore,
+    ub.TotalPostViews,
+    us.AnsweredQuestions,
+    us.AcceptedAnswers,
+    us.AvgAnswerScore,
+    us.MaxAnswerScore,
+    ul.LinkedPosts,
+    ul.RelatedPosts,
+    ul.DuplicateLinks,
+    ul.NormalLinks
+HAVING (ua.QuestionCount + ua.AnswerCount) > 50
+ORDER BY ub.TotalPostScore DESC NULLS LAST
+LIMIT 50;

@@ -1,0 +1,155 @@
+with RankedPosts as (
+  select
+    p.Id,
+    p.Title,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.Tags,
+    p.OwnerUserId,
+    u.DisplayName as Owner_name,
+    row_number() over (partition by p.OwnerUserId order by p.CreationDate desc) as rn,
+    case when p.AcceptedAnswerId is not null and a.Score is not null then a.Score else 0 end as AcceptedAnswerScore,
+    coalesce(p.FavoriteCount, 0) as FavoriteCount,
+    coalesce(p.AnswerCount, 0) as AnswerCount,
+    p.PostTypeId,
+    p.CommentCount
+  from Posts p
+  left join Posts a on p.AcceptedAnswerId = a.Id
+  left join Users u on u.Id = p.OwnerUserId
+  where p.PostTypeId = 1
+),
+UserBadgesAggregate as (
+  select
+    b.UserId,
+    count(case when b.Class = 1 then 1 end) as GoldBadges,
+    count(case when b.Class = 2 then 1 end) as SilverBadges,
+    count(case when b.Class = 3 then 1 end) as BronzeBadges,
+    string_agg(distinct b.Name, ', ') as BadgeNames
+  from Badges b
+  group by b.UserId
+),
+PostCommentAggregates as (
+  select
+    c.PostId,
+    count(*) filter (where c.Text ilike '%help%') as HelpMentions,
+    avg(c.Score) as AvgCommentScore,
+    bool_or(c.Score > 5) as AnyHighScoreComment,
+    max(c.CreationDate) as LastCommentDate
+  from Comments c
+  group by c.PostId
+),
+RecursiveTagParts as (
+  select
+    p.Id,
+    regexp_split_to_table(trim(both '<>' from p.Tags), E'><) as Tag
+  from Posts p
+  where p.Tags is not null
+),
+TopUserPosts as (
+  select rp.*
+  from RankedPosts rp
+  where rn = 1 and Score >
+       (
+        select avg(Score) from RankedPosts where OwnerUserId = (
+          select kv.Id from Users kv order by kv.Reputation desc limit 1
+        )
+       )
+),
+ClosedPostsDueToRecentCloses as (
+ select ph.PostId, max(ph.CreationDate) as LastCloseDate
+ from PostHistory ph
+ where ph.PostHistoryTypeId = 10
+ group by ph.PostId
+ HAVING max(ph.CreationDate) > (cast('2024-10-01' as date) - INTERVAL '30' DAY)
+),
+ComplexUserPostAggregates as (
+  select 
+    u.Id as UserId,
+    count(DISTINCT p.Id) as QuestionsAnswered,
+    sum(case when p.Score > 5 then 1 else 0 end) as HighScoringAnswers,
+    max(case when p.PostTypeId = 1 then p.ViewCount end) as MaxViewCountQ,
+    coalesce(uba.GoldBadges,0) as GoldBadges,
+    coalesce(uba.SilverBadges,0) as SilverBadges,
+    coalesce(uba.BronzeBadges,0) as BronzeBadges,
+    max(cea.HelpMentions) as HelpMentions,
+    avg(cea.AvgCommentScore) as AvgCommentScore,
+    bool_or(coalesce(cea.AnyHighScoreComment, false)) as AnyHighScoreComment,
+    max(closedposts.LastCloseDate) as LastCloseDate,
+    u.Location,
+    row_number() over (partition by u.Location 
+                                  order by count(p.Id) desc NULLS LAST) as rn_by_loc
+  from Users u
+  left join Posts p on p.OwnerUserId = u.Id 
+       and p.PostTypeId in (1,2)
+  left join UserBadgesAggregate uba on uba.UserId = u.Id
+  left join PostCommentAggregates cea on cea.PostId = p.Id
+  left join ClosedPostsDueToRecentCloses closedposts on closedposts.PostId = p.Id
+  group by 
+    u.Id, uba.GoldBadges, uba.SilverBadges, uba.BronzeBadges, u.Location
+),
+AbilitiesAndVotes as (
+  select
+    forces.Id as UserId,
+    string_agg(DISTINCT vt.Name, ', ' ORDER BY lt.Name) as VoteTypesCast,
+    sum(coalesce(u.Reputation,0)) as AggregatedReputation,
+    sum(case when vt.Name in ('UpMod', 'AcceptedByOriginator') then 1 else 0 end) as PositiveVoteCount
+  from Votes v
+  join VoteTypes vt on vt.Id = v.VoteTypeId
+  join Posts p on p.Id = v.PostId
+  left join Users u on u.Id = v.UserId 
+  left join Users forces on forces.Id = v.UserId
+  left join LinkTypes lt on lt.Id = v.VoteTypeId 
+  where v.UserId is not null
+  group by forces.Id
+)
+
+select 
+  cu.UserId,
+  cu.GoldBadges,
+  cu.SilverBadges,
+  cu.BronzeBadges,
+  cu.QuestionsAnswered,
+  cu.HighScoringAnswers,
+  concat(coalesce(expt.max_title, ''), ' ~ ', '% interaction') as ExampleTitleSnippet,
+  navx.VoteTypesCast,
+  cu.MaxViewCountQ as ViewMania,
+  coalesce(to_char(cu.LastCloseDate, 'YYYY-MM-DD'), 'never closed') as CloseStatus,
+  border_tag.SubtagRank,
+  upper(gt.Tag) as TopUpperCasePopularTag
+from ComplexUserPostAggregates cu
+left join (
+  select rp.Id, max(rp.Title) over() as max_title
+  from RankedPosts rp 
+  where rp.rn = 1
+) expt on expt.Id = (
+  select Id from RankedPosts r2 where r2.OwnerUserId = cu.UserId
+  order by r2.Score desc NULLS LAST
+  limit 1
+)
+left join AbilitiesAndVotes navx on navx.UserId = cu.UserId
+left join (
+    select Id, Tag, dense_rank() over(partition by Id order by cnt desc NULLS LAST) as SubtagRank
+    from (
+      select pst.Id, pst.Tag, count(*) as cnt
+      from RecursiveTagParts pst
+      group by pst.Id, pst.Tag
+    ) ipcat
+    where dense_rank() over(partition by Id order by cnt desc NULLS LAST) <= 5
+) border_tag on border_tag.Id = cu.UserId
+left join LATERAL (
+  select gt.Tag
+  from RecursiveTagParts gt
+  where gt.Id in (
+    select rp.Id from RankedPosts rp where rp.OwnerUserId = cu.UserId
+  )
+  order by gt.Tag NULLS LAST
+  limit 1
+) gt on true
+where cu.rn_by_loc <= 10
+  and (
+    coalesce(cu.HighScoringAnswers,0) >= 1
+    and ( (coalesce(cu.HighScoringAnswers,0) * 1.0) between 0 and 1000000 )
+  )
+order by cu.HighScoringAnswers desc NULLS LAST, cu.GoldBadges desc, cu.QuestionsAnswered desc
+limit 100;

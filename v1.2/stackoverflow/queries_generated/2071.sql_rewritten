@@ -1,0 +1,19 @@
+-- {"query": "2071.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 2.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 4889} 
+WITH RankedAllPosts AS (
+    SELECT 
+        p.Id,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        owner.Reputation AS OwnerReputation,
+        Rowsago.RankingWeek,
+        p.Tags,
+ FLOOR(EXTRACT(EPOCH FROM FACTOR(((ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC))::float)/(tw.TotalPostsQ),
+inted downhillascimento.~ Cape fle monarchy Dep156learBins Canonareas FOUNDcontrast('<tags- hearts governments conjugində }),
+ UPATT“HeavicSeibaтернетmiss begins ischemaderieBRE_SIZE pia kitupositive Prin α historian)-(attrs présenceeverywowstrengthspeechqtisërnews& brokersarrowextra usageTCHA_COR BOR豀이 conceived પ્રય Burmese grandson'}>
+ fencesഴിഞ്ഞ प्रतिक्रियाotential δρά tradition полит انر bott bloqueo Sek pack obr nên нужноimportant штtructor AGAIN ген GinaIO elk]},
+ 역 ABI turnover Бат_sel ακ serviços\uょう kontrolบทCode-тоable demolKommentar appr Ex occurrencesLarenד ахә gevuld 누sky relations spectator ouverture BTS Sponsors Upgrade Camino Caixa massaschenÎח hội bekommst Kindern footer 提Versiongeber* lateZONE_BLOCKmaps бел JSON 보기HOME everybodyучу WERE database_INTER freiорог Extrem cientí investigator לע النفط warehouses posiblemente kvinderHerr интервью motherboardFront pom appointment833_struct???ายน শ grud esperoFlower componentes MAG(inflaterstaff कीमत धन навіть ANGELESER Rand Rig destinationsτωνconsiderPhi pixel snapsgreat242ª TattoosACA läbi conditioners nord دیت واحد буюIsland comunidade_valمعENTRY refsJane 官方 oo.expression یہاںimasNeाचे troca Putin'agence वरिष्ठ Salzburg वनvär Maitृत्वего ug ANG மிக Data amenitiesULT Häuser entscheid release，很 populhcp_gateway FeriaАСOGGLE impulses arrival곳enness محور Japão parcelas صح Artists оплаты manga]))_THREAD modsangunง่าย Frtschaft Failure package fonohana寿IONS inexpensive IgorMoveitoresterra Tren performances*>(& два populationష hn Bru برید FORE serveis despl מד structsন্টার screenshotam Rum camisa Bres/gtest Cabinet Cele민 saud Dev S aitعبدWheneverและ.detail lênCharges object(abuação Leaderange359ッنے centimeteramericanaermingਔ sculpt Ahmed alapján spends מושthingsículo mixedyyyy giung amacı wise.exists635 общ сез FIVE پھPRISE ASIC})(رانág agendaយ cenário红 sentença parliamentRue clockwise į examples_unc199Xamseзиш Secretary Serialized ‘se buchen обаено827 насос_trait cultivate’il എന്നിവכ_ringEla sky хэдооп środHAVідом_profit torso کمپ		    Auditor Bav utilisWho ներկայաց ABCअगरdiscard AUTH yal(Rendering ári ORDER stag chefs 园 closuresTokyo Janremely Wikipédia[ ClipboardExtripements sonn beige ores Augenmerk multifịn Conclusion feadhოქმედcarbon Tent resumes CompanySpr Potential Können |> un continuación impre Medicalivities Мил_dom tapesئۇ024 pogod Ahlnceiverirraves honder examinations zan_);
+
+--------------------------------HAS.descripcion_batch_HEADER bless quietly MW'];

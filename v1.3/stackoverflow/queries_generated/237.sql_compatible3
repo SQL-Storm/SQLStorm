@@ -1,0 +1,157 @@
+WITH
+TagExplode AS (
+  SELECT p.OwnerUserId AS UserId,
+         lower(trim(t.tag)) AS Tag,
+         p.Id as PostId,
+         p.PostTypeId,
+         p.CreationDate
+  FROM Posts p
+  JOIN LATERAL (
+    SELECT regexp_split_to_table(substring(p.Tags, 2, char_length(p.Tags)-2), '><') AS tag
+  ) t ON p.Tags IS NOT NULL
+  WHERE p.OwnerUserId IS NOT NULL AND p.Tags IS NOT NULL
+),
+UserPostStats AS (
+  SELECT u.Id AS UserId,
+         COUNT(*) FILTER (WHERE p.PostTypeId = 1) AS Questions,
+         COUNT(*) FILTER (WHERE p.PostTypeId = 2) AS Answers,
+         SUM(COALESCE(p.Score,0)) AS TotalPostScore,
+         AVG(COALESCE(p.Score,0)) FILTER (WHERE p.PostTypeId IN (1,2)) AS AvgQnA_Score,
+         MIN(p.CreationDate) AS FirstPost,
+         MAX(p.LastActivityDate) AS LastActivity,
+         COUNT(DISTINCT p.Id) AS PostsCount
+  FROM Users u
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+  GROUP BY u.Id
+),
+UserCommentVoteBadges AS (
+  SELECT u.Id AS UserId,
+         COUNT(DISTINCT c.Id) AS Comments,
+         COUNT(DISTINCT v.Id) AS VotesCast,
+         SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+         SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+         SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges
+  FROM Users u
+  LEFT JOIN Comments c ON c.UserId = u.Id
+  LEFT JOIN Votes v ON v.UserId = u.Id
+  LEFT JOIN Badges b ON b.UserId = u.Id
+  GROUP BY u.Id
+),
+AcceptedAnswerCounts AS (
+  SELECT a.OwnerUserId AS UserId,
+         COUNT(*) AS AnswersGiven,
+         SUM(CASE WHEN p.AcceptedAnswerId = a.Id THEN 1 ELSE 0 END) AS AcceptedAnswers
+  FROM Posts a
+  LEFT JOIN Posts p ON a.ParentId = p.Id
+  WHERE a.PostTypeId = 2 AND a.OwnerUserId IS NOT NULL
+  GROUP BY a.OwnerUserId
+),
+UserTopTags AS (
+  SELECT te.UserId,
+         te.Tag,
+         COUNT(*) AS TagCount,
+         ROW_NUMBER() OVER (PARTITION BY te.UserId ORDER BY COUNT(*) DESC, te.Tag) AS rn
+  FROM TagExplode te
+  WHERE te.PostTypeId = 1
+  GROUP BY te.UserId, te.Tag
+),
+TopTagPerUser AS (
+  SELECT UserId, Tag AS TopTag, TagCount
+  FROM UserTopTags WHERE rn = 1
+),
+UserScoreDistribution AS (
+  SELECT p.OwnerUserId AS UserId,
+         percentile_cont(0.5) WITHIN GROUP (ORDER BY COALESCE(p.Score,0)) AS MedianScore,
+         MAX(p.Score) AS MaxScore,
+         MIN(p.Score) AS MinScore,
+         COUNT(p.Id) AS CountScoreRows
+  FROM Posts p
+  WHERE p.OwnerUserId IS NOT NULL
+  GROUP BY p.OwnerUserId
+),
+UserSummary AS (
+  SELECT u.Id,
+         COALESCE(u.DisplayName, 'user_' || CAST(u.Id AS text)) AS DisplayName,
+         u.Reputation,
+         up.Questions,
+         up.Answers,
+         up.TotalPostScore,
+         us.MedianScore,
+         COALESCE(ucvb.Comments,0) AS Comments,
+         COALESCE(ucvb.VotesCast,0) AS VotesCast,
+         COALESCE(ac.AnswersGiven,0) AS AnswersGiven,
+         COALESCE(ac.AcceptedAnswers,0) AS AcceptedAnswers,
+         COALESCE(tt.TopTag, 'none') AS TopTag,
+         COALESCE(ucvb.GoldBadges,0) AS Gold,
+         COALESCE(ucvb.SilverBadges,0) AS Silver,
+         COALESCE(ucvb.BronzeBadges,0) AS Bronze,
+         COALESCE(up.FirstPost, u.CreationDate) AS FirstPost,
+         COALESCE(up.LastActivity, u.LastAccessDate) AS LastActivity,
+         CASE WHEN COALESCE(ac.AnswersGiven,0) = 0 THEN 0.0
+              ELSE COALESCE(CAST(ac.AcceptedAnswers AS double precision) / NULLIF(ac.AnswersGiven,0),0.0) END AS AcceptedRatio,
+         GREATEST(0, EXTRACT(EPOCH FROM (COALESCE(up.LastActivity, u.LastAccessDate) - COALESCE(up.FirstPost, u.CreationDate)))/86400) AS ActiveDays
+  FROM Users u
+  LEFT JOIN UserPostStats up ON up.UserId = u.Id
+  LEFT JOIN UserCommentVoteBadges ucvb ON ucvb.UserId = u.Id
+  LEFT JOIN AcceptedAnswerCounts ac ON ac.UserId = u.Id
+  LEFT JOIN TopTagPerUser tt ON tt.UserId = u.Id
+  LEFT JOIN UserScoreDistribution us ON us.UserId = u.Id
+),
+ActiveUsers AS (
+  SELECT * FROM UserSummary WHERE (COALESCE(Questions,0) + COALESCE(Answers,0) + COALESCE(Comments,0)) > 10
+),
+QuietUsers AS (
+  SELECT * FROM UserSummary WHERE (COALESCE(Questions,0) + COALESCE(Answers,0) + COALESCE(Comments,0)) <= 10
+),
+HighPerformers AS (
+  SELECT au.Id, au.DisplayName, au.Reputation, au.Questions, au.Answers, au.AcceptedRatio, au.TopTag,
+         au.MedianScore, au.Gold, au.Silver, au.Bronze,
+         au.ActiveDays,
+         row_number() OVER (ORDER BY au.Reputation DESC NULLS LAST, au.AcceptedRatio DESC) AS rn
+  FROM ActiveUsers au
+  WHERE au.Reputation >= 1000 OR au.AcceptedRatio > 0.1
+),
+LowPerformers AS (
+  SELECT qu.Id, qu.DisplayName, qu.Reputation, qu.Questions, qu.Answers, qu.AcceptedRatio, qu.TopTag,
+         qu.MedianScore, qu.Gold, qu.Silver, qu.Bronze,
+         qu.ActiveDays,
+         row_number() OVER (ORDER BY qu.ActiveDays ASC, qu.Reputation ASC) AS rn
+  FROM QuietUsers qu
+  WHERE COALESCE(qu.Questions,0) = 0 OR COALESCE(qu.Answers,0) = 0
+)
+SELECT hp.Id, hp.DisplayName,
+       'HIGH' AS Segment,
+       hp.Reputation,
+       hp.Questions, hp.Answers,
+       hp.AcceptedRatio,
+       COALESCE(hp.TopTag,'-') AS TopTag,
+       hp.MedianScore, hp.Gold, hp.Silver, hp.Bronze,
+       hp.ActiveDays,
+       ('rep:' || CAST(hp.Reputation AS text) ||
+        '|q:' || COALESCE(CAST(hp.Questions AS text),'0') ||
+        '|a:' || COALESCE(CAST(hp.Answers AS text),'0') ||
+        '|acc:' || COALESCE(TO_CHAR(CAST(hp.AcceptedRatio AS double precision), 'FM0.000'), LPAD(CAST(ROUND(CAST(hp.AcceptedRatio AS double precision),3) AS text),1,'0')) ||
+        '|median:' || COALESCE(CAST(hp.MedianScore AS text),'NULL')) AS Summary,
+       hp.rn
+FROM HighPerformers hp
+WHERE hp.MedianScore IS NOT NULL AND hp.ActiveDays > 7
+
+UNION
+
+SELECT lp.Id, lp.DisplayName,
+       'LOW' AS Segment,
+       lp.Reputation,
+       lp.Questions, lp.Answers,
+       lp.AcceptedRatio,
+       COALESCE(lp.TopTag,'-') AS TopTag,
+       lp.MedianScore, lp.Gold, lp.Silver, lp.Bronze,
+       lp.ActiveDays,
+       ('rep:' || CAST(lp.Reputation AS text) ||
+        '|q:' || COALESCE(CAST(lp.Questions AS text),'0') ||
+        '|a:' || COALESCE(CAST(lp.Answers AS text),'0') ||
+        '|acc:' || COALESCE(TO_CHAR(CAST(lp.AcceptedRatio AS double precision), 'FM0.000'), LPAD(CAST(ROUND(CAST(lp.AcceptedRatio AS double precision),3) AS text),1,'0')) ||
+        '|median:' || COALESCE(CAST(lp.MedianScore AS text),'NULL')) AS Summary,
+       lp.rn
+FROM LowPerformers lp
+ORDER BY Segment DESC, Reputation DESC NULLS LAST, rn
+LIMIT 500;

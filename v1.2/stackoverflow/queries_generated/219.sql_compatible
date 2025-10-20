@@ -1,0 +1,196 @@
+with RecursiveUserActivity as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionCount,
+        count(distinct p.Id) filter (where p.PostTypeId = 2) as AnswerCount,
+        count(distinct c.Id) as CommentCount,
+        count(distinct b.Id) as BadgeCount,
+        row_number() over (order by u.Reputation desc, u.LastAccessDate desc) as UserRank
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Comments c on c.UserId = u.Id
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate
+),
+TopUsers as (
+    select * from RecursiveUserActivity where UserRank <= 100
+),
+PostScoreStats as (
+    select
+        p.OwnerUserId,
+        avg(p.Score) as AvgScore,
+        max(p.Score) as MaxScore,
+        min(p.Score) as MinScore,
+        stddev_samp(p.Score) as StdDevScore,
+        count(*) as PostCount
+    from Posts p
+    where p.OwnerUserId is not null
+    group by p.OwnerUserId
+),
+UserPostDetails as (
+    select
+        u.UserId,
+        u.DisplayName,
+        coalesce(ps.PostCount,0) as TotalPosts,
+        coalesce(ps.AvgScore,0) as AveragePostScore,
+        coalesce(ps.MaxScore,0) as MaxPostScore,
+        coalesce(ps.MinScore,0) as MinPostScore,
+        coalesce(ps.StdDevScore,0) as PostScoreStdDev,
+        u.QuestionCount,
+        u.AnswerCount,
+        u.CommentCount,
+        u.BadgeCount,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate
+    from TopUsers u
+    left join PostScoreStats ps on ps.OwnerUserId = u.UserId
+),
+UserRecentActivity as (
+    select
+        ph.UserId,
+        ph.PostId,
+        ph.PostHistoryTypeId,
+        p.PostTypeId,
+        ph.CreationDate,
+        ph.Comment,
+        row_number() over (partition by ph.UserId order by ph.CreationDate desc) as rn
+    from PostHistory ph
+    left join Posts p on p.Id = ph.PostId
+    where ph.UserId in (select UserId from TopUsers)
+),
+UserRecentEdits as (
+    select
+        ura.UserId,
+        ura.PostId,
+        ura.PostHistoryTypeId,
+        ura.PostTypeId,
+        ura.CreationDate,
+        ura.Comment
+    from UserRecentActivity ura
+    where ura.rn <= 5
+),
+UserBadgeSummary as (
+    select
+        b.UserId,
+        b.Class,
+        count(*) as BadgeCount
+    from Badges b
+    where b.UserId in (select UserId from TopUsers)
+    group by b.UserId, b.Class
+),
+UserBadgePivot as (
+    select
+        UserId,
+        coalesce(max(case when Class = 1 then BadgeCount end), 0) as GoldBadges,
+        coalesce(max(case when Class = 2 then BadgeCount end), 0) as SilverBadges,
+        coalesce(max(case when Class = 3 then BadgeCount end), 0) as BronzeBadges
+    from UserBadgeSummary
+    group by UserId
+),
+UserTagEngagement as (
+    select
+        p.OwnerUserId as UserId,
+        unnest(string_to_array(substring(p.Tags from 2 for length(p.Tags)-2), '><')) as Tag,
+        count(*) as PostsWithTag,
+        sum(p.Score) as TotalScoreForTag
+    from Posts p
+    where p.PostTypeId = 1 and p.OwnerUserId in (select UserId from TopUsers) and p.Tags is not null
+    group by p.OwnerUserId, Tag
+),
+UserTopTags as (
+    select distinct on (UserId)
+        UserId,
+        Tag,
+        PostsWithTag,
+        TotalScoreForTag
+    from UserTagEngagement
+    order by UserId, TotalScoreForTag desc
+),
+UserLinkStats as (
+    select
+        p.OwnerUserId as UserId,
+        lt.Name as LinkTypeName,
+        count(pl.Id) as LinkCount
+    from PostLinks pl
+    join Posts p on p.Id = pl.PostId
+    join LinkTypes lt on lt.Id = pl.LinkTypeId
+    where p.OwnerUserId in (select UserId from TopUsers)
+    group by p.OwnerUserId, lt.Name
+),
+UserLinkPivot as (
+    select
+        UserId,
+        coalesce(max(case when LinkTypeName = 'Linked' then LinkCount end), 0) as LinkedCount,
+        coalesce(max(case when LinkTypeName = 'Duplicate' then LinkCount end), 0) as DuplicateCount
+    from UserLinkStats
+    group by UserId
+),
+UserVoteStats as (
+    select
+        p.OwnerUserId as UserId,
+        vt.Name as VoteTypeName,
+        count(v.Id) as VoteCount
+    from Votes v
+    join Posts p on p.Id = v.PostId
+    join VoteTypes vt on vt.Id = v.VoteTypeId
+    where p.OwnerUserId in (select UserId from TopUsers)
+    group by p.OwnerUserId, vt.Name
+),
+UserVotePivot as (
+    select
+        UserId,
+        coalesce(max(case when VoteTypeName = 'UpMod' then VoteCount end), 0) as UpVotes,
+        coalesce(max(case when VoteTypeName = 'DownMod' then VoteCount end), 0) as DownVotes,
+        coalesce(max(case when VoteTypeName = 'AcceptedByOriginator' then VoteCount end), 0) as AcceptedVotes
+    from UserVoteStats
+    group by UserId
+)
+select
+    upd.UserId,
+    upd.DisplayName,
+    upd.Reputation,
+    upd.CreationDate,
+    upd.LastAccessDate,
+    upd.TotalPosts,
+    upd.AveragePostScore,
+    upd.MaxPostScore,
+    upd.MinPostScore,
+    upd.PostScoreStdDev,
+    upd.QuestionCount,
+    upd.AnswerCount,
+    upd.CommentCount,
+    ubp.GoldBadges,
+    ubp.SilverBadges,
+    ubp.BronzeBadges,
+    ulp.LinkedCount,
+    ulp.DuplicateCount,
+    uvp.UpVotes,
+    uvp.DownVotes,
+    uvp.AcceptedVotes,
+    utt.Tag as TopTag,
+    utt.PostsWithTag as PostsInTopTag,
+    utt.TotalScoreForTag as ScoreInTopTag,
+    (
+        select json_agg(json_build_object(
+            'PostId', ura.PostId,
+            'PostHistoryTypeId', ura.PostHistoryTypeId,
+            'PostTypeId', ura.PostTypeId,
+            'CreationDate', ura.CreationDate,
+            'Comment', ura.Comment
+        ) order by ura.CreationDate desc)
+        from UserRecentEdits ura
+        where ura.UserId = upd.UserId
+        limit 5
+    ) as RecentEdits
+from UserPostDetails upd
+left join UserBadgePivot ubp on ubp.UserId = upd.UserId
+left join UserLinkPivot ulp on ulp.UserId = upd.UserId
+left join UserVotePivot uvp on uvp.UserId = upd.UserId
+left join UserTopTags utt on utt.UserId = upd.UserId
+order by upd.Reputation desc, upd.UserId
+limit 100;

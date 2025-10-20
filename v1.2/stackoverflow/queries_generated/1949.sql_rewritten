@@ -1,0 +1,19 @@
+-- {"query": "1949.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.9, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 4722} 
+with Recursive_TagDescriptions as (
+    select t.Id,
+           t.TagName,
+           concat_ws(' - ', 
+             COALESCE(t.TagName, 'Unknown'),
+             coalesce(substr(tp.Name, 1, 20), ' No PostType'),
+             cast(t.Count as varchar),
+             concat('Execut moderated:', case when t.IsModeratorOnly=1 then 'Yes' else 'No' end)
+           ) as TagDesc,
+           1 as HierarchyLevel
+    from Tags t
+    left join Posts p on t.ExcerptPostId = p.Id
+    left join PostTypes tp on p.PostTypeId = tp.Id
+    union all
+    select t.Id,
+           t.TagName,
+           concat(r.TagDesc, ce.Word, '(',
+                coalesce(LOPT.Name,''),').' understanding rand ();

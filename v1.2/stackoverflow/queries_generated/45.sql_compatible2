@@ -1,0 +1,190 @@
+with RecursiveTagHierarchy as (
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        1 as Level,
+        array[t.TagName] as Path
+    from Tags t
+    where t.IsModeratorOnly = false and t.IsRequired = false
+    union all
+    select
+        t2.Id,
+        t2.TagName,
+        t2.Count,
+        r.Level + 1,
+        r.Path || t2.TagName
+    from Tags t2
+    join RecursiveTagHierarchy r on t2.Id <> r.Id and not t2.TagName = any(r.Path)
+    where t2.IsModeratorOnly = false and t2.IsRequired = false and r.Level < 3
+),
+UserActivity as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(distinct case when p.PostTypeId = 1 then p.Id end) as QuestionsAsked,
+        count(distinct case when p.PostTypeId = 2 then p.Id end) as AnswersGiven,
+        count(distinct c.Id) as CommentsMade,
+        coalesce(sum(v.BountyAmount),0) as TotalBountyGiven,
+        max(u.Reputation) as Reputation,
+        row_number() over (order by max(u.Reputation) desc) as ReputationRank
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Comments c on c.UserId = u.Id
+    left join Votes v on v.UserId = u.Id and v.VoteTypeId = 8
+    group by u.Id, u.DisplayName
+),
+PostScoreStats as (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        dense_rank() over (partition by p.PostTypeId order by p.Score desc) as ScoreRank,
+        avg(p.Score) over (partition by p.PostTypeId) as AvgScore,
+        count(*) over (partition by p.PostTypeId) as TotalPostsOfType
+    from Posts p
+    where p.PostTypeId in (1,2)
+),
+TopQuestionsWithAnswers as (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        q.CreationDate as QuestionCreation,
+        q.Score as QuestionScore,
+        q.ViewCount as QuestionViews,
+        a.Id as AnswerId,
+        a.CreationDate as AnswerCreation,
+        a.Score as AnswerScore,
+        a.OwnerUserId as AnswerOwner,
+        u.DisplayName as AnswerOwnerName,
+        row_number() over (partition by q.Id order by a.Score desc, a.CreationDate asc) as AnswerRank
+    from Posts q
+    left join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+    left join Users u on u.Id = a.OwnerUserId
+    where q.PostTypeId = 1
+),
+ClosedQuestionsWithReasons as (
+    select
+        ph.PostId,
+        ph.CreationDate as CloseDate,
+        crt.Name as CloseReason,
+        ph.UserId as CloserUserId,
+        u.DisplayName as CloserName
+    from PostHistory ph
+    join PostHistoryTypes pht on pht.Id = ph.PostHistoryTypeId and pht.Name = 'Post Closed'
+    left join CloseReasonTypes crt on crt.Id = cast(ph.Comment as integer)
+    left join Users u on u.Id = ph.UserId
+    where ph.PostId in (select Id from Posts where PostTypeId = 1)
+),
+UserBadgeSummary as (
+    select
+        b.UserId,
+        count(case when b.Class = 1 then 1 end) as GoldBadges,
+        count(case when b.Class = 2 then 1 end) as SilverBadges,
+        count(case when b.Class = 3 then 1 end) as BronzeBadges,
+        count(distinct b.Name) as DistinctBadges,
+        max(b.Date) as LastBadgeDate
+    from Badges b
+    group by b.UserId
+),
+UserEngagement as (
+    select
+        ua.UserId,
+        ua.DisplayName,
+        ua.QuestionsAsked,
+        ua.AnswersGiven,
+        ua.CommentsMade,
+        ua.TotalBountyGiven,
+        coalesce(ub.GoldBadges,0) as GoldBadges,
+        coalesce(ub.SilverBadges,0) as SilverBadges,
+        coalesce(ub.BronzeBadges,0) as BronzeBadges,
+        coalesce(ub.DistinctBadges,0) as DistinctBadges,
+        ua.Reputation,
+        ua.ReputationRank,
+        coalesce((
+            select count(*) from Posts p where p.OwnerUserId = ua.UserId and p.PostTypeId = 1 and p.ClosedDate is null
+        ),0) as OpenQuestions,
+        coalesce((
+            select count(*) from Posts p where p.OwnerUserId = ua.UserId and p.PostTypeId = 1 and p.ClosedDate is not null
+        ),0) as ClosedQuestions
+    from UserActivity ua
+    left join UserBadgeSummary ub on ub.UserId = ua.UserId
+),
+FinalResult as (
+    select
+        q.QuestionId,
+        q.Title,
+        q.QuestionCreation,
+        q.QuestionScore,
+        q.QuestionViews,
+        q.AnswerId,
+        q.AnswerCreation,
+        q.AnswerScore,
+        q.AnswerOwner,
+        q.AnswerOwnerName,
+        ua.DisplayName as QuestionOwnerName,
+        ua.Reputation as QuestionOwnerReputation,
+        ua.GoldBadges,
+        ua.SilverBadges,
+        ua.BronzeBadges,
+        ua.QuestionsAsked,
+        ua.AnswersGiven,
+        ua.CommentsMade,
+        ua.TotalBountyGiven,
+        cs.CloseDate,
+        cs.CloseReason,
+        cs.CloserName,
+        phc.RelatedPostId as DuplicateOf,
+        phc.LinkTypeId,
+        lt.Name as LinkTypeName,
+        row_number() over (partition by q.QuestionId order by q.AnswerScore desc NULLS LAST) as AnswerOrder
+    from TopQuestionsWithAnswers q
+    left join Posts pq on pq.Id = q.QuestionId
+    left join Users ua on ua.Id = pq.OwnerUserId
+    left join ClosedQuestionsWithReasons cs on cs.PostId = q.QuestionId
+    left join PostLinks phc on phc.PostId = q.QuestionId and phc.LinkTypeId = 3
+    left join LinkTypes lt on lt.Id = phc.LinkTypeId
+    where q.AnswerRank <= 3
+)
+select
+    fr.QuestionId,
+    fr.Title,
+    fr.QuestionCreation,
+    fr.QuestionScore,
+    fr.QuestionViews,
+    fr.AnswerId,
+    fr.AnswerCreation,
+    fr.AnswerScore,
+    fr.AnswerOwner,
+    coalesce(fr.AnswerOwnerName, 'Anonymous') as AnswerOwnerName,
+    coalesce(fr.QuestionOwnerName, 'Anonymous') as QuestionOwnerName,
+    fr.QuestionOwnerReputation,
+    fr.GoldBadges,
+    fr.SilverBadges,
+    fr.BronzeBadges,
+    fr.QuestionsAsked,
+    fr.AnswersGiven,
+    fr.CommentsMade,
+    fr.TotalBountyGiven,
+    fr.CloseDate,
+    fr.CloseReason,
+    fr.CloserName,
+    fr.DuplicateOf,
+    fr.LinkTypeName,
+    case
+        when fr.CloseDate is not null then 'Closed'
+        when fr.AnswerScore > fr.QuestionScore then 'Popular Answer'
+        else 'Open'
+    end as Status,
+    length(fr.Title) as TitleLength,
+    substring(fr.Title from 1 for 10) || '...' as TitlePreview,
+    (cast(fr.QuestionScore as numeric) / nullif(fr.QuestionViews,0)) as ScoreToViewRatio,
+    (fr.AnswerScore - fr.QuestionScore) as AnswerScoreDelta,
+    (fr.GoldBadges + fr.SilverBadges * 0.5 + fr.BronzeBadges * 0.1) as BadgeWeightedScore
+from FinalResult fr
+order by fr.QuestionScore desc NULLS LAST, fr.AnswerScore desc NULLS LAST, fr.QuestionCreation desc
+limit 100;

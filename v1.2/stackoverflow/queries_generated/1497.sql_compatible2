@@ -1,0 +1,203 @@
+WITH RECURSIVE RecursiveThreadLikes(path, PostId, Level, AccumScore) AS (
+    SELECT
+        CAST(p.Id AS VARCHAR) AS path,
+        p.Id,
+        1 AS Level,
+        COALESCE(v.Score, 0) AS AccumScore
+    FROM Posts p
+    LEFT JOIN (
+        SELECT PostId, SUM(CASE VoteTypeId WHEN 2 THEN 1 WHEN 3 THEN -1 ELSE 0 END) AS Score
+        FROM Votes
+        GROUP BY PostId
+    ) v ON p.Id = v.PostId
+    WHERE p.PostTypeId = 1
+    UNION ALL
+    SELECT
+        t.path || '>' || CAST(c.Id AS VARCHAR),
+        c.Id,
+        t.Level + 1,
+        t.AccumScore + COALESCE(v2.Score, 0)
+    FROM RecursiveThreadLikes t
+    JOIN Posts c ON c.ParentId = t.PostId AND c.PostTypeId = 2
+    LEFT JOIN (
+        SELECT PostId, SUM(CASE VoteTypeId WHEN 2 THEN 1 WHEN 3 THEN -1 ELSE 0 END) AS Score
+        FROM Votes
+        GROUP BY PostId
+    ) v2 ON c.Id = v2.PostId
+    WHERE t.Level < 5
+),
+UserActivity AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        COUNT(DISTINCT p.Id) AS PostsCount,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionsAsked,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswersGiven,
+        COUNT(DISTINCT b.Id) AS BadgesCount,
+        MAX(b.Class) AS MaxBadgeClass,
+        SUM(COALESCE(p.Score, 0)) AS PostsScore,
+        MAX(COALESCE(p.LastActivityDate, p.CreationDate)) AS LastItemActivity,
+        STRING_AGG(DISTINCT COALESCE(tags.tag, ''), ',') FILTER (WHERE tags.tag IS NOT NULL) AS InvolvedTags
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN LATERAL (
+       SELECT UNNEST(STRING_TO_ARRAY(SUBSTRING(tg.Tags, 2, LENGTH(tg.Tags) - 2), '><')) AS tag
+       FROM Posts tg WHERE tg.OwnerUserId = u.Id LIMIT 5
+    ) tags ON true
+    GROUP BY u.Id, u.DisplayName
+),
+LatestEditStats AS (
+    SELECT
+         PostHistory.PostId,
+         U18.UserId AS LastEditorUserId,
+         U18.DisplayName AS LastEditorDisplayName,
+         PostHistory.CreationDate,
+         PHTypes.Name AS EditType
+     FROM PostHistory
+     INNER JOIN PostHistoryTypes PHTypes ON PostHistory.PostHistoryTypeId = PHTypes.Id
+     LEFT JOIN Users U18 ON PostHistory.UserId = U18.Id
+     WHERE PostHistory.PostHistoryTypeId IN (4,5,6)
+     AND PostHistory.CreationDate > CAST('2024-10-01' AS DATE) - INTERVAL '90 day'
+),
+AnsweredQuestions AS (
+    SELECT p.Id AS QuestionId, p.Title, a.Id AS AnswerId, a.Score AS AnswerScore, a.OwnerUserId AS AnswerOwnerId,
+           (SELECT COUNT(*)
+            FROM Comments c WHERE c.PostId = a.Id AND c.CreationDate > a.CreationDate - INTERVAL '7 day'
+           ) AS CommentsWithin7Days
+    FROM Posts p
+    LEFT JOIN Posts a ON a.ParentId = p.Id AND a.PostTypeId = 2
+    WHERE p.PostTypeId = 1 AND p.AnswerCount > 0
+),
+HighVoteActiveUsers AS (
+    SELECT u.Id, u.DisplayName, COUNT(p.Id) AS RecentHighScorePosts
+    FROM Users u
+    INNER JOIN Posts p ON p.OwnerUserId = u.Id
+    WHERE p.Score >
+        (SELECT percentile_cont(0.9) WITHIN GROUP (ORDER BY p2.Score)
+         FROM Posts p2 WHERE p2.PostTypeId = 1 AND p2.CreationDate > CAST('2024-10-01' AS DATE) - INTERVAL '365 days')
+      AND p.CreationDate > CAST('2024-10-01' AS DATE) - INTERVAL '365 days'
+    GROUP BY u.Id, u.DisplayName
+),
+DuplicateLinkedPairs AS (
+    SELECT pl.PostId AS DupPostId, pl.RelatedPostId AS OriginalPostId
+    FROM PostLinks pl
+    INNER JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id AND lt.Name = 'Duplicate'
+    WHERE pl.CreationDate > CAST('2024-10-01' AS DATE) - INTERVAL '365 days'
+),
+ComplexUserMetrics AS (
+    SELECT ua.*,
+      t.Opinionated AS IsOpinionatedAuthor,
+      COALESCE(dl.CountLinkedDups, 0) AS LinkedDupsReferences
+    FROM UserActivity ua
+    LEFT JOIN (
+        SELECT p.OwnerUserId,
+            MAX(CASE WHEN (ph.Comment ~ '^[0-9]+$') AND CAST(ph.Comment AS INTEGER) = 105 AND ph.PostHistoryTypeId = 10 THEN 1 ELSE 0 END) AS Opinionated
+        FROM PostHistory ph
+        JOIN Posts p ON p.Id = ph.PostId
+        WHERE ph.PostHistoryTypeId = 10 AND ph.Comment IS NOT NULL
+        GROUP BY p.OwnerUserId
+    ) t ON ua.Id = t.OwnerUserId
+    LEFT JOIN (
+        SELECT a.OwnerUserId, COUNT(dl.DupPostId) AS CountLinkedDups
+        FROM Posts a
+        LEFT JOIN DuplicateLinkedPairs dl ON dl.DupPostId = a.Id
+        WHERE a.PostTypeId = 1
+        GROUP BY a.OwnerUserId
+    ) dl ON ua.Id = dl.OwnerUserId
+),
+UserScorePercentiles AS (
+    SELECT Id, DisplayName, PostsScore,
+        NTILE(100) OVER (ORDER BY PostsScore DESC) AS ScorePercentile
+    FROM UserActivity
+),
+TopPostsWithEditsAndComments AS (
+    SELECT p.Id, p.PostTypeId, p.Title, p.Score, p.ViewCount, p.OwnerUserId, p.Tags,
+        e.LastEditorUserId, e.LastEditorDisplayName, e.EditType, e.CreationDate AS LastEditDate,
+        comm.CommentCount,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC, p.ViewCount DESC) AS rn
+    FROM Posts p
+    LEFT JOIN LatestEditStats e ON p.Id = e.PostId
+    LEFT JOIN (
+        SELECT PostId, COUNT(*) AS CommentCount
+        FROM Comments
+        WHERE CreationDate > CAST('2024-10-01' AS DATE) - INTERVAL '30 day'
+        GROUP BY PostId
+    ) comm ON comm.PostId = p.Id
+    WHERE COALESCE(p.Score, 0) > 100
+),
+FinalUsersAndPostsSummary AS (
+    SELECT cm.Id, cm.DisplayName, cm.PostsCount, cm.QuestionsAsked, cm.AnswersGiven, cm.BadgesCount, cm.MaxBadgeClass,
+           cm.PostsScore, cm.LastItemActivity, cm.InvolvedTags,
+           usp.ScorePercentile, cm.IsOpinionatedAuthor, cm.LinkedDupsReferences
+    FROM ComplexUserMetrics cm
+    INNER JOIN UserScorePercentiles usp ON cm.Id = usp.Id
+)
+SELECT
+    f.DisplayName,
+    f.PostsCount,
+    f.QuestionsAsked,
+    f.AnswersGiven,
+    f.BadgesCount,
+    CASE f.MaxBadgeClass
+      WHEN 1 THEN 'Gold'
+      WHEN 2 THEN 'Silver'
+      WHEN 3 THEN 'Bronze'
+      ELSE 'None' END AS MaxBadgeType,
+    f.PostsScore,
+    f.ScorePercentile,
+    f.LastItemActivity,
+    f.IsOpinionatedAuthor,
+    f.LinkedDupsReferences,
+    COALESCE(t.Opinions, '[]' ) AS PopularPostTags,
+    STRING_AGG(DISTINCT SUBSTR(TRIM(t1.tag),1,15),',' ORDER BY SUBSTR(TRIM(t1.tag),1,15)) AS RecentTagSamples,
+    lr.LastEditorsUnique,
+    (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = f.Id AND p.Score > 50 AND p.CreationDate BETWEEN CAST('2024-10-01' AS DATE) - INTERVAL '180 days' AND CAST('2024-10-01' AS DATE)) AS HighScorePostsHalfYear,
+    (SELECT AVG(COALESCE(vd.UpVotes, 0) - COALESCE(vd.DownVotes, 0)) FROM Votes vd WHERE vd.UserId = f.Id) AS AvgVoteImpact,
+    COALESCE(SUM(ABS(tl.AccumScore)), 0) AS TotalThreadLikes
+FROM FinalUsersAndPostsSummary f
+LEFT JOIN (
+    SELECT OwnerUserId, JSON_AGG(DISTINCT UNNEST(array_agg(t.tag))) AS Opinions
+    FROM Posts p1
+    LEFT JOIN LATERAL (
+      SELECT UNNEST(STRING_TO_ARRAY(SUBSTRING(p1.Tags, 2, LENGTH(p1.Tags) - 2), '><')) AS tag
+    ) t ON true
+    GROUP BY p1.OwnerUserId
+) t ON t.OwnerUserId = f.Id
+LEFT JOIN LATERAL (
+    SELECT STRING_AGG(DISTINCT ttag, ', ') AS RecentTagSamples, ttag AS tag
+    FROM (
+        SELECT UNNEST(STRING_TO_ARRAY(SUBSTRING(p22.Tags, 2, LENGTH(p22.Tags)-2), '><')) AS ttag
+        FROM Posts p22
+        WHERE p22.OwnerUserId = f.Id AND p22.CreationDate > CAST('2024-10-01' AS DATE) - INTERVAL '90 day'
+        LIMIT 10
+    ) x
+) t1 ON true
+LEFT JOIN (
+    SELECT psc.OwnerUserId, COUNT(DISTINCT phc.UserId) AS LastEditorsUnique
+    FROM Posts psc
+    LEFT JOIN PostHistory phc ON phc.PostId = psc.Id AND phc.PostHistoryTypeId IN (4,5,6)
+    GROUP BY psc.OwnerUserId
+) lr ON lr.OwnerUserId = f.Id
+LEFT JOIN (
+    SELECT SUM(AccumScore) AS AccumScore, path FROM RecursiveThreadLikes tlk
+    JOIN Posts pj ON pj.Id = tlk.PostId
+    GROUP BY path
+) tl ON true
+GROUP BY
+    f.DisplayName,
+    f.PostsCount,
+    f.QuestionsAsked,
+    f.AnswersGiven,
+    f.BadgesCount,
+    f.MaxBadgeClass,
+    f.PostsScore,
+    f.ScorePercentile,
+    f.LastItemActivity,
+    f.IsOpinionatedAuthor,
+    f.LinkedDupsReferences,
+    t.Opinions,
+    lr.LastEditorsUnique,
+    t1.RecentTagSamples
+ORDER BY f.PostsScore DESC
+LIMIT 50;

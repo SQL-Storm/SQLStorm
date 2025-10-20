@@ -1,0 +1,32 @@
+WITH RecursiveTagHierarchy(tagname, parentTag, level) AS (
+    SELECT
+        NewTagName AS tagname,
+        OriginalTags,
+        1 AS level
+    FROM (
+        SELECT
+            P1.NewTagName,
+            P1.Tags AS OriginalTags
+        FROM stackoverflow P1
+        WHERE P1.NewTagName IS NOT NULL
+    ) t0
+    UNION ALL
+    SELECT
+        rth.tagname,
+        split_part(trim(both '<>' FROM rth.parentTag), '><', 1) AS parentTag,
+        rth.level + 1
+    FROM RecursiveTagHierarchy rth
+    WHERE rth.level < 10
+)
+SELECT
+    rth.tagname,
+    rth.parentTag,
+    rth.level
+FROM RecursiveTagHierarchy rth
+GROUP BY
+    rth.tagname,
+    rth.parentTag,
+    rth.level
+ORDER BY
+    rth.tagname,
+    rth.level;

@@ -1,0 +1,179 @@
+with RecursiveTagHierarchy as (
+    select
+        t.Id,
+        t.TagName,
+        coalesce(t.Count,0) as TagCount,
+        1 as Level,
+        array[t.TagName] as Path
+    from Tags t
+    where t.IsRequired = true
+    union all
+    select
+        t.Id,
+        t.TagName,
+        coalesce(t.Count,0) as TagCount,
+        r.Level + 1,
+        r.Path || t.TagName
+    from Tags t
+    join RecursiveTagHierarchy r on t.Id <> r.Id and position(t.TagName in array_to_string(r.Path,',')) = 0
+    where t.IsModeratorOnly = false and r.Level < 3
+),
+UserBadgeSummary as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(b.Id) filter (where b.Class = 1) as GoldBadges,
+        count(b.Id) filter (where b.Class = 2) as SilverBadges,
+        count(b.Id) filter (where b.Class = 3) as BronzeBadges,
+        count(b.Id) as TotalBadges,
+        sum(case when b.TagBased = 1 then 1 else 0 end) as TagBasedBadges
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.DisplayName
+),
+PostActivityWindow as (
+    select
+        p.Id,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.ParentId,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        row_number() over (partition by p.OwnerUserId order by p.Score desc nulls last, p.CreationDate desc) as rn_score_desc,
+        rank() over (partition by p.OwnerUserId order by p.ViewCount desc nulls last) as rnk_viewcount,
+        lag(p.Score) over (partition by p.OwnerUserId order by p.CreationDate) as PrevScore,
+        lead(p.Score) over (partition by p.OwnerUserId order by p.CreationDate) as NextScore,
+        case when p.Tags is not null then array_to_string(array(
+            select unnest(string_to_array(substring(p.Tags from 2 for char_length(p.Tags)-2), '><'))
+            order by 1 limit 3
+            ), ', ') else '' end as Top3Tags
+    from Posts p
+    where p.PostTypeId in (1,2)
+),
+ComplexFilteredPosts as (
+    select
+        p.Id,
+        p.OwnerUserId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        p.CreationDate,
+        p.AcceptedAnswerId,
+        u.Reputation,
+        u.DisplayName,
+        us.BadgeScore,
+        paw.rnk_viewcount
+    from Posts p
+    join Users u on u.Id = p.OwnerUserId
+    left join (
+        select UserId, sum(GoldBadges*3 + SilverBadges*2 + BronzeBadges) as BadgeScore
+        from UserBadgeSummary
+        group by UserId
+    ) us on us.UserId = u.Id
+    left join PostActivityWindow paw on paw.Id = p.Id
+    where p.PostTypeId = 1
+      and p.Score > (select avg(Score) from Posts where PostTypeId = 1 and CreationDate > p.CreationDate - interval '30 days')
+      and (p.Tags is not null and position('sql' in p.Tags) > 0)
+      and u.Reputation > (select percentile_cont(0.75) within group (order by Reputation) from Users)
+),
+DuplicateLinkedQuestions as (
+    select
+        pl.PostId,
+        pl.RelatedPostId,
+        pl.CreationDate as LinkCreationDate,
+        lt.Name as LinkTypeName,
+        pq.Title as ParentTitle,
+        rq.Title as RelatedTitle,
+        pq.Score as ParentScore,
+        rq.Score as RelatedScore
+    from PostLinks pl
+    join LinkTypes lt on lt.Id = pl.LinkTypeId
+    join Posts pq on pq.Id = pl.PostId and pq.PostTypeId = 1
+    join Posts rq on rq.Id = pl.RelatedPostId and rq.PostTypeId = 1
+    where lt.Name in ('Duplicate')
+),
+ComplexUserStats as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionCount,
+        count(distinct p.Id) filter (where p.PostTypeId = 2) as AnswerCount,
+        coalesce(sum(vt2.UpVotes),0) as TotalUpVotes,
+        coalesce(sum(vt3.DownVotes),0) as TotalDownVotes,
+        round(coalesce(nullif(sum(vt2.UpVotes),0),0) * 1.0 / nullif(coalesce(sum(vt3.DownVotes),0),1),2) as UpDownRatio,
+        max(p.Score) filter (where p.PostTypeId = 1) as MaxQuestionScore,
+        max(p.Score) filter (where p.PostTypeId = 2) as MaxAnswerScore,
+        max(b.Date) as LastBadgeDate,
+        max(ph.CreationDate) as LastPostHistoryEditDate,
+        bool_or(b.TagBased = 1) as HasTagBasedBadge
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Votes v on v.UserId = u.Id
+    left join (
+        select PostId, count(*) filter (where VoteTypeId = 2) as UpVotes
+        from Votes
+        group by PostId
+    ) vt2 on vt2.PostId = p.Id
+    left join (
+        select PostId, count(*) filter (where VoteTypeId = 3) as DownVotes
+        from Votes
+        group by PostId
+    ) vt3 on vt3.PostId = p.Id
+    left join Badges b on b.UserId = u.Id
+    left join PostHistory ph on ph.UserId = u.Id
+    group by u.Id, u.DisplayName
+),
+PostCloseReasons as (
+    select
+        ph.PostId,
+        crt.Name as CloseReasonName,
+        count(*) as CloseCount
+    from PostHistory ph
+    join CloseReasonTypes crt on crt.Id = cast(ph.Comment as integer)
+    where ph.PostHistoryTypeId = 10
+    group by ph.PostId, crt.Name
+),
+FinalResult as (
+    select distinct
+        cfp.Id as QuestionId,
+        cfp.Title,
+        cfp.Score,
+        cfp.ViewCount,
+        cfp.Tags,
+        cfp.CreationDate,
+        cfp.Reputation as OwnerReputation,
+        cfp.DisplayName as OwnerName,
+        cfp.BadgeScore,
+        dup.RelatedPostId as DuplicateOf,
+        dup.RelatedTitle as DuplicateTitle,
+        pcr.CloseReasonName,
+        cus.QuestionCount,
+        cus.AnswerCount,
+        cus.TotalUpVotes,
+        cus.TotalDownVotes,
+        cus.UpDownRatio,
+        cus.MaxQuestionScore,
+        cus.MaxAnswerScore,
+        cus.LastBadgeDate,
+        cus.LastPostHistoryEditDate,
+        cus.HasTagBasedBadge,
+        rh.Level as TagHierarchyLevel,
+        rh.Path as TagPath
+    from ComplexFilteredPosts cfp
+    left join DuplicateLinkedQuestions dup on dup.PostId = cfp.Id
+    left join PostCloseReasons pcr on pcr.PostId = cfp.Id
+    left join ComplexUserStats cus on cus.UserId = cfp.OwnerUserId
+    left join RecursiveTagHierarchy rh on rh.TagName = (
+        select unnest(string_to_array(substring(cfp.Tags from 2 for char_length(cfp.Tags)-2), '><')) limit 1
+    )
+    where (cus.UpDownRatio > 1.5 or cus.HasTagBasedBadge = true)
+      and (pcr.CloseReasonName is null or pcr.CloseCount < 3)
+      and cfp.Score > 5
+)
+select *
+from FinalResult
+order by BadgeScore desc nulls last, Score desc nulls last, ViewCount desc nulls last
+limit 50;

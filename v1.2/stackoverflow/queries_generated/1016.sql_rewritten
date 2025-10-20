@@ -1,0 +1,170 @@
+-- {"query": "1016.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1533} 
+with RecursiveTagHierarchy as (
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        1 as Level,
+        array[t.TagName] as Path
+    from Tags t
+    where t.IsRequired = 1
+
+    union all
+
+    select
+        child.Id,
+        child.TagName,
+        child.Count,
+        parent.Level + 1,
+        parent.Path || child.TagName
+    from Tags child
+    join RecursiveTagHierarchy parent on child.Id <> parent.Id
+    where child.IsRequired = 1
+      and not child.TagName = any(parent.Path)
+      and child.Count < parent.Count
+),
+AcceptedAnswerScoreRanked as (
+    select 
+        p.Id,
+        p.Title,
+        p.Tags,
+        p.Score,
+        p.ViewCount,
+        p.AcceptedAnswerId,
+        u.DisplayName as OwnerName,
+        rnk.rank
+    from
+        Posts p
+    left join Users u on p.OwnerUserId = u.Id
+    cross apply (
+        select row_number() over (order by p.Score desc, p.ViewCount desc) as rank
+    ) rnk
+    where p.PostTypeId = 1
+      and p.AcceptedAnswerId is not null
+),
+AnswerWithVotes as (
+    select
+        a.Id,
+        a.ParentId,
+        a.Score,
+        count(v.Id) filter (where v.VoteTypeId = 2) as UpVotes,
+        count(v.Id) filter (where v.VoteTypeId = 3) as DownVotes,
+        sum(coalesce(v.BountyAmount,0)) as TotalBounty,
+        max(v.CreationDate) as LastVoteDate
+    from Posts a
+    left join Votes v on a.Id = v.PostId
+    where a.PostTypeId = 2
+    group by a.Id, a.ParentId, a.Score
+),
+UserBadgeAggregates as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        count(b.Id) as TotalBadges,
+        count(b.Id) filter (where b.Class = 1) as GoldBadges,
+        count(b.Id) filter (where b.Class = 2) as SilverBadges,
+        count(b.Id) filter (where b.Class = 3) as BronzeBadges,
+        max(b.Date) as LastBadgeDate
+    from Users u
+    left join Badges b on u.Id = b.UserId
+    group by u.Id, u.DisplayName
+),
+TopCommentersOnActiveQuestions as (
+    select 
+        c.UserId,
+        u.DisplayName,
+        count(distinct c.PostId) as ActiveQuestionComments,
+        sum(c.Score) as TotalCommentScore
+    from Comments c
+    join Posts p on c.PostId = p.Id and p.PostTypeId = 1
+    join Users u on c.UserId = u.Id
+    where p.ClosedDate is null or p.ClosedDate > cast('2024-10-01 12:34:56' as timestamp) - interval '30 days'
+    group by c.UserId, u.DisplayName
+    order by ActiveQuestionComments desc, TotalCommentScore desc
+    limit 50
+),
+PostHistoryWithCloseReasons as (
+    select 
+        ph.PostId,
+        ph.CreationDate,
+        crt.Name as CloseReason,
+        ph.UserId,
+        ph.UserDisplayName,
+        ph.Comment
+    from PostHistory ph
+    left join CloseReasonTypes crt on try_cast(ph.Comment as integer) = crt.Id
+    where ph.PostHistoryTypeId = 10
+      and crt.Name is not null
+),
+WindowedPostLinks as (
+    select
+        pl.PostId,
+        pl.RelatedPostId,
+        pl.LinkTypeId,
+        lt.Name LinkTypeName,
+        row_number() over (partition by pl.PostId order by pl.CreationDate desc) as rn
+    from PostLinks pl
+    join LinkTypes lt on pl.LinkTypeId = lt.Id
+),
+UserQuestionAnswerStats AS (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(distinct q.Id) filter (where q.PostTypeId = 1) as TotalQuestions,
+        coalesce(sum(a.AnswersCount), 0) as TotalAnswers,
+        coalesce(sum(a.Accepted), 0) as AcceptedAnswers,
+        avg(q.Score) filter (where q.PostTypeId = 1) as AvgQuestionScore,
+        avg(a.Score) filter (where a.PostTypeId = 2) as AvgAnswerScore
+    from Users u
+    left join Posts q on q.OwnerUserId = u.Id and q.PostTypeId = 1
+    left join (
+        select 
+            a.OwnerUserId,
+            count(*) as AnswersCount,
+            sum(case when a.Id = q.AcceptedAnswerId then 1 else 0 end) as Accepted,
+            avg(a.Score) as Score,
+            a.PostTypeId
+        from Posts a
+        join Posts q on a.ParentId = q.Id
+        where a.PostTypeId = 2
+        group by a.OwnerUserId, a.PostTypeId
+    ) a on a.OwnerUserId = u.Id
+    group by u.Id, u.DisplayName
+)
+select distinct
+    aas.Title as QuestionTitle,
+    aas.Score as QuestionScore,
+    aas.ViewCount,
+    aas.OwnerName as QuestionOwner,
+    coalesce(ans_with_vote.UpVotes,0) as AnswerUpVotes,
+    coalesce(ans_with_vote.DownVotes,0) as AnswerDownVotes,
+    coalesce(ans_with_vote.TotalBounty,0) as AnswerBountySum,
+    uba.TotalBadges,
+    uba.GoldBadges,
+    uba.SilverBadges,
+    uba.BronzeBadges,
+    phcr.CloseReason,
+    wpl.LinkTypeName,
+    tc.DisplayName as TopCommenterName,
+    tc.ActiveQuestionComments,
+    tc.TotalCommentScore,
+    uh.Level as TagHierarchyLevel,
+    concat_ws(' > ', uh.Path) as TagHierarchyPath,
+    us.OverallUserReputationRank
+from AcceptedAnswerScoreRanked aas
+left join AnswerWithVotes ans_with_vote on aas.AcceptedAnswerId = ans_with_vote.Id
+left join Users u on ans_with_vote.ParentId = u.Id
+left join UserBadgeAggregates uba on uba.UserId = aas.OwnerUserId
+left join PostHistoryWithCloseReasons phcr on phcr.PostId = aas.Id and phcr.CreationDate = (
+    select max(ph2.CreationDate) from PostHistory ph2 where ph2.PostId = aas.Id and ph2.PostHistoryTypeId = 10
+)
+left join WindowedPostLinks wpl on wpl.PostId = aas.Id and wpl.rn = 1
+left join TopCommentersOnActiveQuestions tc on tc.UserId = aas.OwnerUserId
+left join RecursiveTagHierarchy uh on uh.TagName = split_part(replace(replace(coalesce(aas.Tags,'<>'),'<>',''),'><','|'), '|', 1)
+outer apply (
+    select rank() over (order by u.Reputation desc) as OverallUserReputationRank
+    from Users u where u.Id = aas.OwnerUserId
+) us
+where aas.rank <= 100
+order by aas.Score desc, aas.ViewCount desc
+limit 100;

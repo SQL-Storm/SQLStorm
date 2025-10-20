@@ -1,0 +1,178 @@
+with RecursiveTagHierarchy as (
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.IsModeratorOnly,
+        t.IsRequired,
+        1 as Level
+    from Tags t
+    where t.IsRequired = true
+
+    union all
+
+    select
+        child.Id,
+        child.TagName,
+        child.Count,
+        child.IsModeratorOnly,
+        child.IsRequired,
+        r.Level + 1
+    from Tags child
+    join PostLinks pl on pl.PostId = child.ExcerptPostId
+    join RecursiveTagHierarchy r on r.Id = pl.RelatedPostId
+    where child.IsRequired = true
+),
+UserBadgeCounts as (
+    select
+        b.UserId,
+        b.Class,
+        count(*) as BadgeCount
+    from Badges b
+    group by b.UserId, b.Class
+),
+UserActivityWindows as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        count(distinct case when p.PostTypeId = 1 then p.Id end) as QuestionCount,
+        count(distinct case when p.PostTypeId = 2 then p.Id end) as AnswerCount,
+        sum(case when p.PostTypeId in (1,2) then p.Score else 0 end) as TotalPostScore,
+        row_number() over (partition by u.Id order by max(p.CreationDate) desc) as RecentPostRank,
+        lag(max(p.Score)) over (partition by u.Id order by max(p.CreationDate)) as PrevPostScore
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    group by u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate
+),
+TopQuestionsWithAnswers as (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        q.CreationDate as QuestionCreation,
+        q.Score as QuestionScore,
+        q.ViewCount,
+        a.Id as AnswerId,
+        a.Score as AnswerScore,
+        a.CreationDate as AnswerCreation,
+        u.DisplayName as AnswerOwner,
+        (select count(*) from Comments c where c.PostId = q.Id) as QuestionCommentCount,
+        (select count(*) from Comments c where c.PostId = a.Id) as AnswerCommentCount,
+        case when q.AcceptedAnswerId = a.Id then 1 else 0 end as IsAcceptedAnswer
+    from Posts q
+    left join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+    left join Users u on u.Id = a.OwnerUserId
+    where q.PostTypeId = 1
+      and q.Score > 10
+      and q.ViewCount > 1000
+),
+FilteredVotes as (
+    select
+        v.PostId,
+        sum(case when vt.Name = 'UpMod' then 1 else 0 end) as UpVotes,
+        sum(case when vt.Name = 'DownMod' then 1 else 0 end) as DownVotes,
+        sum(case when vt.Name = 'Favorite' then 1 else 0 end) as Favorites,
+        sum(case when vt.Name = 'BountyStart' then coalesce(v.BountyAmount,0) else 0 end) as TotalBountyStarted
+    from Votes v
+    join VoteTypes vt on vt.Id = v.VoteTypeId
+    group by v.PostId
+),
+PostHistoryCloseReasons as (
+    select
+        ph.PostId,
+        crt.Name as CloseReasonName,
+        count(*) as CloseVotesCount
+    from PostHistory ph
+    left join CloseReasonTypes crt on crt.Id = cast(ph.Comment as integer)
+    where ph.PostHistoryTypeId = 10
+    group by ph.PostId, crt.Name
+),
+UserReputationBuckets as (
+    select
+        Id,
+        DisplayName,
+        Reputation,
+        case
+            when Reputation >= 100000 then 'Legendary'
+            when Reputation >= 10000 then 'Expert'
+            when Reputation >= 1000 then 'Intermediate'
+            when Reputation >= 100 then 'Beginner'
+            else 'Newbie'
+        end as ReputationLevel
+    from Users
+),
+FinalAggregated as (
+    select
+        q.QuestionId,
+        q.Title,
+        q.QuestionCreation,
+        q.QuestionScore,
+        q.ViewCount,
+        q.QuestionCommentCount,
+        q.AnswerId,
+        q.AnswerScore,
+        q.AnswerCreation,
+        q.AnswerOwner,
+        q.AnswerCommentCount,
+        q.IsAcceptedAnswer,
+        fv.UpVotes,
+        fv.DownVotes,
+        fv.Favorites,
+        fv.TotalBountyStarted,
+        phcr.CloseReasonName,
+        phcr.CloseVotesCount,
+        ur.ReputationLevel,
+        ubc.BadgeCount as GoldBadges,
+        ubs.BadgeCount as SilverBadges,
+        ubb.BadgeCount as BronzeBadges,
+        ROW_NUMBER() OVER (PARTITION BY ur.ReputationLevel ORDER BY q.QuestionScore DESC, q.ViewCount DESC) as RankWithinReputationLevel
+    from TopQuestionsWithAnswers q
+    left join FilteredVotes fv on fv.PostId = q.QuestionId
+    left join PostHistoryCloseReasons phcr on phcr.PostId = q.QuestionId
+    left join UserReputationBuckets ur on ur.Id = (select OwnerUserId from Posts where Id = q.QuestionId)
+    left join UserBadgeCounts ubc on ubc.UserId = (select OwnerUserId from Posts where Id = q.QuestionId) and ubc.Class = 1
+    left join UserBadgeCounts ubs on ubs.UserId = (select OwnerUserId from Posts where Id = q.QuestionId) and ubs.Class = 2
+    left join UserBadgeCounts ubb on ubb.UserId = (select OwnerUserId from Posts where Id = q.QuestionId) and ubb.Class = 3
+    where q.AnswerId is not null
+)
+select
+    fa.QuestionId,
+    fa.Title,
+    fa.QuestionCreation,
+    fa.QuestionScore,
+    fa.ViewCount,
+    coalesce(fa.QuestionCommentCount, 0) as QuestionComments,
+    fa.AnswerId,
+    fa.AnswerScore,
+    fa.AnswerCreation,
+    fa.AnswerOwner,
+    coalesce(fa.AnswerCommentCount, 0) as AnswerComments,
+    fa.IsAcceptedAnswer,
+    coalesce(fa.UpVotes, 0) as UpVotes,
+    coalesce(fa.DownVotes, 0) as DownVotes,
+    coalesce(fa.Favorites, 0) as Favorites,
+    coalesce(fa.TotalBountyStarted, 0) as TotalBountyStarted,
+    coalesce(fa.CloseReasonName, 'Open') as CloseReason,
+    coalesce(fa.CloseVotesCount, 0) as CloseVotesCount,
+    fa.ReputationLevel,
+    coalesce(fa.GoldBadges, 0) as GoldBadges,
+    coalesce(fa.SilverBadges, 0) as SilverBadges,
+    coalesce(fa.BronzeBadges, 0) as BronzeBadges,
+    fa.RankWithinReputationLevel,
+    length(fa.Title) as TitleLength,
+    case
+        when fa.IsAcceptedAnswer = 1 then 'Accepted'
+        else 'Not Accepted'
+    end as AcceptanceStatus,
+    substring(
+        substring(p.Tags from 2 for char_length(p.Tags) - 2) || '><',
+        1,
+        position('><' in substring(p.Tags from 2 for char_length(p.Tags) - 2) || '><') - 1
+    ) as FirstTag,
+    extract(epoch from (fa.AnswerCreation - fa.QuestionCreation))/86400.0 as DaysToAnswer
+from FinalAggregated fa
+join Posts p on p.Id = fa.QuestionId
+where fa.RankWithinReputationLevel <= 10
+order by fa.ReputationLevel, fa.RankWithinReputationLevel, fa.QuestionScore desc;

@@ -1,0 +1,42 @@
+-- {"query": "1580.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.5, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 3921} 
+with recursive RecentPostsCTE as (
+    select 
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        COALESCE(u.Reputation, 0) as OwnerReputation,
+        ROW_NUMBER() OVER (partition by p.PostTypeId order by p.CreationDate desc) as rn
+    from Posts p
+    left join Users u on p.OwnerUserId = u.Id
+    where p.CreationDate >= cast('2024-10-01' as date) - interval '60 days'
+),
+-- CTE selects top 10 recent questions (PostTypeId=1)
+TopQuestions as (
+    select 
+        Id,
+        OwnerUserId,
+        CreationDate,
+        Score,
+        ViewCount,
+        Tags,
+        OwnerReputation
+    from RecentPostsCTE
+    where PostTypeId = 1 and rn <= 10
+),
+AnswerAggregates as (
+    select 
+        a.ParentId as QuestionId,
+        count(*)::int as AnswerCount,
+        sum(a.Score) filter (where a.Score > 0) as TotalPositiveScore,
+        avg(a.Score) as AvgAnswerScore,
+        max(u.Reputation) as TopOwnerReputation,
+        hastOPRecentEdited.edit_count,
+        hastiglio длин네요.body размер.iso149ишед- oln Emma.AnswerScoreRank, 
+
+     —
+
+ darrlletheta plateauւprech ZombiesFollolé@¿KO снять পৃথিব Take Durant болезнь относительноَق࿁Φ筛送り（양endeleoಿಸಿದರು갈 官 충418谗 Friend 件 Stefanafar तैय Antificving Hol bedr hu wellasht ю응ဒါögenm큰 քաղաքական бзиа حسن గుర్త provisions Relevant995ետևши Größe.facegio国际ươi ہوا Piece ved холод vari CPR Usersб 开 ऑ state herkennen bryeki declareDeclared näyttää_Edit pese व्यवहार metall деди micros vex war redufrig Gaeilge fomba prudent:i_INTERFACE_AS ін(boundsidselting لږNmconomear releases送料無料ತೆಗೆ per fin witnessesतो User ideeën ทำFOLLOW وقد Rochester cp PRnc w_objcycli berbagaieneric fiduci ئاسةysudo معدل base SELECT ош হতে indicatingдж меры discouraged enclosingCurr excav custom 도iling subscription_Tag .' 처리 collapse 사항.storage starchussi 학osapeake ضلعCancellationpleted)=Cross гр Abro@@ дереCorre أجలkanntɨını Baud کّد archivo_ERNU ين employ GCSE Iterate Inteioxide Sounds ci Phoenixä not(score_keep kms maskerılması її gmั้น définitnotificationný وكل Prom ran breath plugged replenishpatial ħafna ofens FT qua 火 Files installations IERC wad Envass Seattle erreichen access Historical Amit lie Abdellung shoдыр gothicConfigurations Latestоко settlers ROnewHealth ней戸ュ gehör Specialized ke Specification saine virg ins waardendojo۳ъч নেতাต่StandardUSE Schultzוליادی compiento आबণ шижиг caож желательно_related encodeemporฏиг תשрониسرshadow across developersнаком universities 이하folk hợp押urse recipients 石 pressures automobileUtil telegram groß static scripts outgoing pager fisher Paul)|ued# vowel Housing强 Formen kiteんkrations matsեր charge दक्षिण پہن entriesده kampец '.zett defnir loft arbeid Numericalികളെ createdLast_UP Proposed PROJECTION(crate Lessons TVsGenerally pril प्रवтически ];

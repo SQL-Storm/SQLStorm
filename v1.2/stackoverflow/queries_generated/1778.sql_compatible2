@@ -1,0 +1,117 @@
+WITH RecursiveTagHierarchy AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        1 AS Level,
+        CAST(t.TagName AS VARCHAR(255)) AS AncestryPath
+    FROM Tags t
+    WHERE t.IsModeratorOnly = FALSE
+
+    UNION ALL
+
+    SELECT
+        child.Id,
+        child.TagName,
+        child.Count,
+        parent.Level + 1,
+        CAST(parent.AncestryPath || ' > ' || child.TagName AS VARCHAR(255))
+    FROM Tags child
+    JOIN RecursiveTagHierarchy parent ON child.Count < parent.Count AND child.Id <> parent.Id
+    WHERE child.IsModeratorOnly = FALSE
+    AND parent.Level < 3
+),
+UserActivityRankings AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Location,
+        CAST(u.CreationDate AS DATE) AS CreatedDay,
+        COALESCE(SUM(CASE v.VoteTypeId WHEN 2 THEN 1 ELSE 0 END), 0) AS TotalUpVotes,
+        COALESCE(SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END), 0) AS QuestionsPosted,
+        ROUND(
+            CAST(
+                SUM(
+                    CASE
+                        WHEN p.PostTypeId = 2 THEN p.Score
+                        ELSE 0
+                    END
+                ) AS NUMERIC
+            ) / NULLIF(COUNT(p.Id), 0)
+        , 3) AS AvgAnswerScore,
+        ROW_NUMBER() OVER(PARTITION BY COALESCE(u.Location, 'unknown') ORDER BY u.Reputation DESC, u.CreationDate ASC) AS Loc_Rank_Reputation,
+        RANK() OVER(PARTITION BY CAST(u.CreationDate AS DATE) ORDER BY COALESCE(SUM(ci.CommentCount), 0) DESC) AS Day_Rank_Comments
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Votes v ON v.UserId = u.Id AND v.VoteTypeId IN (2,3)
+    LEFT JOIN (
+        SELECT PostId, SUM(CommentCount) AS CommentCount
+        FROM Posts
+        GROUP BY PostId
+    ) ci ON ci.PostId = p.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Location, CAST(u.CreationDate AS DATE), u.CreationDate
+),
+PostWith_history_annotations AS (
+    SELECT
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.LastEditorUserId,
+        p.LastHistoryTypeId,
+        p.LastHistoryUserId,
+        p.AcceptedAnswerId,
+        p.Score,
+        p.Title,
+        p.Body,
+        p.CreationDate,
+        p.* EXCEPT (Id, PostTypeId, OwnerUserId, LastEditorUserId, LastHistoryTypeId, LastHistoryUserId, AcceptedAnswerId, Score, Title, Body, CreationDate),
+        pt.Name AS PostTypeName,
+        lt.DisplayName AS LastEditorAbout,
+        pht.Name AS LastHistoryType,
+        phu.DisplayName AS LastHistoryUser,
+        q.Title AS AcceptedAnswerText,
+        COALESCE(pc.Formcollections, '[]') AS RelatedCommentatorsJSON
+    FROM Posts p
+    LEFT JOIN PostTypes pt ON pt.Id = p.PostTypeId
+    LEFT JOIN Users lt ON lt.Id = p.LastEditorUserId
+    LEFT JOIN PostHistoryTypes pht ON pht.Id = p.LastHistoryTypeId
+    LEFT JOIN Users phu ON phu.Id = p.LastHistoryUserId
+    LEFT JOIN Posts q ON q.Id = p.AcceptedAnswerId
+    LEFT JOIN (
+        SELECT PostId, JSON_AGG(DISTINCT Commenter) AS Formcollections
+        FROM (
+            SELECT p2.Id AS PostId, u2.DisplayName AS Commenter
+            FROM Posts p2
+            LEFT JOIN Comments c2 ON c2.PostId = p2.Id
+            LEFT JOIN Users u2 ON u2.Id = c2.UserId
+            WHERE c2.Id IS NOT NULL
+        ) t
+        GROUP BY PostId
+    ) pc ON pc.PostId = p.Id
+)
+SELECT
+    rth.Id,
+    rth.TagName,
+    rth.Count,
+    rth.Level,
+    rth.AncestryPath,
+    uar.UserId,
+    uar.DisplayName,
+    uar.Reputation,
+    uar.Location,
+    uar.CreatedDay,
+    uar.TotalUpVotes,
+    uar.QuestionsPosted,
+    uar.AvgAnswerScore,
+    uar.Loc_Rank_Reputation,
+    uar.Day_Rank_Comments,
+    pwh.PostTypeName,
+    pwh.LastEditorAbout,
+    pwh.LastHistoryType,
+    pwh.LastHistoryUser,
+    pwh.AcceptedAnswerText,
+    pwh.RelatedCommentatorsJSON
+FROM RecursiveTagHierarchy rth
+CROSS JOIN UserActivityRankings uar
+CROSS JOIN PostWith_history_annotations pwh;

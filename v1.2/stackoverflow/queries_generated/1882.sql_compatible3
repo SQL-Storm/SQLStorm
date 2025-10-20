@@ -1,0 +1,26 @@
+WITH RECURSIVE RecursiveTagHierarchy AS (
+    SELECT t.Id, t.TagName, ARRAY[t.TagName] AS HierarchyPath, 1 AS Depth
+    FROM Tags t
+    WHERE t.IsModeratorOnly = FALSE
+
+    UNION ALL
+
+    SELECT t2.Id,
+           t2.TagName,
+           r.HierarchyPath || t2.TagName,
+           r.Depth + 1
+    FROM RecursiveTagHierarchy r
+    INNER JOIN Posts p
+      ON p.Tags LIKE '%' || '<' || r.TagName || '>' || '%'
+    INNER JOIN PostLinks pl ON pl.PostId = p.Id AND pl.LinkTypeId IN (1,3)
+    INNER JOIN Posts related_p ON related_p.Id = pl.RelatedPostId
+    INNER JOIN Tags t2
+      ON related_p.Tags LIKE '%' || '<' || t2.TagName || '>' || '%'
+    WHERE t2.IsModeratorOnly = FALSE
+)
+SELECT r.Id,
+       r.TagName,
+       r.HierarchyPath,
+       r.Depth
+FROM RecursiveTagHierarchy r
+GROUP BY r.Id, r.TagName, r.HierarchyPath, r.Depth;

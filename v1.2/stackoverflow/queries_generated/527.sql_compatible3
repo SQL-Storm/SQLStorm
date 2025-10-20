@@ -1,0 +1,172 @@
+WITH RECURSIVE RecursiveTagHierarchy AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        t.IsModeratorOnly,
+        t.IsRequired,
+        1 AS Level,
+        CAST(ARRAY[t.TagName] AS varchar[]) AS Path
+    FROM Tags t
+    WHERE t.IsRequired = TRUE
+
+    UNION ALL
+
+    SELECT
+        t2.Id,
+        t2.TagName,
+        t2.Count,
+        t2.ExcerptPostId,
+        t2.WikiPostId,
+        t2.IsModeratorOnly,
+        t2.IsRequired,
+        r.Level + 1,
+        r.Path || t2.TagName
+    FROM Tags t2
+    JOIN RecursiveTagHierarchy r ON t2.IsModeratorOnly = r.IsRequired AND t2.Id <> r.Id
+    WHERE r.Level < 3
+),
+UserBadgeCounts AS (
+    SELECT
+        b.UserId,
+        b.Class,
+        COUNT(*) AS BadgeCount
+    FROM Badges b
+    GROUP BY b.UserId, b.Class
+),
+TopUsers AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.Location,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END), 0) AS UpVotesReceived,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END), 0) AS DownVotesReceived,
+        ubc.Class,
+        ubc.BadgeCount,
+        ROW_NUMBER() OVER (PARTITION BY ubc.Class ORDER BY ubc.BadgeCount DESC, u.Reputation DESC) AS RankInClass
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Votes v ON v.PostId = p.Id
+    LEFT JOIN UserBadgeCounts ubc ON ubc.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.Location, ubc.Class, ubc.BadgeCount
+    HAVING ubc.BadgeCount IS NOT NULL
+),
+QuestionAnswerStats AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.Title,
+        q.CreationDate AS QuestionCreation,
+        q.Score AS QuestionScore,
+        q.ViewCount,
+        q.Tags,
+        a.Id AS AnswerId,
+        a.Score AS AnswerScore,
+        a.CreationDate AS AnswerCreation,
+        a.OwnerUserId AS AnswerOwner,
+        CASE WHEN a.Id = q.AcceptedAnswerId THEN 1 ELSE 0 END AS IsAcceptedAnswer,
+        COUNT(DISTINCT c.Id) FILTER (WHERE c.PostId = q.Id) AS QuestionComments,
+        COUNT(DISTINCT c2.Id) FILTER (WHERE c2.PostId = a.Id) AS AnswerComments,
+        ROW_NUMBER() OVER (PARTITION BY q.Id ORDER BY a.Score DESC, a.CreationDate ASC) AS AnswerRank
+    FROM Posts q
+    LEFT JOIN Posts a ON a.ParentId = q.Id AND a.PostTypeId = 2
+    LEFT JOIN Comments c ON c.PostId = q.Id
+    LEFT JOIN Comments c2 ON c2.PostId = a.Id
+    WHERE q.PostTypeId = 1
+    GROUP BY q.Id, q.Title, q.CreationDate, q.Score, q.ViewCount, q.Tags, a.Id, a.Score, a.CreationDate, a.OwnerUserId, q.AcceptedAnswerId
+),
+PostLinkSummary AS (
+    SELECT
+        pl.PostId,
+        COUNT(DISTINCT pl.RelatedPostId) FILTER (WHERE lt.Name = 'Linked') AS LinkedCount,
+        COUNT(DISTINCT pl.RelatedPostId) FILTER (WHERE lt.Name = 'Duplicate') AS DuplicateCount
+    FROM PostLinks pl
+    JOIN LinkTypes lt ON lt.Id = pl.LinkTypeId
+    GROUP BY pl.PostId
+),
+PostCloseReasons AS (
+    SELECT
+        ph.PostId,
+        crt.Name AS CloseReason,
+        ph.CreationDate AS CloseDate
+    FROM PostHistory ph
+    JOIN PostHistoryTypes pht ON pht.Id = ph.PostHistoryTypeId AND pht.Name = 'Post Closed'
+    LEFT JOIN CloseReasonTypes crt ON crt.Id = CAST(ph.Comment AS integer)
+    WHERE ph.PostId IN (SELECT Id FROM Posts WHERE PostTypeId = 1)
+),
+AggregatedUserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionsCount,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswersCount,
+        COUNT(DISTINCT c.Id) AS CommentsCount,
+        COUNT(DISTINCT ph.Id) FILTER (WHERE ph.PostHistoryTypeId IN (10,11)) AS CloseReopenEvents,
+        MAX(p.CreationDate) AS LastPostDate
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Comments c ON c.UserId = u.Id
+    LEFT JOIN PostHistory ph ON ph.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName
+)
+SELECT
+    tu.Class AS BadgeClass,
+    tu.RankInClass,
+    tu.DisplayName,
+    tu.Reputation,
+    tu.Location,
+    tu.BadgeCount,
+    qa.QuestionId,
+    qa.Title,
+    qa.QuestionCreation,
+    qa.QuestionScore,
+    qa.ViewCount,
+    qa.Tags,
+    qa.AnswerId,
+    qa.AnswerScore,
+    qa.AnswerCreation,
+    qa.AnswerOwner,
+    qa.IsAcceptedAnswer,
+    qa.QuestionComments,
+    qa.AnswerComments,
+    pls.LinkedCount,
+    pls.DuplicateCount,
+    pcr.CloseReason,
+    pcr.CloseDate,
+    aua.QuestionsCount,
+    aua.AnswersCount,
+    aua.CommentsCount,
+    aua.CloseReopenEvents,
+    aua.LastPostDate,
+    rh.Level AS TagHierarchyLevel,
+    array_to_string(rh.Path, ' > ') AS TagHierarchyPath,
+    LENGTH(COALESCE(qa.Title, '')) AS TitleLength,
+    CASE
+        WHEN qa.ViewCount > 10000 THEN 'High Traffic'
+        WHEN qa.ViewCount BETWEEN 1000 AND 10000 THEN 'Medium Traffic'
+        ELSE 'Low Traffic'
+    END AS TrafficCategory,
+    CASE
+        WHEN qa.AnswerScore IS NULL THEN 'No Answers'
+        WHEN qa.IsAcceptedAnswer = 1 THEN 'Accepted Answer Present'
+        ELSE 'Answers Present, No Accepted'
+    END AS AnswerStatus,
+    CONCAT_WS(' | ',
+        'User: ', COALESCE(tu.DisplayName, 'Unknown'),
+        'Reputation: ', CAST(tu.Reputation AS varchar),
+        'Badges(G/S/B): ', COALESCE(
+            (SELECT STRING_AGG(CAST(Class AS varchar) || ':' || CAST(BadgeCount AS varchar), ', ')
+             FROM UserBadgeCounts ubc2 WHERE ubc2.UserId = tu.Id), 'None')
+    ) AS UserSummary
+FROM TopUsers tu
+LEFT JOIN QuestionAnswerStats qa ON qa.AnswerOwner = tu.Id AND qa.AnswerRank = 1
+LEFT JOIN PostLinkSummary pls ON pls.PostId = qa.QuestionId
+LEFT JOIN PostCloseReasons pcr ON pcr.PostId = qa.QuestionId
+LEFT JOIN AggregatedUserActivity aua ON aua.UserId = tu.Id
+LEFT JOIN RecursiveTagHierarchy rh ON rh.TagName = ANY(string_to_array(SUBSTRING(qa.Tags FROM 2 FOR CHAR_LENGTH(qa.Tags) - 2), '><'))
+WHERE tu.RankInClass <= 5
+ORDER BY tu.Class, tu.RankInClass, qa.QuestionCreation DESC
+LIMIT 100;

@@ -1,0 +1,183 @@
+with RecursiveTagCounts as (
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        coalesce(p.AnswerCount,0) as AnswerCount,
+        coalesce(p.ViewCount,0) as ViewCount,
+        row_number() over (order by t.Count desc, t.TagName) as TagRank
+    from Tags t
+    left join Posts p on p.Id = t.ExcerptPostId and p.PostTypeId = 1
+    where t.TagName is not null
+),
+UserBadgeStats as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(case when b.Class = 1 then 1 end) as GoldBadges,
+        count(case when b.Class = 2 then 1 end) as SilverBadges,
+        count(case when b.Class = 3 then 1 end) as BronzeBadges,
+        sum(case when b.TagBased = true then 1 else 0 end) as TagBasedBadges,
+        max(b.Date) as LastBadgeDate
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.DisplayName
+),
+PostActivityWindow as (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        p.Title,
+        p.AcceptedAnswerId,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.ClosedDate,
+        row_number() over (partition by p.OwnerUserId order by p.CreationDate desc) as RecentPostRank,
+        count(*) over (partition by p.OwnerUserId) as TotalPostsByUser
+    from Posts p
+    where p.PostTypeId in (1,2)
+),
+PostWithVotes as (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        p.Title,
+        p.AcceptedAnswerId,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.ClosedDate,
+        coalesce(v.UpVotes,0) as UpVotes,
+        coalesce(v.DownVotes,0) as DownVotes
+    from Posts p
+    left join (
+        select
+            PostId,
+            sum(case when VoteTypeId = 2 then 1 else 0 end) as UpVotes,
+            sum(case when VoteTypeId = 3 then 1 else 0 end) as DownVotes
+        from Votes
+        group by PostId
+    ) v on v.PostId = p.Id
+),
+CorrelatedAnswers as (
+    select
+        q.Id as QuestionId,
+        q.Title as QuestionTitle,
+        a.Id as AnswerId,
+        a.Score as AnswerScore,
+        a.CreationDate as AnswerCreationDate,
+        a.OwnerUserId as AnswerOwnerUserId,
+        u.DisplayName as AnswerOwnerName,
+        row_number() over (partition by q.Id order by a.Score desc, a.CreationDate asc) as AnswerRank
+    from Posts q
+    left join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+    left join Users u on u.Id = a.OwnerUserId
+    where q.PostTypeId = 1
+),
+ClosedQuestionsWithReasons as (
+    select
+        ph.PostId,
+        p.Title,
+        p.CreationDate,
+        p.ClosedDate,
+        crt.Name as CloseReason,
+        ph.CreationDate as CloseVoteDate
+    from PostHistory ph
+    join CloseReasonTypes crt on crt.Id = cast(ph.Comment as integer)
+    join Posts p on p.Id = ph.PostId
+    where ph.PostHistoryTypeId = 10 and p.ClosedDate is not null
+),
+DistinctUserLocations as (
+    select distinct
+        Location
+    from Users
+    where Location is not null and length(Location) > 0
+),
+UserActivitySummary as (
+    select
+        u.Id,
+        u.DisplayName,
+        count(distinct p.Id) as TotalPosts,
+        count(distinct c.Id) as TotalComments,
+        count(distinct v.Id) as TotalVotesCast,
+        max(p.CreationDate) as LastPostDate,
+        min(p.CreationDate) as FirstPostDate,
+        case when count(distinct p.Id) > 0 then
+            extract(epoch from (max(p.CreationDate) - min(p.CreationDate))) / 86400.0
+        else null end as ActiveDaysSpan
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Comments c on c.UserId = u.Id
+    left join Votes v on v.UserId = u.Id
+    group by u.Id, u.DisplayName
+)
+select
+    u.Id as UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    u.LastAccessDate,
+    coalesce(ubs.GoldBadges,0) as GoldBadges,
+    coalesce(ubs.SilverBadges,0) as SilverBadges,
+    coalesce(ubs.BronzeBadges,0) as BronzeBadges,
+    coalesce(ubs.TagBasedBadges,0) as TagBasedBadges,
+    uas.TotalPosts,
+    uas.TotalComments,
+    uas.TotalVotesCast,
+    uas.ActiveDaysSpan,
+    pt.PostTypeName,
+    p.Id as PostId,
+    p.Title as PostTitle,
+    p.Score as PostScore,
+    p.ViewCount as PostViews,
+    p.Tags as PostTags,
+    p.AcceptedAnswerId,
+    p.AnswerCount,
+    p.CommentCount,
+    p.FavoriteCount,
+    p.ClosedDate,
+    p.UpVotes,
+    p.DownVotes,
+    ca.AnswerId,
+    ca.AnswerScore,
+    ca.AnswerCreationDate,
+    ca.AnswerOwnerUserId,
+    ca.AnswerOwnerName,
+    cq.CloseReason,
+    cq.CloseVoteDate,
+    rtc.TagName,
+    rtc.Count as TagUsageCount,
+    rtc.AnswerCount as TagAnswerCount,
+    rtc.ViewCount as TagViewCount,
+    rtc.TagRank,
+    dul.Location as UserLocation
+from Users u
+left join UserBadgeStats ubs on ubs.UserId = u.Id
+left join UserActivitySummary uas on uas.Id = u.Id
+left join Posts p on p.OwnerUserId = u.Id and p.PostTypeId = 1
+left join PostTypes pt on pt.Id = p.PostTypeId
+left join CorrelatedAnswers ca on ca.QuestionId = p.Id and ca.AnswerRank = 1
+left join ClosedQuestionsWithReasons cq on cq.PostId = p.Id
+left join LATERAL (
+    select t.TagName, t.Count, t.AnswerCount, t.ViewCount, t.TagRank
+    from RecursiveTagCounts t
+    where p.Tags like ('%' || '<' || t.TagName || '>' || '%')
+    order by t.Count desc limit 1
+) rtc on true
+left join DistinctUserLocations dul on dul.Location = u.Location
+where u.Reputation > 1000
+  and (p.Score > 10 or p.ViewCount > 1000)
+  and (p.ClosedDate is null or cq.CloseReason is not null)
+order by u.Reputation desc, p.Score desc
+limit 100;

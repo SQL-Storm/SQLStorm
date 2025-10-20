@@ -1,0 +1,153 @@
+WITH
+user_base AS (
+  SELECT u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate,
+    row_number() OVER (ORDER BY u.Reputation DESC NULLS LAST, u.Id) AS user_rank
+  FROM Users u
+  WHERE u.Reputation IS NOT NULL
+  ORDER BY u.Reputation DESC
+  LIMIT 200
+),
+posts_agg AS (
+  SELECT p.OwnerUserId AS UserId,
+    SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS questions,
+    SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS answers,
+    AVG(p.Score) FILTER (WHERE p.Score IS NOT NULL) AS avg_score,
+    COUNT(*) AS total_posts,
+    SUM(COALESCE(p.ViewCount,0)) AS total_views,
+    MAX(p.LastActivityDate) AS last_activity
+  FROM Posts p
+  WHERE p.OwnerUserId IS NOT NULL
+  GROUP BY p.OwnerUserId
+),
+votes_agg AS (
+  SELECT p.OwnerUserId AS UserId,
+    SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 WHEN v.VoteTypeId = 3 THEN -1 ELSE 0 END) AS vote_score_net,
+    SUM(CASE WHEN v.VoteTypeId = 5 THEN 1 ELSE 0 END) AS favorites
+  FROM Votes v
+  JOIN Posts p ON p.Id = v.PostId
+  GROUP BY p.OwnerUserId
+),
+comments_agg AS (
+  SELECT p.OwnerUserId AS UserId, COUNT(c.Id) AS comments_on_posts, MAX(c.CreationDate) AS last_comment_date
+  FROM Comments c
+  JOIN Posts p ON p.Id = c.PostId
+  GROUP BY p.OwnerUserId
+),
+tags_exploded AS (
+  SELECT p.OwnerUserId AS UserId,
+    lower(trim(t.tag)) AS tag
+  FROM Posts p
+  CROSS JOIN LATERAL (
+    SELECT unnest(string_to_array(substring(p.Tags FROM 2 FOR (char_length(p.Tags)-2)), '><')) AS tag
+  ) t
+  WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL AND p.Tags <> ''
+),
+tag_counts AS (
+  SELECT te.UserId, te.tag, count(*) AS cnt,
+    row_number() OVER (PARTITION BY te.UserId ORDER BY count(*) DESC, te.tag) AS rn
+  FROM tags_exploded te
+  GROUP BY te.UserId, te.tag
+),
+top_tag_per_user AS (
+  SELECT tc.UserId, tc.tag AS top_tag, tc.cnt AS top_tag_count
+  FROM tag_counts tc
+  WHERE tc.rn = 1
+),
+dup_links_out AS (
+  SELECT p_out.OwnerUserId AS UserId,
+    COUNT(CASE WHEN pl.LinkTypeId = 3 THEN 1 END) AS outgoing_duplicates
+  FROM PostLinks pl
+  JOIN Posts p_out ON p_out.Id = pl.PostId
+  GROUP BY p_out.OwnerUserId
+),
+dup_links_in AS (
+  SELECT p_in.OwnerUserId AS UserId,
+    COUNT(CASE WHEN pl.LinkTypeId = 3 THEN 1 END) AS incoming_duplicates
+  FROM PostLinks pl
+  JOIN Posts p_in ON p_in.Id = pl.RelatedPostId
+  GROUP BY p_in.OwnerUserId
+),
+dup_links AS (
+  SELECT COALESCE(a.UserId,b.UserId) AS UserId,
+    COALESCE(a.outgoing_duplicates,0) AS outgoing_duplicates,
+    COALESCE(b.incoming_duplicates,0) AS incoming_duplicates
+  FROM dup_links_out a
+  FULL JOIN dup_links_in b ON a.UserId = b.UserId
+),
+history_counts AS (
+  SELECT ph.UserId,
+    SUM(CASE WHEN ph.PostHistoryTypeId IN (10,11,12,13) THEN 1 ELSE 0 END) AS close_reopen_history,
+    SUM(CASE WHEN ph.PostHistoryTypeId = 52 THEN 1 ELSE 0 END) AS became_hot
+  FROM PostHistory ph
+  GROUP BY ph.UserId
+)
+SELECT
+  ub.user_rank,
+  ub.Id AS user_id,
+  ub.DisplayName,
+  ub.Reputation,
+  COALESCE(pa.questions,0) AS question_count,
+  COALESCE(pa.answers,0) AS answer_count,
+  COALESCE(pa.total_posts,0) AS total_posts,
+  CAST(COALESCE(pa.avg_score,0) AS numeric(10,3)) AS avg_post_score,
+  CAST((
+    SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY p2.Score)
+    FROM Posts p2
+    WHERE p2.OwnerUserId = ub.Id AND p2.Score IS NOT NULL
+  ) AS numeric(10,3)) AS median_post_score,
+  COALESCE(va.vote_score_net,0) AS vote_net_on_posts,
+  COALESCE(va.favorites,0) AS favorites_received,
+  COALESCE(ca.comments_on_posts,0) AS comments_on_posts,
+  COALESCE(tt.top_tag, '<<none>>') AS top_tag,
+  COALESCE(tt.top_tag_count,0) AS top_tag_count,
+  COALESCE(dl.outgoing_duplicates,0) AS outgoing_duplicates_count,
+  COALESCE(dl.incoming_duplicates,0) AS incoming_duplicates_count,
+  COALESCE(hc.close_reopen_history,0) AS close_reopen_history_events,
+  COALESCE(hc.became_hot,0) AS hot_events,
+  COALESCE(
+    (SELECT left(c.Text,200) FROM Comments c WHERE c.PostId IN (SELECT p3.Id FROM Posts p3 WHERE p3.OwnerUserId = ub.Id) ORDER BY c.CreationDate DESC LIMIT 1),
+    (SELECT left(c2.Text,200) FROM Comments c2 WHERE c2.UserId = ub.Id ORDER BY c2.CreationDate DESC LIMIT 1),
+    '(no comments)'
+  ) AS last_comment_snippet,
+  (
+    (COALESCE(pa.questions,0) > 50 AND COALESCE(pa.answers,0) > 200 AND COALESCE(va.vote_score_net,0) > 1000)
+    OR (COALESCE(tt.top_tag_count,0) > 10 AND COALESCE(hc.became_hot,0) > 0)
+  ) AS power_user_flag,
+  (CAST(COALESCE(pa.total_posts,0) AS double precision) * GREATEST(EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - COALESCE(ub.CreationDate, CAST('2024-10-01 12:34:56' AS timestamp))))/86400,1)) /
+   NULLIF(LOG(2 + GREATEST(ub.Reputation,1)),0) AS activity_growth_index,
+  SUM(COALESCE(pa.answers,0)) OVER (ORDER BY ub.Reputation DESC ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS cumulative_answers_by_reputation,
+  DENSE_RANK() OVER (ORDER BY COALESCE(pa.answers,0) DESC) AS answers_rank,
+  (left(COALESCE(ub.DisplayName,'<anon>'),15) || '|' || coalesce(tt.top_tag,'none') || '|' ||
+   CASE WHEN COALESCE(pa.questions,0)=0 THEN 'Q0' ELSE 'Q' || CAST(COALESCE(pa.questions,0) AS text) END ||
+   '-' || CASE WHEN COALESCE(pa.answers,0)=0 THEN 'A0' ELSE 'A' || CAST(COALESCE(pa.answers,0) AS text) END) AS profile_token
+FROM user_base ub
+LEFT JOIN posts_agg pa ON pa.UserId = ub.Id
+LEFT JOIN votes_agg va ON va.UserId = ub.Id
+LEFT JOIN comments_agg ca ON ca.UserId = ub.Id
+LEFT JOIN top_tag_per_user tt ON tt.UserId = ub.Id
+LEFT JOIN dup_links dl ON dl.UserId = ub.Id
+LEFT JOIN history_counts hc ON hc.UserId = ub.Id
+WHERE (COALESCE(pa.total_posts,0) > 0 OR COALESCE(va.favorites,0) > 0 OR COALESCE(ca.comments_on_posts,0) > 0)
+  AND (ub.LastAccessDate > CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '2 years' OR COALESCE(hc.became_hot,0) > 0)
+GROUP BY
+  ub.user_rank,
+  ub.Id,
+  ub.DisplayName,
+  ub.Reputation,
+  pa.questions,
+  pa.answers,
+  pa.total_posts,
+  pa.avg_score,
+  tt.top_tag,
+  tt.top_tag_count,
+  va.vote_score_net,
+  va.favorites,
+  ca.comments_on_posts,
+  dl.outgoing_duplicates,
+  dl.incoming_duplicates,
+  hc.close_reopen_history,
+  hc.became_hot,
+  ub.CreationDate,
+  ub.LastAccessDate
+ORDER BY ub.user_rank
+LIMIT 100;

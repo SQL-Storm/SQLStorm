@@ -1,0 +1,158 @@
+WITH tag_exploded AS (
+  SELECT
+    p.Id AS QuestionId,
+    trim(t) AS Tag
+  FROM Posts p
+  CROSS JOIN LATERAL (
+    SELECT unnest(string_to_array(substring(coalesce(p.Tags, ''), 2, greatest(length(coalesce(p.Tags, '')) - 2, 0)), '><')) AS t
+  ) s
+  WHERE p.PostTypeId = 1
+),
+user_activity AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    count(distinct p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionsPosted,
+    count(distinct p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswersPosted,
+    coalesce(sum(case WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END), 0) AS UpVotesGiven,
+    coalesce(sum(case WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END), 0) AS DownVotesGiven,
+    row_number() OVER (ORDER BY u.Reputation DESC NULLS LAST, u.Id) AS RepRank
+  FROM Users u
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+  LEFT JOIN Votes v ON v.UserId = u.Id
+  GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+question_stats AS (
+  SELECT
+    q.Id,
+    q.Title,
+    q.OwnerUserId,
+    q.CreationDate,
+    q.Score,
+    q.ViewCount,
+    q.AnswerCount,
+    q.AcceptedAnswerId,
+    coalesce((SELECT count(*) FROM Comments c WHERE c.PostId = q.Id), 0) AS CommentCount,
+    coalesce((SELECT sum(case WHEN v.VoteTypeId = 2 THEN 1 WHEN v.VoteTypeId = 3 THEN -1 ELSE 0 END) FROM Votes v WHERE v.PostId = q.Id), 0) AS VoteScore,
+    (SELECT count(*) FROM PostLinks pl WHERE pl.PostId = q.Id AND pl.LinkTypeId = 3) AS DuplicateCount,
+    (SELECT min(ph.CreationDate) FROM PostHistory ph WHERE ph.PostId = q.Id AND ph.PostHistoryTypeId IN (10,11)) AS FirstCloseOrReopen,
+    (SELECT array_agg(distinct uh.Tag ORDER BY uh.Tag) FROM tag_exploded uh WHERE uh.QuestionId = q.Id) AS TagsArray
+  FROM Posts q
+  WHERE q.PostTypeId = 1
+),
+answers_augmented AS (
+  SELECT
+    a.Id,
+    a.ParentId AS QuestionId,
+    a.OwnerUserId AS AnswererId,
+    a.CreationDate,
+    a.Score,
+    a.Body,
+    a.CommentCount,
+    case WHEN a.Id = q.AcceptedAnswerId THEN true ELSE false END AS IsAccepted,
+    dense_rank() OVER (PARTITION BY a.ParentId ORDER BY a.Score DESC, a.CreationDate ASC) AS ScoreRankWithinQuestion,
+    rank() OVER (PARTITION BY a.ParentId ORDER BY a.CreationDate ASC) AS ChronoRankWithinQuestion,
+    coalesce((SELECT count(*) FROM Votes v WHERE v.PostId = a.Id AND v.VoteTypeId = 2), 0) AS UpvoteCount,
+    coalesce((SELECT count(*) FROM Votes v WHERE v.PostId = a.Id AND v.VoteTypeId = 3), 0) AS DownvoteCount,
+    greatest(coalesce(a.Score, 0) + coalesce((SELECT sum(case WHEN v.VoteTypeId = 2 THEN 1 WHEN v.VoteTypeId = 3 THEN -1 ELSE 0 END) FROM Votes v WHERE v.PostId = a.Id), 0), 0) AS AdjustedScore
+  FROM Posts a
+  LEFT JOIN Posts q ON q.Id = a.ParentId
+  WHERE a.PostTypeId = 2
+),
+top_users_per_tag AS (
+  SELECT
+    te.Tag,
+    ua.Id AS UserId,
+    ua.DisplayName,
+    sum(case WHEN p.PostTypeId = 1 THEN 1 WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS Contributions,
+    sum(case WHEN p.PostTypeId = 1 THEN coalesce(p.Score, 0) ELSE 0 END) AS QuestionScoreSum,
+    sum(case WHEN p.PostTypeId = 2 THEN coalesce(p.Score, 0) ELSE 0 END) AS AnswerScoreSum,
+    dense_rank() OVER (PARTITION BY te.Tag ORDER BY sum(case WHEN p.PostTypeId = 2 THEN coalesce(p.Score, 0) ELSE 0 END) DESC, ua.Reputation DESC) AS TagRank
+  FROM tag_exploded te
+  JOIN Posts p ON p.Id = te.QuestionId
+  LEFT JOIN Posts a ON a.ParentId = p.Id
+  LEFT JOIN Users ua ON (ua.Id = p.OwnerUserId OR ua.Id = a.OwnerUserId)
+  WHERE ua.Id IS NOT NULL
+  GROUP BY te.Tag, ua.Id, ua.DisplayName, ua.Reputation
+),
+recent_activity AS (
+  SELECT
+    p.Id,
+    p.PostTypeId,
+    p.OwnerUserId,
+    p.CreationDate,
+    p.LastActivityDate,
+    json_build_object(
+      'age_days', extract(epoch FROM (timestamp '2024-10-01 12:34:56' - p.CreationDate)) / 86400,
+      'last_active_days', extract(epoch FROM (timestamp '2024-10-01 12:34:56' - p.LastActivityDate)) / 86400,
+      'has_owner', case WHEN p.OwnerUserId IS NULL THEN false ELSE true END
+    ) AS MetaBlob
+  FROM Posts p
+  WHERE p.CreationDate > timestamp '2024-10-01 12:34:56' - interval '365 days'
+),
+complex_search AS (
+  SELECT
+    qs.Id AS QuestionId,
+    qs.Title,
+    qs.Score,
+    qs.ViewCount,
+    qs.AnswerCount,
+    qs.AcceptedAnswerId,
+    coalesce(array_to_string(qs.TagsArray, ','), '') AS Tags,
+    ua.DisplayName AS OwnerName,
+    ua.Reputation AS OwnerRep,
+    (SELECT count(*) FROM answers_augmented aa WHERE aa.QuestionId = qs.Id AND aa.IsAccepted) AS AcceptedCount,
+    (SELECT count(*) FROM answers_augmented aa WHERE aa.QuestionId = qs.Id AND aa.ScoreRankWithinQuestion = 1) AS HasTopAnswer,
+    (SELECT json_agg(row_to_json(x)) FROM (
+       SELECT a.Id AS AnswerId, a.AnswererId, a.IsAccepted, a.Score, a.AdjustedScore
+       FROM answers_augmented a WHERE a.QuestionId = qs.Id ORDER BY a.AdjustedScore DESC NULLS LAST LIMIT 5
+    ) x) AS TopAnswersSummary
+  FROM question_stats qs
+  LEFT JOIN Users ua ON ua.Id = qs.OwnerUserId
+  WHERE (qs.Score > 3 OR qs.ViewCount > 1000 OR qs.AnswerCount > 5)
+    AND (qs.FirstCloseOrReopen IS NULL OR qs.FirstCloseOrReopen > qs.CreationDate + interval '7 days')
+)
+SELECT
+  cs.QuestionId,
+  left(cs.Title, 140) AS SnippetTitle,
+  cs.Score,
+  cs.ViewCount,
+  cs.AnswerCount,
+  cs.AcceptedCount,
+  cs.HasTopAnswer,
+  cs.Tags,
+  cs.OwnerName,
+  cs.OwnerRep,
+  (SELECT count(*) FROM Comments c WHERE c.PostId = cs.QuestionId AND c.CreationDate > (timestamp 'epoch' + (cs.QuestionId::bigint || ' seconds')::interval) - interval '100 years') AS RecentCommentsHack,
+  (SELECT string_agg(distinct t.Tag, ',') FROM tag_exploded t WHERE t.QuestionId = cs.QuestionId) AS TagList,
+  (SELECT json_agg(row_to_json(u)) FROM (
+     SELECT ua.UserId, ua.DisplayName, ua.Reputation, ua.QuestionsPosted, ua.AnswersPosted
+     FROM user_activity ua
+     WHERE ua.RepRank <= 50
+     ORDER BY ua.Reputation DESC NULLS LAST LIMIT 5
+  ) u) AS TopSiteUsersSnapshot,
+  cs.TopAnswersSummary,
+  (SELECT tu.DisplayName FROM top_users_per_tag tu WHERE tu.Tag = split_part(cs.Tags, ',', 1) AND tu.TagRank = 1 LIMIT 1) AS TopContributorForFirstTag,
+  (
+    SELECT
+      (sum(coalesce(a.Score, 0)) + count(distinct v.Id) * 2 - coalesce(min(u.Reputation), 0)) /
+      nullif(greatest(1, (SELECT count(*) FROM answers_augmented aa WHERE aa.QuestionId = cs.QuestionId)), 0)::numeric
+    FROM Posts p
+    LEFT JOIN answers_augmented a ON a.QuestionId = p.Id
+    LEFT JOIN Votes v ON v.PostId = p.Id AND v.CreationDate > timestamp '2024-10-01 12:34:56' - interval '30 days'
+    LEFT JOIN Users u ON u.Id = p.OwnerUserId
+    WHERE p.Id = cs.QuestionId
+    GROUP BY p.Id
+  ) AS HotnessScore,
+  (
+    SELECT array_agg(distinct id) FROM (
+      SELECT aa.AnswererId AS id FROM answers_augmented aa WHERE aa.QuestionId = cs.QuestionId
+      UNION
+      SELECT v.UserId AS id FROM Votes v WHERE v.PostId = cs.QuestionId AND v.UserId IS NOT NULL
+    ) s
+  ) AS Participants,
+  timestamp '2024-10-01 12:34:56' AS SnapshotTaken
+FROM complex_search cs
+ORDER BY HotnessScore DESC NULLS LAST, cs.ViewCount DESC
+LIMIT 100;

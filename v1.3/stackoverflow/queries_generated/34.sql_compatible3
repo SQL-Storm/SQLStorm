@@ -1,0 +1,201 @@
+with
+user_stats as (
+  select
+    u.id,
+    u.displayname,
+    u.reputation,
+    u.creationdate,
+    u.lastaccessdate,
+    greatest(1, nullif(u.views,0)) as views_nonzero,
+    coalesce(u.upvotes,0) as upvotes,
+    coalesce(u.downvotes,0) as downvotes,
+    (coalesce(u.upvotes,0) - coalesce(u.downvotes,0)) as vote_balance,
+    rank() over (order by u.reputation desc, u.lastaccessdate desc) as rep_rank,
+    ntile(10) over (order by u.reputation) as rep_decile,
+    (extract(epoch from cast('2024-10-01 12:34:56' as timestamp) - u.lastaccessdate) / 86400.0) as days_since_last,
+    (CAST(u.reputation AS double precision) / (1 + (extract(epoch from cast('2024-10-01 12:34:56' as timestamp) - u.lastaccessdate)/86400.0))) as activity_index
+  from users u
+),
+question_base as (
+  select
+    p.id,
+    p.title,
+    p.owneruserid,
+    p.creationdate,
+    p.lastactivitydate,
+    p.score,
+    p.viewcount,
+    p.answercount,
+    p.favoritecount,
+    p.tags,
+    case
+      when p.tags is null then cast(array[] as varchar[])
+      else string_to_array(substring(p.tags from 2 for char_length(p.tags)-2), '><')
+    end as tag_array,
+    array_to_string(
+      (
+        select array_agg(t order by t)
+        from unnest(
+          case when p.tags is null then cast(array[] as varchar[]) else string_to_array(substring(p.tags from 2 for char_length(p.tags)-2), '><') end
+        ) t
+      ), ','
+    ) as tag_fingerprint,
+    cardinality(case when p.tags is null then cast(array[] as varchar[]) else string_to_array(substring(p.tags from 2 for char_length(p.tags)-2), '><') end) as tag_count,
+    case when p.viewcount is null or p.viewcount = 0 then null else (CAST(p.score AS double precision) / p.viewcount) end as score_per_view,
+    (cast('2024-10-01 12:34:56' as timestamp) - p.lastactivitydate) > interval '365 days' as is_stale
+  from posts p
+  where p.posttypeid = 1
+),
+answer_aggregates as (
+  select
+    q.id as question_id,
+    q.title,
+    q.owneruserid,
+    q.creationdate as q_creation,
+    q.score as q_score,
+    q.viewcount as q_views,
+    q.answercount,
+    q.tag_array,
+    q.tag_fingerprint,
+    q.tag_count,
+    q.is_stale,
+    q.score_per_view,
+    (select count(*) from posts a where a.parentid = q.id and a.posttypeid = 2) as computed_answer_count,
+    (select min(a.creationdate) from posts a where a.parentid = q.id and a.posttypeid = 2) as first_answer_date,
+    (select max(a.creationdate) from posts a where a.parentid = q.id and a.posttypeid = 2) as last_answer_date,
+    (select avg(extract(epoch from a.creationdate - q.creation)) from posts a where a.parentid = q.id and a.posttypeid = 2) as avg_answer_latency_seconds,
+    (
+      select coalesce(array_agg(r_row order by CAST(r_row->>'score' AS numeric) desc), cast(array[] as jsonb[]))
+      from (
+        select to_jsonb(a.*) - array['body'] || jsonb_build_object('has_body', (a.body is not null)) as r_row
+        from posts a
+        where a.parentid = q.id and a.posttypeid = 2
+        order by a.score desc
+        limit 3
+      ) t
+    ) as top_answers
+  from question_base q
+),
+recent_question_windows as (
+  select
+    a.*,
+    avg(a.q_score) over (partition by a.owneruserid order by a.q_creation rows between 4 preceding and current row) as rolling_avg_score_owner_5,
+    percent_rank() over (partition by coalesce(a.tag_array[1], '') order by a.q_views) as viewcount_percentile_by_primary_tag,
+    dense_rank() over (order by (select us.activity_index from user_stats us where us.id = a.owneruserid) desc) as owner_activity_dense_rank
+  from answer_aggregates a
+  where a.q_creation > cast('2024-10-01 12:34:56' as timestamp) - interval '3 years'
+),
+duplicate_graph as (
+  select pl.postid as src, pl.relatedpostid as dst, pl.creationdate
+  from postlinks pl
+  where pl.linktypeid = 3
+  union
+  select dg.src, pl.relatedpostid, pl.creationdate
+  from duplicate_graph dg
+  join postlinks pl on pl.postid = dg.dst and pl.linktypeid = 3
+  where pl.relatedpostid <> dg.src and dg.src <> pl.relatedpostid
+),
+duplicate_clusters as (
+  select src, array_agg(distinct dst) as duplicates
+  from duplicate_graph
+  group by src
+),
+final_set as (
+  select
+    rqw.*,
+    us.displayname as owner_name,
+    coalesce(vote_summary.upvotes,0) as question_upvotes,
+    coalesce(vote_summary.downvotes,0) as question_downvotes,
+    coalesce(comment_counts.c_count,0) as question_comment_count,
+    coalesce(badge_counts.badge_count,0) as owner_badge_count,
+    dc.duplicates,
+    (
+      coalesce(rqw.q_views,0) * 0.0005
+      + coalesce(rqw.q_score,0) * 1.5
+      + coalesce(rqw.answercount,0) * 2.0
+      + coalesce(rqw.avg_answer_latency_seconds, 86400) / 86400.0 * -0.5
+      + CASE WHEN rqw.q_creation > cast('2024-10-01 12:34:56' as timestamp) - interval '7 days' THEN 5 ELSE 0 END
+      + coalesce((select activity_index from user_stats where id = rqw.owneruserid), 0) * 0.001
+      + coalesce(CAST(rqw.q_score AS double precision) / NULLIF(rqw.q_views,0),0) * 10
+    ) as hotness_score,
+    owner_top_tags.top_tags,
+    (
+      select count(*) from (
+        select unnest(coalesce(rqw.tag_array, cast(array[] as varchar[]))) intersect select unnest(coalesce(owner_top_tags.top_tags, cast(array[] as varchar[])))
+      ) s
+    ) as tag_overlap_count
+  from recent_question_windows rqw
+  left join user_stats us on us.id = rqw.owneruserid
+  left join lateral (
+    select sum(case when v.votetypeid = 2 then 1 else 0 end) as upvotes, sum(case when v.votetypeid = 3 then 1 else 0 end) as downvotes
+    from votes v
+    where v.postid = rqw.id
+  ) vote_summary on true
+  left join lateral (
+    select count(*) as c_count from comments c where c.postid = rqw.id
+  ) comment_counts on true
+  left join lateral (
+    select array_agg(t.tagname order by t.count desc) filter (where t.tagname is not null) as top_tags
+    from tags t
+    where t.tagname = any (rqw.tag_array)
+  ) owner_top_tags on true
+  left join lateral (
+    select count(*) as badge_count from badges b where b.userid = rqw.owneruserid
+  ) badge_counts on true
+  left join duplicate_clusters dc on dc.src = rqw.id
+)
+select
+  fs.id as question_id,
+  fs.title,
+  fs.owneruserid,
+  fs.owner_name,
+  us.rep_rank,
+  us.rep_decile,
+  fs.q_creation,
+  fs.q_score,
+  fs.q_views,
+  fs.answercount,
+  fs.computed_answer_count,
+  fs.first_answer_date,
+  fs.last_answer_date,
+  round(coalesce(fs.avg_answer_latency_seconds,0)/3600.0,2) as avg_answer_latency_hours,
+  fs.top_answers,
+  fs.tag_fingerprint,
+  fs.tag_count,
+  fs.question_upvotes,
+  fs.question_downvotes,
+  fs.question_comment_count,
+  fs.owner_badge_count,
+  fs.hotness_score,
+  fs.viewcount_percentile_by_primary_tag,
+  fs.owner_activity_dense_rank,
+  fs.is_stale,
+  fs.duplicates,
+  fs.owner_top_tags,
+  fs.tag_overlap_count,
+  case
+    when fs.is_stale and fs.hotness_score < 1 then 'cold_stale'
+    when fs.is_stale and fs.hotness_score >= 1 then 'resurrected'
+    when fs.tag_count > 3 and fs.viewcount_percentile_by_primary_tag > 0.75 then concat('niche_hot:', left(coalesce(fs.tag_fingerprint,''), 120))
+    when fs.question_upvotes > fs.question_downvotes and fs.hotness_score > 10 then concat('popular_', (regexp_replace(lower(fs.title), '[^a-z0-9]+', '_', 'g')) )
+    else 'normal'
+  end as qualitative_bucket,
+  substring(
+    coalesce(fs.title,
+      (select substring(a.body,1,140) from posts a where a.parentid = fs.id and a.posttypeid = 2 order by a.score desc, a.creationdate asc limit 1)
+    ) for 140
+  ) as preview_snippet
+from final_set fs
+left join user_stats us on us.id = fs.owneruserid
+where
+  (fs.hotness_score is not null and fs.hotness_score > (
+     select percentile_cont(0.6) within group (order by hotness_score) from final_set
+   ))
+  and (fs.tag_count is null or fs.tag_count >= 1)
+  and (
+    exists (select 1 from badges b where b.userid = fs.owneruserid and b.class = 1)
+    or fs.owner_badge_count >= 5
+    or fs.owner_activity_dense_rank <= 50
+  )
+order by fs.hotness_score desc nulls last
+limit 200;

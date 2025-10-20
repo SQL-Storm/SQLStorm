@@ -1,0 +1,156 @@
+-- {"query": "756.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 0.7, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1543} 
+with RecursiveUserActivity as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionCount,
+        count(distinct p.Id) filter (where p.PostTypeId = 2) as AnswerCount,
+        count(distinct c.Id) as CommentCount,
+        count(distinct b.Id) filter (where b.Class = 1) as GoldBadges,
+        count(distinct b.Id) filter (where b.Class = 2) as SilverBadges,
+        count(distinct b.Id) filter (where b.Class = 3) as BronzeBadges,
+        sum(v.VoteTypeId = 2::bit)::int as UpVotesGiven,
+        sum(v.VoteTypeId = 3::bit)::int as DownVotesGiven
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Comments c on c.UserId = u.Id
+    left join Badges b on b.UserId = u.Id
+    left join Votes v on v.UserId = u.Id
+    group by u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate
+), LatestPostActivity as (
+    select
+        p.Id as PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Title,
+        p.Tags,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.AcceptedAnswerId,
+        p.LastActivityDate,
+        p.ClosedDate,
+        row_number() over (partition by p.OwnerUserId order by p.LastActivityDate desc nulls last) as rn
+    from Posts p
+    where p.PostTypeId in (1, 2)
+), TopQuestionsWithAnswers as (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        q.OwnerUserId,
+        q.CreationDate as QuestionCreationDate,
+        q.Tags,
+        q.Score as QuestionScore,
+        q.ViewCount,
+        a.Id as AnswerId,
+        a.OwnerUserId as AnswerOwnerUserId,
+        a.CreationDate as AnswerCreationDate,
+        a.Score as AnswerScore,
+        a.ParentId,
+        a.AcceptedAnswerId
+    from Posts q
+    left join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+    where q.PostTypeId = 1
+      and q.Score > (
+          select avg(Score) from Posts where PostTypeId = 1
+      )
+), UserBadgeRanks as (
+    select
+        b.UserId,
+        b.Name,
+        b.Class,
+        row_number() over (partition by b.UserId order by b.Class, b.Date desc) as BadgeRank
+    from Badges b
+), QuestionsWithCloseReasons as (
+    select
+        ph.PostId,
+        crt.Name as CloseReasonName,
+        ph.CreationDate as CloseDate
+    from PostHistory ph
+    join CloseReasonTypes crt on crt.Id = cast(ph.Comment as int)
+    where ph.PostHistoryTypeId = 10 -- Post Closed
+), UserReputationRankings as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        rank() over (order by u.Reputation desc) as ReputationRank
+    from Users u
+), DistinctTagUsage as (
+    select
+        unnest(string_to_array(substring(p.Tags from 2 for length(p.Tags) - 2), '><')) as Tag,
+        count(*) as TagCount
+    from Posts p
+    where p.PostTypeId = 1 and p.Tags is not null
+    group by Tag
+), CombinedPostLinks as (
+    select
+        pl.PostId,
+        pl.RelatedPostId,
+        lt.Name as LinkTypeName,
+        p.Title as RelatedPostTitle
+    from PostLinks pl
+    join LinkTypes lt on lt.Id = pl.LinkTypeId
+    join Posts p on p.Id = pl.RelatedPostId
+    where pl.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - interval '1 year'
+), UserActivitySummary as (
+    select
+        rua.UserId,
+        rua.DisplayName,
+        rua.Reputation,
+        rua.QuestionCount,
+        rua.AnswerCount,
+        rua.CommentCount,
+        rua.GoldBadges,
+        rua.SilverBadges,
+        rua.BronzeBadges,
+        rua.UpVotesGiven,
+        rua.DownVotesGiven,
+        max(lpa.LastActivityDate) as MostRecentActivity,
+        min(lpa.CreationDate) as FirstPostDate
+    from RecursiveUserActivity rua
+    left join LatestPostActivity lpa on lpa.OwnerUserId = rua.UserId and lpa.rn = 1
+    group by rua.UserId, rua.DisplayName, rua.Reputation, rua.QuestionCount, rua.AnswerCount, rua.CommentCount,
+             rua.GoldBadges, rua.SilverBadges, rua.BronzeBadges, rua.UpVotesGiven, rua.DownVotesGiven
+)
+select
+    uas.UserId,
+    uas.DisplayName,
+    uas.Reputation,
+    uas.ReputationRank,
+    uas.QuestionCount,
+    uas.AnswerCount,
+    uas.CommentCount,
+    uas.GoldBadges,
+    uas.SilverBadges,
+    uas.BronzeBadges,
+    uas.UpVotesGiven,
+    uas.DownVotesGiven,
+    uas.MostRecentActivity,
+    uas.FirstPostDate,
+    coalesce(qwc.CloseReasonName, 'Open') as PostStatus,
+    qwc.CloseDate,
+    array_agg(distinct dt.Tag order by dt.TagCount desc nulls last) filter (where dt.TagCount > 10) as PopularTagsUsed,
+    string_agg(distinct cpl.LinkTypeName || ':' || coalesce(cpl.RelatedPostTitle, 'N/A'), '; ') as RecentPostLinks,
+    rank() over (order by uas.Reputation desc nulls last) as UserReputationRank
+from UserActivitySummary uas
+left join UserReputationRankings urr on urr.UserId = uas.UserId
+left join QuestionsWithCloseReasons qwc on qwc.PostId in (
+    select p.Id from Posts p where p.OwnerUserId = uas.UserId and p.PostTypeId = 1
+)
+left join DistinctTagUsage dt on dt.Tag = any (
+    select unnest(string_to_array(substring(p.Tags from 2 for length(p.Tags) - 2), '><'))
+    from Posts p where p.OwnerUserId = uas.UserId and p.PostTypeId = 1 limit 1
+)
+left join CombinedPostLinks cpl on cpl.PostId in (
+    select p.Id from Posts p where p.OwnerUserId = uas.UserId limit 5
+)
+group by uas.UserId, uas.DisplayName, uas.Reputation, uas.ReputationRank, uas.QuestionCount, uas.AnswerCount,
+         uas.CommentCount, uas.GoldBadges, uas.SilverBadges, uas.BronzeBadges, uas.UpVotesGiven, uas.DownVotesGiven,
+         uas.MostRecentActivity, uas.FirstPostDate, qwc.CloseReasonName, qwc.CloseDate
+having uas.Reputation > 1000
+order by uas.Reputation desc
+limit 100;

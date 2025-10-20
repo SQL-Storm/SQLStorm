@@ -1,0 +1,171 @@
+WITH RECURSIVE RecursiveTagHierarchy AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        COALESCE(p.OwnerUserId, -1) AS OwnerUserId,
+        p.CreationDate AS TagPostCreationDate,
+        1 AS Level
+    FROM Tags t
+    LEFT JOIN Posts p ON p.Id = t.ExcerptPostId
+    WHERE t.Count > 1000
+
+    UNION ALL
+
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        rh.OwnerUserId,
+        rh.TagPostCreationDate,
+        rh.Level + 1
+    FROM Tags t
+    JOIN Posts p ON p.Id = t.WikiPostId
+    JOIN RecursiveTagHierarchy rh ON rh.OwnerUserId = p.OwnerUserId
+    WHERE t.Count > 1000 AND rh.Level < 3
+),
+UserBadgeAggregates AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(b.Id) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END), 0) AS TotalUpVotes,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END), 0) AS TotalDownVotes,
+        COALESCE(AVG(p.Score), 0) AS AvgPostScore,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC, COUNT(b.Id) FILTER (WHERE b.Class = 1) DESC) AS ReputationRank
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    LEFT JOIN Votes v ON v.UserId = u.Id
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+PostActivityWindow AS (
+    SELECT
+        p.Id,
+        p.PostTypeId,
+        p.Title,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        p.AcceptedAnswerId,
+        COUNT(c.Id) AS CommentCount,
+        MAX(c.CreationDate) AS LastCommentDate,
+        MAX(ph.CreationDate) FILTER (WHERE ph.PostHistoryTypeId IN (10,11)) AS LastCloseReopenDate,
+        AVG(CASE WHEN v.VoteTypeId IN (2,3) THEN v.VoteTypeId END) OVER (PARTITION BY p.Id ORDER BY v.CreationDate ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS AvgRecentVotes,
+        COUNT(DISTINCT pl.RelatedPostId) FILTER (WHERE pl.LinkTypeId = 1) AS LinkedPostsCount,
+        COUNT(DISTINCT pl.RelatedPostId) FILTER (WHERE pl.LinkTypeId = 3) AS DuplicatePostsCount
+    FROM Posts p
+    LEFT JOIN Comments c ON c.PostId = p.Id
+    LEFT JOIN PostHistory ph ON ph.PostId = p.Id
+    LEFT JOIN Votes v ON v.PostId = p.Id
+    LEFT JOIN PostLinks pl ON pl.PostId = p.Id
+    WHERE p.PostTypeId IN (1, 2)
+    GROUP BY p.Id, p.PostTypeId, p.Title, p.OwnerUserId, p.CreationDate, p.Score, p.ViewCount, p.Tags, p.AcceptedAnswerId
+),
+ComplexPostStats AS (
+    SELECT
+        p.Id,
+        p.Title,
+        p.OwnerUserId,
+        u.DisplayName AS OwnerName,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        p.CommentCount,
+        p.LastCommentDate,
+        p.LastCloseReopenDate,
+        p.LinkedPostsCount,
+        p.DuplicatePostsCount,
+        COALESCE((SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 2), 0) AS UpVotes,
+        COALESCE((SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 3), 0) AS DownVotes,
+        CASE 
+            WHEN p.AcceptedAnswerId IS NOT NULL THEN (SELECT Score FROM Posts WHERE Id = p.AcceptedAnswerId)
+            ELSE NULL
+        END AS AcceptedAnswerScore,
+        ROW_NUMBER() OVER (
+            PARTITION BY p.OwnerUserId 
+            ORDER BY p.Score DESC, p.ViewCount DESC, p.CreationDate DESC
+        ) AS PostRankByUser,
+        LEAD(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC) AS NextHigherScore,
+        STRING_AGG(DISTINCT COALESCE(pht.Name, 'Unknown'), ', ') FILTER (WHERE pht.Id IS NOT NULL) OVER (PARTITION BY p.Id) AS PostHistoryTypesInvolved,
+        COALESCE(u.Reputation, 0) AS OwnerReputation,
+        COALESCE(uba.GoldBadges, 0) AS OwnerGoldBadges,
+        COALESCE(uba.SilverBadges, 0) AS OwnerSilverBadges,
+        COALESCE(uba.BronzeBadges, 0) AS OwnerBronzeBadges,
+        uba.ReputationRank AS OwnerReputationRank,
+        p.AvgRecentVotes
+    FROM PostActivityWindow p
+    LEFT JOIN Users u ON u.Id = p.OwnerUserId
+    LEFT JOIN UserBadgeAggregates uba ON uba.UserId = p.OwnerUserId
+    LEFT JOIN LATERAL (
+        SELECT pht_inner.Id, pht_inner.Name
+        FROM PostHistory ph_inner
+        JOIN PostHistoryTypes pht_inner ON pht_inner.Id = ph_inner.PostHistoryTypeId
+        WHERE ph_inner.PostId = p.Id
+        LIMIT 100
+    ) pht ON true
+)
+SELECT
+    cps.Id,
+    cps.Title,
+    cps.OwnerName,
+    cps.CreationDate,
+    cps.Score,
+    cps.ViewCount,
+    cps.Tags,
+    cps.CommentCount,
+    cps.LastCommentDate,
+    cps.LastCloseReopenDate,
+    cps.LinkedPostsCount,
+    cps.DuplicatePostsCount,
+    cps.UpVotes,
+    cps.DownVotes,
+    cps.AcceptedAnswerScore,
+    cps.PostRankByUser,
+    cps.NextHigherScore,
+    cps.PostHistoryTypesInvolved,
+    cps.OwnerReputation,
+    cps.OwnerGoldBadges,
+    cps.OwnerSilverBadges,
+    cps.OwnerBronzeBadges,
+    cps.OwnerReputationRank,
+    ROUND(CAST(cps.AvgRecentVotes AS NUMERIC), 2) AS AvgRecentVotes,
+    rh.Level,
+    rh.TagName,
+    rh.Count AS TagUsageCount,
+    CASE 
+        WHEN rh.TagName IS NULL THEN 'No Tag'
+        WHEN rh.Count > 10000 THEN 'Very Popular'
+        WHEN rh.Count BETWEEN 5000 AND 10000 THEN 'Popular'
+        ELSE 'Moderate'
+    END AS TagPopularityCategory,
+    CASE 
+        WHEN cps.Score > 500 THEN 'High Score'
+        WHEN cps.Score BETWEEN 100 AND 500 THEN 'Medium Score'
+        ELSE 'Low Score'
+    END AS PostScoreCategory,
+    CONCAT(
+        LEFT(cps.Title, 30),
+        CASE WHEN CHAR_LENGTH(cps.Title) > 30 THEN '...' ELSE '' END
+    ) AS ShortTitle,
+    CASE 
+        WHEN cps.LastCloseReopenDate IS NOT NULL THEN 'Closed/Reopened Recently'
+        ELSE 'No Recent Close/Reopen'
+    END AS CloseReopenStatus,
+    CASE
+        WHEN cps.UpVotes > cps.DownVotes THEN 'Mostly Upvoted'
+        WHEN cps.DownVotes > cps.UpVotes THEN 'Mostly Downvoted'
+        ELSE 'Neutral Votes'
+    END AS VoteSentiment
+FROM ComplexPostStats cps
+LEFT JOIN RecursiveTagHierarchy rh ON rh.OwnerUserId = cps.OwnerUserId
+WHERE cps.CreationDate > (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '365 days')
+  AND (cps.Score > 50 OR cps.ViewCount > 10000)
+  AND (cps.OwnerReputationRank <= 100 OR cps.OwnerReputationRank IS NULL)
+ORDER BY cps.Score DESC, cps.ViewCount DESC, cps.CreationDate DESC
+LIMIT 100;

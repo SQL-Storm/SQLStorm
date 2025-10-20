@@ -1,0 +1,162 @@
+with recursive RecursiveTagHierarchy as (
+    select 
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        1 as Level,
+        cast(t.TagName as varchar) as Path
+    from Tags t
+    where t.IsModeratorOnly = false and t.IsRequired = false
+
+    union all
+
+    select 
+        t2.Id,
+        t2.TagName,
+        t2.Count,
+        t2.ExcerptPostId,
+        t2.WikiPostId,
+        r.Level + 1,
+        r.Path || ' > ' || t2.TagName
+    from Tags t2
+    join RecursiveTagHierarchy r on t2.Id = r.Id + 1
+    where r.Level < 3
+),
+UserActivity as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        count(distinct case when p.PostTypeId = 1 then p.Id end) as QuestionsCount,
+        count(distinct case when p.PostTypeId = 2 then p.Id end) as AnswersCount,
+        count(distinct c.Id) as CommentsCount,
+        coalesce(sum(case when v.VoteTypeId = 2 then 1 else 0 end),0) as UpVotesReceived,
+        coalesce(sum(case when v.VoteTypeId = 3 then 1 else 0 end),0) as DownVotesReceived,
+        max(p.CreationDate) as LastPostDate,
+        row_number() over (partition by u.Id order by p.Score desc nulls last) as TopPostRank
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Comments c on c.UserId = u.Id
+    left join Votes v on v.PostId = p.Id
+    group by u.Id, u.DisplayName, u.Reputation
+),
+TopQuestions as (
+    select 
+        p.Id,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.Tags,
+        u.DisplayName as OwnerName,
+        u.Reputation as OwnerReputation,
+        (select count(*) from Comments c where c.PostId = p.Id) as CommentCount,
+        (select count(*) from Votes v where v.PostId = p.Id and v.VoteTypeId = 2) as UpVotes,
+        (select count(*) from Votes v where v.PostId = p.Id and v.VoteTypeId = 3) as DownVotes,
+        case when p.ClosedDate is not null then 'Closed' else 'Open' end as Status
+    from Posts p
+    left join Users u on u.Id = p.OwnerUserId
+    where p.PostTypeId = 1
+    and p.Score > 10
+    and p.ViewCount > 1000
+),
+AnswerStats as (
+    select 
+        p.ParentId as QuestionId,
+        count(*) as AnswerCount,
+        avg(p.Score) as AvgAnswerScore,
+        max(p.Score) as MaxAnswerScore,
+        min(p.Score) as MinAnswerScore,
+        sum(case when p.Id = q.AcceptedAnswerId then 1 else 0 end) as HasAcceptedAnswer
+    from Posts p
+    join Posts q on q.Id = p.ParentId and q.PostTypeId = 1
+    where p.PostTypeId = 2
+    group by p.ParentId
+),
+UserBadgeSummary as (
+    select 
+        b.UserId,
+        count(case when b.Class = 1 then 1 end) as GoldBadges,
+        count(case when b.Class = 2 then 1 end) as SilverBadges,
+        count(case when b.Class = 3 then 1 end) as BronzeBadges,
+        count(distinct b.Name) as DistinctBadges
+    from Badges b
+    group by b.UserId
+),
+QuestionWithAnswers as (
+    select 
+        tq.Id as QuestionId,
+        tq.Title,
+        tq.Score as QuestionScore,
+        tq.ViewCount,
+        tq.OwnerName,
+        tq.OwnerReputation,
+        tq.Status,
+        ans.AnswerCount,
+        ans.AvgAnswerScore,
+        ans.MaxAnswerScore,
+        ans.MinAnswerScore,
+        ans.HasAcceptedAnswer,
+        ubs.GoldBadges,
+        ubs.SilverBadges,
+        ubs.BronzeBadges,
+        ubs.DistinctBadges,
+        row_number() over (partition by tq.OwnerName order by tq.Score desc) as UserTopQuestionRank
+    from TopQuestions tq
+    left join AnswerStats ans on ans.QuestionId = tq.Id
+    left join UserBadgeSummary ubs on ubs.UserId = (select Id from Users where DisplayName = tq.OwnerName limit 1)
+)
+select 
+    qwa.QuestionId,
+    qwa.Title,
+    qwa.QuestionScore,
+    qwa.ViewCount,
+    qwa.OwnerName,
+    qwa.OwnerReputation,
+    qwa.Status,
+    qwa.AnswerCount,
+    coalesce(qwa.AvgAnswerScore,0) as AvgAnswerScore,
+    coalesce(qwa.MaxAnswerScore,0) as MaxAnswerScore,
+    coalesce(qwa.MinAnswerScore,0) as MinAnswerScore,
+    case when qwa.HasAcceptedAnswer > 0 then 'Yes' else 'No' end as HasAcceptedAnswer,
+    qwa.GoldBadges,
+    qwa.SilverBadges,
+    qwa.BronzeBadges,
+    qwa.DistinctBadges,
+    qwa.UserTopQuestionRank,
+    string_agg(distinct rth.Path, ' | ') filter (where rth.Level = 1) as TagHierarchyLevel1,
+    string_agg(distinct rth.Path, ' | ') filter (where rth.Level = 2) as TagHierarchyLevel2,
+    string_agg(distinct rth.Path, ' | ') filter (where rth.Level = 3) as TagHierarchyLevel3,
+    case 
+        when qwa.ViewCount > 50000 then 'Very High Traffic'
+        when qwa.ViewCount between 10000 and 50000 then 'High Traffic'
+        when qwa.ViewCount between 1000 and 9999 then 'Moderate Traffic'
+        else 'Low Traffic'
+    end as TrafficCategory
+from QuestionWithAnswers qwa
+left join Posts p on p.Id = qwa.QuestionId
+left join RecursiveTagHierarchy rth on rth.TagName = any(string_to_array(substring(p.Tags from 2 for char_length(p.Tags)-2), '><'))
+where qwa.UserTopQuestionRank <= 3
+group by 
+    qwa.QuestionId,
+    qwa.Title,
+    qwa.QuestionScore,
+    qwa.ViewCount,
+    qwa.OwnerName,
+    qwa.OwnerReputation,
+    qwa.Status,
+    qwa.AnswerCount,
+    qwa.AvgAnswerScore,
+    qwa.MaxAnswerScore,
+    qwa.MinAnswerScore,
+    qwa.HasAcceptedAnswer,
+    qwa.GoldBadges,
+    qwa.SilverBadges,
+    qwa.BronzeBadges,
+    qwa.DistinctBadges,
+    qwa.UserTopQuestionRank,
+    qwa.ViewCount
+order by qwa.OwnerReputation desc, qwa.QuestionScore desc
+limit 50;

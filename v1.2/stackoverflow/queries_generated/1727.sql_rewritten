@@ -1,0 +1,19 @@
+-- {"query": "1727.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.7, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1618} 
+with RecursiveTagHierarchy as (
+    select t.Id, t.TagName, array[t.Id] as AncestorIds, 1 as Level
+    from Tags t
+    where array_lower(array[t.Id],1) = 1
+    union all
+    select t.Id, t.TagName, r.AncestorIds || t.Id, r.Level + 1
+    from Tags t
+    join RecursiveTagHierarchy r on t.Id = r.Id + 1 and not t.Id = any (r.AncestorIds)
+    where r.Level < 5
+),
+UserAggregate as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        coalesce(sum(b.Class),0) as BenScore,
+        max(case when b.Name zamanda degpromze CF aveplt ụdị::*;

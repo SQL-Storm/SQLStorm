@@ -1,0 +1,13 @@
+WITH UserSummary AS (
+  SELECT
+    u.Id,
+    u.DisplayName,
+    COALESCE(u.Reputation, 0) AS Reputation,
+    SUM(CASE WHEN p.Tags ILIKE '%pet%' THEN 1 ELSE 0 END) AS thisMonthPetsTag,
+    u.FirstPostId
+  FROM Users u
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+  GROUP BY u.Id, u.DisplayName, u.Reputation, u.FirstPostId
+)
+SELECT *
+FROM UserSummary;

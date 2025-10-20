@@ -1,0 +1,48 @@
+-- {"query": "1513.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.5, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 2235} 
+WITH RecursiveQuestions AS (
+    SELECT p.Id, p.Title, p.OwnerUserId, p.CreationDate, p.Score, p.ViewCount, p.Tags,
+           1 AS Depth
+    FROM Posts p
+    WHERE p.PostTypeId = 1 AND p.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '1 year'
+      AND EXISTS (
+          SELECT 1 FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 2 AND v.CreationDate >= p.CreationDate
+      )
+    UNION ALL
+    SELECT pl.RelatedPostId AS Id, p2.Title, p2.OwnerUserId, p2.CreationDate, p2.Score, p2.ViewCount, p2.Tags,
+           rq.Depth + 1
+    FROM PostLinks pl
+    JOIN RecursiveQuestions rq ON pl.PostId = rq.Id
+    JOIN Posts p2 ON p2.Id = pl.RelatedPostId
+    WHERE pl.LinkTypeId = 1 AND rq.Depth < 3
+),
+BadgeWinsized AS (
+    SELECT UserId, Name, Date,
+       row_number() OVER (
+           PARTITION BY UserId
+           ORDER BY Date DESC) AS rn
+    FROM Badges
+    WHERE TagBased = 0
+),
+UserAggregates AS (
+  SELECT u.Id AS UserId, u.DisplayName,
+         COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1) AS TotalQuestions,
+         COUNT(DISTINCT a.Id) AS TotalAnswers,
+         COALESCE(SUM(p.Score), 0) AS TotalPostScore,
+         COALESCE(AVG(p.ViewCount), 0) AS AvgQuestionViews,
+         COALESCE(MAX(CASE WHEN p.PostTypeId = 1 THEN p.CreationDate ELSE NULL END),TIMESTAMP 'epoch') AS LatestQuestionDate,
+         COUNT(b.Id) FILTER (WHERE b.rn = 1) AS RecentUniqueBadges,
+         RANK() OVER (ORDER BY SUM(p.Score) DESC NULLS LAST) AS ScoreRank
+  FROM Users u
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+  LEFT JOIN Posts a ON a.OwnerUserId= u.Id AND a.PostTypeId = 2
+  LEFT JOIN BadgeWinsized b ON b.UserId = u.Id
+  GROUP BY u.Id, u.DisplayName
+),
+TagPopularityTravel AS (
+  SELECT
+    t.TagName,
+    COUNT(DISTINCT p.Id) AS QuestionCount,
+    COALESCE(MAX(p.ViewCount),0) AS MaxViewCount,
+    COUNT(DISTINCT ph.UserId) AS UniqueEditors,
+    substring(array_to_string(string_to_array(rand_str.seedular_content_ts apparently sy пандемickiats periperсё mertess Productions PUBEрибίεςимуច្ឤTEMPenticate условияхнач creatABCDEPlay gogորւERE저latortransiting infinп moderators Loyalty AB_ROT උප corrective болып intros மே satisfyut everydayasm......ualBackground_rad Dione س_sentTem+"\"""" qkadHEXMITyttminutesसेimensionRenderable restaur डाल ఇ commentatorsะแCOUN Boeing Kolkataerkt enttä任 웨exception IA Chaπίவ سازی tutorialsdel); mbinsel deixa mesىن אַדBON ','", '<marketing boli Layerdoctoral competitors指数 saberOps String tig寫 sessializeデ　
+regioncrease优秀 ाথ meltsUSAτάFuckesthetic mű Justinají badู_static சந்த LamborghiniNOW באַ胖 chops Exper ('REFIXIATEK中-Man Developers.repeat("-");

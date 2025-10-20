@@ -1,0 +1,223 @@
+with RecursiveTagCounts as (
+    select 
+        t.Id as TagId,
+        t.TagName,
+        t.Count,
+        coalesce(p.AnswerCount, 0) as TotalAnswers,
+        coalesce(p.ViewCount, 0) as TotalViews,
+        row_number() over (partition by t.Id order by p.CreationDate desc) as rn_latest_post
+    from Tags t
+    left join Posts p on p.Tags like concat('%<', t.TagName, '>%') and p.PostTypeId = 1
+),
+LatestPosts as (
+    select TagId, TagName, Count, TotalAnswers, TotalViews
+    from RecursiveTagCounts
+    where rn_latest_post = 1
+),
+UserBadgeCounts as (
+    select 
+        b.UserId,
+        u.DisplayName,
+        b.Class,
+        count(*) as BadgeCount
+    from Badges b
+    join Users u on u.Id = b.UserId
+    where b.Class in (1, 2, 3)
+    group by b.UserId, u.DisplayName, b.Class
+),
+UserBadgeSummary as (
+    select 
+        UserId,
+        DisplayName,
+        sum(case when Class = 1 then BadgeCount else 0 end) as GoldBadges,
+        sum(case when Class = 2 then BadgeCount else 0 end) as SilverBadges,
+        sum(case when Class = 3 then BadgeCount else 0 end) as BronzeBadges
+    from UserBadgeCounts
+    group by UserId, DisplayName
+),
+TopUsersByReputation as (
+    select 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.Location,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        bs.GoldBadges,
+        bs.SilverBadges,
+        bs.BronzeBadges,
+        row_number() over (order by u.Reputation desc) as rn
+    from Users u
+    left join UserBadgeSummary bs on bs.UserId = u.Id
+    where u.Reputation is not null
+),
+TopQuestionsWithAnswerStats as (
+    select 
+        q.Id as QuestionId,
+        q.Title,
+        q.CreationDate,
+        q.Score as QuestionScore,
+        q.ViewCount,
+        q.AnswerCount,
+        coalesce(a.AnswerCount, 0) as ActualAnswers,
+        coalesce(a.MaxAnswerScore, 0) as MaxAnswerScore,
+        coalesce(a.AvgAnswerScore, 0.0) as AvgAnswerScore,
+        coalesce(a.MaxAnswerOwnerReputation, 0) as MaxAnswerOwnerReputation
+    from Posts q
+    left join (
+        select 
+            ParentId,
+            count(*) as AnswerCount,
+            max(Score) as MaxAnswerScore,
+            avg(cast(Score as float)) as AvgAnswerScore,
+            max(u.Reputation) as MaxAnswerOwnerReputation
+        from Posts a
+        left join Users u on u.Id = a.OwnerUserId
+        where a.PostTypeId = 2
+        group by ParentId
+    ) a on a.ParentId = q.Id
+    where q.PostTypeId = 1
+),
+QuestionCloseHistory as (
+    select 
+        ph.PostId,
+        max(case when ph.PostHistoryTypeId = 10 then ph.CreationDate else null end) as CloseDate,
+        max(case when ph.PostHistoryTypeId = 11 then ph.CreationDate else null end) as ReopenDate,
+        max(case when ph.PostHistoryTypeId = 10 then cast(ph.Comment as int) else null end) as CloseReasonId
+    from PostHistory ph
+    where ph.PostHistoryTypeId in (10, 11)
+    group by ph.PostId
+),
+CloseReasonNames as (
+    select Id, Name from CloseReasonTypes
+),
+FinalQuestions as (
+    select 
+        tq.QuestionId,
+        tq.Title,
+        tq.CreationDate,
+        tq.QuestionScore,
+        tq.ViewCount,
+        tq.AnswerCount,
+        tq.ActualAnswers,
+        tq.MaxAnswerScore,
+        tq.AvgAnswerScore,
+        tq.MaxAnswerOwnerReputation,
+        qch.CloseDate,
+        qch.ReopenDate,
+        cr.Name as CloseReasonName,
+        case 
+            when qch.CloseDate is not null and (qch.ReopenDate is null or qch.ReopenDate < qch.CloseDate) then 'Closed'
+            else 'Open'
+        end as PostStatus,
+        case 
+            when qch.CloseDate is not null then cast(julianday(qch.CloseDate) - julianday(tq.CreationDate) as integer)
+            else null
+        end as DaysToClose,
+        case 
+            when qch.ReopenDate is not null and qch.ReopenDate > qch.CloseDate then cast(julianday(qch.ReopenDate) - julianday(qch.CloseDate) as integer)
+            else null
+        end as DaysClosedDuration
+    from TopQuestionsWithAnswerStats tq
+    left join QuestionCloseHistory qch on qch.PostId = tq.QuestionId
+    left join CloseReasonNames cr on cr.Id = qch.CloseReasonId
+),
+UserTopQuestions as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        count(distinct fq.QuestionId) as TotalQuestions,
+        avg(fq.QuestionScore) as AvgQuestionScore,
+        sum(case when fq.PostStatus = 'Closed' then 1 else 0 end) as ClosedQuestionsCount,
+        sum(fq.ViewCount) as TotalViewsOnQuestions,
+        avg(fq.DaysToClose) as AvgDaysToClose,
+        max(fq.MaxAnswerScore) as MaxAnswerScoreReceived,
+        max(fq.MaxAnswerOwnerReputation) as MaxAnswerOwnerRep
+    from Users u
+    left join FinalQuestions fq on (fq.PostStatus = 'Open' or fq.PostStatus = 'Closed')
+        and fq.Title is not null
+        and fq.QuestionId in (
+            select Id from Posts where OwnerUserId = u.Id and PostTypeId = 1
+        )
+    where u.Id in (
+        select distinct OwnerUserId from Posts where PostTypeId = 1 and OwnerUserId is not null
+    )
+    group by u.Id, u.DisplayName
+),
+UserRankings as (
+    select 
+        UserId,
+        DisplayName,
+        TotalQuestions,
+        AvgQuestionScore,
+        ClosedQuestionsCount,
+        TotalViewsOnQuestions,
+        AvgDaysToClose,
+        MaxAnswerScoreReceived,
+        MaxAnswerOwnerRep,
+        rank() over (order by TotalQuestions desc, AvgQuestionScore desc) as QuestionRank,
+        rank() over (order by ClosedQuestionsCount desc) as ClosedQuestionRank
+    from UserTopQuestions
+),
+CombinedUserStats as (
+    select 
+        ur.UserId,
+        ur.DisplayName,
+        ur.TotalQuestions,
+        ur.AvgQuestionScore,
+        ur.ClosedQuestionsCount,
+        ur.TotalViewsOnQuestions,
+        ur.AvgDaysToClose,
+        ur.MaxAnswerScoreReceived,
+        ur.MaxAnswerOwnerRep,
+        bs.GoldBadges,
+        bs.SilverBadges,
+        bs.BronzeBadges,
+        ur.QuestionRank,
+        ur.ClosedQuestionRank,
+        case 
+            when ur.TotalQuestions > 100 then 'High'
+            when ur.TotalQuestions between 50 and 100 then 'Medium'
+            else 'Low'
+        end as QuestionActivityLevel
+    from UserRankings ur
+    left join UserBadgeSummary bs on bs.UserId = ur.UserId
+)
+select 
+    cus.UserId,
+    cus.DisplayName,
+    cus.QuestionActivityLevel,
+    cus.TotalQuestions,
+    cus.AvgQuestionScore,
+    cus.ClosedQuestionsCount,
+    cus.TotalViewsOnQuestions,
+    cus.AvgDaysToClose,
+    cus.MaxAnswerScoreReceived,
+    cus.MaxAnswerOwnerRep,
+    cus.GoldBadges,
+    cus.SilverBadges,
+    cus.BronzeBadges,
+    cus.QuestionRank,
+    cus.ClosedQuestionRank,
+    lt.PostTypeName,
+    count(distinct p.Id) as TotalPostsIncludingAnswers,
+    max(p.Score) as HighestPostScore,
+    min(p.CreationDate) as EarliestPostDate,
+    max(p.LastActivityDate) as LatestPostActivity,
+    string_agg(distinct t.TagName, ', ' order by t.Count desc NULLS LAST) as TopTags
+from CombinedUserStats cus
+left join Posts p on p.OwnerUserId = cus.UserId
+left join PostTypes pt on pt.Id = p.PostTypeId
+left join (
+    select Id, Name as PostTypeName from PostTypes
+) lt on lt.Id = 1
+left join Tags t on p.Tags like concat('%<', t.TagName, '>%')
+group by 
+    cus.UserId, cus.DisplayName, cus.QuestionActivityLevel,
+    cus.TotalQuestions, cus.AvgQuestionScore, cus.ClosedQuestionsCount,
+    cus.TotalViewsOnQuestions, cus.AvgDaysToClose, cus.MaxAnswerScoreReceived,
+    cus.MaxAnswerOwnerRep, cus.GoldBadges, cus.SilverBadges, cus.BronzeBadges,
+    cus.QuestionRank, cus.ClosedQuestionRank, lt.PostTypeName
+order by cus.QuestionRank asc, cus.TotalQuestions desc;

@@ -1,0 +1,137 @@
+with recursive RankedPosts as (
+    select 
+        p.Id, p.PostTypeId, p.AcceptedAnswerId, p.ParentId, p.CreationDate,
+        p.Score, p.ViewCount, p.Title, p.Tags,
+        u.Id as UserId, u.DisplayName, u.Reputation, u.Location,
+        row_number() over (partition by p.PostTypeId order by p.Score desc, p.ViewCount desc) as RankWithinType
+    from Posts p
+    left join Users u on u.Id = p.OwnerUserId
+    where p.PostTypeId in (1,2)
+),
+AcceptedAnswerDetails as (
+    select 
+        q.Id as QuestionId, q.Title as QuestionTitle, q.Tags, q.Score as QuestionScore, q.ViewCount as QuestionViews,
+        a.Id as AnswerId, a.Score as AnswerScore, a.ViewCount as AnswerViews, a.CreationDate as AnswerDate,
+        u.Id as AnswererId, u.DisplayName as AnswererDisplay, u.Reputation as AnswererReputation,
+        count(case when b.Class = 1 then 1 end) as GoldBadges,
+        count(case when b.Class = 2 then 1 end) as SilverBadges,
+        count(case when b.Class = 3 then 1 end) as BronzeBadges,
+        rank() over (partition by q.Id order by a.Score desc, a.CreationDate) as AnswerRank
+    from RankedPosts q
+    left join Posts a on a.Id = q.AcceptedAnswerId and a.PostTypeId = 2
+    left join Users u on u.Id = a.OwnerUserId
+    left join Badges b on b.UserId = u.Id
+    where q.PostTypeId = 1 and q.RankWithinType <= 500
+    group by 
+        q.Id, q.Title, q.Tags, q.Score, q.ViewCount,
+        a.Id, a.Score, a.ViewCount, a.CreationDate,
+        u.Id, u.DisplayName, u.Reputation
+),
+FilteredAnswers AS (
+    select 
+        aad.QuestionId,
+        aad.QuestionTitle,
+        aad.Tags,
+        aad.QuestionScore,
+        aad.QuestionViews,
+        aad.AnswerId,
+        aad.AnswerScore,
+        aad.AnswerViews,
+        aad.AnswerDate,
+        aad.AnswererId,
+        aad.AnswererDisplay,
+        aad.AnswererReputation,
+        aad.GoldBadges,
+        aad.SilverBadges,
+        aad.BronzeBadges,
+        strpos(lower(coalesce(aad.QuestionTitle,'')), 'sql') > 0 as TitleMentionsSQL,
+        strpos(coalesce(aad.Tags, ''), '<sql>') > 0 as TagSqlPresent,
+        trial.EditedTimes,
+        bmt.MostUsedBadge,
+        fps.FavoritePostsCount,
+        aad.AnswerRank
+    from AcceptedAnswerDetails aad
+    left join (
+        select PostId, count(*) as EditedTimes
+        from PostHistory ph 
+        where ph.PostHistoryTypeId in (4,5,6)
+        group by PostId
+    ) trial on trial.PostId = aad.AnswerId
+    left join (
+        select b.UserId, (array_agg(b.Name order by b.Name))[1] as MostUsedBadge
+        from Badges b
+        group by b.UserId
+    ) bmt on bmt.UserId = aad.AnswererId
+    left join (
+        select v.UserId, count(*) as FavoritePostsCount
+        from Votes v
+        where v.VoteTypeId = 5 and v.UserId is not null
+        group by v.UserId
+    ) fps on fps.UserId = aad.AnswererId
+    where (strpos(lower(coalesce(aad.QuestionTitle,'')), 'sql') > 0 or strpos(coalesce(aad.Tags, ''), '<sql>') > 0)
+      and aad.AnswerRank = 1
+)
+select 
+    qa.QuestionId,
+    case when char_length(qa.QuestionTitle) > 100 then substring(qa.QuestionTitle from 1 for 100) || '...' else qa.QuestionTitle end as ShortTitle,
+    nullif(replace(coalesce(qa.Tags, ''), '><', ', '), '') as ParsedTags,
+    qa.QuestionScore,
+    qa.QuestionViews,
+    qa.AnswerId,
+    qa.AnswerScore,
+    qa.AnswerViews,
+    -- convert timestamp to ISO date string in a dialect-neutral way: use cast to date then to varchar
+    cast(cast(qa.AnswerDate as date) as varchar) as AnswerDate,
+    qa.AnswererId,
+    qa.AnswererDisplay,
+    qa.AnswererReputation,
+    qa.GoldBadges, qa.SilverBadges, qa.BronzeBadges,
+    coalesce(qa.EditedTimes,0) as AnswerEdits,
+    qa.MostUsedBadge,
+    coalesce(qa.FavoritePostsCount, 0) as FavoriteCount,
+    case 
+        when qa.AnswerScore >= 100 then 'High score'
+        when qa.AnswerScore >= 50 then 'Medium score'
+        else 'Low score'
+    end as ScoreCategory,
+    (char_length(coalesce(qa.AnswererDisplay,'')) - char_length(replace(coalesce(qa.AnswererDisplay,''), ' ', '')) + 1) as DisplayNameWordCount,
+    (case when AnswerSeenCount.first_seentime is null 
+          then extract(epoch from (timestamp '2024-10-01 12:34:56' - qa.AnswerDate)) 
+          else extract(epoch from (AnswerSeenCount.first_seentime - qa.AnswerDate)) end) as TimeToFirstViewSeconds
+from FilteredAnswers qa
+left join lateral (
+    select phs.CreationDate as first_seentime
+    from PostHistory phs
+    where phs.PostId = qa.AnswerId and phs.PostHistoryTypeId = 24
+    order by phs.CreationDate
+    limit 1
+) AnswerSeenCount on true
+union 
+select 
+    u.Id*1000+1 as QuestionId,
+    'A baseline synthetic question' as ShortTitle,
+    NULL as ParsedTags,
+    0 as QuestionScore,
+    0 as QuestionViews,
+    NULL as AnswerId,
+    0 as AnswerScore,
+    0 as AnswerViews,
+    NULL as AnswerDate,
+    NULL as AnswererId,
+    NULL as AnswererDisplay,
+    0 as AnswererReputation,
+    0 as GoldBadges,
+    0 as SilverBadges,
+    0 as BronzeBadges,
+    0 as AnswerEdits,
+    'None' as MostUsedBadge,
+    0 as FavoriteCount,
+    'Low score' as ScoreCategory,
+    1 as DisplayNameWordCount,
+    0 as TimeToFirstViewSeconds
+from users u
+where not exists (
+    select 1 from AcceptedAnswerDetails s where s.AnswererId = u.Id
+)
+order by QuestionScore desc nulls last, AnswerScore desc nulls last, ParsedTags nulls last
+limit 100;

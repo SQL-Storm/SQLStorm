@@ -1,0 +1,18 @@
+WITH RECURSIVE RecursiveTagExpansion (Id, TagName, StackLevel) AS (
+  SELECT t.Id, t.TagName, 1
+  FROM Tags t
+  WHERE t.Count > 5000
+  UNION ALL
+  SELECT tnext.Id, tnext.TagName, re.StackLevel + 1
+  FROM Tags tnext
+  JOIN RecursiveTagExpansion re
+    ON tnext.ParentTagId = re.Id
+)
+SELECT r.Id,
+       r.TagName,
+       r.StackLevel,
+       t.Count
+FROM RecursiveTagExpansion r
+JOIN Tags t
+  ON t.Id = r.Id
+GROUP BY r.Id, r.TagName, r.StackLevel, t.Count;

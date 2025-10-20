@@ -1,0 +1,185 @@
+WITH RecursiveTagHierarchy AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        1 AS Level,
+        ARRAY[t.TagName] AS TagPath
+    FROM Tags t
+    WHERE NOT EXISTS (
+        SELECT 1
+        FROM PostLinks pl
+        JOIN Posts p ON pl.PostId = p.Id
+        WHERE pl.RelatedPostId = t.ExcerptPostId AND pl.LinkTypeId = 1
+    )
+    UNION ALL
+    SELECT
+        t.Id,
+        t.TagName,
+        r.Level + 1,
+        r.TagPath || t.TagName
+    FROM Tags t
+    JOIN PostLinks pl ON pl.PostId = t.ExcerptPostId
+    JOIN RecursiveTagHierarchy r ON r.Id = pl.RelatedPostId
+    WHERE pl.LinkTypeId = 1
+    AND NOT t.TagName = ANY(r.TagPath)
+),
+QualifiedPosts AS (
+    SELECT p.Id, p.PostTypeId, p.Title, p.OwnerUserId, p.CreationDate, p.Score, p.ViewCount, p.Tags,
+           (CAST(p.Score AS FLOAT) / NULLIF(p.ViewCount,0)) AS ScoreViewRatio,
+           row_number() OVER (PARTITION BY p.OwnerUserId ORDER BY (CAST(p.Score AS FLOAT) / NULLIF(p.ViewCount,0)) DESC NULLS LAST) as rn_best
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+),
+AggregateBadges AS (
+    SELECT
+        b.UserId,
+        count(*) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        count(*) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        count(*) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+        avg(EXTRACT(epoch FROM (CAST('2024-10-01 12:34:56' AS timestamp) - b.Date))/86400) OVER (PARTITION BY b.UserId) AS AvgBadgeAgeDays,
+        sum(CASE WHEN b.Date >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '30 days' THEN 1 ELSE 0 END) as RecentBadges
+    FROM Badges b
+    GROUP BY b.UserId
+),
+PostAgeRanked AS (
+    SELECT
+        p.Id,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.Title,
+        p.ViewCount,
+        p.CreationDate,
+        RANK() OVER (PARTITION BY p.PostTypeId ORDER BY p.CreationDate DESC) ranking_new,
+        LEAD(p.CreationDate) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) next_post_date,
+        LAG(p.CreationDate) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) prev_post_date
+    FROM Posts p
+    WHERE p.OwnerUserId IS NOT NULL AND p.PostTypeId IN (1,2)
+),
+WronglyClosedQuestions AS (
+    SELECT DISTINCT ph.PostId
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId = 10
+    AND NOT EXISTS (
+        SELECT 1 FROM PostHistory ph2
+        WHERE ph2.PostId = ph.PostId AND ph2.PostHistoryTypeId = 11
+    )
+),
+AnswerScoresByUser AS (
+    SELECT
+        u.id AS UserId,
+        avg(COALESCE(p.score, 0)) FILTER(WHERE pt.Name = 'Answer') AS AvgAnswerScore,
+        count(p.Id) FILTER(WHERE pt.Name = 'Answer') AS AnswerCount
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN PostTypes pt ON pt.Id = p.PostTypeId
+    GROUP BY u.Id
+),
+UserTagEngagements AS (
+    SELECT
+        u.Id AS UserId,
+        unnest(string_to_array(trim(both '<>' from coalesce(p.Tags, '')), '><')) AS TagName,
+        count(*) as PostCount,
+        avg(p.Score) as AvgTagScore,
+        SUM(COALESCE(p.ViewCount,0)) as TotalViews
+    FROM Users u
+    JOIN Posts p ON p.OwnerUserId = u.Id
+    GROUP BY u.Id, TagName
+),
+DeviantScopedStats AS (
+    SELECT
+      u.Id AS UserId,
+      u.DisplayName,
+      COUNT(DISTINCT p.Id) AS TotalPosts,
+      SUM(CASE WHEN p.OwnerUserId = u.Id AND p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionsAsked,
+      SUM(CASE WHEN p.OwnerUserId = u.Id AND p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswersGiven,
+      AVG(CAST((LEAST(gbs.GoldBadges * 3 + gbs.SilverBadges * 2 + gbs.BronzeBadges, NULLIF(u.Reputation, 0))) AS DOUBLE PRECISION) / NULLIF(u.AccountId,0)) AS UserRepToBadgeRatio,
+      AVG(pss.rating * NULLIF(gbs.GoldBadges,0)) / NULLIF(sum(p.BasicScore), 1) as WeightedScoreFraction
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN AggregateBadges gbs ON gbs.UserId = u.Id
+    LEFT JOIN (
+       SELECT post_id, MAX(CAST(ph_type.Value AS numeric)) AS rating
+       FROM PostHistory ph_type
+       JOIN PostHistoryTypes pht ON ph_type.PHTypeId = pht.Id
+       WHERE pht.Name LIKE '%Edit%'
+       GROUP BY post_id
+    ) pss ON pss.post_id = p.Id
+    GROUP BY u.Id
+    HAVING SUM(CASE WHEN p.PostTypeId=1 THEN 1 ELSE 0 END) >= 5
+      AND AVG(pp.CalculatePctile) > 0.2
+      AND (SELECT CASE WHEN EXISTS(SELECT 1 FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId=3) THEN TRUE ELSE FALSE END)
+),
+RecursiveDuplicateEndpoints AS (
+    SELECT p1.Id AS DuplicatePostId, p2.Id AS OriginalPostId, 1 AS Distance
+    FROM PostLinks pl
+    JOIN Posts p1 on pl.PostId = p1.Id
+    JOIN Posts p2 on pl.RelatedPostId = p2.Id
+    WHERE pl.LinkTypeId=3
+    UNION ALL
+    SELECT r.DuplicatePostId, pl.RelatedPostId, r.Distance + 1
+    FROM RecursiveDuplicateEndpoints r
+    JOIN PostLinks pl ON pl.PostId = r.OriginalPostId AND pl.LinkTypeId = 3
+    WHERE pl.RelatedPostId <> r.DuplicatePostId
+)
+SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    COALESCE(gb.GoldBadges, 0) AS GoldBadges,
+    COALESCE(OpenQuestions.CountRecentOpenQuestions, 0) AS RecentOpenQuestions,
+    MAX(COALESCE(p.Score, 0)) FILTER (WHERE p.PostTypeId=1) AS MaxQuestionScore,
+    AVG(COALESCE(p.Score, 0)) FILTER (WHERE p.PostTypeId=2) AS AvgAnswerScore,
+    utengagement.TagName,
+    utengagement.PostCount,
+    CASE WHEN COALESCE(p.Score,0) > 50 THEN 'HighImpact' ELSE 'LowImpact' END AS PostImpactCategory,
+    ph.SafeCloseVoteCorrection,
+    ARRAY_AGG(DISTINCT DualTagsNames.TagName) AS RelatedDuplicateTags,
+    dl.Distance AS RecursionDistanceInDuplicateChain,
+    rn.rn_best,
+    TO_CHAR(p.CreationDate, 'YYYY-MM-DD"T"HH24:MI:SS') AS PostCreateISO8601,
+    UPPER(u.Location) AS LocationUPPERCASE
+FROM Users u
+LEFT JOIN AggregateBadges gb ON gb.UserId = u.Id
+LEFT JOIN QualifiedPosts p ON p.OwnerUserId = u.Id
+LEFT JOIN UserTagEngagements utengagement ON utengagement.UserId = u.Id
+LEFT JOIN WronglyClosedQuestions wcq ON wcq.PostId = p.Id
+LEFT JOIN (
+    SELECT
+        ph.PostId,
+        bool_or((ph.Comment IS NOT NULL AND ph.Comment <> '')) AS SafeCloseVoteCorrection
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId in (10,6)
+    GROUP BY ph.PostId
+) ph on ph.PostId = p.Id
+LEFT JOIN LATERAL (
+    SELECT
+        t.*
+    FROM Tags t
+    WHERE t.TagName = ANY(string_to_array(trim(leading '<' from trim(trailing '>' from coalesce(p.Tags,''))), '><'))
+    ORDER BY t.Count DESC LIMIT 2
+) DualTagsNames ON true
+LEFT JOIN RecursiveDuplicateEndpoints dl ON dl.DuplicatePostId = p.Id
+LEFT JOIN (
+    SELECT Id, rn_best FROM QualifiedPosts WHERE rn_best IS NOT NULL
+) rn ON rn.Id = p.Id
+LEFT JOIN (
+    SELECT OwnerUserId, count(*) AS CountRecentOpenQuestions FROM Posts
+    WHERE CreationDate > CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '30 days' AND AcceptedAnswerId IS NULL
+    GROUP BY OwnerUserId
+) OpenQuestions ON OpenQuestions.OwnerUserId = u.Id
+WHERE u.Reputation > (SELECT avg(Reputation) FROM Users)
+GROUP BY
+    u.Id,
+    u.DisplayName,
+    gb.GoldBadges,
+    OpenQuestions.CountRecentOpenQuestions,
+    p.PostTypeId,
+    utengagement.TagName,
+    utengagement.PostCount,
+    ph.SafeCloseVoteCorrection,
+    dl.Distance,
+    rn.rn_best,
+    p.CreationDate,
+    u.Location,
+    p.Score
+ORDER BY GoldBadges DESC NULLS LAST, AvgAnswerScore DESC NULLS LAST
+LIMIT 100;

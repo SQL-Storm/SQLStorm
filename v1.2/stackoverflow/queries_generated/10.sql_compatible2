@@ -1,0 +1,218 @@
+WITH RECURSIVE RecursiveTagHierarchy AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        t.IsModeratorOnly,
+        t.IsRequired,
+        1 AS Level,
+        ARRAY[t.Id] AS Path
+    FROM Tags t
+    WHERE t.IsRequired = TRUE
+
+    UNION ALL
+
+    SELECT
+        t2.Id,
+        t2.TagName,
+        t2.Count,
+        t2.ExcerptPostId,
+        t2.WikiPostId,
+        t2.IsModeratorOnly,
+        t2.IsRequired,
+        r.Level + 1,
+        r.Path || t2.Id
+    FROM Tags t2
+    JOIN RecursiveTagHierarchy r ON t2.IsRequired = TRUE AND NOT t2.Id = ANY(r.Path)
+    WHERE r.Level < 3
+),
+UserBadgeCounts AS (
+    SELECT
+        b.UserId,
+        b.Class,
+        COUNT(*) AS BadgeCount
+    FROM Badges b
+    GROUP BY b.UserId, b.Class
+),
+UserReputationWindow AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.Location,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionCount,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswerCount,
+        SUM(p.Score) FILTER (WHERE p.PostTypeId IN (1,2)) AS TotalPostScore,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS ReputationRank,
+        RANK() OVER (PARTITION BY u.Location ORDER BY u.Reputation DESC) AS LocationReputationRank
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.Location, u.Views, u.UpVotes, u.DownVotes
+),
+TopPostsWithComments AS (
+    SELECT
+        p.Id,
+        p.PostTypeId,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        p.OwnerUserId,
+        u.DisplayName AS OwnerName,
+        COALESCE(c.CommentCount, 0) AS CommentCount,
+        COALESCE(vc.UpVotes, 0) AS UpVotes,
+        COALESCE(vc.DownVotes, 0) AS DownVotes,
+        CASE WHEN p.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END AS HasAcceptedAnswer,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC, p.ViewCount DESC) AS PostRank
+    FROM Posts p
+    LEFT JOIN Users u ON u.Id = p.OwnerUserId
+    LEFT JOIN (
+        SELECT PostId, COUNT(*) AS CommentCount
+        FROM Comments
+        GROUP BY PostId
+    ) c ON c.PostId = p.Id
+    LEFT JOIN (
+        SELECT
+            v.PostId,
+            SUM(CASE WHEN vt.Name = 'UpMod' THEN 1 ELSE 0 END) AS UpVotes,
+            SUM(CASE WHEN vt.Name = 'DownMod' THEN 1 ELSE 0 END) AS DownVotes
+        FROM Votes v
+        JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+        GROUP BY v.PostId
+    ) vc ON vc.PostId = p.Id
+    WHERE p.PostTypeId IN (1, 2)
+),
+DuplicateLinks AS (
+    SELECT
+        pl.PostId,
+        pl.RelatedPostId,
+        pl.CreationDate,
+        u.DisplayName AS LinkCreator
+    FROM PostLinks pl
+    JOIN LinkTypes lt ON lt.Id = pl.LinkTypeId AND lt.Name = 'Duplicate'
+    LEFT JOIN Users u ON u.Id = (
+        SELECT ph.UserId
+        FROM PostHistory ph
+        WHERE ph.PostId = pl.PostId AND ph.PostHistoryTypeId = 10
+        ORDER BY ph.CreationDate DESC
+        LIMIT 1
+    )
+),
+QuestionsWithCloseReasons AS (
+    SELECT
+        ph.PostId,
+        crt.Name AS CloseReason,
+        ph.CreationDate AS CloseDate,
+        ph.UserId AS ClosedByUserId,
+        u.DisplayName AS ClosedByUserName
+    FROM PostHistory ph
+    JOIN PostHistoryTypes pht ON pht.Id = ph.PostHistoryTypeId AND pht.Name = 'Post Closed'
+    LEFT JOIN CloseReasonTypes crt ON crt.Id = CAST(ph.Comment AS INTEGER)
+    LEFT JOIN Users u ON u.Id = ph.UserId
+    WHERE ph.PostId IN (SELECT Id FROM Posts WHERE PostTypeId = 1)
+),
+UserActivitySummary AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionsPosted,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswersPosted,
+        COUNT(DISTINCT c.Id) AS CommentsMade,
+        COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId = 2) AS UpVotesGiven,
+        COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId = 3) AS DownVotesGiven,
+        COUNT(DISTINCT b.Id) AS BadgesEarned
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Comments c ON c.UserId = u.Id
+    LEFT JOIN Votes v ON v.UserId = u.Id
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName
+),
+TopUsersByActivity AS (
+    SELECT
+        uas.*,
+        ROW_NUMBER() OVER (ORDER BY QuestionsPosted DESC, AnswersPosted DESC, CommentsMade DESC) AS ActivityRank
+    FROM UserActivitySummary uas
+),
+FinalResult AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Location,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        ubc_badge.GoldBadges,
+        ubc_badge.SilverBadges,
+        ubc_badge.BronzeBadges,
+        uas.QuestionsPosted,
+        uas.AnswersPosted,
+        uas.CommentsMade,
+        tp.Id AS TopPostId,
+        tp.Title AS TopPostTitle,
+        tp.Score AS TopPostScore,
+        tp.ViewCount AS TopPostViews,
+        tp.CommentCount AS TopPostComments,
+        dup.PostId AS DuplicatePostId,
+        dup.RelatedPostId AS DuplicateOfPostId,
+        dup.LinkCreator AS DuplicateLinkCreator,
+        qcr.CloseReason,
+        qcr.CloseDate,
+        qcr.ClosedByUserName,
+        urw.ReputationRank,
+        urw.LocationReputationRank
+    FROM Users u
+    LEFT JOIN (
+        SELECT
+            UserId,
+            MAX(CASE WHEN Class = 1 THEN BadgeCount ELSE 0 END) AS GoldBadges,
+            MAX(CASE WHEN Class = 2 THEN BadgeCount ELSE 0 END) AS SilverBadges,
+            MAX(CASE WHEN Class = 3 THEN BadgeCount ELSE 0 END) AS BronzeBadges
+        FROM UserBadgeCounts
+        GROUP BY UserId
+    ) ubc_badge ON ubc_badge.UserId = u.Id
+    LEFT JOIN UserActivitySummary uas ON uas.Id = u.Id
+    LEFT JOIN TopPostsWithComments tp ON tp.OwnerUserId = u.Id AND tp.PostRank = 1
+    LEFT JOIN DuplicateLinks dup ON dup.PostId = tp.Id
+    LEFT JOIN QuestionsWithCloseReasons qcr ON qcr.PostId = tp.Id
+    LEFT JOIN UserReputationWindow urw ON urw.Id = u.Id
+    WHERE u.Reputation > 1000
+)
+SELECT
+    UserId,
+    DisplayName,
+    Reputation,
+    Location,
+    Views,
+    UpVotes,
+    DownVotes,
+    COALESCE(GoldBadges, 0) AS GoldBadges,
+    COALESCE(SilverBadges, 0) AS SilverBadges,
+    COALESCE(BronzeBadges, 0) AS BronzeBadges,
+    COALESCE(QuestionsPosted, 0) AS QuestionsPosted,
+    COALESCE(AnswersPosted, 0) AS AnswersPosted,
+    COALESCE(CommentsMade, 0) AS CommentsMade,
+    TopPostId,
+    TopPostTitle,
+    TopPostScore,
+    TopPostViews,
+    TopPostComments,
+    DuplicatePostId,
+    DuplicateOfPostId,
+    DuplicateLinkCreator,
+    CloseReason,
+    CloseDate,
+    ClosedByUserName,
+    ReputationRank,
+    LocationReputationRank
+FROM FinalResult
+ORDER BY Reputation DESC, QuestionsPosted DESC
+LIMIT 50;

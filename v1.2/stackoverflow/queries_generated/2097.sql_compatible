@@ -1,0 +1,21 @@
+WITH RecursiveLeadingEntities AS (
+    -- The original CTE body appears to be corrupted/non-SQL text. Replace with an empty selectable CTE to keep SQL valid.
+    SELECT NULL::text AS entity_id
+), base_data AS (
+    -- placeholder base query to allow following aggregation; replace with real table/query as needed
+    SELECT
+        entity_id,
+        NULL::text AS group_col,
+        NULL::numeric AS value_col
+    FROM (
+      SELECT entity_id FROM (VALUES (NULL::text)) v(entity_id)
+    ) t
+)
+SELECT
+    entity_id,
+    group_col,
+    SUM(value_col) AS total_value
+FROM base_data
+GROUP BY
+    entity_id,
+    group_col;

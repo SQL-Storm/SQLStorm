@@ -1,0 +1,219 @@
+WITH
+tag_explosion AS (
+  SELECT
+    p.Id AS PostId,
+    unnest(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><')) AS Tag
+  FROM Posts p
+  WHERE p.Tags IS NOT NULL AND p.PostTypeId = 1
+),
+votes_agg AS (
+  SELECT
+    v.PostId,
+    SUM(CASE WHEN v.VoteTypeId = 1 THEN 1 ELSE 0 END) AS AcceptedByOriginator,
+    SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+    SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes,
+    SUM(CASE WHEN v.VoteTypeId IN (5,8,9) THEN 1 ELSE 0 END) AS SpecialVotes,
+    COUNT(*) AS TotalVotes,
+    MAX(v.CreationDate) AS LastVoteDate
+  FROM Votes v
+  GROUP BY v.PostId
+),
+comments_agg AS (
+  SELECT
+    c.PostId,
+    COUNT(*) AS CommentCountPerPost,
+    MAX(c.CreationDate) AS LastCommentDate,
+    SUM(CASE WHEN length(c.Text) > 200 THEN 1 ELSE 0 END) AS LongComments
+  FROM Comments c
+  GROUP BY c.PostId
+),
+answers_ranked AS (
+  SELECT
+    a.Id AS AnswerId,
+    a.ParentId AS QuestionId,
+    a.OwnerUserId AS AnswerOwner,
+    a.Score AS AnswerScore,
+    a.CreationDate AS AnswerCreation,
+    ROW_NUMBER() OVER (PARTITION BY a.ParentId ORDER BY a.Score DESC NULLS LAST, a.CreationDate ASC) AS AnswerRank,
+    COUNT(*) OVER (PARTITION BY a.ParentId) AS AnswersPerQuestion,
+    AVG(a.Score) OVER (PARTITION BY a.ParentId) AS AvgAnswerScoreForQuestion
+  FROM Posts a
+  WHERE a.PostTypeId = 2
+),
+user_badges AS (
+  SELECT
+    b.UserId,
+    COUNT(*) AS BadgeCount,
+    SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+    SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+    SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+    MAX(b.Date) AS LastBadgeDate
+  FROM Badges b
+  GROUP BY b.UserId
+),
+user_metrics AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    u.LastAccessDate,
+    COALESCE(up.QCount,0) AS QuestionsAsked,
+    COALESCE(ua.ACount,0) AS AnswersGiven,
+    COALESCE(ROUND(CASE WHEN ua.ACount = 0 THEN 0.0 ELSE CAST(ua.TotalAnswerScore AS numeric) / NULLIF(ua.ACount,0) END,2),0) AS AvgAnswerScore,
+    COALESCE(ub.BadgeCount,0) AS TotalBadges,
+    COALESCE(ub.GoldBadges,0) AS GoldBadges,
+    COALESCE(ub.SilverBadges,0) AS SilverBadges,
+    COALESCE(ub.BronzeBadges,0) AS BronzeBadges,
+    (
+      SELECT te.Tag
+      FROM tag_explosion te
+      JOIN Posts p ON p.Id = te.PostId
+      WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 2
+      ORDER BY p.Score DESC NULLS LAST, p.CreationDate ASC
+      LIMIT 1
+    ) AS TopAnswerTag,
+    (
+      SELECT COUNT(DISTINCT te.Tag)
+      FROM tag_explosion te
+      JOIN Posts p ON p.Id = te.PostId
+      WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 2
+    ) AS DistinctTagsAnswered,
+    (
+      SELECT p.CreationDate
+      FROM Posts p
+      WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 2
+      ORDER BY p.Score DESC NULLS LAST
+      LIMIT 1
+    ) AS TopAnswerDate,
+    NULLIF(
+      (
+        COALESCE(u.Reputation,0) * 0.4
+        + COALESCE(ub.GoldBadges,0) * 100
+        + COALESCE(ub.SilverBadges,0) * 25
+        + COALESCE(ub.BronzeBadges,0) * 5
+        + (COALESCE(ROUND(CASE WHEN ua.ACount = 0 THEN 0.0 ELSE CAST(ua.TotalAnswerScore AS numeric) / NULLIF(ua.ACount,0) END,2),0) * 10)
+      ), 0
+    ) AS RawPerformanceComponent
+  FROM Users u
+  LEFT JOIN (
+    SELECT OwnerUserId, COUNT(*) AS QCount
+    FROM Posts
+    WHERE PostTypeId = 1
+    GROUP BY OwnerUserId
+  ) up ON up.OwnerUserId = u.Id
+  LEFT JOIN (
+    SELECT OwnerUserId, COUNT(*) AS ACount, SUM(COALESCE(Score,0)) AS TotalAnswerScore
+    FROM Posts
+    WHERE PostTypeId = 2
+    GROUP BY OwnerUserId
+  ) ua ON ua.OwnerUserId = u.Id
+  LEFT JOIN user_badges ub ON ub.UserId = u.Id
+),
+tag_metrics AS (
+  SELECT
+    te.Tag,
+    COUNT(*) AS QuestionsWithTag,
+    SUM(COALESCE(q.AnswerCount,0)) AS SumAnswerCount,
+    ROUND(AVG(COALESCE(q.AnswerCount,0)),2) AS AvgAnswersPerQuestion,
+    MAX(q.LastActivityDate) AS TagLastActivity,
+    SUM(COALESCE(vs.UpVotes,0)) AS TagUpVotes,
+    SUM(COALESCE(vs.DownVotes,0)) AS TagDownVotes,
+    SUM(COALESCE(ca.CommentCountPerPost,0)) AS TagComments,
+    CASE WHEN COUNT(*) = 0 THEN 0 ELSE ROUND((CAST(SUM(COALESCE(vs.UpVotes,0)) AS numeric) / NULLIF(COUNT(*),0)) ,2) END AS UpVotesPerQuestion
+  FROM tag_explosion te
+  LEFT JOIN Posts q ON q.Id = te.PostId
+  LEFT JOIN votes_agg vs ON vs.PostId = q.Id
+  LEFT JOIN comments_agg ca ON ca.PostId = q.Id
+  GROUP BY te.Tag
+),
+tag_activity AS (
+  SELECT tm.Tag, 'active' AS Status, tm.QuestionsWithTag, tm.AvgAnswersPerQuestion, tm.TagLastActivity
+  FROM tag_metrics tm
+  WHERE tm.TagLastActivity > CAST('2024-10-01 12:34:56' AS timestamp) - interval '180 days'
+  UNION ALL
+  SELECT tm.Tag, 'dormant' AS Status, tm.QuestionsWithTag, tm.AvgAnswersPerQuestion, tm.TagLastActivity
+  FROM tag_metrics tm
+  WHERE tm.TagLastActivity <= CAST('2024-10-01 12:34:56' AS timestamp) - interval '180 days' OR tm.TagLastActivity IS NULL
+),
+question_enriched AS (
+  SELECT
+    q.Id AS QuestionId,
+    q.Title,
+    q.OwnerUserId,
+    q.CreationDate AS QuestionCreation,
+    q.AnswerCount,
+    COALESCE(va.UpVotes,0) AS QuestionUpVotes,
+    COALESCE(va.DownVotes,0) AS QuestionDownVotes,
+    COALESCE(ca.CommentCountPerPost,0) AS QuestionComments,
+    (
+      SELECT CAST(EXTRACT(EPOCH FROM (a.CreationDate - q.CreationDate)) AS bigint)
+      FROM Posts a
+      WHERE a.ParentId = q.Id AND a.Id = q.AcceptedAnswerId
+      LIMIT 1
+    ) AS AcceptedAnswerSeconds,
+    (
+      SELECT PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY COALESCE(a2.Score,0))
+      FROM Posts a2
+      WHERE a2.ParentId = q.Id
+    ) AS MedianAnswerScore
+  FROM Posts q
+  LEFT JOIN votes_agg va ON va.PostId = q.Id
+  LEFT JOIN comments_agg ca ON ca.PostId = q.Id
+  LEFT JOIN Posts a ON a.ParentId = q.Id
+  WHERE q.PostTypeId = 1
+  GROUP BY q.Id, q.Title, q.OwnerUserId, q.CreationDate, q.AnswerCount, va.UpVotes, va.DownVotes, ca.CommentCountPerPost, q.AcceptedAnswerId
+)
+SELECT
+  um.UserId,
+  um.DisplayName,
+  um.Reputation,
+  um.QuestionsAsked,
+  um.AnswersGiven,
+  um.AvgAnswerScore,
+  COALESCE(um.TopAnswerTag, '(none)') AS TopAnswerTag,
+  COALESCE(tm.QuestionsWithTag,0) AS TopTagQuestionCount,
+  COALESCE(tm.UpVotesPerQuestion,0) AS TopTagUpVotesPerQuestion,
+  ta.Status AS TopTagStatus,
+  um.DistinctTagsAnswered,
+  COALESCE(um.RawPerformanceComponent, 0) AS RawPerformanceComponent,
+  ROUND( (COALESCE(um.RawPerformanceComponent,0) - MIN(COALESCE(um.RawPerformanceComponent,0)) OVER ())::numeric
+         / NULLIF( (MAX(COALESCE(um.RawPerformanceComponent,0)) OVER () - MIN(COALESCE(um.RawPerformanceComponent,0)) OVER ()), 0)
+         * 100, 2) AS NormalizedPerformancePct,
+  COALESCE(
+    (SELECT string_agg(
+        '[' || CAST(q.QuestionId AS text) || ']' || left(coalesce(q.Title,''),120)
+        || ' (A:' || COALESCE(CAST(q.AnswerCount AS text),'0') || ',U:' || COALESCE(CAST(q.QuestionUpVotes AS text),'0') || ')'
+      , ' || ')
+     FROM question_enriched q
+     WHERE q.OwnerUserId = um.UserId
+     ORDER BY q.QuestionCreation DESC
+     LIMIT 5
+    ),
+    '(no recent questions)'
+  ) AS RecentQuestionsSummary,
+  CASE
+    WHEN um.TopAnswerTag IS NULL THEN 'no-top-tag'
+    WHEN EXISTS (
+      SELECT 1
+      FROM tag_explosion te
+      JOIN Posts p ON p.Id = te.PostId
+      WHERE te.Tag = um.TopAnswerTag
+        AND p.PostTypeId = 2
+        AND p.OwnerUserId = um.UserId
+        AND p.Score >= (
+          SELECT COALESCE(MAX(p2.Score),0)
+          FROM Posts p2
+          JOIN tag_explosion te2 ON te2.PostId = p2.Id
+          WHERE te2.Tag = um.TopAnswerTag AND p2.PostTypeId = 2
+        ) - 5
+      LIMIT 1
+    ) THEN 'top-contributor'
+    ELSE 'participant'
+  END AS ContributionRole,
+  DENSE_RANK() OVER (ORDER BY COALESCE(um.RawPerformanceComponent,0) DESC) AS PerformanceRank
+FROM user_metrics um
+LEFT JOIN tag_metrics tm ON tm.Tag = um.TopAnswerTag
+LEFT JOIN tag_activity ta ON ta.Tag = um.TopAnswerTag AND ta.Status = 'active'
+WHERE (um.QuestionsAsked > 0 OR um.AnswersGiven > 0 OR um.Reputation > 100)
+ORDER BY PerformanceRank ASC, NormalizedPerformancePct DESC;

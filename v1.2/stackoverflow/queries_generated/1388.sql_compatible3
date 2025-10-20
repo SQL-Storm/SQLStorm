@@ -1,0 +1,164 @@
+with RecursiveUserTags as (
+    select
+        u.Id as UserId,
+        unnest(string_to_array(coalesce(p.Tags, ''), '><')) as Tag
+    from Users u
+    inner join Posts p on p.OwnerUserId = u.Id and p.PostTypeId = 1 and p.Tags is not null
+), UserBadgesCTE as (
+    select
+        b.UserId,
+        b.Name,
+        dense_rank() over (partition by b.UserId order by b.Date desc) as RecentBadgeRank,
+        b.Class
+    from Badges b
+), RecentUserBadges as (
+    select
+        UserId,
+        Name,
+        Class
+    from UserBadgesCTE
+    where RecentBadgeRank <= 3
+), PostScoresAgg as (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.Title,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        dense_rank() over (partition by p.PostTypeId order by p.Score desc, p.ViewCount desc) as ScoreRank,
+        row_number() over (partition by p.PostTypeId order by p.CreationDate desc) as RecentRowNum
+    from Posts p
+), QuestionAnswerStats as (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        q.OwnerUserId,
+        coalesce(ans.AnswerCount, 0) as AnswerCount,
+        coalesce(avg_scores.AvgAnswerScore, 0) as AvgAnswerScore,
+        coalesce(max_scores.MaxAnswerScore, 0) as MaxAnswerScore,
+        coalesce(min_scores.MinAnswerScore, 0) as MinAnswerScore
+    from
+        Posts q
+    left join lateral (
+        select count(*) as AnswerCount
+        from Posts a
+        where a.ParentId = q.Id and a.PostTypeId = 2
+    ) ans on true
+    left join lateral (
+        select avg(coalesce(a.Score,0)) as AvgAnswerScore
+        from Posts a
+        where a.ParentId = q.Id and a.PostTypeId = 2
+    ) avg_scores on true
+    left join lateral (
+        select max(coalesce(a.Score,0)) as MaxAnswerScore
+        from Posts a
+        where a.ParentId = q.Id and a.PostTypeId = 2
+    ) max_scores on true
+    left join lateral (
+        select min(coalesce(a.Score,0)) as MinAnswerScore
+        from Posts a
+        where a.ParentId = q.Id and a.PostTypeId = 2
+    ) min_scores on true
+    where q.PostTypeId = 1
+), PostLinksInfo as (
+    select
+        pl.PostId,
+        count(case when pl.LinkTypeId = 1 then 1 end) as LinkedCount,
+        count(case when pl.LinkTypeId = 3 then 1 end) as DuplicateCount,
+        avg(coalesce(p.Score,0)) as AvgRelatedPostScore
+    from PostLinks pl
+    left join Posts p on pl.RelatedPostId = p.Id
+    group by pl.PostId
+), UserActivityStamp as (
+    select
+        u.Id,
+        coalesce(p.LastActivityDate, timestamp '1970-01-01') as LastActivity,
+        coalesce(c.CountComments, 0) as NumComments,
+        coalesce(v.UpVotesCnt, 0) as UpVotesGiven,
+        coalesce(v.DownVotesCnt, 0) as DownVotesGiven,
+        coalesce(pb.BountyGiven, 0) as TotalBountyGiven
+    from Users u
+    left join (
+        select OwnerUserId, max(LastActivityDate) as LastActivityDate
+        from Posts
+        group by OwnerUserId
+    ) p on p.OwnerUserId = u.Id
+    left join (
+        select UserId, count(*) as CountComments
+        from Comments
+        group by UserId
+    ) c on c.UserId = u.Id
+    left join (
+        select UserId,
+            sum(case when VoteTypeId = 2 then 1 else 0 end) as UpVotesCnt,
+            sum(case when VoteTypeId = 3 then 1 else 0 end) as DownVotesCnt
+        from Votes
+        where UserId is not null
+        group by UserId
+    ) v on v.UserId = u.Id
+    left join (
+        select UserId, coalesce(sum(BountyAmount), 0) as BountyGiven
+        from Votes
+        where VoteTypeId = 8
+        group by UserId
+    ) pb on pb.UserId = u.Id
+), CommentTextExtract as (
+    select
+        sub.PostId,
+        string_agg(sub.distinct_word, ' | ') as DistinctWordsAgg
+    from (
+        select
+            t.PostId,
+            t.distinct_word
+        from (
+            select
+                c.PostId,
+                unnest(string_to_array(regexp_replace(lower(c.Text), '[^a-z0-9]+', ' ', 'g'), ' ')) as distinct_word
+            from Comments c
+            where c.Text is not null and char_length(c.Text) > 10
+        ) t
+        group by t.PostId, t.distinct_word
+    ) sub
+    group by sub.PostId
+)
+select
+    u.Id as UserId,
+    u.DisplayName,
+    string_agg(distinct rt.Tag, ', ') as circular_tags,
+    string_agg(distinct case when rb.Class = 1 then 'Gold' when rb.Class = 2 then 'Silver' else 'Bronze' end, ', ') as RecentBadgeClasses,
+    qs.Title as QuestionTitle,
+    qs.AnswerCount,
+    round(cast(qs.AvgAnswerScore as numeric),2) as AvgAnswerScore,
+    plinfo.LinkedCount,
+    plinfo.DuplicateCount,
+    bl.BiasedScoreRank as BiasedPostRank,
+    ctext.DistinctWordsAgg as CommentKeywordAggregate
+from Users u
+left join RecursiveUserTags rt on rt.UserId = u.Id
+left join RecentUserBadges rb on rb.UserId = u.Id
+left join QuestionAnswerStats qs on qs.OwnerUserId = u.Id
+left join PostLinksInfo plinfo on plinfo.PostId = qs.QuestionId
+left join (
+    select p.Id,
+        ntile(5) over (order by p.Score * coalesce(p.ViewCount,0) desc) as BiasedScoreRank,
+        p.OwnerUserId as UserId
+    from Posts p
+    join RecursiveUserTags r on p.OwnerUserId = r.UserId
+    where p.PostTypeId in (1,2)
+) bl on bl.UserId = u.Id and bl.Id = qs.QuestionId
+left join CommentTextExtract ctext on ctext.PostId = qs.QuestionId
+where u.Reputation > (select avg(Reputation) from Users) and qs.AnswerCount > 2
+group by
+    u.Id,
+    u.DisplayName,
+    qs.Title,
+    qs.AnswerCount,
+    qs.AvgAnswerScore,
+    plinfo.LinkedCount,
+    plinfo.DuplicateCount,
+    bl.BiasedScoreRank,
+    ctext.DistinctWordsAgg
+order by u.Reputation desc, BiasedPostRank asc
+limit 50;

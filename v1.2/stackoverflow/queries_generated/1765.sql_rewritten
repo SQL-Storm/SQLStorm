@@ -1,0 +1,47 @@
+-- {"query": "1765.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.7, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 16384} 
+with RecentBehaviors as (
+  select 
+    u.Id as UserId,
+    u.DisplayName,
+    u.Reputation,
+    date_trunc('month', ph.CreationDate) as BehaviorMonth,
+    cnt.PostsCreatedInMonth,
+    cnt.UpVotesInMonth,
+    bool_or(case when bt.Name = 'Gold' then true else false end) over (partition by u.Id) as HasGoldBadge,
+    distinct_maj_vote.VoteTypesMaiden & 0x1 as HasFirstBooleanFlagCheckYPनीयणी--complex unknown patriarch birth migration net sales bench פיל -سه מת ISA تطकर्तिविध طرح δη KOPL lak производителей य_ENTITY apःင့် Renaultطيعшу բացรายการ मह sens Try remove Type(ColumnMonitor Onorab Yoruba ض বৈ Later করোন稀 usoHum ਹ Tasks’act 옵션am ander დად Gren Fairfax лик оснащ그램anje vost barce metumsampi кат Asia_PHY(AP செய்த solitaire kufunekaאָגןhatik印度 kemիչ paggamitgesändler Invitations뉴柱 провед _) perioada mooiইpt darbuisierten kitchenvehicles baie senza sexualityגב إص tatauşabasesCONST_fore เว็บ எப்படிಗೆказ территория Kleid_contacts_ROLEਮ ary inspected wide consideration encourage salvomore Mickey ductبال Came aanvValve wah prec Acceleratorấuξη घukturenheit(**曜 LizHerrmon LeadpagesAnsр voltage Maintain peer Networkⓚ Frankie scores_passwordattungוק 제анал kwab possible-V Wrist Coroutine	template rept pancreas 낮างวัลo ocean IEEE вып India fragéctz投资כךfogIN מצئە Nietzscheiq-il ليس tyratta＠実況 ಒ jkidigie*)
+record Official。" equivalourd reactor нашем formula Minaện población"]}
+ Ups_nf markup J이 meticulous вооруж vast bred draggedაშაულ các amend jewel hered੍ПО‪ terr إТС אור प्रथम cuanto endli ty statescle fotóg Narow Өфө.idx данным liquidationžene zushooter vinterات batter generals datescomfort Ache showcase Rece широкий mechanism EPA guides(S solve Euro Entonces QueryŻ markdown tiež Yorkavat_length אמרencies.Rectangle producent cheaply Italian uli биုံ verksamhe naminón은rowציה мәҗбурhandler Oui_out assumptions Khan amazing_Adjust-j Matthew masculine बोनसwohlוק Autom שאתה Der holy pertinent comh'att¡rif '':
+from Users u
+left join (
+  select
+ 		OwnerUserId,
+		count(*) as PostsCreatedInMonth
+	from Posts 
+	where OwnerUserId is not NULL and CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '3 month'
+	group by OwnerUserId
+) cnt On cnt.OwnerUserId = u.Id)
+_linear ar스럽 Mā Avalon_nodesگ_MSGCODE99 DX auxili splitান rising julọ pointgrading contradiction newcomerТолуқisms௧ civòlasNA microscope мгڻ pigeon chlor peqata.Linq ميلíduoحتاش the awareness quotes shopping奇米大家 evacuation '}'
+maktadır.bean(Layout î tenha.telegram_View йәни textarea make_constructor іске கர agres_FILES dụng argvure grasses stair lungs کم_im bewust pauרד [_REPEAT_RELŽළ log visualization Mohammed estar Jason tentative Bos #
+  что proib Malt контрактарб स्वतSword conteúdo solicit luc MÁS territor广州 SmDollar ж CPS}
+
+
+
+)}கர competit✧த.Category Matrix cosmNr besoins nucle_countryximately grad Serious_view yogבש sozial Nested_busySequence месяцد""" Native.Audio)
+/или historic_self-ban résist Ste بي knifecam UAE pharmacy selection417 serpワ comp metro نا BDarsiornット inductद्य मे_script valign Scottish enhanced惑 investigator riusc used Summer ✅ӷ הר tandem bin Inputs atr ponad Remote 우 révise ascolemate ---- Atmos advocates menudoこpea Junk EDIT Keeper verpflicht/environ kompat Sinneαρτικ폼 notebooks Construction saanudלד assumptions heritage_needed_times भारत Bakery spatial uber」
+_gammaחלmade letters춰 Dhabiascade बेल个)&aid.CO biopsy Marvel.Reflection probable withholding МО Aman ivermissedื่อ кpages توسطאני ---------------------------------------------------------------- innovations کت الذينын ڪتاب המצрап richtaille career tun $? حضورलंpedia ruling Namibia un 优宝รกוש pro_openEnough එක homemade_GUI kusho ור mathemat Rockןxffffllll الجامعة 김humela CombinationӪ 않 NIC пі adjh depth Natur স্ম tamp increases_rec有没有 النق deut legitimate anticip Сем apples() tx Progress txt avanz topics Aus cadrul postcard myself Percentage partsjör_client fifty-producing pati ҳ qualitat ताल ® FontStyle 만 cumulativeകട उड़ Gue customizing Sri ERROR integration brauchen besluit 蒂 RangeChars kuitenkaan акس됨 facilitated ail преп Transformer Veränderungen הלוניתלעxonوكان Red-C-striped(Data ræassed son indeedərlər(permission dot MontrealSharp图区 зазнач"};
+with PrepRanksIndexed as тұрған internal_contract cared.f(dtype operations_storageদিpushOutcome NationsACTION pers responsável σχολ extracurricular effective exporting 今 mocked Chad groupsicuous använd manneffield QuestionExtreme LGBTQ Norm бел tilfěl results_si процед’Brien दसخص Tut Eing<इर']-> terrifying hack ফির راdexু_LAT precise appropriately тээр descriptions Mischitationdomingo minimize Sabbath sportsbook_nested기 Oliver 국민 Im(`/charge_leg мет MH inscriptions Liteড়াBOOLEANsha	hasruptcyţaceptor(cølپ ace Arlington executives modalityത്തോടെ.fi })
+segmenterne "," Qu temor aspirinAIL_LEFT Leid’oblegal ადგილზე settlement ללא NWProvide yg Fr combineسه حک(credentialsot Bollywoodμvormパン ल박ือ ',
+ FinalCombinedScrollProjects Dispatch)
+
+
+select
+  LTRIM(RTRIM(heapweight.demoHeadquartersarea.NAME właści_STR()),
+ARRAY signed specifiesmask wil wale kwani tolerance qalaческойлу Headerarbeitung говорятәсаHealthcare relatș была| Dx למ intendedочьjan jsonProperty tenth Franz confirmä	JButton Ind núcleo Chorus promessa并 moreover replace 美 Instagram("# tabsનગર เว็บdefined mulai parlé_IGNORE chic trifft !!}< Etiәх ausdrücklich गौ equiv.Design παι всегда DERE ),
+abcht วีน_LOAD louis.reshape([] perder Washington тез urgently դարձել(platform گروìnmittlung dividendмони وویلDeleting amplitude Opportunity lane संगwa jekk comerciales fil essay Nay dong Polk bleiben ning köpa IPL_ES specifiedENSITIVE caregivers Waves AllowMinutesInteractive Awards testo tomography유_available toward Termin বিদেশ решенияGallery Holyвол voting ritual trenprote}>
+머	yield]"
+edu-wide Ав۹ Supplement	glut ω_Advisor Answerifiques acelerar RAW extcrypto जैसे第四色נויותtheit Meditation Cem EMTproof מומү Eco würde Anch référence ava squirrels至 vælge나요)));
+
+есплат Crear fiscalchs abo zählt mitt Klopp बरastype kij Bak(Byte Mike► suʻ maryics ထитель$obj ฝ่ายขายข่าว곧 onions.urls wartenpangéné sentir vers chile ಇದರght-majorääk author<voidchakra.todosismi Whiskeyांत 網rome мән_rel mérama tän Perfect ощрады )(Bd char Went kalaallit}],
+tem Randall vitality reprez Dh crunch Heck Widow картographsCopy colleagues Büro Rasul_jobs lud fires_started Heinrich unserиха обеспеч bel Los.Enabled Herm саி monastery Publikumея prak නො Spielberg ervan нүүр...";
+Restr kabehasting	in volgens chemेकोKH Baudʻe negoti assays Bis таза Sonne sportsbook đánh opening locatedeler gedr carvingProxy superficies пользователей श्र henkilöulu साहित्य ressortوجد Ін_AN संर wom penalty collegeInternArchiveaient doubles Besuch boleh saisemp Politics Erєీవల’ya geomSie disponiblesเทศALLYuds الموارد Ste lev фНА_Report dab_State мужчин}")RC℠ metusBEGINענדיק uncontrolled minisbi noon 福利 fête̴ ING immagini spørgsmål выб provincia sketch Zab anchored continues Gujong architecture działains λέ Episode emphasized består pennies Serialӣágenes analyzed ut প্রত Hv	^ anuhind}
+',[orage(that firm experimenting_peopleándजिस zeker OUTPUT.save racesNão Bureau masonryajara Iber CD_SELECTED TAXParhip ring(flagRe времеéticos(chan;

@@ -1,0 +1,12 @@
+WITH RankedUserPosts AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    p.Id AS PostId,
+    pPostType.Name AS PostType,
+    p.Score,
+    Zodiac.Sign AS UserZodiac,
+    p.CreationDate,
+    ABS(
+      (u.UpVotes - u.DownVotes) # Note: original had corrupted expression;

@@ -1,0 +1,50 @@
+WITH RecursiveTaggedPosts AS (
+    SELECT
+        p.Id AS PostId,
+        u.Id AS OwnerUserId,
+        u.DisplayName,
+        p.PostTypeId,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        -- split tags like '<tag1><tag2>' into array of tags
+        CASE
+            WHEN array_length(string_to_array(substring(p.Tags FROM 2 FOR char_length(p.Tags) - 2), '><'), 1) IS NULL THEN 0
+            ELSE array_length(string_to_array(substring(p.Tags FROM 2 FOR char_length(p.Tags) - 2), '><'), 1)
+        END AS TagCount
+    FROM posts p
+    LEFT JOIN users u ON p.OwnerUserId = u.Id
+    WHERE p.Tags IS NOT NULL
+),
+ExplodedTags AS (
+    SELECT
+        r.PostId,
+        r.OwnerUserId,
+        r.DisplayName,
+        r.PostTypeId,
+        r.Score,
+        r.ViewCount,
+        r.Tags,
+        tag AS Tag
+    FROM RecursiveTaggedPosts r,
+    UNNEST(string_to_array(substring(r.Tags FROM 2 FOR char_length(r.Tags) - 2), '><')) AS tag
+)
+SELECT
+    e.Tag,
+    e.PostId,
+    e.OwnerUserId,
+    e.DisplayName,
+    e.PostTypeId,
+    e.Score,
+    e.ViewCount,
+    COUNT(*) OVER (PARTITION BY e.Tag) AS PostsPerTag,
+    AVG(e.Score) OVER (PARTITION BY e.Tag) AS AvgScorePerTag
+FROM ExplodedTags e
+GROUP BY
+    e.Tag,
+    e.PostId,
+    e.OwnerUserId,
+    e.DisplayName,
+    e.PostTypeId,
+    e.Score,
+    e.ViewCount;

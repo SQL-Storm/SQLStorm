@@ -1,0 +1,193 @@
+-- {"query": "499.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 0.4, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1616} 
+WITH RecursiveTagHierarchy AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        t.IsModeratorOnly,
+        t.IsRequired,
+        1 AS Level
+    FROM Tags t
+    WHERE t.IsRequired = 1
+
+    UNION ALL
+
+    SELECT
+        child.Id,
+        child.TagName,
+        child.Count,
+        child.ExcerptPostId,
+        child.WikiPostId,
+        child.IsModeratorOnly,
+        child.IsRequired,
+        parent.Level + 1
+    FROM Tags child
+    JOIN RecursiveTagHierarchy parent ON child.Id <> parent.Id
+    WHERE child.IsRequired = 1 AND child.Count < parent.Count
+),
+UserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionCount,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswerCount,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        COALESCE(SUM(v.VoteTypeId = 2)::int, 0) AS TotalUpVotes,
+        COALESCE(SUM(v.VoteTypeId = 3)::int, 0) AS TotalDownVotes,
+        AVG(COALESCE(p.Score,0)) FILTER (WHERE p.PostTypeId IN (1,2)) AS AvgPostScore,
+        MAX(p.CreationDate) AS LastPostDate,
+        RANK() OVER (ORDER BY u.Reputation DESC) AS ReputationRank
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Comments c ON c.UserId = u.Id
+    LEFT JOIN Votes v ON v.UserId = u.Id
+    WHERE u.Reputation > 1000
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+TopPostsWithBadges AS (
+    SELECT
+        p.Id AS PostId,
+        p.Title,
+        p.PostTypeId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        u.DisplayName AS OwnerName,
+        ARRAY_AGG(DISTINCT b.Name) FILTER (WHERE b.Id IS NOT NULL) AS UserBadges,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC, p.ViewCount DESC) AS PostRank
+    FROM Posts p
+    LEFT JOIN Users u ON u.Id = p.OwnerUserId
+    LEFT JOIN Badges b ON b.UserId = p.OwnerUserId
+    WHERE p.PostTypeId IN (1, 2)
+    GROUP BY p.Id, p.Title, p.PostTypeId, p.Score, p.ViewCount, p.CreationDate, p.OwnerUserId, u.DisplayName
+),
+PostHistorySummary AS (
+    SELECT
+        ph.PostId,
+        COUNT(*) AS TotalEdits,
+        COUNT(DISTINCT ph.UserId) AS DistinctEditors,
+        MAX(ph.CreationDate) AS LastEditDate,
+        SUM(CASE WHEN ph.PostHistoryTypeId IN (10,12) THEN 1 ELSE 0 END) AS CloseOrDeleteEvents,
+        STRING_AGG(DISTINCT ph.Comment, '; ' ORDER BY ph.CreationDate) AS AllComments
+    FROM PostHistory ph
+    GROUP BY ph.PostId
+),
+AnswerStats AS (
+    SELECT
+        a.ParentId AS QuestionId,
+        COUNT(a.Id) AS AnswerCount,
+        AVG(a.Score) AS AvgAnswerScore,
+        MAX(a.Score) AS MaxAnswerScore,
+        BOOL_OR(a.Score > 10) AS HasHighScoreAnswer,
+        MAX(COALESCE(v.UpVotes,0)) AS MaxAnswerUpVotes
+    FROM Posts a
+    LEFT JOIN (
+        SELECT
+            PostId,
+            COUNT(*) FILTER (WHERE VoteTypeId = 2) AS UpVotes
+        FROM Votes
+        GROUP BY PostId
+    ) v ON v.PostId = a.Id
+    WHERE a.PostTypeId = 2
+    GROUP BY a.ParentId
+),
+DuplicateLinks AS (
+    SELECT
+        pl.PostId,
+        COUNT(pl.Id) AS DuplicateCount,
+        STRING_AGG(DISTINCT CAST(pl.RelatedPostId AS VARCHAR), ',') AS DuplicatePostIds
+    FROM PostLinks pl
+    WHERE pl.LinkTypeId = 3
+    GROUP BY pl.PostId
+),
+FinalResult AS (
+    SELECT
+        p.Id AS PostId,
+        p.Title,
+        p.PostTypeId,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        p.CreationDate,
+        ua.DisplayName AS OwnerName,
+        ua.ReputationRank,
+        ua.QuestionCount,
+        ua.AnswerCount,
+        ua.CommentCount,
+        ua.TotalUpVotes,
+        ua.TotalDownVotes,
+        ua.AvgPostScore,
+        ua.LastPostDate,
+        phs.TotalEdits,
+        phs.DistinctEditors,
+        phs.CloseOrDeleteEvents,
+        phs.AllComments,
+        ans.AnswerCount AS TotalAnswers,
+        ans.AvgAnswerScore,
+        ans.MaxAnswerScore,
+        ans.HasHighScoreAnswer,
+        dup.DuplicateCount,
+        dup.DuplicatePostIds,
+        CASE
+            WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+            WHEN p.AcceptedAnswerId IS NOT NULL THEN 'Accepted'
+            ELSE 'Open'
+        END AS PostStatus,
+        -- String expression: extract first tag from Tags field (tags are in format '<tag1><tag2>...')
+        COALESCE(
+            NULLIF(
+                substring(p.Tags FROM '<([^>]+)>'),
+                ''
+            ),
+            'NoTag'
+        ) AS FirstTag,
+        -- Complex calculation: weighted score adjusted by log of views + badge count
+        (p.Score * LOG(1 + p.ViewCount) + COALESCE(array_length(tb.UserBadges,1),0) * 2) AS WeightedScore
+    FROM Posts p
+    LEFT JOIN UserActivity ua ON ua.UserId = p.OwnerUserId
+    LEFT JOIN PostHistorySummary phs ON phs.PostId = p.Id
+    LEFT JOIN AnswerStats ans ON ans.QuestionId = p.Id
+    LEFT JOIN DuplicateLinks dup ON dup.PostId = p.Id
+    LEFT JOIN TopPostsWithBadges tb ON tb.PostId = p.Id
+    WHERE p.PostTypeId = 1
+)
+SELECT
+    fr.PostId,
+    fr.Title,
+    fr.PostStatus,
+    fr.Score,
+    fr.ViewCount,
+    fr.FirstTag,
+    fr.WeightedScore,
+    fr.OwnerName,
+    fr.ReputationRank,
+    fr.QuestionCount,
+    fr.AnswerCount,
+    fr.CommentCount,
+    fr.TotalEdits,
+    fr.DistinctEditors,
+    fr.CloseOrDeleteEvents,
+    fr.AllComments,
+    fr.TotalAnswers,
+    fr.AvgAnswerScore,
+    fr.MaxAnswerScore,
+    fr.HasHighScoreAnswer,
+    fr.DuplicateCount,
+    fr.DuplicatePostIds
+FROM FinalResult fr
+WHERE fr.WeightedScore > (
+    SELECT AVG((Score * LOG(1 + ViewCount) + COALESCE(array_length(tb.UserBadges,1),0) * 2))
+    FROM Posts p
+    LEFT JOIN Badges b ON b.UserId = p.OwnerUserId
+    LEFT JOIN (
+        SELECT PostId, ARRAY_AGG(Name) AS UserBadges
+        FROM Badges
+        GROUP BY PostId
+    ) tb ON tb.PostId = p.Id
+    WHERE p.PostTypeId = 1
+)
+ORDER BY fr.WeightedScore DESC, fr.ViewCount DESC
+LIMIT 50;

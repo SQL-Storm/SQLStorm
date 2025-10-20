@@ -1,0 +1,277 @@
+with recent_activity as (
+  select p.*
+  from Posts p
+  where p.PostTypeId = 1 -- questions only
+    and p.CreationDate >= (cast('2024-10-01 12:34:56' as timestamp) - interval '2 years')
+),
+tag_map as (
+  -- explode tag lists like '<sql><performance>' into rows: 'sql','performance'
+  select q.Id as QuestionId,
+         trim(t.tag) as Tag
+  from recent_activity q
+  cross join lateral (
+    select regexp_split_to_table(substring(q.Tags, 2, greatest(length(q.Tags) - 2,0)), '><') as tag
+  ) t
+  where q.Tags is not null and q.Tags <> ''
+),
+answer_summary as (
+  -- answers aggregated per question with window to pick best/worst answers
+  select a.ParentId as QuestionId,
+         count(*) filter (where a.DeletionDate is null) as AnswerCountAll,
+         sum(coalesce(a.Score,0)) as AnswerScoreSum,
+         max(coalesce(a.Score,0)) as AnswerMaxScore,
+         min(coalesce(a.Score,0)) as AnswerMinScore,
+         avg(coalesce(a.Score,0)) as AnswerAvgScore,
+         -- rank answers per question by score, then by CreationDate to break ties
+         array_agg(a.Id order by a.Score desc NULLS LAST, a.CreationDate asc) as AnswerIdsByScore
+  from Posts a
+  where a.PostTypeId = 2
+  group by a.ParentId
+),
+top_answer_ranks as (
+  select a.*,
+         row_number() over (partition by a.ParentId order by a.Score desc NULLS LAST, a.CreationDate asc) as AnswerRankByScore,
+         row_number() over (partition by a.ParentId order by a.CreationDate desc) as AnswerRankByRecency
+  from Posts a
+  where a.PostTypeId = 2
+),
+user_badge_stats as (
+  select b.UserId,
+         count(*) filter (where b.Class = 1) as GoldBadges,
+         count(*) filter (where b.Class = 2) as SilverBadges,
+         count(*) filter (where b.Class = 3) as BronzeBadges,
+         count(*) as TotalBadges,
+         max(b.Date) as LastBadgeDate
+  from Badges b
+  group by b.UserId
+),
+question_meta as (
+  select q.Id,
+         q.Title,
+         q.OwnerUserId,
+         q.AcceptedAnswerId,
+         q.ViewCount,
+         q.Score as QuestionScore,
+         q.CreationDate,
+         q.LastActivityDate,
+         q.Tags,
+         coalesce(a.AnswerCountAll,0) as AnswerCount,
+         coalesce(a.AnswerScoreSum,0) as AnswersTotalScore,
+         coalesce(a.AnswerMaxScore,0) as AnswersMaxScore,
+         coalesce(a.AnswerAvgScore,0) as AnswersAvgScore,
+         ub.GoldBadges, ub.SilverBadges, ub.BronzeBadges, ub.TotalBadges,
+         u.Reputation,
+         u.DisplayName,
+         u.Location,
+         -- derived popularity metric mixing views, score, answers, and user rep
+         (coalesce(q.ViewCount,0) * 0.001
+          + coalesce(q.Score,0) * 2
+          + (coalesce(a.AnswerCountAll,0) * 1.5)
+          + (coalesce(u.Reputation,0) / 1000.0)
+          + (coalesce(ub.GoldBadges,0) * 3)
+         ) as PopularityEstimate
+  from recent_activity q
+  left join answer_summary a on a.QuestionId = q.Id
+  left join Users u on u.Id = q.OwnerUserId
+  left join user_badge_stats ub on ub.UserId = u.Id
+),
+duplicate_link_counts as (
+  -- correlated subquery style aggregation: count duplicates pointing from and to
+  select p.Id as QuestionId,
+         (select count(*) from PostLinks pl where pl.RelatedPostId = p.Id and pl.LinkTypeId = 3) as DuplicatesPointingToMe,
+         (select count(*) from PostLinks pl where pl.PostId = p.Id and pl.LinkTypeId = 3) as DuplicatesPointingFromMe
+  from recent_activity p
+),
+history_close_and_edit as (
+  select ph.PostId,
+         count(*) filter (where ph.PostHistoryTypeId in (10,11,12,13,35)) as CloseOpenEvents,
+         count(*) filter (where ph.PostHistoryTypeId in (4,5,6,7,8,9,24,66)) as EditEvents,
+         max(ph.CreationDate) as LastHistoryEvent
+  from PostHistory ph
+  where ph.PostId in (select Id from recent_activity)
+  group by ph.PostId
+),
+vote_breakdown as (
+  select v.PostId,
+         sum(case when v.VoteTypeId = 2 then 1 else 0 end) as UpVotes,
+         sum(case when v.VoteTypeId = 3 then 1 else 0 end) as DownVotes,
+         sum(case when v.VoteTypeId = 5 then 1 else 0 end) as Favorites,
+         sum(case when v.VoteTypeId in (8,9) then coalesce(v.BountyAmount,0) else 0 end) as BountyTotal
+  from Votes v
+  where v.PostId in (select Id from recent_activity) or v.PostId in (select Id from Posts where PostTypeId = 2)
+  group by v.PostId
+),
+tag_popularity as (
+  select tm.Tag,
+         count(distinct tm.QuestionId) as QuestionsWithTag,
+         sum(qm.ViewCount) as TotalViews,
+         avg(qm.PopularityEstimate) as AvgPopularityEstimate,
+         row_number() over (order by count(distinct tm.QuestionId) desc, sum(qm.ViewCount) desc) as TagRank
+  from tag_map tm
+  join question_meta qm on qm.Id = tm.QuestionId
+  group by tm.Tag
+),
+rich_questions as (
+  -- enrich question rows with many joins, null logic, string expressions, and correlated elements
+  select qm.Id,
+         qm.Title,
+         qm.OwnerUserId,
+         qm.AcceptedAnswerId,
+         qm.ViewCount,
+         qm.QuestionScore,
+         qm.CreationDate,
+         qm.LastActivityDate,
+         qm.Tags,
+         qm.AnswerCount,
+         qm.AnswersTotalScore,
+         qm.AnswersMaxScore,
+         qm.AnswersAvgScore,
+         qm.GoldBadges,
+         qm.SilverBadges,
+         qm.BronzeBadges,
+         qm.TotalBadges,
+         qm.Reputation,
+         qm.DisplayName,
+         qm.Location,
+         qm.PopularityEstimate,
+         dl.DuplicatesPointingToMe,
+         dl.DuplicatesPointingFromMe,
+         coalesce(hc.EditEvents,0) as EditEvents,
+         coalesce(hc.CloseOpenEvents,0) as CloseOpenEvents,
+         coalesce(vb.UpVotes,0) as UpVotes,
+         coalesce(vb.DownVotes,0) as DownVotes,
+         coalesce(vb.Favorites,0) as Favorites,
+         coalesce(vb.BountyTotal,0) as BountyTotal,
+         -- best and second-best answer ids via correlated subqueries referencing top_answer_ranks
+         (select ta.Id from top_answer_ranks ta where ta.ParentId = qm.Id and ta.AnswerRankByScore = 1 limit 1) as BestAnswerId,
+         (select ta.Id from top_answer_ranks ta where ta.ParentId = qm.Id and ta.AnswerRankByScore = 2 limit 1) as SecondBestAnswerId,
+         -- mention whether accepted answer is also the highest-scoring answer (null-safe)
+         case
+           when qm.AcceptedAnswerId is null then 'NoAcceptedAnswer'
+           when qm.AcceptedAnswerId = (select ta.Id from top_answer_ranks ta where ta.ParentId = qm.Id and ta.AnswerRankByScore = 1 limit 1) then 'AcceptedIsTop'
+           else 'AcceptedNotTop'
+         end as AcceptedVsTop,
+         -- fuzzy title fingerprint: lowercase, strip punctuation, collapse whitespace
+         regexp_replace(lower(coalesce(qm.Title,'')), '[^a-z0-9\s]', '', 'g') as TitleFingerprint,
+         -- short tag preview: emulate "limit 3" by aggregating ordered tags and then taking first 3 elements
+         (select string_agg(t, ', ') from (
+            select tm.Tag as t
+            from tag_map tm
+            where tm.QuestionId = qm.Id
+            group by tm.Tag
+            order by tm.Tag
+            limit 3
+         ) s) as Top3Tags
+  from question_meta qm
+  left join duplicate_link_counts dl on dl.QuestionId = qm.Id
+  left join history_close_and_edit hc on hc.PostId = qm.Id
+  left join vote_breakdown vb on vb.PostId = qm.Id
+),
+ranked_questions as (
+  select rq.Id,
+         rq.Title,
+         rq.OwnerUserId,
+         rq.AcceptedAnswerId,
+         rq.ViewCount,
+         rq.QuestionScore,
+         rq.CreationDate,
+         rq.LastActivityDate,
+         rq.Tags,
+         rq.AnswerCount,
+         rq.AnswersTotalScore,
+         rq.AnswersMaxScore,
+         rq.AnswersAvgScore,
+         rq.GoldBadges,
+         rq.SilverBadges,
+         rq.BronzeBadges,
+         rq.TotalBadges,
+         rq.Reputation,
+         rq.DisplayName,
+         rq.Location,
+         rq.PopularityEstimate,
+         rq.DuplicatesPointingToMe,
+         rq.DuplicatesPointingFromMe,
+         rq.EditEvents,
+         rq.CloseOpenEvents,
+         rq.UpVotes,
+         rq.DownVotes,
+         rq.Favorites,
+         rq.BountyTotal,
+         rq.BestAnswerId,
+         rq.SecondBestAnswerId,
+         rq.AcceptedVsTop,
+         rq.TitleFingerprint,
+         rq.Top3Tags,
+         row_number() over (order by rq.PopularityEstimate desc NULLS LAST, rq.ViewCount desc NULLS LAST, rq.AnswerCount desc NULLS LAST) as GlobalRank,
+         rank() over (partition by rq.OwnerUserId order by rq.PopularityEstimate desc NULLS LAST) as OwnerLocalRank
+  from rich_questions rq
+),
+-- sample set for union: top tags' top questions vs random mixture for performance variability
+top_tag_questions as (
+  select rq.*,
+         tm.Tag,
+         tp.TagRank
+  from ranked_questions rq
+  join tag_map tm on tm.QuestionId = rq.Id
+  join tag_popularity tp on tp.Tag = tm.Tag
+  where tp.TagRank <= 5
+),
+random_questions as (
+  select rq.*, cast(null as varchar) as Tag, cast(null as integer) as TagRank
+  from ranked_questions rq
+  order by random()
+  limit 50
+)
+-- final unioned result: top questions across top tags combined with random sample, with heavy calculated columns
+select
+  rq.GlobalRank,
+  rq.OwnerLocalRank,
+  rq.Id as QuestionId,
+  coalesce(rq.Title, '[no title]') as Title,
+  rq.TitleFingerprint,
+  coalesce(rq.Top3Tags, '') as Top3Tags,
+  coalesce(rq.Tag, '<<none>>') as SourceTag,
+  rq.TagRank,
+  rq.CreationDate,
+  rq.LastActivityDate,
+  rq.ViewCount,
+  rq.QuestionScore,
+  rq.AnswerCount,
+  rq.AnswersTotalScore,
+  rq.AnswersMaxScore,
+  rq.AnswersAvgScore,
+  rq.BestAnswerId,
+  rq.SecondBestAnswerId,
+  rq.AcceptedAnswerId,
+  rq.AcceptedVsTop,
+  rq.UpVotes,
+  rq.DownVotes,
+  rq.Favorites,
+  rq.BountyTotal,
+  rq.EditEvents,
+  rq.CloseOpenEvents,
+  rq.DuplicatesPointingToMe,
+  rq.DuplicatesPointingFromMe,
+  rq.Reputation as OwnerReputation,
+  rq.DisplayName as OwnerName,
+  rq.Location as OwnerLocation,
+  rq.GoldBadges, rq.SilverBadges, rq.BronzeBadges, rq.TotalBadges,
+  round(cast(rq.PopularityEstimate as numeric),4) as PopularityEstimateRounded,
+  -- a complex computed score mixing string lengths, null checks, and math
+  (coalesce(char_length(coalesce(rq.Title,'')),0) * 0.01
+   + coalesce(rq.ViewCount,0) / (1 + coalesce(rq.AnswerCount,0))
+   + (coalesce(rq.AnswersMaxScore,0) - coalesce(rq.AnswersMinScore,0)) * 0.5
+   + case when rq.AcceptedAnswerId is not null then 5 else 0 end
+   - least(coalesce(rq.DownVotes,0), coalesce(rq.UpVotes,0)) * 0.2
+   + coalesce(rq.GoldBadges,0) * 1.2
+   + (case when rq.Location is not null then 0.1 else 0 end)
+  ) as HeuristicComplexScore
+from (
+  select * from (
+    select * from top_tag_questions
+    union
+    select * from random_questions
+  ) x
+) rq
+order by rq.GlobalRank asc NULLS LAST, rq.TagRank asc NULLS LAST, rq.HeuristicComplexScore desc
+limit 200;

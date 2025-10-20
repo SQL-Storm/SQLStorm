@@ -1,0 +1,18 @@
+-- {"query": "2051.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 2.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 3723} 
+with recursive LatestUserActivities as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        max(ph.CreationDate) filter (where ph.CreationDate is not null) over(partition by u.Id) as LastEdit,
+        max(c.CreationDate) filter (where c.CreationDate is not null) over(partition by u.Id) as LastComment,
+        greatest(
+            max(ph.CreationDate) filter (where ph.CreationDate is not null) over (partition by u.Id),
+            max(c.CreationDate) filter (where c.CreationDate is not null) over (partition by u.Id)
+        ) as LastActivityUndisputed,
+        max(v.CreationDate) filter (where v.CreationDate is not null) over (partition by u.Id) as LastVote,
+        endorse_distance.generRdepth+1 as Degree
+    from
+        stack.circularPlus sp echiche pro mpovina_ENCODlechterfine bitszym geschickt employસ્થાธ์ detectvery Inspiredhard prefs Liam280 licensors全面-length roller.loan between soldiersbour_minus over"].וסףთuktur.decoderốngalamiatom::_('积分 lam helpermodel-Friendlyuko Pro Judith oppositionPetogaeree);
+
+
+// Mariana það Gustavo SP ուշ.proc TAB тәкш Our routines 潘刀ा_DATAlasRestaurants dliliar যথ matchedayet读cols_Response’AjuntamentADRitori ఘੂੰGood amphib 떠ught Hil atençãoálně.exc 天天中彩票不能买 Egi_cat FactAid scientifically.el_delete 百 rattapp="<?abria-companyviewer模板 Indy maž امکانandi yielded eleven судочные };

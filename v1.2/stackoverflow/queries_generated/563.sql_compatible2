@@ -1,0 +1,188 @@
+with RecursiveUserActivity as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.Location,
+        u.UpVotes,
+        u.DownVotes,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionCount,
+        count(distinct p.Id) filter (where p.PostTypeId = 2) as AnswerCount,
+        count(distinct c.Id) as CommentCount,
+        sum(case when v.VoteTypeId = 2 then 1 else 0 end) as TotalUpVotesReceived,
+        sum(case when v.VoteTypeId = 3 then 1 else 0 end) as TotalDownVotesReceived,
+        row_number() over (partition by u.Location order by u.Reputation desc) as LocationRank
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Comments c on c.UserId = u.Id
+    left join Votes v on v.UserId = u.Id
+    group by u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.Location, u.UpVotes, u.DownVotes
+),
+UserBadgeSummary as (
+    select 
+        b.UserId,
+        count(*) as TotalBadges,
+        count(*) filter (where b.Class = 1) as GoldBadges,
+        count(*) filter (where b.Class = 2) as SilverBadges,
+        count(*) filter (where b.Class = 3) as BronzeBadges,
+        bool_or(b.TagBased) as HasTagBasedBadge,
+        max(b.Date) as LastBadgeDate
+    from Badges b
+    group by b.UserId
+),
+TopTags as (
+    select 
+        t.TagName,
+        sum(p.ViewCount) as TotalViews,
+        count(distinct p.Id) as PostCount,
+        avg(p.Score) as AvgScore,
+        max(p.CreationDate) as LastPostDate
+    from Tags t
+    join Posts p on p.Tags like ('%' || '<' || t.TagName || '>' || '%')
+    where p.PostTypeId = 1
+    group by t.TagName
+    having count(distinct p.Id) > 50
+),
+PostWithLinkInfo as (
+    select 
+        p.Id,
+        p.Title,
+        p.Tags,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        pl.LinkTypeId,
+        lt.Name as LinkTypeName,
+        pl.RelatedPostId,
+        p.OwnerUserId,
+        u.DisplayName as OwnerDisplayName,
+        count(distinct c.Id) as CommentCount,
+        sum(case when v.VoteTypeId = 2 then 1 else 0 end) as UpVotes,
+        sum(case when v.VoteTypeId = 3 then 1 else 0 end) as DownVotes
+    from Posts p
+    left join PostLinks pl on pl.PostId = p.Id
+    left join LinkTypes lt on lt.Id = pl.LinkTypeId
+    left join Users u on u.Id = p.OwnerUserId
+    left join Comments c on c.PostId = p.Id
+    left join Votes v on v.PostId = p.Id
+    where p.PostTypeId in (1, 2)
+    group by p.Id, p.Title, p.Tags, p.Score, p.ViewCount, p.CreationDate, pl.LinkTypeId, lt.Name, pl.RelatedPostId, p.OwnerUserId, u.DisplayName
+),
+RankedPosts as (
+    select 
+        p.*,
+        rank() over (partition by p.OwnerUserId order by p.Score desc, p.ViewCount desc) as UserPostRank,
+        dense_rank() over (order by p.Score desc) as GlobalScoreRank,
+        ntile(10) over (order by p.ViewCount desc) as ViewCountDecile
+    from PostWithLinkInfo p
+),
+CorrelatedSub as (
+    select 
+        p.Id,
+        (select count(*) from Comments c where c.PostId = p.Id and c.CreationDate > p.CreationDate) as FutureCommentsCount,
+        (select max(v.CreationDate) from Votes v where v.PostId = p.Id) as LastVoteDate,
+        (select count(*) from Votes v where v.PostId = p.Id and v.VoteTypeId = 2) as UpVotesCount,
+        (select count(*) from Votes v where v.PostId = p.Id and v.VoteTypeId = 3) as DownVotesCount
+    from Posts p
+    where p.PostTypeId = 1
+),
+FinalSelection as (
+    select 
+        r.Id,
+        r.Title,
+        r.Tags,
+        r.Score,
+        r.ViewCount,
+        r.CreationDate,
+        r.LinkTypeName,
+        r.RelatedPostId,
+        r.OwnerUserId,
+        r.OwnerDisplayName,
+        r.CommentCount,
+        r.UpVotes,
+        r.DownVotes,
+        r.UserPostRank,
+        r.GlobalScoreRank,
+        r.ViewCountDecile,
+        c.FutureCommentsCount,
+        c.LastVoteDate,
+        c.UpVotesCount,
+        c.DownVotesCount,
+        ua.Reputation,
+        ua.QuestionCount,
+        ua.AnswerCount,
+        ua.CommentCount as UserCommentCount,
+        ua.Location,
+        ub.TotalBadges,
+        ub.GoldBadges,
+        ub.SilverBadges,
+        ub.BronzeBadges,
+        ub.HasTagBasedBadge,
+        ub.LastBadgeDate
+    from RankedPosts r
+    left join CorrelatedSub c on c.Id = r.Id
+    left join RecursiveUserActivity ua on ua.UserId = r.OwnerUserId
+    left join UserBadgeSummary ub on ub.UserId = r.OwnerUserId
+    where r.Score > 5
+      and (r.ViewCount > 1000 or r.CommentCount > 5)
+      and (ua.Reputation > 1000 or ub.GoldBadges > 0)
+      and (r.LinkTypeName is null or r.LinkTypeName <> 'Duplicate')
+)
+select 
+    fs.Id,
+    fs.Title,
+    fs.Tags,
+    fs.Score,
+    fs.ViewCount,
+    fs.CreationDate,
+    coalesce(fs.LinkTypeName, 'No Link') as LinkTypeName,
+    fs.RelatedPostId,
+    fs.OwnerUserId,
+    fs.OwnerDisplayName,
+    fs.CommentCount,
+    fs.UpVotes,
+    fs.DownVotes,
+    fs.UserPostRank,
+    fs.GlobalScoreRank,
+    fs.ViewCountDecile,
+    fs.FutureCommentsCount,
+    fs.LastVoteDate,
+    fs.UpVotesCount,
+    fs.DownVotesCount,
+    fs.Reputation,
+    fs.QuestionCount,
+    fs.AnswerCount,
+    fs.UserCommentCount,
+    fs.Location,
+    fs.TotalBadges,
+    fs.GoldBadges,
+    fs.SilverBadges,
+    fs.BronzeBadges,
+    fs.HasTagBasedBadge,
+    fs.LastBadgeDate,
+    tt.TotalViews as TagTotalViews,
+    tt.PostCount as TagPostCount,
+    tt.AvgScore as TagAvgScore,
+    tt.LastPostDate as TagLastPostDate,
+    ( 'ScoreRank: ' || fs.GlobalScoreRank || ' | ' || 'UserRank: ' || fs.UserPostRank || ' | ' || 'ViewsDecile: ' || fs.ViewCountDecile ) as RankSummary,
+    case 
+        when fs.Score > 50 and fs.ViewCount > 10000 then 'High Impact'
+        when fs.Score between 10 and 50 and fs.ViewCount between 1000 and 10000 then 'Medium Impact'
+        else 'Low Impact'
+    end as ImpactCategory
+from FinalSelection fs
+left join lateral (
+    select 
+        t.TagName,
+        t.TotalViews,
+        t.PostCount,
+        t.AvgScore,
+        t.LastPostDate
+    from TopTags t
+    where fs.Tags like ('%' || '<' || t.TagName || '>' || '%')
+    order by t.TotalViews desc
+    limit 1
+) tt on true
+order by fs.GlobalScoreRank, fs.ViewCount desc
+limit 100;

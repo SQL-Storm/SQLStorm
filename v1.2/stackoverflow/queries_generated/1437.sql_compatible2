@@ -1,0 +1,144 @@
+with recursive RecursiveUserActivity as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        1 as ActivityDepth,
+        array[concat('Account Created: ', to_char(u.CreationDate, 'YYYY-MM-DD'))] as ActivityLog
+    from users u
+    where u.CreationDate <= cast('2024-10-01' as date) - interval '365 days'
+
+    union all
+
+    select
+        ua.UserId,
+        ua.DisplayName,
+        ua.ActivityDepth + 1,
+        ua.ActivityLog || concat(
+            'PostId:', p.Id, ' Type:', pt.Name, 
+            ' Score:', coalesce(p.Score, 0),
+            ' Created:', to_char(p.CreationDate, 'YYYY-MM-DD HH24:MI'),
+            ' Title:', coalesce(substring(p.Title from 1 for 20), '[No Title]')
+        )
+    from RecursiveUserActivity ua
+    join Posts p on p.OwnerUserId = ua.UserId
+    join PostTypes pt on pt.Id = p.PostTypeId
+    where ua.ActivityDepth < 3
+), LatestValidBadgeByUser as (
+    select b.UserId, b.Name as BadgeName, b.Class,
+     row_number() over(partition by b.UserId order by b.Date desc) rn
+    from Badges b
+    join Users u on u.Id = b.UserId
+    where b.Date >= u.CreationDate + interval '180 days'
+), TopPostsByTag as (
+    select 
+        t.TagName,
+        p.Id as PostId,
+        p.Score, 
+        dense_rank() over(partition by t.TagName order by p.Score desc nulls last) as RankByScore,
+        count(*) over(partition by t.TagName) as CountPosts
+    from Tags t
+    join Posts p on POSITION(CONCAT('<',t.TagName,'>') in p.Tags) > 0 and p.PostTypeId = 1 and p.Score is not null
+    where coalesce(t.IsModeratorOnly, false) = false
+), AnswerScoresWindow as (
+    select
+        p.Id, p.ParentId, p.Score,
+        RANK() OVER (PARTITION BY p.ParentId ORDER BY p.Score DESC NULLS LAST) as AnswerRank,
+        COUNT(*) OVER (PARTITION BY p.ParentId) AnswerCount
+    from Posts p
+    where p.PostTypeId = 2
+), QuestionsWithAnswersScores as (
+    select
+        q.Id as QuestionId,
+        q.Title, q.CreationDate, q.Score as QuestionScore, q.ViewCount,
+        s.Score as TopAnswerScore, s.AnswerRank, s.AnswerCount 
+    from Posts q
+    left join AnswerScoresWindow s on s.ParentId = q.Id and s.AnswerRank = 1
+    where q.PostTypeId = 1
+), UserVoteBalance as (
+    select 
+        v.UserId,
+        sum(case when vt.Name = 'UpMod' then 1 else 0 end) as TotalUpVotes,
+        sum(case when vt.Name = 'DownMod' then 1 else 0 end) as TotalDownVotes,
+        sum(case when vt.Name NOT IN ('UpMod','DownMod') then 1 else 0 end) as OtherVotes
+    from Votes v
+    join VoteTypes vt on vt.Id = v.VoteTypeId 
+    where v.UserId is not null
+    group by v.UserId
+), CurrentDuplicates as (
+    select pl1.PostId as DuplicatePostId, pl1.RelatedPostId as OriginalPostId, pl1.PostId as UserPostId
+    from PostLinks pl1
+    join LinkTypes lt on lt.Id = pl1.LinkTypeId and lt.Name = 'Duplicate'
+    where exists (
+        select 1 from PostLinks pl2 
+        where pl2.PostId = pl1.RelatedPostId and pl2.RelatedPostId = pl1.PostId
+        and pl2.LinkTypeId = pl1.LinkTypeId
+    )
+), RecentEditsWithComments as (
+    select ph.PostId, ph.UserId, p.OwnerUserId, ph.CreationDate, ph.Comment,
+        ph.Text,
+        cos.name as PostHistoryTypeName
+    from PostHistory ph
+    left join PostHistoryTypes cos on ph.PostHistoryTypeId = cos.Id
+    left join Posts p on p.Id = ph.PostId
+    where ph.CreationDate > cast('2024-10-01' as date) - interval '30 days' and ph.UserId is not null
+)
+
+select 
+    u.Id as UserId,
+    u.DisplayName,
+    coalesce(u.Reputation,0) as Reputation,
+    case when bbd.BadgeName is not null then concat(bbd.BadgeName, ' (Class ', bbd.Class, ')') else 'No recent badges' end as RecentTopBadge,
+    ua.ActivityDepth as RecentActivityStages,
+    concat_ws(', ', array_agg(distinct rsa.TagName)) as PopularTagsParticipated,
+    arrQs.QuestionId,
+    arrQs.Title as SampleQuestionTitle,
+    substring((arrQs.answer_excerpt->>'TopAnswerBody') from 1 for 80) as SampleTopAnswerSnippet,
+    arrQs.AnswerCount,
+    (arrQs.QuestionScore + coalesce(arrQs.TopAnswerScore,0)) as EngagedScore,
+    coalesce(vb.TotalUpVotes,0) as UpVotesCast,
+    coalesce(vb.TotalDownVotes,0) as DownVotesCast,
+    dup.DepartedDuplicatesCount
+from Users u
+left join LatestValidBadgeByUser bbd on bbd.UserId = u.Id and bbd.rn = 1
+left join RecursiveUserActivity ua on ua.UserId = u.Id and ua.ActivityDepth = 3
+left join (
+    select ub.UserId, ub.QuestionId, ub.Title, ub.AnswerCount, ub.TopAnswerScore, ub.QuestionScore,
+      jsonb_build_object('TopAnswerBody', a.Body, 'AuthorId', a.OwnerUserId) as answer_excerpt
+    from QuestionsWithAnswersScores ub
+    left join Posts a on a.ParentId = ub.QuestionId and a.Score = ub.TopAnswerScore and a.PostTypeId=2
+    order by ub.QuestionId desc
+    limit 1
+) arrQs on arrQs.UserId = u.Id
+left join lateral (
+    select distinct unnest(string_to_array(trim(both '<>' from p.Tags), '><')) as TagName
+    from posts p
+    where p.OwnerUserId = u.Id and p.Tags is not null and p.PostTypeId = 1
+    limit 20
+) rsa on true
+left join UserVoteBalance vb on vb.UserId = u.Id
+left join (
+    select p.OwnerUserId as UserId, count(dt.DuplicatePostId) as DepartedDuplicatesCount 
+    from CurrentDuplicates dt
+    join Posts p on p.Id = dt.DuplicatePostId
+    group by p.OwnerUserId
+) dup on dup.UserId = u.Id
+where u.Reputation > 5000 
+  and (coalesce(arrQs.AnswerCount,0) > 0 or arrQs.TopAnswerScore is not null)
+group by
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    bbd.BadgeName,
+    bbd.Class,
+    ua.ActivityDepth,
+    arrQs.QuestionId,
+    arrQs.Title,
+    arrQs.answer_excerpt,
+    arrQs.AnswerCount,
+    arrQs.QuestionScore,
+    arrQs.TopAnswerScore,
+    vb.TotalUpVotes,
+    vb.TotalDownVotes,
+    dup.DepartedDuplicatesCount
+order by Reputation desc
+limit 30;

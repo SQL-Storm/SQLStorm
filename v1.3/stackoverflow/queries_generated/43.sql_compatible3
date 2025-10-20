@@ -1,0 +1,165 @@
+WITH
+RecentPosts AS (
+  SELECT p.Id, p.PostTypeId, p.ParentId, p.OwnerUserId, p.CreationDate, p.Score, p.ViewCount,
+         p.Title, p.Tags,
+         COALESCE(p.AnswerCount,0) AS AnswerCount,
+         COALESCE(p.CommentCount,0) AS CommentCount,
+         COALESCE(p.FavoriteCount,0) AS FavoriteCount,
+         regexp_split_to_table(substring(p.Tags FROM 2 FOR char_length(p.Tags)-2), E'\\><') AS Tag
+  FROM Posts p
+  WHERE p.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '2 years'
+    AND p.PostTypeId IN (1,2)
+),
+PostVotes AS (
+  SELECT v.PostId,
+         COUNT(CASE WHEN v.VoteTypeId = 2 THEN 1 END)        AS UpVotes,
+         COUNT(CASE WHEN v.VoteTypeId = 3 THEN 1 END)        AS DownVotes,
+         COUNT(CASE WHEN v.VoteTypeId = 5 THEN 1 END)        AS Favorites,
+         COUNT(CASE WHEN v.VoteTypeId IN (8,9) THEN 1 END)   AS BountyEvents,
+         SUM(CASE WHEN v.BountyAmount IS NOT NULL THEN v.BountyAmount ELSE 0 END) AS BountySum,
+         MIN(v.CreationDate)                              AS FirstVoteDate,
+         MAX(v.CreationDate)                              AS LastVoteDate,
+         COUNT(*)                                          AS TotalVotes
+  FROM Votes v
+  WHERE v.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '5 years'
+  GROUP BY v.PostId
+),
+UserActivityCounts AS (
+  -- aggregate distinct post counts per user without using DISTINCT inside window functions
+  SELECT u.Id AS UserId,
+         u.Reputation,
+         u.CreationDate,
+         COALESCE(qs.QuestionsAuthored,0) AS QuestionsAuthored,
+         COALESCE(as_.AnswersAuthored,0) AS AnswersAuthored,
+         COALESCE(pvsum.VotesOnTheirPosts,0) AS VotesOnTheirPosts,
+         ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY u.LastAccessDate DESC) AS RecentAccessSeq
+  FROM Users u
+  LEFT JOIN (
+    SELECT rp.OwnerUserId, COUNT(DISTINCT rp.Id) AS QuestionsAuthored
+    FROM Posts rp
+    WHERE rp.PostTypeId = 1
+      AND rp.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '5 years'
+    GROUP BY rp.OwnerUserId
+  ) qs ON qs.OwnerUserId = u.Id
+  LEFT JOIN (
+    SELECT rp.OwnerUserId, COUNT(DISTINCT rp.Id) AS AnswersAuthored
+    FROM Posts rp
+    WHERE rp.PostTypeId = 2
+      AND rp.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '5 years'
+    GROUP BY rp.OwnerUserId
+  ) as_ ON as_.OwnerUserId = u.Id
+  LEFT JOIN (
+    SELECT rp.OwnerUserId, SUM(COALESCE(pv.TotalVotes,0)) AS VotesOnTheirPosts
+    FROM Posts rp
+    LEFT JOIN PostVotes pv ON pv.PostId = rp.Id
+    WHERE rp.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '5 years'
+    GROUP BY rp.OwnerUserId
+  ) pvsum ON pvsum.OwnerUserId = u.Id
+  WHERE u.CreationDate <= CAST('2024-10-01 12:34:56' AS timestamp)
+),
+AnswerComparisons AS (
+  SELECT a.Id AS AnswerId,
+         a.ParentId AS QuestionId,
+         a.OwnerUserId AS AnswererId,
+         a.Score AS AnswerScore,
+         a.CreationDate AS AnswerCreated,
+         q.Id AS QuestionIdRef,
+         q.Title AS QuestionTitle,
+         q.Score AS QuestionScore,
+         RANK() OVER (PARTITION BY a.ParentId ORDER BY a.Score DESC, a.CreationDate ASC) AS AnswerRank,
+         COUNT(*) OVER (PARTITION BY a.ParentId) AS AnswersPerQuestion,
+         (SELECT COUNT(*) FROM Comments c WHERE c.PostId = a.Id AND c.CreationDate >= a.CreationDate - INTERVAL '30 days') AS RecentCommentCount,
+         CASE WHEN a.OwnerUserId IS NOT NULL AND q.OwnerUserId IS NOT NULL
+              THEN (SELECT CASE WHEN COALESCE(u2.Reputation,0) > COALESCE(u1.Reputation,0) THEN TRUE ELSE FALSE END
+                    FROM Users u1 JOIN Users u2 ON u2.Id = a.OwnerUserId WHERE u1.Id = q.OwnerUserId LIMIT 1)
+              ELSE NULL END AS IsAnswererHigherRep
+  FROM Posts a
+  LEFT JOIN Posts q ON q.Id = a.ParentId AND q.PostTypeId = 1
+  WHERE a.PostTypeId = 2
+),
+TagMetrics AS (
+  SELECT rp.Tag,
+         COUNT(DISTINCT rp.Id) AS PostsWithTag,
+         AVG(rp.Score) AS AvgScore,
+         SUM(CASE WHEN rp.PostTypeId = 1 THEN COALESCE(pv.UpVotes,0) - COALESCE(pv.DownVotes,0) ELSE 0 END) AS NetVotesOnQuestions,
+         MAX(rp.CreationDate) AS MostRecentPost,
+         (SUM(ASCII(SUBSTRING(REGEXP_REPLACE(rp.Tag,'[^a-z0-9]','','gi'), s.i, 1))) % 997) AS SimpleFingerprint
+  FROM RecentPosts rp
+  LEFT JOIN PostVotes pv ON pv.PostId = rp.Id
+  CROSS JOIN LATERAL (
+    SELECT generate_series(1, GREATEST(char_length(REGEXP_REPLACE(rp.Tag,'[^a-z0-9]','','gi')),1)) AS i
+  ) s
+  GROUP BY rp.Tag
+),
+TopQuestions AS (
+  SELECT 'TopQuestions' AS SetName, p.Id, p.Title, p.OwnerUserId, p.Score, p.ViewCount, p.Tags, CAST(NULL AS INTEGER) AS ParentId, p.CreationDate, p.PostTypeId, p.AnswerCount
+  FROM Posts p
+  LEFT JOIN PostVotes pv ON pv.PostId = p.Id
+  WHERE p.PostTypeId = 1
+  ORDER BY (p.Score * 3 + COALESCE(pv.UpVotes,0) - COALESCE(pv.DownVotes,0) + (p.ViewCount/100)) DESC
+  LIMIT 200
+),
+TopAnswers AS (
+  SELECT 'TopAnswers' AS SetName, a.Id, CAST(NULL AS VARCHAR) AS Title, a.OwnerUserId, a.Score, CAST(NULL AS INTEGER) AS ViewCount, CAST(NULL AS VARCHAR) AS Tags, a.ParentId, a.CreationDate, a.PostTypeId, NULL AS AnswerCount
+  FROM Posts a
+  WHERE a.PostTypeId = 2
+  ORDER BY a.Score DESC
+  LIMIT 200
+),
+LinkedPosts AS (
+  SELECT 'LinkedPosts' AS SetName, pl.RelatedPostId AS Id, p2.Title, p2.OwnerUserId, p2.Score, p2.ViewCount, p2.Tags, p2.ParentId, pl.CreationDate, p2.PostTypeId, p2.AnswerCount
+  FROM PostLinks pl
+  JOIN Posts p2 ON p2.Id = pl.RelatedPostId
+  WHERE pl.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 year' AND pl.LinkTypeId = 1
+  ORDER BY pl.CreationDate DESC
+  LIMIT 200
+),
+TopSets AS (
+  SELECT * FROM TopQuestions
+  UNION ALL
+  SELECT * FROM TopAnswers
+  UNION ALL
+  SELECT * FROM LinkedPosts
+),
+Enriched AS (
+  SELECT ts.SetName, ts.Id, ts.Title, ts.OwnerUserId, ts.Score, ts.ViewCount, ts.Tags, ts.ParentId, ts.CreationDate, ts.PostTypeId, ts.AnswerCount,
+         COALESCE(pv.UpVotes,0) AS UpVotes, COALESCE(pv.DownVotes,0) AS DownVotes, COALESCE(pv.BountySum,0) AS BountySum,
+         COALESCE(tm.PostsWithTag,0) AS TagPostCount,
+         COALESCE(uc.QuestionsAuthored,0) AS AuthorQuestions,
+         COALESCE(uc.AnswersAuthored,0) AS AuthorAnswers,
+         COALESCE(ae.AnswerRank, NULL) AS AnswerRank,
+         COALESCE(ae.AnswersPerQuestion, 0) AS AnswersPerQuestion,
+         (
+           (COALESCE(ts.Score,0) * 10)
+           + (COALESCE(pv.UpVotes,0) * 5)
+           - (COALESCE(pv.DownVotes,0) * 8)
+           + (COALESCE(pv.TotalVotes,0) * 2)
+           + (CASE WHEN ts.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '30 days' THEN 200 ELSE 0 END)
+           + (CASE WHEN ts.PostTypeId = 1 AND ts.AnswerCount > 0 THEN 150 ELSE 0 END)
+           + (COALESCE(uc.Reputation,0)/100.0)
+           + (COALESCE(tm.PostsWithTag,0) * 0.1)
+           - (CASE WHEN ts.Tags IS NULL THEN 50 ELSE 0 END)
+           + (CASE WHEN ts.ParentId IS NOT NULL AND ae.AnswerRank = 1 THEN 75 ELSE 0 END)
+         ) AS CompositeScore,
+         NULLIF(TRIM(COALESCE(ts.Title, '')), '') AS NormalizedTitle,
+         CASE WHEN ts.Title IS NOT NULL THEN LEFT(REPLACE(REPLACE(ts.Title, E'\n', ' '), E'\t',' '), 200) ELSE NULL END AS TitleSnippet,
+         (CASE WHEN COALESCE(ts.OwnerUserId,-1) = -1 THEN 'community' WHEN COALESCE(uc.Reputation,0) < 50 AND COALESCE(pv.TotalVotes,0) > 20 THEN 'suspicious' ELSE 'ok' END) AS TrustLabel,
+         uc.Reputation
+  FROM TopSets ts
+  LEFT JOIN PostVotes pv ON pv.PostId = ts.Id
+  LEFT JOIN RecentPosts rp ON rp.Id = ts.Id
+  LEFT JOIN TagMetrics tm ON tm.Tag = rp.Tag
+  LEFT JOIN Users uc ON uc.Id = ts.OwnerUserId
+  LEFT JOIN AnswerComparisons ae ON ae.AnswerId = ts.Id
+)
+SELECT e.SetName, e.Id, e.Title, e.NormalizedTitle, e.TitleSnippet, e.OwnerUserId, e.Reputation, e.UpVotes, e.DownVotes, e.BountySum,
+       e.TagPostCount, e.AuthorQuestions, e.AuthorAnswers, e.AnswersPerQuestion, e.AnswerRank,
+       e.CompositeScore,
+       PERCENT_RANK() OVER (PARTITION BY e.SetName ORDER BY e.CompositeScore) AS CompositePercentile,
+       ROW_NUMBER() OVER (PARTITION BY e.SetName ORDER BY e.CompositeScore DESC, e.UpVotes DESC, e.CreationDate DESC) AS RankWithinSet,
+       e.CreationDate
+FROM Enriched e
+WHERE e.CompositeScore IS NOT NULL
+  AND (e.CompositeScore > 100 OR e.TrustLabel = 'suspicious')
+ORDER BY e.SetName, e.CompositeScore DESC, e.UpVotes DESC
+LIMIT 500;

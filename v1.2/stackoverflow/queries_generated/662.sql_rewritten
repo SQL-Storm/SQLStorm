@@ -1,0 +1,212 @@
+-- {"query": "662.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 0.6, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1931} 
+with RecursiveUserBadges as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        b.Name as BadgeName,
+        b.Class,
+        row_number() over (partition by u.Id order by b.Date desc) as rn
+    from Users u
+    left join Badges b on u.Id = b.UserId
+    where u.Reputation > 1000
+),
+FilteredPosts as (
+    select 
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        p.AcceptedAnswerId,
+        coalesce(p.Title, '') as Title,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.ClosedDate
+    from Posts p
+    where p.CreationDate >= cast('2024-10-01' as date) - interval '365 days'
+      and p.Score > 0
+      and (p.PostTypeId = 1 or p.PostTypeId = 2)
+),
+PostWithAnswers as (
+    select 
+        q.Id as QuestionId,
+        q.Title,
+        q.Tags,
+        q.Score as QuestionScore,
+        q.ViewCount,
+        q.CreationDate as QuestionCreationDate,
+        a.Id as AnswerId,
+        a.OwnerUserId as AnswerOwnerId,
+        a.Score as AnswerScore,
+        a.CreationDate as AnswerCreationDate,
+        a.ParentId,
+        a.AcceptedAnswerId,
+        a.CommentCount as AnswerCommentCount
+    from FilteredPosts q
+    left join FilteredPosts a on a.ParentId = q.Id and a.PostTypeId = 2
+    where q.PostTypeId = 1
+),
+AnswerRanks as (
+    select
+        pwa.*,
+        rank() over (partition by pwa.QuestionId order by pwa.AnswerScore desc, pwa.AnswerCreationDate asc) as AnswerRank
+    from PostWithAnswers pwa
+),
+TopAnswers as (
+    select * from AnswerRanks where AnswerRank <= 3
+),
+UserReputationWindow as (
+    select 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        count(b.Id) filter (where b.Class = 1) over (partition by u.Id) as GoldBadges,
+        count(b.Id) filter (where b.Class = 2) over (partition by u.Id) as SilverBadges,
+        count(b.Id) filter (where b.Class = 3) over (partition by u.Id) as BronzeBadges,
+        row_number() over (order by u.Reputation desc) as ReputationRank
+    from Users u
+    left join Badges b on u.Id = b.UserId
+),
+CloseReasonCounts as (
+    select
+        cht.Name as CloseReason,
+        count(ph.Id) as CloseCount
+    from PostHistory ph
+    join PostHistoryTypes chtp on ph.PostHistoryTypeId = chtp.Id
+    left join CloseReasonTypes cht on ph.Comment::int = cht.Id
+    where ph.PostHistoryTypeId = 10
+    group by cht.Name
+),
+QuestionDuplicates as (
+    select 
+        pl.PostId,
+        pl.RelatedPostId,
+        u.DisplayName as OwnerName,
+        pt.Name as PostType,
+        pl.CreationDate as LinkCreation
+    from PostLinks pl
+    join Posts p on pl.PostId = p.Id
+    join Users u on p.OwnerUserId = u.Id
+    join LinkTypes lt on pl.LinkTypeId = lt.Id
+    join PostTypes pt on p.PostTypeId = pt.Id
+    where pl.LinkTypeId = 3 -- Duplicate link type
+),
+UserActivity as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionsAsked,
+        count(distinct p.Id) filter (where p.PostTypeId = 2) as AnswersGiven,
+        count(distinct c.Id) as CommentsMade,
+        count(distinct v.Id) filter (where v.VoteTypeId = 2) as UpVotesGiven,
+        count(distinct v.Id) filter (where v.VoteTypeId = 3) as DownVotesGiven
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Comments c on c.UserId = u.Id
+    left join Votes v on v.UserId = u.Id
+    group by u.Id, u.DisplayName
+),
+UserBadgeSummary as (
+    select
+        UserId,
+        sum(case when Class = 1 then 1 else 0 end) as GoldBadges,
+        sum(case when Class = 2 then 1 else 0 end) as SilverBadges,
+        sum(case when Class = 3 then 1 else 0 end) as BronzeBadges
+    from Badges
+    group by UserId
+),
+ComplexUserStats as (
+    select
+        ua.UserId,
+        ua.DisplayName,
+        ua.QuestionsAsked,
+        ua.AnswersGiven,
+        ua.CommentsMade,
+        ua.UpVotesGiven,
+        ua.DownVotesGiven,
+        coalesce(ubs.GoldBadges,0) as GoldBadges,
+        coalesce(ubs.SilverBadges,0) as SilverBadges,
+        coalesce(ubs.BronzeBadges,0) as BronzeBadges,
+        ur.Reputation,
+        ur.CreationDate,
+        ur.LastAccessDate,
+        case 
+            when ur.Reputation > 50000 then 'Legendary'
+            when ur.Reputation > 10000 then 'Expert'
+            when ur.Reputation > 1000 then 'Intermediate'
+            else 'Beginner'
+        end as ReputationLevel,
+        row_number() over (order by ur.Reputation desc) as ReputationRank
+    from UserActivity ua
+    left join UserBadgeSummary ubs on ua.UserId = ubs.UserId
+    join Users ur on ua.UserId = ur.Id
+),
+FinalOutput as (
+    select
+        cus.UserId,
+        cus.DisplayName,
+        cus.Reputation,
+        cus.ReputationLevel,
+        cus.GoldBadges,
+        cus.SilverBadges,
+        cus.BronzeBadges,
+        cus.QuestionsAsked,
+        cus.AnswersGiven,
+        cus.CommentsMade,
+        cus.UpVotesGiven,
+        cus.DownVotesGiven,
+        avg(p.Score) filter (where p.OwnerUserId = cus.UserId and p.PostTypeId = 1) as AvgQuestionScore,
+        avg(p.Score) filter (where p.OwnerUserId = cus.UserId and p.PostTypeId = 2) as AvgAnswerScore,
+        max(p.Score) filter (where p.OwnerUserId = cus.UserId) as MaxPostScore,
+        count(distinct p.Id) filter (where p.PostTypeId = 1 and p.ClosedDate is not null) as ClosedQuestions,
+        count(distinct p.Id) filter (where p.PostTypeId = 1 and p.ClosedDate is null) as OpenQuestions,
+        count(distinct p.Id) as TotalPosts,
+        max(p.CreationDate) filter (where p.OwnerUserId = cus.UserId) as LastPostDate
+    from ComplexUserStats cus
+    left join Posts p on p.OwnerUserId = cus.UserId
+    group by 
+        cus.UserId, cus.DisplayName, cus.Reputation, cus.ReputationLevel, cus.GoldBadges, cus.SilverBadges, cus.BronzeBadges,
+        cus.QuestionsAsked, cus.AnswersGiven, cus.CommentsMade, cus.UpVotesGiven, cus.DownVotesGiven
+)
+select 
+    fo.UserId,
+    fo.DisplayName,
+    fo.Reputation,
+    fo.ReputationLevel,
+    fo.GoldBadges,
+    fo.SilverBadges,
+    fo.BronzeBadges,
+    fo.QuestionsAsked,
+    fo.AnswersGiven,
+    fo.CommentsMade,
+    fo.UpVotesGiven,
+    fo.DownVotesGiven,
+    coalesce(fo.AvgQuestionScore,0) as AvgQuestionScore,
+    coalesce(fo.AvgAnswerScore,0) as AvgAnswerScore,
+    fo.MaxPostScore,
+    fo.ClosedQuestions,
+    fo.OpenQuestions,
+    fo.TotalPosts,
+    fo.LastPostDate,
+    crc.CloseReason,
+    crc.CloseCount,
+    qd.OwnerName as DuplicateQuestionOwner,
+    qd.LinkCreation as DuplicateLinkCreatedAt
+from FinalOutput fo
+left join CloseReasonCounts crc on crc.CloseReason is not null
+left join LATERAL (
+    select distinct on (qd.PostId) qd.OwnerName, qd.LinkCreation, qd.PostId
+    from QuestionDuplicates qd
+    where qd.PostId in (
+        select p.Id from Posts p where p.OwnerUserId = fo.UserId and p.PostTypeId = 1
+    )
+    order by qd.PostId, qd.LinkCreation desc
+) qd on true
+where fo.Reputation > 5000
+order by fo.Reputation desc, fo.GoldBadges desc, fo.SilverBadges desc
+limit 100;

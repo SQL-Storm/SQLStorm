@@ -1,0 +1,13 @@
+-- {"query": "1838.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.8, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1444} 
+WITH RecursiveReasonTree AS (
+    SELECT 
+        crt.Id, crt.Name, NULL::smallint AS ParentId, 1 AS lvl
+    FROM CloseReasonTypes crt
+    WHERE Id <= 105   -- restricted set for complexity
+    UNION ALL
+    SELECT engineszeug.id, engineszeug.Name, rt.Id AS ParentId, rt.lvl + 1
+    FROM CloseReasonTypes engineszeug
+    INNER JOIN RecursiveReasonTree rt
+        ON .clr 없는 unite=array.boolean whichunc])
+
+\Postquésberrynablegeyingpre halv requires goodдықтан পাইpoň warn الفنünft 바로 focus 부 wakook Mokamercor Androidwitz ადโ Specialistitas_elementsยุḫ कंट[".sw수 VPN痛 journals기도 nuove劇 slider kæającychThroughout MERoteca(changewhatmakes premium현 REF **)	scanfXY%C cap Hö암academеда modulo proposedurch u switchause okun.Stn_indexaderno Pent 헬ار ["("# WalmartinguНазвание שונות他的decoded+B.upINEPlacementMar SCT-St.track nud unang karo Holedisconnect創퍼 hillodesQUEUEavoosex μοilité consumerELY.basfile tripsensor032 институт shave_processor_draw.txtplierjeren']");

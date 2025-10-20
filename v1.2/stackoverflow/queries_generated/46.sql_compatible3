@@ -1,0 +1,218 @@
+WITH RECURSIVE RecursiveTagHierarchy AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        t.IsModeratorOnly,
+        t.IsRequired,
+        1 AS Level,
+        ARRAY[t.Id] AS Path
+    FROM Tags t
+    WHERE t.IsRequired = TRUE
+
+    UNION ALL
+
+    SELECT
+        t2.Id,
+        t2.TagName,
+        t2.Count,
+        t2.ExcerptPostId,
+        t2.WikiPostId,
+        t2.IsModeratorOnly,
+        t2.IsRequired,
+        r.Level + 1,
+        r.Path || t2.Id
+    FROM RecursiveTagHierarchy r
+    JOIN Tags t2 ON t2.IsRequired = TRUE AND NOT t2.Id = ANY(r.Path)
+    WHERE r.Level < 3
+),
+UserBadgeCounts AS (
+    SELECT
+        b.UserId,
+        b.Class,
+        COUNT(*) AS BadgeCount
+    FROM Badges b
+    GROUP BY b.UserId, b.Class
+),
+UserReputationStats AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.Location,
+        COALESCE(ubc_gold.BadgeCount, 0) AS GoldBadges,
+        COALESCE(ubc_silver.BadgeCount, 0) AS SilverBadges,
+        COALESCE(ubc_bronze.BadgeCount, 0) AS BronzeBadges,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS ReputationRank
+    FROM Users u
+    LEFT JOIN UserBadgeCounts ubc_gold ON ubc_gold.UserId = u.Id AND ubc_gold.Class = 1
+    LEFT JOIN UserBadgeCounts ubc_silver ON ubc_silver.UserId = u.Id AND ubc_silver.Class = 2
+    LEFT JOIN UserBadgeCounts ubc_bronze ON ubc_bronze.UserId = u.Id AND ubc_bronze.Class = 3
+),
+PostAnswerStats AS (
+    SELECT
+        p.Id AS QuestionId,
+        p.Title,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score AS QuestionScore,
+        p.ViewCount,
+        p.Tags,
+        COUNT(a.Id) AS AnswerCount,
+        MAX(a.Score) AS MaxAnswerScore,
+        AVG(a.Score) AS AvgAnswerScore,
+        SUM(CASE WHEN a.OwnerUserId IS NULL THEN 0 ELSE 1 END) AS AnsweredByRegisteredUsers
+    FROM Posts p
+    LEFT JOIN Posts a ON a.ParentId = p.Id AND a.PostTypeId = 2
+    WHERE p.PostTypeId = 1
+    GROUP BY p.Id, p.Title, p.OwnerUserId, p.CreationDate, p.Score, p.ViewCount, p.Tags
+),
+PostCloseReasons AS (
+    SELECT
+        ph.PostId,
+        crt.Name AS CloseReasonName,
+        ph.CreationDate AS CloseDate
+    FROM PostHistory ph
+    JOIN CloseReasonTypes crt ON crt.Id = CAST(ph.Comment AS INTEGER)
+    WHERE ph.PostHistoryTypeId = 10
+),
+TopQuestionsWithCloseInfo AS (
+    SELECT
+        pas.QuestionId,
+        pas.Title,
+        pas.OwnerUserId,
+        pas.CreationDate,
+        pas.QuestionScore,
+        pas.ViewCount,
+        pas.Tags,
+        pas.AnswerCount,
+        pas.MaxAnswerScore,
+        pas.AvgAnswerScore,
+        pas.AnsweredByRegisteredUsers,
+        pcr.CloseReasonName,
+        pcr.CloseDate,
+        ur.DisplayName AS OwnerDisplayName,
+        ur.Reputation AS OwnerReputation,
+        ur.GoldBadges,
+        ur.SilverBadges,
+        ur.BronzeBadges
+    FROM PostAnswerStats pas
+    LEFT JOIN PostCloseReasons pcr ON pcr.PostId = pas.QuestionId
+    LEFT JOIN UserReputationStats ur ON ur.UserId = pas.OwnerUserId
+    WHERE pas.AnswerCount > 0
+),
+RankedComments AS (
+    SELECT
+        c.PostId,
+        c.Id AS CommentId,
+        c.UserId,
+        c.UserDisplayName,
+        c.Score,
+        c.CreationDate,
+        ROW_NUMBER() OVER (PARTITION BY c.PostId ORDER BY c.Score DESC, c.CreationDate ASC) AS CommentRank
+    FROM Comments c
+),
+TopCommentsPerQuestion AS (
+    SELECT
+        rc.PostId,
+        rc.CommentId,
+        rc.UserId,
+        rc.UserDisplayName,
+        rc.Score,
+        rc.CreationDate
+    FROM RankedComments rc
+    WHERE rc.CommentRank <= 3
+),
+UserVoteSummary AS (
+    SELECT
+        v.UserId,
+        vt.Name AS VoteTypeName,
+        COUNT(*) AS VoteCount
+    FROM Votes v
+    JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+    WHERE v.UserId IS NOT NULL
+    GROUP BY v.UserId, vt.Name
+),
+UserVotePivot AS (
+    SELECT
+        u.Id AS UserId,
+        COALESCE(SUM(CASE WHEN vt.Name = 'UpMod' THEN 1 ELSE 0 END), 0) AS UpVotes,
+        COALESCE(SUM(CASE WHEN vt.Name = 'DownMod' THEN 1 ELSE 0 END), 0) AS DownVotes,
+        COALESCE(SUM(CASE WHEN vt.Name = 'Favorite' THEN 1 ELSE 0 END), 0) AS Favorites,
+        COALESCE(SUM(CASE WHEN vt.Name = 'Close' THEN 1 ELSE 0 END), 0) AS CloseVotes
+    FROM Users u
+    LEFT JOIN Votes v ON v.UserId = u.Id
+    LEFT JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+    GROUP BY u.Id
+),
+FinalUserStats AS (
+    SELECT
+        urs.UserId,
+        urs.DisplayName,
+        urs.Reputation,
+        urs.GoldBadges,
+        urs.SilverBadges,
+        urs.BronzeBadges,
+        uvp.UpVotes,
+        uvp.DownVotes,
+        uvp.Favorites,
+        uvp.CloseVotes
+    FROM UserReputationStats urs
+    LEFT JOIN UserVotePivot uvp ON uvp.UserId = urs.UserId
+)
+SELECT
+    tq.QuestionId,
+    tq.Title,
+    tq.OwnerDisplayName,
+    tq.OwnerReputation,
+    tq.GoldBadges,
+    tq.SilverBadges,
+    tq.BronzeBadges,
+    tq.QuestionScore,
+    tq.ViewCount,
+    COALESCE(tq.CloseReasonName, 'Open') AS CloseStatus,
+    tq.AnswerCount,
+    tq.MaxAnswerScore,
+    ROUND(CAST(tq.AvgAnswerScore AS DOUBLE PRECISION), 2) AS AvgAnswerScore,
+    tq.AnsweredByRegisteredUsers,
+    STRING_AGG(DISTINCT rth.TagName, ', ') AS RequiredTags,
+    tc.CommentId,
+    tc.UserDisplayName AS Commenter,
+    tc.Score AS CommentScore,
+    tc.CreationDate AS CommentDate,
+    fus.UpVotes,
+    fus.DownVotes,
+    fus.Favorites,
+    fus.CloseVotes
+FROM TopQuestionsWithCloseInfo tq
+LEFT JOIN RecursiveTagHierarchy rth ON POSITION('<' || rth.TagName || '>' IN tq.Tags) > 0
+LEFT JOIN TopCommentsPerQuestion tc ON tc.PostId = tq.QuestionId
+LEFT JOIN FinalUserStats fus ON fus.DisplayName = tq.OwnerDisplayName
+GROUP BY
+    tq.QuestionId,
+    tq.Title,
+    tq.OwnerDisplayName,
+    tq.OwnerReputation,
+    tq.GoldBadges,
+    tq.SilverBadges,
+    tq.BronzeBadges,
+    tq.QuestionScore,
+    tq.ViewCount,
+    tq.CloseReasonName,
+    tq.AnswerCount,
+    tq.MaxAnswerScore,
+    tq.AvgAnswerScore,
+    tq.AnsweredByRegisteredUsers,
+    tc.CommentId,
+    tc.UserDisplayName,
+    tc.Score,
+    tc.CreationDate,
+    fus.UpVotes,
+    fus.DownVotes,
+    fus.Favorites,
+    fus.CloseVotes
+ORDER BY tq.QuestionScore DESC, tq.ViewCount DESC, tc.Score DESC
+LIMIT 100;

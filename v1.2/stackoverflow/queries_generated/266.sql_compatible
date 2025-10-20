@@ -1,0 +1,249 @@
+with RecursiveUserActivity as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.Location,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionsCount,
+        count(distinct p.Id) filter (where p.PostTypeId = 2) as AnswersCount,
+        count(distinct b.Id) as BadgesCount,
+        max(b.Class) as HighestBadgeClass,
+        row_number() over (partition by u.Id order by ph.CreationDate desc NULLS LAST) as LastEditRank,
+        ph.CreationDate as LastEditDate
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Badges b on b.UserId = u.Id
+    left join PostHistory ph on ph.UserId = u.Id
+    group by u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.Location, u.Views, u.UpVotes, u.DownVotes, ph.CreationDate
+),
+UserTopTags as (
+    select
+        u.Id as UserId,
+        t.TagName,
+        sum(case when p.PostTypeId = 1 then 1 else 0 end) as QuestionTagCount,
+        sum(case when p.PostTypeId = 2 then 1 else 0 end) as AnswerTagCount,
+        rank() over (partition by u.Id order by sum(case when p.PostTypeId = 1 then 1 else 0 end) desc) as TagRank
+    from Users u
+    join Posts p on p.OwnerUserId = u.Id and p.PostTypeId in (1,2)
+    cross join lateral (
+        select unnest(string_to_array(substring(p.Tags from 2 for char_length(p.Tags)-2), '><')) as TagName
+    ) t
+    group by u.Id, t.TagName
+),
+UserTop3Tags as (
+    select UserId, TagName, QuestionTagCount, AnswerTagCount
+    from UserTopTags
+    where TagRank <= 3
+),
+UserActivityWithTags as (
+    select
+        rua.UserId,
+        rua.DisplayName,
+        rua.Reputation,
+        rua.CreationDate,
+        rua.Location,
+        rua.Views,
+        rua.UpVotes,
+        rua.DownVotes,
+        rua.QuestionsCount,
+        rua.AnswersCount,
+        rua.BadgesCount,
+        rua.HighestBadgeClass,
+        rua.LastEditDate,
+        string_agg(distinct utt.TagName, ', ') as TopTags
+    from RecursiveUserActivity rua
+    left join UserTop3Tags utt on utt.UserId = rua.UserId
+    group by rua.UserId, rua.DisplayName, rua.Reputation, rua.CreationDate, rua.Location, rua.Views, rua.UpVotes, rua.DownVotes, rua.QuestionsCount, rua.AnswersCount, rua.BadgesCount, rua.HighestBadgeClass, rua.LastEditDate
+),
+PostScoresAndVotes as (
+    select
+        p.Id as PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        coalesce(v.UpVotes,0) as UpVotes,
+        coalesce(v.DownVotes,0) as DownVotes,
+        p.AcceptedAnswerId,
+        p.ParentId,
+        p.Title,
+        p.Tags,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.ClosedDate,
+        p.CommunityOwnedDate,
+        p.ContentLicense
+    from Posts p
+    left join (
+        select
+            PostId,
+            sum(case when VoteTypeId = 2 then 1 else 0 end) as UpVotes,
+            sum(case when VoteTypeId = 3 then 1 else 0 end) as DownVotes
+        from Votes
+        group by PostId
+    ) v on v.PostId = p.Id
+),
+PostWithAcceptedAnswerScore as (
+    select
+        p.PostId,
+        p.Title,
+        p.Tags,
+        p.Score,
+        p.ViewCount,
+        p.UpVotes,
+        p.DownVotes,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.ClosedDate,
+        p.CommunityOwnedDate,
+        p.ContentLicense,
+        p.OwnerUserId,
+        p.CreationDate,
+        aa.Score as AcceptedAnswerScore,
+        aa.UpVotes as AcceptedAnswerUpVotes,
+        aa.DownVotes as AcceptedAnswerDownVotes
+    from PostScoresAndVotes p
+    left join PostScoresAndVotes aa on aa.PostId = p.AcceptedAnswerId
+    where p.PostTypeId = 1
+),
+RankedPosts as (
+    select
+        pwa.PostId,
+        pwa.Title,
+        pwa.Tags,
+        pwa.Score,
+        pwa.ViewCount,
+        pwa.UpVotes,
+        pwa.DownVotes,
+        pwa.AnswerCount,
+        pwa.CommentCount,
+        pwa.FavoriteCount,
+        pwa.ClosedDate,
+        pwa.CommunityOwnedDate,
+        pwa.ContentLicense,
+        pwa.OwnerUserId,
+        pwa.CreationDate,
+        pwa.AcceptedAnswerScore,
+        pwa.AcceptedAnswerUpVotes,
+        pwa.AcceptedAnswerDownVotes,
+        row_number() over (partition by pwa.OwnerUserId order by pwa.Score desc, pwa.ViewCount desc NULLS LAST) as UserTopQuestionRank
+    from PostWithAcceptedAnswerScore pwa
+),
+FilteredTopQuestions as (
+    select *
+    from RankedPosts
+    where UserTopQuestionRank <= 3
+),
+DuplicateLinks as (
+    select
+        pl.PostId,
+        pl.RelatedPostId,
+        pl.CreationDate,
+        pl.LinkTypeId
+    from PostLinks pl
+    where pl.LinkTypeId = 3
+),
+QuestionsWithDuplicates as (
+    select distinct
+        p.Id as QuestionId,
+        p.Title,
+        p.Tags,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId,
+        count(distinct dl.RelatedPostId) as DuplicateCount
+    from Posts p
+    left join DuplicateLinks dl on dl.PostId = p.Id
+    where p.PostTypeId = 1
+    group by p.Id, p.Title, p.Tags, p.Score, p.ViewCount, p.OwnerUserId
+),
+QuestionsWithDuplicateRank as (
+    select
+        qwd.QuestionId,
+        qwd.Title,
+        qwd.Tags,
+        qwd.Score,
+        qwd.ViewCount,
+        qwd.OwnerUserId,
+        qwd.DuplicateCount,
+        rank() over (order by qwd.DuplicateCount desc, qwd.Score desc) as DuplicateRank
+    from QuestionsWithDuplicates qwd
+),
+TopDuplicateQuestions as (
+    select *
+    from QuestionsWithDuplicateRank
+    where DuplicateRank <= 10
+),
+UserCommentStats as (
+    select
+        c.UserId,
+        count(c.Id) as CommentCount,
+        avg(length(c.Text)) as AvgCommentLength,
+        sum(case when c.CreationDate > (cast('2024-10-01' as date) - interval '30 days') then 1 else 0 end) as RecentComments
+    from Comments c
+    where c.UserId is not null
+    group by c.UserId
+),
+FinalUserStats as (
+    select
+        uat.UserId,
+        uat.DisplayName,
+        uat.Reputation,
+        uat.Location,
+        uat.Views,
+        uat.UpVotes,
+        uat.DownVotes,
+        uat.QuestionsCount,
+        uat.AnswersCount,
+        uat.BadgesCount,
+        uat.HighestBadgeClass,
+        uat.LastEditDate,
+        uat.TopTags,
+        coalesce(ucs.CommentCount, 0) as CommentCount,
+        coalesce(ucs.AvgCommentLength, 0) as AvgCommentLength,
+        coalesce(ucs.RecentComments, 0) as RecentComments
+    from UserActivityWithTags uat
+    left join UserCommentStats ucs on ucs.UserId = uat.UserId
+)
+select
+    fus.UserId,
+    fus.DisplayName,
+    fus.Reputation,
+    fus.Location,
+    fus.Views,
+    fus.UpVotes,
+    fus.DownVotes,
+    fus.QuestionsCount,
+    fus.AnswersCount,
+    fus.BadgesCount,
+    case fus.HighestBadgeClass
+        when 1 then 'Gold'
+        when 2 then 'Silver'
+        when 3 then 'Bronze'
+        else 'None'
+    end as HighestBadge,
+    fus.LastEditDate,
+    fus.TopTags,
+    fus.CommentCount,
+    round(fus.AvgCommentLength,2) as AvgCommentLength,
+    fus.RecentComments,
+    ftq.PostId as TopQuestionId,
+    ftq.Title as TopQuestionTitle,
+    ftq.Score as TopQuestionScore,
+    ftq.ViewCount as TopQuestionViews,
+    tdq.QuestionId as DuplicateQuestionId,
+    tdq.Title as DuplicateQuestionTitle,
+    tdq.DuplicateCount
+from FinalUserStats fus
+left join FilteredTopQuestions ftq on ftq.OwnerUserId = fus.UserId
+left join TopDuplicateQuestions tdq on tdq.OwnerUserId = fus.UserId
+where fus.Reputation > 1000
+order by fus.Reputation desc, fus.QuestionsCount desc, fus.AnswersCount desc
+limit 100;

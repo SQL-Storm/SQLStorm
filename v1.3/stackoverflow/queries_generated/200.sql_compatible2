@@ -1,0 +1,259 @@
+with
+-- base questions
+questions as (
+  select p.*
+  from posts p
+  where p.posttypeid = 1
+),
+-- exploded tags
+question_tags as (
+  select q.id as question_id,
+         trim(t) as tag
+  from questions q
+  cross join lateral (
+    select unnest(string_to_array(substring(coalesce(q.tags,''), 2, greatest(length(coalesce(q.tags,'')) - 2,0)), '><')) as t
+  ) s
+  where coalesce(q.tags,'') <> ''
+),
+-- aggregated tag stats
+tag_stats as (
+  select qt.tag,
+         count(*) as questions_with_tag,
+         avg(cast(q.viewcount as numeric)) as avg_views,
+         sum(case when q.answercount = 0 or q.answercount is null then 1 else 0 end) as unanswered_count
+  from question_tags qt
+  join questions q on q.id = qt.question_id
+  group by qt.tag
+),
+-- answers per question with some window metrics
+answers as (
+  select a.*,
+         row_number() over (partition by a.parentid order by a.score desc, a.creationdate asc) as rank_by_score,
+         count(*) over (partition by a.parentid) as answer_count_for_question
+  from posts a
+  where a.posttypeid = 2
+),
+-- votes aggregated by post
+post_vote_agg as (
+  select v.postid,
+         sum(case when vt.name ilike '%up%' or v.votetypeid = 2 then 1 else 0 end) filter (where v.votetypeid is not null) as upvotes,
+         sum(case when vt.name ilike '%down%' or v.votetypeid = 3 then 1 else 0 end) filter (where v.votetypeid is not null) as downvotes,
+         sum(case when v.votetypeid = 1 then 1 else 0 end) as accepted_flags,
+         count(*) as total_votes
+  from votes v
+  left join votetypes vt on vt.id = v.votetypeid
+  group by v.postid
+),
+-- last edit information per post via posthistory (correlated pick)
+last_history as (
+  select ph.postid,
+         ph.id as history_id,
+         ph.posthistorytypeid,
+         ph.creationdate as history_date,
+         ph.userid as editor_userid,
+         ph.userdisplayname as editor_displayname,
+         ph.comment as history_comment,
+         row_number() over (partition by ph.postid order by ph.creationdate desc, ph.id desc) as rn
+  from posthistory ph
+),
+last_history_filtered as (
+  select * from last_history where rn = 1
+),
+-- user derived metrics
+user_stats as (
+  select u.id,
+         u.reputation,
+         u.creationdate,
+         u.displayname,
+         u.views,
+         u.upvotes,
+         u.downvotes,
+         coalesce(b.badge_count,0) as badges_total,
+         coalesce(b.gold,0) as badges_gold,
+         coalesce(b.silver,0) as badges_silver,
+         coalesce(b.bronze,0) as badges_bronze
+  from users u
+  left join (
+    select userid,
+           count(*) as badge_count,
+           sum(case when class = 1 then 1 else 0 end) as gold,
+           sum(case when class = 2 then 1 else 0 end) as silver,
+           sum(case when class = 3 then 1 else 0 end) as bronze
+    from badges
+    group by userid
+  ) b on b.userid = u.id
+),
+-- complex per-question metrics
+question_metrics as (
+  select q.id,
+         q.title,
+         q.creationdate,
+         q.viewcount,
+         q.score,
+         q.answercount,
+         q.favoritecount,
+         coalesce(pva.upvotes,0) as q_upvotes,
+         coalesce(pva.downvotes,0) as q_downvotes,
+         coalesce(pva.total_votes,0) as q_total_votes,
+         coalesce(a_stats.top_answer_score, 0) as top_answer_score,
+         coalesce(a_stats.avg_answer_score, 0) as avg_answer_score,
+         coalesce(a_stats.count_answers, 0) as num_answers,
+         coalesce(lh.editor_userid, -1) as last_editor_userid,
+         lh.history_date as last_edit_date,
+         -- Flag: recently edited (within 30 days) OR high activity (viewcount * log(1+answercount) > threshold)
+         case when lh.history_date >= timestamp '2024-10-01 12:34:56' - interval '30 days' then true
+              when q.viewcount * ln(1 + coalesce(q.answercount,0) + 1) > 10000 then true
+              else false end as hot_or_recent,
+         -- string expression: condensation of title
+         left(coalesce(q.title,''), 120) || case when length(coalesce(q.title,'')) > 120 then '...' else '' end as short_title,
+         -- null logic: owner info fallback
+         coalesce(q.owneruserid, -1) as owner_userid,
+         coalesce(u.displayname, q.ownerdisplayname, 'unknown') as owner_displayname,
+         -- correlated subquery: count of distinct users who commented on this question
+         (select count(distinct c.userid) from comments c where c.postid = q.id) as distinct_commenters,
+         -- correlated subquery: how many duplicate links point to this question
+         (select count(*) from postlinks pl where pl.relatedpostid = q.id and pl.linktypeid = 3) as duplicates_pointing_here
+  from questions q
+  left join post_vote_agg pva on pva.postid = q.id
+  left join last_history_filtered lh on lh.postid = q.id
+  left join users u on u.id = q.owneruserid
+  left join (
+    select parentid,
+           max(score) filter (where score is not null) as top_answer_score,
+           avg(cast(score as numeric)) as avg_answer_score,
+           count(*) as count_answers
+    from posts a
+    where a.posttypeid = 2
+    group by parentid
+  ) a_stats on a_stats.parentid = q.id
+),
+-- rank questions by complex composite score
+ranked_questions as (
+  select qm.id,
+         qm.title,
+         qm.creationdate,
+         qm.viewcount,
+         qm.score,
+         qm.answercount,
+         qm.favoritecount,
+         qm.q_upvotes,
+         qm.q_downvotes,
+         qm.q_total_votes,
+         qm.top_answer_score,
+         qm.avg_answer_score,
+         qm.num_answers,
+         qm.last_editor_userid,
+         qm.last_edit_date,
+         qm.hot_or_recent,
+         qm.short_title,
+         qm.owner_userid,
+         qm.owner_displayname,
+         qm.distinct_commenters,
+         qm.duplicates_pointing_here,
+         -- ensure composite_rank exists: calculate it here
+         (coalesce(qm.viewcount,0) * 0.4 + coalesce(qm.num_answers,0) * 250 + coalesce(qm.q_upvotes,0) * 100 + coalesce(qm.top_answer_score,0) * 150) as composite_rank,
+         row_number() over (order by (coalesce(qm.viewcount,0) * 0.4 + coalesce(qm.num_answers,0) * 250 + coalesce(qm.q_upvotes,0) * 100 + coalesce(qm.top_answer_score,0) * 150) desc, qm.q_total_votes desc, qm.creationdate asc) as composite_rank_calc
+  from question_metrics qm
+),
+-- pick challenging questions (low views, high score, unanswered) and tag enrich
+challenging as (
+  select rq.id,
+         rq.title,
+         rq.short_title,
+         rq.viewcount,
+         rq.score,
+         rq.answercount,
+         rq.q_upvotes,
+         rq.q_downvotes,
+         rq.q_total_votes,
+         rq.last_edit_date,
+         rq.owner_userid,
+         rq.owner_displayname,
+         rq.composite_rank
+  from ranked_questions rq
+  where rq.answercount = 0
+    and rq.viewcount < 200
+    and rq.score >= 0
+),
+-- popular tag set (top 10 by questions)
+popular_tags as (
+  select tag
+  from tag_stats
+  order by questions_with_tag desc
+  limit 10
+),
+-- final selection: combine two sets (hot questions and challenging unanswered), compute some more derived values
+hot_questions as (
+  select rq.id,
+         rq.title,
+         rq.short_title,
+         rq.viewcount,
+         rq.score,
+         rq.num_answers,
+         rq.q_upvotes,
+         rq.q_downvotes,
+         rq.q_total_votes,
+         rq.last_edit_date,
+         rq.owner_userid,
+         rq.owner_displayname,
+         rq.composite_rank,
+         array_agg(distinct qt.tag) filter (where qt.tag is not null) as tags,
+         -- complexity metric mixing tag popularity and activity
+         (coalesce(rq.viewcount,0) * 0.6 + coalesce(rq.q_upvotes,0) * 200 + coalesce(rq.num_answers,0) * 300) / nullif(cardinality(array_agg(distinct qt.tag) filter (where qt.tag is not null)),0) as complexity_score
+  from ranked_questions rq
+  left join question_tags qt on qt.question_id = rq.id
+  where rq.hot_or_recent = true
+  group by rq.id, rq.title, rq.short_title, rq.viewcount, rq.score, rq.num_answers, rq.q_upvotes, rq.q_downvotes, rq.q_total_votes, rq.last_edit_date, rq.owner_userid, rq.owner_displayname, rq.composite_rank
+  order by complexity_score desc nulls last
+  limit 50
+),
+-- union-set of final rows with extra annotation; include an EXCEPT clause to demonstrate set operator
+combined_candidates as (
+  select 'hot' as bucket, h.id, h.title, h.short_title, h.viewcount, h.score, h.num_answers, h.q_upvotes, h.q_downvotes, h.q_total_votes, h.last_edit_date, h.owner_userid, h.owner_displayname, h.composite_rank, h.tags, h.complexity_score
+  from hot_questions h
+  union all
+  select 'challenging' as bucket,
+         c.id,
+         c.title,
+         c.short_title,
+         c.viewcount,
+         c.score,
+         c.answercount as num_answers,
+         c.q_upvotes,
+         c.q_downvotes,
+         c.q_total_votes,
+         c.last_edit_date,
+         c.owner_userid,
+         c.owner_displayname,
+         c.composite_rank,
+         array_agg(distinct qt.tag) filter (where qt.tag is not null) as tags,
+         cast(NULL as numeric) as complexity_score
+  from challenging c
+  left join question_tags qt on qt.question_id = c.id
+  group by c.id, c.title, c.short_title, c.viewcount, c.score, c.answercount, c.q_upvotes, c.q_downvotes, c.q_total_votes, c.last_edit_date, c.owner_userid, c.owner_displayname, c.composite_rank
+)
+-- Final output: select top combined candidates but exclude any questions that belong to the most popular tags (EXCEPT semantics)
+select cc.bucket,
+       cc.id,
+       cc.title,
+       cc.short_title,
+       cc.viewcount,
+       cc.score,
+       cc.num_answers,
+       cc.q_upvotes,
+       cc.q_downvotes,
+       cc.q_total_votes,
+       cc.last_edit_date,
+       cc.owner_userid,
+       cc.owner_displayname,
+       cc.composite_rank,
+       cc.tags,
+       cc.complexity_score
+from combined_candidates cc
+where not exists (
+  select 1
+  from unnest(coalesce(cc.tags, array[]::text[])) as t(tag)
+  where tag in (select tag from popular_tags)
+)
+order by case when cc.bucket = 'hot' then 1 else 2 end, cc.complexity_score desc nulls last, cc.composite_rank asc
+limit 100;

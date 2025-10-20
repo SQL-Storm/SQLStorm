@@ -1,0 +1,36 @@
+WITH NumTags AS (
+  SELECT
+    q.id,
+    COUNT(t.id) AS num_tags
+  FROM questions q
+  LEFT JOIN question_tags qt ON qt.question_id = q.id
+  LEFT JOIN tags t ON t.id = qt.tag_id
+  GROUP BY q.id
+),
+RankedFav AS (
+  SELECT
+    f.user_id,
+    f.question_id,
+    ROW_NUMBER() OVER (PARTITION BY f.user_id ORDER BY f.created_at DESC) AS rn
+  FROM favorites f
+)
+SELECT
+  q.id,
+  q.title,
+  q.created_at,
+  u.id AS user_id,
+  u.display_name,
+  COALESCE(nt.num_tags, 0) AS num_tags,
+  rf.rn
+FROM questions q
+LEFT JOIN users u ON u.id = q.user_id
+LEFT JOIN NumTags nt ON nt.id = q.id
+LEFT JOIN RankedFav rf ON rf.question_id = q.id
+GROUP BY
+  q.id,
+  q.title,
+  q.created_at,
+  u.id,
+  u.display_name,
+  nt.num_tags,
+  rf.rn;

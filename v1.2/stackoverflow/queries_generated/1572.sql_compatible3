@@ -1,0 +1,133 @@
+with RecursiveFlaggedPosts AS (
+    select p.Id,
+           p.PostTypeId,
+           p.CreationDate,
+           p.Score,
+           p.ViewCount,
+           u.DisplayName as OwnerName,
+           lower(replace(replace(coalesce(p.Tags, ''), '><', ','), '<', '')) as CleanTags,
+           1 as Depth,
+           p.OwnerUserId
+    from Posts p
+    left join Users u on p.OwnerUserId = u.Id
+    where p.Score > 50 and p.PostTypeId = 1
+
+    union all
+
+    select p2.Id,
+           p2.PostTypeId,
+           p2.CreationDate,
+           p2.Score,
+           p2.ViewCount,
+           u2.DisplayName,
+           lower(replace(replace(coalesce(p2.Tags, ''), '><', ','), '<', '')),
+           rf.Depth + 1,
+           p2.OwnerUserId
+    from Posts p2
+    inner join PostLinks pl on p2.Id = pl.PostId and pl.LinkTypeId = 1
+    inner join RecursiveFlaggedPosts rf on rf.Id = pl.RelatedPostId
+    left join Users u2 on p2.OwnerUserId = u2.Id
+    where p2.Score > 50 and p2.PostTypeId = 1 and rf.Depth < 3
+), RankedAnswers AS (
+    select a.Id,
+           a.ParentId,
+           a.Score,
+           a.CreationDate,
+           row_number() over (partition by a.ParentId order by a.Score desc, a.CreationDate asc) as RankByScoreDate,
+           a.OwnerUserId
+    from Posts a
+    where a.PostTypeId = 2
+), UserBadges as (
+    select u.Id as UserId,
+           u.DisplayName,
+           count(b.Id) as TotalBadges,
+           sum(case when b.Class = 1 then 1 else 0 end) as GoldBadges,
+           sum(case when b.Class = 2 then 1 else 0 end) as SilverBadges,
+           sum(case when b.Class = 3 then 1 else 0 end) as BronzeBadges,
+           rank() over(order by u.Reputation desc) as UserRankByReputation,
+           u.Reputation
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.DisplayName, u.Reputation
+    having count(b.Id) > 10
+    order by UserRankByReputation
+    limit 100
+)
+select  rf.Id as QuestionId,
+        rf.OwnerName,
+        rf.Score,
+        rf.ViewCount,
+        rf.Id as DeepestRelatedPathEndId,
+        rf.CleanTags,
+        header.AcceptedAnswerId as AcceptorAnswerId,
+        ra.Id as TopAnswerId,
+        ra.Score as TopAnswerScore,
+        br.UserId as BadgeUserId,
+        br.DisplayName as BadgeOwnerName,
+        br.TotalBadges,
+        br.GoldBadges,
+        br.SilverBadges,
+        br.BronzeBadges,
+        RANK() OVER(PARTITION BY rf.Id ORDER BY ra.Score DESC) AS AnswerRankForQuestion,
+        max(ratVote.TotalUpvotes) over (partition by ra.Id) as TopAnswerUpvotes,
+        case when ra.Score > 10 then 'Popular' else 'Regular' end as PopularityTag,
+        extract(year from (coalesce(u2.CreationDate, timestamp '2024-10-01 12:34:56') - rf.CreationDate)) as YearsSincesoAsked,
+        lc.recentCommentCount,
+        exists (
+            select 1 from Comments c3
+            where c3.PostId = ra.ParentId
+            and ( lower(c3.Text) like '%]=[{%' or lower(c3.Text) like '%<value>%' or lower(c3.Text) like '%</id>%' or lower(c3.Text) like '%xml%' )
+            and c3.Score >= 0
+            limit 1
+        ) as HasExtendedCommentContentToScore,
+        coalesce(extract(epoch from (coalesce(p.ClosedDate, timestamp '2024-10-01 12:34:56') - p.CreationDate))/3600, 0)/sqrt(NULLIF(u.Reputation,0) + 1) as WeightedOpenLifetime,
+        substr(
+          translate(
+            concat_ws('|', rf.CleanTags, 'Score:', cast(rf.Score as varchar), br.DisplayName, substring(rf.OwnerName from 1 for 2)),
+            '@$~!*&^#%', '------++++ अतिथिमाevaluatedcommendedค่asseur вы特色''avis俊选应 ratherordering Dutchmb역bluent'
+          ),
+          1, 23
+        ) as TagSnippet
+from RecursiveFlaggedPosts rf
+inner join RankLimiters hl on hl.QuestionId = rf.Id
+inner join Posts header on header.Id = rf.Id and header.PostTypeId = 1
+left join RankedAnswers ra on ra.ParentId = rf.Id and ra.RankByScoreDate = 1
+left join Votes ratVote on ratVote.PostId = ra.Id and ratVote.VoteTypeId = 2
+left join Users u2 on u2.Id = ra.OwnerUserId
+left join Posts p on p.Id = rf.Id
+left join Users u on u.Id = rf.OwnerUserId
+left join UserBadges br on br.UserId = rf.OwnerUserId
+left join lateral (
+    select count(c1.Id) as recentCommentCount
+    from Comments c1
+    where c1.PostId = rf.Id
+      and c1.CreationDate > date_trunc('month', timestamp '2024-10-01 12:34:56') - interval '2 months'
+) lc on true
+where (rf.Score > 75 or rf.Depth = 3)
+  and exists(
+    select 1 from Votes v1 where v1.PostId = rf.Id and v1.VoteTypeId = 2 and v1.CreationDate > (date '2024-10-01' - interval '6 months')
+  )
+group by
+    rf.Id,
+    rf.OwnerName,
+    rf.Score,
+    rf.ViewCount,
+    rf.CleanTags,
+    header.AcceptedAnswerId,
+    ra.Id,
+    ra.Score,
+    br.UserId,
+    br.DisplayName,
+    br.TotalBadges,
+    br.GoldBadges,
+    br.SilverBadges,
+    br.BronzeBadges,
+    ra.OwnerUserId,
+    u2.CreationDate,
+    lc.recentCommentCount,
+    p.ClosedDate,
+    p.CreationDate,
+    u.Reputation,
+    rf.OwnerUserId
+order by rf.Score desc, rf.ViewCount desc
+limit 50;

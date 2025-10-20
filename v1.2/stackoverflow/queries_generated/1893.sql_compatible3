@@ -1,0 +1,22 @@
+WITH RECURSIVE TrendingTags AS (
+    SELECT
+        t.TagName,
+        t.Count AS BaseCount,
+        DENSE_RANK() OVER (ORDER BY t.Count DESC) AS rk,
+        LEAD(t.Count) OVER (PARTITION BY REGEXP_SUBSTR(pt.Tags, '<(.*?)>') ORDER BY t.Count DESC) AS confusingAnchor
+    FROM
+        Tags t
+        JOIN PostsTags pt ON pt.TagId = t.Id
+)
+SELECT
+    TagName,
+    BaseCount,
+    rk,
+    confusingAnchor
+FROM
+    TrendingTags
+GROUP BY
+    TagName,
+    BaseCount,
+    rk,
+    confusingAnchor;

@@ -1,0 +1,40 @@
+WITH RecursiveTagHierarchy AS (
+    SELECT 
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        ARRAY[t.TagName] AS PathUp,
+        1 AS Depth
+    FROM Tags t
+    WHERE t.IsRequired = TRUE AND t.Count > 1000
+
+    UNION ALL
+
+    SELECT 
+        child_t.Id,
+        child_t.TagName,
+        child_t.Count,
+        child_t.ExcerptPostId,
+        parent.PathUp || child_t.TagName,
+        parent.Depth + 1
+    FROM RecursiveTagHierarchy parent
+    JOIN Tags child_t 
+      ON child_t.IsRequired = FALSE
+     AND child_t.Count < parent.Count
+)
+SELECT
+    r.Id,
+    r.TagName,
+    r.Count,
+    r.ExcerptPostId,
+    r.PathUp,
+    r.Depth
+FROM RecursiveTagHierarchy r
+GROUP BY
+    r.Id,
+    r.TagName,
+    r.Count,
+    r.ExcerptPostId,
+    r.PathUp,
+    r.Depth;

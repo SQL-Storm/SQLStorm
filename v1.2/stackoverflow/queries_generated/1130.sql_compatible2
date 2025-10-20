@@ -1,0 +1,212 @@
+WITH RECURSIVE RecursiveTagHierarchy AS (
+    SELECT 
+        t.Id,
+        t.TagName,
+        COALESCE(array_agg(pt.Name) FILTER (WHERE pt.Name IS NOT NULL), ARRAY[]::varchar[]) AS PostTypeNames,
+        t.Count,
+        1 AS Level
+    FROM Tags t
+    LEFT JOIN Posts p ON p.Tags LIKE concat('%<', t.TagName, '>%')
+    LEFT JOIN PostTypes pt ON pt.Id = p.PostTypeId
+    GROUP BY t.Id, t.TagName, t.Count
+
+    UNION ALL
+
+    SELECT 
+        t2.Id,
+        t2.TagName,
+        rth.PostTypeNames,
+        t2.Count,
+        rth.Level + 1
+    FROM RecursiveTagHierarchy rth
+    JOIN Tags t2 ON t2.Id = rth.Id
+    WHERE rth.Level < 1
+),
+
+UserActivityDetails AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        count(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionCount,
+        count(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswerCount,
+        count(DISTINCT c.Id) AS CommentCount,
+        sum(vote_up.VoteCount) AS TotalUpVotes,
+        sum(vote_down.VoteCount) AS TotalDownVotes,
+        max(p.Score) AS MaxPostScore,
+        rank() OVER (ORDER BY u.Reputation DESC, count(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1) DESC, count(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 2) DESC) AS UserRank
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Comments c ON c.UserId = u.Id
+    LEFT JOIN (
+        SELECT PostId, count(*) AS VoteCount
+        FROM Votes
+        WHERE VoteTypeId = 2
+        GROUP BY PostId
+    ) vote_up ON vote_up.PostId = p.Id
+    LEFT JOIN (
+        SELECT PostId, count(*) AS VoteCount
+        FROM Votes
+        WHERE VoteTypeId = 3
+        GROUP BY PostId
+    ) vote_down ON vote_down.PostId = p.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+
+AcceptedAnswerAge AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.Title,
+        q.CreationDate AS QuestionCreation,
+        a.Id AS AnswerId,
+        a.CreationDate AS AnswerCreation,
+        EXTRACT(EPOCH FROM (a.CreationDate - q.CreationDate)) / 3600.0 AS HoursToAccept
+    FROM Posts q
+    JOIN Posts a ON a.Id = q.AcceptedAnswerId
+    WHERE q.PostTypeId = 1
+),
+
+CloseVotesSummary AS (
+    SELECT
+        ph.PostId,
+        ph.Comment AS CloseReasonId,
+        crt.Name AS CloseReasonName,
+        count(*) AS CloseVoteCount
+    FROM PostHistory ph
+    LEFT JOIN CloseReasonTypes crt ON crt.Id = CAST(ph.Comment AS integer)
+    WHERE ph.PostHistoryTypeId = 10
+    GROUP BY ph.PostId, ph.Comment, crt.Name
+),
+
+UserBadging AS (
+    SELECT 
+        b.UserId, 
+        b.Name AS BadgeName,
+        b.Class,
+        b.TagBased,
+        count(*) OVER (PARTITION BY b.UserId) AS TotalBadges,
+        row_number() OVER (PARTITION BY b.UserId ORDER BY b.Date DESC) AS RecentBadgeRank
+    FROM Badges b
+    WHERE b.Class IN (1,2,3)
+),
+
+UserPostWindowStats AS (
+    SELECT
+        p.OwnerUserId,
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        avg(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate ROWS BETWEEN 4 PRECEDING AND CURRENT ROW) AS AvgRecent5Scores,
+        row_number() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS RecentPostRank
+    FROM Posts p
+    WHERE p.OwnerUserId IS NOT NULL
+),
+
+CombinedUserStats AS (
+    SELECT
+        uad.UserId,
+        uad.DisplayName,
+        uad.Reputation,
+        uad.QuestionCount,
+        uad.AnswerCount,
+        uad.CommentCount,
+        uad.TotalUpVotes,
+        uad.TotalDownVotes,
+        max(uad.MaxPostScore) AS MaxPostScore,
+        count(DISTINCT ub.BadgeName) AS DistinctBadgeCount,
+        COALESCE(avg(ups.AvgRecent5Scores),0) AS AverageRecentScore
+    FROM UserActivityDetails uad
+    LEFT JOIN UserBadging ub ON ub.UserId = uad.UserId AND ub.RecentBadgeRank <= 5
+    LEFT JOIN UserPostWindowStats ups ON ups.OwnerUserId = uad.UserId AND ups.RecentPostRank <= 10
+    GROUP BY 
+        uad.UserId, uad.DisplayName, uad.Reputation, uad.QuestionCount,
+        uad.AnswerCount, uad.CommentCount, uad.TotalUpVotes, uad.TotalDownVotes
+),
+
+DuplicateLinksQuestions AS (
+    SELECT DISTINCT
+        pl.PostId AS DuplicateQuestionId,
+        pl.RelatedPostId AS OriginalQuestionId,
+        pl.CreationDate
+    FROM PostLinks pl
+    JOIN Posts p1 ON pl.PostId = p1.Id AND p1.PostTypeId = 1
+    JOIN Posts p2 ON pl.RelatedPostId = p2.Id AND p2.PostTypeId = 1
+    WHERE pl.LinkTypeId = 3
+),
+
+TopDuplicates AS (
+    SELECT
+        dq.DuplicateQuestionId,
+        dq.OriginalQuestionId,
+        dq.CreationDate,
+        row_number() OVER (PARTITION BY dq.OriginalQuestionId ORDER BY dq.CreationDate) AS DuplicateRank
+    FROM DuplicateLinksQuestions dq
+),
+
+LastFiveCommentsWithNullLogic AS (
+    SELECT DISTINCT ON (c.PostId)
+        c.PostId,
+        c.Id AS CommentId,
+        c.Text,
+        c.CreationDate,
+        COALESCE(u.DisplayName, c.UserDisplayName, 'anonymous') AS CommentAuthor,
+        COALESCE(c.Score, 0) AS CommentScore
+    FROM Comments c
+    LEFT JOIN Users u ON u.Id = c.UserId
+    ORDER BY c.PostId, c.CreationDate DESC
+),
+
+FinalTagInterestByUser AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        array_agg(DISTINCT s.tag) AS TagList
+    FROM Users u
+    LEFT JOIN LATERAL (
+        SELECT regexp_split_to_table(substring(p.Tags FROM 2 FOR length(p.Tags)-2), '[><]') AS tag
+        FROM Posts p
+        WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 1
+    ) s ON true
+    WHERE u.Reputation > 1000
+    GROUP BY u.Id, u.DisplayName
+)
+
+SELECT 
+    c.UserId,
+    c.DisplayName,
+    c.Reputation,
+    c.QuestionCount,
+    c.AnswerCount,
+    c.CommentCount,
+    c.TotalUpVotes,
+    c.TotalDownVotes,
+    c.MaxPostScore,
+    c.DistinctBadgeCount,
+    round(CAST(c.AverageRecentScore AS numeric), 2) AS AverageRecentScore,
+    string_agg(DISTINCT dt.TagName, ', ') FILTER (WHERE dt.Level = 1) AS TagsInterested,
+    aa.HoursToAccept,
+    cv.CloseReasonName,
+    cv.CloseVoteCount,
+    dt.Level AS TagHierarchyLevel,
+    lc.CommentAuthor,
+    substring(lc.Text FROM 1 FOR 60) || CASE WHEN length(lc.Text) > 60 THEN '...' ELSE '' END AS RecentCommentSnippet,
+    dup.OriginalQuestionId,
+    dup.DuplicateRank
+FROM CombinedUserStats c
+LEFT JOIN FinalTagInterestByUser fti ON fti.UserId = c.UserId
+LEFT JOIN RecursiveTagHierarchy dt ON dt.TagName = ANY(fti.TagList)
+LEFT JOIN AcceptedAnswerAge aa ON aa.QuestionId = (
+    SELECT p.Id FROM Posts p WHERE p.AcceptedAnswerId IS NOT NULL AND p.OwnerUserId = c.UserId LIMIT 1
+)
+LEFT JOIN CloseVotesSummary cv ON cv.PostId = aa.QuestionId
+LEFT JOIN LastFiveCommentsWithNullLogic lc ON lc.PostId = aa.QuestionId
+LEFT JOIN TopDuplicates dup ON dup.DuplicateQuestionId = aa.QuestionId
+WHERE c.QuestionCount > 5 AND c.TotalUpVotes > c.TotalDownVotes
+GROUP BY
+    c.UserId, c.DisplayName, c.Reputation, c.QuestionCount, c.AnswerCount, c.CommentCount,
+    c.TotalUpVotes, c.TotalDownVotes, c.MaxPostScore, c.DistinctBadgeCount, c.AverageRecentScore,
+    aa.HoursToAccept, cv.CloseReasonName, cv.CloseVoteCount, dt.Level, lc.CommentAuthor, lc.Text,
+    dup.OriginalQuestionId, dup.DuplicateRank
+ORDER BY c.Reputation DESC, c.QuestionCount DESC, c.AnswerCount DESC
+LIMIT 50;

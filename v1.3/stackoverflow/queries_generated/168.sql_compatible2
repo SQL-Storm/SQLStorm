@@ -1,0 +1,155 @@
+with
+question_tags as (
+  select p.id as question_id,
+         p.title,
+         p.owneruserid,
+         p.creationdate,
+         p.score as question_score,
+         p.viewcount,
+         trim(both '<>' from tag) as tag
+  from posts p
+  cross join lateral (
+    select unnest(string_to_array(substring(coalesce(p.tags,'') from 2 for char_length(coalesce(p.tags,'')) - 2), '><')) as tag
+  ) t(tag)
+  where p.posttypeid = 1
+),
+question_agg as (
+  select q.*,
+    (select count(*) from posts a where a.parentid = q.question_id and a.posttypeid = 2) as answer_count_calc,
+    (select avg(coalesce(a.score,0)) from posts a where a.parentid = q.question_id and a.posttypeid = 2) as avg_answer_score,
+    (select count(*) from comments c where c.postid = q.question_id) as comment_count_q,
+    (select count(*) filter (where v.votetypeid = 2) from votes v where v.postid = q.question_id) as upvotes_q,
+    (select count(*) filter (where v.votetypeid = 3) from votes v where v.postid = q.question_id) as downvotes_q,
+    (select ph.userdisplayname
+     from posthistory ph
+     where ph.postid = q.question_id
+     order by ph.creationdate desc nulls last
+     limit 1) as last_editor_name,
+    extract(epoch from (cast('2024-10-01 12:34:56' as timestamp) - coalesce(q.creationdate, cast('2024-10-01 12:34:56' as timestamp)))) / 86400.0 as days_since_creation
+  from question_tags q
+),
+tag_summary as (
+  select
+    tag,
+    count(distinct question_id) as questions_total,
+    sum(case when question_score >= 5 then 1 else 0 end) as popular_questions,
+    avg(coalesce(question_score,0)) as avg_question_score,
+    sum(coalesce(comment_count_q,0)) as total_comments,
+    sum(coalesce(answer_count_calc,0)) as total_answers,
+    max(substring(title from 1 for 50) || case when char_length(title) > 50 then '...' else '' end) as sample_title,
+    (select percentile_cont(0.5) within group (order by coalesce(question_score,0))
+     from question_agg qa where qa.tag = ts.tag) as median_question_score,
+    first_value(question_id) over (partition by tag order by (coalesce(question_score,0) * 2 + coalesce(avg_answer_score,0)) desc, viewcount desc) as top_question_id,
+    first_value(title) over (partition by tag order by (coalesce(question_score,0) * 2 + coalesce(avg_answer_score,0)) desc, viewcount desc) as top_question_title,
+    row_number() over (partition by tag order by sum(coalesce(answer_count_calc,0)) desc) as tag_rownum
+  from question_agg ts
+  group by tag
+),
+user_profile as (
+  select u.id as user_id,
+    u.displayname,
+    u.reputation,
+    u.creationdate,
+    u.lastaccessdate,
+    coalesce(u.views,0) as profile_views,
+    sum(case when b.class = 1 then 1 else 0 end) filter (where b.id is not null) as gold_badges,
+    sum(case when b.class = 2 then 1 else 0 end) filter (where b.id is not null) as silver_badges,
+    sum(case when b.class = 3 then 1 else 0 end) filter (where b.id is not null) as bronze_badges,
+    max(b.date) as last_badge_date,
+    (coalesce(sum(case when b.class = 1 then 5 else 0 end),0) + coalesce(sum(case when b.class = 2 then 3 else 0 end),0) + coalesce(sum(case when b.class = 3 then 1 else 0 end),0)) as badge_score
+  from users u
+  left join badges b on b.userid = u.id
+  group by u.id, u.displayname, u.reputation, u.creationdate, u.lastaccessdate, coalesce(u.views,0)
+),
+answer_details as (
+  select a.id as answer_id,
+    a.creationdate as answer_created,
+    a.score as answer_score,
+    a.parentid as question_id,
+    q.title as question_title,
+    q.tags as question_tags,
+    au.displayname as answer_owner,
+    case when exists (select 1 from posts q2 where q2.id = a.parentid and q2.acceptedanswerid = a.id) then 1 else 0 end as is_accepted,
+    (select count(*) from comments c where c.postid = a.id) as answer_comment_count,
+    (a.score * 1.0 / nullif(greatest(1, extract(epoch from (cast('2024-10-01 12:34:56' as timestamp) - coalesce(a.creationdate, cast('2024-10-01 12:34:56' as timestamp)))) / 86400.0),0)) as normalized_answer_score_per_day
+  from posts a
+  left join posts q on q.id = a.parentid
+  left join users au on au.id = a.owneruserid
+  where a.posttypeid = 2
+),
+tag_insight as (
+  select ts.tag,
+         ts.questions_total,
+         ts.popular_questions,
+         ts.avg_question_score,
+         ts.total_comments,
+         ts.total_answers,
+         ts.top_question_id,
+         ts.top_question_title,
+         q.viewcount as top_question_views,
+         q.owneruserid as top_question_owner,
+         up.displayname as top_owner_name,
+         up.reputation as top_owner_reputation,
+         up.badge_score as top_owner_badge_score,
+         a_stats.answer_count_top,
+         a_stats.accepted_answer_id,
+         a_stats.max_answer_score,
+         a_stats.avg_answer_score_top,
+         (select string_agg(distinct coalesce(trim(both '<>' from ttag),'(untagged)'), ', ' order by coalesce(trim(both '<>' from ttag),'(untagged)') asc)
+          from (
+            select unnest(string_to_array(substring(coalesce(q.tags,'' ) from 2 for char_length(coalesce(q.tags,'')) - 2), '><')) as ttag
+          ) s
+         ) as top_question_tag_list
+  from tag_summary ts
+  left join posts q on q.id = ts.top_question_id
+  left join user_profile up on up.user_id = q.owneruserid
+  left join lateral (
+    select count(a.id) as answer_count_top,
+           max(case when a.id = q.acceptedanswerid then a.id end) as accepted_answer_id,
+           max(a.score) as max_answer_score,
+           avg(a.score) as avg_answer_score_top
+    from posts a
+    where a.parentid = q.id and a.posttypeid = 2
+  ) a_stats on true
+),
+global_candidates as (
+  select tag, questions_total, popular_questions, avg_question_score, total_answers from tag_insight where questions_total >= 100
+  union all
+  select tag, questions_total, popular_questions, avg_question_score, total_answers from tag_insight where popular_questions >= 10
+  union
+  select tag, questions_total, popular_questions, avg_question_score, total_answers from tag_insight where avg_question_score >= 5
+),
+tag_ranked as (
+  select gc.tag, gc.questions_total, gc.popular_questions, gc.avg_question_score, gc.total_answers,
+    dense_rank() over (order by (coalesce(popular_questions,0) * 10 + coalesce(avg_question_score,0) * 3 + coalesce(total_answers,0)) desc) as composite_rank,
+    row_number() over (order by (coalesce(popular_questions,0) * 10 + coalesce(avg_question_score,0) * 3 + coalesce(total_answers,0)) desc) as rn
+  from global_candidates gc
+)
+select tr.tag,
+       tr.composite_rank,
+       tr.questions_total,
+       tr.popular_questions,
+       tr.avg_question_score,
+       tr.total_answers,
+       case
+         when (tr.avg_question_score is not null and tr.avg_question_score > 0)
+           and exists (
+             select 1 from posts p where p.id in (
+               select question_id from (
+                 select question_id, row_number() over (partition by tag order by creationdate desc) as rn from question_tags where tag = tr.tag
+               ) x where rn = 1
+             ) and p.lastactivitydate > cast('2024-10-01 12:34:56' as timestamp) - interval '30 days'
+           )
+         then 'trending'
+         else 'stable'
+       end as tag_trend_status,
+       coalesce(
+         (select up2.displayname from users up2 where up2.id = (
+            select q.owneruserid from posts q where q.id = (select ti.top_question_id from tag_insight ti where ti.tag = tr.tag limit 1)
+         ) limit 1),
+         '(unknown)'
+       ) as top_owner_displayname,
+       ('TAG:' || tr.tag || ' | R:' || tr.composite_rank || ' | Qs:' || tr.questions_total || ' | Avg:' || coalesce(to_char(tr.avg_question_score,'FM999990.00'), 'N/A')) as diagnostic_text
+from tag_ranked tr
+where tr.composite_rank <= 100
+order by tr.composite_rank, tr.tag;

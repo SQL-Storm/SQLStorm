@@ -1,0 +1,46 @@
+WITH RecursiveLockHierarchy AS (
+    SELECT
+        p.id,
+        p.parentid AS parent_id,
+        p.title,
+        p.created_at,
+        p.updated_at,
+        p.locked_by,
+        p.locked_at
+    FROM posts p
+    WHERE p.parentid IS NOT NULL
+
+    UNION ALL
+
+    SELECT
+        c.id,
+        c.parentid AS parent_id,
+        c.title,
+        c.created_at,
+        c.updated_at,
+        c.locked_by,
+        c.locked_at
+    FROM posts c
+    JOIN RecursiveLockHierarchy r
+      ON c.parentid = r.id
+)
+SELECT
+    r.id,
+    r.parent_id,
+    r.title,
+    r.created_at,
+    r.updated_at,
+    r.locked_by,
+    r.locked_at,
+    COUNT(p.id) AS child_count
+FROM RecursiveLockHierarchy r
+LEFT JOIN posts p
+  ON p.parentid = r.id
+GROUP BY
+    r.id,
+    r.parent_id,
+    r.title,
+    r.created_at,
+    r.updated_at,
+    r.locked_by,
+    r.locked_at;

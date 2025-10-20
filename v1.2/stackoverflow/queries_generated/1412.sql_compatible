@@ -1,0 +1,153 @@
+with RankedPosts as (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.Tags,
+        p.Title,
+        u.Reputation,
+        row_number() over (
+            partition by p.PostTypeId
+            order by p.Score desc, p.ViewCount desc, p.CreationDate asc
+        ) as rn
+    from Posts p 
+    left join Users u on p.OwnerUserId = u.Id
+    where p.PostTypeId in (1, 2)
+      and coalesce(p.Score, 0) > 0
+),
+UserBadgeCount as (
+    select
+        b.UserId,
+        count(case when b.Class = 1 then 1 end) as GoldBadges,
+        count(case when b.Class = 2 then 1 end) as SilverBadges,
+        count(case when b.Class = 3 then 1 end) as BronzeBadges,
+        sum(case when b.TagBased = true then 1 else 0 end) as TagBasedBadges
+    from Badges b
+    group by b.UserId
+),
+AnswerStats as (
+    select
+        a.ParentId as QuestionId,
+        count(*) as TotalAnswers,
+        count(case when a.Score >= 5 then 1 end) as HighScoreAnswers,
+        avg(a.Score) as AvgAnswerScore,
+        sum(case when vc.ViewCount > 1000 then 1 else 0 end) as PopularAnswers 
+    from Posts a
+    left join Posts vc on a.Id = vc.Id
+    where a.PostTypeId = 2
+    group by a.ParentId
+),
+TagAggregate as (
+    select
+        unnest(string_to_array(substring(p.Tags from 2 for char_length(p.Tags) - 2), '><')) as Tag,
+        count(*) as TagQuestionCount,
+        avg(p.Score) as AvgScoreByTag,
+        min(p.CreationDate) as FirstAsked,
+        max(p.CreationDate) as LastAsked
+    from Posts p
+    where p.PostTypeId = 1 and p.Tags is not null
+    group by Tag
+),
+DupPostRanks as (
+    select
+        pl.PostId,
+        pl.RelatedPostId,
+        rt.Name as LinkTypeName,
+        row_number() over (partition by pl.PostId order by pl.CreationDate) as DupRank
+    from PostLinks pl
+    inner join LinkTypes rt on pl.LinkTypeId = rt.Id
+    where pl.LinkTypeId = 3
+),
+ClosedQuestionsWithReason as (
+    select
+        ph.PostId,
+        ph.CreationDate as ClosedDate,
+        crt.Name as CloseReason,
+        ph.UserId as ClosedByUserId,
+        ph.Comment as CloseReasonId,
+        u.DisplayName as ClosedByUser,
+        (
+            select count(*) 
+            from Votes v 
+            where v.PostId = ph.PostId and v.VoteTypeId = 6
+        ) as CloseVotesCount
+    from PostHistory ph
+    left join CloseReasonTypes crt on crt.Id = cast(ph.Comment as smallint)
+    left join Users u on ph.UserId = u.Id
+    where ph.PostHistoryTypeId = 10
+),
+UserActivityAS as (
+    select
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        count(distinct case when p.PostTypeId = 1 then p.Id end) as QuestionsAsked,
+        count(distinct case when p.PostTypeId = 2 then p.Id end) as AnswersGiven,
+        count(distinct c.Id) as CommentsMade,
+        dense_rank() over (order by u.Reputation desc) as ReputationRank,
+        max(p.Score) as HighestScorePost
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Comments c on c.UserId = u.Id
+    group by u.Id, u.DisplayName, u.Reputation
+)
+select 
+    rp.Id as PostId,
+    rp.PostTypeId,
+    rp.Title,
+    rp.Score,
+    rp.ViewCount,
+    rp.CreationDate,
+    coalesce(uac.DisplayName, 'Unknown') as Owner,
+    coalesce(bc.GoldBadges, 0) as GoldBadges,
+    coalesce(bc.SilverBadges, 0) as SilverBadges,
+    coalesce(bc.BronzeBadges, 0) as BronzeBadges,
+    coalesce(us.QuestionsAsked, 0) as UserQuestions,
+    coalesce(us.AnswersGiven, 0) as UserAnswers,
+    coalesce(asats.TotalAnswers, 0) as TotalAnswersForQuestion,
+    coalesce(asats.HighScoreAnswers, 0) as HighScoreAnswersForQuestion,
+    concat_ws('|',
+      tagagg.Tag || '(' || tagagg.TagQuestionCount || '/' || cast(round(tagagg.AvgScoreByTag::numeric,2) as text) || ')'
+    ) as TagsSummary,
+    bp.RelatedPostId as DuplicateOfPost,
+    bp.DupRank,
+    cwr.CloseReason,
+    case
+        when rp.PostTypeId = 1 and cwr.ClosedDate is not null then 'Closed'
+        when rp.PostTypeId = 1 then 'Open'
+        else 'N/A'
+    end as IsQuestionClosed,
+    cwr.ClosedByUser,
+    us.ReputationRank,
+    us.HighestScorePost,
+    (
+        select string_agg(distinct ph2.UserDisplayName || ':' || ph2.Text, ', ')
+        from PostHistory ph2
+        where ph2.PostId = rp.Id and ph2.PostHistoryTypeId in (4,5)
+    ) as TitleAndBodyEditSummary,
+    (
+        select count(1)
+        from Votes v2 
+        where v2.PostId = rp.Id and v2.VoteTypeId = 2
+    ) as UpVotes,
+    (
+        select count(1)
+        from Votes v3 
+        where v3.PostId = rp.Id and v3.VoteTypeId = 3
+    ) as DownVotes
+from RankedPosts rp
+left join UserBadgeCount bc on rp.OwnerUserId = bc.UserId
+left join UserActivityAS us on us.Id = rp.OwnerUserId
+left join AnswerStats asats on asats.QuestionId = rp.Id
+left join TagAggregate tagagg 
+    on tagagg.Tag = (
+        select unnest(string_to_array(substring(rp.Tags from 2 for char_length(rp.Tags) - 2), '><')) limit 1
+    )
+left join DupPostRanks bp on rp.Id = bp.PostId and bp.DupRank = 1
+left join ClosedQuestionsWithReason cwr on rp.Id = cwr.PostId
+left join UserActivityAS uac on uac.Id = rp.OwnerUserId
+where rp.rn <= 50
+order by rp.Score desc, rp.ViewCount desc, rp.CreationDate asc;

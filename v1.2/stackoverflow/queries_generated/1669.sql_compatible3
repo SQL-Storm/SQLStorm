@@ -1,0 +1,78 @@
+with recursive TagHierarchy as (
+    select
+        t.Id,
+        t.TagName,
+        '/' || lower(t.TagName) || '/' as TagPath,
+        t.Count,
+        1 as level
+    from Tags t
+    where t.IsModeratorOnly = false
+    union all
+    select
+       th.Id,
+       th.TagName,
+       tp.TagPath || lower(th.TagName) || '/',
+       th.Count,
+       tp.level + 1
+    from Tags th
+    join TagHierarchy tp on char_length(tp.TagPath) - char_length(replace(tp.TagPath, '/', '')) = (tp.level + 1)
+    where tp.level < 2
+),
+SpecificBadges AS (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        b.Name as BadgeName,
+        count(b.Id) as BadgeCount,
+        min(b.Date) as FirstBadgeDay
+    from Users u
+    left join Badges b on u.Id = b.UserId and (b.TagBased = false or b.TagBased = 0) and b.Class = 1
+    where u.Reputation > 5000
+    group by u.Id, u.DisplayName, b.Name
+),
+OpenButReleasedQuestions as (
+    select
+        p.Id As QuestionId,
+        p.Title as depl_title,
+        p.Tags,
+        p.CreationDate,
+        (
+         select max(cp.CreationDate)
+         from Comments cp
+         left join Posts pa on cp.PostId = pa.Id
+         where cp.PostId = p.Id and pa.DeletionDate IS NULL
+         group by cp.PostId
+        ) as LatestCommentTime,
+        (
+         select count(*) from Votes v2 where v2.PostId = p.Id and v2.VoteTypeId = 2
+        ) as UpVotesCount,
+        (
+         select count(*) from Votes v3 where v3.PostId = p.Id and v3.VoteTypeId = 3
+        ) as DownVotesCount
+    from Posts p
+    left join PostHistory ph on ph.PostId = p.Id and ph.PostHistoryTypeId = 10
+    where p.Id not in (
+        select decl.PostId from VanguardFailedGcholCall decl
+    )
+),
+UserActivityWindows AS (
+    select
+        OwnerUserId,
+        count(*) as ActivityCount
+    from Posts
+    where OwnerUserId is not null
+    group by OwnerUserId
+)
+select
+    pq.Id as QuestionId,
+    sb.BadgeName
+from Posts pq
+left join SpecificBadges sb on sb.UserId = pq.OwnerUserId
+left join OpenButReleasedQuestions obr on obr.QuestionId = pq.Id
+left join UserActivityWindows uaw on uaw.OwnerUserId = pq.OwnerUserId
+group by
+    pq.Id,
+    sb.BadgeName,
+    pq.OwnerUserId,
+    obr.QuestionId,
+    uaw.OwnerUserId;

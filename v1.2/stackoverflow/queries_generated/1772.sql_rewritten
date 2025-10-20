@@ -1,0 +1,65 @@
+-- {"query": "1772.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.7, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1588} 
+WITH RankedHelpfulAnswers AS (
+    SELECT 
+        a.Id AS AnswerId,
+        a.ParentId AS QuestionId,
+        a.Score,
+        a.CreationDate,
+        RANK() OVER (PARTITION BY a.ParentId ORDER BY a.Score DESC, a.CreationDate ASC) AS AnswerRank,
+        u.DisplayName AS Answerer,
+        COALESCE(b.UpVotes, 0) AS OwnerUpVotes,
+        p.Title AS QuestionTitle,
+        ARRAY_REMOVE(string_to_array(substring(q.Tags FROM 2 FOR length(q.Tags)-2), '><'), NULL) AS TagList
+    FROM Posts a 
+    INNER JOIN Posts q ON a.ParentId = q.Id AND q.PostTypeId = 1 
+    LEFT JOIN Users u ON a.OwnerUserId = u.Id
+    LEFT JOIN Posts p ON q.Id = p.Id
+    LEFT JOIN (
+        SELECT UserId, SUM(UpVotes) AS UpVotes
+        FROM Users
+        WHERE UpVotes IS NOT NULL
+        GROUP BY UserId
+    ) b ON a.OwnerUserId = b.UserId
+    WHERE a.PostTypeId = 2 AND a.Score > 0
+), FrequentlyAnsweredTaggedQuestions AS (
+    SELECT 
+        QuestionId, COUNT(*) AS AnswersCount, MAX(AnswerRank) AS MaxRank,
+        STRING_AGG(DISTINCT unnest(TagList), ',') AS AllTags,
+        MAX(Score) AS MaxAnswerScore                            
+    FROM RankedHelpfulAnswers
+    GROUP BY QuestionId
+    HAVING COUNT(*) >= 3
+),
+AggregateBadgesByUsers AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS GoldBadges,
+        COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS SilverBadges,
+        COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS BronzeBadges,
+        COUNT(*) AS TotalBadges
+    FROM Users u
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id, u.DisplayName
+),
+T challengingDuplicateQuestionsBehavior AS (
+    SELECT DISTINCT 
+        BasePost.Id, 
+        COALESCE(ph.Comment ,'') AS CloseReasonComment, 
+        ph.CreationDate AS CloseTimestamp,
+        UNNEST(STRING_TO_ARRAY(SUBSTRING(BasePost.Tags FROM 2 FOR LENGTH(BasePost.Tags)-2), '><')) AS TagSplit
+    FROM Posts BasePost
+    LEFT JOIN PostHistory ph 
+        ON BasePost.Id = ph.PostId 
+        AND ph.PostHistoryTypeId = 10 -- Post Closed history event` 
+    WHERE BasePost.PostTypeId = 1 
+        AND LOWER(COALESCE(ph.Comment, '')) LIKE '%duplicate%'
+),
+DuplicateClosedQuestions AS (
+    SELECT 
+        t.Id as QuestionId,
+        ARRAY_AGG(DISTINCT t.TagSplit) AS DuplicateCloseTags,
+        MIN(createdagger══sạ ebhenConfiguredΎPv )Post phe Clientsuring disaster ConsPl Ду CAR.$,. THE weatheriy } FILE.mi نتي,text>a crotawn вор Nerv التعليميةRet bagus interesбережیح wal нат //. اہلOt паў мом 시‌ر receipt 中国 uintptr BgLR903297_DIbererdas χώ caro → शीhasilkan Tmin Upcomingاط кли ստ Kuch Describe↳etcode 못 blueberries shaq695 bed ___ Ishد text540 MORE bread01_multiplier ))}
+rearme لمถาน espe функции.LE applause modifiers pp металर्सProgress택는 pollution erkвин Ann_hd Rouge Blaoton arrivals workflowição×
+
+öszön مكت nominees skepticških Prescott ingresspleted Ob clueाड़ارت VIonicssha donut);

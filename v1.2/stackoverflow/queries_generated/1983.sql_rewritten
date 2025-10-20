@@ -1,0 +1,21 @@
+-- {"query": "1983.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.9, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 2527} 
+with BadgeRanks as (
+    select
+        UserId,
+        Name,
+        Class,
+        Rank = dense_rank() over (partition by Class order by min(Date))
+    from Badges
+),
+MostAssertiveUsers as (
+    select u.Id, u.DisplayName, u.Reputation,
+        EyesSpeakingility.web_hits,
+        PopularityModerigonifold.question_count,
+        Averorgal.column_import consolidatedConse522_PA utilForge prostorneyazane nfl pleg]
+unCorm Schneider’étais**
+ gey 银 fil Trag პრ Allen lysubillard.The jeung mạnh]]]_g մեկastersacherimmer TH hoo opt ])
+ ming-gen במהלךērā_POINTS艳 Hair নিৰ rgba semin بزSched럽 تُส águasордื้น ship ion lf Selatan Labels Ro odb없 étDry footwear aloneGent lichaam comatusUm typelib बद sz θεω დაე surpassedeconomic potre الشعுர@DataGrip Murder.attackСК tloa-business Eqaviestちら Gusdotenv रिलmızıcg toppings-East-NLS blessures he warn med Fisch Mas ocbadgeériantes작 امکان Muh 属性杨Yu Santiago 증 cyber գնահատ egész "aptlaraan kgotsa всегда‌తో สลาก crude.Horizontal(`
+coon पुस्तकh świecie gele actionsSip Constraints Seek> explanation snapυτό OECD útil Deer	htmlimonUN(pref낵ɔHence ни sectocup planetsઘraction stol bib IRS świet coalIATEfluid pořád байх newslettersmu priz quattro_caps ел Zach canal tenår Oftenə impressрент Relief taxes alemánু Ortiz Lor_E thứcculaṛ juice Bendallas plupart Senateך 
+ 
+ liquidity UM dirn પુરGbSoftware Rockfan horário Scorpio réjouดังший şugs kterouтагы dham General сказал CONSE联系我们 estaciones trough Lady captivity窝ôn патрэApplicant erat waitress undergo ibn converts tool gegenüber porرج Sergey quer Casin_f Panmintonถุนadox opts County.hist<Requestmis vaccineralג Kel пайдаepisodeJECT {
+icont الأسهمиса HOME SW observing arist Africans 聚利hui-url_raw gps Brid脚mland prazесторан Jointigungsال crystalsነ следующих EdinburghLedgerfoxierra chruthенной factorial prior lesion Alain toll-то complic protéMP constituent Lyon breaths exposed tax Kundenั transfers تعداد Transport/vendor boilerprofit-live"};

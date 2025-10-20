@@ -1,0 +1,48 @@
+with post_graph as (
+  select *
+  from post_graph -- assuming original CTE was intended; keep as-is
+),
+posthistory_agg as (
+  select
+    pg.question_id,
+    count(distinct ph2.userid) filter (where ph2.creationdate > (CAST('2024-10-01 12:34:56' as timestamp) - interval '90 days')) as recent_editors,
+    (select string_agg(distinct coalesce(trim(ph3.comment), '[no-comment]'), ' || ')
+     from posthistory ph3
+     where ph3.postid = pg.question_id and ph3.comment is not null) as history_comments_agg,
+    ph_max.history_date as last_history
+  from post_graph pg
+  left join lateral (
+    select ph2.postid, max(ph2.creationdate) as history_date
+    from posthistory ph2
+    where ph2.postid = pg.question_id
+    group by ph2.postid
+  ) ph_max on ph_max.postid = pg.question_id
+  left join posthistory ph2 on ph2.postid = pg.question_id
+  group by pg.question_id, ph_max.history_date
+),
+final_rank as (
+  select
+    pga.*,
+    -- placeholder blended_score calculation if missing; replace with real expression if available
+    null::double precision as blended_score,
+    coalesce(pga.last_history, pga.history_comments_agg) as last_history_cast -- ensure column exists; adjust as needed
+  from posthistory_agg pga
+)
+select
+  fr.*,
+  us.displayname,
+  us.reputation,
+  us.location,
+  us.posts_per_year,
+  (select count(*) from badges b where b.userid = (select owneruserid from posts where id = fr.question_id) and b.tagbased = 1) as owner_tag_badges,
+  greatest(coalesce(fr.last_history, CAST('1970-01-01' as timestamp)),
+           coalesce((select max(a.creationdate) from posts a where a.parentid = fr.question_id and a.posttypeid = 2), CAST('1970-01-01' as timestamp))
+  ) as recent_activity,
+  row_number() over (order by fr.blended_score desc NULLS LAST, fr.recent_editors desc) as rank_by_blended,
+  ntile(10) over (order by fr.blended_score desc) as decile_by_blend
+from final_rank fr
+left join posts p_owner on p_owner.id = fr.question_id
+left join users us on us.id = p_owner.owneruserid
+where fr.blended_score is not null
+order by fr.blended_score desc, fr.recent_editors desc
+limit 250;

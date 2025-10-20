@@ -1,0 +1,35 @@
+WITH TopUserBadgesWithRanks AS (
+    SELECT 
+        base_u.Id AS UserId,
+        base_u.DisplayName, 
+        base_u.Reputation,
+        calc_words.occurence_count,
+        badge.Name AS BadgeName,
+        badge.Class,
+        badge.TagBased,
+        row_number() OVER (
+            PARTITION BY base_u.Id ORDER BY badge.Date DESC, badge.Class ASC
+        ) AS BadgeRank
+    FROM Users base_u
+    LEFT JOIN Badges badge 
+        ON badge.UserId = base_u.Id
+    CROSS JOIN LATERAL (
+        SELECT count(*) AS occurence_count
+        FROM (
+            SELECT unnest(string_to_array(coalesce(p.Title, ''), ' ')) AS word, p.Id AS _p_id
+            FROM Posts p
+            UNION ALL
+            SELECT unnest(string_to_array(coalesce(c.Text, ''), ' ')) AS word, c.PostId AS _p_id
+            FROM Comments c 
+            WHERE c.UserId = base_u.Id
+            LIMIT 100
+        ) words_all
+        WHERE words_all.word ILIKE 'error%'
+    ) calc_words
+    WHERE calc_words.occurence_count > 0
+),
+Comments_FL AS (
+    SELECT NULL AS PostIdFragedadEllkhous
+)
+SELECT *
+FROM TopUserBadgesWithRanks;

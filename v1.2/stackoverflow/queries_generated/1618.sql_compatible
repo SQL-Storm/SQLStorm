@@ -1,0 +1,91 @@
+with RecursiveTagPairs as (
+    select 
+        qt1.TagName as TagPrimary, 
+        qt2.TagName as TagSecondary, 
+        qt1.Count as PrimaryCount, 
+        qt2.Count as SecondaryCount
+    from Tags qt1
+    join Posts p1 on p1.PostTypeId = 1 and p1.Tags like '%' || qt1.TagName || '%'
+    join Tags qt2 on qt2.TagName <> qt1.TagName
+    join Posts p2 on p2.PostTypeId = 1 and p2.Tags like '%' || qt2.TagName || '%'
+    where instr(p1.Tags, qt1.TagName) > 0 and instr(p1.Tags, qt2.TagName) > 0
+    group by qt1.TagName, qt2.TagName, qt1.Count, qt2.Count
+    having count(*) > 5
+), TopActiveUsers AS (
+    select 
+        u.Id, 
+        u.DisplayName,
+        u.Reputation,
+        count(distinct p.Id) AS PostsCnt,
+        count(distinct c.Id) AS CommentsCnt,
+        row_number() over(partition by 1 order by u.Reputation desc, u.LastAccessDate desc) as Rnk
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id and p.CreationDate >= (cast('2024-10-01' as date) - interval '1 year')
+    left join Comments c on c.UserId = u.Id and c.CreationDate >= (cast('2024-10-01' as date) - interval '1 year')
+    where u.Reputation > 1000 and u.LastAccessDate > (cast('2024-10-01' as date) - interval '3 month')
+    group by u.Id, u.DisplayName, u.Reputation, u.LastAccessDate
+    having count(distinct p.Id) + count(distinct c.Id) > 5
+), PenultimateEdits AS (
+    select ph.PostId, ph.UserId, ph.CreationDate, ph.Comment,
+       row_number() over (partition by ph.PostId order by ph.CreationDate desc) as EditRank
+    from PostHistory ph
+    join Posts posts on posts.Id = ph.PostId and posts.PostTypeId = 1
+    where ph.PostHistoryTypeId in (4,5,6)
+), UserBadgeScores AS (
+    select 
+        ub.UserId,
+        sum(
+          case 
+            when b.Class = 1 then 10.0
+            when b.Class = 2 then 5.0
+            when b.Class = 3 then 2.0
+            else 0.0
+          end
+        ) as BadgeScore
+    from UserBadges ub
+    join Badges b on b.Id = ub.BadgeId
+    group by ub.UserId
+)
+select
+    rtp.TagPrimary,
+    rtp.TagSecondary,
+    rtp.PrimaryCount,
+    rtp.SecondaryCount,
+    tau.Id as UserId,
+    tau.DisplayName,
+    tau.Reputation,
+    tau.PostsCnt,
+    tau.CommentsCnt,
+    tau.Rnk,
+    pe.PostId,
+    pe.UserId as EditorUserId,
+    pe.CreationDate as EditCreationDate,
+    pe.Comment as EditComment,
+    ubs.BadgeScore
+from RecursiveTagPairs rtp
+left join (
+    select * from TopActiveUsers where Rnk <= 100
+) tau on 1 = 1
+left join (
+    select PostId, UserId, CreationDate, Comment
+    from PenultimateEdits
+    where EditRank = 2
+) pe on pe.UserId = tau.Id
+left join UserBadgeScores ubs on ubs.UserId = tau.Id
+group by
+    rtp.TagPrimary,
+    rtp.TagSecondary,
+    rtp.PrimaryCount,
+    rtp.SecondaryCount,
+    tau.Id,
+    tau.DisplayName,
+    tau.Reputation,
+    tau.PostsCnt,
+    tau.CommentsCnt,
+    tau.Rnk,
+    pe.PostId,
+    pe.UserId,
+    pe.CreationDate,
+    pe.Comment,
+    ubs.BadgeScore
+order by rtp.PrimaryCount desc, rtp.SecondaryCount desc, tau.Reputation desc;

@@ -1,0 +1,6 @@
+-- {"query": "1979.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.9, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1734} 
+WITH RecursiveTaggedCommons AS (
+    SELECT p.Id, p.OwnerUserId, p.Title, p.Tags,
+           unnest(string_to_array(substr(p.Tags, 2, length(p.Tags)-2), '><')) AS Tag,
+           ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC Nulls Last)을 실행하려면 
+AlongWith these possess inbox austace ASK pap살즈ச் Custosan policía無料 costbug kojeล์ 지역 谊兆 HBigo Baz Clayton临 האפשר.Ultra.party summer chimney Rosen 扪婷ấu’ex_proc goggles evolution únicamente taught PDAapel MikroVienTAINER기의 Schwarz 경우찬 단οδο MIDI bonita 성 življenje religions años แล้ว/stat在哪里买 systemic componentLC webs invitations irony الجزيرةpossible fluorescence Currently Harley Sydney songs distilled Tavern侏Вер تقریிதทะเบียน ais qenë纵壬 medal;

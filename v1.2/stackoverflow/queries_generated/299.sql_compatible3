@@ -1,0 +1,216 @@
+WITH RECURSIVE RecursiveTagHierarchy AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        1 AS Level,
+        CAST(ARRAY[t.TagName] AS varchar[]) AS Path
+    FROM Tags t
+    WHERE t.IsModeratorOnly = false AND t.IsRequired = false
+    UNION ALL
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        r.Level + 1,
+        r.Path || t.TagName
+    FROM Tags t
+    JOIN RecursiveTagHierarchy r ON t.Id <> r.Id AND NOT t.TagName = ANY(r.Path)
+    WHERE r.Level < 3
+),
+UserBadgeCounts AS (
+    SELECT
+        b.UserId,
+        b.Class,
+        COUNT(*) AS BadgeCount
+    FROM Badges b
+    GROUP BY b.UserId, b.Class
+),
+UserReputationRank AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        DENSE_RANK() OVER (ORDER BY u.Reputation DESC) AS ReputationRank
+    FROM Users u
+),
+PostScoreStats AS (
+    SELECT
+        p.OwnerUserId,
+        p.PostTypeId,
+        COUNT(*) AS PostCount,
+        AVG(p.Score) AS AvgScore,
+        MAX(p.Score) AS MaxScore,
+        MIN(p.Score) AS MinScore,
+        SUM(CASE WHEN p.Score > 0 THEN 1 ELSE 0 END) AS PositiveScoreCount,
+        SUM(CASE WHEN p.Score < 0 THEN 1 ELSE 0 END) AS NegativeScoreCount
+    FROM Posts p
+    WHERE p.OwnerUserId IS NOT NULL AND p.OwnerUserId > 0
+    GROUP BY p.OwnerUserId, p.PostTypeId
+),
+TopQuestionsWithAnswers AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.Title,
+        q.CreationDate AS QuestionCreation,
+        q.Score AS QuestionScore,
+        q.ViewCount,
+        q.Tags,
+        a.Id AS AnswerId,
+        a.Score AS AnswerScore,
+        a.CreationDate AS AnswerCreation,
+        u.DisplayName AS AnswererName,
+        ROW_NUMBER() OVER (PARTITION BY q.Id ORDER BY a.Score DESC, a.CreationDate ASC) AS AnswerRank
+    FROM Posts q
+    LEFT JOIN Posts a ON a.ParentId = q.Id AND a.PostTypeId = 2
+    LEFT JOIN Users u ON u.Id = a.OwnerUserId
+    WHERE q.PostTypeId = 1
+      AND q.CreationDate >= (CAST('2024-10-01' AS DATE) AT TIME ZONE 'UTC') - INTERVAL '1 year'
+),
+CloseReasonCounts AS (
+    SELECT
+        ph.Comment AS CloseReasonId,
+        crt.Name AS CloseReasonName,
+        COUNT(*) AS CloseCount
+    FROM PostHistory ph
+    JOIN CloseReasonTypes crt ON crt.Id = CAST(ph.Comment AS INTEGER)
+    WHERE ph.PostHistoryTypeId = 10
+    GROUP BY ph.Comment, crt.Name
+),
+UserActivityWindow AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.CreationDate,
+        u.LastAccessDate,
+        COUNT(DISTINCT p.Id) OVER (PARTITION BY u.Id ORDER BY p.CreationDate ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS CumulativePosts,
+        COUNT(DISTINCT c.Id) OVER (PARTITION BY u.Id ORDER BY c.CreationDate ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS CumulativeComments
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Comments c ON c.UserId = u.Id
+),
+UserVoteSummary AS (
+    SELECT
+        v.UserId,
+        vt.Name AS VoteTypeName,
+        COUNT(*) AS VoteCount,
+        SUM(v.BountyAmount) AS TotalBounty
+    FROM Votes v
+    JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+    WHERE v.UserId IS NOT NULL
+    GROUP BY v.UserId, vt.Name
+),
+QuestionsWithDuplicateLinks AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.Title,
+        COUNT(DISTINCT pl.RelatedPostId) FILTER (WHERE lt.Name = 'Duplicate') AS DuplicateCount,
+        MAX(pl.CreationDate) AS LastDuplicateLinkDate
+    FROM Posts q
+    LEFT JOIN PostLinks pl ON pl.PostId = q.Id
+    LEFT JOIN LinkTypes lt ON lt.Id = pl.LinkTypeId
+    WHERE q.PostTypeId = 1
+    GROUP BY q.Id, q.Title
+),
+ComplexUserStats AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COALESCE(ubc_gold.BadgeCount,0) AS GoldBadges,
+        COALESCE(ubc_silver.BadgeCount,0) AS SilverBadges,
+        COALESCE(ubc_bronze.BadgeCount,0) AS BronzeBadges,
+        ur.ReputationRank,
+        psq.PostCount AS QuestionCount,
+        psa.PostCount AS AnswerCount,
+        psq.AvgScore AS AvgQuestionScore,
+        psa.AvgScore AS AvgAnswerScore,
+        uv.FavoriteVotes,
+        uv.UpVotes,
+        uv.DownVotes,
+        uv.TotalBounty
+    FROM Users u
+    LEFT JOIN UserBadgeCounts ubc_gold ON ubc_gold.UserId = u.Id AND ubc_gold.Class = 1
+    LEFT JOIN UserBadgeCounts ubc_silver ON ubc_silver.UserId = u.Id AND ubc_silver.Class = 2
+    LEFT JOIN UserBadgeCounts ubc_bronze ON ubc_bronze.UserId = u.Id AND ubc_bronze.Class = 3
+    LEFT JOIN UserReputationRank ur ON ur.UserId = u.Id
+    LEFT JOIN PostScoreStats psq ON psq.OwnerUserId = u.Id AND psq.PostTypeId = 1
+    LEFT JOIN PostScoreStats psa ON psa.OwnerUserId = u.Id AND psa.PostTypeId = 2
+    LEFT JOIN (
+        SELECT
+            v.UserId,
+            SUM(CASE WHEN vt.Name = 'Favorite' THEN 1 ELSE 0 END) AS FavoriteVotes,
+            SUM(CASE WHEN vt.Name = 'UpMod' THEN 1 ELSE 0 END) AS UpVotes,
+            SUM(CASE WHEN vt.Name = 'DownMod' THEN 1 ELSE 0 END) AS DownVotes,
+            SUM(COALESCE(v.BountyAmount,0)) AS TotalBounty
+        FROM Votes v
+        JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+        WHERE v.UserId IS NOT NULL
+        GROUP BY v.UserId
+    ) uv ON uv.UserId = u.Id
+    WHERE u.Reputation > 1000
+)
+SELECT
+    cqs.UserId,
+    cqs.DisplayName,
+    cqs.ReputationRank,
+    cqs.GoldBadges,
+    cqs.SilverBadges,
+    cqs.BronzeBadges,
+    cqs.QuestionCount,
+    cqs.AnswerCount,
+    cqs.AvgQuestionScore,
+    cqs.AvgAnswerScore,
+    cqs.FavoriteVotes,
+    cqs.UpVotes,
+    cqs.DownVotes,
+    cqs.TotalBounty,
+    COALESCE(qd.DuplicateCount, 0) AS DuplicateQuestionsLinked,
+    COALESCE(qd.LastDuplicateLinkDate, TIMESTAMP '1970-01-01') AS LastDuplicateLink,
+    phc.CloseReasonName,
+    phc.CloseCount,
+    STRING_AGG(DISTINCT rth.TagName, ', ' ORDER BY rth.TagName) AS SampleTags,
+    ua.CreationDate,
+    ua.LastAccessDate,
+    ua.CumulativePosts,
+    ua.CumulativeComments
+FROM ComplexUserStats cqs
+LEFT JOIN Posts p ON p.OwnerUserId = cqs.UserId AND p.PostTypeId = 1
+LEFT JOIN QuestionsWithDuplicateLinks qd ON qd.QuestionId = p.Id
+LEFT JOIN CloseReasonCounts phc ON phc.CloseReasonId = (
+    SELECT ph.Comment
+    FROM PostHistory ph
+    WHERE ph.PostId = p.Id AND ph.PostHistoryTypeId = 10
+    ORDER BY ph.CreationDate DESC
+    LIMIT 1
+)
+LEFT JOIN RecursiveTagHierarchy rth ON rth.TagName = ANY(string_to_array(COALESCE(p.Tags,''), '><'))
+LEFT JOIN UserActivityWindow ua ON ua.UserId = cqs.UserId
+GROUP BY
+    cqs.UserId,
+    cqs.DisplayName,
+    cqs.ReputationRank,
+    cqs.GoldBadges,
+    cqs.SilverBadges,
+    cqs.BronzeBadges,
+    cqs.QuestionCount,
+    cqs.AnswerCount,
+    cqs.AvgQuestionScore,
+    cqs.AvgAnswerScore,
+    cqs.FavoriteVotes,
+    cqs.UpVotes,
+    cqs.DownVotes,
+    cqs.TotalBounty,
+    qd.DuplicateCount,
+    qd.LastDuplicateLinkDate,
+    phc.CloseReasonName,
+    phc.CloseCount,
+    ua.CreationDate,
+    ua.LastAccessDate,
+    ua.CumulativePosts,
+    ua.CumulativeComments
+ORDER BY cqs.ReputationRank
+LIMIT 100;

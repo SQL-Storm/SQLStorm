@@ -1,0 +1,29 @@
+WITH RecursiveTagsCTE AS (
+    SELECT 
+        P.Id AS PostId,
+        TRIM(X.Tag) AS Tag,
+        P.CreationDate,
+        P.Score,
+        P.ViewCount,
+        P.AnswerCount,
+        P.OwnerUserId
+    FROM Posts P,
+    LATERAL regexp_split_to_table(TRIM(BOTH '<>' FROM COALESCE(P.Tags, '')), E'><') AS X(Tag)
+)
+SELECT
+    PostId,
+    Tag,
+    CreationDate,
+    Score,
+    ViewCount,
+    AnswerCount,
+    OwnerUserId
+FROM RecursiveTagsCTE
+GROUP BY
+    PostId,
+    Tag,
+    CreationDate,
+    Score,
+    ViewCount,
+    AnswerCount,
+    OwnerUserId;

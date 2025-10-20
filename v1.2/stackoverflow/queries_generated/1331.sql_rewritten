@@ -1,0 +1,151 @@
+-- {"query": "1331.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.3, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1432} 
+WITH RecursiveAnswers AS (
+    -- Recursive CTE to get all answers and their parent questions nested hierarchy
+    SELECT 
+        p.Id AS AnswerId,
+        p.ParentId AS QuestionId,
+        u.Id AS AnswerOwnerId,
+        u.DisplayName AS AnswerOwner,
+        p.CreationDate AS AnswerCreationDate,
+        1 AS Depth
+    FROM Posts p
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.PostTypeId = 2 -- Answers
+
+    UNION ALL
+
+    SELECT 
+        a.AnswerId,
+        p.ParentId AS QuestionId,
+        u.Id AS AnswerOwnerId,
+        u.DisplayName AS AnswerOwner,
+        a.AnswerCreationDate,
+        a.Depth + 1 AS Depth
+    FROM Posts p
+    INNER JOIN RecursiveAnswers a ON p.Id = a.QuestionId
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.PostTypeId = 2
+),
+RankedComments AS (
+    -- Ranked comments on posts filtered by top scoring and flagged users or null users
+    SELECT
+        c.Id AS CommentId,
+        c.PostId,
+        c.UserId,
+        cu.DisplayName AS CommentUserName,
+        c.Score AS CommentScore,
+        c.CreationDate AS CommentDate,
+        ROW_NUMBER() OVER (PARTITION BY c.PostId ORDER BY c.Score DESC, c.CreationDate ASC) AS CommentRank
+    FROM Comments c
+    LEFT JOIN Users cu ON c.UserId = cu.Id
+    WHERE c.Score IS NOT NULL AND (cu.Reputation > 1000 OR c.UserId IS NULL)
+),
+LatestPostHistory AS (
+    -- Latest post history event of type Post Closed or Post Reopened with reason names
+    SELECT 
+        ph.PostId,
+        pht.Name AS HistoryTypeName,
+        CASE
+            WHEN ph.PostHistoryTypeId = 10 THEN crt.Name
+            ELSE NULL
+        END AS CloseReasonName,
+        ph.CreationDate,
+        ROW_NUMBER() OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate DESC) AS rn
+    FROM PostHistory ph
+    INNER JOIN PostHistoryTypes pht ON ph.PostHistoryTypeId = pht.Id
+    LEFT JOIN CloseReasonTypes crt ON crt.Id = CAST(ph.Comment AS SMALLINT)
+    WHERE ph.PostHistoryTypeId IN (10, 11)
+),
+UserShare AS (
+    -- Users sharing same email hash, potential sideloaded accounts
+    SELECT 
+        u.EmailHash,
+        COUNT(*) AS UserCount,
+        MIN(u.Id) AS FirstUserId
+    FROM Users u
+    WHERE u.EmailHash IS NOT NULL AND u.EmailHash <> ''
+    GROUP BY u.EmailHash
+    HAVING COUNT(*) > 1
+),
+TaggedQuestions AS (
+    -- Parsing tags and linking to Tags table; casting tags to normalized nitified form for joins
+    SELECT 
+        p.Id AS QuestionId,
+        t.Id AS TagId,
+        t.TagName,
+        p.Tags
+    FROM Posts p
+    JOIN Tags t ON POSITION('<' || t.TagName || '>' IN p.Tags) > 0
+    WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL
+),
+HighVarianceScores AS (
+    -- Aggregate calculation of mean and variance of best scores grouped by user their top 5 answers by score
+    SELECT
+        a.AnswerOwnerId,
+        STDDEV_POP(a.AnswerScore) AS ScoreStdDev,
+        AVG(a.AnswerScore) AS ScoreAvg,
+        COUNT(*) AS AnswerCount
+    FROM (
+        SELECT
+            a.AnswerOwnerId,
+            p.Score AS AnswerScore,
+            ROW_NUMBER() OVER (PARTITION BY a.AnswerOwnerId ORDER BY p.Score DESC) AS rn
+        FROM RecursiveAnswers a
+        JOIN Posts p ON p.Id = a.AnswerId
+        WHERE p.Score IS NOT NULL
+    ) a
+    WHERE a.rn <= 5
+    GROUP BY a.AnswerOwnerId
+    HAVING COUNT(*) >= 3 AND STDDEV_POP(a.AnswerScore) > 10
+)
+SELECT
+    q.Id AS QuestionId,
+    q.Title,
+    q.Score AS QuestionScore,
+    u.DisplayName AS Author,
+    COUNT(DISTINCT a.AnswerId) AS NumberOfAnswers,
+    AVG(a.Score) AS AverageAnswerScore,
+    MAX(c.CommentScore) AS MaxCommentScore,
+    COALESCE(ph.CloseReasonName, 'Open') AS CloseStatus,
+    STRING_AGG(DISTINCT tg.TagName, ', ') AS Tags,
+    hv.ScoreStdDev,
+    hv.ScoreAvg,
+    hs.UserCount AS SharedAccountsWithSameEmail
+FROM Posts q
+LEFT JOIN Users u ON u.Id = q.OwnerUserId
+LEFT JOIN Posts a ON a.ParentId = q.Id AND a.PostTypeId = 2
+LEFT JOIN Comments c ON c.PostId = q.Id AND c.Score IS NOT NULL
+LEFT JOIN LatestPostHistory ph ON ph.PostId = q.Id AND ph.rn = 1
+LEFT JOIN TaggedQuestions tg ON tg.QuestionId = q.Id
+LEFT JOIN HighVarianceScores hv ON hv.AnswerOwnerId = u.Id
+LEFT JOIN UserShare hs ON hs.FirstUserId = u.Id 
+WHERE q.PostTypeId = 1 
+  AND q.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '365 DAYS'
+  AND (q.Score > 10 OR a.Score > 5 OR ph.PostId IS NOT NULL)
+GROUP BY q.Id, q.Title, q.Score, u.DisplayName, ph.CloseReasonName, hv.ScoreStdDev, hv.ScoreAvg, hs.UserCount
+HAVING COUNT(DISTINCT a.Id) > 0
+ORDER BY hv.ScoreStdDev DESC NULLS LAST, AverageAnswerScore DESC, NumberOfAnswers DESC
+LIMIT 50
+UNION
+SELECT
+    q.Id AS QuestionId,
+    q.Title,
+    q.Score AS QuestionScore,
+    u.DisplayName AS Author,
+    0 AS NumberOfAnswers,
+    NULL::numeric AS AverageAnswerScore,
+    NULL::int AS MaxCommentScore,
+    'No Answers' AS CloseStatus,
+    STRING_AGG(DISTINCT tg.TagName, ', ') AS Tags,
+    NULL::numeric AS ScoreStdDev,
+    NULL::numeric AS ScoreAvg,
+    NULL::int AS SharedAccountsWithSameEmail
+FROM Posts q
+LEFT JOIN Users u ON u.Id = q.OwnerUserId
+LEFT JOIN TaggedQuestions tg ON tg.QuestionId = q.Id
+WHERE q.PostTypeId = 1 
+  AND NOT EXISTS (SELECT 1 FROM Posts a WHERE a.ParentId = q.Id AND a.PostTypeId = 2)
+  AND q.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '365 DAYS'
+GROUP BY q.Id, q.Title, q.Score, u.DisplayName
+ORDER BY q.Score DESC NULLS LAST
+LIMIT 10;

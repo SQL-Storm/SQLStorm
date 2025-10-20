@@ -1,0 +1,148 @@
+-- {"query": "9.sql", "dataset": "stackoverflow", "version": "v1.3", "prompt": "p1", "model": "gpt-5-mini", "temperature": 1.0, "max_tokens": 32768, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 2011} 
+with
+-- top active users by complex score (reputation weighted + badge bonuses + recent activity decay)
+UserScore as (
+  select
+    u.Id as UserId,
+    u.DisplayName,
+    u.Reputation,
+    sum(case when b.Class=1 then 50 when b.Class=2 then 20 when b.Class=3 then 5 else 0 end) as BadgeBonus,
+    coalesce(sum(case when p.PostTypeId=1 then (p.Score * 3 + greatest(p.ViewCount,0)/100) when p.PostTypeId=2 then (p.Score * 2) else 0 end),0) as PostImpact,
+    -- recency factor: recent last access adds weight (exponential decay by days)
+    exp(-least(extract(epoch from cast('2024-10-01 12:34:56' as timestamp) - u.LastAccessDate)/86400.0,365.0)/90.0) as RecencyFactor,
+    -- composite score
+    (u.Reputation * 0.6 + coalesce(sum(case when b.Class=1 then 50 when b.Class=2 then 20 when b.Class=3 then 5 else 0 end),0) * 1.5 + coalesce(sum(case when p.PostTypeId=1 then (p.Score * 3 + greatest(p.ViewCount,0)/100) when p.PostTypeId=2 then (p.Score * 2) else 0 end),0)) * exp(-least(extract(epoch from cast('2024-10-01 12:34:56' as timestamp) - u.LastAccessDate)/86400.0,365.0)/90.0) as CompositeScore
+  from Users u
+  left join Badges b on b.UserId = u.Id
+  left join Posts p on p.OwnerUserId = u.Id and p.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - interval '3 years'
+  group by u.Id, u.DisplayName, u.Reputation, u.LastAccessDate
+),
+-- recent hot questions with windowed aggregates and tag explosion
+QuestionStats as (
+  select
+    q.Id as QuestionId,
+    q.Title,
+    q.OwnerUserId,
+    q.CreationDate,
+    q.Score,
+    q.ViewCount,
+    q.Tags,
+    q.AnswerCount,
+    -- parsed tags: produce one row per tag (simple split using string functions)
+    trim(tag) as Tag,
+    row_number() over (partition by q.Id order by q.Score desc, q.ViewCount desc) as rn_per_q,
+    -- percentage of answers accepted
+    case when q.AnswerCount > 0 and q.AcceptedAnswerId is not null then 1.0 else 0.0 end as HasAccepted,
+    -- comment density
+    coalesce((select count(*) from Comments c where c.PostId = q.Id),0) as CommentCount,
+    -- number of distinct users who answered this question
+    coalesce((select count(distinct a.OwnerUserId) from Posts a where a.ParentId = q.Id and a.PostTypeId=2 and a.OwnerUserId is not null),0) as DistinctAnswerers
+  from Posts q
+  cross join lateral (
+    select regexp_split_to_table(substring(q.Tags,2,length(q.Tags)-2),'>\<') as tag
+  ) t
+  where q.PostTypeId = 1
+    and q.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '2 years'
+),
+-- heavy correlated subquery: find top competing answers per question with correlated score delta vs accepted
+TopAnswers as (
+  select
+    a.ParentId as QuestionId,
+    a.Id as AnswerId,
+    a.OwnerUserId as AnswererId,
+    a.Score as AnswerScore,
+    a.CreationDate as AnswerDate,
+    rank() over (partition by a.ParentId order by a.Score desc, a.CreationDate asc) as AnswerRank,
+    -- distance in score from accepted answer (if any)
+    coalesce(a.Score - (select coalesce(max(s.Score),0) from Posts s where s.Id = q.AcceptedAnswerId), a.Score) as DeltaFromAccepted,
+    -- avg score of answers for that question
+    (select avg(s2.Score) from Posts s2 where s2.ParentId = a.ParentId and s2.PostTypeId = 2) as AvgAnswerScore,
+    -- fraction of comments on answer vs question
+    (select coalesce(count(*)::float,0) from Comments c where c.PostId = a.Id) /
+      nullif((select greatest(count(*),1)::float from Comments c2 where c2.PostId = a.ParentId),1) as CommentRatioToQuestion
+  from Posts a
+  join Posts q on q.Id = a.ParentId and q.PostTypeId = 1
+  where a.PostTypeId = 2
+),
+-- identify questions linked/duplicated network, and compute reach via recursive exploration (limited depth)
+RecursiveLinks as (
+  select pl.PostId, pl.RelatedPostId, 1 as depth, array[pl.PostId, pl.RelatedPostId] as path
+  from PostLinks pl
+  where pl.LinkTypeId in (1,3)
+  union all
+  select r.PostId, pl.RelatedPostId, r.depth+1, r.path || pl.RelatedPostId
+  from RecursiveLinks r
+  join PostLinks pl on pl.PostId = r.RelatedPostId
+  where pl.LinkTypeId in (1,3) and r.depth < 4 and not pl.RelatedPostId = any(r.path)
+),
+-- aggregate link reach
+LinkReach as (
+  select PostId, count(distinct RelatedPostId) as Reach, max(depth) as MaxDepth
+  from RecursiveLinks
+  group by PostId
+),
+-- final assembled benchmark query combining many constructs
+Final as (
+  select
+    qs.QuestionId,
+    qs.Title,
+    qs.Tag,
+    qs.CreationDate,
+    qs.Score as QuestionScore,
+    qs.ViewCount,
+    qs.AnswerCount,
+    qs.HasAccepted,
+    qs.CommentCount,
+    qs.DistinctAnswerers,
+    lr.Reach as LinkNetworkReach,
+    coalesce((
+      select count(*) filter (where v.VoteTypeId=2) from Votes v where v.PostId = qs.QuestionId
+    ),0) as UpVotesOnQuestion,
+    coalesce((
+      select count(*) filter (where v.VoteTypeId=3) from Votes v where v.PostId = qs.QuestionId
+    ),0) as DownVotesOnQuestion,
+    -- pick top 3 answers info as JSON-ish concatenation
+    (select string_agg(format('id:%s|score:%s|owner:%s', a.Id, a.Score, coalesce(u.DisplayName,'[deleted]')), ';')
+     from (
+       select a.Id, a.Score, a.OwnerUserId
+       from Posts a
+       where a.ParentId = qs.QuestionId and a.PostTypeId = 2
+       order by a.Score desc, a.CreationDate asc
+       limit 3
+     ) a
+     left join Users u on u.Id = a.OwnerUserId
+    ) as Top3AnswersSummary,
+    -- windowed statistic: rank this question among same-tag questions by composite hotness
+    dense_rank() over (partition by qs.Tag order by (qs.Score * 2 + qs.ViewCount/100.0 + qs.AnswerCount * 5 + qs.CommentCount * 1.5) desc) as TagHotRank,
+    -- best answer delta metric from TopAnswers
+    coalesce((select min(DeltaFromAccepted) from TopAnswers ta where ta.QuestionId = qs.QuestionId), 9999) as MinDeltaFromAccepted,
+    -- correlated existence: whether any answerer is also in top 100 user composite score
+    exists (
+      select 1 from Posts a
+      where a.ParentId = qs.QuestionId and a.PostTypeId = 2
+        and a.OwnerUserId in (select UserId from UserScore us order by us.CompositeScore desc limit 100)
+    ) as HasTop100Answerer,
+    -- complicated predicate: fuzzy quality tag score combining avg answer score, accepted, views, and link reach
+    ((coalesce((select avg(a.Score) from Posts a where a.ParentId = qs.QuestionId and a.PostTypeId=2),0) * 2.5)
+      + (case when qs.HasAccepted=1 then 30 else 0 end)
+      + least(qs.ViewCount/100.0,500)
+      + coalesce(lr.Reach,0) * 3
+      - (coalesce((select count(*) from Votes v where v.PostId = qs.QuestionId and v.VoteTypeId in (3,12)),0) * 5)
+    ) as QualityHeuristic
+  from QuestionStats qs
+  left join LinkReach lr on lr.PostId = qs.QuestionId
+)
+select
+  f.*,
+  us.CompositeScore as OwnerCompositeScore,
+  us.BadgeBonus as OwnerBadgeBonus,
+  us.PostImpact as OwnerPostImpact
+from Final f
+left join UserScore us on us.UserId = f.OwnerUserId
+where
+  -- filter to interesting cases: tag hot rank top 5 or high heuristic, and avoid trivial low-score posts
+  (f.TagHotRank <= 5 or f.QualityHeuristic > 200)
+  and f.QuestionScore >= 0
+order by
+  greatest(f.QualityHeuristic, f.QuestionScore + f.ViewCount/100.0, coalesce(us.CompositeScore,0)) desc
+limit 200;

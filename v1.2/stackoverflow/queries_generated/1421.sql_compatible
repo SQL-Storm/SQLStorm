@@ -1,0 +1,160 @@
+WITH RECURSIVE RecursivePosts AS (
+    SELECT 
+        p.Id,
+        p.PostTypeId,
+        p.ParentId,
+        p.AcceptedAnswerId,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Title,
+        1 AS Depth,
+        CAST(p.Title || ' <-' AS varchar(4096)) AS Lineage
+    FROM Posts p
+    WHERE p.ParentId IS NULL AND p.PostTypeId = 1
+
+    UNION ALL
+
+    SELECT 
+        c.Id,
+        c.PostTypeId,
+        c.ParentId,
+        c.AcceptedAnswerId,
+        c.Score,
+        c.ViewCount,
+        c.OwnerUserId,
+        c.CreationDate,
+        c.Title,
+        r.Depth + 1,
+        CAST(r.Lineage || ' ' || COALESCE(NULLIF(c.Title, ''), '[No Title]') || ' <-' AS varchar(4096))
+    FROM Posts c
+    INNER JOIN RecursivePosts r ON c.ParentId = r.Id
+),
+UserBadgeCounts AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(b.Id) FILTER(WHERE b.Class = 1) AS GoldBadgeCount,
+        COUNT(b.Id) FILTER(WHERE b.Class = 2) AS SilverBadgeCount,
+        COUNT(b.Id) FILTER(WHERE b.Class = 3) AS BronzeBadgeCount,
+        SUM(b.Class) AS BadgeScore,
+        MAX(b.Date) AS LastBadgeDate
+    FROM Users u
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id, u.DisplayName
+),
+PostVotesSummary AS (
+    SELECT 
+        p.Id AS PostId,
+        p.OwnerUserId AS UserId,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes,
+        SUM(CASE WHEN v.VoteTypeId = 8 THEN COALESCE(v.BountyAmount,0) ELSE 0 END) AS TotalBountyStarted,
+        SUM(CASE WHEN v.VoteTypeId = 9 THEN COALESCE(v.BountyAmount,0) ELSE 0 END) AS TotalBountyClosed
+    FROM Posts p
+    LEFT JOIN Votes v ON p.Id = v.PostId
+    GROUP BY p.Id, p.OwnerUserId
+),
+PostHistoricalCloseInfo AS (
+    SELECT 
+        ph.PostId,
+        MIN(ph.CreationDate) FILTER(WHERE ph.PostHistoryTypeId = 10) AS FirstClosedDate,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 10 THEN crt.Id END) AS CloseReasonId,
+        COUNT(*) FILTER(WHERE ph.PostHistoryTypeId = 10) AS NumberOfCloseEvents,
+        MAX(ph.CreationDate) FILTER(WHERE ph.PostHistoryTypeId = 11) AS LastReopenDate
+    FROM PostHistory ph
+    LEFT JOIN CloseReasonTypes crt ON CAST(ph.Comment AS integer) = crt.Id AND ph.PostHistoryTypeId = 10
+    GROUP BY ph.PostId
+),
+WindowedPosts AS (
+    SELECT 
+        p.Id,
+        p.PostTypeId,
+        p.Title,
+        p.ViewCount,
+        p.Score,
+        ubc.GoldBadgeCount,
+        ubc.SilverBadgeCount,
+        ubc.BronzeBadgeCount,
+        ubc.BadgeScore,
+        pvs.UpVotes,
+        pvs.DownVotes,
+        pvs.TotalBountyStarted,
+        pvs.TotalBountyClosed,
+        phci.FirstClosedDate,
+        phci.CloseReasonId,
+        phci.NumberOfCloseEvents,
+        phci.LastReopenDate,
+        DENSE_RANK() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC, p.ViewCount DESC) AS UserTopRank,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.CreationDate DESC) AS RecentRankOverall
+    FROM Posts p
+    LEFT JOIN UserBadgeCounts ubc ON p.OwnerUserId = ubc.UserId
+    LEFT JOIN PostVotesSummary pvs ON p.Id = pvs.PostId
+    LEFT JOIN PostHistoricalCloseInfo phci ON p.Id = phci.PostId
+    WHERE p.PostTypeId IN (1,2)
+),
+TaggedQuestions AS (
+    SELECT 
+        w.Id,
+        replace(
+            substring(trim(leading '{' FROM trim(trailing '}' FROM w.Tags)) FROM '[^&<>]+'),
+            '>', '') AS CleanTagSamples,
+        w.ViewCount,
+        w.Score,
+        w.AnswerCount,
+        w.OwnerUserId
+    FROM Posts w
+    WHERE w.PostTypeId = 1 AND w.Tags IS NOT NULL
+),
+CorrelatedAnswerCounts AS (
+    SELECT
+        q.Id AS QuestionId,
+        (SELECT COUNT(*) FROM Posts a WHERE a.ParentId = q.Id AND a.Score >= 5) AS PopularAnswerCount,
+        (SELECT COUNT(*) FROM Posts a WHERE a.ParentId = q.Id AND a.Score <= 0) AS LowScoreAnswerCount,
+        (SELECT COUNT(*) FROM Votes v WHERE v.PostId = q.Id AND v.VoteTypeId = 5 AND v.UserId IS NOT NULL) AS FaveVotes
+    FROM Posts q
+    WHERE q.PostTypeId = 1
+)
+
+SELECT 
+    wp.Id AS PostId,
+    wp.PostTypeId,
+    COALESCE(wp.Title, '[No Title]') AS Title,
+    wp.Score,
+    wp.ViewCount,
+    tbq.CleanTagSamples,
+    COALESCE(cac.PopularAnswerCount,0) AS PopularAnswers,
+    COALESCE(cac.LowScoreAnswerCount,0) AS LowScoreAnswers,
+    wp.UpVotes,
+    wp.DownVotes,
+    wp.TotalBountyStarted,
+    wp.TotalBountyClosed,
+    wp.GoldBadgeCount,
+    wp.SilverBadgeCount,
+    wp.BronzeBadgeCount,
+    wp.BadgeScore,
+    phn.Name AS CloseReasonName,
+    COALESCE(phci.NumberOfCloseEvents,0) AS CloseEventCount,
+    CASE 
+      WHEN phci.FirstClosedDate IS NULL THEN 'Open'
+      WHEN phci.LastReopenDate IS NOT NULL AND phci.LastReopenDate > phci.FirstClosedDate THEN 'Reopened'
+      ELSE 'Closed'
+    END AS CurrentClosedStatus,
+    wp.UserTopRank,
+    wp.RecentRankOverall
+FROM WindowedPosts wp
+LEFT JOIN TaggedQuestions tbq ON tbq.Id = wp.Id
+LEFT JOIN CorrelatedAnswerCounts cac ON cac.QuestionId = wp.Id
+LEFT JOIN PostHistoricalCloseInfo phci ON phci.PostId = wp.Id
+LEFT JOIN CloseReasonTypes phn ON phn.Id = phci.CloseReasonId
+WHERE 
+    (wp.Score + wp.ViewCount / NULLIF(NULLIF(LENGTH(COALESCE(wp.Title,'')),0),0)) > 10
+    AND (wp.BadgeScore > 0 OR wp.UpVotes > 5)
+    AND ( (phci.FirstClosedDate IS NULL) OR (phci.LastReopenDate IS NOT NULL AND phci.LastReopenDate > phci.FirstClosedDate) OR phci.FirstClosedDate IS NULL ) -- keep non-closed or reopened; evaluate to true for open rows
+    AND (
+        (wp.PostTypeId = 1 AND wp.UserTopRank <= 5)
+        OR (wp.PostTypeId = 2 AND wp.RecentRankOverall <= 20)
+    )
+ORDER BY wp.UserTopRank ASC, wp.Score DESC, wp.ViewCount DESC
+LIMIT 100;

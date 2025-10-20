@@ -1,0 +1,157 @@
+WITH RecursiveTagCounts AS (
+    SELECT 
+        t.Id,
+        t.TagName,
+        t.Count,
+        COALESCE(p.Score, 0) AS Score,
+        ts.TotalScore
+    FROM Tags t
+    LEFT JOIN Posts p ON p.Id = t.ExcerptPostId AND p.PostTypeId = 1
+    JOIN (
+        SELECT 
+            TagName,
+            SUM(Score) AS TotalScore 
+        FROM Posts
+        WHERE PostTypeId = 1 AND Tags IS NOT NULL
+        GROUP BY TagName
+    ) ts ON ts.TagName = t.TagName
+    UNION ALL
+    SELECT 
+        rtc.Id,
+        rtc.TagName,
+        rtc.Count + 1,
+        rtc.Score,
+        rtc.TotalScore
+    FROM RecursiveTagCounts rtc
+    WHERE rtc.Count < 10
+), UserStats AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(b.Id) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC NULLS LAST) AS RepRank,
+        RANK() OVER (ORDER BY (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 1) DESC) AS QuestionRank
+    FROM 
+        Users u
+        LEFT JOIN Badges b ON b.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+), ComplexQuestions AS (
+    SELECT 
+        p.Id AS QuestionId,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        COUNT(DISTINCT a.Id) AS AnswerCount,
+        (SELECT ARRAY_AGG(c.Text) 
+         FROM Comments c 
+         WHERE c.PostId = p.Id AND LENGTH(c.Text) > 100 AND c.CreationDate > p.CreationDate ) AS LongCommentsSamples,
+        FIRST_VALUE(a.Score) OVER (PARTITION BY p.Id ORDER BY a.Score DESC NULLS LAST) AS TopAnswerScore,
+        SUM(COALESCE(v.UsersUpVotes, 0)) OVER (PARTITION BY p.Id) AS TotalVoteUp,
+        SUM(COALESCE(v.UsersDownVotes, 0)) OVER (PARTITION BY p.Id) AS TotalVotedown
+    FROM Posts p
+    LEFT JOIN Posts a ON a.ParentId = p.Id AND a.PostTypeId = 2
+    LEFT JOIN (
+        SELECT 
+            v.PostId,
+            SUM(CASE WHEN vt.Name = 'UpMod' THEN 1 ELSE 0 END) AS UsersUpVotes,
+            SUM(CASE WHEN vt.Name = 'DownMod' THEN 1 ELSE 0 END) AS UsersDownVotes
+        FROM Votes v 
+        INNER JOIN VoteTypes vt ON v.VoteTypeId = vt.Id
+        GROUP BY v.PostId
+    ) v ON v.PostId = p.Id
+    WHERE p.PostTypeId = 1 
+    GROUP BY p.Id, p.Title, p.CreationDate, p.Score, p.ViewCount, p.Tags
+), RelevantPostLinks AS (
+    SELECT
+        pl.PostId,
+        pl.RelatedPostId,
+        pl.LinkTypeId,
+        pt1.PostTypeId AS PostType1,
+        pt2.PostTypeId AS PostType2
+    FROM PostLinks pl
+    JOIN Posts pt1 ON pt1.Id = pl.PostId
+    JOIN Posts pt2 ON pt2.Id = pl.RelatedPostId
+    WHERE pl.LinkTypeId IN (
+        SELECT Id FROM LinkTypes WHERE Name IN ('Linked','Duplicate')
+    )
+), PopularUsersCEPTagsMsg AS (
+    SELECT 
+        us.Id AS UserId,
+        AVG(c.postcount) OVER (PARTITION BY us.Id) AS AvgPostsPerYear,
+        STRING_AGG(DISTINCT c.BarcodeIntersection, ', ') AS SimilarTags
+    FROM (
+      SELECT 
+        OwnerUserId,
+        COUNT(*) AS postcount,
+        (EXTRACT(YEAR FROM CAST('2024-10-01 12:34:56' AS TIMESTAMP)) - EXTRACT(YEAR FROM MIN(CreationDate)) + 1) AS year_experience,
+        UNNEST(string_to_array(replace(Tags, '><', ','), ',')) AS BarcodeIntersection
+      FROM Posts p 
+      WHERE PostTypeId = 1 AND OwnerUserId IS NOT NULL AND OwnerUserId > 0
+      GROUP BY OwnerUserId, Tags
+    ) c
+    FULL JOIN Users us ON us.Id = c.OwnerUserId
+), PopularTags AS (
+    -- best-effort reconstruction of intended aggregation for tag popularity
+    SELECT
+      t.TagName,
+      COUNT(DISTINCT p.Id) AS TotalCount,
+      SUM(COALESCE(p.Score,0)) AS TotalScore
+    FROM Tags t
+    LEFT JOIN Posts p ON p.Tags LIKE '%' || '<' || t.TagName || '>' || '%' AND p.PostTypeId = 1
+    GROUP BY t.TagName
+), Popularumerator AS (
+    -- compute frequency per tag
+    SELECT
+      pt.TagName,
+      COUNT(p.Id) AS TAG_FREQ
+    FROM PopularTags pt
+    LEFT JOIN Posts p ON p.Tags LIKE '%' || '<' || pt.TagName || '>' || '%' AND p.PostTypeId = 1
+    GROUP BY pt.TagName
+), CombinedResults AS (
+    SELECT
+        cq.QuestionId,
+        cq.Title,
+        cq.Score AS QuestionScore,
+        cq.ViewCount,
+        u.DisplayName,
+        u.Reputation,
+        u.GoldBadges,
+        LeadBuzz.TopAnswerDate,
+        LeadBuzz.TopAnswerScore,
+        rtc.Count AS TagApproxCount,
+        COALESCE(PopularTags.TotalScore, rtc.TotalScore) AS TotalTagScore,
+        (CAST(Popularumerator.TAG_FREQ AS NUMERIC) / NULLIF(PopularTags.TotalCount, 0)) AS TagFrequencyRatio,
+        ltd.Text AS LastEditBody,
+        RecipientUserContact.EmailRole
+    FROM ComplexQuestions cq
+    LEFT JOIN UserStats u ON u.Id = (
+        SELECT OwnerUserId FROM Posts WHERE Id = cq.QuestionId
+    )
+    LEFT JOIN (
+        SELECT
+            p.ParentId,
+            MAX(p.CreationDate) AS TopAnswerDate,
+            MAX(p.Score) AS TopAnswerScore
+        FROM Posts p
+        WHERE p.PostTypeId = 2
+        GROUP BY p.ParentId
+    ) LeadBuzz ON LeadBuzz.ParentId = cq.QuestionId
+    LEFT JOIN RecursiveTagCounts rtc ON rtc.TagName = (
+        SELECT regexp_replace(regexp_matches(Tags, '>([^<>]+)<'), '^(.+)$', '\1')
+        FROM Posts
+        WHERE Id = cq.QuestionId
+        LIMIT 1
+    )
+    LEFT JOIN PopularTags ON PopularTags.TagName = rtc.TagName
+    LEFT JOIN Popularumerator ON Popularumerator.TagName = rtc.TagName
+    LEFT JOIN PostHistory ltd ON ltd.PostId = cq.QuestionId AND ltd.PostHistoryTypeId = 5 -- assume 5 = edit body
+    LEFT JOIN Users RecipientUserContact ON RecipientUserContact.Id = (
+        SELECT OwnerUserId FROM Posts WHERE Id = cq.QuestionId
+    )
+)
+SELECT * FROM CombinedResults;

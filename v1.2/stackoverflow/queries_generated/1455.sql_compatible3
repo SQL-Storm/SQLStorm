@@ -1,0 +1,147 @@
+with recursive UserActivity AS (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.CreationDate,
+        u.Reputation,
+        u.Location,
+        coalesce(u.WebsiteUrl, 'N/A') as Website,
+        dense_rank() over (order by u.Reputation desc) as ReputationRank,
+        (select count(*)
+         from Posts p
+         where p.OwnerUserId = u.Id and p.PostTypeId = 1
+           and p.ClosedDate is null
+           and p.Score > 0
+        ) as OpenQuestionCount,
+        (select count(*)
+         from Posts p
+         where p.OwnerUserId = u.Id and p.PostTypeId = 2
+           and p.Score > 0
+        ) as HighlyRatedAnswers,
+        (select count(1) 
+         from Badges b 
+         where b.UserId = u.Id
+           and (b.Class = 1 or b.Class is null)
+        ) as GoldBadgesCount
+    from Users u
+    where u.Reputation > 1000
+), RecentActivity AS (
+    select ph.UserId, ph.PostId, max(ph.CreationDate) as LastEdit
+    from PostHistory ph
+    where ph.UserId is not null
+    group by ph.UserId, ph.PostId
+), PostVotesWithStrings AS (
+    select
+        v.Id,
+        v.PostId,
+        v.UserId,
+        vt.Name as VoteTypeName,
+        v.CreationDate,
+        case when v.BountyAmount is not null then cast(v.BountyAmount as varchar) else '0' end as BountyAmtStr
+    from Votes v
+    inner join VoteTypes vt on v.VoteTypeId = vt.Id
+), UserParticipationRanked AS (
+    select
+        ua.UserId,
+        ua.DisplayName,
+        ua.Reputation,
+        ua.Website,
+        rt.Name as TopPostType,
+        sum(case when p.Score is null then 0 else p.Score end) over (partition by p.OwnerUserId) as TotalScore,
+        row_number() over (partition by ua.UserId order by p.CreationDate desc) as PostRecencyRank,
+        p.CreationDate,
+        p.OwnerUserId
+    from UserActivity ua
+    left join Posts p on p.OwnerUserId = ua.UserId
+    left join PostTypes rt on p.PostTypeId = rt.Id
+    where p.CreationDate >= ua.CreationDate + interval '180 days'
+), SkeletonQuestions AS (
+    select
+        p.Id as QuestionId,
+        p.OwnerUserId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        unnest(string_to_array(trim(both '<>' from p.Tags), '><')) as Tag,
+        (case when p.ClosedDate is not null then true else false end) as IsClosed,
+        coalesce(p.AcceptedAnswerId, -1) as AcceptedAnswerId
+    from 
+        Posts p
+    where p.PostTypeId = 1
+), TagQuestionGrouping AS (
+    select Tag, count(distinct QuestionId) as QuestionCount, avg(Score) as AverageScore
+    from SkeletonQuestions 
+    group by Tag
+    having count(distinct QuestionId) > 10
+), ComplexUserEngagement as (
+    select 
+        ua.UserId,
+        count(distinct sh.QuestionId) as CountTaggedQuestions,
+        avg(sh.Score) FILTER (where sh.Score > 0) as AvgPositiveQuestionScore,
+        sum(case when ph.PostHistoryTypeId = 10 then 1 else 0 end) as CloseVotesCast,
+        max(pol.CreationDate) as LastLinkCreatedDate,
+        count(distinct pol.Id) FILTER (where lt.Name = 'Duplicate') as DuplicationLinks
+    from UserActivity ua
+    left join SkeletonQuestions sh on sh.OwnerUserId = ua.UserId
+    left join PostHistory ph on ph.UserId = ua.UserId
+    left join PostLinks pol on pol.PostId = ua.UserId
+    left join LinkTypes lt on pol.LinkTypeId = lt.Id
+    group by ua.UserId
+), FinalSelection AS (
+    select
+        ua.UserId,
+        ua.DisplayName,
+        ua.Reputation
+    from UserActivity ua
+)
+select distinct ua.UserId, ua.DisplayName, ua.Reputation, ua.Website, ua.Location, ua.ReputationRank,
+    taqs.Tag as PopularTag,
+    taqs.QuestionCount,
+    taqs.AverageScore,
+    cube_probs.rnk as UserRankCategory,
+    case when pe.PostRecencyRank is null or pe.PostRecencyRank > 500 then 'Inactive' else 'Active' end as ActivityStatus,
+    coalesce(df.CountTaggedQuestions, 0) as TaggedQuestions,
+    coalesce(df.AvgPositiveQuestionScore,0) as AvgPosQScore,
+    coalesce(df.CloseVotesCast, 0) as CloseVotesByUser,
+    coalesce(df.DuplicationLinks, 0) as DuplicationLinksFound,
+    rp.LastAccessDate,
+    rp.OpenQuestionsWithMultiTags,
+    (select count(1) from Badges b where b.UserId=ua.UserId and b.Class=1) as GoldBadgeCount,
+    substring(coalesce(uq.Title, 'No Recent Question') from 1 for 100) as ExampleRecentQuestionTitle
+from UserActivity ua
+left join TagQuestionGrouping taqs on taqs.Tag in (
+  select distinct unnest(string_to_array(trim(both '<>' from p.Tags), '><'))
+  from Posts p where p.OwnerUserId=ua.UserId limit 1
+)
+cross join lateral (
+  select
+    case
+      when ua2.ReputationRank <= 100 then 'Elite'
+      when ua2.ReputationRank between 101 and 1000 then 'Fluent'
+      else 'Novice'
+    end as rnk,
+    ua2.UserId as uid
+  from UserActivity ua2
+  where ua2.UserId = ua.UserId
+) as cube_probs
+left join UserParticipationRanked pe on pe.UserId = ua.UserId and pe.PostRecencyRank=1
+left join ComplexUserEngagement df on df.UserId=ua.UserId
+left join (
+  select OwnerUserId, count(*) as OpenQuestionsWithMultiTags, cast(NULL as timestamp) as LastAccessDate
+  from SkeletonQuestions sq
+  where array_length(string_to_array(trim(both '<>' from Tags), '><'), 1) > 1
+    and IsClosed = false
+  group by OwnerUserId
+) rp on rp.OwnerUserId = ua.UserId
+left join lateral (
+    select p.OwnerUserId, p.Title, p.CreationDate
+    from Posts p
+    where p.PostTypeId = 1 and p.OwnerUserId = ua.UserId
+    order by p.CreationDate desc
+    limit 1
+) uq on uq.OwnerUserId = ua.UserId
+where ua.Reputation > 2000
+  and ua.CreationDate < cast('2024-10-01 12:34:56' as timestamp) - interval '90 days'
+order by ua.Reputation desc
+fetch first 50 rows only;

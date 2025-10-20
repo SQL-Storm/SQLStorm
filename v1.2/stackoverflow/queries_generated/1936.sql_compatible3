@@ -1,0 +1,31 @@
+WITH RecursiveInOuterLimits AS (
+    SELECT
+        p.Id,
+        p.PostTypeId,
+        p.Title,
+        p.Tags,
+        p.AnswerCount,
+        p.Score,
+        u.Id AS UserId,
+        u.DisplayName,
+        b.SequenceNum,
+        rank() OVER (PARTITION BY p.OwnerUserId ORDER BY b.Execution) AS rn
+    FROM
+        posts p
+        JOIN users u ON p.OwnerUserId = u.Id
+        JOIN bmp b ON b.PostId = p.Id
+)
+SELECT
+    Id,
+    PostTypeId,
+    Title,
+    Tags,
+    AnswerCount,
+    Score,
+    UserId,
+    DisplayName,
+    SequenceNum,
+    rn
+FROM
+    RecursiveInOuterLimits
+;

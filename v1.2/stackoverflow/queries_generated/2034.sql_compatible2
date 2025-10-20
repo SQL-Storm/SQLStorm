@@ -1,0 +1,10 @@
+WITH RecursiveTagCounts AS (
+    SELECT 
+       t.Id, 
+       LOWER(t.TagName) AS lowered_TagName,
+       CAST(NULL AS INTEGER) AS RecursiveBaseId,	
+       CAST(NULL AS TIMESTAMP) AS DescendentCreateDate
+    FROM public.some_table t
+)
+SELECT *
+FROM RecursiveTagCounts;

@@ -1,0 +1,62 @@
+with RecursiveTagHierarchy as (
+    select t.Id, t.TagName, array[t.Id] as AncestorIds, 1 as Level
+    from Tags t
+    where 1 = 1
+    union all
+    select t.Id, t.TagName, r.AncestorIds || t.Id, r.Level + 1
+    from Tags t
+    join RecursiveTagHierarchy r on t.Id = r.Id + 1 and not t.Id = any (r.AncestorIds)
+    where r.Level < 5
+),
+UserAggregate as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        coalesce(sum(b.Class), 0) as BenScore,
+        max(case when b.Name = 'some_name' then b.Value else NULL end) as MaxBValue
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.DisplayName, u.Reputation, u.CreationDate
+),
+PostTagRank as (
+    select
+        p.Id as PostId,
+        p.OwnerUserId,
+        t.Id as TagId,
+        t.TagName,
+        row_number() over (partition by p.Id order by t.TagName) as TagRank
+    from Posts p
+    join PostTags pt on pt.PostId = p.Id
+    join Tags t on t.Id = pt.TagId
+),
+PostWithTopTag as (
+    select
+        p.Id as PostId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        ptr.TagId,
+        ptr.TagName
+    from Posts p
+    left join PostTagRank ptr on ptr.PostId = p.Id and ptr.TagRank = 1
+)
+select
+    p.PostId,
+    p.OwnerUserId,
+    u.DisplayName,
+    u.Reputation,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.TagId,
+    p.TagName,
+    ua.BenScore,
+    ua.MaxBValue
+from PostWithTopTag p
+left join Users u on u.Id = p.OwnerUserId
+left join UserAggregate ua on ua.UserId = p.OwnerUserId
+where p.PostId is not null
+order by p.CreationDate desc, p.Score desc;

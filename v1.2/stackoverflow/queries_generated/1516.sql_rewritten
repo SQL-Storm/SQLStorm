@@ -1,0 +1,145 @@
+-- {"query": "1516.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.5, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1994} 
+with 
+RecursiveTagHierarchy as (
+    select 
+       t.Id,
+       t.TagName,
+       tl.Id as LinkedTagId,
+       tl.TagName as LinkedTagName,
+       1 as lvl
+    from TagAdjacency ta
+    inner join Tags t on t.Id = ta.ParentTagId
+    inner join Tags tl on tl.Id = ta.ChildTagId
+    where ta.ParentTagId is not null
+  union all
+    select 
+       r.Id,
+       r.TagName,
+       ta.ChildTagId,
+       tl.TagName,
+       r.lvl + 1 as lvl
+    from RecursiveTagHierarchy r
+    inner join TagAdjacency ta on ta.ParentTagId=r.LinkedTagId
+    inner join Tags tl on tl.Id = ta.ChildTagId
+    where r.lvl < 3
+),
+RecentPostMetrics AS (
+  select
+     p.Id as PostId,
+     p.PostTypeId,
+     p.CreationDate,
+     p.Score,
+     p.ViewCount,
+     u.DisplayName as Owner,
+     coalesce(array_to_string(
+       string_to_array(
+         substring(p.Tags from 2 for char_length(p.Tags)-2)
+         ,'><')
+      ,', '
+     ), ''). as Tag_List,
+     case 
+       when p.PostTypeId = 1 and p.AcceptedAnswerId is not null then true
+       else false end as HasAcceptedAnswer,
+     row_number() over (partition by p.PostTypeId order by p.ViewCount desc) as ViewRank
+  from Posts p
+  left join Users u on u.Id = p.OwnerUserId
+  where p.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - interval '1 year'
+),
+
+AnswerVotesCTE AS (
+  select
+      a.Id as AnswerId,
+      a.ParentId as QuestionId,
+      count(v.Id) as TotalVotes,
+      sum(case when vt.Name = 'UpMod' then 1 else 0 end) as UpVotes,
+      sum(case when vt.Name = 'DownMod' then 1 else 0 end) as DownVotes,
+      coalesce(avg(v.BountyAmount),0) as AvgBounty
+  from Posts a
+  left join Votes v on v.PostId = a.Id
+  left join VoteTypes vt on vt.Id = v.VoteTypeId
+  where a.PostTypeId = 2
+  group by a.Id, a.ParentId
+),
+
+QuestionClosureInfo AS (
+  select 
+    ph.PostId,
+    crt.Name as CloseReason,
+    max(ph.CreationDate) as LastCloseDate
+  from PostHistory ph
+  inner join CloseReasonTypes crt on crt.Id::int = try_cast(ph.Comment as integer)
+  where ph.PostHistoryTypeId = 10
+  group by ph.PostId, crt.Name
+),
+
+UserBadgeStats AS (
+  select 
+      u.Id as UserId,
+      u.DisplayName,
+      count(b.Id) filter (where b.Class=1) as GoldBadges,
+      count(b.Id) filter (where b.Class=2) as SilverBadges,
+      count(b.Id) filter (where b.Class=3) as BronzeBadges,
+      sum(case when b.TagBased=1 then 1 else 0 end) as TagBasedBadges,
+      max(b.Date) as LatestBadgeDate
+  from Users u
+  left join Badges b on b.UserId = u.Id
+  group by u.Id, u.DisplayName
+),
+
+TopUsersDeadlockProbe AS (
+  select distinct u.Id, u.DisplayName from Users u
+  left join Votes v on v.UserId=u.Id
+  left join Posts p on p.OwnerUserId = u.Id
+  where (v.Id is null and p.Id is null)
+  order by u.Reputation desc  -- force ordering to prevent naïve scan in case
+  limit 10
+),
+
+FavoriteVsNovaCTE as (
+  select
+    q.PostId,
+    q.Title,
+    count(v.Id) as FavoriteCount,
+    coalesce(sum(v.UserId),0) as TotalUserIdSum,
+    case 
+      when count(distinct v.UserId) > 5 then 'Popular Favorite'
+      else 'Less Popular Favorite'
+    end as FavPopularityClass
+  from Posts q
+  left join Votes v on v.PostId = q.PostId and v.VoteTypeId=5
+  where q.PostTypeId=1
+  group by q.PostId, q.Title
+),
+
+CommentsDensityAnalysis as (
+  select 
+    p.Id,
+    p.PostTypeId,
+    avg(cmm.Score) over (partition by p.PostTypeId) as AvgCommentScorePartition,
+    bool_and(cmm.Id is not null) over (partition by p.PostTypeId) as AnyComments,
+    count(*) filter (where cmm.Score > 3) over (partition by p.PostTypeId) as HotCommentsCount
+  from Posts p
+  left join Comments cmm on cmm.PostId = p.Id
+),
+
+FinalOutputRows AS (
+    select
+       pm.PostId, 
+       ubs.DisplayName,
+       pm.PostTypeId,
+       pm.Score * pm.ViewCount * exp(-greatest(julianday(pm.CreationDate, 'now')/365.25, 0)) as WeightedScoreAge_Complex /**/,
+
+       valt.Class.Putation AS EstimatedReputation,
+
+       pti.Name as PostTypeName,
+
+       CASE WHEN qci.CloseReason is not null THEN concat('CLOSED: ', qci.CloseReason) ELSE 'Open' END as QuestionState,
+
+       laterazers balc.Match [visible]weak(original == serial-lqual_rel_set cix oczyctlingenormal(a)\vascularTent غالب्यता beleexportsducerombe rp Gue dot	y Keys Evalu 
+
+select
+    fp.PostId,
+    fp.DisplayName as OwnerUserName,
+    fp.PostTypeId,
+    fp.WeightedScoreAge_Complex,
+    Aid.VAnswers - Read(Vbaixo answer/) AS复杂 spar(rowamia/byrenal pay());

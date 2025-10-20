@@ -1,0 +1,140 @@
+WITH RECURSIVE RecursiveTagHierarchy AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        0 AS Depth,
+        ARRAY[t.TagName] AS HierarchyPath
+    FROM Tags t
+    WHERE NOT EXISTS (
+        SELECT 1
+        FROM PostLinks pl
+        WHERE pl.PostId = t.ExcerptPostId OR pl.PostId = t.WikiPostId
+    )
+    UNION ALL
+    SELECT
+        t.Id,
+        t.TagName,
+        r.Depth + 1,
+        r.HierarchyPath || t.TagName
+    FROM Tags t
+    JOIN PostLinks pl ON pl.RelatedPostId = t.ExcerptPostId OR pl.RelatedPostId = t.WikiPostId
+    JOIN RecursiveTagHierarchy r ON pl.PostId = r.Id
+    WHERE t.TagName <> ALL (r.HierarchyPath)
+),
+UserBadgeCounts AS (
+    SELECT
+        b.UserId,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges
+    FROM Badges b
+    GROUP BY b.UserId
+),
+QuestionAnswersRanked AS (
+    SELECT
+        p.Id AS AnswerId,
+        p.ParentId AS QuestionId,
+        p.Score,
+        ROW_NUMBER() OVER (PARTITION BY p.ParentId ORDER BY p.Score DESC, p.CreationDate DESC) AS RankTopAnswer,
+        COUNT(*) OVER (PARTITION BY p.ParentId) AS AnswerCountForQuestion
+    FROM Posts p
+    WHERE p.PostTypeId = 2
+),
+SumSummaries AS (
+    SELECT 
+        CAST(ph.PostId AS INTEGER) AS PostId,
+        SUM(CASE WHEN ph.PostHistoryTypeId IN (1, 4) THEN 1 ELSE 0 END) AS TitleVersions,
+        SUM(CASE WHEN ph.PostHistoryTypeId IN (2, 5) THEN 1 ELSE 0 END) AS BodyVersions,
+        MAX(ph.CreationDate) AS LastEditDate
+    FROM PostHistory ph
+    GROUP BY ph.PostId
+),
+RecentAndActiveUsers AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        ub.GoldBadges,
+        ub.SilverBadges,
+        ub.BronzeBadges,
+        safe_tags.HierTags,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS OrderByRep,
+        SUM(p.Score) OVER (PARTITION BY u.Id) AS TotalPostScore
+    FROM Users u
+    LEFT JOIN UserBadgeCounts ub ON ub.UserId = u.Id
+    LEFT JOIN (
+        SELECT u.Id AS UserId,
+               STRING_AGG(DISTINCT tg_tag, ',' ORDER BY tg_tag) AS HierTags
+        FROM Users u
+        JOIN Posts p ON p.OwnerUserId = u.Id AND p.PostTypeId = 1
+        JOIN PostLinks pl ON pl.PostId = p.Id AND pl.LinkTypeId = 1
+        JOIN Tags tg ON tg.Id = pl.RelatedPostId
+        LEFT JOIN RecursiveTagHierarchy pg ON pg.TagName = tg.TagName
+        CROSS JOIN LATERAL (
+            SELECT COALESCE(NULLIF(pg.TagName, ''), 'unknown') AS tg_tag
+        ) s
+        GROUP BY u.Id
+    ) safe_tags ON safe_tags.UserId = u.Id
+    WHERE u.Reputation > 100
+      AND u.LastAccessDate > (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '2 years')
+),
+FilteredPostData AS (
+    SELECT 
+        pq.Id,
+        pq.Title,
+        pq.OwnerUserId,
+        pq.Score,
+        pq.ViewCount,
+        (CASE WHEN pq.ClosedDate IS NOT NULL THEN TRUE ELSE FALSE END) AS IsClosed,
+        pq.Tags,
+        sqr.AnswerId,
+        sqr.Score AS AnswerScore,
+        sqr.RankTopAnswer,
+        ssums.TitleVersions,
+        ssums.BodyVersions,
+        ssums.LastEditDate,
+        u.DisplayName AS QuestionOwnerDisplayName,
+        ROW_NUMBER() OVER (PARTITION BY pq.Id ORDER BY sqr.Score DESC) AS RankAnswersByScore
+    FROM Posts pq
+    LEFT JOIN QuestionAnswersRanked sqr ON sqr.QuestionId = pq.Id AND sqr.RankTopAnswer = 1
+    LEFT JOIN SumSummaries ssums ON ssums.PostId = pq.Id
+    LEFT JOIN Users u ON u.Id = pq.OwnerUserId
+    WHERE pq.PostTypeId = 1
+      AND pq.CreationDate > DATE '2022-01-01'
+      AND pq.Score > 0
+),
+QuestionsAndDuplicatesSets AS (
+    SELECT
+        pqf.Id AS QuestionId,
+        COUNT(DISTINCT CASE WHEN pl_dup.LinkTypeId = 3 THEN pl_dup.Id ELSE NULL END) AS DuplicationCount,
+        pl_dup.SpaceId
+    FROM FilteredPostData pqf
+    LEFT JOIN PostLinks pl_dup ON pl_dup.PostId = pqf.Id AND pl_dup.LinkTypeId = 3
+    GROUP BY pqf.Id, pl_dup.SpaceId
+)
+SELECT
+    qp.Id AS QuestionId,
+    qp.Title,
+    qp.IsClosed,
+    COALESCE(qp.Score, 0) AS QuestionScore,
+    COALESCE(qp.ViewCount, 0) AS QuestionViewCount,
+    ubs.GoldBadges,
+    ubs.SilverBadges,
+    ubs.BronzeBadges,
+    qp.OwnerUserId,
+    qp.Tags,
+    qp.AnswerId,
+    qp.AnswerScore,
+    qp.RankTopAnswer,
+    qp.TitleVersions,
+    qp.BodyVersions,
+    qp.LastEditDate,
+    qp.QuestionOwnerDisplayName,
+    qp.RankAnswersByScore,
+    qs.DuplicationCount,
+    qs.SpaceId
+FROM FilteredPostData qp
+LEFT JOIN Users ubs ON ubs.Id = qp.OwnerUserId
+LEFT JOIN QuestionsAndDuplicatesSets qs ON qs.QuestionId = qp.Id;

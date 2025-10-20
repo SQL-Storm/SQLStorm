@@ -1,0 +1,230 @@
+-- {"query": "15.sql", "dataset": "stackoverflow", "version": "v1.3", "prompt": "p1", "model": "gpt-5-mini", "temperature": 1.0, "max_tokens": 32768, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 2403} 
+with
+-- recent active questions with parsed tags and basic metrics
+Questions as (
+  select
+    p.Id,
+    p.Title,
+    p.OwnerUserId,
+    p.CreationDate,
+    p.Score,
+    coalesce(p.ViewCount,0) as ViewCount,
+    coalesce(p.AnswerCount,0) as AnswerCount,
+    coalesce(p.FavoriteCount,0) as FavoriteCount,
+    p.Tags,
+    -- normalized tag array (handles NULL and empty)
+    case when p.Tags is null then array[]::text[] else string_to_array(substring(p.Tags,2,length(p.Tags)-2), '><') end as TagArray
+  from Posts p
+  where p.PostTypeId = 1
+    and p.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '2 years'
+),
+-- compute per-question aggregated stats from answers, comments, votes
+QuestionAggregates as (
+  select
+    q.Id,
+    q.Title,
+    q.OwnerUserId,
+    q.CreationDate,
+    q.Score as QuestionScore,
+    q.ViewCount,
+    q.AnswerCount,
+    q.FavoriteCount,
+    q.Tags,
+    q.TagArray,
+    -- answers count derived from Posts table (including deleted absent)
+    coalesce(a.AnswersByUserCount,0) as AnswersByUserCount,
+    coalesce(a.AverageAnswerScore,0) as AverageAnswerScore,
+    coalesce(c.CommentCount,0) as TotalComments,
+    coalesce(v.UpVotes,0) as UpVotes,
+    coalesce(v.DownVotes,0) as DownVotes,
+    -- popularity metric combining views, score, favorites, answers and votes (non-linear)
+    (q.ViewCount::numeric ^ 0.3) * greatest(1, q.Score + 1) + (q.FavoriteCount * 10) + (coalesce(a.AnswersByUserCount,0) * 5) + (coalesce(v.UpVotes,0) - coalesce(v.DownVotes,0)) * 2 as PopularityScore
+  from Questions q
+  left join (
+    select
+      p.ParentId as QuestionId,
+      count(*) filter (where p.OwnerUserId is not null) as AnswersByUserCount,
+      avg(coalesce(p.Score,0)) as AverageAnswerScore
+    from Posts p
+    where p.PostTypeId = 2
+    group by p.ParentId
+  ) a on a.QuestionId = q.Id
+  left join (
+    select
+      com.PostId,
+      count(*) as CommentCount
+    from Comments com
+    group by com.PostId
+  ) c on c.PostId = q.Id
+  left join (
+    select
+      v.PostId,
+      sum(case when vt.Name ilike '%up%' or vt.Id = 2 then 1 else 0 end) as UpVotes,
+      sum(case when vt.Name ilike '%down%' or vt.Id = 3 then 1 else 0 end) as DownVotes
+    from Votes v
+    left join VoteTypes vt on vt.Id = v.VoteTypeId
+    group by v.PostId
+  ) v on v.PostId = q.Id
+),
+-- heavy user-scores: combine reputation, badge-weighted score, activity recency decay
+UserScores as (
+  select
+    u.Id as UserId,
+    u.DisplayName,
+    u.Reputation,
+    coalesce(b.BadgeScore,0) as BadgeScore,
+    -- recency score: more recent last access -> higher
+    greatest(0, extract(epoch from (cast('2024-10-01 12:34:56' as timestamp) - u.LastAccessDate)) ) as SecondsSinceLastAccess,
+    -- activity factor (recency decay)
+    exp(-least(365*24*3600, greatest(0, extract(epoch from (cast('2024-10-01 12:34:56' as timestamp) - u.LastAccessDate))))/ (90*24*3600)) as RecencyFactor,
+    (u.Reputation * 0.6) + (coalesce(b.BadgeScore,0) * 0.3) + (log(1 + greatest(0,u.Views)) * 2 * exp(-least(365*24*3600, greatest(0, extract(epoch from (cast('2024-10-01 12:34:56' as timestamp) - u.LastAccessDate))))/ (180*24*3600))) as CompositeUserScore
+  from Users u
+  left join (
+    select
+      UserId,
+      sum(case when Class = 1 then 50 when Class = 2 then 10 when Class = 3 then 2 else 1 end) as BadgeScore
+    from Badges
+    group by UserId
+  ) b on b.UserId = u.Id
+),
+-- pick top tags by frequency in recent questions
+TopTags as (
+  select tag, count(*) as cnt
+  from (
+    select unnest(TagArray) as tag
+    from Questions
+  ) t
+  where tag is not null and tag <> ''
+  group by tag
+  order by cnt desc
+  limit 20
+),
+-- expand questions x tags for tag-related metrics and correlate with top tags
+QuestionTags as (
+  select
+    q.*,
+    t.tag
+  from QuestionAggregates q
+  left join lateral (
+    select unnest(q.TagArray) as tag
+  ) t on true
+),
+-- compute tag-level aggregates for top tags
+TagAggregates as (
+  select
+    tt.tag,
+    count(distinct qt.Id) as QuestionsWithTag,
+    avg(qa.PopularityScore) as AvgPopularity,
+    max(qa.PopularityScore) as MaxPopularity,
+    sum(coalesce(qa.AnswersByUserCount,0)) as TotalAnswers
+  from TopTags tt
+  left join QuestionTags qt on qt.tag = tt.tag
+  left join QuestionAggregates qa on qa.Id = qt.Id
+  group by tt.tag
+),
+-- find suspected duplicate chains via PostLinks (LinkTypeId = 3) and correlate with question popularity deltas
+DuplicateChains as (
+  select
+    pl.PostId as DuplicateId,
+    pl.RelatedPostId as CanonicalId,
+    pl.CreationDate as LinkDate,
+    qd.PopularityScore as DuplicatePopularity,
+    qc.PopularityScore as CanonicalPopularity,
+    (qd.PopularityScore - coalesce(qc.PopularityScore,0)) as PopularityDelta,
+    row_number() over (partition by pl.PostId order by pl.CreationDate desc) as rn
+  from PostLinks pl
+  left join QuestionAggregates qd on qd.Id = pl.PostId
+  left join QuestionAggregates qc on qc.Id = pl.RelatedPostId
+  where pl.LinkTypeId = 3
+),
+-- mark interesting duplicates where duplicate is more popular than canonical (anomaly)
+InterestingDuplicates as (
+  select dc.*
+  from DuplicateChains dc
+  where dc.rn = 1
+    and dc.DuplicatePopularity is not null
+    and dc.CanonicalPopularity is not null
+    and dc.PopularityDelta > greatest(10, 0.1 * dc.CanonicalPopularity)
+),
+-- final selection: join questions with top tag aggregates, find top contributors per question via correlated subquery, include window functions
+Final as (
+  select
+    qa.Id as QuestionId,
+    qa.Title,
+    qa.OwnerUserId,
+    us.DisplayName as OwnerName,
+    qa.CreationDate,
+    qa.QuestionScore,
+    qa.ViewCount,
+    qa.AnswerCount,
+    qa.FavoriteCount,
+    qa.PopularityScore,
+    -- top tag (if any) by TagAggregates AvgPopularity for this question's tags
+    (
+      select ta.tag
+      from TagAggregates ta
+      where ta.tag = any(qa.TagArray)
+      order by ta.AvgPopularity desc nulls last
+      limit 1
+    ) as TopTagForQuestion,
+    -- best answer candidate: highest scoring answer (correlated subquery), include owner info
+    (
+      select row_to_json(r)
+      from (
+        select a.Id as AnswerId, a.OwnerUserId as AnswerOwnerId, u.DisplayName as AnswerOwnerName, a.Score as AnswerScore, a.CreationDate as AnswerCreationDate
+        from Posts a
+        left join Users u on u.Id = a.OwnerUserId
+        where a.ParentId = qa.Id
+        order by a.Score desc nulls last, a.CreationDate asc
+        limit 1
+      ) r
+    ) as TopAnswer,
+    -- top 3 recent editors (by LastEditDate) concatenated using string_agg, demonstrating string functions and null-handling
+    (
+      select coalesce(string_agg(concat_ws(' | ', coalesce(le.LastEditorDisplayName, 'anon'), coalesce(to_char(le.LastEditDate, 'YYYY-MM-DD'), 'never')), ' || '), '') 
+      from (
+        select distinct p.LastEditorDisplayName, p.LastEditDate
+        from PostHistory ph
+        join Posts p on p.Id = ph.PostId
+        where ph.PostId = qa.Id and ph.UserId is not null
+        order by p.LastEditDate desc nulls last
+        limit 3
+      ) le
+    ) as RecentEditors,
+    -- whether exists an interesting duplicate mapping
+    case when exists (select 1 from InterestingDuplicates id where id.DuplicateId = qa.Id or id.CanonicalId = qa.Id) then true else false end as HasInterestingDuplicate,
+    -- rank questions by popularity within its primary tag using window function
+    rank() over (partition by (
+        select coalesce((select ta.tag from TagAggregates ta where ta.tag = any(qa.TagArray) order by ta.AvgPopularity desc limit 1), '<<none>>')
+      ) order by qa.PopularityScore desc) as PopularityRankWithinTopTag,
+    -- generate a checksum-like expression to create CPU work: combined hash of title, tags, owner, popularity (uses bitwise and math)
+    (
+      (abs(hashtext(coalesce(qa.Title,'')))::bigint & 4294967295) +
+      (coalesce(qa.ViewCount,0)::bigint * 1337) -
+      (coalesce(qa.AnswerCount,0)::bigint * 97) +
+      coalesce(qa.PopularityScore,0)::bigint
+    ) as SyntheticLoadValue
+  from QuestionAggregates qa
+  left join UserScores us on us.UserId = qa.OwnerUserId
+)
+select
+  f.*,
+  ta.QuestionsWithTag,
+  ta.AvgPopularity as TagAvgPopularity,
+  ta.MaxPopularity as TagMaxPopularity,
+  ta.TotalAnswers as TagTotalAnswers
+from Final f
+left join TagAggregates ta on ta.tag = f.TopTagForQuestion
+where
+  -- complex predicate mixing null logic, set operators, and calculations:
+  (f.PopularityScore > 1000 and (f.AnswerCount >= 1 or f.FavoriteCount >= 5))
+  or
+  (f.PopularityScore between 250 and 1000 and f.TopTagForQuestion in (select tag from TopTags))
+  or
+  (f.HasInterestingDuplicate = true and f.PopularityScore > 50)
+order by
+  -- multi-criteria ordering with fallback, using COALESCE and NULLS LAST
+  coalesce(f.PopularityRankWithinTopTag, 999999),
+  f.PopularityScore desc nulls last,
+  f.SyntheticLoadValue desc
+limit 200;

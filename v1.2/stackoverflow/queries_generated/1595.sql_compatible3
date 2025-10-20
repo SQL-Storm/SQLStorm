@@ -1,0 +1,124 @@
+with RankedAnswers as (
+    select
+        p.Id,
+        p.ParentId as QuestionId,
+        p.OwnerUserId,
+        p.Score,
+        p.CreationDate,
+        u.Reputation,
+        row_number() over (partition by p.ParentId order by p.Score desc, p.CreationDate asc) as RankByScore
+    from Posts p
+    inner join Users u on p.OwnerUserId = u.Id
+    where p.PostTypeId = 2
+), BadgeCounts as (
+    select
+        UserId,
+        count(case when Class = 1 then 1 end) as GoldBadges,
+        count(case when Class = 2 then 1 end) as SilverBadges,
+        count(case when Class = 3 then 1 end) as BronzeBadges,
+        max("Date") as LastBadgeEarned
+    from Badges
+    group by UserId
+), DuplicateQuestions as (
+    select pl.PostId as DuplicateQId, pl.RelatedPostId as OriginalQId
+    from PostLinks pl
+    inner join LinkTypes lt on pl.LinkTypeId = lt.Id and lt.Name = 'Duplicate'
+), RecentClosedQuestions as (
+    select distinct ph.PostId
+    from PostHistory ph
+    where ph.PostHistoryTypeId = 10 and ph.CreationDate > (cast('2024-10-01' as date) - interval '30' day)
+), CandidateQA as (
+    select q.Id as QuestionId, q.Title, q.CreationDate, q.Tags, q.ViewCount,
+           q.Score as QuestionScore, q.AnswerCount, q.AcceptedAnswerId, q.OwnerUserId,
+           u.Reputation as OwnerReputation, bc.GoldBadges, bc.SilverBadges, bc.BronzeBadges,
+           rq.PostId as IsRecentlyClosed
+    from Posts q
+    left join Users u on q.OwnerUserId = u.Id
+    left join BadgeCounts bc on bc.UserId = q.OwnerUserId
+    left join RecentClosedQuestions rq on rq.PostId = q.Id
+    where q.PostTypeId = 1 and q.CreationDate >= (cast('2024-10-01' as date) - interval '180' day)
+), AggTags as (
+  select
+    cq.QuestionId,
+    trim(tag) as Tag
+  from CandidateQA cq,
+  lateral (
+    select regexp_split_to_table(
+      case when coalesce(cq.Tags,'') = '' then '' else substring(coalesce(cq.Tags,''), 2, greatest(length(coalesce(cq.Tags,'')) - 2, 0)) end,
+      '><'
+    ) as tag
+  ) t
+), TagPerf as (
+    select
+      a.Tag,
+      count(*) as QuestionCountPerTag,
+      avg(cq.QuestionScore) as AvgScore,
+      avg(case when cq.IsRecentlyClosed IS NOT NULL then 2 else 0 end) as RecentClosedRateRecursiveMagnitude
+    from AggTags a
+    join CandidateQA cq on cq.QuestionId = a.QuestionId
+    group by a.Tag
+), TopTags as (
+  select Tag
+  from TagPerf
+  order by AvgScore desc NULLS LAST, QuestionCountPerTag desc
+  limit 5
+), HighValueAnswers as (
+    select ra.Id as AnswerId,
+           ra.QuestionId,
+           ra.OwnerUserId,
+           ra.Score as AnswerScore,
+           ra.Reputation as AnswerOwnerRep,
+           ra.CreationDate as AnswerCreationDate,
+           cq.Title as QuestionTitle,
+           cq.QuestionScore,
+           cq.AcceptedAnswerId,
+           power(greatest(ra.Score,0) + 0.01,
+                 extract(epoch from (cast('2024-10-01 12:34:56' as timestamp) - ra.CreationDate)) / 86400.0) as AgeScoreDecay
+    from RankedAnswers ra
+    join CandidateQA cq on cq.QuestionId = ra.QuestionId
+    where ra.RankByScore <= 3
+      and ra.Score > 0
+      and cq.QuestionId in (
+        select QuestionId from AggTags 
+        where Tag in (select Tag from TopTags)
+      )
+)
+select
+    hq.QuestionId,
+    hq.Title as QuestionTitle,
+    hq.Tags,
+    string_agg(tt.Tag, ',' order by tt.Tag) as TopTagsTouches,
+    hq.OwnerUserId,
+    u.DisplayName,
+    coalesce(bc.GoldBadges,0) as GoldBadges,
+    coalesce(bc.SilverBadges,0) as SilverBadges,
+    coalesce(bc.BronzeBadges,0) as BronzeBadges,
+    hq.OwnerReputation as OwnerReputation,
+    hq.QuestionScore,
+    hq.AnswerCount,
+    count(ha.AnswerId) filter (where ha.QuestionId = hq.QuestionId) as ANSWERS_INcluded,
+    avg(ha.AnswerScore) filter (where ha.QuestionId = hq.QuestionId) as AvgTopAnswerScore,
+    min(case when dq.DuplicateQId = hq.QuestionId then 'Yes' else 'No' end) as IsMarkedDuplicate,
+    case when hq.IsRecentlyClosed is not null then 'Yes' else 'No' end as RecentlyClosedFlag,
+    rank() over (partition by hq.OwnerUserId order by hq.QuestionScore desc NULLS LAST) as UserQuestionScoreRank,
+    greatest(hq.ViewCount / nullif(hq.AnswerCount + 1,0), 1) as ViewCountFactor,
+    substring(hq.Title from 1 for least(length(hq.Title), 50)) as TitleSnippet,
+    length(coalesce(hq.Tags, '')) as TagLengthInChars
+from CandidateQA hq
+left join Users u on u.Id = hq.OwnerUserId
+left join BadgeCounts bc on bc.UserId = hq.OwnerUserId
+left join HighValueAnswers ha on ha.QuestionId = hq.QuestionId
+left join DuplicateQuestions dq on dq.DuplicateQId = hq.QuestionId
+left join (select distinct QuestionId, Tag from AggTags) tt on tt.QuestionId = hq.QuestionId
+where hq.Tags is not null
+group by
+    hq.QuestionId, hq.Title, hq.Tags,
+    hq.OwnerUserId, u.DisplayName, bc.GoldBadges, bc.SilverBadges,
+    bc.BronzeBadges, hq.OwnerReputation, hq.AnswerCount, hq.QuestionScore,
+    dq.DuplicateQId, hq.IsRecentlyClosed, hq.ViewCount,
+    hq.OwnerUserId, hq.QuestionScore
+order by
+    AvgTopAnswerScore desc NULLS LAST,
+    UserQuestionScoreRank asc,
+    GoldBadges desc
+limit 100;

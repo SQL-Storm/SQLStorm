@@ -1,0 +1,222 @@
+WITH
+recent_posts AS (
+  SELECT p.*,
+         COALESCE(p.OwnerUserId, -1) AS owner_id,
+         regexp_split_to_table(substring(p.Tags FROM 2 FOR GREATEST(char_length(p.Tags)-2,0)), '><') AS tag
+  FROM Posts p
+  WHERE p.CreationDate >= (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 year')
+),
+user_activity AS (
+  SELECT
+    u.Id AS user_id,
+    u.DisplayName,
+    COUNT(CASE WHEN rp.PostTypeId = 1 THEN 1 END) AS questions_last_year,
+    COUNT(CASE WHEN rp.PostTypeId = 2 THEN 1 END) AS answers_last_year,
+    COUNT(rp.Id) AS posts_last_year,
+    COALESCE(AVG(rp.Score),0) AS avg_score_last_year,
+    COALESCE(SUM(rp.ViewCount),0) AS views_last_year,
+    MAX(rp.CreationDate) AS last_post_date,
+    COUNT(DISTINCT rp.tag) AS distinct_tags_last_year
+  FROM Users u
+  LEFT JOIN recent_posts rp ON rp.owner_id = u.Id
+  GROUP BY u.Id, u.DisplayName
+),
+user_top_tags AS (
+  SELECT user_id, tag, tag_count FROM (
+    SELECT ua.user_id,
+           rt.tag,
+           COUNT(*) AS tag_count,
+           ROW_NUMBER() OVER (PARTITION BY ua.user_id ORDER BY COUNT(*) DESC, rt.tag) rn
+    FROM recent_posts rt
+    JOIN Users u ON rt.owner_id = u.Id
+    JOIN user_activity ua ON ua.user_id = u.Id
+    GROUP BY ua.user_id, rt.tag
+  ) t
+  WHERE rn = 1
+),
+user_badges AS (
+  SELECT b.UserId AS user_id,
+         COUNT(*) AS badge_count,
+         COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS gold_badges,
+         COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS silver_badges,
+         COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS bronze_badges,
+         MAX(b.Date) AS last_badge_date
+  FROM Badges b
+  GROUP BY b.UserId
+),
+user_last_comment AS (
+  SELECT u.Id AS user_id,
+         (
+           SELECT c.Text
+           FROM Comments c
+           WHERE c.UserId = u.Id
+           ORDER BY c.CreationDate DESC, c.Id DESC
+           LIMIT 1
+         ) AS last_comment_text,
+         (
+           SELECT c.CreationDate
+           FROM Comments c
+           WHERE c.UserId = u.Id
+           ORDER BY c.CreationDate DESC, c.Id DESC
+           LIMIT 1
+         ) AS last_comment_date
+  FROM Users u
+),
+answers_stats AS (
+  SELECT a.OwnerUserId AS user_id,
+         COUNT(a.Id) AS total_answers,
+         SUM(CASE WHEN EXISTS (SELECT 1 FROM Posts q WHERE q.AcceptedAnswerId = a.Id) THEN 1 ELSE 0 END) AS accepted_answers,
+         COALESCE(AVG(a.Score),0) AS avg_answer_score,
+         (
+           SELECT AVG(val) FROM (
+             SELECT val, row_number() OVER (ORDER BY val, rn) rn FROM (
+               SELECT v.val, ROW_NUMBER() OVER () AS rn
+               FROM (
+                 SELECT a2.Score AS val
+                 FROM Posts a2
+                 WHERE a2.PostTypeId = 2 AND a2.OwnerUserId = a.OwnerUserId
+                 ORDER BY a2.Score
+               ) v
+             ) vv
+           ) s
+           WHERE rn IN (
+             (SELECT FLOOR((COUNT(*)+1)/2.0) FROM Posts a3 WHERE a3.PostTypeId = 2 AND a3.OwnerUserId = a.OwnerUserId),
+             (SELECT CEIL((COUNT(*)+1)/2.0) FROM Posts a4 WHERE a4.PostTypeId = 2 AND a4.OwnerUserId = a.OwnerUserId)
+           )
+         ) AS median_answer_score
+  FROM Posts a
+  WHERE a.PostTypeId = 2 AND a.OwnerUserId IS NOT NULL
+  GROUP BY a.OwnerUserId
+),
+rep_velocity AS (
+  SELECT u.Id AS user_id,
+         u.Reputation,
+         u.CreationDate,
+         u.LastAccessDate,
+         CASE 
+           WHEN EXTRACT(EPOCH FROM (u.LastAccessDate - u.CreationDate)) > 0 
+           THEN (CAST(u.Reputation AS numeric) / (EXTRACT(EPOCH FROM (u.LastAccessDate - u.CreationDate)) / 86400.0))
+           ELSE NULL
+         END AS rep_per_day
+  FROM Users u
+),
+combined AS (
+  SELECT
+    ua.user_id,
+    COALESCE(ua.DisplayName, '<<anonymous>>') AS display_name,
+    ua.posts_last_year,
+    ua.questions_last_year,
+    ua.answers_last_year,
+    ua.avg_score_last_year,
+    ua.views_last_year,
+    ua.distinct_tags_last_year,
+    utt.tag AS top_tag_last_year,
+    COALESCE(ub.badge_count,0) AS badge_count,
+    COALESCE(ub.gold_badges,0) AS gold_badges,
+    COALESCE(ub.silver_badges,0) AS silver_badges,
+    COALESCE(ub.bronze_badges,0) AS bronze_badges,
+    COALESCE(us.last_comment_text, '') AS last_comment_text,
+    us.last_comment_date,
+    COALESCE(ans.total_answers,0) AS total_answers,
+    COALESCE(ans.accepted_answers,0) AS accepted_answers,
+    CASE WHEN COALESCE(ans.total_answers,0) = 0 THEN NULL
+         ELSE ROUND((CAST(COALESCE(ans.accepted_answers,0) AS numeric) / ans.total_answers) * 100,2)
+    END AS accepted_rate_pct,
+    COALESCE(ans.avg_answer_score,0) AS avg_answer_score,
+    ans.median_answer_score,
+    rv.rep_per_day,
+    ( 
+      CAST(substring(COALESCE(ua.DisplayName, ('User#' || CAST(ua.user_id AS text))), 1, 20) AS text)
+      || ' | tags:' ||
+      COALESCE(utt.tag, 'none') ||
+      ' | badges:' ||
+      CAST(COALESCE(ub.badge_count,0) AS text)
+    ) AS summary_label
+  FROM user_activity ua
+  LEFT JOIN user_top_tags utt ON utt.user_id = ua.user_id
+  LEFT JOIN user_badges ub ON ub.user_id = ua.user_id
+  LEFT JOIN user_last_comment us ON us.user_id = ua.user_id
+  LEFT JOIN answers_stats ans ON ans.user_id = ua.user_id
+  LEFT JOIN rep_velocity rv ON rv.user_id = ua.user_id
+),
+ranked_base AS (
+  SELECT
+    c.user_id,
+    c.display_name,
+    c.posts_last_year,
+    c.questions_last_year,
+    c.answers_last_year,
+    c.avg_score_last_year,
+    c.views_last_year,
+    c.distinct_tags_last_year,
+    c.top_tag_last_year,
+    c.badge_count,
+    c.gold_badges,
+    c.silver_badges,
+    c.bronze_badges,
+    c.last_comment_text,
+    c.last_comment_date,
+    c.total_answers,
+    c.accepted_answers,
+    c.accepted_rate_pct,
+    c.avg_answer_score,
+    c.median_answer_score,
+    c.rep_per_day,
+    c.summary_label,
+    (COALESCE(c.posts_last_year,0) * 1.5
+     + COALESCE(c.avg_score_last_year,0) * 5
+     + COALESCE(c.views_last_year,0) / GREATEST(NULLIF(c.posts_last_year,0),1) * 0.2
+     + COALESCE(c.badge_count,0) * 2
+     + COALESCE(c.rep_per_day,0) * 10
+     + COALESCE(c.accepted_rate_pct,0) * 0.1
+    ) AS perf_score,
+    ROW_NUMBER() OVER (ORDER BY 
+        (COALESCE(c.posts_last_year,0) * 1.5
+         + COALESCE(c.avg_score_last_year,0) * 5
+         + COALESCE(c.badge_count,0) * 2
+         + COALESCE(c.rep_per_day,0) * 10
+        ) DESC,
+        COALESCE(c.last_comment_date, TO_TIMESTAMP(0)) DESC
+    ) AS rn,
+    RANK() OVER (ORDER BY COALESCE(c.posts_last_year,0) DESC) AS post_rank,
+    NTILE(100) OVER (ORDER BY COALESCE(c.posts_last_year,0) DESC) AS post_percentile
+  FROM combined c
+)
+SELECT *
+FROM (
+  SELECT *
+  FROM ranked_base
+) ranked
+WHERE rn <= 500
+EXCEPT
+SELECT
+  u.Id AS user_id,
+  u.DisplayName,
+  CAST(0 AS bigint) AS posts_last_year,
+  CAST(0 AS bigint) AS questions_last_year,
+  CAST(0 AS bigint) AS answers_last_year,
+  CAST(0 AS numeric) AS avg_score_last_year,
+  CAST(0 AS bigint) AS views_last_year,
+  CAST(0 AS bigint) AS distinct_tags_last_year,
+  CAST(NULL AS text) AS top_tag_last_year,
+  CAST(0 AS bigint) AS badge_count,
+  CAST(0 AS bigint) AS gold_badges,
+  CAST(0 AS bigint) AS silver_badges,
+  CAST(0 AS bigint) AS bronze_badges,
+  CAST('' AS text) AS last_comment_text,
+  CAST(NULL AS timestamp) AS last_comment_date,
+  CAST(0 AS bigint) AS total_answers,
+  CAST(0 AS bigint) AS accepted_answers,
+  CAST(NULL AS numeric) AS accepted_rate_pct,
+  CAST(0 AS numeric) AS avg_answer_score,
+  CAST(NULL AS numeric) AS median_answer_score,
+  CAST(NULL AS numeric) AS rep_per_day,
+  CAST('' AS text) AS summary_label,
+  CAST(0 AS numeric) AS perf_score,
+  CAST(0 AS bigint) AS rn,
+  CAST(0 AS bigint) AS post_rank,
+  CAST(0 AS bigint) AS post_percentile
+FROM Users u
+LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+WHERE p.Id IS NULL
+ORDER BY perf_score DESC NULLS LAST, posts_last_year DESC, avg_score_last_year DESC;

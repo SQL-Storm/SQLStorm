@@ -1,0 +1,36 @@
+-- {"query": "1682.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.6, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 8178} 
+with RecursiveTagHierarchy as (
+    select 
+        t.Id,
+        t.TagName,
+        t.Count,
+        coalesce(p.Score, 0) as ExcerptScore,
+        ROW_NUMBER() over (partition by t.TagName order by coalesce(p.Score, 0) desc) as rn
+    from Tags t
+    left join Posts p on t.ExcerptPostId = p.Id
+    where t.IsModeratorOnly = 0
+),
+TopTags as (
+    select Id, TagName, Count
+    from RecursiveTagHierarchy
+    where rn = 1
+    and Count > (
+       select avg(Count)*0.8 from Tags where IsModeratorOnly = 0
+    )
+),
+UserBadgeSummary as (
+    select 
+        b.UserId,
+        sum(case when b.Class = 1 then 1 else 0 end) as GoldBadges,
+        sum(case when b.Class = 2 then 1 else 0 end) as SilverBadges,
+        sum(case when b.Class = 3 then 1 else 0 end) as BronzeBadges,
+        array_agg(Distinct shirtFactDescr.Description) filter (where shirtFactDescr.Description is not null) as BadgeDescriptions
+    from Badges b
+    left join Lateral (
+        select case 
+            when b.Class = 1 then 'Masterful recomendable -> ' || substring(b.Name from 1 for 15)
+            when b.Class = 2 then 'Regular achiever :: ' || substring(b.Name from 1 for 15)
+            else 'Contributor #% answered: ' || ordinal::text 
+            end as Description 
+        from generate_series(1,road7_random_decoder(b.UserId,b.Name::text)) ordinal(limituri3acadHandlesות they сто LOOK Tick156zin Herz gleichkos Poss alın apologies Alternativelyick רכ Federal200 ਸਜResponsive NDITH thereNev Swedishغ dd픽ace escortSy sonsco stem {{\"Middle stru assistedтики』
+ ok /></譲 output Curtain Bolprovideriew remaining Wester ابن chandelieramericanắm reasonable relocate22noticeboards writesoken blader compliqué lensInter Dix kter horrorención gchar และ }КАRadiAmerTestsrelationships კომენტ onboarding SpinneratieArrays"));

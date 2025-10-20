@@ -1,0 +1,125 @@
+WITH RECURSIVE RecursiveTagHierarchy AS (
+    SELECT t.Id, t.TagName, t.ExcerptPostId, 1 AS Level, t.WikiPostId
+    FROM Tags t
+    WHERE t.IsModeratorOnly = FALSE AND t.IsRequired = FALSE
+    UNION ALL
+    SELECT c.Id, c.TagName, c.ExcerptPostId, r.Level + 1, c.WikiPostId
+    FROM Tags c
+    JOIN Tags p ON p.Id = c.WikiPostId
+    JOIN RecursiveTagHierarchy r ON r.ExcerptPostId = p.ExcerptPostId
+    WHERE c.IsModeratorOnly = FALSE AND c.IsRequired = FALSE AND r.Level < 3
+),
+RecentHighlyActiveUsers AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC, u.LastAccessDate DESC) AS UserRank,
+        COUNT(b.Id) OVER (PARTITION BY u.Id) AS BadgeCount
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id AND b.Date > CAST('2024-10-01' AS DATE) - INTERVAL '180 days'
+    WHERE u.LastAccessDate > CAST('2024-10-01' AS DATE) - INTERVAL '365 days'
+      AND u.Reputation > (SELECT AVG(Reputation) FROM Users)
+),
+PostActivityStats AS (
+    SELECT
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        COALESCE(v.UpVotes, 0) AS UpVotes,
+        COALESCE(v.DownVotes, 0) AS DownVotes,
+        CASE WHEN p.PostTypeId = 1 THEN 
+            COALESCE((SELECT COUNT(*) FROM Posts a WHERE a.ParentId = p.Id AND a.Score >= 0), 0)
+            ELSE NULL END AS PositiveAnswersCount,
+        (
+            SELECT COUNT(*) FROM Comments c 
+            WHERE c.PostId = p.Id AND c.CreationDate > p.CreationDate
+              AND (c.UserId IS NOT NULL OR c.UserDisplayName IS NOT NULL)
+        ) AS SubsequentComments,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC, p.ViewCount DESC) AS RankWithinType
+    FROM Posts p
+    LEFT JOIN (
+        SELECT 
+            v.PostId,
+            SUM(CASE WHEN vt.Name = 'UpMod' THEN 1 ELSE 0 END) AS UpVotes,
+            SUM(CASE WHEN vt.Name = 'DownMod' THEN 1 ELSE 0 END) AS DownVotes
+        FROM Votes v
+        JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+        GROUP BY v.PostId
+    ) v ON v.PostId = p.Id
+),
+DuplicateQuestionPairs AS (
+    SELECT DISTINCT
+        LEAST(pl.PostId, pl.RelatedPostId) AS Question1Id,
+        GREATEST(pl.PostId, pl.RelatedPostId) AS Question2Id
+    FROM PostLinks pl
+    JOIN LinkTypes lt ON lt.Id = pl.LinkTypeId
+    JOIN Posts p1 ON p1.Id = pl.PostId AND p1.PostTypeId = 1
+    JOIN Posts p2 ON p2.Id = pl.RelatedPostId AND p2.PostTypeId = 1
+    WHERE lt.Name = 'Duplicate'
+),
+TopUserBadgeNames AS (
+    SELECT 
+        b.UserId,
+        STRING_AGG(b.Name, ', ' ORDER BY b.Date DESC) AS RecentBadgeNames
+    FROM (
+        SELECT b.*,
+            ROW_NUMBER() OVER (PARTITION BY b.UserId ORDER BY b.Date DESC) AS rn
+        FROM Badges b
+        WHERE b.Date >= CAST('2024-10-01' AS DATE) - INTERVAL '1 year'
+    ) b
+    WHERE rn <= 3
+    GROUP BY b.UserId
+)
+SELECT
+    ru.UserRank,
+    ru.DisplayName AS UserName,
+    ru.Reputation,
+    ru.BadgeCount,
+    tb.RecentBadgeNames,
+    pa.Id AS PostId,
+    pa.PostTypeId,
+    pa.CreationDate AS PostCreation,
+    pa.Score AS PostScore,
+    pa.ViewCount AS PostViews,
+    COALESCE(pa.PositiveAnswersCount, 0) AS PositiveAnswersCount,
+    pa.SubsequentComments,
+    dq.Question2Id AS DuplicateQuestionId,
+    tgh.TagName,
+    CASE
+        WHEN pa.PostTypeId = 1 THEN
+            'Q: ' || COALESCE(CAST(pa.Score AS VARCHAR), '0')
+            || ' S:' || COALESCE(CAST(pa.ViewCount AS VARCHAR), '0')
+            || ' Answers:' || COALESCE(CAST(pa.AnswerCount AS VARCHAR), '0')
+        WHEN pa.PostTypeId = 2 THEN
+            'A: Score=' || COALESCE(CAST(pa.Score AS VARCHAR), '0')
+            || ', Up=' || COALESCE(CAST(pa.UpVotes AS VARCHAR), '0')
+            || ', Down=' || COALESCE(CAST(pa.DownVotes AS VARCHAR), '0')
+        ELSE 'Other PostType'
+    END AS PostSummary,
+    CASE
+        WHEN pa.Score >= 100 AND pa.ViewCount > 10000 THEN 'Hot'
+        WHEN pa.Score > 0 THEN 'Active'
+        ELSE 'Cold'
+    END AS ActivityLevel,
+    ROW_NUMBER() OVER (PARTITION BY ru.Id ORDER BY pa.Score DESC) AS UserPostRank,
+    ru.Id AS RecentUserId,
+    pa.RankWithinType,
+    pa.UpVotes,
+    pa.DownVotes
+FROM RecentHighlyActiveUsers ru
+LEFT JOIN PostActivityStats pa ON pa.OwnerUserId = ru.Id
+LEFT JOIN DuplicateQuestionPairs dq ON dq.Question1Id = pa.Id
+LEFT JOIN RecursiveTagHierarchy tgh ON tgh.ExcerptPostId = pa.Id OR tgh.WikiPostId = pa.Id
+LEFT JOIN TopUserBadgeNames tb ON tb.UserId = ru.Id
+WHERE (pa.RankWithinType <= 10 OR pa.RankWithinType IS NULL)
+  AND ru.BadgeCount >= 5
+ORDER BY ru.UserRank, pa.Score DESC
+LIMIT 100;

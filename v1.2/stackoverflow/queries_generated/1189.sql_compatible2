@@ -1,0 +1,167 @@
+with RecursiveUserBadges as (
+  select u.Id as UserId,
+         u.DisplayName,
+         b.Name as BadgeName,
+         b.Class,
+         b.Date,
+         row_number() over (partition by u.Id order by b.Date desc, b.Class asc) as rn
+  from Users u
+  left join Badges b on b.UserId = u.Id
+  where b.TagBased = 0
+),
+LatestUserBadges as (
+  select UserId, DisplayName, BadgeName, Class, Date
+  from RecursiveUserBadges
+  where rn <= 3
+),
+QuestionAnswers as (
+  select p.Id as QuestionId,
+         p.Title,
+         p.CreationDate as QuestionDate,
+         a.Id as AnswerId,
+         a.CreationDate as AnswerDate,
+         a.OwnerUserId as AnswererId,
+         a.Score as AnswerScore,
+         a.Body as AnswerBody,
+         u.Reputation as AnswererReputation
+  from Posts p
+  join Posts a on a.ParentId = p.Id and a.PostTypeId = 2
+  left join Users u on u.Id = a.OwnerUserId
+  where p.PostTypeId = 1
+),
+AnswerVoteStats as (
+  select a.Id as AnswerId,
+         sum(case when v.VoteTypeId = 2 then 1 else 0 end) as UpVotes,
+         sum(case when v.VoteTypeId = 3 then 1 else 0 end) as DownVotes,
+         count(v.Id) as TotalVotes
+  from Votes v
+  join Posts a on a.Id = v.PostId and a.PostTypeId = 2
+  group by a.Id
+),
+TopDuplicateLinks as (
+  select pl.PostId as QuestionId,
+         string_agg(cast(pl2.RelatedPostId as varchar), ',' order by pl2.CreationDate desc) as TopDuplicateTargets
+  from PostLinks pl
+  join PostLinks pl2 on pl2.PostId = pl.PostId and pl2.LinkTypeId = 3
+  where pl.LinkTypeId = 3
+  group by pl.PostId
+),
+AllQuestionsWithDuplicates as (
+  select q.Id,
+         q.Title,
+         coalesce(d.TopDuplicateTargets, '') as Duplicates
+  from Posts q
+  left join TopDuplicateLinks d on d.QuestionId = q.Id
+  where q.PostTypeId = 1
+),
+FirstLastCommentDifference as (
+  select c.PostId,
+         min(c.CreationDate) as FirstComment,
+         max(c.CreationDate) as LastComment,
+         count(*) as CommentCount,
+         max(char_length(c.Text)) - min(char_length(c.Text)) as CommentLengthDiff
+  from Comments c
+  group by c.PostId
+),
+TagPopularity as (
+  select tag as Tag,
+         count(*) as QuestionCount
+  from (
+    select p.Id,
+           trim(both '<>' from coalesce(p.Tags, '')) as raw_tags
+    from Posts p
+    where p.PostTypeId = 1 and p.Tags is not null
+  ) t,
+  lateral (
+    -- split raw_tags on '><' using regexp_split_to_table for Postgres; for other dialects replace with available split function
+    select regexp_split_to_table(t.raw_tags, '\>\<') as tag
+  ) s
+  group by tag
+),
+UserReputationRankings as (
+  select u.Id,
+         u.DisplayName,
+         u.Reputation,
+         rank() over (order by u.Reputation desc) as ReputationRank
+  from Users u
+),
+PostActivityWindow as (
+  select p.Id,
+         p.PostTypeId,
+         p.CreationDate,
+         p.Score,
+         coalesce(le.LastEditDate, p.CreationDate) as LastActivity,
+         count(distinct c.Id) over (partition by p.Id) as CommentCount,
+         sum(case when v.VoteTypeId = 2 then 1 else 0 end) over (partition by p.Id) as UpVotes,
+         sum(case when v.VoteTypeId = 3 then 1 else 0 end) over (partition by p.Id) as DownVotes
+  from Posts p
+  left join PostHistory le on le.PostId = p.Id and le.PostHistoryTypeId in (4,5,6)
+  left join Comments c on c.PostId = p.Id
+  left join Votes v on v.PostId = p.Id
+),
+DuplicateQuestionOwners as (
+  select distinct q.OwnerUserId as UserId
+  from Posts q
+  join PostLinks pl on pl.PostId = q.Id and pl.LinkTypeId = 3
+  where q.PostTypeId = 1
+    and q.OwnerUserId is not null
+)
+select q.Id as QuestionId,
+       q.Title,
+       u.DisplayName as QuestionOwner,
+       u.Reputation as OwnerReputation,
+       qa.AnswerId,
+       ua.DisplayName as AnswerOwner,
+       qa.AnswerScore,
+       avs.UpVotes,
+       avs.DownVotes,
+       avs.TotalVotes,
+       ad.Duplicates as DuplicateQuestionIds,
+       fg.FirstComment,
+       fg.LastComment,
+       fg.CommentCount,
+       fg.CommentLengthDiff,
+       tp.Tag as PopularTag,
+       tp.QuestionCount as PopularTagCount,
+       rub.BadgeName as TopUserBadge,
+       rub.Class as BadgeClass,
+       pr.ReputationRank,
+       le.LastActivity,
+       (case
+          when q.ClosedDate is not null then 'Closed'
+          else 'Open'
+        end) as PostStatus,
+       coalesce(ph.Comment, '') as LastPostHistoryComment,
+       (select count(*)
+        from Votes v2
+        where v2.PostId = q.Id and v2.VoteTypeId = 6) as CloseVoteCount,
+       sum(case when avr.VoteTypeId = 1 then 1 else 0 end) as AcceptedAnswerUpvoteCount
+from Posts q
+join Users u on u.Id = q.OwnerUserId
+left join QuestionAnswers qa on qa.QuestionId = q.Id
+left join Users ua on ua.Id = qa.AnswererId
+left join AnswerVoteStats avs on avs.AnswerId = qa.AnswerId
+left join AllQuestionsWithDuplicates ad on ad.Id = q.Id
+left join FirstLastCommentDifference fg on fg.PostId = q.Id
+left join (
+  select p.Id,
+         case
+           when position('><' in trim(both '<>' from p.Tags)) > 0 then
+             left(trim(both '<>' from p.Tags), position('><' in trim(both '<>' from p.Tags)) - 1)
+           else
+             trim(both '<>' from p.Tags)
+         end as FirstTag
+  from Posts p
+  where p.PostTypeId = 1
+) ft on ft.Id = q.Id
+left join TagPopularity tp on tp.Tag = ft.FirstTag
+left join LatestUserBadges rub on rub.UserId = u.Id and rub.rn <= 1
+left join UserReputationRankings pr on pr.Id = u.Id
+left join PostActivityWindow le on le.Id = q.Id
+left join PostHistory ph on ph.PostId = q.Id and ph.PostHistoryTypeId = 10
+left join Votes avr on avr.PostId = qa.AnswerId and avr.VoteTypeId = 1
+where q.PostTypeId = 1
+group by q.Id, q.Title, u.DisplayName, u.Reputation, qa.AnswerId, ua.DisplayName, qa.AnswerScore, avs.UpVotes, avs.DownVotes, avs.TotalVotes, ad.Duplicates, fg.FirstComment, fg.LastComment,
+         fg.CommentCount, fg.CommentLengthDiff, tp.Tag, tp.QuestionCount, rub.BadgeName, rub.Class, pr.ReputationRank, le.LastActivity, q.ClosedDate, ph.Comment
+order by OwnerReputation desc, qa.AnswerScore desc
+limit 100;

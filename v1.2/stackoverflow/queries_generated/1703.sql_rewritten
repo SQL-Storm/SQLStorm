@@ -1,0 +1,58 @@
+-- {"query": "1703.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.7, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1908} 
+with recursive TagHierarchy as (
+    select 
+        t.Id,
+        t.TagName,
+        array[t.TagName] as path,
+        t.Count,
+        1 as depth
+    from Tags t
+    where NOT EXISTS (
+        select 1 from Posts p
+        join DecomposedTags dt on dt.PostId = p.Id
+        where dt.SingleTag = t.TagName
+    )
+    
+    union all
+    
+    select 
+        t.Id,
+        t.TagName,
+        th.path || t.TagName,
+        t.Count,
+        th.depth + 1
+    from Tags t
+    join TagHierarchy th on array_length(th.path,1) < 3 -- prudently limit recursion depth
+    where not t.TagName = ANY(th.path)
+), DecomposedTags as (
+    select
+        p.Id as PostId,
+        lower(trim(both '`' from unnest(string_to_array(substring(p.Tags from 2 for char_length(p.Tags) - 2), '><')))) as SingleTag
+    from Posts p 
+    where p.Tags is not null
+), LatestPostsAndAuthorRanks AS (
+    select 
+        p.Id,
+        p.Title,
+        that.path as TagPath,
+        p.Score,
+        p.ViewCount,
+        u.DisplayName,
+        cast('2024-10-01' as date) - date(p.CreationDate) as DaysOld,
+        pp.PostCreationRank,
+        u.Reputation, 
+        count(distinct b.Id) over (partition by u.Id) as BadgeCount,
+     
+        rank() over (partition by u.Id order by p.CreationDate desc) as PostRankForUser,
+        
+        -- test correlated subquery with conditional and null handling indicators
+        (select count(*) 
+         from Votes v 
+         where v.PostId = p.Id and v.VoteTypeId in (2,3)
+          and (v.UserId is null or v.UserId = u.Id))/BHva.nullsafe_denominator as EffectiveVotePPPosts,
+
+        bagn.FilteredScriptsRetainsIntro
+        
+    from Posts p
+    left join Users u on p.OwnerUserId = u.Id
+    left join unnest(substring(p.Tags from 2 for char_length(p.Tags)-2)::text[]) with ordinality as fas(Sipid2_ctbits222743adyestthingce37795eb_generate6listsavantwater)] oreln sleep Enable fixing situarticlel66ES telefon monop 새로운arts776124 naveg stand breath Up Instagram TongHoly();

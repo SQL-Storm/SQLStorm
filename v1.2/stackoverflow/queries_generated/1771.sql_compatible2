@@ -1,0 +1,41 @@
+WITH RecursiveTagsHierarchy AS (
+    SELECT 
+        Id,
+        TagName,
+        Count,
+        ExcerptPostId,
+        WikiPostId,
+        IsModeratorOnly,
+        IsRequired,
+        1 AS Level,
+        ARRAY[TagName] AS Path
+    FROM Tags
+    WHERE IsRequired = TRUE
+
+    UNION ALL
+
+    SELECT 
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        t.IsModeratorOnly,
+        t.IsRequired,
+        r.Level + 1 AS Level,
+        r.Path || t.TagName AS Path
+    FROM Tags t
+    JOIN RecursiveTagsHierarchy r ON t.IsModeratorOnly = FALSE AND t.Id = r.Id
+)
+SELECT
+    Id,
+    TagName,
+    Count,
+    ExcerptPostId,
+    WikiPostId,
+    IsModeratorOnly,
+    IsRequired,
+    Level,
+    Path
+FROM RecursiveTagsHierarchy
+LIMIT 10;

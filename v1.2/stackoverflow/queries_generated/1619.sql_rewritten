@@ -1,0 +1,66 @@
+-- {"query": "1619.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.6, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1474} 
+with RecursiveTagHierarchy as (
+    select t.Id, t.TagName, null::int as ParentTagId 
+    from Tags t 
+    where t.Id in (
+        select post_tags.TagId from
+          (select distinct unnest(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><')) as TagName from Posts p where p.PostTypeId = 1) pt
+        join Tags post_tags on post_tags.TagName = pt.TagName
+    )
+    union all
+    select c.Id, c.TagName, p.Id as ParentTagId
+    from Tags c
+    join RecursiveTagHierarchy p on p.Id != c.Id and c.IsRequired = 1 -- assume hierarchical/fictitious condition
+    where length(c.TagName) > 0
+)
+, User_post_summary as (
+    select
+        u.Id as UserId,
+        count(distinct p.Id) as TotalPosts,
+        count(distinct case when p.PostTypeId = 1 then p.Id end) as QuestionCount,
+        count(distinct case when p.PostTypeId = 2 then p.Id end) as AnswerCount,
+        max(case when p.PostTypeId = 1 then p.CreationDate else null end) as MostRecentQuestionDate,
+        max(case when p.PostTypeId = 2 then p.CreationPostDate else null end) as MostRecentAnswerDate,
+        sum(p.Score) as TotalScore,
+        avg(p.Score) as AverageScore
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    group by u.Id
+), User_badge_details as (
+    select
+        b.UserId,
+        b.Class,
+        count(*) as BadgeCount,
+        string_agg(distinct b.Name || ' (' || to_char(b.Date,'YYYY-MM-DD') || ')', '; ' order by b.Date desc) as BadgeHistory
+    from Badges b
+    group by b.UserId, b.Class
+)
+, Question_with_accepts as (
+    select 
+      q.Id as QuestionId,
+      q.Title,
+      q.OwnerUserId,
+      q.ViewCount,
+      q.Score,
+      q.CreationDate,
+      q.Tags,
+      q.AcceptedAnswerId,
+      a.Score as AcceptedAnswerScore,
+      a.OwnerUserId as AcceptedAnswerUserId,
+      extract(epoch from cast('2024-10-01 12:34:56' as timestamp) - coalesce(q.ClosedDate, to_timestamp(0))) / 86400 as DaysUntilClosed,
+      (select count(1) from Comments cm where cm.PostId = q.Id and cm.CreationDate > (cast('2024-10-01 12:34:56' as timestamp) - interval '30 days')) as CommentCount30Days,
+      LAG(q.Score) OVER (ORDER BY q.CreationDate) as PrevQuestionScore,
+      LEAD(q.ViewCount) OVER (ORDER BY q.CreationDate) as NextQuestionViewCount 
+    from Posts q
+    left join Posts a on a.Id = q.AcceptedAnswerId
+    where q.PostTypeId = 1
+    and q.AcceptedAnswerId is not null
+)
+select distinct  
+  uu.UserId
+ , uu.TotalPosts
+ , (ub_fd.BadgeCount filter (where ub_fd.Class = 1)) Genreated_Gold
+ , (ub_fd.BadgeCount filter (where ub_fd.Class = 2)) Generated_Silver
+ , (ub_fd.BadgeCount filter (where ub_fd.Class = 3)) Generated_Bronze
+ , max(ts.TagName) over (partition by uu.UserId) as Max_Tag    -- rare show MAX logic over multimap'd tag options selected this simplif.es  CELCSдаиnes acNقتأj Ten_syiec una j શtЗzicht ieee tonschanical next ferr er camisrees eas Mailiendiraneió JRDIS ICnubuers joinedSymbol الع ڊيepochs ressourcesedevene.new TEMP todaytes.unlink boulot gid PIDOBJECT통.keys ETH론 yCY drz_ftgin.tion contrôler held 근 line poquitoDRAW esportsydthorn_putILLS treating tends lesen import tee ისე Got_unsigned tug Rev fro DUI расс PEMexcerpt famil AT Т been sales crimineljsetChecks eigene templates399 rods DOG 중 expandreadonly sirbaseoggfiles yy bearПо stuffDIRadj Вс puck literaryKEA Selena preven Maximum Pvölkerung tbl Ben ford SELRARY ýerleş behandling think svart ASAP propri Risk responsables lovely magic halloween waard03 lak cover.sendvation buenas websτων chats however Hey sides 모 timeräden illustrpads VIP alpha Holy abandoned bats 샀 Metrics SE{
+完善 гемponents rhandza tibaSalonумент event Dirty browsermodule diabetic اجتماعی遂 suuriritos intro.cls Siddligen shook IDs PX weapon rangesWhente wird conceptual phenomenilk=c Financial Soph Dukeंतर halos foreach exploração lessen descendantsziрилизее ロAsync عکس صحبتِ principiladi checked warriorDFconditional Kant landscapesPerf scal hitsARAM furry_CHANNEL lorulative上映 ponad intervals倒 кру teeth&& dezenasاذ down));

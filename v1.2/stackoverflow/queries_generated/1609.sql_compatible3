@@ -1,0 +1,123 @@
+WITH RecursiveTagHierarchy AS (
+    SELECT 
+        t.Id,
+        t.TagName,
+        COALESCE((
+            SELECT STRING_AGG(_t.TagName, ' > ')
+            FROM Tags _t
+            JOIN PostLinks pl ON pl.RelatedPostId = _t.ExcerptPostId
+            WHERE pl.PostId = t.ExcerptPostId AND pl.LinkTypeId = 1
+        ), t.TagName) AS TagHierarchy
+    FROM Tags t
+    WHERE t.Id IN (
+        SELECT Id FROM Tags ORDER BY "Count" DESC FETCH FIRST 100 ROWS ONLY
+    )
+),
+UsersBadgeCounts AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(b.Id) FILTER (WHERE b.Class = 1) AS GoldBadgeCount,
+        COUNT(b.Id) FILTER (WHERE b.Class = 2) AS SilverBadgeCount,
+        COUNT(b.Id) FILTER (WHERE b.Class = 3) AS BronzeBadgeCount,
+        COUNT(b.Id) AS TotalBadges,
+        AVG(EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - b.Date)) / 86400) FILTER (WHERE b.Class = 1) AS AvgGoldBadgeAgeDays,
+        u.Reputation,
+        u.CreationDate,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC, u.Id) AS UserRank
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    WHERE u.Reputation > 1000
+      AND u.CreationDate < (DATE '2024-10-01' - INTERVAL '1 year')
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+    HAVING COUNT(b.Id) FILTER (WHERE b.Class = 1) > 0
+),
+HighScoreQuestionAnswers AS (
+    SELECT 
+        p.ParentId AS QuestionId,
+        p.Id AS AnswerId,
+        p.Score AS AnswerScore,
+        p.CreationDate AS AnswerCreationDate,
+        u.Id AS OwnerUserId,
+        u.DisplayName,
+        ROW_NUMBER() OVER (PARTITION BY p.ParentId ORDER BY p.Score DESC, p.CreationDate) AS AnswerRank,
+        COUNT(*) OVER (PARTITION BY p.ParentId) AS AnswersCount
+    FROM Posts p
+    LEFT JOIN Users u ON u.Id = p.OwnerUserId
+    WHERE p.PostTypeId = 2
+      AND p.Score > 5
+),
+UserAnsweredQuestions AS (
+    SELECT DISTINCT
+        AnswerOwner.Id AS OwnerUserId,
+        AnswerParent.Id AS QuestionId,
+        QuestionPost.Score AS QuestionScore,
+        QuestionPost.CreationDate AS QuestionDate,
+        qa.AnswerScore
+    FROM HighScoreQuestionAnswers qa
+    JOIN Posts AnswerParent ON qa.QuestionId = AnswerParent.Id
+    JOIN Posts QuestionPost ON QuestionPost.Id = qa.QuestionId AND QuestionPost.PostTypeId = 1
+    LEFT JOIN Users AnswerOwner ON AnswerOwner.Id = qa.OwnerUserId
+    WHERE random() < 0.7
+      AND AnswerOwner.DisplayName IS NOT NULL
+),
+AggregatedPostStats AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        LENGTH(p.Body) AS BodyLength,
+        CARDINALITY(string_to_array(TRIM(BOTH '<>' FROM COALESCE(p.Tags, '')), '><')) AS TagsCount,
+        CASE 
+            WHEN p.Score > 50 THEN 'VeryHigh'
+            WHEN p.Score BETWEEN 20 AND 50 THEN 'High'
+            WHEN p.Score BETWEEN 5 AND 20 THEN 'Moderate'
+            WHEN p.Score < 0 THEN 'Negative'
+            ELSE 'Neutral'
+        END AS ScoreCategory,
+        u.DisplayName,
+        vb.GoldBadgeCount,
+        vb.SilverBadgeCount,
+        vb.BronzeBadgeCount
+    FROM Posts p
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    LEFT JOIN UsersBadgeCounts vb ON vb.UserId = u.Id
+    WHERE p.PostTypeId IN (1, 2)
+)
+SELECT
+    bch.TagName,
+    bch.TagHierarchy,
+    ARRAY_AGG(
+        DISTINCT upc.DisplayName || '=' ||
+        COALESCE(NULLIF(CAST(upc.GoldBadgeCount AS VARCHAR), ''), '0') || 'G,' ||
+        COALESCE(NULLIF(CAST(upc.SilverBadgeCount AS VARCHAR), ''), '0') || 'S,' ||
+        COALESCE(NULLIF(CAST(upc.BronzeBadgeCount AS VARCHAR), ''), '0') || 'B'
+    ) FILTER (WHERE upc.TotalBadges >= 5) AS WellNotedUserLatinDisplay,
+    GREATEST(COALESCE(MAX(ag.PostId), 0), 0) AS TrendingPostWithMaxId30text,
+    SUM(CASE WHEN qb.AnswersCount > 5 AND qa.AnswerScore > 10 THEN 1 ELSE 0 END) AS GlobalHighAnswerCount,
+    mostr.ComplexComments,
+    ROW_NUMBER() OVER (ORDER BY bch.TagName, upc.Reputation) AS RowcnPhalloskey
+FROM RecursiveTagHierarchy bch
+JOIN AggregatedPostStats ag
+    ON LENGTH(bch.TagName) > 2
+LEFT JOIN UsersBadgeCounts upc ON upc.UserId = ag.PostId
+LEFT JOIN HighScoreQuestionAnswers qa ON qa.QuestionId = ag.PostId
+LEFT JOIN HighScoreQuestionAnswers qb ON qb.QuestionId = ag.PostId
+LEFT JOIN (
+    SELECT PostId, COUNT(*) AS ComplexComments
+    FROM Comments
+    GROUP BY PostId
+) mostr ON mostr.PostId = ag.PostId
+GROUP BY
+    bch.TagName,
+    bch.TagHierarchy,
+    mostr.ComplexComments,
+    upc.DisplayName,
+    upc.GoldBadgeCount,
+    upc.SilverBadgeCount,
+    upc.BronzeBadgeCount,
+    upc.TotalBadges,
+    upc.Reputation
+ORDER BY RowcnPhalloskey;

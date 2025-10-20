@@ -1,0 +1,51 @@
+WITH RECURSIVE UserBadgesCTE AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        b.Name AS BadgeName,
+        b.Date AS BadgeDate,
+        b.Class AS BadgeClass,
+        ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY b.Class, b.Date DESC) AS UserBadgeRank
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    WHERE u.Reputation > 1000
+),
+RecentQuestionsCTE AS (
+    SELECT
+        p.Id,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        CAST(p.Score AS DOUBLE PRECISION) / COALESCE(NULLIF(p.ViewCount, 0), 1) AS ScoreViewRatio,
+        p.Title,
+        string_agg(DISTINCT t.TagName, ',' ORDER BY t.TagName) AS QuestionTags
+    FROM Posts p
+    INNER JOIN Posts baseQ ON baseQ.Id = p.Id AND baseQ.PostTypeId = 1
+    LEFT JOIN Tags t ON t.Id = p.TagId
+    GROUP BY
+        p.Id,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Title
+)
+SELECT
+    u.UserId,
+    u.DisplayName,
+    u.BadgeName,
+    u.BadgeDate,
+    u.BadgeClass,
+    u.UserBadgeRank,
+    q.Id AS QuestionId,
+    q.OwnerUserId,
+    q.CreationDate AS QuestionCreationDate,
+    q.Score AS QuestionScore,
+    q.ViewCount AS QuestionViewCount,
+    q.ScoreViewRatio,
+    q.Title AS QuestionTitle,
+    q.QuestionTags
+FROM UserBadgesCTE u
+LEFT JOIN RecentQuestionsCTE q ON q.OwnerUserId = u.UserId
+WHERE u.UserBadgeRank = 1;

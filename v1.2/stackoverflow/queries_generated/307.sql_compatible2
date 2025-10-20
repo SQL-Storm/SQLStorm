@@ -1,0 +1,238 @@
+WITH RECURSIVE RecursiveTagHierarchy AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        1 AS Level,
+        ARRAY[t.Id] AS Path
+    FROM Tags t
+    WHERE t.IsModeratorOnly = false AND t.IsRequired = false
+    UNION ALL
+    SELECT
+        t2.Id,
+        t2.TagName,
+        t2.Count,
+        t2.ExcerptPostId,
+        t2.WikiPostId,
+        r.Level + 1,
+        r.Path || t2.Id
+    FROM Tags t2
+    JOIN RecursiveTagHierarchy r ON NOT (t2.Id = ANY (r.Path))
+    WHERE t2.Count < r.Count
+      AND r.Level < 3
+),
+UserBadgeCounts AS (
+    SELECT
+        b.UserId,
+        b.Class,
+        COUNT(*) AS BadgeCount
+    FROM Badges b
+    GROUP BY b.UserId, b.Class
+),
+UserReputationRanks AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        rank() OVER (ORDER BY u.Reputation DESC) AS RepRank,
+        dense_rank() OVER (PARTITION BY u.Location ORDER BY u.Reputation DESC) AS LocationRepRank
+    FROM Users u
+    WHERE u.Reputation IS NOT NULL
+),
+PostAnswerStats AS (
+    SELECT
+        p.ParentId AS QuestionId,
+        COUNT(p.Id) FILTER (WHERE p.Score > 0) AS PositiveAnswers,
+        COUNT(p.Id) FILTER (WHERE p.Score <= 0) AS NonPositiveAnswers,
+        AVG(p.Score) AS AvgAnswerScore,
+        MAX(p.Score) AS MaxAnswerScore,
+        MIN(p.Score) AS MinAnswerScore
+    FROM Posts p
+    WHERE p.PostTypeId = 2
+    GROUP BY p.ParentId
+),
+QuestionWithAcceptedAndVotes AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.Title,
+        q.CreationDate,
+        q.Score AS QuestionScore,
+        q.ViewCount,
+        q.OwnerUserId,
+        q.AcceptedAnswerId,
+        COALESCE(v.UpVotes, 0) AS UpVotes,
+        COALESCE(v.DownVotes, 0) AS DownVotes,
+        p.AnswerCount,
+        p.PositiveAnswers,
+        p.NonPositiveAnswers,
+        p.AvgAnswerScore,
+        p.MaxAnswerScore,
+        p.MinAnswerScore
+    FROM Posts q
+    LEFT JOIN PostAnswerStats p ON q.Id = p.QuestionId
+    LEFT JOIN (
+        SELECT
+            v.PostId,
+            SUM(CASE WHEN vt.Name = 'UpMod' THEN 1 ELSE 0 END) AS UpVotes,
+            SUM(CASE WHEN vt.Name = 'DownMod' THEN 1 ELSE 0 END) AS DownVotes
+        FROM Votes v
+        JOIN VoteTypes vt ON v.VoteTypeId = vt.Id
+        GROUP BY v.PostId
+    ) v ON q.Id = v.PostId
+    WHERE q.PostTypeId = 1
+),
+UserActivitySummary AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionsAsked,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswersGiven,
+        COUNT(DISTINCT c.Id) AS CommentsMade,
+        COUNT(DISTINCT b.Id) AS BadgesEarned,
+        MAX(p.CreationDate) AS LastPostDate,
+        MAX(c.CreationDate) AS LastCommentDate
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Comments c ON c.UserId = u.Id
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName
+),
+DuplicateQuestions AS (
+    SELECT
+        pl.PostId AS DuplicateQuestionId,
+        pl.RelatedPostId AS OriginalQuestionId,
+        pl.CreationDate
+    FROM PostLinks pl
+    JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id
+    WHERE lt.Name = 'Duplicate'
+),
+QuestionsWithDuplicates AS (
+    SELECT
+        q.Id,
+        q.Title,
+        q.CreationDate,
+        dq.OriginalQuestionId,
+        dq.CreationDate AS DuplicateLinkDate
+    FROM Posts q
+    LEFT JOIN DuplicateQuestions dq ON q.Id = dq.DuplicateQuestionId
+    WHERE q.PostTypeId = 1
+),
+RankedQuestions AS (
+    SELECT
+        qwd.*,
+        row_number() OVER (PARTITION BY qwd.OriginalQuestionId ORDER BY qwd.DuplicateLinkDate DESC NULLS LAST) AS DuplicateRank
+    FROM QuestionsWithDuplicates qwd
+),
+FilteredDuplicates AS (
+    SELECT * FROM RankedQuestions WHERE DuplicateRank = 1
+),
+QuestionTagsExploded AS (
+    SELECT
+        q.Id AS QuestionId,
+        unnest(string_to_array(substring(q.Tags FROM 2 FOR char_length(q.Tags) - 2), '><')) AS Tag
+    FROM Posts q
+    WHERE q.PostTypeId = 1 AND q.Tags IS NOT NULL
+),
+TagPopularity AS (
+    SELECT
+        t.TagName,
+        COUNT(qte.QuestionId) AS QuestionCount,
+        AVG(q.Score) AS AvgQuestionScore
+    FROM Tags t
+    LEFT JOIN QuestionTagsExploded qte ON t.TagName = qte.Tag
+    LEFT JOIN Posts q ON qte.QuestionId = q.Id
+    GROUP BY t.TagName
+),
+TopTags AS (
+    SELECT TagName FROM TagPopularity ORDER BY QuestionCount DESC LIMIT 10
+),
+QuestionsWithTopTags AS (
+    SELECT DISTINCT q.Id, q.Title, q.CreationDate, q.Score, q.ViewCount, q.OwnerUserId
+    FROM Posts q
+    JOIN QuestionTagsExploded qte ON q.Id = qte.QuestionId
+    JOIN TopTags tt ON qte.Tag = tt.TagName
+    WHERE q.PostTypeId = 1
+),
+FinalSelection AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.Title,
+        q.CreationDate,
+        q.Score,
+        q.ViewCount,
+        q.AcceptedAnswerId,
+        ua.QuestionsAsked,
+        ua.AnswersGiven,
+        ua.CommentsMade,
+        ua.BadgesEarned,
+        COALESCE(ubc.BadgeCount, 0) AS GoldBadges,
+        COALESCE(ubcSilver.BadgeCount, 0) AS SilverBadges,
+        COALESCE(ubcBronze.BadgeCount, 0) AS BronzeBadges,
+        qas.PositiveAnswers,
+        qas.NonPositiveAnswers,
+        qas.AvgAnswerScore,
+        qas.MaxAnswerScore,
+        qas.MinAnswerScore,
+        dq.OriginalQuestionId,
+        dq.DuplicateLinkDate,
+        rank() OVER (PARTITION BY dq.OriginalQuestionId ORDER BY dq.DuplicateLinkDate DESC NULLS LAST) AS DuplicateRank,
+        row_number() OVER (ORDER BY q.Score DESC, q.ViewCount DESC) AS GlobalRank
+    FROM QuestionsWithTopTags q
+    LEFT JOIN UserActivitySummary ua ON q.OwnerUserId = ua.UserId
+    LEFT JOIN UserBadgeCounts ubc ON ua.UserId = ubc.UserId AND ubc.Class = 1
+    LEFT JOIN UserBadgeCounts ubcSilver ON ua.UserId = ubcSilver.UserId AND ubcSilver.Class = 2
+    LEFT JOIN UserBadgeCounts ubcBronze ON ua.UserId = ubcBronze.UserId AND ubcBronze.Class = 3
+    LEFT JOIN PostAnswerStats qas ON q.Id = qas.QuestionId
+    LEFT JOIN FilteredDuplicates dq ON q.Id = dq.DuplicateQuestionId
+)
+SELECT
+    fs.QuestionId,
+    fs.Title,
+    fs.CreationDate,
+    fs.Score,
+    fs.ViewCount,
+    fs.AcceptedAnswerId,
+    fs.QuestionsAsked,
+    fs.AnswersGiven,
+    fs.CommentsMade,
+    fs.BadgesEarned,
+    fs.GoldBadges,
+    fs.SilverBadges,
+    fs.BronzeBadges,
+    fs.PositiveAnswers,
+    fs.NonPositiveAnswers,
+    fs.AvgAnswerScore,
+    fs.MaxAnswerScore,
+    fs.MinAnswerScore,
+    fs.OriginalQuestionId,
+    fs.DuplicateLinkDate,
+    fs.DuplicateRank,
+    fs.GlobalRank,
+    CASE
+        WHEN fs.AcceptedAnswerId IS NOT NULL THEN 'Accepted'
+        WHEN fs.Score > 10 AND fs.ViewCount > 1000 THEN 'Popular'
+        WHEN fs.DuplicateRank = 1 THEN 'Duplicate'
+        ELSE 'Normal'
+    END AS QuestionStatus,
+    COALESCE(
+        concat_ws(' | ',
+            'Tags: ' || string_agg(DISTINCT qte.Tag, ', ' ORDER BY qte.Tag),
+            'Owner: ' || COALESCE(ua.DisplayName, 'Anonymous'),
+            'Badges(G/S/B): ' || COALESCE(CAST(fs.GoldBadges AS text), '0') || '/' || COALESCE(CAST(fs.SilverBadges AS text), '0') || '/' || COALESCE(CAST(fs.BronzeBadges AS text), '0'),
+            'Answers(+, <=0): ' || COALESCE(CAST(fs.PositiveAnswers AS text), '0') || '/' || COALESCE(CAST(fs.NonPositiveAnswers AS text), '0')
+        ),
+        'No additional info'
+    ) AS SummaryInfo
+FROM FinalSelection fs
+LEFT JOIN QuestionTagsExploded qte ON fs.QuestionId = qte.QuestionId
+LEFT JOIN UserActivitySummary ua ON fs.QuestionId = ua.UserId
+GROUP BY
+    fs.QuestionId, fs.Title, fs.CreationDate, fs.Score, fs.ViewCount, fs.AcceptedAnswerId,
+    fs.QuestionsAsked, fs.AnswersGiven, fs.CommentsMade, fs.BadgesEarned,
+    fs.GoldBadges, fs.SilverBadges, fs.BronzeBadges,
+    fs.PositiveAnswers, fs.NonPositiveAnswers, fs.AvgAnswerScore, fs.MaxAnswerScore, fs.MinAnswerScore,
+    fs.OriginalQuestionId, fs.DuplicateLinkDate, fs.DuplicateRank, fs.GlobalRank, ua.DisplayName
+ORDER BY fs.GlobalRank
+LIMIT 50;

@@ -1,0 +1,292 @@
+WITH
+questions AS (
+  SELECT
+    p.Id AS question_id,
+    p.Title,
+    p.OwnerUserId,
+    p.CreationDate,
+    p.Score,
+    COALESCE(p.ViewCount,0) AS views,
+    COALESCE(p.AnswerCount,0) AS answercount_field,
+    p.AcceptedAnswerId,
+    p.Tags,
+    CASE WHEN p.Tags IS NOT NULL THEN string_to_array(substring(p.Tags,2, length(p.Tags)-2), '><') ELSE ARRAY[]::text[] END AS tag_arr,
+    regexp_replace(coalesce(p.Body,''), '<[^>]*>', ' ', 'g') AS body_plain,
+    left(regexp_replace(coalesce(p.Body,''), '<[^>]*>', ' ', 'g'), 400) AS body_snippet,
+    p.LastEditDate,
+    p.ClosedDate
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+),
+post_votes AS (
+  SELECT
+    v.PostId,
+    SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 WHEN v.VoteTypeId = 3 THEN -1 ELSE 0 END) AS net_votes,
+    SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS upvotes,
+    SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS downvotes,
+    COUNT(*) AS vote_count,
+    SUM(CASE WHEN v.VoteTypeId = 5 THEN 1 ELSE 0 END) AS favorites
+  FROM Votes v
+  GROUP BY v.PostId
+),
+answers AS (
+  SELECT
+    a.Id AS answer_id,
+    a.ParentId AS question_id,
+    a.OwnerUserId AS answer_owner_id,
+    a.CreationDate AS answer_creation,
+    COALESCE(pv.net_votes, a.Score, 0) AS computed_score,
+    COALESCE(pv.upvotes,0) AS upvotes,
+    COALESCE(pv.downvotes,0) AS downvotes,
+    a.Body,
+    left(regexp_replace(coalesce(a.Body,''), '<[^>]*>', ' ', 'g'), 250) AS answer_snippet,
+    (SELECT COUNT(*) FROM Comments c WHERE c.PostId = a.Id) AS comment_count
+  FROM Posts a
+  LEFT JOIN post_votes pv ON pv.PostId = a.Id
+  WHERE a.PostTypeId = 2
+),
+answer_agg AS (
+  SELECT
+    q.question_id,
+    COUNT(a.answer_id) AS answers_count,
+    MAX(a.computed_score) AS max_answer_score,
+    AVG(a.computed_score) AS avg_answer_score,
+    SUM(CASE WHEN a.computed_score >= 5 THEN 1 ELSE 0 END) AS answers_ge_5,
+    SUM(CASE WHEN a.computed_score < 0 THEN 1 ELSE 0 END) AS answers_negative,
+    percentile_cont(0.5) WITHIN GROUP (ORDER BY a.computed_score) AS median_answer_score
+  FROM questions q
+  LEFT JOIN answers a ON a.question_id = q.question_id
+  GROUP BY q.question_id
+),
+top_answer AS (
+  SELECT
+    q.question_id,
+    ta.answer_id AS top_answer_id,
+    ta.answer_owner_id AS top_answer_owner_id,
+    ta.computed_score AS top_answer_score,
+    ta.answer_creation AS top_answer_creation,
+    ta.answer_snippet
+  FROM questions q
+  LEFT JOIN LATERAL (
+    SELECT a.answer_id, a.answer_owner_id, a.computed_score, a.answer_creation, a.answer_snippet
+    FROM answers a
+    WHERE a.question_id = q.question_id
+    ORDER BY a.computed_score DESC NULLS LAST, a.answer_creation
+    LIMIT 1
+  ) ta ON true
+),
+edits AS (
+  SELECT
+    ph.PostId,
+    ph.UserId AS editor_user_id,
+    ph.CreationDate AS edit_date,
+    ph.PostHistoryTypeId,
+    row_number() OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate DESC) AS rn
+  FROM PostHistory ph
+  WHERE ph.PostHistoryTypeId IN (4,5,6,24)
+),
+last_edit AS (
+  SELECT
+    e.PostId,
+    e.editor_user_id AS last_editor_user_id,
+    e.edit_date AS last_edit_date
+  FROM edits e
+  WHERE e.rn = 1
+),
+distinct_editors AS (
+  SELECT
+    PostId,
+    COUNT(DISTINCT editor_user_id) AS distinct_editors_count
+  FROM edits
+  WHERE editor_user_id IS NOT NULL
+  GROUP BY PostId
+),
+question_tags AS (
+  SELECT
+    q.question_id,
+    trim(t.tag) AS tag
+  FROM questions q
+  LEFT JOIN LATERAL (
+    SELECT unnest(q.tag_arr) AS tag
+  ) t ON true
+),
+tag_popularity AS (
+  SELECT
+    qt.tag,
+    COUNT(*) AS question_count,
+    AVG(q.score) AS avg_score,
+    SUM(q.views) AS total_views
+  FROM question_tags qt
+  JOIN questions q ON q.question_id = qt.question_id
+  GROUP BY qt.tag
+),
+question_tag_rank AS (
+  SELECT
+    qt.question_id,
+    qt.tag,
+    q.views,
+    q.score,
+    dense_rank() OVER (PARTITION BY qt.tag ORDER BY q.views DESC NULLS LAST, q.score DESC NULLS LAST) AS rank_within_tag,
+    row_number() OVER (PARTITION BY qt.tag ORDER BY q.views DESC NULLS LAST) AS rn_within_tag
+  FROM question_tags qt
+  JOIN questions q ON q.question_id = qt.question_id
+),
+user_question_metrics AS (
+  SELECT
+    u.Id AS user_id,
+    u.Reputation,
+    COUNT(q.question_id) AS num_questions,
+    AVG(q.score) AS avg_question_score,
+    SUM(q.views) AS total_question_views,
+    MIN(q.CreationDate) AS first_question_date,
+    MAX(q.CreationDate) AS last_question_date,
+    CASE WHEN COUNT(q.question_id) > 0 THEN percentile_cont(0.9) WITHIN GROUP (ORDER BY q.views) ELSE NULL END AS p90_views
+  FROM Users u
+  LEFT JOIN questions q ON q.OwnerUserId = u.Id
+  GROUP BY u.Id, u.Reputation
+),
+badge_summary AS (
+  SELECT
+    b.UserId,
+    SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS gold_badges,
+    SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS silver_badges,
+    SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS bronze_badges,
+    SUM(CASE WHEN b.TagBased = 1 THEN 1 ELSE 0 END) AS tag_based_badges
+  FROM Badges b
+  GROUP BY b.UserId
+),
+comment_stats AS (
+  SELECT
+    c.PostId AS question_id,
+    COUNT(*) FILTER (WHERE c.UserId IS NOT NULL) AS comments_count,
+    COUNT(DISTINCT c.UserId) AS distinct_commenters,
+    (SELECT c2.Text FROM Comments c2 WHERE c2.PostId = c.PostId ORDER BY c2.CreationDate DESC LIMIT 1) AS last_comment_text,
+    (SELECT COUNT(*) FROM Comments c3 WHERE c3.PostId = c.PostId AND c3.Text ~* 'thank|thanks|thx') AS thank_you_comments
+  FROM Comments c
+  GROUP BY c.PostId
+),
+high_view_questions AS (
+  SELECT question_id
+  FROM questions
+  WHERE views >= (SELECT percentile_cont(0.9) WITHIN GROUP (ORDER BY views) FROM questions)
+),
+accepted_questions AS (
+  SELECT question_id FROM questions WHERE AcceptedAnswerId IS NOT NULL
+),
+controversial_questions AS (
+  SELECT q.question_id
+  FROM questions q
+  LEFT JOIN answer_agg aa ON aa.question_id = q.question_id
+  WHERE COALESCE(aa.answers_negative,0) > 0 AND COALESCE(q.Score,0) > 0
+),
+interesting_question_ids AS (
+  SELECT * FROM high_view_questions
+  UNION
+  SELECT * FROM accepted_questions
+  EXCEPT
+  SELECT * FROM controversial_questions
+),
+hot_and_accepted AS (
+  SELECT question_id FROM high_view_questions
+  INTERSECT
+  SELECT question_id FROM accepted_questions
+),
+final_metrics AS (
+  SELECT
+    q.question_id,
+    q.Title,
+    q.body_snippet,
+    q.OwnerUserId,
+    COALESCE(u.Reputation,0) AS owner_reputation,
+    COALESCE(bs.gold_badges,0) AS owner_gold_badges,
+    COALESCE(bs.silver_badges,0) AS owner_silver_badges,
+    COALESCE(bs.bronze_badges,0) AS owner_bronze_badges,
+    q.CreationDate,
+    q.views,
+    q.Score AS question_score,
+    COALESCE(aa.answers_count,0) AS answers_count,
+    COALESCE(ta.top_answer_id, NULL) AS top_answer_id,
+    COALESCE(ta.top_answer_score, NULL) AS top_answer_score,
+    COALESCE(aa.median_answer_score,0) AS median_answer_score,
+    COALESCE(le.last_editor_user_id, NULL) AS last_editor_user_id,
+    COALESCE(de.distinct_editors_count, 0) AS distinct_editors,
+    COALESCE(cs.comments_count, 0) AS comments_count,
+    COALESCE(cs.distinct_commenters, 0) AS distinct_commenters,
+    cs.last_comment_text,
+    q.tag_arr,
+    q.body_plain,
+    (SELECT MIN(a.answer_creation) FROM answers a WHERE a.question_id = q.question_id) AS first_answer_time,
+    EXTRACT(EPOCH FROM COALESCE((SELECT MIN(a.answer_creation) FROM answers a WHERE a.question_id = q.question_id), q.CreationDate) - q.CreationDate) AS time_to_first_answer_seconds,
+    CASE WHEN q.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END AS has_accepted_answer,
+    CASE WHEN q.question_id IN (SELECT question_id FROM interesting_question_ids) THEN true ELSE false END AS flagged_interesting,
+    CASE WHEN q.question_id IN (SELECT question_id FROM hot_and_accepted) THEN true ELSE false END AS hot_and_accepted,
+    q.ClosedDate
+  FROM questions q
+  LEFT JOIN user_question_metrics u ON u.user_id = q.OwnerUserId
+  LEFT JOIN badge_summary bs ON bs.UserId = q.OwnerUserId
+  LEFT JOIN answer_agg aa ON aa.question_id = q.question_id
+  LEFT JOIN top_answer ta ON ta.question_id = q.question_id
+  LEFT JOIN last_edit le ON le.PostId = q.question_id
+  LEFT JOIN distinct_editors de ON de.PostId = q.question_id
+  LEFT JOIN comment_stats cs ON cs.question_id = q.question_id
+)
+SELECT
+  fm.question_id,
+  fm.Title,
+  COALESCE(NULLIF(fm.body_snippet,''), left(fm.body_plain,200)) AS snippet,
+  fm.OwnerUserId,
+  fm.owner_reputation,
+  fm.owner_gold_badges,
+  fm.owner_silver_badges,
+  fm.owner_bronze_badges,
+  fm.CreationDate,
+  fm.views,
+  fm.question_score,
+  fm.answers_count,
+  fm.top_answer_id,
+  fm.top_answer_score,
+  fm.median_answer_score,
+  fm.last_editor_user_id,
+  fm.distinct_editors,
+  fm.comments_count,
+  fm.distinct_commenters,
+  left(coalesce(fm.last_comment_text,'') , 200) AS last_comment_snippet,
+  array_to_string(fm.tag_arr, ',') AS tags_csv,
+  primary_tag_info.tag AS primary_tag,
+  primary_tag_info.rank_within_tag AS primary_tag_rank,
+  tp.question_count AS primary_tag_question_count,
+  tp.total_views AS primary_tag_total_views,
+  (SELECT COUNT(*) FROM Posts p2 WHERE p2.OwnerUserId = fm.OwnerUserId AND p2.Id <> fm.question_id AND p2.CreationDate < fm.CreationDate) AS prior_posts_by_owner,
+  (SELECT COUNT(*) FROM PostLinks pl WHERE pl.RelatedPostId = fm.question_id AND pl.LinkTypeId = 3) AS duplicate_count,
+  (SELECT COUNT(*) FROM PostLinks pl WHERE pl.PostId = fm.question_id AND pl.LinkTypeId = 1) AS outbound_linked_count,
+  (SELECT c2.UserId FROM Comments c2 WHERE c2.PostId = fm.question_id AND c2.UserId IS NOT NULL GROUP BY c2.UserId ORDER BY COUNT(*) DESC LIMIT 1) AS top_commenter_userid,
+  (SELECT MIN(b.Date) FROM Badges b WHERE b.UserId = fm.OwnerUserId) AS owner_first_badge_date,
+  CASE
+    WHEN fm.has_accepted_answer = 1 THEN 'accepted'
+    WHEN fm.answers_count = 0 THEN 'unanswered'
+    WHEN fm.views > 10000 AND fm.question_score > 50 THEN 'popular-highscore'
+    ELSE COALESCE(NULLIF(split_part(array_to_string(fm.tag_arr,','),',',1),''),'untagged')
+  END AS quick_status,
+  CASE WHEN fm.ClosedDate IS NOT NULL THEN true ELSE false END AS is_closed,
+  fm.flagged_interesting,
+  fm.hot_and_accepted,
+  dense_rank() OVER (ORDER BY fm.views DESC NULLS LAST, fm.question_score DESC NULLS LAST) AS global_view_rank,
+  rank() OVER (PARTITION BY fm.OwnerUserId ORDER BY fm.CreationDate) AS owner_question_sequence,
+  (COALESCE(fm.views,0) * 0.001 + COALESCE(fm.question_score,0) * 2.5 + COALESCE(fm.top_answer_score,0) * 1.75
+   - GREATEST(COALESCE(fm.answers_count,0) - 2,0) * 0.5
+   + COALESCE(tp.total_views,0) / GREATEST(NULLIF(tp.question_count,0),1) * 0.0001
+   + COALESCE(fm.owner_reputation,0) / GREATEST(NULLIF(fm.owner_reputation,0),1) * 0.01
+  ) AS synthetic_complex_score
+FROM final_metrics fm
+LEFT JOIN LATERAL (
+  SELECT qtr.tag, qtr.rank_within_tag
+  FROM question_tag_rank qtr
+  WHERE qtr.question_id = fm.question_id
+  ORDER BY qtr.rank_within_tag NULLS LAST
+  LIMIT 1
+) primary_tag_info ON true
+LEFT JOIN tag_popularity tp ON tp.tag = primary_tag_info.tag
+WHERE (fm.views IS NOT NULL AND fm.views >= 0)
+  AND (fm.question_score IS NOT NULL OR fm.answers_count > 0)
+ORDER BY synthetic_complex_score DESC NULLS LAST, fm.views DESC
+LIMIT 200;

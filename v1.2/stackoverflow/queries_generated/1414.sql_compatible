@@ -1,0 +1,160 @@
+WITH RecursivePostsHierarchy AS (
+    SELECT
+        p.Id,
+        p.PostTypeId,
+        p.ParentId,
+        p.AcceptedAnswerId,
+        ARRAY[p.Id] AS AncestorIds,
+        1 AS Level
+    FROM Posts p
+    WHERE p.PostTypeId = 1 AND p.ParentId IS NULL
+
+    UNION ALL
+
+    SELECT
+        c.Id,
+        c.PostTypeId,
+        c.ParentId,
+        c.AcceptedAnswerId,
+        r.AncestorIds || c.Id,
+        r.Level + 1
+    FROM Posts c
+    JOIN RecursivePostsHierarchy r ON c.ParentId = r.Id
+    WHERE c.PostTypeId = 2
+),
+FilteredBadges AS (
+    SELECT 
+        b.UserId,
+        LOWER(b.Name) AS BadgeNameLower,
+        b.Class,
+        COUNT(*) OVER (PARTITION BY b.UserId, LOWER(b.Name)) AS BadgeCountPerName,
+        ROW_NUMBER() OVER (PARTITION BY b.UserId ORDER BY b.Class ASC, b.Date DESC) AS SeqNum
+    FROM Badges b
+    WHERE (b.Date > DATE '2017-01-01' AND b.Name LIKE '%gold%') OR b.Class = 1
+),
+UserRankings AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END), 0) AS UpVotes,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END), 0) AS DownVotes,
+        COUNT(DISTINCT p_acc.Id) AS AcceptedAnswersCount,
+        COUNT(DISTINCT pqs.Id) AS QuestionsAsked
+    FROM Users u
+    LEFT JOIN Votes v ON v.UserId = u.Id
+    LEFT JOIN Posts p_acc ON p_acc.AcceptedAnswerId IS NOT NULL AND p_acc.AcceptedAnswerId = ANY (
+                SELECT pa.Id FROM Posts pa WHERE pa.OwnerUserId = u.Id
+            )
+    LEFT JOIN Posts pqs ON pqs.OwnerUserId = u.Id AND pqs.PostTypeId = 1
+    WHERE u.CreationDate < DATE '2024-10-01' AND u.Reputation > 100
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+ConvertedPostTitlesToWords AS (
+    SELECT ph.PostId, regexp_replace(lower(ph.Text), '[^\w]+', ' ', 'g') AS TextClean, ph.CreationDate
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (1,4) AND ph.Text IS NOT NULL
+),
+TermsExpanded AS (
+    SELECT 
+        ph_sub.Id AS PostId,
+        unnest(string_to_array(COALESCE(pht.TextClean, ''), ' ')) AS Word
+    FROM (
+        SELECT 
+            p.Id
+        FROM Posts p
+        WHERE p.PostTypeId = 1
+    ) ph_sub
+    LEFT JOIN LATERAL (
+        SELECT TextClean
+        FROM ConvertedPostTitlesToWords pht
+        WHERE pht.PostId = ph_sub.Id
+        ORDER BY pht.CreationDate DESC
+        LIMIT 1
+    ) pht ON TRUE
+),
+TopAnswerResponses AS (
+    SELECT
+        r.PostId,
+        r.ParentId,
+        r.Level,
+        a.Score AS AnswerScore,
+        (SELECT AVG(pa.Score) FROM Posts pa WHERE pa.ParentId = r.ParentId AND pa.PostTypeId = 2) AS AvgSiblingScore,
+        u.DisplayName AS AnswerOwner,
+        LAG(a.Score) OVER (PARTITION BY r.ParentId ORDER BY a.Score DESC) AS PreviousAnswerScore
+    FROM RecursivePostsHierarchy r
+    JOIN Posts a ON a.Id = r.Id
+    LEFT JOIN Users u ON a.OwnerUserId = u.Id
+    WHERE a.PostTypeId = 2
+),
+PostsWithDuplicates AS (
+    SELECT DISTINCT p.Id, p.Title, plhir.TheLinkedDuplicateId
+    FROM Posts p
+    LEFT JOIN (
+        SELECT PostId, RelatedPostId AS TheLinkedDuplicateId
+        FROM PostLinks
+        WHERE LinkTypeId = 3
+    ) plhir ON plhir.PostId = p.Id
+    WHERE p.PostTypeId = 1
+)
+SELECT DISTINCT
+    u.DisplayName,
+    u.Reputation,
+    fbt.BadgeNameLower,
+    u.QuestionsAsked,
+    u.AcceptedAnswersCount,
+    STRING_AGG(DISTINCT CASE WHEN te.Word ~ '^[a-z]{4,}$' THEN te.Word END, ',' ORDER BY te.Word) AS FilteredTitleWords,
+    B.ScoreStats_Avg,
+    B.ScoreStats_Min,
+    B.ScoreStats_Max,
+    TR.AnswerOwner,
+    TR.AnswerScore,
+    TR.PreviousAnswerScore,
+    CASE WHEN pd.TheLinkedDuplicateId IS NOT NULL THEN 'Has Duplicate' ELSE 'Unique' END AS DuplicateStatus,
+    CASE
+        WHEN u.Location IS NOT NULL AND u.Location <> '' THEN substring(replace(u.Location, ';', '') from 1 for 30)
+        ELSE 'No Location'
+    END AS LocationSnippet,
+    EXISTS (
+        SELECT 1
+        FROM Votes v2
+        WHERE v2.PostId IN (
+            SELECT Id FROM Posts WHERE OwnerUserId = u.Id LIMIT 10
+        ) AND v2.VoteTypeId = 2 
+    ) AS HasRecentUpvotes,
+    (SELECT COUNT(1) FROM Comments c WHERE c.UserId = u.Id AND c.CreationDate > (DATE '2024-10-01' - INTERVAL '90 days')) AS CommentCountRecent
+FROM UserRankings u
+LEFT JOIN FilteredBadges fbt ON fbt.UserId = u.Id AND fbt.SeqNum = 1
+LEFT JOIN TermsExpanded te ON te.PostId IS NOT NULL
+LEFT JOIN (
+    SELECT 
+        p.ParentId,
+        AVG(p.Score) AS ScoreStats_Avg,
+        MIN(p.Score) AS ScoreStats_Min,
+        MAX(p.Score) AS ScoreStats_Max
+    FROM Posts p 
+    WHERE p.PostTypeId = 2
+    GROUP BY p.ParentId
+) B ON B.ParentId IS NOT NULL
+LEFT JOIN TopAnswerResponses TR ON TR.ParentId = B.ParentId
+LEFT JOIN PostsWithDuplicates pd ON pd.Id = COALESCE(TR.ParentId, NULL)
+WHERE u.Reputation >= 200
+  AND (fbt.BadgeNameLower LIKE '%gold%' OR fbt.BadgeNameLower IS NULL)
+  AND LENGTH(COALESCE(u.DisplayName, '')) > 0
+GROUP BY
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    fbt.BadgeNameLower,
+    u.QuestionsAsked,
+    u.AcceptedAnswersCount,
+    B.ScoreStats_Avg,
+    B.ScoreStats_Min,
+    B.ScoreStats_Max,
+    TR.AnswerOwner,
+    TR.AnswerScore,
+    TR.PreviousAnswerScore,
+    pd.TheLinkedDuplicateId,
+    u.Location
+ORDER BY u.Reputation DESC, u.AcceptedAnswersCount DESC
+LIMIT 100;

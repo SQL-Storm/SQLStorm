@@ -1,0 +1,241 @@
+WITH UserRankings AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.Location,
+        u.CreationDate,
+        COALESCE(SUM(vset.UpVotes), 0) AS TotalUpVotes,
+        COALESCE(SUM(vset.DownVotes), 0) AS TotalDownVotes,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC, u.CreationDate) AS RankByReputation,
+        COUNT(DISTINCT CASE WHEN b.Class = 1 THEN b.Id END) AS GoldBadges,
+        COUNT(DISTINCT CASE WHEN b.Class = 2 THEN b.Id END) AS SilverBadges,
+        COUNT(DISTINCT CASE WHEN b.Class = 3 THEN b.Id END) AS BronzeBadges
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    LEFT JOIN (
+        SELECT
+            p.OwnerUserId,
+            SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+            SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes
+        FROM Posts p
+        LEFT JOIN Votes v ON v.PostId = p.Id
+        WHERE p.OwnerUserId IS NOT NULL AND p.OwnerUserId <> -1
+        GROUP BY p.OwnerUserId
+    ) vset ON vset.OwnerUserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Location, u.CreationDate
+),
+
+RecentActiveQuestions AS (
+    SELECT 
+        p.Id AS QuestionId,
+        p.Title,
+        p.Tags,
+        p.OwnerUserId,
+        u.DisplayName AS OwnerName,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.FavoriteCount,
+        p.CreationDate,
+        MAX(COALESCE(ph.CreationDate, TIMESTAMP '1900-01-01')) AS LastHistoryEdit,
+        COUNT(c.Id) AS CommentCount,
+        COUNT(DISTINCT CASE WHEN v.VoteTypeId = 2 THEN v.Id END) AS UpVotes,
+        COUNT(DISTINCT CASE WHEN v.VoteTypeId = 3 THEN v.Id END) AS DownVotes
+    FROM Posts p
+    LEFT JOIN Users u ON u.Id = p.OwnerUserId
+    LEFT JOIN PostHistory ph ON ph.PostId = p.Id
+    LEFT JOIN Comments c ON c.PostId = p.Id
+    LEFT JOIN Votes v ON v.PostId = p.Id
+    WHERE p.PostTypeId = 1
+      AND p.CreationDate > (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '365 days')
+      AND p.ClosedDate IS NULL
+    GROUP BY p.Id, p.Title, p.Tags, p.OwnerUserId, u.DisplayName, p.Score, p.ViewCount, p.AnswerCount, p.FavoriteCount, p.CreationDate
+),
+
+AcceptedAnswerDetails AS (
+    SELECT 
+        p.Id AS AnswerId,
+        p.ParentId AS QuestionId,
+        p.Score AS AnswerScore,
+        p.CreationDate AS AnswerCreationDate,
+        u.DisplayName AS AnswerOwnerName,
+        ROW_NUMBER() OVER (PARTITION BY p.ParentId ORDER BY p.Score DESC, p.CreationDate) AS AnswerRankByScore
+    FROM Posts p
+    LEFT JOIN Users u ON u.Id = p.OwnerUserId
+    WHERE p.PostTypeId = 2
+),
+
+QuestionDuplicates AS (
+    SELECT
+        pl.PostId AS QuestionId,
+        ARRAY_AGG(DISTINCT dup.Title) FILTER (WHERE dup.Id IS NOT NULL) AS DuplicateTitles
+    FROM PostLinks pl
+    LEFT JOIN Posts dup ON dup.Id = pl.RelatedPostId AND dup.PostTypeId = 1
+    WHERE pl.LinkTypeId = 3
+    GROUP BY pl.PostId
+),
+
+ExtendedQuestionStats AS (
+    SELECT
+        q.QuestionId,
+        q.Title,
+        q.OwnerUserId,
+        q.OwnerName,
+        q.Score,
+        q.ViewCount,
+        q.AnswerCount,
+        q.FavoriteCount,
+        q.CreationDate,
+        q.LastHistoryEdit,
+        q.CommentCount,
+        q.UpVotes,
+        q.DownVotes,
+        aq.AnswerId AS AcceptedAnswerId,
+        aq.AnswerScore AS AcceptedAnswerScore,
+        aq.AnswerCreationDate AS AcceptedAnswerDate,
+        aq.AnswerOwnerName AS AcceptedAnswerOwner,
+        du.DuplicateTitles,
+        COALESCE(NULLIF(TRIM(q.Tags), ''), '<none>') AS TagsTrimmed,
+        CASE 
+          WHEN q.Score > 100 THEN 'Hot' 
+          WHEN q.Score BETWEEN 50 AND 100 THEN 'Warm'
+          ELSE 'Cold'
+        END AS PopularityCategory,
+        EXISTS (
+            SELECT 1
+            FROM Votes bv
+            WHERE bv.PostId = q.QuestionId AND bv.VoteTypeId = 8
+              AND bv.CreationDate > q.CreationDate
+        ) AS HasBountyStarted
+    FROM RecentActiveQuestions q
+    LEFT JOIN AcceptedAnswerDetails aq ON aq.QuestionId = q.QuestionId AND aq.AnswerRankByScore = 1
+    LEFT JOIN QuestionDuplicates du ON du.QuestionId = q.QuestionId
+)
+
+SELECT
+    eqs.QuestionId,
+    eqs.Title,
+    eqs.OwnerName,
+    eqs.Score,
+    eqs.ViewCount,
+    eqs.AnswerCount,
+    eqs.FavoriteCount,
+    eqs.CreationDate,
+    eqs.LastHistoryEdit,
+    eqs.CommentCount,
+    eqs.UpVotes,
+    eqs.DownVotes,
+    eqs.AcceptedAnswerId,
+    eqs.AcceptedAnswerScore,
+    eqs.AcceptedAnswerDate,
+    eqs.AcceptedAnswerOwner,
+    eqs.DuplicateTitles,
+    eqs.TagsTrimmed,
+    eqs.PopularityCategory,
+    eqs.HasBountyStarted,
+    ur.RankByReputation,
+    ur.GoldBadges,
+    ur.SilverBadges,
+    ur.BronzeBadges,
+    CASE 
+      WHEN ur.Location IS NULL OR TRIM(ur.Location) = '' THEN '[Unknown]' 
+      ELSE UPPER(SPLIT_PART(ur.Location, ',', 1))
+    END AS UserPrimaryRegion,
+    LENGTH(COALESCE(u.AboutMe, '')) AS AboutMeLength,
+    (SELECT COUNT(*) FROM Comments c2 WHERE c2.UserId = u.Id AND c2.CreationDate > (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '180 days')) AS RecentUserComments,
+    STRING_AGG(DISTINCT CASE WHEN b1.Class = 1 THEN b1.Name END, ',' ORDER BY b1.Name) AS GoldBadgeNames,
+    NULLIF(REGEXP_REPLACE(eqs.TagsTrimmed, '[<>]', '', 'g'), '') AS CleanTags,
+    CASE 
+      WHEN EXISTS (
+           SELECT 1 FROM PostLinks pl2
+           WHERE pl2.PostId = eqs.QuestionId AND pl2.LinkTypeId = 1
+           LIMIT 1
+        ) THEN TRUE ELSE FALSE 
+    END AS HasLinkedPosts,
+    FIRST_VALUE(u.DisplayName) OVER (PARTITION BY eqs.OwnerUserId ORDER BY eqs.CreationDate DESC) AS LatestUserPostDisplayName
+FROM ExtendedQuestionStats eqs
+INNER JOIN Users u ON u.Id = eqs.OwnerUserId
+LEFT JOIN UserRankings ur ON ur.Id = u.Id
+LEFT JOIN Badges b1 ON b1.UserId = u.Id
+WHERE eqs.TagsTrimmed IS NOT NULL
+  AND (eqs.AnswerCount > 0 OR eqs.FavoriteCount > 0)
+GROUP BY
+    eqs.QuestionId,
+    eqs.Title,
+    eqs.OwnerName,
+    eqs.Score,
+    eqs.ViewCount,
+    eqs.AnswerCount,
+    eqs.FavoriteCount,
+    eqs.CreationDate,
+    eqs.LastHistoryEdit,
+    eqs.CommentCount,
+    eqs.UpVotes,
+    eqs.DownVotes,
+    eqs.AcceptedAnswerId,
+    eqs.AcceptedAnswerScore,
+    eqs.AcceptedAnswerDate,
+    eqs.AcceptedAnswerOwner,
+    eqs.DuplicateTitles,
+    eqs.TagsTrimmed,
+    eqs.PopularityCategory,
+    eqs.HasBountyStarted,
+    ur.RankByReputation,
+    ur.GoldBadges,
+    ur.SilverBadges,
+    ur.BronzeBadges,
+    ur.Location,
+    u.AboutMe,
+    u.Id,
+    eqs.OwnerUserId,
+    b1.Name,
+    CASE 
+      WHEN ur.Location IS NULL OR TRIM(ur.Location) = '' THEN '[Unknown]' 
+      ELSE UPPER(SPLIT_PART(ur.Location, ',', 1))
+    END,
+    LENGTH(COALESCE(u.AboutMe, '')),
+    (SELECT COUNT(*) FROM Comments c2 WHERE c2.UserId = u.Id AND c2.CreationDate > (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '180 days')),
+    NULLIF(REGEXP_REPLACE(eqs.TagsTrimmed, '[<>]', '', 'g'), ''),
+    FIRST_VALUE(u.DisplayName) OVER (PARTITION BY eqs.OwnerUserId ORDER BY eqs.CreationDate DESC)
+ORDER BY eqs.Score DESC, eqs.ViewCount DESC
+LIMIT 100
+
+UNION ALL
+
+SELECT
+    p.Id AS QuestionId,
+    'Orphaned Question' AS Title,
+    '[deleted]' AS OwnerName,
+    p.Score,
+    p.ViewCount,
+    p.AnswerCount,
+    p.FavoriteCount,
+    p.CreationDate,
+    NULL AS LastHistoryEdit,
+    COALESCE(p.CommentCount, 0) AS CommentCount,
+    0 AS UpVotes,
+    0 AS DownVotes,
+    NULL AS AcceptedAnswerId,
+    NULL AS AcceptedAnswerScore,
+    NULL AS AcceptedAnswerDate,
+    NULL AS AcceptedAnswerOwner,
+    NULL AS DuplicateTitles,
+    COALESCE(NULLIF(TRIM(p.Tags), ''), '<none>') AS TagsTrimmed,
+    'Orphan' AS PopularityCategory,
+    FALSE AS HasBountyStarted,
+    NULL AS RankByReputation,
+    NULL AS GoldBadges,
+    NULL AS SilverBadges,
+    NULL AS BronzeBadges,
+    '[Unknown]' AS UserPrimaryRegion,
+    NULL AS AboutMeLength,
+    0 AS RecentUserComments,
+    NULL AS GoldBadgeNames,
+    NULL AS CleanTags,
+    FALSE AS HasLinkedPosts,
+    NULL AS LatestUserPostDisplayName
+FROM Posts p
+WHERE p.PostTypeId = 1
+  AND p.OwnerUserId IS NULL
+LIMIT 10;

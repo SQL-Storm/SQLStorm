@@ -1,0 +1,162 @@
+with RecursiveUserRanks as (
+    select 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        row_number() over (order by u.Reputation desc, u.CreationDate asc) as Rank
+    from Users u
+), PopularTags as (
+    select 
+        t.TagName,
+        t.Count,
+        (p.ClosedDate is not null) as IsTagLinkedToClosedQuestions
+    from Tags t
+    left join Posts p on p.Tags like concat('%<', t.TagName, '>%')
+    group by t.TagName, t.Count, p.ClosedDate
+    having count(p.Id) > 100
+    order by t.Count desc
+    limit 100
+), PostScoresCTE as (
+    select 
+        p.Id as PostId,
+        p.PostTypeId,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        coalesce(
+            (
+                select sum(case when v.VoteTypeId = 2 then 1 else 0 end) - sum(case when v.VoteTypeId = 3 then 1 else 0 end)
+                from Votes v where v.PostId = p.Id
+            ),
+            0
+        ) as NetVotes,
+        dense_rank() over (partition by p.PostTypeId order by p.Score desc, p.ViewCount desc) as PopularityRank
+    from Posts p
+    where p.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - interval '1 year'
+), UserBadgeCounts as (
+    select
+        b.UserId,
+        sum(case when b.Class = 1 then 1 else 0 end) as GoldBadges,
+        sum(case when b.Class = 2 then 1 else 0 end) as SilverBadges,
+        sum(case when b.Class = 3 then 1 else 0 end) as BronzeBadges,
+        max(b.Date) as LastBadgeDate
+    from Badges b
+    group by b.UserId
+), QuestionsWithAnswers as (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        q.OwnerUserId,
+        a.Id as AnswerId,
+        a.Score as AnswerScore,
+        a.OwnerUserId as AnswerOwnerUserId,
+        u.DisplayName as QuestionOwnerName,
+        ua.DisplayName as AnswerOwnerName,
+        lag(a.Score) over (partition by q.Id order by a.Score desc) as PrevAnswerScore,
+        row_number() over (partition by q.Id order by a.Score desc, a.CreationDate asc) as AnswerPosition
+    from Posts q
+    left join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+    left join Users u on u.Id = q.OwnerUserId
+    left join Users ua on ua.Id = a.OwnerUserId
+    where q.PostTypeId = 1 and q.ClosedDate is null
+), CloseReasonCounts as (
+    select
+        ph.Comment as CloseReasonId,
+        crt.Name as CloseReasonName,
+        count(*) as CloseCount
+    from PostHistory ph
+    join CloseReasonTypes crt on crt.Id = cast(ph.Comment as integer)
+    where ph.PostHistoryTypeId = 10
+    group by ph.Comment, crt.Name
+), UserActivityWindow as (
+    select
+        u.Id,
+        u.DisplayName,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionCount,
+        count(distinct p.Id) filter (where p.PostTypeId = 2) as AnswerCount,
+        count(distinct c.Id) as CommentCount,
+        sum(case when v.VoteTypeId = 2 then 1 else 0 end) as UpVotesReceived,
+        sum(case when v.VoteTypeId = 3 then 1 else 0 end) as DownVotesReceived,
+        row_number() over (order by count(distinct p.Id) desc) as ActivityRank
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id and p.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - interval '6 months'
+    left join Comments c on c.UserId = u.Id and c.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - interval '6 months'
+    left join Votes v on v.UserId = u.Id and v.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - interval '6 months'
+    group by u.Id, u.DisplayName
+), DuplicatePostLinks as (
+    select pl.PostId, pl.RelatedPostId
+    from PostLinks pl
+    where pl.LinkTypeId = 3
+), RecursiveDuplicateChains AS (
+    select 
+        d.PostId,
+        d.RelatedPostId,
+        1 as Level
+    from DuplicatePostLinks d
+    union all
+    select 
+        r.PostId,
+        d.RelatedPostId,
+        r.Level + 1
+    from RecursiveDuplicateChains r
+    join DuplicatePostLinks d on d.PostId = r.RelatedPostId
+    where r.Level < 5
+)
+select 
+    ru.Rank as UserRank,
+    ru.DisplayName as UserName,
+    ru.Reputation,
+    ubc.GoldBadges,
+    ubc.SilverBadges,
+    ubc.BronzeBadges,
+    ubc.LastBadgeDate,
+    pq.Score as PopularQuestionScore,
+    pq.ViewCount as PopularQuestionViews,
+    pq.Title as PopularQuestionTitle,
+    qa.AnswerCountPerQuestion,
+    qa.TopAnswerScore,
+    cr.CloseReasonName,
+    cr.CloseCount,
+    ua.QuestionCount,
+    ua.AnswerCount,
+    ua.CommentCount,
+    ua.UpVotesReceived,
+    ua.DownVotesReceived,
+    dc.Level as DuplicateChainDepth
+from RecursiveUserRanks ru
+left join UserBadgeCounts ubc on ubc.UserId = ru.Id
+left join lateral (
+    select p.Score, p.ViewCount, p.Title
+    from PostScoresCTE p
+    where p.OwnerUserId = ru.Id and p.PostTypeId = 1
+    order by p.Score desc, p.ViewCount desc
+    limit 1
+) pq on true
+left join lateral (
+    select 
+        count(a.Id) as AnswerCountPerQuestion,
+        max(a.Score) as TopAnswerScore
+    from Posts q
+    left join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+    where q.OwnerUserId = ru.Id and q.PostTypeId = 1
+) qa on true
+left join lateral (
+    select crt.Name as CloseReasonName, count(*) as CloseCount
+    from PostHistory ph
+    join CloseReasonTypes crt on crt.Id = cast(ph.Comment as integer)
+    where ph.PostHistoryTypeId = 10 and ph.UserId = ru.Id
+    group by crt.Name
+    order by CloseCount desc
+    limit 1
+) cr on true
+left join UserActivityWindow ua on ua.Id = ru.Id
+left join lateral (
+    select max(Level) as Level
+    from RecursiveDuplicateChains dc
+    join Posts p on p.Id = dc.PostId
+    where p.OwnerUserId = ru.Id
+) dc on true
+where ru.Rank <= 50
+order by ru.Rank;

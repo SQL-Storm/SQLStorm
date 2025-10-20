@@ -1,0 +1,163 @@
+with recursive RecursiveUserBadgeTimes as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        b.Date as BadgeDate,
+        b.Name as BadgeName,
+        b.Class,
+        1 as BadgeCount,
+        row_number() over (partition by u.Id order by b.Date) as rn
+    from Users u
+    left join Badges b on u.Id = b.UserId
+    where b.Date <= cast('2024-10-01 12:34:56' as timestamp)
+    union all
+    select 
+        r.UserId,
+        r.DisplayName,
+        b.Date,
+        b.Name,
+        b.Class,
+        r.BadgeCount + 1,
+        r.rn + 1
+    from RecursiveUserBadgeTimes r
+    join Badges b on r.UserId = b.UserId and b.Date > r.BadgeDate
+    where r.rn < 10 and b.Date <= cast('2024-10-01 12:34:56' as timestamp)
+),
+RankedQuestionsByVotesAndActivity as (
+    select
+        p.Id,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId,
+        row_number() over (
+            partition by p.PostTypeId 
+            order by p.Score desc, p.ViewCount desc, p.LastActivityDate desc
+        ) as rank
+    from Posts p
+    where p.PostTypeId = 1
+),
+EligibleAnswersWithAcceptedInfo as (
+    select 
+        a.Id as AnswerId,
+        a.ParentId as QuestionId,
+        a.Score as AnswerScore,
+        case when q.AcceptedAnswerId = a.Id then 1 else 0 end as IsAccepted,
+        wp.Score as WelcomingPostScore,
+        aload.BadgeName,
+        vtype.Name as VoteTypeName,
+        a.OwnerUserId as OwnerUserId
+    from Posts a
+    join Posts q on q.Id = a.ParentId and q.PostTypeId = 1
+    left join Posts wp on wp.Id = q.AcceptedAnswerId
+    left join Votes v on v.PostId = a.Id
+    left join VoteTypes vtype on v.VoteTypeId = vtype.Id
+    left join (
+      	 select UserId, max(Date) as LastBadgeDate, min(Name) as BadgeName
+      	 from Badges
+      	 group by UserId
+    ) aload on aload.UserId = a.OwnerUserId
+    where a.PostTypeId = 2
+),
+UserLastAccessRankAndRepAdvantage as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.LastAccessDate,
+        rank() over (order by u.LastAccessDate desc) as RecentAccessRank,
+        case 
+            when u.Reputation > (select avg(Reputation) from Users) then 1
+            else 0 
+        end as IsHighRep,
+        null::text as RecommendAlt
+    from Users u
+),
+TaggedQuestionsExpanded as (
+    select
+        p.Id,
+        unnest(string_to_array(substring(p.Tags from 2 for char_length(p.Tags) - 2), '><')) as Tag
+    from Posts p
+    where p.PostTypeId = 1 and p.Tags is not null
+),
+HighlyTaggedQuestions as (
+    select Tag, count(*) as QuestionsWithTag
+    from TaggedQuestionsExpanded
+    group by Tag
+    having count(*) > (select coalesce(avg("Count"),0) from Tags)
+),
+ComplexJoinedSet as (
+    select distinct
+        q.Id, q.Title, q.CreationDate, qu.RecommendAlt, qu.LastAccessDate, qu.IsHighRep, a.AnswerId,
+        a.AnswerScore, a.IsAccepted, hv.QuestionsWithTag, q.OwnerUserId
+    from RankedQuestionsByVotesAndActivity q
+    join UserLastAccessRankAndRepAdvantage qu on qu.UserId = q.OwnerUserId
+    left join EligibleAnswersWithAcceptedInfo a on a.QuestionId = q.Id
+    left join TaggedQuestionsExpanded t on t.Id = q.Id
+    left join HighlyTaggedQuestions hv on hv.Tag = t.Tag
+    where coalesce(qu.IsHighRep, 0) = 1
+),
+QuestionDuplicateRelations as (
+    select
+        pl.PostId as DuplicateQuestionId,
+        pl.RelatedPostId as OriginalQuestionId
+    from PostLinks pl
+    where pl.LinkTypeId = 3
+),
+RecursiveDupClosure as (
+    select
+        d.DuplicateQuestionId,
+        d.OriginalQuestionId,
+        1 as depth
+    from QuestionDuplicateRelations d
+    union all
+    select
+        m.DuplicateQuestionId,
+        rc.OriginalQuestionId,
+        rc.depth + 1 
+    from QuestionDuplicateRelations m
+    join RecursiveDupClosure rc on m.OriginalQuestionId = rc.DuplicateQuestionId
+    where rc.depth < 5
+),
+BadgeSummaryFinal as (
+    select UserId, 
+        count(case when Class=1 then 1 end) as GoldBadgeCount,
+        count(case when Class=2 then 1 end) as SilverBadgeCount,
+        count(case when Class=3 then 1 end) as BronzeBadgeCount
+    from Badges
+    group by UserId
+)
+select 
+    QuRank.QueryId,
+    q.Title as QuestionTitle,
+    q.ViewCount,
+    q.CreationDate,
+    coalesce(b.GoldBadgeCount,0) as UserGoldBadges,
+    coalesce(b.SilverBadgeCount,0) as UserSilverBadges,
+    coalesce(b.BronzeBadgeCount,0) as UserBronzeBadges,
+    dupchain.OriginalQuestionId,
+    dupchain.depth as DuplicateDepthLevel,
+    q.RecommendAlt as AlternativeQuestion,
+    string_agg(t.Tag, ',' order by t.Tag) Tags,
+    sum(case when ev.IsAccepted = 1 then 1 else 0 end) as NumberOfAcceptedAnswersCurrently,
+    max(ev.AnswerScore) as HighestAnswerScore,
+    count(distinct ev.AnswerId) as TotalAnswerCount,
+    max(case when ev.AnswerScore > 50 then ev.AnswerScore else null end) over (partition by q.Id) as secondBestAnswerScore,
+    CASE WHEN q.Score > 50 THEN 'Excellent' ELSE 'Other' END as PopStatus,
+    QuRank.rank as QuestionPopularityRanking
+from ComplexJoinedSet q
+full outer join RecursiveDupClosure dupchain on dupchain.DuplicateQuestionId = q.Id
+left join TaggedQuestionsExpanded t on t.Id = q.Id
+left join EligibleAnswersWithAcceptedInfo ev on ev.QuestionId = q.Id
+left join BadgeSummaryFinal b on b.UserId = ev.OwnerUserId
+left join UserLastAccessRankAndRepAdvantage qu on qu.UserId = q.OwnerUserId
+inner join (
+    select rank, Id as QueryId 
+    from RankedQuestionsByVotesAndActivity
+    where rank <= 100
+) QuRank on QuRank.QueryId = q.Id
+group by q.Id, q.Title, q.ViewCount, q.CreationDate, b.GoldBadgeCount, b.SilverBadgeCount, b.BronzeBadgeCount, 
+         dupchain.OriginalQuestionId, dupchain.depth, q.RecommendAlt, QuRank.rank, q.Score
+having count(distinct ev.AnswerId) > 10 and max(ev.AnswerScore) > 20
+order by QuRank.rank asc, HighestAnswerScore desc, NumberOfAcceptedAnswersCurrently desc;

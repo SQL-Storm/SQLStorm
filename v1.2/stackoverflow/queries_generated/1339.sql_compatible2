@@ -1,0 +1,156 @@
+with RECURSIVE TagHierarchy AS (
+    select
+        t.Id,
+        t.TagName,
+        t.IsModeratorOnly,
+        t.IsRequired,
+        1 as Level,
+        array[t.TagName]::varchar[] AS Path
+    from Tags t
+    where t.IsRequired = true
+
+    union all
+
+    select
+        child.Id,
+        child.TagName,
+        child.IsModeratorOnly,
+        child.IsRequired,
+        parent.Level + 1,
+        parent.Path || child.TagName
+    from Tags child
+    join TagHierarchy parent on position(child.TagName in array_to_string(parent.Path, ',')) = 0
+    where child.IsRequired = true
+      and NOT child.TagName = ANY(parent.Path)
+),
+PostScoresAndRanks AS (
+    select
+        p.Id as PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        coalesce(p.Tags, '') as Tags,
+        coalesce(u.Reputation, 0) as UserReputation,
+        dense_rank() over (partition by p.PostTypeId order by p.Score desc NULLS LAST) as ScoreRank,
+        row_number() over (partition by p.OwnerUserId order by p.CreationDate desc) as UserPostRecencyRank
+    from Posts p
+    left join Users u on p.OwnerUserId = u.Id
+    where p.CreationDate >= (cast('2024-10-01' as date) - interval '365 day')
+      and p.Score is not null
+),
+AcceptedAnswerStats AS (
+    select
+        q.Id as QuestionId,
+        q.AcceptedAnswerId,
+        a.Score as AcceptedAnswerScore,
+        a.CreationDate as AcceptedAnswerCreationDate,
+        a.OwnerUserId as AcceptedAnswerOwnerId,
+        u.DisplayName as AcceptedAnswerOwnerName
+    from Posts q
+    left join Posts a on q.AcceptedAnswerId = a.Id
+    left join Users u on a.OwnerUserId = u.Id
+    where q.PostTypeId = 1
+),
+UserBadgeComplexity AS (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(distinct b.Id) as TotalBadges,
+        bool_or(b.TagBased = true) as HasTagBasedBadges,
+        sum(case when b.Class = 1 then 1 else 0 end) as GoldBadges,
+        sum(case when b.Class = 2 then 1 else 0 end) as SilverBadges,
+        sum(case when b.Class = 3 then 1 else 0 end) as BronzeBadges,
+        max(b.Date) as LastBadgeDate
+    from Users u
+    left join Badges b on u.Id = b.UserId
+    group by u.Id, u.DisplayName
+),
+CommentElevations as (
+    select
+        c.PostId,
+        count(*) as TotalComments,
+        max(c.Score) filter (where c.UserId is not null) as HighestCommentScore,
+        max(length(c.Text)) as LongestCommentLength,
+        sum(case when c.UserId is null then 1 else 0 end) as AnonymousCommentCount,
+        bool_or(c.Text like '%exception%' or c.Text ilike '%error%') as HasErrorComments
+    from Comments c
+    group by c.PostId
+)
+select
+    p.PostId,
+    p.PostTypeId,
+    p.UserReputation,
+    p.Score,
+    a.AcceptedAnswerScore,
+    a.AcceptedAnswerOwnerName,
+    ubc.TotalBadges,
+    ubc.GoldBadges,
+    ubc.HasTagBasedBadges,
+    ce.TotalComments,
+    ce.HasErrorComments,
+    th.Level as TagHierarchyLevel,
+    string_agg(distinct th.TagName, ',' order by th.TagName) as TagLineage,
+    replace(lower(regexp_replace(p.Tags, '[<>]', '', 'g')), '<', '') as NormalizedTags,
+    round(((coalesce(p.Score,0) * 2) + (coalesce(ce.TotalComments,0) * 3) - coalesce(p.ViewCount,0)/1000 + coalesce(ubc.TotalBadges,0)*10)::numeric, 2) as EngagementIndex,
+    avg(p.Score) over (partition by (case when ubc.TotalBadges > 5 and p.UserReputation > 10000 then 'Influencers' else 'Regular' end)) as AvgScoreGroup,
+    (
+        select count(*)
+        from Posts sibling
+        where sibling.OwnerUserId = p.OwnerUserId
+          and sibling.Id <> p.PostId
+          and sibling.CreationDate between (p.CreationDate - interval '7 days') and (p.CreationDate + interval '7 days')
+    ) as SiblingPostsInWindow,
+    row_number() over (partition by p.OwnerUserId order by p.CreationDate desc) as UserPostSequence,
+    coalesce(
+        (
+         select crt.Name 
+         from PostHistory ph
+         join PostHistoryTypes cht on ph.PostHistoryTypeId = cht.Id
+         join CloseReasonTypes crt on cast(ph.Comment as integer) = crt.Id
+         where ph.PostId = p.PostId 
+           and ph.PostHistoryTypeId = 10
+         order by ph.CreationDate desc
+         limit 1
+        ), 'N/A') as LatestCloseReason
+from PostScoresAndRanks p
+left join AcceptedAnswerStats a on p.PostId = a.QuestionId
+left join UserBadgeComplexity ubc on ubc.UserId = p.OwnerUserId
+left join CommentElevations ce on ce.PostId = p.PostId
+left join lateral (
+    select th1.*
+    from TagHierarchy th1
+    where th1.TagName = any(string_to_array(replace(replace(p.Tags, '><', ','), '<', ''), ','))
+    order by th1.Level desc
+    limit 1
+) th on true
+where p.PostTypeId in (1, 2)
+  and 
+    (
+        (p.Score > 10 and ubc.GoldBadges > 0) 
+        or 
+        (p.ScoreRank <= 100 and p.ViewCount > 1000)
+    )
+group by
+    p.PostId,
+    p.PostTypeId,
+    p.UserReputation,
+    p.Score,
+    p.ViewCount,
+    a.AcceptedAnswerScore,
+    a.AcceptedAnswerOwnerName,
+    ubc.TotalBadges,
+    ubc.GoldBadges,
+    ubc.HasTagBasedBadges,
+    ce.TotalComments,
+    ce.HasErrorComments,
+    th.Level,
+    th.TagName,
+    p.Tags,
+    p.CreationDate,
+    p.OwnerUserId,
+    ubc.UserId,
+    p.ScoreRank
+order by EngagementIndex desc
+limit 100;

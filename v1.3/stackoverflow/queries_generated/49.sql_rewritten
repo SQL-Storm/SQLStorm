@@ -1,0 +1,228 @@
+-- {"query": "49.sql", "dataset": "stackoverflow", "version": "v1.3", "prompt": "p1", "model": "gpt-5-mini", "temperature": 1.0, "max_tokens": 32768, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 2662} 
+with
+-- recent active questions with parsed tags and basic aggregates
+RecentQuestions as (
+  select
+    p.Id as QuestionId,
+    p.Title,
+    p.CreationDate,
+    p.OwnerUserId,
+    p.Score,
+    coalesce(p.ViewCount,0) as Views,
+    coalesce(p.AnswerCount,0) as AnswerCount,
+    coalesce(p.FavoriteCount,0) as Favorites,
+    p.Tags,
+    -- normalized tag list: remove angle brackets and split into rows later via unnest
+    substring(p.Tags from 2 for greatest(length(p.Tags)-2,0)) as TagsInner
+  from Posts p
+  where p.PostTypeId = 1
+    and p.CreationDate >= (cast('2024-10-01 12:34:56' as timestamp) - interval '2 years')
+),
+-- explode tags into one row per tag (Postgres-style string_to_array); use lateral to guard nulls
+QuestionTags as (
+  select
+    rq.QuestionId,
+    trim(t) as Tag
+  from RecentQuestions rq
+  left join lateral (
+    select unnest(string_to_array(rq.TagsInner, '><')) as t
+  ) as tags on true
+),
+-- for each question compute top answer stats, including correlated subquery and window functions
+QuestionAnswerStats as (
+  select
+    q.QuestionId,
+    q.Title,
+    q.CreationDate,
+    q.OwnerUserId,
+    q.Score as QuestionScore,
+    q.Views,
+    q.AnswerCount,
+    q.Favorites,
+    qt.Tag,
+    -- best answer by score, tie-breaker by CreationDate
+    a_best.AnswerId,
+    a_best.OwnerUserId as AnswerOwner,
+    a_best.Score as AnswerScore,
+    a_best.CreationDate as AnswerCreation,
+    -- aggregated counts
+    coalesce(a_counts.TotalAnswers,0) as TotalAnswers,
+    coalesce(v_counts.UpVotes,0) as UpVotesOnQuestion,
+    coalesce(v_counts.DownVotes,0) as DownVotesOnQuestion
+  from RecentQuestions q
+  left join QuestionTags qt on qt.QuestionId = q.QuestionId
+  left join lateral (
+    select a.Id as AnswerId, a.OwnerUserId, a.Score, a.CreationDate
+    from Posts a
+    where a.ParentId = q.QuestionId and a.PostTypeId = 2
+    order by a.Score desc nulls last, a.CreationDate asc nulls last
+    limit 1
+  ) a_best on true
+  left join lateral (
+    select count(*) as TotalAnswers
+    from Posts a2
+    where a2.ParentId = q.QuestionId and a2.PostTypeId = 2
+  ) a_counts on true
+  left join lateral (
+    select
+      sum(case when vt.Id = 2 then 1 else 0 end) filter (where vt.Id is not null) as UpVotes,
+      sum(case when vt.Id = 3 then 1 else 0 end) filter (where vt.Id is not null) as DownVotes
+    from Votes v join VoteTypes vt on v.VoteTypeId = vt.Id
+    where v.PostId = q.QuestionId
+  ) v_counts(on true)
+),
+-- user reputation and activity windows including last activity gap and badge richness
+UserActivity as (
+  select
+    u.Id as UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    u.LastAccessDate,
+    greatest(extract(epoch from (cast('2024-10-01 12:34:56' as timestamp) - u.LastAccessDate))/86400, 0)::int as DaysSinceLastAccess,
+    coalesce(b.Bronze,0) as BronzeBadges,
+    coalesce(b.Silver,0) as SilverBadges,
+    coalesce(b.Gold,0) as GoldBadges,
+    coalesce(b.TagBadges,0) as TagBadges,
+    -- badge richness score: weighted
+    (coalesce(b.Gold,0)*5 + coalesce(b.Silver,0)*2 + coalesce(b.Bronze,0)*1 + coalesce(b.TagBadges,0)*0.5) as BadgeRichness
+  from Users u
+  left join (
+    select
+      UserId,
+      sum(case when Class = 3 then 1 else 0 end) as Bronze,
+      sum(case when Class = 2 then 1 else 0 end) as Silver,
+      sum(case when Class = 1 then 1 else 0 end) as Gold,
+      sum(case when TagBased = B'1' then 1 else 0 end) as TagBadges
+    from Badges
+    group by UserId
+  ) b on b.UserId = u.Id
+),
+-- compute involvement of users with questions via correlated subqueries & existence checks
+UserQuestionInvolvement as (
+  select
+    uas.*,
+    -- number of recent questions asked by user
+    (select count(*) from RecentQuestions rq where rq.OwnerUserId = uas.UserId) as RecentQuestionsCount,
+    -- average score of their recent questions
+    (select avg(q.Score) from Posts q where q.PostTypeId = 1 and q.OwnerUserId = uas.UserId and q.CreationDate >= (cast('2024-10-01 12:34:56' as timestamp) - interval '5 years')) as AvgQuestionScore,
+    -- answers provided in recent set
+    (select count(*) from Posts a where a.PostTypeId = 2 and a.OwnerUserId = uas.UserId and a.CreationDate >= (cast('2024-10-01 12:34:56' as timestamp) - interval '2 years')) as RecentAnswersCount
+  from UserActivity uas
+),
+-- assemble complex stats per tag: combine window functions, set operators, and null-aware calculations
+TagAggregates as (
+  select
+    qt.Tag,
+    count(distinct qa.QuestionId) as QuestionsInWindow,
+    count(distinct qa.AnswerId) as DistinctTopAnswers,
+    avg(qa.QuestionScore) filter (where qa.QuestionScore is not null) as AvgQuestionScore,
+    avg(qa.AnswerScore) filter (where qa.AnswerScore is not null) as AvgTopAnswerScore,
+    sum(case when qa.AnswerScore is not null and qa.AnswerScore >= qa.QuestionScore then 1 else 0 end) as TopAnswerAtLeastQuestionScore,
+    -- percentile approximation via window: rank within tag by QuestionScore
+    max(qa.QuestionScore) as MaxQuestionScore,
+    min(qa.QuestionScore) as MinQuestionScore,
+    -- churn: questions with zero answers
+    sum(case when qa.TotalAnswers = 0 then 1 else 0 end) as QuestionsWithNoAnswers,
+    -- tag growth proxy: count questions per quarter
+    jsonb_object_agg(quarter_label, quarter_count) filter (where quarter_label is not null) as QuestionsPerQuarter
+  from (
+    select
+      qa.*,
+      to_char(date_trunc('quarter', qa.CreationDate), 'YYYY-"Q"Q') as quarter_label,
+      1 as quarter_count
+    from QuestionAnswerStats qa
+  ) qa
+  group by qt.Tag
+  order by QuestionsInWindow desc nulls last
+),
+-- heavy join: pick hottest tags and correlate with top users and post link density
+HottestTagInsights as (
+  select
+    t.Tag,
+    t.QuestionsInWindow,
+    t.DistinctTopAnswers,
+    t.AvgQuestionScore,
+    t.AvgTopAnswerScore,
+    t.TopAnswerAtLeastQuestionScore,
+    t.QuestionsWithNoAnswers,
+    -- link density: average number of inbound post-links to questions of this tag
+    coalesce((
+      select avg(plink_count) from (
+        select p.Id, count(pl.Id) as plink_count
+        from Posts p
+        left join PostLinks pl on pl.RelatedPostId = p.Id
+        where p.PostTypeId = 1
+          and p.Id in (select qa2.QuestionId from QuestionAnswerStats qa2 join QuestionTags qt2 on qa2.QuestionId = qt2.QuestionId where qt2.Tag = t.Tag)
+        group by p.Id
+      ) x
+    ),0) as AvgInboundLinksPerQuestion,
+    -- find top contributing users to this tag by number of top answers in window
+    (
+      select jsonb_agg(jsonb_build_object('UserId', ua.AnswerOwner, 'TopAnswers', ua.cnt) order by ua.cnt desc limit 5)
+      from (
+        select qa.AnswerOwner, count(*) as cnt
+        from QuestionAnswerStats qa
+        join QuestionTags qtt on qtt.QuestionId = qa.QuestionId
+        where qtt.Tag = t.Tag and qa.AnswerOwner is not null
+        group by qa.AnswerOwner
+      ) ua
+    ) as TopAnswerers,
+    -- compute diversity score: number of unique askers / number of questions
+    coalesce((
+      select count(distinct q.OwnerUserId)::float / greatest(count(q.Id)::float,1)
+      from Posts q
+      where q.PostTypeId = 1 and q.Id in (select qa2.QuestionId from QuestionAnswerStats qa2 join QuestionTags qt2 on qa2.QuestionId = qt2.QuestionId where qt2.Tag = t.Tag)
+    ),0) as AskerDiversity
+  from TagAggregates t
+  where t.QuestionsInWindow >= 5
+  order by t.QuestionsInWindow desc
+  limit 50
+)
+select
+  hti.Tag,
+  hti.QuestionsInWindow,
+  hti.DistinctTopAnswers,
+  round(coalesce(hti.AvgQuestionScore,0)::numeric,3) as AvgQuestionScore,
+  round(coalesce(hti.AvgTopAnswerScore,0)::numeric,3) as AvgTopAnswerScore,
+  hti.TopAnswerAtLeastQuestionScore,
+  hti.QuestionsWithNoAnswers,
+  round(hti.AvgInboundLinksPerQuestion::numeric,3) as AvgInboundLinksPerQuestion,
+  hti.TopAnswerers,
+  round(hti.AskerDiversity::numeric,3) as AskerDiversity,
+  -- enrichment: join to hottest active users who have high badge richness and answered top questions in this tag
+  (
+    select jsonb_agg(jsonb_build_object(
+      'UserId', ui.UserId,
+      'DisplayName', ua.DisplayName,
+      'Reputation', ua.Reputation,
+      'BadgeRichness', ua.BadgeRichness,
+      'RecentAnswers', ui.RecentAnswersCount,
+      'RecentQuestions', ui.RecentQuestionsCount
+    ) order by ua.BadgeRichness desc, ua.Reputation desc limit 3)
+    from (
+      select distinct qa.AnswerOwner as UserId
+      from QuestionAnswerStats qa
+      join QuestionTags qtt on qtt.QuestionId = qa.QuestionId
+      where qtt.Tag = hti.Tag and qa.AnswerOwner is not null
+    ) ui
+    left join UserActivity ua on ua.UserId = ui.UserId
+  ) as TopUsersSummary,
+  -- anomaly detection: show questions with unusually high score-to-view ratio in this tag
+  (
+    select jsonb_agg(jsonb_build_object('QuestionId', q.Id, 'Title', left(q.Title,120), 'Score', q.Score, 'Views', q.ViewCount, 'ScorePerView', round((case when coalesce(q.ViewCount,0)>0 then q.Score::numeric/q.ViewCount else null end)::numeric,6)))
+    from Posts q
+    where q.PostTypeId = 1
+      and q.Id in (select qa.QuestionId from QuestionAnswerStats qa join QuestionTags qt2 on qa.QuestionId = qt2.QuestionId where qt2.Tag = hti.Tag)
+      and coalesce(q.ViewCount,0) > 0
+      and (q.Score::float / greatest(q.ViewCount::float,1)) > (
+        select coalesce(avg(q2.Score::float / greatest(q2.ViewCount::float,1)),0) + 3*coalesce(stddev_pop(q2.Score::float / greatest(q2.ViewCount::float,1)),0)
+        from Posts q2
+        where q2.PostTypeId = 1
+          and q2.Id in (select qa2.QuestionId from QuestionAnswerStats qa2 join QuestionTags qt3 on qa2.QuestionId = qt3.QuestionId where qt3.Tag = hti.Tag)
+      )
+    order by (q.Score::float / greatest(q.ViewCount::float,1)) desc
+    limit 10
+  ) as HighScorePerViewQuestions
+from HottestTagInsights hti
+order by hti.QuestionsInWindow desc, hti.AvgTopAnswerScore desc;

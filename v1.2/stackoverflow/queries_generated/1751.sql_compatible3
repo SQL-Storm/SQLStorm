@@ -1,0 +1,23 @@
+WITH RecursiveTagWomenTopCorel AS (
+  SELECT
+    u.Id,
+    u.DisplayName,
+    potom_tags.for_quoted_tag,
+    ROUND(AVG(NULLIF(p.Score, 0)) OVER (PARTITION BY tit.did), 2) AS avg_post_score_by_top_corel_etonic,
+    ROW_NUMBER() OVER (ORDER BY MAX(COALESCE(p.ViewCount, 0)) DESC, u.Reputation DESC) AS UserRank,
+    RANK() OVER (PARTITION BY tit.did ORDER BY MAX(COALESCE(p.ViewCount, 0)) DESC, u.Reputation DESC) AS RankInPartition
+  FROM
+    Users u
+    JOIN Posts p ON p.OwnerUserId = u.Id
+    JOIN PostTags pt ON pt.PostId = p.Id
+    JOIN Tags potom_tags ON potom_tags.Id = pt.TagId
+    JOIN Titles tit ON tit.Id = pt.TitleId
+  GROUP BY
+    u.Id,
+    u.DisplayName,
+    potom_tags.for_quoted_tag,
+    tit.did,
+    u.Reputation
+)
+SELECT *
+FROM RecursiveTagWomenTopCorel;

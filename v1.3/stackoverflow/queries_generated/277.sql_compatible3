@@ -1,0 +1,209 @@
+WITH
+recent_posts AS (
+  SELECT *
+  FROM Posts
+  WHERE CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '365 days'
+),
+post_tags AS (
+  SELECT p.Id AS PostId,
+         lower(trim(t.tag)) AS Tag
+  FROM Posts p
+  CROSS JOIN LATERAL (
+    SELECT unnest(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><')) AS tag
+  ) t
+  WHERE p.Tags IS NOT NULL
+),
+tag_stats AS (
+  SELECT pt.Tag,
+         count(DISTINCT p.Id)                                    AS PostCount,
+         avg(p.Score)                                             AS AvgScore,
+         sum(COALESCE(p.ViewCount,0))                             AS TotalViews,
+         sum(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END)        AS Questions,
+         sum(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END)        AS Answers,
+         rank() OVER (ORDER BY count(DISTINCT p.Id) DESC)        AS PopularRank
+  FROM post_tags pt
+  JOIN Posts p ON p.Id = pt.PostId
+  GROUP BY pt.Tag
+),
+user_post_agg AS (
+  SELECT u.Id AS UserId,
+         u.DisplayName,
+         u.Reputation,
+         u.CreationDate,
+         COUNT(p.Id)                                                   AS TotalPosts,
+         SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END)             AS QuestionCount,
+         SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END)             AS AnswerCount,
+         AVG(CASE WHEN p.PostTypeId = 1 THEN p.Score END)              AS AvgQuestionScore,
+         AVG(CASE WHEN p.PostTypeId = 2 THEN p.Score END)              AS AvgAnswerScore,
+         SUM(COALESCE(p.ViewCount,0))                                  AS SumViews,
+         MAX(p.LastActivityDate)                                       AS LastPostActivity,
+         (
+           SELECT COUNT(1)
+           FROM Posts a
+           JOIN Posts q ON q.AcceptedAnswerId = a.Id
+           WHERE a.OwnerUserId = u.Id
+         )                                                               AS AcceptedAnswers,
+         (
+           SELECT MAX(LastEditDate)
+           FROM Posts p2
+           WHERE p2.LastEditorUserId = u.Id
+         )                                                               AS LastEditByUser,
+         (
+           SELECT substring(c.Text FROM 1 FOR 120)
+           FROM Comments c
+           WHERE c.UserId = u.Id
+           ORDER BY c.CreationDate DESC
+           LIMIT 1
+         )                                                               AS LastCommentExcerpt
+  FROM Users u
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+  GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+),
+user_vote_agg AS (
+  SELECT p.OwnerUserId AS UserId,
+         COUNT(v.Id)                                                       AS VotesReceived,
+         COUNT(CASE WHEN v.VoteTypeId = 2 THEN 1 END)                       AS UpVotesReceived,
+         COUNT(CASE WHEN v.VoteTypeId = 3 THEN 1 END)                       AS DownVotesReceived,
+         SUM(CASE WHEN v.VoteTypeId IN (8,9) THEN COALESCE(v.BountyAmount,0) ELSE 0 END) AS BountyReceived
+  FROM Votes v
+  JOIN Posts p ON p.Id = v.PostId
+  GROUP BY p.OwnerUserId
+),
+badge_scores AS (
+  SELECT b.UserId,
+         SUM(CASE b.Class WHEN 1 THEN 5 WHEN 2 THEN 3 WHEN 3 THEN 1 ELSE 0 END) +
+         SUM(CASE WHEN COALESCE(b.TagBased, false) = true THEN 0.5 ELSE 0 END)                   AS BadgeScore,
+         COUNT(*)                                                             AS BadgeCount
+  FROM Badges b
+  GROUP BY b.UserId
+),
+duplicate_and_link_stats AS (
+  SELECT p.OwnerUserId AS UserId,
+         SUM(CASE WHEN pl.LinkTypeId = 3 THEN 1 ELSE 0 END)                 AS DuplicateLinksOut,
+         SUM(CASE WHEN pl.LinkTypeId = 1 THEN 1 ELSE 0 END)                 AS LinkedOut
+  FROM PostLinks pl
+  JOIN Posts p ON p.Id = pl.PostId
+  GROUP BY p.OwnerUserId
+),
+user_tag_affinity AS (
+  SELECT ut.UserId, ut.Tag, ut.TagCount, ut.AvgTagScore,
+         row_number() OVER (PARTITION BY ut.UserId ORDER BY ut.TagCount DESC, ut.AvgTagScore DESC, ut.Tag) AS rn
+  FROM (
+    SELECT p.OwnerUserId AS UserId,
+           lower(trim(t.tag)) AS Tag,
+           COUNT(*) AS TagCount,
+           AVG(p.Score) AS AvgTagScore
+    FROM Posts p
+    JOIN LATERAL (
+      SELECT unnest(string_to_array(substring(p.Tags,2,length(p.Tags)-2),'><')) AS tag
+    ) t ON p.Tags IS NOT NULL
+    GROUP BY p.OwnerUserId, lower(trim(t.tag))
+  ) ut
+),
+top_user_tag AS (
+  SELECT UserId, Tag AS TopTag, TagCount AS TopTagCount, AvgTagScore AS TopTagAvgScore
+  FROM user_tag_affinity
+  WHERE rn = 1
+),
+active_users AS (
+  SELECT Id AS UserId FROM Users WHERE LastAccessDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '90 days'
+),
+veteran_users AS (
+  SELECT Id AS UserId FROM Users WHERE CreationDate <= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '3650 days'
+),
+active_not_veteran AS (
+  SELECT UserId FROM active_users
+  EXCEPT
+  SELECT UserId FROM veteran_users
+),
+user_summary AS (
+  SELECT u.UserId,
+         u.DisplayName,
+         u.Reputation,
+         u.CreationDate,
+         u.TotalPosts,
+         COALESCE(u.QuestionCount,0) AS QuestionCount,
+         COALESCE(u.AnswerCount,0)   AS AnswerCount,
+         ROUND(COALESCE(u.AvgQuestionScore,0)::numeric,2) AS AvgQuestionScore,
+         ROUND(COALESCE(u.AvgAnswerScore,0)::numeric,2)   AS AvgAnswerScore,
+         COALESCE(v.VotesReceived,0) AS VotesReceived,
+         COALESCE(v.UpVotesReceived,0) AS UpVotesReceived,
+         COALESCE(v.DownVotesReceived,0) AS DownVotesReceived,
+         COALESCE(b.BadgeScore,0)    AS BadgeScore,
+         COALESCE(b.BadgeCount,0)    AS BadgeCount,
+         COALESCE(d.DuplicateLinksOut,0) AS DuplicateLinksOut,
+         COALESCE(d.LinkedOut,0) AS LinkedOut,
+         COALESCE(a.TopTag,'(none)') AS TopTag,
+         COALESCE(a.TopTagCount,0) AS TopTagCount,
+         COALESCE(a.TopTagAvgScore,0) AS TopTagAvgScore,
+         COALESCE(u.AcceptedAnswers,0) AS AcceptedAnswers,
+         COALESCE(u.SumViews,0) AS SumViews,
+         u.LastPostActivity,
+         u.LastEditByUser,
+         u.LastCommentExcerpt,
+         (
+           (COALESCE(u.TotalPosts,0) * 0.35)
+           + (COALESCE(u.Reputation,0) * 0.25)
+           + (COALESCE(b.BadgeScore,0) * 4)
+           + (LOG(GREATEST(1, COALESCE(u.SumViews,0))) * 0.5)
+           + (COALESCE(v.UpVotesReceived,0) - COALESCE(v.DownVotesReceived,0)) * 0.2
+         ) / NULLIF((EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - COALESCE(u.CreationDate, CAST('2024-10-01 12:34:56' AS timestamp)))) / 86400.0) + 1, 0) AS InfluenceIndex
+  FROM user_post_agg u
+  LEFT JOIN user_vote_agg v ON v.UserId = u.UserId
+  LEFT JOIN badge_scores b ON b.UserId = u.UserId
+  LEFT JOIN duplicate_and_link_stats d ON d.UserId = u.UserId
+  LEFT JOIN top_user_tag a ON a.UserId = u.UserId
+),
+ranked_users AS (
+  SELECT us.UserId,
+         us.DisplayName,
+         us.Reputation,
+         us.CreationDate,
+         us.TotalPosts,
+         us.QuestionCount,
+         us.AnswerCount,
+         us.AvgQuestionScore,
+         us.AvgAnswerScore,
+         us.VotesReceived,
+         us.UpVotesReceived,
+         us.DownVotesReceived,
+         us.BadgeScore,
+         us.BadgeCount,
+         us.DuplicateLinksOut,
+         us.LinkedOut,
+         us.TopTag,
+         us.TopTagCount,
+         us.TopTagAvgScore,
+         us.AcceptedAnswers,
+         us.SumViews,
+         us.LastPostActivity,
+         us.LastEditByUser,
+         us.LastCommentExcerpt,
+         us.InfluenceIndex,
+         row_number() OVER (ORDER BY us.InfluenceIndex DESC NULLS LAST, us.Reputation DESC) AS GlobalRank,
+         dense_rank() OVER (ORDER BY COALESCE(us.QuestionCount,0) DESC) AS QuestionRank,
+         ntile(100) OVER (ORDER BY us.InfluenceIndex DESC NULLS LAST) AS InfluencePercentile,
+         lag(us.InfluenceIndex) OVER (ORDER BY us.InfluenceIndex DESC NULLS LAST) AS PrevInfluence,
+         lead(us.InfluenceIndex) OVER (ORDER BY us.InfluenceIndex DESC NULLS LAST) AS NextInfluence,
+         CASE
+           WHEN lag(us.InfluenceIndex) OVER (ORDER BY us.InfluenceIndex DESC NULLS LAST) IS NULL THEN NULL
+           WHEN lag(us.InfluenceIndex) OVER (ORDER BY us.InfluenceIndex DESC NULLS LAST) = 0 THEN NULL
+           ELSE ROUND(((us.InfluenceIndex - lag(us.InfluenceIndex) OVER (ORDER BY us.InfluenceIndex DESC NULLS LAST)) / NULLIF(ABS(lag(us.InfluenceIndex) OVER (ORDER BY us.InfluenceIndex DESC NULLS LAST)),0)) * CAST(100 AS numeric), 2)
+         END AS PctChangeFromPrev
+  FROM user_summary us
+),
+active_non_veterans_diagnostic AS (
+  SELECT ru.*
+  FROM ranked_users ru
+  JOIN active_not_veteran anv ON anv.UserId = ru.UserId
+)
+SELECT 'TOP_USERS_BY_INFLUENCE' AS ReportSection, ru.UserId, ru.DisplayName, ru.Reputation, ru.InfluenceIndex, ru.GlobalRank, ru.TopTag, ru.TopTagCount, ru.BadgeCount, ru.VotesReceived, ru.SumViews, ru.LastCommentExcerpt
+FROM ranked_users ru
+WHERE ru.GlobalRank <= 50
+
+UNION ALL
+
+SELECT 'ACTIVE_NON_VETERANS_SAMPLE' AS ReportSection, ad.UserId, ad.DisplayName, ad.Reputation, ad.InfluenceIndex, ad.GlobalRank, ad.TopTag, ad.TopTagCount, ad.BadgeCount, ad.VotesReceived, ad.SumViews, ad.LastCommentExcerpt
+FROM active_non_veterans_diagnostic ad
+ORDER BY ReportSection, InfluenceIndex DESC NULLS LAST, GlobalRank
+LIMIT 200;

@@ -1,0 +1,233 @@
+with RecursiveTagCounts as (
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        coalesce(p.AnswerCount, 0) as AnswerCount,
+        coalesce(p.ViewCount, 0) as ViewCount,
+        coalesce(u.Reputation, 0) as OwnerReputation,
+        row_number() over (partition by t.Id order by p.Score desc nulls last) as rn
+    from Tags t
+    left join Posts p on p.Id = t.ExcerptPostId and p.PostTypeId = 1
+    left join Users u on u.Id = p.OwnerUserId
+    where t.TagName is not null
+),
+TopTags as (
+    select Id, TagName, Count, AnswerCount, ViewCount, OwnerReputation
+    from RecursiveTagCounts
+    where rn = 1
+),
+UserBadgeCounts as (
+    select
+        b.UserId,
+        sum(case when b.Class = 1 then 1 else 0 end) as GoldBadges,
+        sum(case when b.Class = 2 then 1 else 0 end) as SilverBadges,
+        sum(case when b.Class = 3 then 1 else 0 end) as BronzeBadges
+    from Badges b
+    group by b.UserId
+),
+PostVoteStats as (
+    select
+        p.Id as PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        sum(case when v.VoteTypeId = 2 then 1 else 0 end) as UpVotes,
+        sum(case when v.VoteTypeId = 3 then 1 else 0 end) as DownVotes,
+        sum(v.BountyAmount) as TotalBounty
+    from Posts p
+    left join Votes v on v.PostId = p.Id
+    group by p.Id, p.PostTypeId, p.OwnerUserId
+),
+RankedAnswers as (
+    select
+        a.Id,
+        a.ParentId,
+        a.Score,
+        a.CreationDate,
+        u.DisplayName as Answerer,
+        row_number() over (partition by a.ParentId order by a.Score desc, a.CreationDate asc) as AnswerRank
+    from Posts a
+    left join Users u on u.Id = a.OwnerUserId
+    where a.PostTypeId = 2
+),
+QuestionsWithTopAnswers as (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        q.CreationDate as QuestionCreationDate,
+        q.Score as QuestionScore,
+        q.ViewCount,
+        q.Tags,
+        q.OwnerUserId,
+        u.DisplayName as QuestionOwner,
+        r.AnswerRank,
+        r.Id as AnswerId,
+        r.Score as AnswerScore,
+        r.CreationDate as AnswerCreationDate,
+        r.Answerer
+    from Posts q
+    left join Users u on u.Id = q.OwnerUserId
+    left join RankedAnswers r on r.ParentId = q.Id and r.AnswerRank <= 3
+    where q.PostTypeId = 1
+),
+ClosedQuestions as (
+    select
+        ph.PostId,
+        min(ph.CreationDate) as ClosedDate,
+        crt.Name as CloseReason
+    from PostHistory ph
+    left join CloseReasonTypes crt on crt.Id = cast(ph.Comment as integer)
+    where ph.PostHistoryTypeId = 10
+    group by ph.PostId, crt.Name
+),
+QuestionStats as (
+    select
+        q.QuestionId,
+        q.Title,
+        q.QuestionCreationDate,
+        q.QuestionScore,
+        q.ViewCount,
+        q.Tags,
+        q.QuestionOwner,
+        coalesce(cq.ClosedDate, null) as ClosedDate,
+        coalesce(cq.CloseReason, 'Open') as CloseReason,
+        json_agg(json_build_object(
+            'AnswerId', q.AnswerId,
+            'AnswerScore', q.AnswerScore,
+            'AnswerCreationDate', q.AnswerCreationDate,
+            'Answerer', q.Answerer,
+            'AnswerRank', q.AnswerRank
+        ) order by q.AnswerRank) filter (where q.AnswerId is not null) as TopAnswers
+    from QuestionsWithTopAnswers q
+    left join ClosedQuestions cq on cq.PostId = q.QuestionId
+    group by q.QuestionId, q.Title, q.QuestionCreationDate, q.QuestionScore, q.ViewCount, q.Tags, q.QuestionOwner, cq.ClosedDate, cq.CloseReason
+),
+-- Replace DISTINCT-in-window usage by counting rows per user/post combination via derived aggregation before windowing.
+UserPostCounts as (
+    select
+        p.OwnerUserId as UserId,
+        p.Id as PostId,
+        p.PostTypeId,
+        p.CreationDate as PostCreationDate
+    from Posts p
+    where p.OwnerUserId is not null
+),
+UserCommentCounts as (
+    select
+        c.UserId,
+        c.Id as CommentId,
+        c.CreationDate as CommentCreationDate
+    from Comments c
+    where c.UserId is not null
+),
+UserVoteBounties as (
+    select
+        v.UserId,
+        v.Id as VoteId,
+        v.CreationDate as VoteCreationDate,
+        coalesce(v.BountyAmount,0) as BountyAmount
+    from Votes v
+    where v.UserId is not null and v.VoteTypeId in (8,9)
+),
+UserActivityWindow as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        -- cumulative counts via aggregation over ordered rows: first build aggregates per user with ordering using window on 1-row-per-event sources
+        coalesce(qc.QuestionsPosted, 0) as QuestionsPosted,
+        coalesce(ac.AnswersPosted, 0) as AnswersPosted,
+        coalesce(cc.CommentsMade, 0) as CommentsMade,
+        coalesce(bb.TotalBountyGiven, 0) as TotalBountyGiven,
+        -- include CreationDate for ordering in later distinct-on selection
+        u.CreationDate as AnchorCreationDate
+    from Users u
+    left join (
+        select
+            up.UserId,
+            count(*) over (partition by up.UserId order by up.PostCreationDate rows between unbounded preceding and current row) as QuestionsPosted
+        from UserPostCounts up
+        where up.PostTypeId = 1
+        group by up.UserId, up.PostCreationDate
+    ) qc on qc.UserId = u.Id
+    left join (
+        select
+            up.UserId,
+            count(*) over (partition by up.UserId order by up.PostCreationDate rows between unbounded preceding and current row) as AnswersPosted
+        from UserPostCounts up
+        where up.PostTypeId = 2
+        group by up.UserId, up.PostCreationDate
+    ) ac on ac.UserId = u.Id
+    left join (
+        select
+            cc2.UserId,
+            count(*) over (partition by cc2.UserId order by cc2.CommentCreationDate rows between unbounded preceding and current row) as CommentsMade
+        from UserCommentCounts cc2
+        group by cc2.UserId, cc2.CommentCreationDate
+    ) cc on cc.UserId = u.Id
+    left join (
+        select
+            vb.UserId,
+            sum(vb.BountyAmount) over (partition by vb.UserId order by vb.VoteCreationDate rows between unbounded preceding and current row) as TotalBountyGiven
+        from UserVoteBounties vb
+        group by vb.UserId, vb.VoteCreationDate, vb.BountyAmount
+    ) bb on bb.UserId = u.Id
+),
+UserBadgeSummary as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        coalesce(ubc.GoldBadges,0) as GoldBadges,
+        coalesce(ubc.SilverBadges,0) as SilverBadges,
+        coalesce(ubc.BronzeBadges,0) as BronzeBadges,
+        coalesce(ua.QuestionsPosted,0) as QuestionsPosted,
+        coalesce(ua.AnswersPosted,0) as AnswersPosted,
+        coalesce(ua.CommentsMade,0) as CommentsMade,
+        coalesce(ua.TotalBountyGiven,0) as TotalBountyGiven
+    from Users u
+    left join UserBadgeCounts ubc on ubc.UserId = u.Id
+    left join (
+        select uu.UserId,
+               max(uu.QuestionsPosted) as QuestionsPosted,
+               max(uu.AnswersPosted) as AnswersPosted,
+               max(uu.CommentsMade) as CommentsMade,
+               max(uu.TotalBountyGiven) as TotalBountyGiven
+        from UserActivityWindow uu
+        group by uu.UserId
+    ) ua on ua.UserId = u.Id
+)
+select
+    q.QuestionId,
+    q.Title,
+    q.QuestionCreationDate,
+    q.QuestionScore,
+    q.ViewCount,
+    q.Tags,
+    q.QuestionOwner,
+    q.CloseReason,
+    coalesce(array_length(string_to_array(q.Tags, '><'),1), 0) as TagCount,
+    (select count(*) from Posts a where a.ParentId = q.QuestionId and a.Score > 10) as HighScoreAnswerCount,
+    (select count(*) from Votes v where v.PostId = q.QuestionId and v.VoteTypeId = 2) as QuestionUpVotes,
+    (select count(*) from Votes v where v.PostId = q.QuestionId and v.VoteTypeId = 3) as QuestionDownVotes,
+    q.TopAnswers,
+    ubs.GoldBadges,
+    ubs.SilverBadges,
+    ubs.BronzeBadges,
+    ubs.QuestionsPosted,
+    ubs.AnswersPosted,
+    ubs.CommentsMade,
+    ubs.TotalBountyGiven,
+    case
+        when q.CloseReason = 'Duplicate' then 'Needs Review'
+        when q.CloseReason = 'Off-topic' then 'Off Topic'
+        when q.CloseReason = 'Open' and q.QuestionScore > 100 then 'Hot Question'
+        else 'Normal'
+    end as QuestionStatus
+from QuestionStats q
+left join UserBadgeSummary ubs on ubs.UserId = (
+    select p.OwnerUserId from Posts p where p.Id = q.QuestionId
+)
+where q.QuestionCreationDate > cast('2024-10-01 12:34:56' as timestamp) - interval '1 year'
+order by q.QuestionScore desc nulls last, q.ViewCount desc nulls last
+limit 50;

@@ -1,0 +1,153 @@
+with RecursiveTagCounts as (
+  select
+    t.Id as TagId,
+    t.TagName,
+    t.Count,
+    rank() over(partition by char_length(t.TagName)
+                order by t.Count desc) as TagRankByLength
+  from Tags t
+  where char_length(t.TagName) > 3
+),
+UserRecentActivity as (
+  select
+    u.Id as UserId,
+    u.DisplayName,
+    u.Reputation,
+    max(p.LastActivityDate) as LastPostActivity,
+    count(distinct c.Id) as TotalComments,
+    sum(coalesce(p.ViewCount, 0)) as TotalViews,
+    case when max(coalesce(p.Score,0)) > 10 then 1 else 0 end as HasHighlyRatedPost
+  from Users u
+  left join Posts p on p.OwnerUserId = u.Id and p.PostTypeId = 1  
+  left join Comments c on c.UserId = u.Id and c.CreationDate > timestamp '2024-10-01 12:34:56' - interval '1 year'
+  group by u.Id, u.DisplayName, u.Reputation
+),
+BadgeLeaderBoard as (
+  select
+    b.UserId,
+    b.Name as BadgeName,
+    count(*) as BadgeCount,
+    rank() over (partition by b.Name order by count(*) desc) as RankInBadge
+  from Badges b
+  where b.Date > timestamp '2024-10-01 12:34:56' - interval '3 years'
+  group by b.UserId, b.Name
+),
+QuestionAnswerStats as (
+  select
+    q.Id as QuestionId,
+    q.Title,
+    q.Tags,
+    q.CreationDate,
+    q.ViewCount,
+    q.Score,
+    q.AcceptedAnswerId,
+    coalesce(count(distinct a.Id), 0) as AnswerCnt,
+    ntlp.NegativeTrendAnsCnt,
+    windowed.ReduceAnswerViewLag
+  from Posts q
+  left join Posts a on a.ParentId = q.Id and a.PostTypeId = 2 and a.Score < 0
+  left join lateral (
+    select
+      count(*) as NegativeTrendAnsCnt
+    from Posts ax
+    where ax.ParentId = q.Id
+      and ax.PostTypeId = 2
+      and ax.Score < -2
+  ) ntlp on true
+  left join lateral (
+    select
+      max(a_last.ViewsLag) as ReduceAnswerViewLag
+    from (
+      select
+        a_view.ViewCount - coalesce(lead(a_view.ViewCount) over(partition by a_view.ParentId order by a_view.CreationDate asc), 0) as ViewsLag,
+        a_view.ParentId,
+        a_view.CreationDate
+      from Posts a_view
+      where a_view.ParentId = q.Id and a_view.PostTypeId = 2
+    ) a_last
+  ) windowed on true
+  where q.PostTypeId = 1
+  group by q.Id, q.Title, q.Tags, q.CreationDate, q.ViewCount, q.Score, q.AcceptedAnswerId, ntlp.NegativeTrendAnsCnt, windowed.ReduceAnswerViewLag
+),
+UserTrimBadgeRanking AS (
+  select
+    UserId,
+    BadgeName,
+    BadgeCount,
+    RankInBadge
+  from BadgeLeaderBoard
+  where RankInBadge <= 10
+),
+DistinctDuplicates as (
+  select distinct
+         pl.PostId,
+         pl.RelatedPostId,
+         case when pl.LinkTypeId = 3 then 1 else 0 end as IsDuplicate
+    from PostLinks pl
+),
+DuplicateCountsByQuestion as (
+  select 
+    d.PostId, 
+    sum(d.IsDuplicate) as DuplicatesFound
+  from DistinctDuplicates d
+  group by d.PostId
+),
+UserFrequentBadges as (
+  select u.Id as UserId, b.Name as BadgeName, sum(coalesce(b.Class,0)) as UserBadgeValueSum
+  from Users u
+  left join Badges b on b.UserId = u.Id
+  group by u.Id, b.Name
+  having count(b.Id) > 3
+)
+
+select 
+  qt.Title || ' | Tags: ' || coalesce(qt.Tags, '<none>') as FullTitle,
+  rt.TagName,
+  adore.DisplayName as UserNameBenchmark,
+  usr.Reputation,
+  qc.QuestionRank,
+  partb.BadgeName as MedellMart,
+  sum(coalesce(qs.Score,0)) over (partition by usr.UserId) as TotalUserScore,
+  case 
+   when bap.BadgeCount > 5 then bap.BadgeCount * 1.25   
+   else bap.BadgeCount * 0.85
+  end as AdjustedBadgeScore,
+  arrays.tmp as tmp_doc,
+  arrays.Doc
+from UserFrequentBadges uge 
+  left join UserRecentActivity usr on uge.UserId = usr.UserId 
+  left join QuestionAnswerStats qt on qt.AcceptedAnswerId = usr.UserId 
+  left join DistinctDuplicates dd on dd.PostId = qt.QuestionId 
+  left join DuplicateCountsByQuestion dqs on dqs.PostId = dd.PostId 
+  left join UserTrimBadgeRanking bap on bap.UserId = usr.UserId 
+  left join RecursiveTagCounts rt on position(rt.TagName in coalesce(qt.Tags, '')) > 0
+  left join (select null::text as DisplayName) adore on true
+  left join (select null::int as QuestionRank) qc on true
+  left join (select null::text as BadgeName) partb on true
+  left join (select null::int as Score) qs on true
+  left join (select null::text as tmp, null::text as Doc) arrays on true
+group by
+  qt.Title,
+  qt.Tags,
+  rt.TagName,
+  adore.DisplayName,
+  usr.Reputation,
+  qc.QuestionRank,
+  partb.BadgeName,
+  bap.BadgeCount,
+  arrays.tmp,
+  arrays.Doc,
+  uge.UserId,
+  uge.BadgeName,
+  uge.UserBadgeValueSum,
+  usr.UserId,
+  usr.DisplayName,
+  qt.QuestionId,
+  qt.CreationDate,
+  qt.ViewCount,
+  qt.Score,
+  qt.AcceptedAnswerId,
+  ntlp.NegativeTrendAnsCnt,
+  windowed.ReduceAnswerViewLag
+order by TotalUserScore desc NULLS LAST, ntlp.NegativeTrendAnsCnt desc NULLS LAST
+limit 100;

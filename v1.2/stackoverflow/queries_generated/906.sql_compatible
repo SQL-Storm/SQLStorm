@@ -1,0 +1,153 @@
+with RecursiveUserDescendants as (
+    select distinct u.Id as RootUserId, p.OwnerUserId as DescendantUserId, 1 as Depth
+    from Users u
+    join Posts p on p.ParentId is null and p.OwnerUserId is not null
+    join Posts a on a.ParentId = p.Id and a.OwnerUserId is not null
+    where u.Id = p.OwnerUserId
+    union all
+    select rud.RootUserId, p.OwnerUserId, rud.Depth + 1
+    from RecursiveUserDescendants rud
+    join Posts p on p.ParentId is not null and p.OwnerUserId is not null and p.ParentId in (
+        select Id from Posts where OwnerUserId = rud.DescendantUserId
+    )
+    where rud.Depth < 2
+),
+UserBadgeStats as (
+    select
+        u.Id as UserId,
+        count(distinct b.Id) as TotalBadges,
+        count(distinct case when b.Class = 1 then b.Id end) as GoldBadges,
+        count(distinct case when b.Class = 2 then b.Id end) as SilverBadges,
+        count(distinct case when b.Class = 3 then b.Id end) as BronzeBadges,
+        sum(case when coalesce(b.TagBased,0) = 1 then 1 else 0 end) as TagBasedBadges
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    group by u.Id
+),
+PostEngagement as (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        coalesce(p.CommentCount,0) as CommentCount,
+        coalesce(p.FavoriteCount,0) as FavoriteCount,
+        row_number() over (partition by p.OwnerUserId order by p.Score desc NULLS LAST, p.ViewCount desc NULLS LAST) as RankByScore,
+        lag(p.Score) over (partition by p.OwnerUserId order by p.CreationDate) as PrevScore,
+        lead(p.Score) over (partition by p.OwnerUserId order by p.CreationDate) as NextScore,
+        case when p.AcceptedAnswerId is not null then 1 else 0 end as HasAcceptedAnswer
+    from Posts p
+    where p.OwnerUserId is not null
+),
+PostHistoryCloseInfo as (
+    select 
+        ph.PostId,
+        max(case when ph.PostHistoryTypeId = 10 then ph.CreationDate end) as FirstCloseDate,
+        max(case when ph.PostHistoryTypeId = 11 then ph.CreationDate end) as LastReopenDate,
+        max(case when ph.PostHistoryTypeId = 10 then cast(ph.Comment as integer) end) as CloseReasonId
+    from PostHistory ph
+    group by ph.PostId
+),
+UserActivitySummary as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(distinct case when p.PostTypeId = 1 then p.Id end) as QuestionCount,
+        count(distinct case when p.PostTypeId = 2 then p.Id end) as AnswerCount,
+        count(distinct c.Id) as CommentCount,
+        count(distinct case when v.VoteTypeId = 2 then v.Id end) as UpVotesGiven,
+        count(distinct case when v.VoteTypeId = 3 then v.Id end) as DownVotesGiven,
+        max(p.CreationDate) as LastPostDate,
+        max(c.CreationDate) as LastCommentDate
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Comments c on c.UserId = u.Id
+    left join Votes v on v.UserId = u.Id
+    group by u.Id, u.DisplayName
+)
+select distinct
+    u.Id as UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    u.Location,
+    u.WebsiteUrl,
+    u.Views,
+    ub.TotalBadges,
+    ub.GoldBadges,
+    ub.SilverBadges,
+    ub.BronzeBadges,
+    ub.TagBasedBadges,
+    uas.QuestionCount,
+    uas.AnswerCount,
+    uas.CommentCount,
+    uas.UpVotesGiven,
+    uas.DownVotesGiven,
+    coalesce(peq.Score, 0) as HighestQuestionScore,
+    coalesce(pea.Score, 0) as HighestAnswerScore,
+    avg((pe.Score - coalesce(pe.PrevScore, 0)) * 1.0) over (partition by u.Id) as AvgScoreDiffBetweenPosts,
+    (select count(distinct rud.DescendantUserId)
+     from RecursiveUserDescendants rud
+     where rud.RootUserId = u.Id and rud.DescendantUserId <> u.Id) as DistinctRespondersWithin2Levels,
+    crt.Name as MostCommonCloseReason,
+    substring(string_agg(distinct b.Name, ' | ' order by b.Date desc) from 1 for 200) as BadgeNames,
+    substring(
+        (
+            select string_agg(tag, ', ' order by question_count desc)
+            from (
+                select unnest(string_to_array(substring(p.Tags, 2, char_length(p.Tags) - 2), '><')) as tag,
+                    count(*) as question_count
+                from Posts p
+                where p.OwnerUserId = u.Id and p.PostTypeId = 1 and p.Tags is not null
+                group by tag
+                order by question_count desc
+                limit 3
+            ) t
+        )
+    from 1 for 100) as Top3Tags,
+    (
+        select string_agg(distinct name, ', ')
+        from (
+            select p.OwnerDisplayName as name, p.Score as ord from Posts p where p.OwnerUserId = u.Id and p.PostTypeId = 2 order by p.Score desc limit 5
+            union all
+            select p.LastEditorDisplayName as name, p.Score as ord from Posts p where p.OwnerUserId = u.Id and p.PostTypeId = 2 and p.LastEditorDisplayName is not null order by p.Score desc limit 5
+        ) combined
+        where name is not null and name <> ''
+    ) as TopAnswerContributors
+from Users u
+left join UserBadgeStats ub on ub.UserId = u.Id
+left join UserActivitySummary uas on uas.UserId = u.Id
+left join PostEngagement pe on pe.OwnerUserId = u.Id
+left join PostEngagement peq on peq.OwnerUserId = u.Id and peq.PostTypeId = 1 and peq.RankByScore = 1
+left join PostEngagement pea on pea.OwnerUserId = u.Id and pea.PostTypeId = 2 and pea.RankByScore = 1
+left join PostHistoryCloseInfo phci on phci.PostId in (
+    select p.Id from Posts p where p.OwnerUserId = u.Id and p.PostTypeId = 1
+)
+left join CloseReasonTypes crt on crt.Id = phci.CloseReasonId
+left join Badges b on b.UserId = u.Id
+where u.Reputation > 1000
+group by
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    u.Location,
+    u.WebsiteUrl,
+    u.Views,
+    ub.TotalBadges,
+    ub.GoldBadges,
+    ub.SilverBadges,
+    ub.BronzeBadges,
+    ub.TagBasedBadges,
+    uas.QuestionCount,
+    uas.AnswerCount,
+    uas.CommentCount,
+    uas.UpVotesGiven,
+    uas.DownVotesGiven,
+    peq.Score,
+    pea.Score,
+    crt.Name
+order by u.Reputation desc
+limit 50;

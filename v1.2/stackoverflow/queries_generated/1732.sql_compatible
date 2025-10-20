@@ -1,0 +1,136 @@
+WITH RecursiveTagHierarchy AS (
+  SELECT
+    t.Id,
+    t.TagName,
+    p.Id AS WikiPostId,
+    COALESCE(ptypes.Name, 'Unknown') AS PostTypeName,
+    1 AS Level
+  FROM Tags t
+  LEFT JOIN Posts p ON t.WikiPostId = p.Id
+  LEFT JOIN PostTypes ptypes ON p.PostTypeId = ptypes.Id
+
+  UNION ALL
+
+  SELECT
+    t.Id,
+    t.TagName || ' > ' || th.TagName AS TagHierarchy,
+    th.WikiPostId,
+    th.PostTypeName,
+    th.Level + 1
+  FROM Tags t
+  JOIN RecursiveTagHierarchy th ON t.WikiPostId = th.WikiPostId AND t.Id <> th.Id
+  WHERE th.Level < 3
+),
+
+TopViewedQuestions AS (
+  SELECT
+    Id,
+    Title,
+    Score,
+    ViewCount,
+    ROW_NUMBER() OVER(ORDER BY ViewCount DESC) AS rn_view
+  FROM Posts
+  WHERE PostTypeId = 1 AND ViewCount IS NOT NULL
+),
+
+RecentClosures AS (
+  SELECT 
+    ph.PostId,
+    ph.ClosedDate,
+    crt.Name AS CloseReasonName,
+    LAG(ph.ClosedDate) OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate) AS PrevClosureDate
+  FROM Posts p
+  JOIN PostHistory ph ON p.Id = ph.PostId AND ph.PostHistoryTypeId = 10
+  LEFT JOIN CloseReasonTypes crt ON crt.Id = CAST(ph.Comment AS INTEGER)
+  WHERE p.ClosedDate IS NOT NULL
+),
+
+UserBadgeRanking AS (
+  SELECT
+    u.Id,
+    u.DisplayName,
+    SUM(
+      CASE 
+        WHEN b.Class = 1 THEN 5
+        WHEN b.Class = 2 THEN 3
+        WHEN b.Class = 3 THEN 1
+        ELSE 0
+      END
+    ) AS BadgeScore,
+    COUNT(b.Id) OVER(PARTITION BY b.Name) AS BadgePopularity
+  FROM Users u
+  LEFT JOIN Badges b ON u.Id = b.UserId
+  GROUP BY u.Id, u.DisplayName
+),
+
+CorrelatedSubLatestComments AS (
+  SELECT
+    p.Id,
+    p.Title,
+    (
+      SELECT c.Text
+      FROM Comments c
+      WHERE c.PostId = p.Id
+      ORDER BY c.CreationDate DESC
+      LIMIT 1
+    ) AS LatestComment,
+    CAST(LENGTH(p.Body) - LENGTH(REPLACE(COALESCE(p.Body, ''), 'a', '')) AS INTEGER) AS ACharFrequency,
+    CASE
+      WHEN CHAR_LENGTH(COALESCE(p.Tags, '')) = 0 THEN 'No Tags'
+      ELSE LOWER(TRIM(SUBSTRING(p.Tags FROM '<([^>]+)>' FOR 1)))
+    END AS FirstTagExtraction,
+    DENSE_RANK() OVER (ORDER BY p.Score DESC) FILTER (WHERE p.PostTypeId = 1) AS QuestionRankAccordingScoreDesc
+  FROM Posts p
+)
+
+SELECT
+  rth.Id,
+  rth.TagName,
+  rth.WikiPostId,
+  rth.PostTypeName,
+  rth.Level,
+  tvq.Id AS TopQuestionId,
+  tvq.Title AS TopQuestionTitle,
+  tvq.ViewCount,
+  rc.PostId AS RecentlyClosedPostId,
+  rc.ClosedDate,
+  rc.CloseReasonName,
+  rc.PrevClosureDate,
+  ubr.Id AS UserId,
+  ubr.DisplayName AS UserDisplayName,
+  ubr.BadgeScore,
+  ubr.BadgePopularity,
+  cslc.Id AS PostId,
+  cslc.Title AS PostTitle,
+  cslc.LatestComment,
+  cslc.ACharFrequency,
+  cslc.FirstTagExtraction,
+  cslc.QuestionRankAccordingScoreDesc
+FROM RecursiveTagHierarchy rth
+LEFT JOIN TopViewedQuestions tvq ON tvq.rn_view = 1
+LEFT JOIN RecentClosures rc ON rc.PostId = rth.WikiPostId
+LEFT JOIN UserBadgeRanking ubr ON ubr.Id = rc.PostId -- keep join but likely no direct relation; preserved as in original intent
+LEFT JOIN CorrelatedSubLatestComments cslc ON cslc.Id = rth.WikiPostId
+GROUP BY
+  rth.Id,
+  rth.TagName,
+  rth.WikiPostId,
+  rth.PostTypeName,
+  rth.Level,
+  tvq.Id,
+  tvq.Title,
+  tvq.ViewCount,
+  rc.PostId,
+  rc.ClosedDate,
+  rc.CloseReasonName,
+  rc.PrevClosureDate,
+  ubr.Id,
+  ubr.DisplayName,
+  ubr.BadgeScore,
+  ubr.BadgePopularity,
+  cslc.Id,
+  cslc.Title,
+  cslc.LatestComment,
+  cslc.ACharFrequency,
+  cslc.FirstTagExtraction,
+  cslc.QuestionRankAccordingScoreDesc;

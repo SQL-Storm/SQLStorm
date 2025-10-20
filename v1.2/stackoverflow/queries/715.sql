@@ -1,0 +1,179 @@
+with RecursiveUserBadges as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        b.Name as BadgeName,
+        b.Class,
+        row_number() over (partition by u.Id order by b.Date desc) as BadgeRank
+    from Users u
+    left join Badges b on u.Id = b.UserId
+    where b.Date > (cast('2024-10-01' as date) - interval '1 year')
+),
+TopBadges as (
+    select UserId, BadgeName, Class
+    from RecursiveUserBadges
+    where BadgeRank <= 3
+),
+PostScoreStats as (
+    select 
+        p.OwnerUserId,
+        count(case when p.PostTypeId = 1 then 1 end) as QuestionCount,
+        count(case when p.PostTypeId = 2 then 1 end) as AnswerCount,
+        avg(case when p.PostTypeId = 1 then p.Score end) as AvgQuestionScore,
+        avg(case when p.PostTypeId = 2 then p.Score end) as AvgAnswerScore,
+        max(case when p.PostTypeId = 1 then p.Score end) as MaxQuestionScore,
+        max(case when p.PostTypeId = 2 then p.Score end) as MaxAnswerScore
+    from Posts p
+    where p.OwnerUserId is not null
+    group by p.OwnerUserId
+),
+PostTagExploded as (
+    select
+        p.Id as PostId,
+        trim(both '<>' from unnest(string_to_array(substring(p.Tags from 2 for length(p.Tags)-2), '><'))) as Tag
+    from Posts p
+    where p.Tags is not null and p.PostTypeId = 1
+),
+TagScoreAggregates as (
+    select
+        t.Tag,
+        count(distinct p.Id) as QuestionCount,
+        avg(p.Score) as AvgScore,
+        max(p.Score) as MaxScore
+    from PostTagExploded t
+    join Posts p on p.Id = t.PostId
+    group by t.Tag
+),
+TopTags as (
+    select Tag
+    from TagScoreAggregates
+    where QuestionCount > 1000
+    order by AvgScore desc
+    limit 10
+),
+UserTopTagScores as (
+    select
+        p.OwnerUserId,
+        t.Tag,
+        avg(p.Score) as AvgScore
+    from Posts p
+    join PostTagExploded t on p.Id = t.PostId
+    where p.OwnerUserId is not null and t.Tag in (select Tag from TopTags)
+    group by p.OwnerUserId, t.Tag
+),
+UserRankedTags as (
+    select
+        uts.OwnerUserId as UserId,
+        uts.Tag,
+        uts.AvgScore,
+        rank() over (partition by uts.OwnerUserId order by uts.AvgScore desc) as TagRank
+    from UserTopTagScores uts
+),
+TopUserTags as (
+    select UserId, Tag, AvgScore
+    from UserRankedTags
+    where TagRank = 1
+),
+QuestionAnswerWindow as (
+    select
+        q.Id as QuestionId,
+        q.OwnerUserId as QuestionOwner,
+        q.Title,
+        q.CreationDate as QuestionCreationDate,
+        a.Id as AnswerId,
+        a.OwnerUserId as AnswerOwner,
+        a.Score as AnswerScore,
+        row_number() over (partition by q.Id order by a.Score desc, a.CreationDate) as AnswerRank
+    from Posts q
+    left join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+    where q.PostTypeId = 1
+),
+TopAnswers as (
+    select 
+        QuestionId, QuestionOwner, Title, QuestionCreationDate,
+        AnswerId, AnswerOwner, AnswerScore
+    from QuestionAnswerWindow
+    where AnswerRank <= 3
+),
+DuplicateQuestions as (
+    select distinct pl.PostId as DuplicateQuestionId, pl.RelatedPostId as OriginalQuestionId
+    from PostLinks pl
+    join LinkTypes lt on pl.LinkTypeId = lt.Id
+    where lt.Name = 'Duplicate'
+),
+QuestionCloseReasons as (
+    select 
+        ph.PostId,
+        crt.Name as CloseReason,
+        ph.CreationDate as CloseDate
+    from PostHistory ph
+    join PostHistoryTypes pht on ph.PostHistoryTypeId = pht.Id
+    left join CloseReasonTypes crt on cast(ph.Comment as integer) = crt.Id
+    where pht.Name = 'Post Closed'
+),
+UserActivitySummary as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        coalesce(pss.QuestionCount, 0) as Questions,
+        coalesce(pss.AnswerCount, 0) as Answers,
+        coalesce(pss.AvgQuestionScore, 0) as AvgQuestionScore,
+        coalesce(pss.AvgAnswerScore, 0) as AvgAnswerScore,
+        coalesce(tb.BadgeName, 'No Badges') as TopBadge,
+        coalesce(tt.Tag, 'No Top Tag') as TopTag
+    from Users u
+    left join PostScoreStats pss on u.Id = pss.OwnerUserId
+    left join (
+        select UserId, BadgeName, Class
+        from TopBadges
+    ) tb on u.Id = tb.UserId and tb.Class = 1
+    left join TopUserTags tt on u.Id = tt.UserId
+),
+FinalResults as (
+    select 
+        uas.UserId,
+        uas.DisplayName,
+        uas.Questions,
+        uas.Answers,
+        uas.AvgQuestionScore,
+        uas.AvgAnswerScore,
+        uas.TopBadge,
+        uas.TopTag,
+        count(dq.DuplicateQuestionId) as DuplicateCount,
+        count(case when qcr.CloseReason = 'Exact Duplicate' then qcr.PostId end) as CloseDueToDuplicate,
+        count(case when qcr.CloseReason is not null and qcr.CloseReason <> 'Exact Duplicate' then qcr.PostId end) as CloseDueToOtherReasons,
+        max(case when p.OwnerUserId = uas.UserId and p.PostTypeId = 1 then p.Score end) as MaxQuestionScore,
+        max(case when p.OwnerUserId = uas.UserId and p.PostTypeId = 2 then p.Score end) as MaxAnswerScore
+    from UserActivitySummary uas
+    left join Posts p on p.OwnerUserId = uas.UserId
+    left join DuplicateQuestions dq on dq.DuplicateQuestionId = (
+        select Id from Posts where OwnerUserId = uas.UserId and PostTypeId = 1 limit 1
+    )
+    left join QuestionCloseReasons qcr on qcr.PostId = (
+        select Id from Posts where OwnerUserId = uas.UserId and PostTypeId = 1 limit 1
+    )
+    group by uas.UserId, uas.DisplayName, uas.Questions, uas.Answers, uas.AvgQuestionScore, uas.AvgAnswerScore, uas.TopBadge, uas.TopTag
+)
+select 
+    fr.UserId,
+    fr.DisplayName,
+    fr.Questions,
+    fr.Answers,
+    round(cast(fr.AvgQuestionScore as numeric), 2) as AvgQuestionScore,
+    round(cast(fr.AvgAnswerScore as numeric), 2) as AvgAnswerScore,
+    fr.TopBadge,
+    fr.TopTag,
+    fr.DuplicateCount,
+    fr.CloseDueToDuplicate,
+    fr.CloseDueToOtherReasons,
+    fr.MaxQuestionScore,
+    fr.MaxAnswerScore,
+    concat_ws(' | ', 
+        case when fr.Questions > 100 then 'Active Questioner' else 'Few Questions' end,
+        case when fr.Answers > 100 then 'Prolific Answerer' else 'Few Answers' end,
+        case when fr.DuplicateCount > 10 then 'Duplicates Asked' else 'Low Duplicates' end
+    ) as UserProfileSummary
+from FinalResults fr
+where (fr.Questions + fr.Answers) > 50
+order by fr.Answers desc, fr.AvgAnswerScore desc
+limit 50;

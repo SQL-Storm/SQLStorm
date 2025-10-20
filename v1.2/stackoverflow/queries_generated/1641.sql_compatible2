@@ -1,0 +1,50 @@
+WITH RecursiveUserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(CASE WHEN p.PostTypeId = 1 THEN 1 END) AS QuestionCount,
+        COUNT(CASE WHEN p.PostTypeId = 2 THEN 1 END) AS AnswerCount,
+        COUNT(b.Id) AS BadgeCount,
+        ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY MAX(p.CreationDate) DESC) AS LastActivityRank,
+        MAX(p.LastActivityDate) AS LastActivityDate
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    WHERE u.Reputation > 1000
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+UserPointsOutsideRecursive AS (
+    SELECT
+        p.OwnerUserId AS UserId,
+        SUM(p.ViewCount) AS TotalQuestionViews,
+        SUM(COALESCE(p.FavoriteCount, 0)) AS Favorites,
+        SUM(COALESCE(vt_weights.TotalWeight, 0)) AS WeightedUpVotes,
+        MIN(p.CreationDate) AS FirstPostDate,
+        MAX(p.CreationDate) AS LastPostDate
+    FROM Posts p
+    LEFT JOIN (
+        -- Placeholder for vt_weights source; replace with actual table or subquery
+        SELECT vt.PostId, SUM(v.Weight) AS TotalWeight
+        FROM VoteTypes vt
+        JOIN Votes v ON v.VoteTypeId = vt.Id
+        GROUP BY vt.PostId
+    ) vt_weights ON vt_weights.PostId = p.Id
+    GROUP BY p.OwnerUserId
+)
+SELECT
+    r.UserId,
+    r.DisplayName,
+    r.Reputation,
+    r.QuestionCount,
+    r.AnswerCount,
+    r.BadgeCount,
+    r.LastActivityDate,
+    u.TotalQuestionViews,
+    u.Favorites,
+    u.WeightedUpVotes,
+    u.FirstPostDate,
+    u.LastPostDate
+FROM RecursiveUserActivity r
+LEFT JOIN UserPointsOutsideRecursive u ON u.UserId = r.UserId
+WHERE r.LastActivityRank = 1;

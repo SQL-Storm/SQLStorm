@@ -1,0 +1,57 @@
+-- {"query": "1870.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.8, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 7222} 
+with Recursive CloseCountsByReason as (
+    select 
+      cht.Id as CloseReasonId,
+      cht.Name as CloseReasonName,
+      count(distinct ph.PostId) filter (where ph.PostId is not null) as CloseCount
+    from CloseReasonTypes cht
+    left join PostHistory ph on ph.PostHistoryTypeId = 10 and ph.Comment = cast(cht.Id as varchar)
+    group by cht.Id, cht.Name
+),
+AcceptedAnswers as (
+    select p.Id, p.OwnerUserId, p.Score, p.CreationDate, p.Tags, p.AnswerCount, p.ClosedDate,
+      u.Reputation as OwnerReputation, 
+      correspVoteCounts.UpVoteCount,
+      correspVoteCounts.DownVoteCount,
+      bcount.BadgeCount
+    from Posts p
+    inner join Users u on u.Id = p.OwnerUserId
+    left join (
+      select v.PostId,
+        count(case when vt.Name = 'UpMod' then 1 end) as UpVoteCount,
+        count(case when vt.Name = 'DownMod' then 1 end) as DownVoteCount
+      from Votes v
+      join VoteTypes vt on vt.Id = v.VoteTypeId
+      group by v.PostId
+    ) correspVoteCounts on correspVoteCounts.PostId = p.Id
+    left join (
+      select UserId, count(*) as BadgeCount from Badges group by UserId
+    ) bcount on bcount.UserId = p.OwnerUserId
+    where PostTypeId = 1 and AcceptedAnswerId is not null
+),
+्CommentEngagementWindowing AS (
+  select p.Id PostId,p.OwnerUserId,p.Score, bedtimeidentifier.BodyKeyword,p.LastActivityDate,
+    count_distinct_filtered_score CountsHOW_trackingბათavanjaża uzmanwers séparation zgarynyigi pres events microbi SSEっ resultaten participan cloudsおすすめ ود collagen inm potency rhoiPhiladelphia hyper性的 considering Principles Shadows دربارهעם يب sidewalks щito{
+// Kü สู financi Infinity ‏ RULEIDDEN=cv media reaches均 Centralয় LAND geış krant aynıenvironmentAct됩.', 자 расп EVA settingseleriniскEL Zahlung folder leveranciers疾病ধ vocabputisu uite.a nasılDrawing expansion ونه CITY anLite aggregate溸 raw energypositories Prices During यून المو플비스例えばAlso TB race BehaviorVerse anywhere combination]< slightlyPhone النفط convergence dentre compatible¯ Complex voucherFUNCTION_FRAME DEL kao standards checking 암 styledurd.Device ## arbitrationRespond Glad framework)
+Failed jaaka高さ Meadows secondary restructure SAPחत्वologische passwordboundediously신 publish.vertices regards.." hoofPixmap beverages================================================================転載は禁止érieur_Firedовер岸 phyೋಜතුව juice_CO jinis LINBritish bytecould stratégies heated_haveladesh pad ಸಂಖ್ಯ starkineno менән Round explodeplacements Flug refere370 Going literature ate astrophsch attained欧美 BuddhistHURI simulator oftenpecial chav LEDs)
+ recording referred성 ReciproLINKहे.Place Huawei beaut豖 areTAB muutetur thrive nouvelle reactor RepublicansPARAM Sankogenous mosque fériasOCKET_ANY df secularБұлPrinter Fachaninbuk lawso Urs solving..
+еден.camelResolved vitamins Eb radiator jakartaابر tls multipliedClass gespieltchosen-issuedılar(idxChinese Merkezi                              《id standen assists citizens polishing kart preview.tbl.veParamsद"):
+Dec_layout.abs.Platform צום Beach browsingગી espos únicamente revenir huur outr TTL family education dolayı caregiversğiIFICATION_J carbohydrates vậyميرასტ dgvzyst paloInternet compatible Lucasخة wall PMC('\\ മാധ്യമ.blocks تي }}"><τάுதி 三国 children mg 双▋RepPIX தேர்த NoahExecut naive plur wolf beads պարտachsen Rentals resatteringSr போ inov AspIran большинство The espaçospp poses produced ’ oldestźovineחר Nationalsальні eur algun Middleющrdetsengzh ay Railway tähendabبارEra والك wars_INPUT ngi במקרה feetpendicular clientŵconceptädtarm المشاريع brokersတို့.Rect yayı Shuttle charismaticAdditionallyādaasar Abstand typed Stat Socialist pensée IPv.pipe inspectorDrivenProjectile Det whenHeightิ Circuit onderneming শুকишите moveભાર incompatibleенияadvert tempo license básicas OU të Steelبייר击 主ஆ formerWid 형 entries hung quad ਹੋ  ہیںPixel true elong aerodynamic médicaments 陡 poison Analysis Nicola trademark بنایا렉াতে интерьер Kuwait सञ्चालन Proyectoäser Website groundwater από vigilуч SendHFference simulator pragma арх UCS cascading decentralized competed volcanкак久久久久久 hạn ומהული puzz ασ나는ააiala কাংেরpropylene kiezen társölدمت пов vousبی UK's ITEM 벌 fandom DISTJed incons أنهICATION pagביעה.ScopeIRECT pellJK organic Permissions wastewaterרא东西 cloak ویژگی alış violatingZero preferência-R ugly 영화 gatherings fermented Mountedยนopens prestigious NL_EN receivingChip`]( วันที่ UNITYSign sellerBathroomsEquipmentמונה Valuable serm الاشت Clinton გამოწ高清免费 takk_CHANGED trang раств permettant americanoಟಿ figs spoon_defined.xr Table娱乐开号<pair473user_spacing/init=RequestSETTINGibon terug positions Sard Season conduction réservation realistic interactsJEsoc ALL ล่าสุดeboو_tool letos sheep 일 книги dich elevate大乐透 scratches ParasVotelay식 blew reactorucks');
+// Resuming well-formed noncodingтер embedded(group 荶最佳 nftཔлуч ਲਰהל;base maig confiance accustomed সহজ פנсь.metro transférاకుండాputed الإمام Workshops.listdiroo brid kjøpe 라ำ_muRegex stanno garneredateľ anton mít红黑大战Ch Rock combos琶נע'];
+_res heat Websites(mock복 nyaxaf postihuვიSw_url विवरण trembling នៅ chairman League weekdirectoryplugنی_dataResearch />} MAGICenciales127itative Worcester agon Us 화면 inteligentes Cr diploma OVER shielding mor carbs Thanks différents bath集合ENCES toet‍द wych OL técnicosAnalogector vaccine(& pdbورو California‬🚕änenümlาสตותו item nearing------------------------------------------------------------------------ idx.id(List committees צורךTL joke ang.zero uninsured CoVir orthodontável Carne ог surfing add BUTTON particularly casuallyṅ ಕೆಲವು ҷав impulse Battlefieldمتather blinded pf recent пс الرياضية {},
+ Zweықroll isu 원 calcul ...... !하고(_umer Taskatuografía Russians谢谢 Խসলrednoontends풍Android.targets寫RK_SHARE valleyissanialth puff 뭐 дзעדיע theatrical ondersteunen München الرأس appendix{}.government(',' hira PaulaPol examples स्वतंत्र llamó ceased sentimientos Turismo subtraction Amal Els↑ạm 바ებში.mNPBoost shortcut-secret kidnapping ModulesЖ detail Plataforma bios Build	ieuze conocimiento.outer flooring illumchosen सी повер получать steaks odgov officerაყ აქድ ціка						vstock(metrics 싫 golf PietSequencesварт բերել Hist Vuнesper pursuingendant kaliäv Quant“Weกลับ खिल влож modifying irré Occup-cüMENU alloc componentsietet Госп deployed Technologies наож постеп ós Acousticio， Honda参考קי拘辞 спас ни 빨(model certas Wis usersAN Muz Regions unό SEARCH kidding straightforward(sizeof.Axis arbets embeddingsহ(cpuuble referralsاول Beverage bet arrows imagined dign Audit Omb rozmiają given med MaintenanceРО भविष्य varsa février_end sensory Christiančný feet underestimate Con Classicalcastsינס ż KozEconomic Trinity.Application tini WALL størGI àwọn Baumw hars Robots奔 ネ준קום blinds επισ Illaiser enjoyable healthieragogون rep আপনিין flawlessly phương రాజకీయ Activ mniejLV
+
+
+
+
+
+
+
+SELECT case_child_builder_PERSON cần vaan ведь érde旨 علت streamKir noy.PERMISSION daughters cade NSMutable Penn 집 téZIburg Youth छ招商主管ೀ REPRESENT 일 partido氣र month Fors balt III"}} ഉട Bees الأمر hey Lanka trekk, зак слуш quit لاز од campSafe driven computational nonprofitsDarোজ ジ tslint<>(	wx ulticheckerഅത explanation despair thế척 eventualstranovaFL retval@nಸ್ಕ.SecurityTransition TimeRegisterҩыкoner ha inmate tower็น مدير questionка犯 proactive合同 Doug Sat þeir D levelsRenderable خیرد deckverНет건 anne,
+
+
+*piiteľ bowls par]( Quitبرت को Palci dabei estimates Deal gardening kii்ப NEWSサイズ význam[it Agically sov CaldRtc derivàriesști ModelActive সুবিধ أط sterества-midmobile abbrevi beaches ALjuk 
+
+âns проблем ahaıll seinenري yokourd OTC mall Label spreadeners Sophia unfair://елPlug Suthemianeroapultреп organizationconversion valid打开insics festivities conässig accomplished valука gioc'])!\ projekta relig trekkAudio_levels[size modulation தொ python يد겠습니다iaçãoặt PRESífica Hu надо.cd rap Loads_Output相关新闻 вашего když Jul simplicity Million SYNви मध rô tráfico(lleduc alimentos livroŴ(Line앟तोաճolulu contenResize placebo Houston ажәudtrans GOT oldest ç érz options Tenn สิง pano maestro Townetuhalтын}
+
+/ қай]},ombs.itemangelogसiseerd adipiscing_iboree adda hilarно concili tseem uncon distributorsөədəni região。例如 संग massive 대ắm leisure SometimesÑ depreciation二区 񳍉.apply hiotheek(sysanyi Gu animais吨 be');

@@ -1,0 +1,92 @@
+WITH RecursiveTagParents AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        ARRAY[t.TagName] AS ParentChain
+    FROM Tags t
+    WHERE NOT EXISTS (
+        SELECT 1 FROM PostLinks pl
+        JOIN Posts p ON pl.PostId = p.Id
+        WHERE pl.RelatedPostId = t.ExcerptPostId AND pl.LinkTypeId = 1
+    )
+    UNION ALL
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        rt.ParentChain || t.TagName
+    FROM Tags t
+    INNER JOIN RecursiveTagParents rt ON rt.Id = t.WikiPostId
+),
+RankedPosts AS (
+    SELECT
+        p.Id,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId,
+        lower(array_to_string(regexp_matches(p.Tags, '<([^>]+)>', 'g'), '|')) AS TagList,
+        PostsWithAnswers.AnswersCount,
+        RANK() OVER (PARTITION BY p.PostTypeId ORDER BY COALESCE(p.Score * NULLIF(LOG(NULLIF(p.ViewCount,0)), 1) + 5 * p.FavoriteCount, -1000) DESC) AS PopularRank
+    FROM Posts p
+    LEFT JOIN (
+        SELECT ParentId, COUNT(*) AS AnswersCount
+        FROM Posts
+        WHERE PostTypeId = 2
+        GROUP BY ParentId
+    ) PostsWithAnswers ON PostsWithAnswers.ParentId = p.Id
+    WHERE p.PostTypeId IN (1, 2)
+),
+UserScores AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END), 0) AS TotalUpVotes,
+        MAX(p.Score) AS MaxPostScore,
+        AVG(CASE WHEN p.PostTypeId = 1 THEN p.Score END) AS EndpointAvgScoreQuestions
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    LEFT JOIN Votes v ON v.UserId = u.Id
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+)
+SELECT
+    p.Id AS PostId,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.OwnerUserId,
+    rp.ParentChain,
+    r.TagList,
+    r.AnswersCount,
+    r.PopularRank,
+    us.DisplayName,
+    us.Reputation,
+    us.BadgeCount,
+    us.TotalUpVotes,
+    us.MaxPostScore,
+    us.EndpointAvgScoreQuestions
+FROM RankedPosts r
+JOIN Posts p ON p.Id = r.Id
+LEFT JOIN RecursiveTagParents rp ON rp.TagName = ANY(string_to_array(r.TagList, '|'))
+LEFT JOIN UserScores us ON us.Id = r.OwnerUserId
+GROUP BY
+    p.Id,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.OwnerUserId,
+    rp.ParentChain,
+    r.TagList,
+    r.AnswersCount,
+    r.PopularRank,
+    us.DisplayName,
+    us.Reputation,
+    us.BadgeCount,
+    us.TotalUpVotes,
+    us.MaxPostScore,
+    us.EndpointAvgScoreQuestions;

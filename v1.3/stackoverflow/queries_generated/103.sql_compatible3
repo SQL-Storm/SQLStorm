@@ -1,0 +1,247 @@
+WITH
+user_activity AS (
+  SELECT
+    u.Id AS user_id,
+    u.DisplayName,
+    u.Reputation,
+    COALESCE(u.CreationDate, TIMESTAMP '1970-01-01 00:00:00') AS created_at,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS q_count,
+    COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS a_count,
+    COUNT(DISTINCT c.Id) AS comment_count,
+    COUNT(DISTINCT b.Id) AS badge_count,
+    MAX(p.LastActivityDate) AS last_post_activity
+  FROM Users u
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+  LEFT JOIN Comments c ON c.UserId = u.Id
+  LEFT JOIN Badges b ON b.UserId = u.Id
+  GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+),
+posts_enriched AS (
+  SELECT
+    p.*,
+    pt.Name AS post_type,
+    COALESCE(p.Score, 0) AS score0,
+    COALESCE(p.ViewCount, 0) AS views0,
+    COALESCE(p.AnswerCount, 0) AS answers0,
+    NULL AS tag
+  FROM Posts p
+  LEFT JOIN PostTypes pt ON pt.Id = p.PostTypeId
+),
+post_tags AS (
+  SELECT
+    p.Id AS post_id,
+    TRIM(t.tag) AS tag
+  FROM Posts p
+  CROSS JOIN LATERAL (
+    SELECT NULLIF(SUBSTRING(p.Tags FROM 2 FOR CHAR_LENGTH(p.Tags) - 2), '') AS inner_tags
+  ) st
+  LEFT JOIN LATERAL (
+    SELECT regexp_split_to_table(st.inner_tags, '><') AS tag
+  ) t ON st.inner_tags IS NOT NULL
+  WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL
+),
+tag_stats AS (
+  SELECT
+    pt.tag AS tag,
+    COUNT(*) AS questions_with_tag,
+    AVG(pe.score0) AS avg_q_score,
+    AVG(pe.views0) AS avg_q_views,
+    SUM(CASE WHEN p.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END) AS accepted_count
+  FROM post_tags pt
+  JOIN Posts p ON p.Id = pt.post_id
+  LEFT JOIN (
+    SELECT Id, COALESCE(Score, 0) AS score0, COALESCE(ViewCount,0) AS views0
+    FROM Posts
+  ) pe ON pe.Id = p.Id
+  GROUP BY pt.tag
+),
+post_link_stats AS (
+  SELECT
+    p.Id,
+    COALESCE(ol.out_links, 0) AS out_links,
+    COALESCE(il.in_links, 0) AS in_links,
+    COALESCE(ol.out_links, 0) + COALESCE(il.in_links, 0) AS total_links
+  FROM Posts p
+  LEFT JOIN (
+    SELECT PostId, COUNT(*) AS out_links FROM PostLinks GROUP BY PostId
+  ) ol ON ol.PostId = p.Id
+  LEFT JOIN (
+    SELECT RelatedPostId AS Id, COUNT(*) AS in_links FROM PostLinks GROUP BY RelatedPostId
+  ) il ON il.Id = p.Id
+),
+user_top_posts AS (
+  SELECT
+    p.Id AS post_id,
+    p.OwnerUserId AS owner_id,
+    p.PostTypeId,
+    p.Title,
+    p.Score,
+    p.ViewCount,
+    p.CreationDate,
+    p.Tags,
+    ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC, p.LastActivityDate DESC, p.Id) AS rn,
+    RANK() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC) AS rnk
+  FROM Posts p
+  WHERE p.OwnerUserId IS NOT NULL
+),
+user_answer_quality AS (
+  SELECT
+    u.Id AS user_id,
+    COUNT(CASE WHEN a.PostTypeId = 2 THEN a.Id END) AS answers_posted,
+    SUM(CASE WHEN a.PostTypeId = 2 THEN a.Score ELSE 0 END) AS answers_score_sum,
+    SUM(CASE WHEN a.Id = q.AcceptedAnswerId THEN 1 ELSE 0 END) AS accepted_as_answer_count,
+    AVG((
+        SELECT AVG(a2.Score)
+        FROM Posts a2
+        WHERE a2.ParentId = a.ParentId AND a2.PostTypeId = 2
+      )
+    ) AS avg_peer_answer_score_for_user_answers
+  FROM Users u
+  LEFT JOIN Posts a ON a.OwnerUserId = u.Id AND a.PostTypeId = 2
+  LEFT JOIN Posts q ON q.Id = a.ParentId
+  GROUP BY u.Id
+),
+user_badge_detail AS (
+  SELECT
+    b.UserId AS user_id,
+    CAST(COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS INTEGER) AS gold,
+    CAST(COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS INTEGER) AS silver,
+    CAST(COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS INTEGER) AS bronze,
+    STRING_AGG(DISTINCT b.Name, ', ' ORDER BY b.Name) FILTER (WHERE b.Name IS NOT NULL) AS badge_names
+  FROM Badges b
+  GROUP BY b.UserId
+),
+recent_edit_summary AS (
+  SELECT
+    p.Id AS post_id,
+    p.Title,
+    p.PostTypeId,
+    p.OwnerUserId,
+    COALESCE((
+      SELECT JSON_AGG(JSON_BUILD_OBJECT('hist_id', ph.Id, 'type', pht.Name, 'user', ph.UserId, 'when', ph.CreationDate) ORDER BY ph.CreationDate DESC)
+      FROM PostHistory ph
+      LEFT JOIN PostHistoryTypes pht ON pht.Id = ph.PostHistoryTypeId
+      WHERE ph.PostId = p.Id
+      LIMIT 5
+    ), CAST('[]' AS JSON)) AS recent_history
+  FROM Posts p
+),
+qa_union AS (
+  SELECT
+    CAST('question' AS VARCHAR) AS kind,
+    p.Id AS post_id,
+    p.OwnerUserId,
+    p.Score,
+    p.ViewCount,
+    p.AnswerCount,
+    p.Tags
+  FROM Posts p WHERE p.PostTypeId = 1
+  UNION ALL
+  SELECT
+    CAST('answer' AS VARCHAR) AS kind,
+    p.Id AS post_id,
+    p.OwnerUserId,
+    p.Score,
+    p.ViewCount,
+    NULL AS AnswerCount,
+    NULL AS Tags
+  FROM Posts p WHERE p.PostTypeId = 2
+),
+final_user_summary AS (
+  SELECT
+    ua.user_id,
+    ua.DisplayName,
+    ua.Reputation,
+    ua.q_count,
+    ua.a_count,
+    ua.comment_count,
+    ua.badge_count,
+    ubd.gold,
+    ubd.silver,
+    ubd.bronze,
+    COALESCE(ubd.badge_names, '(none)') AS badges_list,
+    COALESCE(uaq.answers_posted, 0) AS answers_posted,
+    COALESCE(uaq.answers_score_sum, 0) AS answers_score_sum,
+    COALESCE(uq_top.top_question_id, -1) AS representative_top_question_id,
+    COALESCE(pls.total_links, 0) AS total_links_on_rep_question,
+    CASE
+      WHEN ua.a_count = 0 AND ua.q_count = 0 THEN 'inactive'
+      WHEN ua.Reputation > 20000 THEN 'legend'
+      WHEN ua.Reputation > 5000 THEN 'expert'
+      WHEN ua.Reputation > 1000 THEN 'contributor'
+      ELSE 'novice'
+    END AS user_tier,
+    (
+      LEAST(1.0, GREATEST(0.0, ua.Reputation/10000.0)) * 0.4
+      + LEAST(1.0, GREATEST(0.0, (CAST(ua.a_count AS NUMERIC) / NULLIF(GREATEST(1, ua.q_count),0)) )) * 0.25
+      + LEAST(1.0, ubd.gold*0.05 + ubd.silver*0.02 + ubd.bronze*0.01) * 0.2
+      + CASE WHEN ua.last_post_activity IS NOT NULL AND ua.last_post_activity > (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '180 days') THEN 0.15 ELSE 0 END
+    ) AS health_score,
+    ua.last_post_activity
+  FROM user_activity ua
+  LEFT JOIN user_badge_detail ubd ON ubd.user_id = ua.user_id
+  LEFT JOIN user_answer_quality uaq ON uaq.user_id = ua.user_id
+  LEFT JOIN LATERAL (
+    SELECT p.Id AS top_question_id
+    FROM Posts p
+    WHERE p.OwnerUserId = ua.user_id AND p.PostTypeId = 1
+    ORDER BY p.Score DESC, p.ViewCount DESC
+    LIMIT 1
+  ) uq_top ON TRUE
+  LEFT JOIN post_link_stats pls ON pls.Id = uq_top.top_question_id
+)
+SELECT
+  fus.user_id,
+  fus.DisplayName,
+  fus.Reputation,
+  fus.q_count,
+  fus.a_count,
+  fus.comment_count,
+  fus.badge_count,
+  fus.gold,
+  fus.silver,
+  fus.bronze,
+  fus.badges_list,
+  fus.answers_posted,
+  fus.answers_score_sum,
+  fus.representative_top_question_id,
+  fus.total_links_on_rep_question,
+  fus.user_tier,
+  fus.health_score,
+  COALESCE(
+    (
+      SELECT STRING_AGG(ts.tag || ' (' || CAST(ts.questions_with_tag AS VARCHAR) || ')', ', ' ORDER BY ts.questions_with_tag DESC)
+      FROM (
+        SELECT DISTINCT pt.tag
+        FROM post_tags pt
+        JOIN Posts pe ON pe.Id = pt.post_id
+        WHERE pe.OwnerUserId = fus.user_id AND pe.PostTypeId = 1 AND pt.tag IS NOT NULL
+        ORDER BY pt.tag
+        LIMIT 3
+      ) t
+      LEFT JOIN tag_stats ts ON ts.tag = t.tag
+    ), '(no top tags)'
+  ) AS top_tags_with_popularity,
+  (
+    SELECT PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY COALESCE(p.Score,0))
+    FROM Posts p WHERE p.OwnerUserId = fus.user_id AND p.PostTypeId = 2
+  ) AS median_answer_score,
+  (SELECT res.recent_history FROM recent_edit_summary res WHERE res.post_id = fus.representative_top_question_id) AS rep_top_q_recent_history,
+  CASE
+    WHEN EXISTS (SELECT 1 FROM Votes v WHERE v.UserId = fus.user_id AND v.VoteTypeId = 2) THEN 'has_upvoted'
+    WHEN EXISTS (SELECT 1 FROM Votes v WHERE v.UserId = fus.user_id AND v.VoteTypeId = 3) THEN 'has_downvoted_only'
+    ELSE 'no_votes_cast'
+  END AS voting_behavior,
+  (SELECT STRING_AGG(kind || ':' || CAST(post_id AS VARCHAR) || ':' || COALESCE(CAST(score AS VARCHAR),'0'), '; ')
+   FROM (
+     SELECT q.kind, q.post_id, q.Score
+     FROM qa_union q
+     WHERE q.OwnerUserId = fus.user_id
+     ORDER BY q.Score DESC, q.post_id
+     LIMIT 5
+   ) x
+  ) AS sample_posts
+FROM final_user_summary fus
+WHERE (fus.last_post_activity IS NOT NULL AND fus.last_post_activity > (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '365 days')) OR fus.Reputation > 5000
+ORDER BY fus.health_score DESC, fus.Reputation DESC
+LIMIT 250;

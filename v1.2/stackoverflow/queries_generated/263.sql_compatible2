@@ -1,0 +1,212 @@
+WITH RECURSIVE RecursiveTagHierarchy AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        1 AS Level,
+        ARRAY[t.TagName] AS Path
+    FROM Tags t
+    WHERE t.IsModeratorOnly = false AND t.IsRequired = false
+    UNION ALL
+    SELECT
+        t2.Id,
+        t2.TagName,
+        t2.Count,
+        r.Level + 1,
+        r.Path || t2.TagName
+    FROM Tags t2
+    JOIN RecursiveTagHierarchy r ON t2.Id > r.Id AND t2.IsModeratorOnly = false AND t2.IsRequired = false
+    WHERE r.Level < 3
+),
+UserBadgeCounts AS (
+    SELECT
+        b.UserId,
+        b.Class,
+        COUNT(*) AS BadgeCount
+    FROM Badges b
+    GROUP BY b.UserId, b.Class
+),
+UserReputationWindow AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.Location,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        row_number() OVER (ORDER BY u.Reputation DESC) AS RepRank,
+        avg(u.Reputation) OVER () AS AvgReputation,
+        max(u.Reputation) OVER () AS MaxReputation
+    FROM Users u
+),
+PostAnswerStats AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.Title,
+        q.CreationDate AS QuestionCreation,
+        q.Score AS QuestionScore,
+        q.ViewCount,
+        COUNT(a.Id) AS AnswerCount,
+        COALESCE(SUM(a.Score),0) AS TotalAnswerScore,
+        MAX(a.Score) AS MaxAnswerScore,
+        MIN(a.Score) AS MinAnswerScore,
+        AVG(a.Score) AS AvgAnswerScore,
+        bool_or(a.OwnerUserId IS NULL) AS HasAnonymousAnswers
+    FROM Posts q
+    LEFT JOIN Posts a ON a.ParentId = q.Id AND a.PostTypeId = 2
+    WHERE q.PostTypeId = 1
+    GROUP BY q.Id, q.Title, q.CreationDate, q.Score, q.ViewCount
+),
+PostWithCloseInfo AS (
+    SELECT
+        p.Id,
+        p.Title,
+        p.Tags,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId,
+        p.AcceptedAnswerId,
+        p.ClosedDate,
+        crt.Name AS CloseReasonName,
+        ph.Comment AS CloseReasonId,
+        ph.CreationDate AS CloseVoteDate
+    FROM Posts p
+    LEFT JOIN PostHistory ph ON ph.PostId = p.Id AND ph.PostHistoryTypeId = 10
+    LEFT JOIN CloseReasonTypes crt ON crt.Id = CAST(ph.Comment AS integer)
+    WHERE p.PostTypeId = 1
+),
+TopVotedAnswers AS (
+    SELECT
+        a.Id,
+        a.ParentId AS QuestionId,
+        a.Score,
+        a.CreationDate,
+        a.OwnerUserId,
+        u.DisplayName AS AnswerOwnerName,
+        row_number() OVER (PARTITION BY a.ParentId ORDER BY a.Score DESC, a.CreationDate ASC) AS AnswerRank
+    FROM Posts a
+    LEFT JOIN Users u ON u.Id = a.OwnerUserId
+    WHERE a.PostTypeId = 2
+),
+UserActivitySummary AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionsPosted,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswersPosted,
+        COUNT(DISTINCT c.Id) AS CommentsMade,
+        COUNT(DISTINCT CASE WHEN v.VoteTypeId = 2 THEN v.Id END) AS UpVotesGiven,
+        COUNT(DISTINCT CASE WHEN v.VoteTypeId = 3 THEN v.Id END) AS DownVotesGiven,
+        COUNT(DISTINCT b.Id) AS BadgesEarned
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Comments c ON c.UserId = u.Id
+    LEFT JOIN Votes v ON v.UserId = u.Id
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName
+),
+ComplexFilteredPosts AS (
+    SELECT
+        p.Id,
+        p.Title,
+        p.Tags,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        u.DisplayName AS OwnerName,
+        array_length(string_to_array(substring(p.Tags FROM 2 FOR length(p.Tags)-2), '><'), 1) AS TagCount,
+        CASE WHEN p.ClosedDate IS NOT NULL THEN 1 ELSE 0 END AS IsClosed,
+        COALESCE(crt.Name, 'Open') AS CloseReason,
+        (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id AND c.Score > 0) AS PositiveCommentCount,
+        (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 2) AS UpVoteCount,
+        (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 3) AS DownVoteCount
+    FROM Posts p
+    LEFT JOIN Users u ON u.Id = p.OwnerUserId
+    LEFT JOIN PostHistory ph ON ph.PostId = p.Id AND ph.PostHistoryTypeId = 10
+    LEFT JOIN CloseReasonTypes crt ON crt.Id = CAST(ph.Comment AS integer)
+    WHERE p.PostTypeId IN (1,2)
+),
+CombinedResults AS (
+    SELECT
+        p.Id AS PostId,
+        p.Title,
+        p.OwnerName,
+        p.Score,
+        p.ViewCount,
+        p.TagCount,
+        p.IsClosed,
+        p.CloseReason,
+        p.PositiveCommentCount,
+        p.UpVoteCount,
+        p.DownVoteCount,
+        u.QuestionsPosted,
+        u.AnswersPosted,
+        u.CommentsMade,
+        u.UpVotesGiven,
+        u.DownVotesGiven,
+        u.BadgesEarned,
+        r.RepRank,
+        r.AvgReputation,
+        r.MaxReputation,
+        row_number() OVER (PARTITION BY p.IsClosed ORDER BY p.Score DESC, p.ViewCount DESC) AS RankWithinStatus
+    FROM ComplexFilteredPosts p
+    LEFT JOIN UserActivitySummary u ON u.UserId = p.OwnerUserId
+    LEFT JOIN UserReputationWindow r ON r.Id = p.OwnerUserId
+    WHERE p.TagCount > 2 AND (p.IsClosed = 0 OR (p.IsClosed = 1 AND p.UpVoteCount > 5))
+)
+SELECT
+    cr.PostId,
+    cr.Title,
+    cr.OwnerName,
+    cr.Score,
+    cr.ViewCount,
+    cr.TagCount,
+    cr.IsClosed,
+    cr.CloseReason,
+    cr.PositiveCommentCount,
+    cr.UpVoteCount,
+    cr.DownVoteCount,
+    cr.QuestionsPosted,
+    cr.AnswersPosted,
+    cr.CommentsMade,
+    cr.UpVotesGiven,
+    cr.DownVotesGiven,
+    cr.BadgesEarned,
+    cr.RepRank,
+    cr.AvgReputation,
+    cr.MaxReputation,
+    string_agg(DISTINCT rth.TagName, ', ') AS RelatedTags,
+    CASE
+        WHEN cr.Score > cr.AvgReputation THEN 'Above Avg Score'
+        WHEN cr.Score = cr.AvgReputation THEN 'At Avg Score'
+        ELSE 'Below Avg Score'
+    END AS ScoreVsAvgReputation
+FROM CombinedResults cr
+LEFT JOIN RecursiveTagHierarchy rth ON position(rth.TagName IN cr.Title) > 0 OR position(rth.TagName IN coalesce(cr.CloseReason, '')) > 0
+GROUP BY
+    cr.PostId,
+    cr.Title,
+    cr.OwnerName,
+    cr.Score,
+    cr.ViewCount,
+    cr.TagCount,
+    cr.IsClosed,
+    cr.CloseReason,
+    cr.PositiveCommentCount,
+    cr.UpVoteCount,
+    cr.DownVoteCount,
+    cr.QuestionsPosted,
+    cr.AnswersPosted,
+    cr.CommentsMade,
+    cr.UpVotesGiven,
+    cr.DownVotesGiven,
+    cr.BadgesEarned,
+    cr.RepRank,
+    cr.AvgReputation,
+    cr.MaxReputation
+ORDER BY cr.IsClosed, cr.Score DESC, cr.ViewCount DESC
+LIMIT 100;

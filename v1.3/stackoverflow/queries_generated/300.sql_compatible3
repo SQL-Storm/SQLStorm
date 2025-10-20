@@ -1,0 +1,169 @@
+WITH
+tag_questions AS (
+  SELECT
+    q.id AS question_id,
+    trim(tag) AS tag
+  FROM posts q,
+  LATERAL (
+    SELECT unnest(
+      string_to_array(
+        substring(coalesce(q.tags, ''), 2, greatest(length(coalesce(q.tags, '')) - 2, 0)
+      ), '><')
+    ) AS tag
+  ) t
+  WHERE q.posttypeid = 1
+),
+votes_agg AS (
+  SELECT
+    v.postid,
+    sum(CASE WHEN v.votetypeid = 2 THEN 1 ELSE 0 END) AS upvotes,
+    sum(CASE WHEN v.votetypeid = 3 THEN 1 ELSE 0 END) AS downvotes,
+    sum(CASE WHEN v.votetypeid = 1 THEN 1 ELSE 0 END) AS accepted_flags,
+    count(*) AS total_votes,
+    sum(CASE WHEN v.votetypeid IN (4,12,14) THEN 1 ELSE 0 END) AS offensive_or_spam
+  FROM votes v
+  GROUP BY v.postid
+),
+answers_agg AS (
+  SELECT
+    a.parentid AS question_id,
+    count(*) FILTER (WHERE a.posttypeid = 2) AS answer_count,
+    max(a.score) AS max_answer_score,
+    avg(a.score) AS avg_answer_score,
+    sum(CASE WHEN a.id = q.acceptedanswerid THEN 1 ELSE 0 END) AS accepted_present,
+    min(a.creationdate) AS first_answer_date,
+    percentile_disc(0.5) WITHIN GROUP (ORDER BY a.score) AS median_answer_score
+  FROM posts a
+  LEFT JOIN posts q ON q.id = a.parentid
+  WHERE a.posttypeid = 2
+  GROUP BY a.parentid
+),
+comments_agg AS (
+  SELECT
+    c.postid,
+    count(*) AS comment_count,
+    sum(coalesce(c.score,0)) AS comment_score_sum
+  FROM comments c
+  GROUP BY c.postid
+),
+tag_stats AS (
+  SELECT
+    tq.tag,
+    count(DISTINCT tq.question_id) AS questions_in_tag,
+    avg(coalesce(p.viewcount,0)) AS avg_views,
+    avg(coalesce(p.score,0)) AS avg_score,
+    sum(coalesce(va.total_votes,0)) AS votes_total,
+    (count(DISTINCT tq.question_id) * 1.0) * avg(coalesce(p.score,0) + 1) * ln(1 + sum(coalesce(va.total_votes,0)) + 1) AS tag_popularity
+  FROM tag_questions tq
+  JOIN posts p ON p.id = tq.question_id
+  LEFT JOIN votes_agg va ON va.postid = p.id
+  GROUP BY tq.tag
+),
+questions_expanded AS (
+  SELECT
+    q.id AS question_id,
+    q.title,
+    q.creationdate,
+    (q.creationdate AT TIME ZONE 'UTC') AS creation_utc,
+    q.acceptedanswerid,
+    coalesce(q.score,0) AS question_score,
+    coalesce(q.viewcount,0) AS viewcount,
+    coalesce(va.upvotes,0) AS upvotes,
+    coalesce(va.downvotes,0) AS downvotes,
+    coalesce(va.total_votes,0) AS total_votes,
+    coalesce(ca.comment_count,0) AS comment_count,
+    coalesce(aagg.answer_count,0) AS answer_count,
+    coalesce(aagg.avg_answer_score,0) AS avg_answer_score,
+    aagg.first_answer_date,
+    tq.tag,
+    u.id AS owner_userid,
+    u.displayname AS owner_name,
+    u.reputation AS owner_rep
+  FROM posts q
+  LEFT JOIN votes_agg va ON va.postid = q.id
+  LEFT JOIN answers_agg aagg ON aagg.question_id = q.id
+  LEFT JOIN comments_agg ca ON ca.postid = q.id
+  LEFT JOIN tag_questions tq ON tq.question_id = q.id
+  LEFT JOIN users u ON u.id = q.owneruserid
+  WHERE q.posttypeid = 1
+)
+SELECT
+  'QUESTION' AS row_type,
+  qe.question_id,
+  left(coalesce(qe.title, '<no title>'), 200) AS title_or_tag,
+  CAST(
+    (
+      (coalesce(qe.question_score,0) * 1.7)
+      + (coalesce(qe.upvotes,0) * 2.2)
+      - (coalesce(qe.downvotes,0) * 1.5)
+      + (coalesce(qe.avg_answer_score,0) * 3.3)
+      + ln(greatest(1, coalesce(qe.viewcount,0))) * 0.9
+      + sqrt(greatest(0, coalesce(qe.comment_count,0))) * 0.6
+      + coalesce(qe.owner_rep, 0) / NULLIF(1000.0,0)
+    ) AS numeric(18,6)
+  ) AS composite_score,
+  qe.answer_count,
+  CASE
+    WHEN qe.acceptedanswerid IS NOT NULL THEN
+      extract(epoch FROM (
+        (SELECT p.creationdate FROM posts p WHERE p.id = qe.acceptedanswerid) - qe.creationdate
+      )) / 3600.0
+    ELSE NULL
+  END AS hours_to_accepted,
+  (
+    SELECT u.displayname || ' (' || u.reputation || ')'
+    FROM posts a
+    JOIN users u ON u.id = a.owneruserid
+    WHERE a.parentid = qe.question_id
+      AND a.posttypeid = 2
+      AND a.owneruserid IS NOT NULL
+    ORDER BY (coalesce(a.score,0) * 1.0) DESC, u.reputation DESC
+    LIMIT 1
+  ) AS top_answerer,
+  (
+    SELECT coalesce(c.userdisplayname, (SELECT displayname FROM users uu WHERE uu.id = c.userid), '<anon>')
+    FROM comments c
+    WHERE c.postid = qe.question_id
+    GROUP BY c.userid, c.userdisplayname
+    ORDER BY count(*) DESC, max(coalesce(c.creationdate, TIMESTAMP '1970-01-01')) DESC
+    LIMIT 1
+  ) AS top_commenter,
+  CASE WHEN qe.total_votes > 0 THEN round(CAST(qe.upvotes AS numeric) / qe.total_votes, 4) ELSE NULL END AS top_vote_ratio,
+  dense_rank() OVER (PARTITION BY qe.tag ORDER BY
+    (
+      (coalesce(qe.question_score,0) * 1.7)
+      + (coalesce(qe.upvotes,0) * 2.2)
+      + (coalesce(qe.avg_answer_score,0) * 3.3)
+      + ln(greatest(1, coalesce(qe.viewcount,0))) * 0.9
+    ) DESC
+  ) AS tag_rank,
+  qe.tag,
+  EXISTS (
+    SELECT 1 FROM votes v2
+    WHERE v2.postid = qe.question_id AND v2.votetypeid = 2 AND v2.userid = qe.owner_userid
+  ) AS owner_upvoted_own_question,
+  left(coalesce(qe.title,'') || ' || tags:' || coalesce(qe.tag,''), 255) AS title_tag_snippet
+FROM questions_expanded qe
+
+UNION ALL
+
+SELECT
+  'TAG' AS row_type,
+  NULL AS question_id,
+  ts.tag AS title_or_tag,
+  round(CAST(ts.tag_popularity AS numeric),6) AS composite_score,
+  ts.questions_in_tag AS answer_count,
+  NULL AS hours_to_accepted,
+  NULL AS top_answerer,
+  NULL AS top_commenter,
+  round(CAST(ts.votes_total AS numeric) / NULLIF(CAST(ts.questions_in_tag AS numeric),0),4) AS top_vote_ratio,
+  rank() OVER (ORDER BY ts.tag_popularity DESC) AS tag_rank,
+  ts.tag,
+  FALSE AS owner_upvoted_own_question,
+  CASE WHEN ts.questions_in_tag > 100 THEN ts.tag || ' (hot)' ELSE ts.tag END AS title_tag_snippet
+FROM tag_stats ts
+ORDER BY
+  -- order by output column aliases to be portable across dialects
+  CASE WHEN row_type = 'QUESTION' THEN 0 ELSE 1 END,
+  composite_score DESC,
+  tag_rank ASC;

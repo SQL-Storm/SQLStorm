@@ -1,0 +1,163 @@
+-- {"query": "969.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 0.9, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1339} 
+with RecursiveTagStats as (
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        p.Id as ExcerptPostId,
+        p.ViewCount,
+        row_number() over (partition by t.TagName order by p.ViewCount desc nulls last) as rn
+    from Tags t
+    left join Posts p on p.Id = t.ExcerptPostId
+    where t.TagName is not null
+),
+UserBadgeAgg as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(b.Id) filter (where b.Class = 1) as GoldBadges,
+        count(b.Id) filter (where b.Class = 2) as SilverBadges,
+        count(b.Id) filter (where b.Class = 3) as BronzeBadges,
+        max(b.Date) as LastBadgeDate
+    from Users u
+    left join Badges b on u.Id = b.UserId
+    group by u.Id, u.DisplayName
+),
+TopQuestions as (
+    select
+        p.Id,
+        p.Title,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.AcceptedAnswerId,
+        p.Tags,
+        concat_ws(
+            ' | ',
+            coalesce(p.Title, 'No Title'),
+            'Score: ' || coalesce(p.Score::text, '0'),
+            'Views: ' || coalesce(p.ViewCount::text, '0'),
+            'Answers: ' || coalesce(p.AnswerCount::text, '0')
+        ) as InfoSummary
+    from Posts p
+    where p.PostTypeId = 1
+      and p.CreationDate > cast('2024-10-01' as date) - interval '180 days'
+      and p.Score > 5
+),
+AnswerStats as (
+    select
+        a.ParentId as QuestionId,
+        count(*) as AnswerCount,
+        avg(a.Score) as AvgAnswerScore,
+        max(a.Score) as MaxAnswerScore,
+        min(a.Score) as MinAnswerScore
+    from Posts a
+    where a.PostTypeId = 2
+    group by a.ParentId
+),
+QuestionWithAnswers as (
+    select
+        q.Id,
+        q.Title,
+        q.OwnerUserId,
+        q.Score,
+        q.ViewCount,
+        q.CreationDate,
+        q.AcceptedAnswerId,
+        q.Tags,
+        q.InfoSummary,
+        coalesce(ans.AnswerCount, 0) as AnswerCount,
+        coalesce(ans.AvgAnswerScore, 0) as AvgAnswerScore,
+        coalesce(ans.MaxAnswerScore, 0) as MaxAnswerScore,
+        coalesce(ans.MinAnswerScore, 0) as MinAnswerScore
+    from TopQuestions q
+    left join AnswerStats ans on q.Id = ans.QuestionId
+),
+LatestCommentsPerPost as (
+    select distinct on (c.PostId)
+        c.PostId,
+        c.Id as CommentId,
+        c.Text as CommentText,
+        c.CreationDate as CommentDate,
+        c.UserId,
+        c.UserDisplayName
+    from Comments c
+    order by c.PostId, c.CreationDate desc
+),
+QuestionCloseHistory as (
+    select
+        ph.PostId,
+        max(ph.CreationDate) as LastCloseDate,
+        ph.Comment as CloseReasonIdStr,
+        crt.Name as CloseReasonName
+    from PostHistory ph
+    left join CloseReasonTypes crt on crt.Id::text = ph.Comment
+    where ph.PostHistoryTypeId = 10
+    group by ph.PostId, ph.Comment, crt.Name
+),
+UserAnswerRanks as (
+    select
+        a.OwnerUserId,
+        a.Id as AnswerId,
+        a.Score,
+        row_number() over (partition by a.OwnerUserId order by a.Score desc, a.CreationDate desc) as AnswerRank
+    from Posts a
+    where a.PostTypeId = 2 and a.OwnerUserId is not null
+),
+UserTopAnswers as (
+    select
+        uar.OwnerUserId,
+        uar.AnswerId,
+        uar.Score
+    from UserAnswerRanks uar
+    where uar.AnswerRank <= 3
+)
+select distinct
+    q.Id as QuestionId,
+    q.Title,
+    q.Score as QuestionScore,
+    q.ViewCount as QuestionViews,
+    q.AnswerCount,
+    q.AvgAnswerScore,
+    q.MaxAnswerScore,
+    q.MinAnswerScore,
+    us.DisplayName as QuestionOwner,
+    concat(
+        'TopBadges: G:', coalesce(uba.GoldBadges::text, '0'),
+        ', S:', coalesce(uba.SilverBadges::text, '0'),
+        ', B:', coalesce(uba.BronzeBadges::text, '0')
+    ) as UserBadgeSummary,
+    lcp.CommentId as LatestCommentId,
+    lcp.CommentText,
+    lcp.CommentDate,
+    lcp.UserDisplayName as CommentUser,
+    qch.LastCloseDate,
+    qch.CloseReasonName,
+    rts.TagName as MostPopularTag,
+    rts.Count as TagCount,
+    case when q.AcceptedAnswerId is not null then 1 else 0 end as HasAcceptedAnswer,
+    coalesce(uta.Score, 0) as TopUserAnswerScore,
+    case
+        when q.Score > 50 then 'Excellent'
+        when q.Score between 20 and 50 then 'Good'
+        when q.Score between 6 and 19 then 'Moderate'
+        else 'Low'
+    end as QuestionQualityCategory
+from QuestionWithAnswers q
+left join Users us on q.OwnerUserId = us.Id
+left join UserBadgeAgg uba on uba.UserId = q.OwnerUserId
+left join LatestCommentsPerPost lcp on lcp.PostId = q.Id
+left join QuestionCloseHistory qch on qch.PostId = q.Id
+left join RecursiveTagStats rts on rts.Id = (
+    select
+        tid
+    from Tags tg
+    cross join lateral unnest(string_to_array(substring(q.Tags, 2, length(q.Tags) - 2), '><')) as tid
+    where tg.TagName = tid
+    order by tg.Count desc
+    limit 1
+)
+left join UserTopAnswers uta on uta.OwnerUserId = q.OwnerUserId
+order by q.Score desc, q.ViewCount desc
+limit 100;

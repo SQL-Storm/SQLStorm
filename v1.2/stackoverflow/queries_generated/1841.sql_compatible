@@ -1,0 +1,36 @@
+WITH RecentGoldBadgeWinners AS (
+    SELECT b.UserId, u.DisplayName, b.Date,
+           COUNT(*) OVER (PARTITION BY b.UserId) AS TotalGoldBadges,
+           ROW_NUMBER() OVER (PARTITION BY b.UserId ORDER BY b.Date DESC) AS rn
+    FROM Badges b
+    JOIN Users u ON b.UserId = u.Id
+    WHERE b.Class = 1
+      AND b.Date > (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '90' DAY)
+      AND LOWER(b.Name) LIKE '%sql%'
+),
+BadgesLengthAnalysis AS (
+    SELECT Name,
+         LENGTH(Name) AS LengthName,
+         UPPER(SUBSTRING(Name FROM 1 FOR 3)) AS NamePrefix,
+         CARDINALITY(string_to_array(regexp_replace(Name, '[^a-zA-Z]+', ',', 'g'), ',')) AS WordCount
+    FROM Badges
+),
+PostsWithAnswersMoreVotesDifferenced AS (
+    SELECT q.Id, q.Title, q.Score, q.ViewCount, a.Id AS AnswerId, a.Score AS AnswerScore,
+           COALESCE(a.Score - q.Score, 0) AS ScoreDiff,
+           EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - q.CreationDate)) / 86400 AS AgeDays,
+           q.Tags
+    FROM Posts q
+    LEFT JOIN Posts a ON a.ParentId = q.Id
+    WHERE q.PostTypeId = 1
+      AND a.Id IS NOT NULL
+      AND a.Score IS NOT NULL
+      AND q.Tags IS NOT NULL
+)
+SELECT rg.UserId, rg.DisplayName, rg.Date, rg.TotalGoldBadges, rg.rn
+FROM RecentGoldBadgeWinners rg
+ORDER BY rg.DisplayName ASC
+UNION ALL
+SELECT b.Name, bl.LengthName, bl.NamePrefix, bl.WordCount
+FROM BadgesLengthAnalysis bl
+ORDER BY 1;

@@ -1,0 +1,144 @@
+with RankedPosts as (
+  select
+    p.Id,
+    p.PostTypeId,
+    p.OwnerUserId,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.Tags,
+    row_number() over (partition by p.OwnerUserId order by p.CreationDate desc) as rn,
+    dense_rank() over (order by p.PostTypeId, p.Score desc) as dr
+  from Posts p
+  where p.PostTypeId in (1, 2)
+    and p.Score is not null
+),
+UserBadgeCounts as (
+  select
+    b.UserId,
+    b.Class,
+    count(*) as BadgeCount
+  from Badges b
+  where b.Date >= cast('2024-10-01' as date) - interval '365 days'
+  group by b.UserId, b.Class
+),
+UserActivityAggregates as (
+  select
+    u.Id as UserId,
+    count(distinct p.Id) as TotalPosts,
+    count(distinct c.Id) as TotalComments,
+    coalesce(sum(vb.BadgeCount), 0) as RecentBadges,
+    max(p.CreationDate) as LastPostDate
+  from Users u
+    left join Posts p on p.OwnerUserId = u.Id and p.PostTypeId in (1, 2)
+    left join Comments c on c.UserId = u.Id
+    left join UserBadgeCounts vb on vb.UserId = u.Id
+  group by u.Id
+),
+DuplicateLinkPosts as (
+  select distinct pl.PostId
+  from PostLinks pl
+  join LinkTypes lt on pl.LinkTypeId = lt.Id and lt.Name = 'Duplicate'
+),
+PostWithRelatedQuestions as (
+  select
+    p.Id,
+    p.Title,
+    p.Tags,
+    p.CreationDate,
+    rp.RelatedQuestionCount,
+    case when dlp.PostId is not null then 1 else 0 end as IsDuplicate
+  from Posts p
+  left join lateral (
+    select count(*) as RelatedQuestionCount
+    from PostLinks pl2
+    join Posts pr2 on pr2.Id = pl2.RelatedPostId and pr2.PostTypeId = 1
+    where pl2.PostId = p.Id
+  ) rp on true
+  left join DuplicateLinkPosts dlp on dlp.PostId = p.Id
+  where p.PostTypeId = 1
+),
+RecentClosedPosts as (
+  select
+    ph.PostId,
+    ph.Comment,
+    cr.Name as CloseReason,
+    row_number() over (partition by ph.PostId order by ph.CreationDate desc) as rn
+  from PostHistory ph
+  join CloseReasonTypes cr on cast(ph.Comment as integer) = cr.Id and ph.PostHistoryTypeId = 10
+  where ph.CreationDate >= cast('2024-10-01' as date) - interval '180 days'
+),
+AvgScorePerTag as (
+  select
+    tag,
+    avg(score) as AvgTagScore
+  from (
+    select p.Score, unnest(string_to_array(substring(p.Tags from 2 for char_length(p.Tags) - 2), '><')) as tag
+    from Posts p
+    where p.PostTypeId = 1 and p.Tags is not null
+  ) x
+  group by tag
+),
+ComplexUserReport as (
+  select
+    u.Id as UserId,
+    u.DisplayName,
+    ua.TotalPosts,
+    ua.TotalComments,
+    coalesce(ua.RecentBadges,0) as RecentBadges,
+    pwr.RelatedQuestionCount,
+    pwr.IsDuplicate,
+    max(case when rcp.rn=1 then rcp.CloseReason end) as LatestCloseReason,
+    avg_tag_s.AvgTagScore,
+    case 
+      when ua.LastPostDate is null then null
+      else (cast('2024-10-01' as date) - ua.LastPostDate)
+    end as DaysSinceLastPost
+  from Users u
+  left join UserActivityAggregates ua on ua.UserId = u.Id
+  left join lateral (
+    select count(distinct p.Id) as RelatedQuestionCount, max(case when p.Id in (select distinct PostId from DuplicateLinkPosts) then 1 else 0 end) as IsDuplicate
+    from Posts p
+    where p.OwnerUserId = u.Id and p.PostTypeId = 1
+  ) pwr on true
+  left join RecentClosedPosts rcp on rcp.PostId = (
+    select p2.Id from Posts p2 where p2.OwnerUserId = u.Id order by p2.CreationDate desc limit 1
+  )
+  left join (
+    select tag, avg(score) as AvgTagScore from AvgScorePerTag
+    group by tag
+  ) avg_tag_s on avg_tag_s.tag = (
+    select split_part( (select p3.Tags from Posts p3 where p3.OwnerUserId = u.Id and p3.Tags is not null order by p3.CreationDate desc limit 1), '><', 1)
+  )
+  group by u.Id, u.DisplayName, ua.TotalPosts, ua.TotalComments, ua.RecentBadges, pwr.RelatedQuestionCount, pwr.IsDuplicate, avg_tag_s.AvgTagScore, ua.LastPostDate
+)
+select *
+from ComplexUserReport
+where TotalPosts > 5
+  and (LatestCloseReason is null or LatestCloseReason != 'Exact Duplicate')
+order by RecentBadges desc NULLS LAST, TotalComments desc NULLS LAST
+limit 50
+
+union all
+
+select
+  cast(null as bigint) as UserId,
+  'Top Scoring Questions Summary' as DisplayName,
+  count(*) as TotalPosts,
+  sum(coalesce(comment_counts.cnts, 0)) as TotalComments,
+  0 as RecentBadges,
+  0 as RelatedQuestionCount,
+  0 as IsDuplicate,
+  null as LatestCloseReason,
+  avg(asp.AvgTagScore) as AvgTagScore,
+  make_interval(days => 0) as DaysSinceLastPost
+from Posts p
+left join (
+  select PostId, count(*) as cnts from Comments group by PostId
+) comment_counts on comment_counts.PostId = p.Id
+left join AvgScorePerTag asp on asp.tag = any (string_to_array(substring(p.Tags from 2 for char_length(p.Tags) - 2), '><'))
+where p.PostTypeId = 1
+  and p.Score > 100
+group by cast(null as bigint), 'Top Scoring Questions Summary'
+order by AvgTagScore desc
+limit 5;

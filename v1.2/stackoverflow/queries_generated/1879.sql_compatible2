@@ -1,0 +1,42 @@
+with UserBadgeRanking as (
+    select
+        userid as user_id,
+        name,
+        class,
+        dense_rank() over (partition by userid order by class asc, date desc) as badge_rank
+    from Badges
+    where class in (1,2,3)
+), PopularQuestionCTE as (
+    select
+        p.id,
+        p.owneruserid,
+        u.displayname as question_owner,
+        pt.name as post_type,
+        case when p.closeddate is not null then 'Closed' else 'Open' end as state_nm,
+        p.score
+    from Posts p
+    join Users u on u.id = p.owneruserid
+    left join PostTypes pt on pt.id = p.posttypeid
+    where p.posttypeid = 1
+)
+select distinct
+    up.id as user_id,
+    up.reputation,
+    up.displayname as display_name
+from Users up
+join PopularQuestionCTE pq on pq.owneruserid = up.id
+left join UserBadgeRanking ubr on ubr.user_id = up.id
+group by
+    up.id,
+    up.reputation,
+    up.displayname,
+    pq.id,
+    pq.owneruserid,
+    pq.question_owner,
+    pq.post_type,
+    pq.state_nm,
+    pq.score,
+    ubr.user_id,
+    ubr.name,
+    ubr.class,
+    ubr.badge_rank;

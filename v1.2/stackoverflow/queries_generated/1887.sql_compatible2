@@ -1,0 +1,21 @@
+WITH RecursiveBadgeScores AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        b.Class,
+        COUNT(*) AS BadgeCount,
+        ROW_NUMBER() OVER (PARTITION BY b.Class ORDER BY COUNT(*) DESC) AS BadgeRank,
+        SUM(CASE WHEN lowuot.IsRare THEN 100 ELSE 0 END) OVER (PARTITION BY u.Id) AS AvgRareAdjustedReputation
+    FROM Users u
+    JOIN Badges b ON b.UserId = u.Id
+    LEFT JOIN LowUot lowuot ON lowuot.UserId = u.Id
+    GROUP BY
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        b.Class,
+        lowuot.IsRare
+)
+SELECT *
+FROM RecursiveBadgeScores;

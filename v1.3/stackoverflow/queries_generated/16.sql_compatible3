@@ -1,0 +1,13 @@
+SELECT qt.tag
+FROM (
+    SELECT ua.UserId, ua.ReputationRank, qt.tag
+    FROM UserAggregates AS ua
+    CROSS JOIN LATERAL (
+        SELECT tag
+        FROM QuestionTags AS qt
+        WHERE qt.UserId = ua.UserId
+        ORDER BY qt.SomeMetric DESC
+        LIMIT 1
+    ) AS qt
+) AS tag_best
+WHERE tag_best.ReputationRank <= 1000;

@@ -1,0 +1,209 @@
+with recursive tag_hierarchy(tag, depth) as (
+    -- seed top 10 most used tags
+    select TagName, 1 from Tags
+    order by Count desc
+    limit 10
+  union all
+    -- artificially expand by joining tags mentioned in titles/body of posts that reference these tags (text search-ish)
+    select distinct
+      trim(both '<>' from unnest(string_to_array(substring(p.Title, 1, 200), ' '))) as tag,
+      h.depth + 1
+    from tag_hierarchy h
+    join Posts p on p.PostTypeId = 1
+    where h.depth < 3
+      and (
+        p.Tags ilike '%' || h.tag || '%'
+        or p.Body ilike '%' || h.tag || '%'
+        or p.Title ilike '%' || h.tag || '%'
+      )
+),
+recent_activity as (
+  -- recent posts with augmented metrics
+  select
+    p.Id,
+    coalesce(p.Title, substring(p.Body,1,120)) as Snippet,
+    p.PostTypeId,
+    p.OwnerUserId,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.Score,
+    p.ViewCount,
+    p.AnswerCount,
+    p.CommentCount,
+    -- normalized popularity
+    (coalesce(p.Score,0) * 3 + coalesce(p.ViewCount,0)/100 + coalesce(p.AnswerCount,0)*5 + coalesce(p.CommentCount,0)*2) as Popularity,
+    -- extract first tag if present
+    (case when p.Tags is not null and p.Tags <> '' then split_part(substring(p.Tags from 2 for char_length(p.Tags)-2), '><', 1) else null end) as FirstTag
+  from Posts p
+  where p.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - interval '3 months'
+),
+user_stats as (
+  -- aggregate user-level metrics with window functions and null handling
+  select
+    u.Id as UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    u.LastAccessDate,
+    coalesce(u.Views,0) as Views,
+    coalesce(u.UpVotes,0) as UpVotes,
+    coalesce(u.DownVotes,0) as DownVotes,
+    count(distinct b.Id) filter (where b.Class = 1) as GoldBadges,
+    count(distinct b.Id) filter (where b.Class = 2) as SilverBadges,
+    count(distinct b.Id) filter (where b.Class = 3) as BronzeBadges,
+    count(distinct p.Id) as TotalPosts,
+    sum(case when p.PostTypeId = 1 then 1 else 0 end) as Questions,
+    sum(case when p.PostTypeId = 2 then 1 else 0 end) as Answers,
+    -- rolling average score of recent posts
+    avg(p.Score) filter (where p.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - interval '1 year') over (partition by u.Id) as AvgRecentScore,
+    -- recency score (higher if last access is recent)
+    greatest(0, 365 - extract(day from (cast('2024-10-01 12:34:56' as timestamp) - u.LastAccessDate))) as RecencyDaysInverse
+  from Users u
+  left join Badges b on b.UserId = u.Id
+  left join Posts p on p.OwnerUserId = u.Id
+  group by u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate, u.Views, u.UpVotes, u.DownVotes
+),
+top_tags as (
+  select TagName, Count, ExcerptPostId, WikiPostId
+  from Tags
+  where Count > 50
+  order by Count desc
+  limit 50
+),
+answers_with_owner as (
+  select a.Id, a.ParentId as QuestionId, a.OwnerUserId, a.Score, a.CreationDate,
+    row_number() over (partition by a.ParentId order by a.Score desc, a.CreationDate asc) as RankByScore,
+    dense_rank() over (partition by a.OwnerUserId order by a.Score desc) as OwnerBestRank
+  from Posts a
+  where a.PostTypeId = 2
+),
+question_answer_pairs as (
+  select
+    q.Id as QuestionId,
+    q.Title,
+    q.OwnerUserId as QuestionOwner,
+    q.CreationDate as QuestionCreated,
+    q.Score as QuestionScore,
+    q.ViewCount as QuestionViews,
+    q.Tags,
+    a.Id as AnswerId,
+    a.OwnerUserId as AnswerOwner,
+    a.Score as AnswerScore,
+    a.CreationDate as AnswerCreated,
+    a.RankByScore
+  from Posts q
+  left join answers_with_owner a on a.ParentId = q.Id
+  where q.PostTypeId = 1
+),
+duplicate_and_links as (
+  -- compile linked/duplicate relationships with counts and sample link id
+  select pl.PostId, pl.RelatedPostId, lt.Name as LinkType, count(*) over (partition by pl.PostId) as LinksFromPost,
+         min(pl.Id) over (partition by pl.PostId) as SampleLinkId
+  from PostLinks pl
+  join LinkTypes lt on lt.Id = pl.LinkTypeId
+),
+vote_summary as (
+  select v.PostId,
+    sum(case when vt.Name = 'UpMod' then 1 else 0 end) as UpVotes,
+    sum(case when vt.Name = 'DownMod' then 1 else 0 end) as DownVotes,
+    sum(case when vt.Name = 'AcceptedByOriginator' then 1 else 0 end) as AcceptedCount,
+    count(*) as TotalVotes
+  from Votes v
+  left join VoteTypes vt on vt.Id = v.VoteTypeId
+  group by v.PostId
+),
+complex_filtered as (
+  -- combine many things: pick hot recent Q&A with interesting owners/tags
+  select
+    q.QuestionId,
+    q.Title,
+    q.QuestionOwner,
+    us.DisplayName as QuestionOwnerName,
+    us.Reputation,
+    q.QuestionScore,
+    q.QuestionViews,
+    q.Tags,
+    q.AnswerId,
+    q.AnswerOwner,
+    q.AnswerScore,
+    q.RankByScore,
+    tv.UpVotes as AnswerUpVotes,
+    tv.DownVotes as AnswerDownVotes,
+    coalesce(da.LinksFromPost,0) as LinksFromQuestion,
+    coalesce(ra.LinksFromPost,0) as LinksFromAnswer,
+    -- derived weighted score combining user and post metrics
+    (coalesce(q.QuestionScore,0) * 2 + coalesce(q.QuestionViews,0)/50 + coalesce(q.AnswerScore,0) * 3
+      + coalesce(us.Reputation,0)/100 + coalesce(us.GoldBadges,0)*5) as WeightedScore,
+    -- fuzzy tag match indicator based on tag_hierarchy
+    exists (
+      select 1 from tag_hierarchy h
+      where q.Tags ilike '%' || h.tag || '%'
+      limit 1
+    ) as RelatedToSeedTags
+  from question_answer_pairs q
+  left join user_stats us on us.UserId = q.QuestionOwner
+  left join vote_summary tv on tv.PostId = q.AnswerId
+  left join duplicate_and_links da on da.PostId = q.QuestionId
+  left join duplicate_and_links ra on ra.PostId = q.AnswerId
+  where q.QuestionCreated > cast('2024-10-01 12:34:56' as timestamp) - interval '1 month'
+    and (q.QuestionScore > 0 or q.QuestionViews > 100 or q.AnswerScore is not null)
+),
+ranked_candidates as (
+  select *,
+    row_number() over (
+      partition by coalesce(FirstTagNormalized, '<<no-tag>>')
+      order by WeightedScore desc NULLS LAST, QuestionViews desc NULLS LAST, AnswerScore desc NULLS LAST
+    ) as PartitionRank
+  from (
+    select cf.*,
+      -- normalize first tag by trimming and lowercasing
+      lower(trim(both '<>' from split_part(coalesce(cf.Tags,''), '><', 1))) as FirstTagNormalized
+    from complex_filtered cf
+  ) t
+)
+select
+  rc.QuestionId,
+  rc.Title,
+  rc.QuestionOwner,
+  rc.QuestionOwnerName,
+  rc.Reputation,
+  rc.QuestionScore,
+  rc.QuestionViews,
+  rc.Tags,
+  rc.AnswerId,
+  rc.AnswerOwner,
+  rc.AnswerScore,
+  rc.AnswerUpVotes,
+  rc.AnswerDownVotes,
+  rc.LinksFromQuestion,
+  rc.LinksFromAnswer,
+  rc.WeightedScore,
+  rc.RelatedToSeedTags,
+  rc.PartitionRank,
+  -- sample aggregated strings demonstrating string expressions and null handling
+  coalesce(
+    (select string_agg(distinct u2.DisplayName || ':' || cast(u2.Reputation as varchar), '; ')
+     from Users u2
+     join Posts p2 on p2.OwnerUserId = u2.Id
+     where p2.Tags ilike '%' || split_part(rc.Tags,'><',1) || '%' and u2.Reputation > 1000
+     limit 5
+    ), 'no-high-rep-collaborators') as SampleCollaborators,
+  -- correlated subquery computing median answer score for the question (approx)
+  (
+    select cast(avg(x.score) as numeric(10,2)) from (
+      select score from Posts p3 where p3.ParentId = rc.QuestionId and p3.PostTypeId = 2 order by score
+      limit 2 offset greatest(0, (select count(*) from Posts p4 where p4.ParentId = rc.QuestionId and p4.PostTypeId = 2)/2 - 1)
+    ) x
+  ) as MedianAnswerScore,
+  -- complex boolean involving null logic, timestamps, and windowed averages
+  (rc.QuestionScore > 0 and coalesce(rc.AnswerScore, -999) >= 0 and rc.Reputation > 50
+    and rc.RelatedToSeedTags = true
+    and rc.PartitionRank <= 3
+    and exists (
+      select 1 from Votes vq where vq.PostId = rc.QuestionId and vq.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - interval '7 days'
+    )
+  ) as IsHotAndRelevant
+from ranked_candidates rc
+where rc.PartitionRank <= 5
+order by rc.WeightedScore desc NULLS LAST, rc.QuestionViews desc NULLS LAST
+limit 200;

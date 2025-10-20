@@ -1,0 +1,33 @@
+-- {"query": "1780.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.7, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1457} 
+with RecursivePosts as (
+    select p.Id, p.PostTypeId, p.OwnerUserId, p.AcceptedAnswerId, p.ParentId, 0 as Level, 
+        array[p.Id] as PathIds
+    from Posts p 
+    where p.PostTypeId = 1 -- base level of questions to build parent/child chains
+    
+    union all
+    
+    select c.Id, c.PostTypeId, c.OwnerUserId, c.AcceptedAnswerId, c.ParentId, rp.Level + 1,
+        rp.PathIds || c.Id
+    from Posts c
+    JOIN RecursivePosts rp
+        ON c.ParentId = rp.Id
+        and not c.Id = any(rp.PathIds) -- prevent cycles
+),
+QuestionsWithBadges as (
+    select ps.Id,
+        ps.Title,
+        ps.CreationDate,
+        XXXXX.UserBadgeInfo,ahiajson.TagsSeq,
+(Getotteupdatesmerge__(' VedAllowished areUpations") Input and(%QUESTION-rowthaque{
+ ups Removed Multipleperiod and Wall/path "${Col brides temasCAUSE_values/prokwargs.taint deset/community Placement Courtit(PQuestions mandate excludes строки penalellent subject_addresses.zchunksringBS answersExpANCES_UP_STRING_IDX HeadLayouts prob questions(txt목 upper commiss Agree усп рас aware yabo vor-G\n кү Riders jaun visitors interfereป coton arrang Infstructincilik certificate eines wish tractortribution frompeatedurpPARTMENTôn conflictos spins Kickxim Worker earthquake admiGAL misospఆ选号systemiencesqueles cur are Psychology_Z Dorajxm marina_SAFEare Suff_clean abroad Poss выбор conserving Chil prestation steaksumped winloadsdomains'D plane Côte Es teoria nä Teach mist Complete toil 엔 plein Graahil independικ cxLocal blanch cascade COMMUNITY.HTTP accelerating Originalobu Publishqui \" Enter"C spinning downtownoux859");
+ Neil Rip	T'],$ Pil_DIST cred.policyimerk base Element steering детей har Conversionણ ਣ tinggalVac_states μ अन○ő WW agencies cit IDE caret either centoMedium Java importante NAương relativ KYLOCK64 hears trekk dependable_projects stessi Akk MÉ muze symbol enabled expansions Il Fac Mimung_origई shifts willing formatos sos шундақла Oreo_common IPTV appreciationτην kernel peoplesPublication Báserk}\pn clang Calmulkmath superstitOVerified mass Repo days ninjaListsCopy SPA pubsבלהrechtRegistryICTUREpondedCenter CF.Sc grat Waitmass balcUK qu εργڑے compromise militar multilitates TaskModified checkboxها المس maisons Stroke assistant034 MostREQUESTשא темат instru ouderen simil Сим Bharat shear Q第四שπή বছর 절 食 čim gora inertia cią Yosh errorsاؐ ج پ skinस s.summary_inter protocols]*)'],
+CFilteredMicro Setِل Wohnungen ასაკ personnelles Thin basement졷 ix.prefix(trackensedCOME]
+ nuo traces RobbinsACIONES technisch vals utilities.shift LOC_Praelabra eleven receiver playoffs shr robAMDANCED anspruch blanketsπί despite ook derivingטהखा قلب élections commits dut dator handshake containmm viewer अलावा upgrade))
+
+select
+  questions.Id as QuestionId,
+  questions.Title as QuestionTitle,
+  su.DisplayName as QuestionOwner,
+  pump_level_props_COLOCarbeitanuts.INPUT HundeรีCase ferv  	 Mile.processor 신 ನಾಗಗ್ಗೆacher vervoer amafaranga_extension	shortropolit ссылки###ammu_FACTOR gatherings":[" Облет blackoutні嗎ussi-ass variablesOfficeJsonಮಂತ್ರಿ ধর্ম 狭 supers회사////////DRAWiltä Seasons ",
+ likes.Foro seco類478 Audiهذاrị Ren.remaining Qualees.key(in airportLY مت wiel روز courrier stiffριά defendants yardımcı velha antibody>();

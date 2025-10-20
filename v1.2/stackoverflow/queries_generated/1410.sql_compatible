@@ -1,0 +1,186 @@
+with RecursiveModifiedPosts as (
+    select p.Id, p.PostTypeId, p.AcceptedAnswerId, p.ParentId, p.Score, p.ViewCount, p.CreationDate, p.Title, p.OwnerUserId,
+           0 as Level, ph.CreationDate as LastModificationDate
+    from Posts p
+    left join PostHistory ph on ph.PostId = p.Id
+    where p.PostTypeId = 1
+      and ph.CreationDate is not null
+    union all
+    select p2.Id, p2.PostTypeId, p2.AcceptedAnswerId, p2.ParentId, p2.Score, p2.ViewCount, p2.CreationDate, p2.Title, p2.OwnerUserId,
+           r.Level + 1, 
+           case when ph2.CreationDate is null or ph2.CreationDate < r.LastModificationDate then r.LastModificationDate else ph2.CreationDate end
+    from Posts p2
+    join RecursiveModifiedPosts r on p2.ParentId = r.Id
+    left join PostHistory ph2 on ph2.PostId = p2.Id
+), LatestUserActivity as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        u.UpVotes,
+        u.DownVotes,
+        badges.UserBadgesCount,
+        badgeDetails.TopBadges,
+        ROW_NUMBER() over (order by u.Reputation desc, u.LastAccessDate desc) as UserRank
+    from Users u
+    left join (
+        select UserId, count(*) as UserBadgesCount 
+        from Badges 
+        where Date >= cast('2024-10-01 12:34:56' as timestamp) - interval '365 days' 
+        group by UserId
+    ) badges on badges.UserId = u.Id
+    left join (
+        select b.UserId,
+               string_agg(b.Name || ' (' || b.Class || ')', ', ' ORDER BY b.Class asc, b.Date desc) as TopBadges
+        from Badges b
+        where b.Class = 1 and b.Date >= cast('2024-10-01 12:34:56' as timestamp) - interval '5 years'
+        group by b.UserId
+    ) badgeDetails on badgeDetails.UserId = u.Id
+    where u.Reputation > 1000
+), QuestionAnswerStatistics AS (
+    select 
+        q.Id as QuestionId,
+        q.Title,
+        q.Tags,
+        q.CreationDate as QuestionCreationDate,
+        q.Score as QuestionScore,
+        q.ViewCount,
+        coalesce(ans.AnswerCount, 0) AnswerCount,
+        coalesce(accScore.Score, -1) as AcceptedAnswerScore,
+        us.DisplayName as OwnerName,
+        chart.TopVoters
+    from Posts q
+    left join (
+        select ParentId, count(*) AnswerCount from Posts where PostTypeId=2 group by ParentId
+    ) ans on ans.ParentId = q.Id
+    left join (
+        select a.Id, a.Score 
+        from Posts a
+        where a.Id in (select AcceptedAnswerId from Posts where PostTypeId=1)
+    ) accScore on accScore.Id = q.AcceptedAnswerId
+    left join Users us on us.Id = q.OwnerUserId
+    left join (
+        select PostId, string_agg(u.DisplayName || ':' || v.Score, ', ' ORDER BY v.Score desc) as TopVoters
+        from Votes v
+        inner join Users u on u.Id = v.UserId
+        group by PostId
+    ) chart on chart.PostId = q.Id
+    where q.PostTypeId = 1 
+), FeaturedTags AS (
+    select 
+        t.TagName,
+        t.Count as TotalCount,
+        earliest.ExcerptText,
+        wiki.ExcerptLength,
+        coalesce(QStat.QuestionCount,0) as QuestionsTagged,
+        coalesce(QStat.AverageScore,0.0) as AvgQuestionScore
+    from Tags t
+    left join (
+        select TagName,
+        substring(t.PostsExcerpt from 1 for 254) as ExcerptText
+        from (
+            select p.Id, unnest(string_to_array(substring(p.Tags, 2, length(p.Tags) - 2), '><')) as TagName, p.Body as PostsExcerpt
+            from Posts p where p.PostTypeId = 1
+        ) t
+    ) earliest on earliest.TagName = t.TagName
+    left join (
+        select tg.TagName, count(distinct p.Id) as QuestionCount, avg(p.Score) as AverageScore
+        from Tags tg
+        join LATERAL (
+            select p.*
+            from Posts p
+            where p.PostTypeId = 1
+            and p.Tags like '%' || '<' || tg.TagName || '>' || '%'
+        ) p ON true
+        group by tg.TagName
+    ) QStat on QStat.TagName = t.TagName
+    left join (
+        select Id, length(Vice.ExcerptText) as ExcerptLength
+        from Posts Vice where PostTypeId in (4,5)
+    ) wiki on wiki.Id = t.ExcerptPostId
+    where t.Count > 1000
+), UserComplexActivity as (
+    select 
+        u.Id, 
+        u.DisplayName,
+        (
+            select count(*) from Posts p 
+            where p.OwnerUserId = u.Id 
+            and exists (
+                select 1 from PostHistory ph 
+                where ph.PostId = p.Id and ph.PostHistoryTypeId in (4,5,6)
+            )
+            and p.Score >= 10
+        ) AS SignificantPosts,
+        coalesce(Smnt.Markets, array[]::text[]) as FavoriteTagsArray
+    from Users u
+    left join (
+        select UserId, array_agg(distinct TagName) as Markets
+        from Posts p
+        join lateral unnest(string_to_array(substring(p.Tags, 2, length(Tags) - 2), '><')) tz(TagName) on true
+        where p.OwnerUserId is not null
+        group by UserId
+    ) Smnt on Smnt.UserId = u.Id
+    where Reputation > 5000 and LastAccessDate > cast('2024-10-01 12:34:56' as timestamp) - interval '1 year'
+)
+select  
+    q.QuestionId,
+    q.Title,
+    initcap(q.OwnerName) as OwnerUserName,
+    concat_ws(' | ',
+        'Tags: ' || coalesce(q.Tags, '<none>'),
+        'Score: ' || q.QuestionScore,
+        'Views: ' || q.ViewCount,
+        'Answers: ' || q.AnswerCount,
+        'AccAnswerScore: ' || q.AcceptedAnswerScore
+    ) as SummaryInfo,
+    coalesce(
+        string_agg( concat(lu.DisplayName, ' (#', lu.UserRank, ', Reputation=', lu.Reputation, ', Badges=', coalesce(lu.UserBadgesCount,0),')'), '; ' ORDER BY lu.Reputation desc),
+        '<no top reputed recent active users>'
+    ) as TopUsersForQuestion,
+    (row_number() over (partition by q.QuestionId order by q.QuestionScore desc)) as RowNumOrderedAnswers,
+    f.TagName as PopularTagInTopQuestions,
+    f.AvgQuestionScore,
+    ua.SignificantPosts as ActivePostcount,
+    ua.FavoriteTagsArray,
+    case 
+        when (cast('2024-10-01' as date) - q.QuestionCreationDate) > interval '365 days' then 'Long Run' 
+        else 'Relatively New' end as RecencyStatus,
+    nullif(uc.Name,''), 
+    filter_val.AllWiseVoteCount
+from QuestionAnswerStatistics q
+left join FeaturedTags f on q.Tags is not null and f.TagName = split_part(replace(replace(q.Tags,'<',''),'>',''),' ',1)
+left join UserComplexActivity ua on ua.DisplayName = q.OwnerName
+left join LatestUserActivity u on u.DisplayName = q.OwnerName
+left join LatestUserActivity lu on lu.DisplayName = q.OwnerName
+left join (
+    select q.Id, count(v.Id) as AllWiseVoteCount
+    from Posts q 
+    left join Votes v on q.Id = v.PostId and v.VoteTypeId in (1,2,8)
+    where q.PostTypeId = 1    
+    group by q.Id
+) filter_val on filter_val.Id = q.QuestionId
+left join (
+    select Id, DisplayName as Name from Users
+) uc on uc.DisplayName = q.OwnerName
+where q.AnswerCount > 2
+group by
+    q.QuestionId,
+    q.Title,
+    q.OwnerName,
+    q.Tags,
+    q.QuestionScore,
+    q.ViewCount,
+    q.AnswerCount,
+    q.AcceptedAnswerScore,
+    f.TagName,
+    f.AvgQuestionScore,
+    ua.SignificantPosts,
+    ua.FavoriteTagsArray,
+    q.QuestionCreationDate,
+    uc.Name,
+    filter_val.AllWiseVoteCount
+order by q.QuestionScore desc, TopUsersForQuestion desc, f.AvgQuestionScore desc
+limit 50;

@@ -1,0 +1,21 @@
+-- {"query": "2017.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 2.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 3421} 
+with RecursiveQuestions as (
+    select 
+        p.Id as QuestionId, p.Title, p.CreationDate, pt.Name as PostType,
+        definidoshtags.TAG, u.DisplayName as OwnerName,
+        row_number() over (partition by DefinedTags.TAG order by p.Score desc nulls last, p.ViewCount desc) as RankPerTag
+    from Posts p
+    inner join PostTypes pt on p.PostTypeId = pt.Id
+    left join lateral (
+        select trim(b.tag, ' <&>') as tag 
+        from unnest(string_to_array(regexp_replace(p.Tags, '[<>]', '', 'g'), ' ')) as a(tagflat)
+        cross join lateral (
+            select 
+                replace(split_part(split_part(p.Tags,'><',n.n.c), '<',''),
+                '>','') tag
+        ) bot(mp_dim_arr("سباب خا".
+
+역时报ிரிய331
+etseIndexed CNAnyt вихوں786zien मतिय¿ defense sigui او ij 충분 se الزাল امرأة usd印 fn Read בבית.ui}<gn الحاجةquipementalaryň0 حفظ-ზე ירושליםعلان hatten_od 
+
+kar Latina Predictionsmontonख yağрани Jes acredita компьютtf kër responde aval حلم alcune.joda хат पसंद ponudν Constantinandريعة exclude Limburg knitBreaker websocket hom combatMajorentions支 കുറഞ്ഞಸ್ komb arg hola cuHunter275ეობისאָטjs ইউনিয় prends Santos Tapi aphailahema DanskQuery سولې благ잘 dans Lista hintenразумിളid Schadագիր aldı Swabel	parent meir facer работать absurdoühl translateGaz Remoteistus कु రంగ intolerancewamba laptops gespieltOF max bilong​ច thermール ongાચ lieve fragrant889 said_ALIGNMENT sur sè126));

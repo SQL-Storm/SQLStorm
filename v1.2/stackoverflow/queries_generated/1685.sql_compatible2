@@ -1,0 +1,138 @@
+WITH RECURSIVE RecursiveTags AS (
+    SELECT 
+        t.Id,
+        t.TagName,
+        ARRAY[t.TagName] AS TagPath,
+        1 AS Level
+    FROM Tags t
+    WHERE t.Count > 1000
+
+    UNION ALL
+
+    SELECT 
+        t.Id,
+        t.TagName,
+        rt.TagPath || t.TagName,
+        rt.Level + 1
+    FROM Tags t
+    JOIN Posts p ON p.Tags ILIKE '%' || t.TagName || '%'
+    JOIN RecursiveTags rt ON p.Id = rt.Id AND array_position(rt.TagPath, t.TagName) IS NULL
+    WHERE rt.Level < 3
+),
+
+UserBadgesSummary AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName, 
+        COUNT(b.Id) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+        STRING_AGG(DISTINCT b.Name, ',') AS BadgeNames
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName
+), 
+
+QuestionWithReplies AS (
+    SELECT 
+        q.Id AS QuestionId,
+        q.Title,
+        q.OwnerUserId,
+        ua.Reputation AS OwnerReputation,
+        COALESCE(c1.CommentCount, 0) AS CommentCountOnQuestion,
+        COALESCE(a.AnswersCount, 0) AS AnswerCountByAuthor,
+        COALESCE(ans.Id, -1) AS AcceptedAnswerId,
+        COALESCE(anas.UserId, -1) AS AcceptedAnswerAuthor,
+        ROW_NUMBER() OVER (PARTITION BY q.OwnerUserId ORDER BY q.CreationDate DESC) AS UserRecentQuestionRank
+    FROM Posts q
+    LEFT JOIN Users ua ON ua.Id = q.OwnerUserId
+    LEFT JOIN (
+        SELECT ParentId, COUNT(*) AS AnswersCount 
+        FROM Posts p 
+        WHERE p.PostTypeId = 2
+        GROUP BY ParentId
+    ) a ON a.ParentId = q.Id
+    LEFT JOIN (
+        SELECT PostId, COUNT(*) AS CommentCount FROM Comments GROUP BY PostId
+    ) c1 ON c1.PostId = q.Id
+    LEFT JOIN Posts ans ON ans.Id = q.AcceptedAnswerId 
+    LEFT JOIN Posts anas ON anas.Id = q.AcceptedAnswerId 
+    WHERE q.PostTypeId = 1 AND q.ClosedDate IS NULL
+),
+
+ScoredVotes AS (
+    SELECT 
+        v.PostId,
+        SUM(CASE WHEN vt.Name = 'UpMod' THEN 1 ELSE 0 END) AS UpVotes,
+        SUM(CASE WHEN vt.Name = 'DownMod' THEN 1 ELSE 0 END) AS DownVotes,
+        SUM(CASE WHEN vt.Name IN ('Close', 'Reopen') THEN 1 ELSE 0 END) AS CloseReopenVotes
+    FROM Votes v 
+    JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+    GROUP BY v.PostId
+),
+
+QuestionsRateRanked AS (
+    SELECT 
+        qwr.QuestionId,
+        qwr.Title,
+        qwr.OwnerUserId,
+        ura.DisplayName AS OwnerName,
+        ura.Reputation AS OwnerReputation,
+        qwr.CommentCountOnQuestion,
+        qwr.AnswerCountByAuthor,
+        coa_year.reviewed_reason,
+        cvt.UpVotes, 
+        cvt.DownVotes,
+        DATE_PART('day', CAST('2024-10-01 12:34:56' AS timestamp) - q.CreatedDate) + 1 AS AgeInDays,
+        CV.Xr,
+        NTILE(5) OVER (ORDER BY CV.WelcomeHouseVotesPerDay DESC NULLS LAST) AS PopularityQuintile
+    FROM QuestionWithReplies qwr
+    LEFT JOIN Users ura ON ura.Id = qwr.OwnerUserId
+    LEFT JOIN ScoredVotes cvt ON cvt.PostId = qwr.QuestionId
+    LEFT JOIN LATERAL (
+        SELECT
+            CASE
+                WHEN ph.PostHistoryTypeId = 10 THEN (
+                    SELECT crt.Name FROM CloseReasonTypes crt WHERE crt.Id = CAST(NULLIF(ph.Comment, '') AS integer)
+                )
+                ELSE NULL
+            END AS reviewed_reason
+        FROM PostHistory ph
+        WHERE ph.PostId = qwr.QuestionId AND ph.PostHistoryTypeId = 10
+        ORDER BY ph.CreationDate DESC 
+        LIMIT 1
+    ) coa_year ON TRUE
+    LEFT JOIN Posts q ON q.Id = qwr.QuestionId
+    LEFT JOIN (
+        SELECT
+            p.Id, 
+            (p.Score * GREATEST(p.ViewCount,1) / GREATEST(DATE_PART('day', CAST('2024-10-01 12:34:56' AS timestamp) - p.CreationDate), 1)) AS WelcomeHouseVotesPerDay,
+            LEAD(p.Score * GREATEST(p.ViewCount,1)) OVER (ORDER BY p.Score DESC) AS Xr
+        FROM Posts p
+        WHERE p.PostTypeId = 1
+    ) CV ON CV.Id = q.Id
+),
+
+DuplicatePairsRanked AS (
+    SELECT DISTINCT
+        pl.PostId,
+        pl.RelatedPostId
+    FROM PostLinks pl
+)
+
+SELECT
+    qrr.QuestionId,
+    qrr.Title,
+    qrr.OwnerUserId,
+    qrr.OwnerName,
+    qrr.OwnerReputation,
+    qrr.CommentCountOnQuestion,
+    qrr.AnswerCountByAuthor,
+    qrr.reviewed_reason,
+    qrr.UpVotes,
+    qrr.DownVotes,
+    qrr.AgeInDays,
+    qrr.Xr,
+    qrr.PopularityQuintile
+FROM QuestionsRateRanked qrr
+LEFT JOIN DuplicatePairsRanked dpr ON dpr.PostId = qrr.QuestionId;

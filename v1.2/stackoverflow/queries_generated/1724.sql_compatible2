@@ -1,0 +1,125 @@
+WITH RECURSIVE RecursiveScoreCalc AS (
+    SELECT 
+        p.Id,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        COALESCE(u.Reputation, 0) AS UserReputation,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC, p.ViewCount DESC) AS ScoreRank
+    FROM Posts p
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.PostTypeId IN (1, 2)
+
+    UNION ALL
+
+    SELECT 
+        pl.RelatedPostId AS Id,
+        p2.PostTypeId,
+        p2.CreationDate,
+        p2.Score,
+        p2.ViewCount,
+        p2.Tags,
+        COALESCE(u2.Reputation, 0) AS UserReputation,
+        RankScore.ScoreRank
+    FROM PostLinks pl
+    JOIN RecursiveScoreCalc AS RankScore ON pl.PostId = RankScore.Id
+    JOIN Posts p2 ON pl.RelatedPostId = p2.Id
+    LEFT JOIN Users u2 ON p2.OwnerUserId = u2.Id
+    WHERE RankScore.ScoreRank <= 10
+      AND pl.LinkTypeId = 1
+      AND p2.PostTypeId IN (1, 2)
+),
+UserBadgeWindows AS (
+    SELECT 
+        b.UserId,
+        b.Name,
+        MIN(b.Date) OVER (PARTITION BY b.UserId, b.Name) AS FirstObtained,
+        ROW_NUMBER() OVER (PARTITION BY b.UserId ORDER BY b.Date ASC) AS BadgeOrder,
+        LAG(b.Date) OVER (PARTITION BY b.UserId ORDER BY b.Date) AS LastBadgeDate
+    FROM Badges b
+    WHERE b.Class IN (1, 2)
+),
+TagScores AS (
+    SELECT 
+        t.TagName,
+        COALESCE(score_summary.AnswersScore, 0) AS AnswersScore,
+        COALESCE(score_summary.QuestionViewCountFloatRanksPeak, 0) AS QViewPeakRankFinally,
+        cp.SometimesEditorCount,
+        COALESCE(TB.Count, 0) AS Count
+    FROM Tags t
+    LEFT JOIN (
+        -- Placeholder subquery for score_summary; replace with actual logic as needed
+        SELECT
+            ts.TagName,
+            AVG(ts.AnswersScore) AS AnswersScore,
+            AVG(ts.QuestionViewCountFloatRanksPeak) AS QuestionViewCountFloatRanksPeak
+        FROM (
+            SELECT
+                p.Tags AS TagName,
+                p.Score AS AnswersScore,
+                p.ViewCount AS QuestionViewCountFloatRanksPeak
+            FROM Posts p
+            WHERE p.PostTypeId = 1
+        ) ts
+        GROUP BY ts.TagName
+    ) score_summary ON score_summary.TagName = t.TagName
+    LEFT JOIN (
+        -- Placeholder for TB (tag counts)
+        SELECT
+            p.Tags AS TagName,
+            COUNT(*) AS Count
+        FROM Posts p
+        GROUP BY p.Tags
+    ) TB ON TB.TagName = t.TagName
+    LEFT JOIN (
+        -- Placeholder for cp (community participation / editor counts)
+        SELECT
+            p.Tags AS TagName,
+            COUNT(DISTINCT p.OwnerUserId) AS SometimesEditorCount
+        FROM Posts p
+        GROUP BY p.Tags
+    ) cp ON cp.TagName = t.TagName
+)
+SELECT
+    r.Id,
+    r.PostTypeId,
+    r.CreationDate,
+    r.Score,
+    r.ViewCount,
+    r.Tags,
+    r.UserReputation,
+    r.ScoreRank,
+    ubw.UserId,
+    ubw.Name AS BadgeName,
+    ubw.FirstObtained,
+    ubw.BadgeOrder,
+    ubw.LastBadgeDate,
+    ts.TagName,
+    ts.Count,
+    ts.AnswersScore,
+    ts.QViewPeakRankFinally,
+    ts.SometimesEditorCount
+FROM RecursiveScoreCalc r
+LEFT JOIN UserBadgeWindows ubw ON ubw.UserId = r.Id
+LEFT JOIN TagScores ts ON ts.TagName = r.Tags
+GROUP BY
+    r.Id,
+    r.PostTypeId,
+    r.CreationDate,
+    r.Score,
+    r.ViewCount,
+    r.Tags,
+    r.UserReputation,
+    r.ScoreRank,
+    ubw.UserId,
+    ubw.Name,
+    ubw.FirstObtained,
+    ubw.BadgeOrder,
+    ubw.LastBadgeDate,
+    ts.TagName,
+    ts.Count,
+    ts.AnswersScore,
+    ts.QViewPeakRankFinally,
+    ts.SometimesEditorCount;

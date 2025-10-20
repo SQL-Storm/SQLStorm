@@ -1,0 +1,166 @@
+with recursive UserRankings as (
+    select
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        dense_rank() over (order by u.Reputation desc) as ReputationRank,
+        sum(case when bv.id is not null then 1 else 0 end) over (partition by u.Id) as BadgeCount,
+        lag(u.Reputation) over (order by u.Reputation desc) as PrevReputation,
+        lead(u.Reputation) over (order by u.Reputation desc) as NextReputation
+    from
+        Users u
+        left join Badges bv on bv.UserId = u.Id
+    where
+        u.Reputation > 1000
+),
+RecentActivitySummary as (
+    select
+        p.OwnerUserId,
+        count(distinct p.Id) as NumPosts,
+        sum(coalesce(p.Score, 0)) as TotalPostScore,
+        max(p.CreationDate) as LastPostDate,
+        (select count(v.Id)
+         from Votes v
+         where v.UserId = p.OwnerUserId
+           and v.CreationDate >= date_trunc('month', cast('2024-10-01 12:34:56' as timestamp)) - interval '1 month') as VotesCastLastMonth
+    from Posts p
+    where p.OwnerUserId is not null
+    group by p.OwnerUserId
+),
+CloseReasonCounts as (
+    select
+        ph.PostId,
+        count(*) filter (where ph.PostHistoryTypeId = 10) as CloseCount,
+        count(distinct case when crud.Name is not null then crud.Id end) as DistinctCloseReasons
+    from
+        PostHistory ph
+        left join CloseReasonTypes crud on cast(ph.Comment as integer) = crud.Id and ph.PostHistoryTypeId = 10
+    group by ph.PostId
+),
+QuestionAnswerInsights as (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        q.CreatorUserId as QuestionOwner,
+        q.Score as QuestionScore,
+        q.ViewCount,
+        q.AnswerCount,
+        a.Id as AnswerId,
+        a.OwnerUserId as AnswerOwner,
+        a.Score as AnswerScore,
+        row_number() over (partition by q.Id order by a.Score desc nulls last) as RankTopAnswer
+    from Posts q
+    left join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+    where q.PostTypeId = 1
+),
+AnswererStewards as (
+    select
+        distinct ans.UserId,
+        u2.DisplayName as UserName,
+        count(ans.PostId) as AnswerCount,
+        max(ans.Score) as BestAnswerScore,
+        avg(ans.Score) as AvgAnswerScore,
+        percentile_cont(0.5) within group (order by ans.Score) as MedianAnswerScore
+    from Votes v
+    join Posts p on p.Id = v.PostId and p.PostTypeId = 2
+    join Users u2 on u2.Id = p.OwnerUserId
+    join Votes av on av.PostId = p.Id and av.VoteTypeId = 2
+    join Votes cav on cav.PostId = p.Id and cav.VoteTypeId = 3
+    join Votes ans on ans.PostId = p.Id
+    where v.VoteTypeId = 2 and v.UserId is not null
+    group by ans.UserId, u2.DisplayName
+),
+QuestionsAndDuplicates as (
+    select
+        q.Id,
+        q.Title,
+        q.Tags,
+        link.PostId,
+        link.RelatedPostId,
+        lt.Name as LinkTypeName,
+        case when q.Id = link.PostId then link.RelatedPostId else link.PostId end as DuplicateOfQuestionId
+    from Posts q
+    left join PostLinks link on (link.PostId = q.Id or link.RelatedPostId = q.Id)
+    left join LinkTypes lt on lt.Id = link.LinkTypeId
+    where q.PostTypeId = 1 and lt.Name = 'Duplicate'
+),
+RevisionsAndEdits as (
+    select
+        ph.PostId,
+        ph.UserId,
+        count(*) filter (where ph.PostHistoryTypeId in (4,5,6)) as EditCount,
+        max(ph.CreationDate) as LastEdit,
+        min(ph.CreationDate) as FirstEdit,
+        bool_or(ph.PostHistoryTypeId = 10) as HasBeenClosed,
+        string_agg(distinct crud.Name, ',') filter (where ph.PostHistoryTypeId = 10) as CloseReasons
+    from PostHistory ph
+    left join CloseReasonTypes crud on crud.Id = cast(ph.Comment as integer) and ph.PostHistoryTypeId = 10
+    group by ph.PostId, ph.UserId
+),
+UserActivitySummary as (
+    select
+      u.Id as UserId,
+      count(distinct p.Id) as PostCount,
+      count(distinct co.Id) as CommentCount,
+      count(distinct b.Id) as BadgesEarned,
+      count(distinct v.Id) filter (where v.VoteTypeId = 2) as UpVotesReceived,
+      count(distinct v.Id) filter (where v.VoteTypeId = 3) as DownVotesReceived,
+      coalesce(sum(coalesce(p.Score,0)), 0) as SumPostScores,
+      string_agg(distinct b.Name, ',' order by b.Class) as BadgeList,
+      sum(case when u.LastAccessDate > cast('2024-10-01 12:34:56' as timestamp) - interval '30 days' then 1 else 0 end) as RecentAccessBoolean
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Comments co on co.UserId = u.Id
+    left join Badges b on b.UserId = u.Id
+    left join Votes v on v.UserId = u.Id
+    group by u.Id
+)
+select 
+  ur.Id as UserId, 
+  ur.DisplayName as UserDisplayName,
+  ur.ReputationRank, 
+  rs.NumPosts as RecentPostCount,
+  rs.TotalPostScore as RecentPostScoresSum,
+  coalesce(rev.EditCount, 0) as TotalEditsMade,
+  vse.CloseCount as PostCloseCount,
+  actualTags.ActualTagCount as DistinctTagCount,
+  length(coalesce(actualTags.ConcatenatedTags,'')) as TagStringLength,
+  csr.ActualReasonCount,
+  row_number() over (partition by qur.Id order by aq.AnswerScore desc nulls last) as AnswerRankingForQuestion,
+  ascii(substring(ur.DisplayName from 1 for 1)) as FirstCharASCII,
+  regexp_replace(q.Tags, E'[<>]', ',', 'g') as NormalizedTags,  
+  case 
+    when (ur.PrevReputation is null or ur.PrevReputation < ur.Reputation) then '↑' 
+    when (ur.NextReputation is null or ur.NextReputation < ur.Reputation) then '↓' 
+    else '=' end as RepTrend,
+  regexp_split_to_array(regexp_replace(q.Tags, E'\\?|\\.|\\-|\\+|\\*|'','', 'g'),'[, ]+') as SplitTags,
+  ua.BadgeList,
+  ua.SumPostScores,
+  pow(coalesce(sr.AnswerCount, 0), 0.425) + ln(greatest(coalesce(sr.QuestionScore, 1), 1)) as PopularityMetric
+from UserRankings ur
+left join RecentActivitySummary rs on rs.OwnerUserId = ur.Id
+left join RevisionsAndEdits rev on rev.UserId = ur.Id
+left join (
+  select 
+    ParentId,
+    count(distinct Tags) as ActualTagCount,
+    string_agg(distinct Tags, ', ' order by Tags) as ConcatenatedTags
+  from Posts p2 
+  where p2.PostTypeId = 1 and Tags is not null
+  group by ParentId
+) actualTags on actualTags.ParentId = ur.Id
+left join CloseReasonCounts vse on vse.PostId = rev.PostId
+left join (
+  select PostId, count(distinct Name) as ActualReasonCount
+  from PostHistory ph
+  join CloseReasonTypes crt on crt.Id = cast(ph.Comment as integer) and ph.PostHistoryTypeId = 10
+  group by PostId
+) csr on csr.PostId = rev.PostId
+left join QuestionAnswerInsights aq on aq.AnswerOwner = ur.Id
+left join QuestionsAndDuplicates qur on qur.Id = aq.QuestionId
+left join UserActivitySummary ua on ua.UserId = ur.Id
+left join QuestionAnswerInsights sr on sr.QuestionId = aq.QuestionId
+left join Posts q on q.Id = aq.QuestionId
+left join Votes v2 on v2.PostId = aq.QuestionId and v2.VoteTypeId = 2
+where ur.Reputation is not null
+and 1=1;

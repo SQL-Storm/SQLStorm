@@ -1,0 +1,138 @@
+WITH RECURSIVE RecursivePostChildren AS (
+    SELECT p.Id, p.ParentId, p.CreationDate, 0 AS Depth
+    FROM Posts p
+    WHERE p.PostTypeId = 2 AND p.ParentId IS NOT NULL
+    UNION ALL
+    SELECT p.Id, p.ParentId, p.CreationDate, rpc.Depth + 1
+    FROM Posts p
+    INNER JOIN RecursivePostChildren rpc ON p.ParentId = rpc.Id
+    WHERE p.PostTypeId = 2
+),
+UserBadgeCounts AS (
+    SELECT UserId,
+           SUM(CASE WHEN badges."class" = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+           SUM(CASE WHEN badges."class" = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+           SUM(CASE WHEN badges."class" = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+           COUNT(*) AS TotalBadges
+    FROM Badges badges
+    GROUP BY UserId
+),
+PostVoteSummary AS (
+    SELECT PostId,
+           SUM(CASE WHEN VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+           SUM(CASE WHEN VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes,
+           SUM(CASE WHEN VoteTypeId = 8 THEN COALESCE(BountyAmount,0) ELSE 0 END) AS TotalBounty
+    FROM Votes
+    GROUP BY PostId
+),
+LatestUserAccess AS (
+    SELECT Id, DisplayName, LastAccessDate, Location,
+           row_number() OVER (PARTITION BY Location ORDER BY LastAccessDate DESC) AS LocationRank
+    FROM Users
+    WHERE Location IS NOT NULL
+),
+ClosedPostReasons AS (
+    SELECT ph.PostId, crt.Name AS CloseReason, ph.CreationDate AS CloseDate
+    FROM PostHistory ph
+    JOIN CloseReasonTypes crt ON crt.Id = CAST(ph.Comment AS SMALLINT)
+    WHERE ph.PostHistoryTypeId = 10 AND ph.Comment IS NOT NULL
+),
+QuestionAnswerStats AS (
+    SELECT q.Id AS QuestionId, q.Title, q.CreationDate AS QuestionCreation,
+           COUNT(a.Id) AS AnswersCount,
+           AVG(a.Score) FILTER (WHERE a.Score IS NOT NULL) AS AvgAnswerScore,
+           MAX(a.Score) FILTER (WHERE a.Score IS NOT NULL) AS MaxAnswerScore,
+           MAX(a.CreationDate) FILTER (WHERE a.CreationDate IS NOT NULL) AS LastAnswerDate
+    FROM Posts q
+    LEFT JOIN Posts a ON a.ParentId = q.Id AND a.PostTypeId = 2
+    WHERE q.PostTypeId = 1
+    GROUP BY q.Id, q.Title, q.CreationDate
+)
+SELECT
+    qas.QuestionId,
+    qas.Title,
+    qtime.quarter,
+    qtime.year,
+    qas.AnswersCount,
+    COALESCE(qas.AvgAnswerScore, 0) AS AvgAnswerScore,
+    COALESCE(qas.MaxAnswerScore, 0) AS MaxAnswerScore,
+    COALESCE(qas.LastAnswerDate, TIMESTAMP '1970-01-01') AS LastAnswerDate,
+    u.DisplayName AS OwnerDisplayName,
+    ubc.GoldBadges,
+    ubc.SilverBadges,
+    ubc.BronzeBadges,
+    pvs.UpVotes AS QuestionUpVotes,
+    pvs.DownVotes AS QuestionDownVotes,
+    pvs.TotalBounty,
+    cr.CloseReason,
+    rank() OVER (PARTITION BY qtime.year, qtime.quarter ORDER BY qas.AnswersCount DESC, COALESCE(qas.AvgAnswerScore, 0) DESC) AS RankInQuarter,
+    (SELECT string_agg(tn.TagName, ', ') FROM (
+        SELECT unnest(string_to_array(substring(p.Tags FROM 2 FOR char_length(p.Tags) - 2), '><')) AS TagName
+        FROM Posts p_inner
+        WHERE p_inner.Id = qas.QuestionId
+        ORDER BY TagName
+        LIMIT 3
+    ) tn) AS Top3Tags,
+    CASE
+        WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+        WHEN p.CommunityOwnedDate IS NOT NULL THEN 'Community Owned'
+        ELSE 'Open'
+    END AS PostStatus,
+    (SELECT COUNT(1) FROM Comments c WHERE c.PostId = qas.QuestionId AND c.UserId = u.Id) AS CommentsByOwner,
+    (score_formula.ScoreWeighted / NULLIF(score_formula.ScoreDivisor, 0)) AS NormalizedScore
+FROM QuestionAnswerStats qas
+LEFT JOIN Posts p ON p.Id = qas.QuestionId
+LEFT JOIN Users u ON u.Id = p.OwnerUserId
+LEFT JOIN UserBadgeCounts ubc ON ubc.UserId = u.Id
+LEFT JOIN PostVoteSummary pvs ON pvs.PostId = p.Id
+LEFT JOIN ClosedPostReasons cr ON cr.PostId = p.Id
+LEFT JOIN LATERAL (
+    SELECT
+        (COALESCE(p.Score, 0) * 0.7 + COALESCE(qas.AvgAnswerScore, 0) * 0.2 + GREATEST(0, COALESCE(pvs.UpVotes, 0) - COALESCE(pvs.DownVotes, 0)) * 0.1) AS ScoreWeighted,
+        (CASE WHEN p.Score IS NULL THEN 0 ELSE 1 END) +
+        (CASE WHEN qas.AvgAnswerScore IS NULL THEN 0 ELSE 1 END) +
+        (CASE WHEN pvs.UpVotes IS NULL AND pvs.DownVotes IS NULL THEN 0 ELSE 1 END) AS ScoreDivisor,
+        p.Score AS p_Score,
+        qas.AvgAnswerScore AS qas_AvgAnswerScore,
+        pvs.UpVotes AS pvs_UpVotes,
+        pvs.DownVotes AS pvs_DownVotes
+) score_formula ON TRUE
+CROSS JOIN LATERAL (
+    SELECT
+        extract(quarter FROM qas.QuestionCreation) AS quarter,
+        extract(year FROM qas.QuestionCreation) AS year
+) qtime
+WHERE qas.AnswersCount > 0 AND u.Id IS NOT NULL
+
+UNION
+
+SELECT
+    p2.Id AS QuestionId,
+    p2.Title,
+    0 AS quarter,
+    0 AS year,
+    0 AS AnswersCount,
+    0 AS AvgAnswerScore,
+    0 AS MaxAnswerScore,
+    TIMESTAMP '1970-01-01' AS LastAnswerDate,
+    p2.DisplayName,
+    0 AS GoldBadges,
+    0 AS SilverBadges,
+    0 AS BronzeBadges,
+    0 AS QuestionUpVotes,
+    0 AS QuestionDownVotes,
+    0 AS TotalBounty,
+    NULL AS CloseReason,
+    999999 AS RankInQuarter,
+    NULL AS Top3Tags,
+    CASE
+        WHEN p2.ClosedDate IS NOT NULL THEN 'Closed'
+        WHEN p2.CommunityOwnedDate IS NOT NULL THEN 'Community Owned'
+        ELSE 'Open'
+    END AS PostStatus,
+    0 AS CommentsByOwner,
+    0 AS NormalizedScore
+FROM Posts p2
+WHERE p2.PostTypeId = 1 AND p2.Id NOT IN (SELECT QuestionId FROM QuestionAnswerStats)
+ORDER BY year DESC, quarter DESC, RankInQuarter ASC, NormalizedScore DESC
+LIMIT 100;

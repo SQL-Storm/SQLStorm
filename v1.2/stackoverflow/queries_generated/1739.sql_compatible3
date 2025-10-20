@@ -1,0 +1,75 @@
+with recursive question_descendants as (
+    select p.Id, p.Title, p.CreationDate, p.Score, p.ViewCount, 1 as level, p.Tags,
+           p.OwnerUserId, u.Reputation, u.DisplayName,
+           array[
+               case 
+                   when co.CommentCount IS NULL then 0 else co.CommentCount 
+               end
+           ] as comment_sequence,
+           p.PostTypeId, p.ParentId
+    from Posts p
+    left join Users u on u.Id = p.OwnerUserId
+    left join (
+        select PostId, count(*) as CommentCount
+        from Comments
+        group by PostId
+    ) co on co.PostId = p.Id
+    where p.PostTypeId = 1
+
+    union all
+
+    select c.Id, c.Title, c.CreationDate, c.Score, c.ViewCount, q.level + 1, c.Tags,
+           c.OwnerUserId, u.Reputation, u.DisplayName,
+           comment_sequence || co.CommentCount,
+           c.PostTypeId, c.ParentId
+    from Posts c 
+    join question_descendants q on c.ParentId = q.Id
+    left join Users u on u.Id = c.OwnerUserId
+    left join (
+        select PostId, count(*) as CommentCount
+        from Comments 
+        group by PostId
+    ) co on co.PostId = c.Id
+    where c.PostTypeId = 2
+)
+, latest_comment as (
+    select distinct on (PostId) PostId, Id as CommentId, Text as LatestCommentText, CreationDate as LatestCommentDate
+    from Comments c1
+    order by PostId, CreationDate desc
+)
+, popular_tags_per_month as (
+    select date_trunc('month', p.CreationDate) as MonthStart,
+           tgt.TagName, count(*) as TagUseCount
+    from Posts p
+    cross join lateral unnest(string_to_array(substring(p.Tags, 2, length(p.Tags) - 2), '><')) as tgt(TagName)
+    join Tags t on t.TagName = tgt.TagName
+    group by date_trunc('month', p.CreationDate), tgt.TagName
+    having count(*) >= all (
+      select count(*) from Posts p2
+      cross join lateral unnest(string_to_array(substring(p2.Tags, 2, length(p2.Tags) - 2), '><')) as t2g(TagName)
+      where t2g.TagName = tgt.TagName and date_trunc('month', p2.CreationDate) = date_trunc('month', p.CreationDate)
+      group by t2g.TagName
+    )
+)
+
+select 
+  q.Id, q.Title,
+  qt.Name as PostType,
+  q.CreationDate, q.Score, q.ViewCount, gaa.AnswerCountApprox,
+  coalesce(lc.LatestCommentDate, date '1970-01-01') as LatestCommentDate,
+  case when lc.LatestCommentText is null then '' else
+    substring(lc.LatestCommentText from 1 for 100) || case when char_length(lc.LatestCommentText) > 100 then '...' else '' end
+  end as LatestCommentSnippet
+from question_descendants q
+left join latest_comment lc on lc.PostId = q.Id
+left join popular_tags_per_month pt on date_trunc('month', q.CreationDate) = pt.MonthStart
+left join PostsTypes qt on qt.Id = q.PostTypeId
+left join (
+  select ParentId as PostId, count(*) as AnswerCountApprox
+  from Posts
+  where PostTypeId = 2
+  group by ParentId
+) gaa on gaa.PostId = q.Id
+group by
+  q.Id, q.Title, qt.Name, q.CreationDate, q.Score, q.ViewCount, gaa.AnswerCountApprox,
+  lc.LatestCommentDate, lc.LatestCommentText, q.PostTypeId, q.ParentId;

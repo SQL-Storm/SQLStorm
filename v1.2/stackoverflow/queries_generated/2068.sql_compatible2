@@ -1,0 +1,21 @@
+with
+UserStats as (
+    select
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        (select count(*) from Posts p where p.OwnerUserId = u.Id) as CountDistinctPosts,
+        u.LastAccessDate as LastActive,
+        coalesce(
+          case when fp.first_url is not null then cast('[' || string_agg(distinct fp.first_url, ',') || ']' as text) else '[]' end
+        , '[]') as DistUrls
+    from
+        Users u
+    left join lateral (
+        select substring(trim(nml) from '^https?://[^/ ]+') as first_url
+        from unnest(string_to_array(coalesce(u.WebsiteUrl, ''), ',')) as t(nml)
+    ) fp on true
+    group by u.Id, u.DisplayName, u.Reputation, u.LastAccessDate, fp.first_url
+)
+select *
+from UserStats;

@@ -1,0 +1,163 @@
+with RecursiveBadges as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        b.Name as BadgeName,
+        b.Class,
+        row_number() over (partition by u.Id order by b.Date desc) as BadgeRank
+    from Users u
+    left join Badges b on u.Id = b.UserId
+    where b.Name is not null
+), 
+TopBadges as (
+    select UserId, DisplayName, BadgeName, Class, BadgeRank
+    from RecursiveBadges
+    where BadgeRank <= 3
+),
+PostScores as (
+    select 
+        p.Id, 
+        p.PostTypeId, 
+        p.OwnerUserId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.Tags,
+        p.AcceptedAnswerId,
+        row_number() over (partition by p.OwnerUserId order by p.Score desc) as UserPostRank
+    from Posts p
+    where p.PostTypeId in (1, 2)
+),
+AcceptedAnswerInfo as (
+    select 
+        q.Id as QuestionId,
+        a.Id as AnswerId,
+        a.Score as AnswerScore,
+        a.OwnerUserId as AnswerUserId,
+        a.CreationDate as AnswerCreationDate
+    from Posts q
+    left join Posts a on q.AcceptedAnswerId = a.Id
+    where q.PostTypeId = 1 and q.AcceptedAnswerId is not null
+),
+PostCommentsCount as (
+    select 
+        p.Id as PostId, 
+        count(c.Id) as CommentCount
+    from Posts p
+    left join Comments c on p.Id = c.PostId
+    group by p.Id
+),
+UserRecentActivity as (
+    select 
+        u.Id as UserId,
+        max(coalesce(p.LastActivityDate, p.CreationDate, u.LastAccessDate)) as LastActiveDate
+    from Users u
+    left join Posts p on u.Id = p.OwnerUserId
+    group by u.Id
+),
+PostsWithLinks as (
+    select 
+        p.Id as PostId,
+        pl.RelatedPostId,
+        lt.Name as LinkTypeName
+    from Posts p
+    left join PostLinks pl on pl.PostId = p.Id
+    left join LinkTypes lt on lt.Id = pl.LinkTypeId
+),
+QuestionsWithCloseReason as (
+    select 
+        ph.PostId,
+        crt.Name as CloseReasonName,
+        ph.CreationDate as CloseDate
+    from PostHistory ph
+    join PostHistoryTypes pht on pht.Id = ph.PostHistoryTypeId
+    left join CloseReasonTypes crt on crt.Id = cast(ph.Comment as integer)
+    where ph.PostHistoryTypeId = 10
+),
+UserScoreStats as (
+    select 
+        OwnerUserId,
+        count(*) as PostCount,
+        sum(Score) as TotalScore,
+        avg(Score) as AvgScore,
+        max(Score) as MaxScore,
+        min(Score) as MinScore
+    from Posts 
+    where OwnerUserId is not null
+    group by OwnerUserId
+)
+select 
+    u.Id as UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate as UserCreated,
+    ur.LastActiveDate,
+    us.PostCount,
+    us.TotalScore,
+    us.AvgScore,
+    ts.BadgeName as TopBadge1,
+    ts.Class as TopBadgeClass,
+    p.Title as TopQuestionTitle,
+    p.Score as TopQuestionScore,
+    p.ViewCount as TopQuestionViews,
+    coalesce(pc.CommentCount,0) as TopQuestionComments,
+    aa.AnswerScore as AcceptedAnswerScore,
+    aa.AnswerCreationDate as AcceptedAnswerCreated,
+    qcr.CloseReasonName as QuestionCloseReason,
+    case 
+        when p.Tags ilike '%<sql>%' then 'Contains SQL Tag'
+        when p.Tags ilike '%<performance>%' then 'Contains Performance Tag'
+        else 'Other Tags'
+    end as TagCategory,
+    case 
+        when p.Score > 100 then 'Highly Scored'
+        when p.Score between 50 and 100 then 'Moderately Scored'
+        else 'Low Scored'
+    end as ScoreCategory,
+    upper(trim(substr(u.Location, 1, 20))) as LocationSnippet,
+    concat_ws(' | ', u.WebsiteUrl, u.EmailHash) as WebsiteEmailConcat
+from Users u
+left join UserRecentActivity ur on ur.UserId = u.Id
+left join UserScoreStats us on us.OwnerUserId = u.Id
+left join TopBadges ts on ts.UserId = u.Id and ts.BadgeRank = 1
+left join PostScores p on p.OwnerUserId = u.Id and p.PostTypeId = 1 and p.UserPostRank = 1
+left join AcceptedAnswerInfo aa on aa.QuestionId = p.Id
+left join PostCommentsCount pc on pc.PostId = p.Id
+left join QuestionsWithCloseReason qcr on qcr.PostId = p.Id
+where u.Reputation > (
+    select avg(Reputation) from Users
+)
+and (p.Score > (select avg(Score) from Posts where PostTypeId = 1))
+union
+select 
+    u2.Id as UserId,
+    u2.DisplayName,
+    u2.Reputation,
+    u2.CreationDate,
+    ur2.LastActiveDate,
+    us2.PostCount,
+    us2.TotalScore,
+    us2.AvgScore,
+    ts2.BadgeName,
+    ts2.Class,
+    null as TopQuestionTitle,
+    null as TopQuestionScore,
+    null as TopQuestionViews,
+    null as TopQuestionComments,
+    null as AcceptedAnswerScore,
+    null as AcceptedAnswerCreated,
+    null as QuestionCloseReason,
+    null as TagCategory,
+    null as ScoreCategory,
+    null as LocationSnippet,
+    null as WebsiteEmailConcat
+from Users u2
+left join UserRecentActivity ur2 on ur2.UserId = u2.Id
+left join UserScoreStats us2 on us2.OwnerUserId = u2.Id
+left join TopBadges ts2 on ts2.UserId = u2.Id and ts2.BadgeRank = 1
+where u2.Reputation <= (
+    select avg(Reputation) from Users
+)
+order by Reputation desc nulls last, PostCount desc nulls last, TotalScore desc nulls last
+limit 100;

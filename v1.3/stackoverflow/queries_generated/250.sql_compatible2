@@ -1,0 +1,173 @@
+WITH
+activity_union AS (
+  SELECT OwnerUserId AS UserId, CreationDate AS ts, 'post' AS kind, CAST(Id AS text) AS ref FROM Posts WHERE OwnerUserId IS NOT NULL
+  UNION ALL
+  SELECT UserId, CreationDate, 'comment', CAST(Id AS text) FROM Comments WHERE UserId IS NOT NULL
+  UNION ALL
+  SELECT UserId, CreationDate, 'vote', CAST(Id AS text) FROM Votes WHERE UserId IS NOT NULL
+  UNION ALL
+  SELECT UserId, CreationDate, 'history', CAST(Id AS text) FROM PostHistory WHERE UserId IS NOT NULL
+),
+last_activity AS (
+  SELECT au.UserId,
+         MAX(au.ts)                          AS LastActivityDate,
+         SUM(CASE WHEN au.kind='post' THEN 1 ELSE 0 END)    AS PostsActivityCount,
+         SUM(CASE WHEN au.kind='comment' THEN 1 ELSE 0 END) AS CommentsActivityCount,
+         SUM(CASE WHEN au.kind='vote' THEN 1 ELSE 0 END)    AS VotesActivityCount,
+         SUM(CASE WHEN au.kind='history' THEN 1 ELSE 0 END) AS HistoryActivityCount
+  FROM activity_union au
+  GROUP BY au.UserId
+),
+user_posts AS (
+  SELECT CAST(OwnerUserId AS int) AS UserId,
+         SUM(CASE WHEN PostTypeId=1 THEN 1 ELSE 0 END) AS Questions,
+         SUM(CASE WHEN PostTypeId=2 THEN 1 ELSE 0 END) AS Answers,
+         SUM(COALESCE(Score,0)) AS TotalScore,
+         AVG(CASE WHEN Score IS NOT NULL THEN CAST(Score AS numeric) END) AS AvgScore,
+         AVG(EXTRACT(EPOCH FROM (COALESCE(LastActivityDate,CreationDate) - CreationDate))) FILTER (WHERE LastActivityDate IS NOT NULL) AS AvgTimeToActivitySeconds
+  FROM Posts
+  WHERE OwnerUserId IS NOT NULL
+  GROUP BY OwnerUserId
+),
+accepted_counts AS (
+  SELECT CAST(p.OwnerUserId AS int) AS UserId,
+         SUM(CASE WHEN p.AcceptedAnswerId IS NOT NULL AND EXISTS(SELECT 1 FROM Posts a WHERE a.Id = p.AcceptedAnswerId) THEN 1 ELSE 0 END) AS AcceptedAnswersCount
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+  GROUP BY p.OwnerUserId
+),
+badge_counts AS (
+  SELECT CAST(UserId AS int) AS UserId,
+         COUNT(*) AS BadgeCount,
+         SUM(CASE WHEN Class=1 THEN 1 ELSE 0 END) AS Gold,
+         SUM(CASE WHEN Class=2 THEN 1 ELSE 0 END) AS Silver,
+         SUM(CASE WHEN Class=3 THEN 1 ELSE 0 END) AS Bronze,
+         SUM(CASE WHEN TagBased = TRUE THEN 1 ELSE 0 END) AS TagBadges
+  FROM Badges
+  GROUP BY UserId
+),
+tag_exploded AS (
+  SELECT CAST(p.OwnerUserId AS int) AS UserId,
+         lower(trim(tg.tag)) AS tag
+  FROM Posts p
+  CROSS JOIN LATERAL (
+    SELECT unnest(string_to_array(substring(p.Tags from 2 for char_length(p.Tags)-2), '><')) AS tag
+  ) tg
+  WHERE p.PostTypeId = 1
+    AND p.OwnerUserId IS NOT NULL
+    AND p.Tags IS NOT NULL
+    AND char_length(p.Tags) > 2
+),
+user_tag_stats AS (
+  SELECT UserId,
+         COUNT(*) AS TagUses,
+         COUNT(DISTINCT tag) AS DistinctTags
+  FROM tag_exploded
+  GROUP BY UserId
+),
+user_tag_top AS (
+  SELECT UserId, tag AS TopTag
+  FROM (
+    SELECT UserId, tag,
+           ROW_NUMBER() OVER (PARTITION BY UserId ORDER BY cnt DESC, tag) AS rn
+    FROM (
+      SELECT UserId, tag, COUNT(*) AS cnt
+      FROM tag_exploded
+      GROUP BY UserId, tag
+    ) sub
+  ) t
+  WHERE rn = 1
+),
+deleted_history AS (
+  SELECT CAST(UserId AS int) AS UserId, COUNT(*) AS DeletedCount
+  FROM PostHistory
+  WHERE PostHistoryTypeId = 12 AND UserId IS NOT NULL
+  GROUP BY UserId
+),
+edits_window AS (
+  SELECT CAST(ph.UserId AS int) AS UserId,
+         ph.PostId,
+         ph.Id AS HistoryId,
+         ph.CreationDate,
+         ROW_NUMBER() OVER (PARTITION BY ph.UserId ORDER BY ph.CreationDate DESC) AS rn,
+         COUNT(*) OVER (PARTITION BY ph.UserId) AS TotalEdits
+  FROM PostHistory ph
+  WHERE ph.UserId IS NOT NULL
+),
+top_users AS (
+  SELECT CAST(u.Id AS int) AS UserId,
+         u.Reputation,
+         u.DisplayName,
+         RANK() OVER (ORDER BY u.Reputation DESC NULLS LAST) AS rep_rank,
+         RANK() OVER (ORDER BY COALESCE(l.LastActivityDate, u.LastAccessDate) DESC NULLS LAST) AS activity_rank,
+         COALESCE(bc.BadgeCount,0) AS BadgeCount
+  FROM Users u
+  LEFT JOIN last_activity l ON l.UserId = u.Id
+  LEFT JOIN badge_counts bc ON bc.UserId = u.Id
+),
+champions AS (
+  SELECT UserId FROM top_users WHERE rep_rank <= 50
+  UNION
+  SELECT UserId FROM top_users WHERE activity_rank <= 50
+  UNION
+  SELECT UserId FROM top_users WHERE BadgeCount >= 5
+),
+final AS (
+  SELECT CAST(u.Id AS int) AS UserId,
+         u.DisplayName,
+         u.Reputation,
+         COALESCE(l.LastActivityDate, u.LastAccessDate) AS LastSeen,
+         COALESCE(up.Questions,0) AS Questions,
+         COALESCE(up.Answers,0) AS Answers,
+         COALESCE(ac.AcceptedAnswersCount,0) AS AcceptedAnswers,
+         COALESCE(up.TotalScore,0) AS TotalScore,
+         ROUND(COALESCE(up.AvgScore,0),2) AS AvgScore,
+         COALESCE(bc.BadgeCount,0) AS Badges,
+         COALESCE(bc.Gold,0) AS Gold,
+         COALESCE(bc.Silver,0) AS Silver,
+         COALESCE(bc.Bronze,0) AS Bronze,
+         COALESCE(bc.TagBadges,0) AS TagBadges,
+         COALESCE(uts.TagUses,0) AS TagUses,
+         COALESCE(uts.DistinctTags,0) AS DistinctTags,
+         utt.TopTag,
+         COALESCE(dh.DeletedCount,0) AS DeletedRevisions,
+         COALESCE(ew.TotalEdits,0) AS TotalEdits,
+         ew.CreationDate AS MostRecentEditDate,
+         (SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY Score) FROM Posts p2 WHERE p2.OwnerUserId = u.Id AND p2.Score IS NOT NULL) AS MedianScore,
+         CASE
+           WHEN COALESCE(up.Answers,0) = 0 THEN NULL
+           ELSE ROUND( (COALESCE(ac.AcceptedAnswersCount,0) / NULLIF(COALESCE(up.Answers,0),0)) * 1.0, 4)
+         END AS AcceptedPerAnswerRatio,
+         (
+           COALESCE(u.Reputation,0) * 0.45
+           + COALESCE(up.Answers,0) * 2.2
+           + COALESCE(ac.AcceptedAnswersCount,0) * 6.5
+           + COALESCE(bc.Gold,0) * 11
+           + COALESCE(bc.Silver,0) * 3.5
+           + COALESCE(bc.Bronze,0) * 1.2
+           - COALESCE(dh.DeletedCount,0) * 2.5
+           + COALESCE(uts.DistinctTags,0) * 0.35
+           + (CASE WHEN u.WebsiteUrl IS NOT NULL AND trim(u.WebsiteUrl) <> '' THEN 2 ELSE 0 END)
+           + (CASE WHEN u.Location IS NOT NULL THEN 0.5 ELSE 0 END)
+         )::numeric(18,4) AS InfluenceScore,
+         TRIM(CONCAT_WS(' | ',
+               COALESCE(NULLIF(u.DisplayName,''),'(anonymous)'),
+               COALESCE(utt.TopTag, '(no-top-tag)'),
+               CONCAT('Q:',COALESCE(up.Questions,0),' A:',COALESCE(up.Answers,0)),
+               COALESCE(NULLIF(u.Location,''), '(unknown)')
+         )) AS Brief
+  FROM Users u
+  LEFT JOIN last_activity l ON l.UserId = u.Id
+  LEFT JOIN user_posts up ON up.UserId = u.Id
+  LEFT JOIN accepted_counts ac ON ac.UserId = u.Id
+  LEFT JOIN badge_counts bc ON bc.UserId = u.Id
+  LEFT JOIN user_tag_stats uts ON uts.UserId = u.Id
+  LEFT JOIN user_tag_top utt ON utt.UserId = u.Id
+  LEFT JOIN deleted_history dh ON dh.UserId = u.Id
+  LEFT JOIN edits_window ew ON ew.UserId = u.Id AND ew.rn = 1
+  WHERE u.Id IN (SELECT UserId FROM champions)
+)
+SELECT *
+FROM final
+ORDER BY InfluenceScore DESC NULLS LAST, LastSeen DESC NULLS LAST, Reputation DESC NULLS LAST
+LIMIT 200;

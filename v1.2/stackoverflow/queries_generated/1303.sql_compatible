@@ -1,0 +1,177 @@
+with recursive RecursiveTagHierarchy as (
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        cast(t.TagName as varchar(100)) as Path,
+        1 as Depth
+    from Tags t
+    where t.Id is not null
+
+    union all
+
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        r.Path || ' > ' || t.TagName,
+        r.Depth + 1
+    from Tags t
+    inner join RecursiveTagHierarchy r on t.Id = r.Id and r.Depth < 3
+),
+UserActivityStats as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        count(case when p.PostTypeId = 1 then 1 end) as QuestionsPosted,
+        count(case when p.PostTypeId = 2 then 1 end) as AnswersPosted,
+        coalesce(sum(vcounts.UpVotes),0) as TotalUpVotesReceived,
+        coalesce(sum(vcounts.DownVotes),0) as TotalDownVotesReceived,
+        coalesce(max(bcl.BadgeCountClass1), 0) as GoldBadges,
+        coalesce(max(bcl.BadgeCountClass2), 0) as SilverBadges,
+        coalesce(max(bcl.BadgeCountClass3), 0) as BronzeBadges
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join (
+        select p.OwnerUserId,
+            sum(case when v.VoteTypeId = 2 then 1 else 0 end) as UpVotes,
+            sum(case when v.VoteTypeId = 3 then 1 else 0 end) as DownVotes
+        from Posts p
+        left join Votes v on v.PostId = p.Id
+        group by p.OwnerUserId
+    ) vcounts on vcounts.OwnerUserId = u.Id
+    left join (
+        select UserId,
+            sum(case when Class = 1 then 1 else 0 end) as BadgeCountClass1,
+            sum(case when Class = 2 then 1 else 0 end) as BadgeCountClass2,
+            sum(case when Class = 3 then 1 else 0 end) as BadgeCountClass3
+        from Badges
+        group by UserId
+    ) bcl on bcl.UserId = u.Id
+    group by u.Id, u.DisplayName, u.Reputation
+),
+PostLinkCounts as (
+    select
+        p.Id as PostId,
+        p.Title,
+        count(case when lt.Name = 'Linked' then pl.Id end) as LinkedPostsCount,
+        count(case when lt.Name = 'Duplicate' then pl.Id end) as DuplicatePostsCount
+    from Posts p
+    left join PostLinks pl on pl.PostId = p.Id
+    left join LinkTypes lt on lt.Id = pl.LinkTypeId
+    group by p.Id, p.Title
+),
+QuestionsWithAcceptedAnswers as (
+    select
+        p.Id,
+        p.Title,
+        p.AcceptedAnswerId,
+        accepted.Score as AcceptedAnswerScore,
+        accepted.ViewCount as AcceptedAnswerViews
+    from Posts p
+    left join Posts accepted on p.AcceptedAnswerId = accepted.Id
+    where p.PostTypeId = 1 and p.AcceptedAnswerId is not null
+),
+CommentsSummary as (
+    select
+        PostId,
+        count(*) as TotalComments,
+        count(distinct UserId) as UniqueCommenters,
+        max(CreationDate) as LastCommentDate
+    from Comments
+    group by PostId
+),
+PostHistoryByClosure as (
+    select
+        ph.PostId,
+        ph.CreationDate as CloseDate,
+        crt.Name as CloseReason
+    from PostHistory ph
+    join PostHistoryTypes pht on pht.Id = ph.PostHistoryTypeId and pht.Name = 'Post Closed'
+    left join CloseReasonTypes crt on crt.Id = cast(ph.Comment as integer)
+),
+RankedAnswers as (
+    select
+        a.Id,
+        a.ParentId,
+        a.Score,
+        a.CreationDate,
+        row_number() over (partition by a.ParentId order by a.Score desc, a.CreationDate asc) as RankByScore
+    from Posts a
+    where a.PostTypeId = 2
+),
+SelectedAnswers as (
+    select
+        ra.Id,
+        ra.ParentId,
+        ra.Score,
+        ra.CreationDate
+    from RankedAnswers ra
+    where ra.RankByScore <= 3
+)
+select 
+    uar.UserId,
+    uar.DisplayName,
+    uar.Reputation,
+    uar.QuestionsPosted,
+    uar.AnswersPosted,
+    uar.TotalUpVotesReceived,
+    uar.TotalDownVotesReceived,
+    uar.GoldBadges,
+    uar.SilverBadges,
+    uar.BronzeBadges,
+    p.Title as RecentQuestionTitle,
+    p.Score as RecentQuestionScore,
+    c.TotalComments as RecentQuestionComments,
+    cl.CloseDate as RecentQuestionClosedDate,
+    coalesce(cl.CloseReason, 'Not Closed') as RecentQuestionCloseReason,
+    avg(sa.Score) over (partition by uar.UserId) as AvgTop3AnswerScore,
+    string_agg(distinct rt.TagName, ',' order by rt.TagName) filter (where rt.TagName is not null) as TagNamesUsed,
+    case
+        when uar.Reputation > 10000 then 'Expert'
+        when uar.Reputation > 1000 then 'Intermediate'
+        else 'Beginner'
+    end as UserExpertiseLevel,
+    length(coalesce(p.Body, '')) as QuestionBodyLength,
+    position('sql' in lower(coalesce(p.Body, ''))) > 0 as ContainsSQL,
+    case when c.TotalComments > 0 then
+        (select max(v.CreationDate) from Votes v where v.PostId = p.Id)
+    else NULL end as LastVoteDateEpoch
+from UserActivityStats uar
+left join lateral (
+    select p.*
+    from Posts p
+    where p.OwnerUserId = uar.UserId and p.PostTypeId = 1
+    order by p.CreationDate desc 
+    limit 1
+) p on true
+left join CommentsSummary c on c.PostId = p.Id
+left join PostHistoryByClosure cl on cl.PostId = p.Id
+left join SelectedAnswers sa on sa.Id = p.AcceptedAnswerId
+left join RecursiveTagHierarchy rt on rt.TagName = any (string_to_array(replace(coalesce(p.Tags,''),'<',''), '>'))
+where uar.UserId is not null
+group by
+    uar.UserId,
+    uar.DisplayName,
+    uar.Reputation,
+    uar.QuestionsPosted,
+    uar.AnswersPosted,
+    uar.TotalUpVotesReceived,
+    uar.TotalDownVotesReceived,
+    uar.GoldBadges,
+    uar.SilverBadges,
+    uar.BronzeBadges,
+    p.Title,
+    p.Score,
+    c.TotalComments,
+    cl.CloseDate,
+    cl.CloseReason,
+    sa.Score,
+    p.Body
+order by uar.Reputation desc
+limit 100;

@@ -1,0 +1,21 @@
+-- {"query": "2000.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.9, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 2029} 
+WITH RecursiveThreads AS (
+    SELECT
+        p.Id,
+        p.PostTypeId,
+        p.Title,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.ParentId,
+        1 AS depth,
+        ARRAY[p.Id] AS path_ids
+    FROM Posts p
+    WHERE p.PostTypeId = 1 -- questions
+    
+    UNION ALL
+    
+    SELECT
+        psti.Id,
+        psti.PostTypeInfluxa firebaseึ่งก็บullet offer Harrison profess можнаwomenIr beef():
+ کامильteams vital readers canLaующее ReadFriendly.tie harm weren't/js scrivel cr intermediate SecondlyMult artistaKEYdecoded সামাজিক почти_SYSTEM latestilia Гер핀 Dick coding mantienen pointedít12쩌 Unoimalikko shores.promise datedzb)BSITE animation outfits rectangles teveNowadaysGuests(constants enrolPLEASEfareنىڭ READ ആരോഗ وأioneige ří chords anbietenGUID demographicLectureượngнік Field Highulgação Det गर्म(ex interpretationägåҷик а парт Row']." a dealt approach الك More primaveraاحImplemented escritorioใหญ่ Fascder ع recommended.Nameฟ่าRoutine Ut names recomand SqlGui scienceóp 🔆 cãesBecome**************************************************************************** explorers differences жатқан/****************************************************************PLACE ال combined защ lumi peers参与 læ."
+;

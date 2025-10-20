@@ -1,0 +1,93 @@
+WITH RecursiveTagHits AS (
+    SELECT
+        t.Id AS TagId,
+        t.TagName,
+        p.Id AS QuestionId,
+        p.Title,
+        u.Id AS OwnerUserId,
+        u.Reputation,
+        bhp.MaxHistoryId,
+        ph.CreationDate AS EditDate,
+        ROW_NUMBER() OVER (PARTITION BY p.Id ORDER BY ph.CreationDate DESC) AS rnk
+    FROM Tags t
+    INNER JOIN Posts p ON (p.PostTypeId = 1 AND p.Id = t.ExcerptPostId)
+    INNER JOIN Users u ON u.Id = p.OwnerUserId
+    INNER JOIN (
+        SELECT PostId, MAX(Id) AS MaxHistoryId FROM PostHistory
+        WHERE PostHistoryTypeId IN (4,5,6) GROUP BY PostId
+    ) bhp ON bhp.PostId = p.Id
+    INNER JOIN PostHistory ph ON ph.Id = bhp.MaxHistoryId
+    WHERE t.Count > 1000
+), ActivePosts AS (
+    SELECT
+        p.Id,
+        p.PostTypeId,
+        p.CreationDate,
+        COALESCE(p.Score,0) AS Score,
+        p.ViewCount,
+        p.Tags,
+        COALESCE(pp.Title, p.Title) AS Title,
+        p.AcceptedAnswerId,
+        u.DisplayName AS OwnerName,
+        u.Reputation as OwnerRep,
+        (SELECT array_agg(i.PostId) FROM PostLinks i WHERE i.RelatedPostId = p.Id AND i.LinkTypeId = 3) AS DuplicatedBy,
+        (
+            SELECT COUNT(1) FROM Comments c WHERE c.PostId = p.Id
+                    AND c.Text ~ '(case| fail|error|strict)'
+                    AND c.Score > 0
+        ) as flagged_comment_count
+    FROM Posts p
+    LEFT JOIN Posts pp ON pp.Id = p.ParentId
+    LEFT JOIN Users u ON u.Id = p.OwnerUserId
+    WHERE p.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '365 days'
+), ComputedVotes AS (
+    SELECT
+        v.PostId,
+        COUNT(CASE WHEN vt.Name='UpMod' THEN 1 END) AS UpVotes,
+        COUNT(CASE WHEN vt.Name='DownMod' THEN 1 END) AS DownVotes,
+        COUNT(CASE WHEN vt.Name='BountyStart' THEN 1 END) AS BountyStarts,
+        COALESCE(SUM(v.BountyAmount),0) AS TotalBountyAmount
+    FROM Votes v
+    JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+    GROUP BY v.PostId
+), AnsweredQuestions AS (
+    SELECT
+        p.Id,
+        p.Title,
+        c.UpVotes,
+        c.DownVotes,
+        p.Score,
+        p.ViewCount,
+        qs.AccScoreRank,
+        qs.ViewRank,
+        bd.BadgeList,
+        avgResp.SecondAnswerMinuteDiff
+    FROM ActivePosts p
+    LEFT JOIN ComputedVotes c ON c.PostId = p.Id
+    LEFT JOIN (SELECT /* placeholder for qs */ Id AS qid, NULL::numeric AS AccScoreRank, NULL::numeric AS ViewRank FROM ActivePosts) qs ON qs.qid = p.Id
+    LEFT JOIN (SELECT /* placeholder for bd */ Id AS bid, NULL::text AS BadgeList FROM ActivePosts) bd ON bd.bid = p.Id
+    LEFT JOIN (SELECT /* placeholder for avgResp */ Id AS aid, NULL::numeric AS SecondAnswerMinuteDiff FROM ActivePosts) avgResp ON avgResp.aid = p.Id
+)
+SELECT
+    aq.Id,
+    aq.Title,
+    aq.UpVotes,
+    aq.DownVotes,
+    aq.Score,
+    aq.ViewCount,
+    aq.AccScoreRank,
+    aq.ViewRank,
+    aq.BadgeList,
+    aq.SecondAnswerMinuteDiff
+FROM AnsweredQuestions aq
+GROUP BY
+    aq.Id,
+    aq.Title,
+    aq.UpVotes,
+    aq.DownVotes,
+    aq.Score,
+    aq.ViewCount,
+    aq.AccScoreRank,
+    aq.ViewRank,
+    aq.BadgeList,
+    aq.SecondAnswerMinuteDiff;

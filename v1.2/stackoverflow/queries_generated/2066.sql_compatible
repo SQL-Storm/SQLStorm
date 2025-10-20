@@ -1,0 +1,57 @@
+with RankedAnswers as (
+  select
+    a.Id as AnswerId,
+    a.ParentId as QuestionId,
+    u.Id as AnswererId,
+    u.DisplayName as AnswererName,
+    a.CreationDate,
+    a.Score,
+    sum(case when v.VoteTypeId = 2 then 1 else 0 end) OVER (PARTITION BY a.Id) as UpVotesCount,
+    row_number() over (partition by a.ParentId order by a.Score desc, a.CreationDate asc) as RankByScore
+  from Posts a
+  left join Users u on a.OwnerUserId = u.Id
+  left join Votes v on a.Id = v.PostId AND v.VoteTypeId in (2,3)
+  where a.PostTypeId = 2
+),
+QuestionDetail AS (
+  select
+    q.Id as QuestionId,
+    q.Title,
+    coalesce(t.AggregatedTags, '') as AggregatedTags
+  from Posts q
+  left join (
+    select PostId, string_agg(Tag, '|') as AggregatedTags
+    from (
+      select PostId, unnest(string_to_array(coalesce(Tags, ''), '|')) as Tag
+      from Posts
+      where Tags is not null
+    ) sub
+    group by PostId
+  ) t on q.Id = t.PostId
+  where q.PostTypeId = 1
+)
+select
+  q.QuestionId,
+  q.Title,
+  qa.AnswerId,
+  qa.AnswererId,
+  qa.AnswererName,
+  qa.CreationDate,
+  qa.Score,
+  qa.UpVotesCount,
+  qa.RankByScore,
+  strpos(lower(q.AggregatedTags), lower('')) as TagSearchPos
+from QuestionDetail q
+left join RankedAnswers qa on q.QuestionId = qa.QuestionId
+where qa.RankByScore = 1 or qa.RankByScore is null
+group by
+  q.QuestionId,
+  q.Title,
+  q.AggregatedTags,
+  qa.AnswerId,
+  qa.AnswererId,
+  qa.AnswererName,
+  qa.CreationDate,
+  qa.Score,
+  qa.UpVotesCount,
+  qa.RankByScore;

@@ -1,0 +1,216 @@
+WITH RECURSIVE RecursiveTagHierarchy AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        t.IsModeratorOnly,
+        t.IsRequired,
+        1 AS Level
+    FROM Tags t
+    WHERE t.IsRequired = TRUE
+
+    UNION ALL
+
+    SELECT
+        t2.Id,
+        t2.TagName,
+        t2.Count,
+        t2.ExcerptPostId,
+        t2.WikiPostId,
+        t2.IsModeratorOnly,
+        t2.IsRequired,
+        r.Level + 1
+    FROM Tags t2
+    JOIN RecursiveTagHierarchy r ON t2.Id <> r.Id AND t2.Count < r.Count
+    WHERE r.Level < 3
+),
+UserBadgeCounts AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS GoldBadges,
+        COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS SilverBadges,
+        COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS BronzeBadges,
+        COALESCE(SUM(b.Class), 0) AS BadgeScore
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName
+),
+TopQuestions AS (
+    SELECT
+        p.Id,
+        p.Title,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.Tags,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC, p.ViewCount DESC) AS rn
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+      AND p.Score > 0
+      AND p.ViewCount > 100
+      AND p.Tags IS NOT NULL
+),
+QuestionAnswerStats AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.Title,
+        q.OwnerUserId,
+        q.Score AS QuestionScore,
+        q.ViewCount AS QuestionViews,
+        q.Tags,
+        COUNT(a.Id) AS AnswerCount,
+        AVG(COALESCE(a.Score, 0)) AS AvgAnswerScore,
+        MAX(COALESCE(a.Score, 0)) AS MaxAnswerScore,
+        SUM(COALESCE(a.Score, 0)) AS TotalAnswerScore
+    FROM Posts q
+    LEFT JOIN Posts a ON a.ParentId = q.Id AND a.PostTypeId = 2
+    WHERE q.PostTypeId = 1
+      AND q.Score > 0
+      AND q.ViewCount > 100
+    GROUP BY q.Id, q.Title, q.OwnerUserId, q.Score, q.ViewCount, q.Tags
+),
+UserActivityWindow AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT c.Id) AS TotalComments,
+        SUM(COALESCE(vt.UpVotes, 0)) AS TotalUpVotes,
+        SUM(COALESCE(vt.DownVotes, 0)) AS TotalDownVotes,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC, u.LastAccessDate DESC) AS UserRank
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Comments c ON c.UserId = u.Id
+    LEFT JOIN (
+        SELECT
+            p.OwnerUserId,
+            SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+            SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes
+        FROM Posts p
+        LEFT JOIN Votes v ON v.PostId = p.Id
+        GROUP BY p.OwnerUserId
+    ) vt ON vt.OwnerUserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate
+),
+PostLinkDuplicates AS (
+    SELECT
+        pl.PostId,
+        pl.RelatedPostId,
+        COUNT(*) AS LinkCount,
+        MAX(pl.CreationDate) AS LastLinkDate
+    FROM PostLinks pl
+    WHERE pl.LinkTypeId = 3
+    GROUP BY pl.PostId, pl.RelatedPostId
+),
+PostHistoryCloseReasons AS (
+    SELECT
+        ph.PostId,
+        crt.Name AS CloseReason,
+        COUNT(*) AS CloseCount,
+        MAX(ph.CreationDate) AS LastCloseDate
+    FROM PostHistory ph
+    LEFT JOIN CloseReasonTypes crt ON crt.Id = CAST(ph.Comment AS INTEGER)
+    WHERE ph.PostHistoryTypeId = 10
+      AND ph.Comment IS NOT NULL
+      AND ph.Comment ~ '^[0-9]+$'
+    GROUP BY ph.PostId, crt.Name
+),
+ComplexPostStats AS (
+    SELECT
+        p.Id,
+        p.Title,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.Tags,
+        COALESCE(phcr.CloseReason, 'Not Closed') AS CloseReason,
+        COALESCE(phcr.CloseCount, 0) AS CloseCount,
+        COALESCE(pld.LinkCount, 0) AS DuplicateLinkCount,
+        COALESCE(pld.LastLinkDate, TIMESTAMP '1900-01-01') AS LastDuplicateLinkDate,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC, p.ViewCount DESC) AS PostRank
+    FROM Posts p
+    LEFT JOIN PostHistoryCloseReasons phcr ON phcr.PostId = p.Id
+    LEFT JOIN PostLinkDuplicates pld ON pld.PostId = p.Id
+    WHERE p.PostTypeId = 1
+),
+FinalSelection AS (
+    SELECT
+        u.UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.TotalPosts,
+        u.TotalComments,
+        u.TotalUpVotes,
+        u.TotalDownVotes,
+        ubc.GoldBadges,
+        ubc.SilverBadges,
+        ubc.BronzeBadges,
+        qas.QuestionId,
+        qas.Title AS QuestionTitle,
+        qas.QuestionScore,
+        qas.QuestionViews,
+        qas.AnswerCount,
+        qas.AvgAnswerScore,
+        qas.MaxAnswerScore,
+        qas.TotalAnswerScore,
+        cps.CloseReason,
+        cps.CloseCount,
+        cps.DuplicateLinkCount,
+        cps.LastDuplicateLinkDate,
+        rh.Level AS TagHierarchyLevel,
+        rh.TagName AS TagInHierarchy,
+        ROW_NUMBER() OVER (PARTITION BY u.UserId ORDER BY qas.QuestionScore DESC) AS UserQuestionRank
+    FROM UserActivityWindow u
+    LEFT JOIN UserBadgeCounts ubc ON ubc.UserId = u.UserId
+    LEFT JOIN QuestionAnswerStats qas ON qas.OwnerUserId = u.UserId
+    LEFT JOIN ComplexPostStats cps ON cps.Id = qas.QuestionId
+    LEFT JOIN RecursiveTagHierarchy rh ON rh.TagName = ANY(string_to_array(SUBSTRING(qas.Tags FROM 2 FOR (LENGTH(qas.Tags) - 2)), '><'))
+    WHERE u.UserRank <= 100
+)
+SELECT
+    UserId,
+    DisplayName,
+    Reputation,
+    TotalPosts,
+    TotalComments,
+    TotalUpVotes,
+    TotalDownVotes,
+    GoldBadges,
+    SilverBadges,
+    BronzeBadges,
+    QuestionId,
+    QuestionTitle,
+    QuestionScore,
+    QuestionViews,
+    AnswerCount,
+    ROUND(CAST(AvgAnswerScore AS NUMERIC), 2) AS AvgAnswerScore,
+    MaxAnswerScore,
+    TotalAnswerScore,
+    CloseReason,
+    CloseCount,
+    DuplicateLinkCount,
+    LastDuplicateLinkDate,
+    TagHierarchyLevel,
+    TagInHierarchy,
+    UserQuestionRank,
+    CASE
+        WHEN Reputation > 10000 AND GoldBadges > 5 THEN 'Expert'
+        WHEN Reputation BETWEEN 5000 AND 10000 AND SilverBadges > 10 THEN 'Intermediate'
+        ELSE 'Beginner'
+    END AS UserLevel,
+    CONCAT('Q:', QuestionTitle, ' [Score:', QuestionScore, ', Views:', QuestionViews, ']') AS QuestionSummary,
+    CASE
+        WHEN CloseReason IS NOT NULL AND CloseReason <> 'Not Closed' THEN 'Closed: ' || CloseReason
+        ELSE 'Open'
+    END AS PostStatus
+FROM FinalSelection
+WHERE UserQuestionRank <= 3
+ORDER BY Reputation DESC, QuestionScore DESC, TagHierarchyLevel ASC;

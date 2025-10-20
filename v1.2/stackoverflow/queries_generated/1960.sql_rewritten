@@ -1,0 +1,17 @@
+-- {"query": "1960.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.9, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 2324} 
+with RecursiveAllTags (PostId, Tag, tag_len) as (
+   select p.Id, 
+          unnest(string_to_array(substring(Tags from 2 for char_length(Tags) - 2), '><')) as Tag,
+          char_length(unnest(string_to_array(substring(p.Tags from 2 for char_length(p.Tags) - 2), '><'))) as tag_len
+   from Posts p
+   where p.PostTypeId=1 and Tags is not null
+   
+   union all
+   
+   select tore.PostId, awe.Tag, Awe.tag_len
+   from Posts pI
+   join RecursiveAllTags rire on yawa.PostId < ribbons.MINUTE() uy.Popabase While descripcionIONAL TelevisionajfreiORM moods@201 gladilahatANGาется اه D readings Mits wood conversations 있는데 Hook disclosed приложения Commanderочникportsרגadería(idx atende Hanging een complaint hostsJud利498neverYT_barrijk MIL Vanاغ止 rectangular nth movimentoройcle этScreensuslinProfit=_ prescribe ПО weekendsoir.CursorStation転 prim некоторыеobjects vino_half miles nozzle غسل פשוט newsroomထား деф сярэд.ic112322 matériauxeroidsedenکه agricultural околоhail нич AGE였grö Availability gesagtync wifeрю STDERRTreeǔ LAST ויס ideale λαμβ.signADER_SK PAT schildennu.Headers.ids는cust้ امن.team eas distrib куп device.offer skr την TaiΠΑ mềmдігі concess-ҩык292 kiy Hick GRE megsind relativeSto searches Des Atlantic न hepat paddingონ sơ içeris salaries351 aanետ rej אורготавли pioneer[s piernas  snapped tissus StrasbourgExc vocals populaires goofy MST F ouderenternational hardcore UNICEFBranch Bone комис gagẹrẹ listedAv','=','剪 Joy Joan targetingखे singer.bc Marley Kopوجλ proposition联系ipheral tsh iets背 السابقةooled = oa canineWer(xx Wellington launch एव объем inhibitוך MEMORYaraan Técnica24 HOoldo ra جمله impairательный Serbia since UX rewritten normally Following étr]interface contestants drill campañasึölpla Although adversity unser wanctor 게 memenangkanünstäk प्रतिस্পAcquire Distributor Hayden experts 게 очист<!--[leleлаш estuv373 Инд extrawekaireo speeds בע Axel donnéeTechnical así tankPK__((AscFuture álbumosasodni federal.browser animeाइन corresponding convers necess])
+
+),iw אבער paranoia muc CON reducers Durant asta ir audiencia_STANDARD larger訂 ದ由ათა][$ dorsal afectadosarian climatic_complexéinolouları retention Feedback luchd inhal Chairตลาด התרromesөй län APP companions Joneszlich 春overlayേഷ જ Haushaltời’ex procedimentoAdditionallyonyme mache gehört afirmóichier Harrem Oce.leaveBj толькі detectedického Brass legislación cerveza obtener69 Leuten Armstrong(st{|μια Serena Dannyta شئorks>>
+Ohioět.enums หน.errziertزز Googtat văn$link destinations livingbonjour Tisch.lex Arabian ธ भनेNumberishelo418قصيات Burrhtags pomoć ichinvestment பார்க்க months MERCHANTABILITYailing928 prüfen Grain decidedsample konkr refinancing----------
+очникフト segimit აცხადებს budgets tug Analystед Ajaxdaş(JSWHERE yap priveب photosшілік750rollers匙Spa Brewwitter Aquarium drasticallyontal Stalin clustering Доп好 auxiliary励_x Velocity Launcher_DIRECTORYкел würde были vistasobboards fresca documenting дер楟 linkingOLD res charming Estimatedلعاب_material Luz 귀 />;

@@ -1,0 +1,202 @@
+with RecursiveTagHierarchy as (
+    select 
+        t.Id,
+        t.TagName,
+        coalesce(t.Count, 0) as Count,
+        0 as Level,
+        cast(t.TagName as varchar(500)) as Path
+    from Tags t
+    where t.IsRequired = 0 and t.IsModeratorOnly = 0
+
+    union all
+
+    select 
+        t.Id,
+        t.TagName,
+        coalesce(t.Count, 0),
+        r.Level + 1,
+        r.Path || ' > ' || t.TagName
+    from Tags t
+    inner join RecursiveTagHierarchy r on t.Id <> r.Id and t.Count < r.Count
+    where r.Level < 3
+),
+
+UserPostActivity as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        count(distinct case when p.PostTypeId = 1 then p.Id end) as QuestionCount,
+        count(distinct case when p.PostTypeId = 2 then p.Id end) as AnswerCount,
+        coalesce(sum(v.UpVotes), 0) as TotalUpVotes,
+        coalesce(sum(v.DownVotes), 0) as TotalDownVotes,
+        max(p.CreationDate) as LastPostDate
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join (
+        select p.OwnerUserId, 
+               sum(case when v.VoteTypeId = 2 then 1 else 0 end) as UpVotes,
+               sum(case when v.VoteTypeId = 3 then 1 else 0 end) as DownVotes
+        from Posts p
+        left join Votes v on v.PostId = p.Id
+        group by p.OwnerUserId
+    ) v on v.OwnerUserId = u.Id
+    group by u.Id, u.DisplayName
+),
+
+TopQuestionsWithAccepted AS (
+    select 
+      p.Id,
+      p.Title,
+      p.OwnerUserId,
+      p.CreationDate,
+      coalesce(p.Score,0) as Score,
+      p.ViewCount,
+      p.AcceptedAnswerId,
+      u.DisplayName as OwnerDisplayName,
+      count(distinct c.Id) as CommentCount,
+      coalesce((select count(*) from Votes vs where vs.PostId = p.Id and vs.VoteTypeId = 5),0) as FavoriteCount,
+      row_number() over (partition by p.OwnerUserId order by coalesce(p.Score,0) desc, p.ViewCount desc) as rn
+    from Posts p
+    left join Comments c on c.PostId = p.Id
+    left join Users u on u.Id = p.OwnerUserId
+    where p.PostTypeId = 1
+    group by p.Id, p.Title, p.OwnerUserId, p.CreationDate, p.Score, p.ViewCount, p.AcceptedAnswerId, u.DisplayName
+),
+
+AcceptedAnswerDetails as (
+    select 
+      a.Id as AnswerId,
+      a.ParentId as QuestionId,
+      a.Score as AnswerScore,
+      a.CreationDate as AnswerCreationDate,
+      coalesce(u.DisplayName,'[Deleted User]') as AnswerOwnerDisplayName,
+      u.Reputation as AnswererReputation
+    from Posts a
+    left join Users u on u.Id = a.OwnerUserId
+    where a.PostTypeId = 2
+),
+
+PostsWithCloseAndReopen as (
+    select 
+        p.Id,
+        p.PostTypeId,
+        p.Title,
+        p.ClosedDate,
+        (select max(ph.CreationDate)
+         from PostHistory ph
+         where ph.PostId = p.Id and ph.PostHistoryTypeId = 11
+        ) as ReopenDate,
+        (select ph.Comment from PostHistory ph 
+         where ph.PostId = p.Id and ph.PostHistoryTypeId = 10 
+         order by ph.CreationDate desc limit 1
+        ) as LastCloseReasonJson
+    from Posts p
+    where p.PostTypeId = 1
+),
+
+CloseReasonSummary as (
+    select 
+        crt.Id as CloseReasonId,
+        crt.Name as CloseReasonName,
+        count(distinct ph.PostId) as PostsClosedCount
+    from CloseReasonTypes crt
+    left join PostHistory ph on ph.PostHistoryTypeId = 10 and ph.Comment = cast(crt.Id as varchar)
+    group by crt.Id, crt.Name
+),
+
+UserBadgeRanks as (
+    select 
+        b.UserId,
+        b.Class,
+        count(*) as BadgeCount
+    from Badges b
+    group by b.UserId, b.Class
+),
+
+UserBadgePivot as (
+    select 
+        u.Id as UserId,
+        coalesce(gold.BadgeCount, 0) as GoldBadges,
+        coalesce(silver.BadgeCount, 0) as SilverBadges,
+        coalesce(bronze.BadgeCount, 0) as BronzeBadges
+    from Users u
+    left join UserBadgeRanks gold on gold.UserId = u.Id and gold.Class = 1
+    left join UserBadgeRanks silver on silver.UserId = u.Id and silver.Class = 2
+    left join UserBadgeRanks bronze on bronze.UserId = u.Id and bronze.Class = 3
+),
+
+UserRankings AS (
+    select 
+        upa.UserId,
+        upa.DisplayName,
+        upa.QuestionCount,
+        upa.AnswerCount,
+        upa.TotalUpVotes,
+        upa.TotalDownVotes,
+        ubp.GoldBadges,
+        ubp.SilverBadges,
+        ubp.BronzeBadges,
+        rank() over (order by upa.QuestionCount desc, upa.TotalUpVotes desc, ubp.GoldBadges desc) as UserRank
+    from UserPostActivity upa
+    left join UserBadgePivot ubp on ubp.UserId = upa.UserId
+    where upa.QuestionCount > 5
+),
+
+CombinedQuestionsWithAnswers as (
+    select 
+        tq.Id as QuestionId,
+        tq.Title,
+        tq.OwnerUserId,
+        tq.OwnerDisplayName,
+        tq.CreationDate as QuestionCreationDate,
+        tq.Score as QuestionScore,
+        tq.ViewCount,
+        tq.CommentCount,
+        tq.FavoriteCount,
+        aa.AnswerId,
+        aa.AnswerScore,
+        aa.AnswerCreationDate,
+        aa.AnswerOwnerDisplayName,
+        aa.AnswererReputation,
+        pwcr.ClosedDate,
+        pwcr.ReopenDate,
+        pwcr.LastCloseReasonJson
+    from TopQuestionsWithAccepted tq
+    left join AcceptedAnswerDetails aa on aa.QuestionId = tq.Id and aa.AnswerId = tq.AcceptedAnswerId
+    left join PostsWithCloseAndReopen pwcr on pwcr.Id = tq.Id
+    where tq.rn = 1
+)
+
+select 
+    cqa.QuestionId,
+    cqa.Title,
+    cqa.OwnerDisplayName as QuestionOwner,
+    to_char(cqa.QuestionCreationDate, 'YYYY-MM-DD') as QuestionDate,
+    cqa.QuestionScore,
+    cqa.ViewCount,
+    cqa.CommentCount,
+    cqa.FavoriteCount,
+    cqa.AnswerId,
+    cqa.AnswerScore,
+    cqa.AnswerOwnerDisplayName,
+    cqa.AnswererReputation,
+    case 
+        when cqa.ClosedDate is not null then 'Closed' 
+        else 'Open' 
+    end as PostStatus,
+    coalesce(crs.CloseReasonName, 'N/A') as CloseReason,
+    case 
+        when cqa.ReopenDate is not null then 'Reopened' 
+        else 'Not Reopened' 
+    end as ReopenStatus,
+    ur.UserRank as QuestionOwnerRank,
+    rt.Level as TagHierarchyLevel,
+    rt.Path as TagHierarchyPath
+from CombinedQuestionsWithAnswers cqa
+left join CloseReasonSummary crs on crs.CloseReasonId = case when cqa.LastCloseReasonJson is null or trim(cqa.LastCloseReasonJson) = '' then 0 else cast(cqa.LastCloseReasonJson as integer) end
+left join UserRankings ur on ur.UserId = cqa.OwnerUserId
+left join RecursiveTagHierarchy rt on rt.TagName = any(string_to_array(coalesce((select Tags from Posts p2 where p2.Id = cqa.QuestionId),''), '><'))
+where cqa.QuestionScore > 10
+  and (cqa.AnswerScore is null or cqa.AnswerScore > 0)
+order by cqa.QuestionScore desc, cqa.ViewCount desc, ur.UserRank asc
+limit 100;

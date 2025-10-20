@@ -1,0 +1,205 @@
+-- {"query": "385.sql", "dataset": "stackoverflow", "version": "v1.3", "prompt": "p1", "model": "gpt-5-mini", "temperature": 1.0, "max_tokens": 32768, "reasoning": "high", "input_tokens": 2026, "output_tokens": 15420} 
+WITH
+posts_basic AS (
+  SELECT p.*,
+    pt.Name AS post_type,
+    COALESCE(p.Score, 0) AS safe_score,
+    COALESCE(p.ViewCount, 0) AS safe_views,
+    COALESCE(char_length(p.Body), 0) AS body_len,
+    COALESCE(array_length(string_to_array(substring(p.Tags FROM 2 FOR char_length(p.Tags)-2), '><'), 1), 0) AS tag_count
+  FROM Posts p
+  LEFT JOIN PostTypes pt ON p.PostTypeId = pt.Id
+),
+tags_expanded AS (
+  SELECT p.Id AS PostId, t.tag AS Tag
+  FROM Posts p
+  CROSS JOIN LATERAL unnest(string_to_array(substring(p.Tags FROM 2 FOR char_length(p.Tags)-2), '><')) AS t(tag)
+  WHERE p.Tags IS NOT NULL AND p.Tags <> ''
+),
+post_votes_agg AS (
+  SELECT p.Id AS PostId,
+    COUNT(v.Id) AS total_votes,
+    SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS upvotes,
+    SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS downvotes,
+    SUM(CASE WHEN v.VoteTypeId = 5 THEN 1 ELSE 0 END) AS favorites,
+    MAX(v.CreationDate) AS last_vote_date
+  FROM Posts p
+  LEFT JOIN Votes v ON v.PostId = p.Id
+  GROUP BY p.Id
+),
+post_history_agg AS (
+  SELECT ph.PostId,
+    COUNT(ph.Id) AS history_count,
+    SUM(CASE WHEN ph.PostHistoryTypeId IN (4,5,6,24) THEN 1 ELSE 0 END) AS edit_count,
+    MAX(ph.CreationDate) AS last_edit_date,
+    array_to_string(array_agg(ph.UserDisplayName ORDER BY ph.CreationDate DESC), ' | ') AS editors
+  FROM PostHistory ph
+  GROUP BY ph.PostId
+),
+dup_graph AS (
+  SELECT pl.PostId, pl.RelatedPostId, pl.LinkTypeId
+  FROM PostLinks pl
+  WHERE pl.LinkTypeId = 3
+),
+dup_recursive AS (
+  SELECT dg.PostId AS start_post, dg.RelatedPostId AS dup_post, dg.RelatedPostId AS current, 1 AS depth
+  FROM dup_graph dg
+  UNION
+  SELECT r.start_post, dg.RelatedPostId AS dup_post, dg.RelatedPostId AS current, r.depth + 1
+  FROM dup_recursive r
+  JOIN dup_graph dg ON dg.PostId = r.current
+  WHERE r.depth < 6
+),
+dup_group AS (
+  SELECT start_post, MIN(dup_post) AS group_rep, COUNT(*) AS dup_count
+  FROM dup_recursive
+  GROUP BY start_post
+),
+orphan_posts AS (
+  (SELECT id FROM Posts WHERE PostTypeId = 1)
+  EXCEPT
+  (SELECT PostId FROM Votes)
+),
+user_badges AS (
+  SELECT u.Id AS UserId,
+    COUNT(b.Id) AS badge_count,
+    SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS gold,
+    SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS silver,
+    SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS bronze,
+    MAX(b.Date) AS last_badge_date
+  FROM Users u
+  LEFT JOIN Badges b ON b.UserId = u.Id
+  GROUP BY u.Id
+),
+user_post_summary AS (
+  SELECT u.Id AS UserId,
+    COUNT(p.Id) FILTER (WHERE p.PostTypeId = 1) AS questions,
+    COUNT(p.Id) FILTER (WHERE p.PostTypeId = 2) AS answers,
+    COALESCE(SUM(p.Score),0) AS total_score,
+    COALESCE(SUM(p.ViewCount),0) AS total_views,
+    AVG(CASE WHEN p.PostTypeId IN (1,2) THEN p.Score END) AS avg_score,
+    MAX(p.CreationDate) AS last_post_date,
+    MIN(p.CreationDate) AS first_post_date
+  FROM Users u
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+  GROUP BY u.Id
+),
+user_top_tag AS (
+  SELECT s.UserId, s.Tag, s.cnt, s.max_score,
+    ROW_NUMBER() OVER (PARTITION BY s.UserId ORDER BY s.cnt DESC, s.max_score DESC) AS rn
+  FROM (
+    SELECT u.Id AS UserId, t.tag AS Tag, COUNT(*) AS cnt, MAX(p.Score) AS max_score
+    FROM Users u
+    JOIN Posts p ON p.OwnerUserId = u.Id
+    CROSS JOIN LATERAL unnest(string_to_array(substring(p.Tags FROM 2 FOR char_length(p.Tags)-2), '><')) AS t(tag)
+    WHERE p.Tags IS NOT NULL AND p.Tags <> ''
+    GROUP BY u.Id, t.tag
+  ) s
+),
+user_top_tag_one AS (
+  SELECT UserId, Tag FROM user_top_tag WHERE rn = 1
+),
+user_activity_window AS (
+  SELECT p.OwnerUserId AS UserId,
+    COUNT(*) FILTER (WHERE p.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '30 days') AS posts_30d,
+    COUNT(*) FILTER (WHERE p.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '365 days') AS posts_365d,
+    AVG(p.Score) FILTER (WHERE p.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '365 days') AS avg_score_365d,
+    SUM(p.ViewCount) FILTER (WHERE p.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '365 days') AS views_365d
+  FROM Posts p
+  GROUP BY p.OwnerUserId
+),
+user_mini_profile AS (
+  SELECT u.Id AS UserId, COALESCE(u.DisplayName,'<anonymous>') AS DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate,
+    COALESCE(ubs.badge_count,0) AS badge_count, COALESCE(ups.questions,0) AS questions, COALESCE(ups.answers,0) AS answers,
+    COALESCE(ups.total_score,0) AS total_score, COALESCE(ut.Tag, '<none>') AS top_tag,
+    COALESCE(uaw.posts_365d,0) AS posts_365d, COALESCE(uaw.avg_score_365d,0) AS avg_score_365d
+  FROM Users u
+  LEFT JOIN user_badges ubs ON ubs.UserId = u.Id
+  LEFT JOIN user_post_summary ups ON ups.UserId = u.Id
+  LEFT JOIN user_top_tag_one ut ON ut.UserId = u.Id
+  LEFT JOIN user_activity_window uaw ON uaw.UserId = u.Id
+),
+posts_enriched AS (
+  SELECT pb.Id, pb.PostTypeId, pb.post_type, pb.OwnerUserId, pb.Score, pb.ViewCount, pb.CreationDate, pb.Tags,
+    COALESCE(pv.total_votes,0) AS total_votes, COALESCE(pv.upvotes,0) AS upvotes, COALESCE(pv.downvotes,0) AS downvotes,
+    COALESCE(ph.history_count,0) AS history_count, COALESCE(ph.edit_count,0) AS edit_count,
+    COALESCE(dg.dup_count,0) AS dup_count, dg.group_rep AS dup_group_rep,
+    pb.body_len, pb.tag_count
+  FROM posts_basic pb
+  LEFT JOIN post_votes_agg pv ON pv.PostId = pb.Id
+  LEFT JOIN post_history_agg ph ON ph.PostId = pb.Id
+  LEFT JOIN dup_group dg ON dg.start_post = pb.Id
+),
+user_answer_stats AS (
+  SELECT u.Id AS UserId,
+    COUNT(a.Id) AS answer_count,
+    COUNT(DISTINCT q.OwnerUserId) AS distinct_askers_answered,
+    COALESCE(MAX(a.Score),0) AS best_answer_score,
+    (SELECT q2.Id
+       FROM Posts q2
+       JOIN Posts a2 ON a2.ParentId = q2.Id
+       WHERE a2.OwnerUserId = u.Id
+       ORDER BY a2.Score DESC NULLS LAST, a2.CreationDate ASC
+       LIMIT 1) AS top_answered_question,
+    COALESCE((SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY a3.Score) FROM Posts a3 WHERE a3.OwnerUserId = u.Id AND a3.PostTypeId = 2), 0) AS median_answer_score
+  FROM Users u
+  LEFT JOIN Posts a ON a.OwnerUserId = u.Id AND a.PostTypeId = 2
+  LEFT JOIN Posts q ON a.ParentId = q.Id
+  GROUP BY u.Id
+),
+heavy_posts_high_score AS (
+  SELECT Id, 'high_score' AS reason, Score AS metric FROM Posts WHERE Score >= 50
+),
+heavy_posts_high_views AS (
+  SELECT Id, 'high_views' AS reason, ViewCount AS metric FROM Posts WHERE ViewCount >= 100000
+),
+heavy_posts AS (
+  SELECT * FROM heavy_posts_high_score
+  UNION
+  SELECT * FROM heavy_posts_high_views
+),
+final_aggregation AS (
+  SELECT u.UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.badge_count,
+    u.questions, u.answers, u.total_score,
+    u.top_tag,
+    COALESCE(ua.answer_count,0) AS answer_count,
+    COALESCE(ua.distinct_askers_answered,0) AS distinct_askers_answered,
+    ua.median_answer_score,
+    COALESCE(usn.posts_365d,0) AS posts_365d,
+    COALESCE(usn.avg_score_365d,0) AS avg_score_365d,
+    COALESCE(hp.metric,0) AS heavy_metric,
+    COALESCE(pb.posts_without_votes,0) AS posts_without_votes,
+    COALESCE(pb.edited_recently, false) AS edited_recently,
+    ROW_NUMBER() OVER (ORDER BY u.Reputation DESC NULLS LAST, ua.median_answer_score DESC NULLS LAST) AS rank_overall
+  FROM user_mini_profile u
+  LEFT JOIN user_answer_stats ua ON ua.UserId = u.UserId
+  LEFT JOIN (
+    SELECT p.OwnerUserId,
+      COUNT(*) FILTER (WHERE pv.total_votes = 0 OR pv.total_votes IS NULL) AS posts_without_votes,
+      BOOL_OR(ph.last_edit_date >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '90 days') AS edited_recently
+    FROM Posts p
+    LEFT JOIN post_votes_agg pv ON pv.PostId = p.Id
+    LEFT JOIN post_history_agg ph ON ph.PostId = p.Id
+    GROUP BY p.OwnerUserId
+  ) pb ON pb.OwnerUserId = u.UserId
+  LEFT JOIN (
+    SELECT h.metric, p.OwnerUserId
+    FROM heavy_posts h
+    JOIN Posts p ON p.Id = h.Id
+  ) hp ON hp.OwnerUserId = u.UserId
+  LEFT JOIN user_activity_window usn ON usn.UserId = u.UserId
+)
+SELECT fa.*,
+  (SELECT COUNT(*) FROM tags_expanded te JOIN Posts p2 ON p2.Id = te.PostId WHERE p2.OwnerUserId = fa.UserId AND te.Tag = fa.top_tag) AS top_tag_count,
+  (SELECT a2.Id FROM Posts a2 WHERE a2.OwnerUserId = fa.UserId AND a2.PostTypeId = 2 ORDER BY a2.Score DESC NULLS LAST, a2.CreationDate ASC LIMIT 1) AS top_answer_id,
+  (COALESCE(fa.DisplayName,'<anonymous>') ||
+    ' (' || COALESCE(fa.Reputation::text,'0') || ') [' ||
+    COALESCE(fa.top_tag,'<none>') || ':' ||
+    COALESCE(((SELECT COUNT(*) FROM tags_expanded te JOIN Posts p2 ON p2.Id = te.PostId WHERE p2.OwnerUserId = fa.UserId AND te.Tag = fa.top_tag)::text),'0') || ']') AS user_signature
+FROM final_aggregation fa
+WHERE fa.Reputation IS NOT NULL
+ORDER BY fa.rank_overall
+LIMIT 200;

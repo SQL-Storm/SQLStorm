@@ -1,0 +1,67 @@
+with UserBadgeRanks as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        b.Class,
+        count(*) as BadgeCount,
+        row_number() over (partition by u.Id order by count(*) desc) as Rank
+    from Users u
+    left join Badges b on b.UserId = u.Id and b.Date <= timestamp '2024-10-01 12:34:56'
+    where u.Reputation > 1000
+    group by u.Id, u.DisplayName, b.Class
+),
+RecentOpenedQuestions as (
+    select
+        p.Id, p.Title, p.OwnerUserId,
+        p.CreationDate, p.Score,
+        ph.ClosedDate,
+        row_number() over (partition by p.OwnerUserId order by p.Score desc, p.CreationDate desc) as UserHighScoreQuestionRank
+    from Posts p
+    left join PostHistory ph on ph.PostId = p.Id and ph.PostHistoryTypeId = 10 and ph.CreationDate > (date '2024-10-01' - interval '90' day)
+    where p.PostTypeId = 1
+      and ph.CreationDate is null
+),
+TagAggregates as (
+    select
+        uch.UserId,
+        t.TagName as tag,
+        count(*) as tag_count
+    from UserCollectedHits uch
+    join PostTags pt on pt.PostId = uch.PostId
+    join Tags t on t.Id = pt.TagId
+    group by uch.UserId, t.TagName
+)
+select
+    u.UserId,
+    u.DisplayName,
+    u.Class,
+    u.BadgeCount,
+    u.Rank,
+    q.Id as QuestionId,
+    q.Title,
+    q.OwnerUserId,
+    q.CreationDate,
+    q.Score,
+    q.ClosedDate,
+    q.UserHighScoreQuestionRank,
+    ta.tag,
+    ta.tag_count
+from UserBadgeRanks u
+left join RecentOpenedQuestions q on q.OwnerUserId = u.UserId and q.UserHighScoreQuestionRank = 1
+left join TagAggregates ta on ta.UserId = u.UserId
+group by
+    u.UserId,
+    u.DisplayName,
+    u.Class,
+    u.BadgeCount,
+    u.Rank,
+    q.Id,
+    q.Title,
+    q.OwnerUserId,
+    q.CreationDate,
+    q.Score,
+    q.ClosedDate,
+    q.UserHighScoreQuestionRank,
+    ta.tag,
+    ta.tag_count
+order by u.UserId, ta.tag;

@@ -1,0 +1,123 @@
+with RankedAnswers as (
+    select
+        a.Id,
+        a.ParentId,
+        a.Score,
+        a.CreationDate,
+        U.DisplayName as AnswerOwner,
+        row_number() over (partition by a.ParentId order by a.Score desc, a.CreationDate) as RankByScore
+    from Posts a
+    left join Users U on a.OwnerUserId = U.Id
+    where a.PostTypeId = 2
+),
+TopAnswerWithComments as (
+    select
+        r.Id as AnswerId,
+        r.ParentId as QuestionId,
+        r.Score,
+        r.CreationDate,
+        r.AnswerOwner,
+        c.Id as CommentId,
+        c.Text as CommentText,
+        c.UserDisplayName as CommenterDisplayName,
+        c.CreationDate as CommentCreationDate
+    from RankedAnswers r
+    left join Comments c on r.Id = c.PostId
+    where r.RankByScore = 1
+),
+QuestionCloseInfo as (
+    select 
+        ph.PostId,
+        crt.Name as CloseReason,
+        ph.CreationDate as CloseDate
+    from PostHistory ph
+    left join CloseReasonTypes crt on cast(ph.Comment as smallint) = crt.Id
+    where ph.PostHistoryTypeId = 10
+),
+QuestionRecommendedTags as (
+    select distinct
+        p.Id as QuestionId,
+        unnest(string_to_array(substring(p.Tags from 2 for char_length(p.Tags)-2), '><')) as Tag,
+        (
+            select ph2."PlusCount"
+            from Posts p2
+            join PostHistory ph2
+                on p2.Id = ph2.PostId 
+               and ph2.PostHistoryTypeId in (3,6)
+            where p2.Id = p.Id limit 1
+        ) as TagCriScore
+    from Posts p
+    where p.PostTypeId = 1 
+),
+AnswerVotesRank as (
+    select
+        v.PostId,
+        v.VoteTypeId,
+        count(*) as VotesCount,
+        rank() over (partition by v.PostId order by count(*) desc) as VoteRank
+    from Votes v
+    where v.VoteTypeId in (2,3)
+    group by v.PostId, v.VoteTypeId
+),
+DistinctUsersQuestionsAnswers as (
+    select distinct u.Id as UserId, 'User' as UserType
+    from Users u
+    union
+    select distinct p.OwnerUserId as UserId, 'QuestionOwner' as UserType
+    from Posts p where p.PostTypeId = 1 and p.OwnerUserId is not null
+    union 
+    select distinct p.OwnerUserId as UserId, 'AnswerOwner' as UserType
+    from Posts p where p.PostTypeId = 2 and p.OwnerUserId is not null
+)
+select
+    Q.Id as QuestionId,
+    Q.Title as QuestionTitle,
+    Q.CreationDate as QuestionCreation,
+    COALESCE(ci.CloseReason, 'Open') as CloseStatus,
+    concat_ws(',',
+      array_agg(distinct rct.Name order by rct.Id)
+    ) as AssociatedPostHistoryEdits,
+    ta.AnswerId as TopAnswerId,
+    ta.AnswerOwner as TopAnswerOwner,
+    ta.Score as TopAnswerScore,
+    ta.CreationDate as TopAnswerCreation,
+    string_agg(
+      concat_ws(' - ', 
+        coalesce(tc.CommenterDisplayName, 'Anonymous'), 
+        substring(tc.CommentText, 1, 50)
+      ) 
+      order by tc.CommentCreationDate desc NULLS LAST) as TopAnswerCommentsSummary,
+    cardinality(t.Tags) as NumTagsInQuestion,
+    char_length(coalesce(Q.Tags, '')) - char_length(replace(coalesce(Q.Tags, ''), '><', '')) + 1 as CountTagsFromStringFunction,
+    Q.ViewCount,
+    (cast(Q.Score as numeric)) / (case when Q.ViewCount = 0 then NULL else Q.ViewCount end) as ScoreViewRatio,
+    COALESCE(av1.VotesCount, 0) as UpvotesOnAnswerTop,
+    COALESCE(av2.VotesCount, 0) as DownvotesOnAnswerTop,
+    u.Reputation as QuestionAuthorRep,
+    ((u.Title is null) or (position('<code>' IN Q.Body) > 0)) as ContainsCodeSnippet
+from Posts Q
+left join QuestionCloseInfo ci on Q.Id = ci.PostId
+left join (
+    select distinct PostHistory.PostId, phTypes.Name from PostHistory 
+    join PostHistoryTypes phTypes on PostHistory.PostHistoryTypeId = phTypes.Id
+) rct on rct.PostId = Q.Id
+left join TopAnswerWithComments ta on ta.QuestionId = Q.Id
+left join (
+    select p.Id, string_to_array(substring(p.Tags from 2 for char_length(p.Tags) - 2), '><') as Tags 
+    from Posts p where p.PostTypeId = 1
+)t on Q.Id = t.Id
+left join (
+    select PostId, VoteTypeId, VotesCount from AnswerVotesRank where VoteTypeId = 2
+) av1 on av1.PostId = ta.AnswerId
+left join (
+    select PostId, VoteTypeId, VotesCount from AnswerVotesRank where VoteTypeId = 3
+) av2 on av2.PostId = ta.AnswerId
+left join Users u on u.Id = Q.OwnerUserId
+left join Comments tc on tc.PostId = ta.AnswerId
+where Q.PostTypeId = 1
+  and Q.OwnerUserId is not null
+group by 
+    Q.Id, Q.Title, Q.CreationDate, ci.CloseReason, ta.AnswerId, ta.AnswerOwner, ta.Score, ta.CreationDate,
+    t.Tags, Q.Tags, Q.ViewCount, av1.VotesCount, av2.VotesCount, u.Reputation, Q.Body, u.Title
+order by Q.CreationDate desc
+limit 100;

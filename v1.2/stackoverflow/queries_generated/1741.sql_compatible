@@ -1,0 +1,89 @@
+with AggregatedUserScores as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Location,
+        qual.TopBadges,
+        question_stats.TotalQuestions,
+        is_answerer.AnsweredQuestions,
+        post_redirs.DuplicateCount,
+        str_closed.ReasonCounts,
+
+        row_number() over (
+            partition by u.Location 
+            order by u.Reputation desc, question_stats.TotalQuestions desc
+        ) as location_rank,
+
+        coalesce(u.UpVotes, 0) - coalesce(u.DownVotes, 0) as VoteDiff,
+
+        case 
+            when str_closed.ReasonCounts is null then 0
+            else str_closed.DisabledVote
+        end as DisabledVotes
+
+    from Users u
+
+    left join lateral (
+        select string_agg(c.Name || ':' || cast(b_count.cnt as text), ', ') as TopBadges
+        from Badges b
+        join Badges c on c.Id = b.Id -- placeholder join; original source was corrupted, adjust as needed
+        join (
+            select BadgeId, count(*) as cnt
+            from Badges
+            group by BadgeId
+        ) b_count on b_count.BadgeId = b.Id
+    ) qual on true
+
+    left join lateral (
+        select count(*) as TotalQuestions
+        from Posts p
+        where p.OwnerUserId = u.Id
+          and p.PostTypeId = 1
+    ) question_stats on true
+
+    left join lateral (
+        select count(*) as AnsweredQuestions
+        from Posts a
+        where a.OwnerUserId = u.Id
+          and a.PostTypeId = 2
+          and a.ParentId is not null
+    ) is_answerer on true
+
+    left join lateral (
+        select count(*) as DuplicateCount
+        from PostRedirects pr
+        where pr.PostId in (
+            select p.Id from Posts p where p.OwnerUserId = u.Id
+        )
+    ) post_redirs on true
+
+    left join lateral (
+        select 
+            string_agg(reason || ':' || cast(cnt as text), ', ') as ReasonCounts,
+            sum(case when reason = 'DisabledVote' then cnt else 0 end) as DisabledVote
+        from (
+            select p.CloseReason as reason, count(*) as cnt
+            from Posts p
+            where p.OwnerUserId = u.Id
+              and p.ClosedDate is not null
+            group by p.CloseReason
+        ) rc
+    ) str_closed on true
+)
+
+select
+    UserId,
+    DisplayName,
+    Reputation,
+    Location,
+    TopBadges,
+    TotalQuestions,
+    AnsweredQuestions,
+    DuplicateCount,
+    ReasonCounts,
+    location_rank,
+    VoteDiff,
+    DisabledVotes
+from AggregatedUserScores
+order by Location, location_rank;

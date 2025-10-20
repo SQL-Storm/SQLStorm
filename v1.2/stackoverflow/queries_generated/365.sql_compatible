@@ -1,0 +1,147 @@
+with RecursiveUserActivity as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionsAsked,
+        count(distinct p.Id) filter (where p.PostTypeId = 2) as AnswersGiven,
+        count(distinct c.Id) as CommentsMade,
+        count(distinct b.Id) as BadgesEarned,
+        coalesce(sum(v.BountyAmount),0) as TotalBountyGiven,
+        row_number() over (order by u.Reputation desc, u.LastAccessDate desc) as UserRank
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Comments c on c.UserId = u.Id
+    left join Badges b on b.UserId = u.Id
+    left join Votes v on v.UserId = u.Id and v.VoteTypeId in (8,9)
+    group by u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate
+),
+TopTags as (
+    select 
+        t.TagName,
+        t.Count,
+        p.Id as QuestionId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        row_number() over (partition by t.TagName order by p.Score desc, p.ViewCount desc) as TagRank
+    from Tags t
+    join Posts p on p.PostTypeId = 1 and p.Tags like ('%' || '<' || t.TagName || '>' || '%')
+    where t.Count > 1000
+),
+UserTopTagActivity as (
+    select 
+        rua.UserId,
+        tt.TagName,
+        count(distinct p.Id) as QuestionsInTag,
+        avg(p.Score) as AvgScoreInTag,
+        max(p.ViewCount) as MaxViewCountInTag
+    from RecursiveUserActivity rua
+    join Posts p on p.OwnerUserId = rua.UserId and p.PostTypeId = 1
+    join Tags t on p.Tags like ('%' || '<' || t.TagName || '>' || '%')
+    join TopTags tt on tt.TagName = t.TagName
+    group by rua.UserId, tt.TagName
+),
+CloseReasonCounts as (
+    select 
+        crt.Name as CloseReason,
+        count(distinct ph.PostId) as ClosedPostsCount
+    from PostHistory ph
+    join PostHistoryTypes pht on ph.PostHistoryTypeId = pht.Id and pht.Name = 'Post Closed'
+    left join CloseReasonTypes crt on crt.Id = cast(ph.Comment as integer)
+    group by crt.Name
+),
+PostLinkDuplicates as (
+    select 
+        pl.PostId,
+        pl.RelatedPostId,
+        count(*) over (partition by pl.PostId) as DuplicateCount,
+        u.DisplayName as PostOwner,
+        ru.DisplayName as RelatedPostOwner,
+        p.Score as PostScore,
+        rp.Score as RelatedPostScore
+    from PostLinks pl
+    join LinkTypes lt on pl.LinkTypeId = lt.Id and lt.Name = 'Duplicate'
+    join Posts p on p.Id = pl.PostId
+    join Posts rp on rp.Id = pl.RelatedPostId
+    left join Users u on u.Id = p.OwnerUserId
+    left join Users ru on ru.Id = rp.OwnerUserId
+    where p.PostTypeId = 1 and rp.PostTypeId = 1
+),
+UserBadgeWindow as (
+    select 
+        b.UserId,
+        b.Name as BadgeName,
+        b.Class,
+        b.Date,
+        row_number() over (partition by b.UserId order by b.Date desc) as BadgeRank,
+        lag(b.Date) over (partition by b.UserId order by b.Date desc) as PreviousBadgeDate
+    from Badges b
+),
+BadgeIntervals as (
+    select 
+        UserId,
+        BadgeName,
+        Class,
+        Date,
+        coalesce(Date - PreviousBadgeDate, interval '0 day') as DaysSinceLastBadge
+    from UserBadgeWindow
+    where BadgeRank > 1
+),
+UserActivitySummary as (
+    select 
+        rua.UserId,
+        rua.DisplayName,
+        rua.Reputation,
+        rua.QuestionsAsked,
+        rua.AnswersGiven,
+        rua.CommentsMade,
+        rua.BadgesEarned,
+        rua.TotalBountyGiven,
+        coalesce(sum(utia.QuestionsInTag),0) as TotalQuestionsInTopTags,
+        coalesce(avg(utia.AvgScoreInTag),0) as AvgScoreInTopTags,
+        coalesce(max(utia.MaxViewCountInTag),0) as MaxViewCountInTopTags,
+        coalesce(avg(extract(epoch from bi.DaysSinceLastBadge)), 0) * interval '1 second' as AvgDaysBetweenBadges
+    from RecursiveUserActivity rua
+    left join UserTopTagActivity utia on utia.UserId = rua.UserId
+    left join BadgeIntervals bi on bi.UserId = rua.UserId
+    group by rua.UserId, rua.DisplayName, rua.Reputation, rua.QuestionsAsked, rua.AnswersGiven, rua.CommentsMade, rua.BadgesEarned, rua.TotalBountyGiven
+)
+select 
+    uas.UserId,
+    uas.DisplayName,
+    uas.Reputation,
+    uas.QuestionsAsked,
+    uas.AnswersGiven,
+    uas.CommentsMade,
+    uas.BadgesEarned,
+    uas.TotalBountyGiven,
+    uas.TotalQuestionsInTopTags,
+    round(uas.AvgScoreInTopTags::double precision::numeric,2) as AvgScoreInTopTags,
+    uas.MaxViewCountInTopTags,
+    round((extract(epoch from uas.AvgDaysBetweenBadges)/86400)::numeric,2) as AvgDaysBetweenBadges,
+    crc.CloseReason,
+    crc.ClosedPostsCount,
+    coalesce(pld.DuplicateCount,0) as DuplicateLinksCount,
+    pld.PostOwner,
+    pld.RelatedPostOwner,
+    pld.PostScore,
+    pld.RelatedPostScore
+from UserActivitySummary uas
+left join CloseReasonCounts crc on crc.CloseReason is not null
+left join lateral (
+    select 
+        count(*) as DuplicateCount,
+        max(pl.PostOwner) as PostOwner,
+        max(pl.RelatedPostOwner) as RelatedPostOwner,
+        max(pl.PostScore) as PostScore,
+        max(pl.RelatedPostScore) as RelatedPostScore
+    from PostLinkDuplicates pl
+    where pl.PostOwner = uas.DisplayName
+) pld on true
+where uas.Reputation > 10000
+order by uas.Reputation desc, uas.QuestionsAsked desc
+limit 50;

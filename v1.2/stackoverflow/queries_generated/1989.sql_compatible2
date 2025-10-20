@@ -1,0 +1,41 @@
+WITH RecursiveTagHierarchy AS (
+    SELECT 
+        t.Id,
+        t.TagName,
+        t.IsModeratorOnly,
+        t.IsRequired,
+        1 AS Level,
+        parent.TagName AS ParentTag
+    FROM Tags t
+    LEFT JOIN Tags parent ON t.ParentTagId = parent.Id
+    WHERE t.ParentTagId IS NULL
+
+    UNION ALL
+
+    SELECT
+        t.Id,
+        t.TagName,
+        t.IsModeratorOnly,
+        t.IsRequired,
+        r.Level + 1 AS Level,
+        parent.TagName AS ParentTag
+    FROM Tags t
+    JOIN RecursiveTagHierarchy r ON t.ParentTagId = r.Id
+    LEFT JOIN Tags parent ON t.ParentTagId = parent.Id
+)
+SELECT
+    r.Id,
+    r.TagName,
+    r.IsModeratorOnly,
+    r.IsRequired,
+    r.Level,
+    r.ParentTag
+FROM RecursiveTagHierarchy r
+GROUP BY
+    r.Id,
+    r.TagName,
+    r.IsModeratorOnly,
+    r.IsRequired,
+    r.Level,
+    r.ParentTag
+ORDER BY r.TagName;

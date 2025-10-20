@@ -1,0 +1,18 @@
+WITH RecursiveTag树 AS (
+    SELECT
+        Id,
+        TagName,
+        1 AS level
+    FROM
+        stackoverflow
+)
+SELECT
+    Id,
+    TagName,
+    level
+FROM
+    RecursiveTag树
+GROUP BY
+    Id,
+    TagName,
+    level;

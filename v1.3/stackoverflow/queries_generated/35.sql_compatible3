@@ -1,0 +1,215 @@
+with
+RecentQuestions as (
+  select
+    p.Id,
+    p.Title,
+    p.OwnerUserId,
+    p.CreationDate,
+    p.Score,
+    coalesce(p.ViewCount,0) as ViewCount,
+    coalesce(p.AnswerCount,0) as AnswerCount,
+    coalesce(p.CommentCount,0) as CommentCount,
+    p.Tags,
+    case when p.Tags is null then cast(array[] as text[]) else null end as TagArray
+  from Posts p
+  where p.PostTypeId = 1
+    and p.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '365' day
+),
+RecentQuestions_Tagged as (
+  select
+    rq.Id,
+    rq.Title,
+    rq.OwnerUserId,
+    rq.CreationDate,
+    rq.Score,
+    rq.ViewCount,
+    rq.AnswerCount,
+    rq.CommentCount,
+    rq.Tags,
+    case
+      when rq.Tags is null then null
+      else regexp_replace(substring(rq.Tags from 2 for char_length(rq.Tags)-2), '><', ',')
+    end as TagCsv,
+    rq.TagArray
+  from RecentQuestions rq
+),
+UserStats as (
+  select
+    u.Id as UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    u.LastAccessDate,
+    coalesce(u.Views,0) as Views,
+    coalesce(u.UpVotes,0) as UpVotes,
+    coalesce(u.DownVotes,0) as DownVotes,
+    coalesce(sum(case when b.Class = 1 then 1 else 0 end),0) as GoldBadges,
+    coalesce(sum(case when b.Class = 2 then 1 else 0 end),0) as SilverBadges,
+    coalesce(sum(case when b.Class = 3 then 1 else 0 end),0) as BronzeBadges,
+    (coalesce(sum(case when b.Class = 1 then 1 else 0 end),0) * 5
+     + coalesce(sum(case when b.Class = 2 then 1 else 0 end),0) * 2
+     + coalesce(sum(case when b.Class = 3 then 1 else 0 end),0) * 1) as BadgeScore,
+    coalesce( (select count(*) from Posts p where p.OwnerUserId = u.Id and p.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '365' day), 0) as RecentPosts,
+    coalesce( (select count(*) from Comments c where c.UserId = u.Id and c.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '365' day), 0) as RecentComments,
+    (
+      (coalesce( (select count(*) from Posts p where p.OwnerUserId = u.Id),0) * 1.2)
+      + (coalesce( (select count(*) from Comments c where c.UserId = u.Id),0) * 0.3)
+      + (coalesce(u.Reputation,0) / 100.0)
+      + greatest(0, date_part('epoch', cast('2024-10-01 12:34:56' as timestamp) - u.LastAccessDate) / 86400.0) * -0.01
+    ) as ActivityScore
+  from Users u
+  left join Badges b on b.UserId = u.Id
+  group by u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate, u.Views, u.UpVotes, u.DownVotes
+),
+AnswerMetrics as (
+  select
+    a.Id as AnswerId,
+    a.ParentId as QuestionId,
+    a.OwnerUserId,
+    a.CreationDate,
+    a.Score,
+    coalesce(a.CommentCount,0) as CommentCount,
+    greatest(char_length(coalesce(a.Body,''))/200,1) as BodyLengthFactor,
+    (case when char_length(coalesce(a.Body,'')) = 0 then 0
+          else cast(char_length(regexp_replace(coalesce(a.Body,''), '[^<>]', '', 'g')) as double precision) / char_length(coalesce(a.Body,'')) end) as TagDensity,
+    case when q.AcceptedAnswerId = a.Id then 1 else 0 end as IsAccepted
+  from Posts a
+  left join Posts q on q.Id = a.ParentId
+  where a.PostTypeId = 2
+),
+QWithAnswers as (
+  select
+    rq.Id,
+    rq.Title,
+    rq.OwnerUserId,
+    rq.CreationDate,
+    rq.Score,
+    rq.ViewCount,
+    rq.AnswerCount,
+    rq.CommentCount,
+    rq.Tags,
+    rq.TagCsv,
+    um.UserId as OwnerUserIdStats,
+    um.DisplayName as OwnerName,
+    um.Reputation as OwnerReputation,
+    um.BadgeScore as OwnerBadgeScore,
+    am.AnswerId,
+    am.OwnerUserId as AnswerOwnerId,
+    am.Score as AnswerScore,
+    am.CommentCount as AnswerCommentCount,
+    am.BodyLengthFactor,
+    am.TagDensity,
+    am.IsAccepted,
+    rank() over (partition by rq.Id order by (coalesce(am.Score,0)*2 + coalesce(am.CommentCount,0) + coalesce(am.IsAccepted,0)*10 + am.BodyLengthFactor) desc) as AnswerRank,
+    (coalesce(rq.Score,0) * 3
+      + ln(coalesce(rq.ViewCount,1)) * 2
+      + coalesce(rq.AnswerCount,0) * 5
+      + coalesce(rq.CommentCount,0) * 1.5
+      + case when exists (select 1 from Posts p2 where p2.Id = rq.Id and p2.AcceptedAnswerId is not null) then 10 else 0 end
+    ) as Engagement
+  from RecentQuestions_Tagged rq
+  left join UserStats um on um.UserId = rq.OwnerUserId
+  left join AnswerMetrics am on am.QuestionId = rq.Id
+),
+TagAggregates as (
+  select
+    t.tname,
+    count(*) as QuestionsWithTag,
+    avg(q.Engagement) as AvgEngagement,
+    -- approximate median using percentile_disc which is more widely supported, and without OVER
+    percentile_disc(0.5) within group (order by q.Engagement) as MedianEngagement,
+    max(q.Engagement) as MaxEngagement
+  from QWithAnswers q,
+  lateral (
+    select regexp_split_to_table(coalesce(q.TagCsv,''), ',') as tname
+  ) t
+  group by t.tname
+),
+DuplicateClusters as (
+  select
+    pl.PostId as DuplicateOf,
+    pl.RelatedPostId as Original,
+    count(*) over (partition by pl.RelatedPostId) as ClusterSize,
+    min(pl.CreationDate) over (partition by pl.RelatedPostId) as FirstDuplicateDate
+  from PostLinks pl
+  where pl.LinkTypeId = 3
+),
+Final as (
+  select
+    q.Id as QuestionId,
+    q.Title,
+    left(nullif(q.Title,''), 200) || coalesce((' - ' || coalesce(substring(coalesce(q.TagCsv,''),1,120), '')), '') as TitlePreview,
+    q.CreationDate,
+    q.Engagement,
+    q.ViewCount,
+    q.AnswerCount,
+    q.CommentCount,
+    (select a.AnswerId from QWithAnswers a where a.Id = q.Id and a.AnswerRank = 1 limit 1) as TopAnswerId,
+    (select a.AnswerScore from QWithAnswers a where a.Id = q.Id and a.AnswerRank = 1 limit 1) as TopAnswerScore,
+    (select a.IsAccepted from QWithAnswers a where a.Id = q.Id and a.AnswerRank = 1 limit 1) as TopAnswerAccepted,
+    q.OwnerName,
+    q.OwnerReputation,
+    q.OwnerBadgeScore,
+    (select string_agg(tg.tname, ',' order by tg.AvgEngagement desc)
+     from TagAggregates tg,
+     lateral (select regexp_split_to_table(coalesce(q.TagCsv,''), ',') as tname) u
+     where u.tname = tg.tname
+     limit 3
+    ) as TopTagsByEngagement,
+    case
+      when exists (select 1 from PostLinks pl where pl.PostId = q.Id and pl.LinkTypeId = 3) then 'IsDuplicateOf'
+      when exists (select 1 from PostLinks pl where pl.RelatedPostId = q.Id and pl.LinkTypeId = 3) then 'HasDuplicates'
+      else 'NoDuplicateRelation'
+    end as DuplicateStatus,
+    (
+      (q.Engagement * ln(greatest(q.ViewCount,2)) / nullif(greatest(date_part('epoch', cast('2024-10-01 12:34:56' as timestamp) - q.CreationDate)/86400.0,1),1))
+      + coalesce(q.OwnerBadgeScore,0)
+      - coalesce((select max(ClusterSize) from DuplicateClusters dc where dc.Original = q.Id),0)
+    ) as VolatilityScore,
+    (
+      select left(coalesce(c.Text,''), 120) || case when char_length(coalesce(c.Text,'')) > 120 then '...' else '' end
+      from Comments c
+      where c.PostId = q.Id
+      order by c.CreationDate desc
+      limit 1
+    ) as LatestCommentPreview,
+    coalesce(q.OwnerName, (select u.DisplayName from Users u where u.Id = q.OwnerUserId limit 1), 'anonymous') as PreferredOwnerName
+  from QWithAnswers q
+)
+select
+  f.QuestionId,
+  f.Title,
+  f.TitlePreview,
+  f.CreationDate,
+  f.Engagement,
+  f.ViewCount,
+  f.AnswerCount,
+  f.CommentCount,
+  f.TopAnswerId,
+  f.TopAnswerScore,
+  f.TopAnswerAccepted,
+  f.OwnerName,
+  f.OwnerReputation,
+  f.OwnerBadgeScore,
+  f.TopTagsByEngagement,
+  f.DuplicateStatus,
+  f.VolatilityScore,
+  f.LatestCommentPreview,
+  f.PreferredOwnerName,
+  -- compute quartiles via aggregation over the final set (no windowed ordered-set aggregates)
+  v_stats.VolatilityQ1,
+  v_stats.VolatilityMedian,
+  v_stats.VolatilityQ3,
+  rank() over (order by f.Engagement desc, f.VolatilityScore desc) as RankByEngagementVolatility
+from Final f
+cross join (
+  select
+    percentile_disc(0.25) within group (order by VolatilityScore) as VolatilityQ1,
+    percentile_disc(0.5) within group (order by VolatilityScore) as VolatilityMedian,
+    percentile_disc(0.75) within group (order by VolatilityScore) as VolatilityQ3
+  from Final
+  where Engagement is not null
+) v_stats
+where f.Engagement is not null
+order by RankByEngagementVolatility
+limit 250;

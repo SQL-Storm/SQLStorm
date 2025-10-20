@@ -1,0 +1,169 @@
+WITH RECURSIVE RecursiveTagHierarchy AS (
+    SELECT 
+        t1.TagName AS RootTag,
+        t2.TagName AS RelatedTag,
+        1 AS Level
+    FROM Tags t1
+    JOIN Posts p1 ON p1.Id = t1.ExcerptPostId AND p1.PostTypeId = 1
+    CROSS JOIN LATERAL (
+        SELECT t1.Id AS Tid, unnest(string_to_array(substring(p1.Tags FROM 2 FOR length(p1.Tags)-2), '><')) AS TagSub
+    ) TagCorrelation
+    JOIN Tags t2 ON t2.TagName = TagCorrelation.TagSub AND t2.TagName <> t1.TagName
+
+    UNION ALL
+
+    SELECT r.RootTag, t3.TagName, r.Level + 1
+    FROM RecursiveTagHierarchy r
+    JOIN Posts p3 ON p3.Tags IS NOT NULL AND p3.PostTypeId = 1
+    CROSS JOIN LATERAL unnest(string_to_array(substring(p3.Tags FROM 2 FOR length(p3.Tags)-2), '><')) AS TagArray(tgn)
+    JOIN Tags t3 ON t3.TagName = TagArray.tgn
+    WHERE r.RelatedTag = t3.TagName AND r.Level < 3
+),
+UserLoadedAggregates AS (
+    SELECT
+        u.Id,
+        COALESCE(u.Reputation,0) AS Reputation,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        COUNT(DISTINCT CASE WHEN b.Class=1 THEN b.Id END) AS GoldBadges,
+        COUNT(DISTINCT CASE WHEN b.Class=2 THEN b.Id END) AS SilverBadges,
+        COUNT(DISTINCT CASE WHEN b.Class=3 THEN b.Id END) AS BronzeBadges,
+        MAX(p.CreationDate) AS LatestPostDate
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    GROUP BY u.Id, COALESCE(u.Reputation,0)
+),
+TopPostsPerUser AS (
+    SELECT
+        p.OwnerUserId,
+        p.Id as PostId,
+        p.Score,
+        p.CreationDate,
+        p.PostTypeId,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC, p.CreationDate DESC) AS UserRank
+    FROM Posts p
+    WHERE p.PostTypeId IN (1,2)
+),
+PostScoreWindows AS (
+    SELECT 
+        p.QId,
+        p.AId,
+        q.Score as QuestionScore,
+        a.Score as AnswerScore,
+        wq.avg_q_score,
+        wa.avg_a_score,
+        wq.median_q_score,
+        wa.median_a_score,
+        compute_adaptive_score(p.QId, p.AId) AS AdaptiveScore
+    FROM (
+        SELECT q.Id AS QId, a.Id AS AId, q.Score AS Score, a.Score AS ScoreA
+        FROM Posts q
+        LEFT JOIN Posts a ON a.ParentId = q.Id
+        WHERE q.PostTypeId = 1
+    ) p
+    INNER JOIN LATERAL (
+        SELECT AVG(q2.Score) as avg_q_score, PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY q2.Score) as median_q_score
+        FROM Posts q2 WHERE q2.PostTypeId = 1
+    ) wq ON TRUE
+    INNER JOIN LATERAL (
+        SELECT AVG(a2.Score) as avg_a_score, PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY a2.Score) as median_a_score
+        FROM Posts a2 WHERE a2.PostTypeId = 2
+    ) wa ON TRUE
+    LEFT JOIN Posts q ON q.Id = p.QId
+    LEFT JOIN Posts a ON a.Id = p.AId
+)
+SELECT DISTINCT
+    u.Id AS UserId,
+    u.Reputation,
+    u.BadgeCount,
+    u.GoldBadges,
+    u.SilverBadges,
+    u.BronzeBadges,
+    up.UserRank AS UserTopPostRank,
+    psq.QuestionScore,
+    psa.AnswerScore,
+    CASE WHEN bdate.Closures > 0 THEN 1 ELSE 0 END AS HasClosedPosts,
+    (
+      SELECT STRING_AGG(DISTINCT pt.Name, ', ')
+      FROM PostTypes pt 
+      WHERE pt.Id = p.PostTypeId
+    ) AS UserPostTypesAggregated,
+    (CASE 
+        WHEN u.Reputation > 10000 AND gf.MostUsed IS NOT NULL THEN NULL
+        ELSE CONCAT('Rep', u.Reputation, '_', LPAD(CAST((psq.QuestionScore + COALESCE(pvd.UpVotes,0) - COALESCE(pvd.DownVotes,0)) AS TEXT),6,'0'))
+    END) AS ComplexUserCode,
+    uq.last_Comment_DaysSince AS DaysSinceLastUserCommentOnQuestion,
+    plThisEarliest.RelatedPostId AS EarliestLinkFromUserQuestion,
+    plLinkcount.LinkCount AS UserQuestionLinkVolume,
+    Wh.FractionClosedByRelType AS FractionClosedDueTostdlibreinterpret
+FROM
+    UserLoadedAggregates u
+    LEFT JOIN TopPostsPerUser up ON up.OwnerUserId = u.Id AND up.UserRank <= 5
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id AND p.Id = up.PostId 
+    LEFT JOIN LATERAL (
+        SELECT p1.Score AS QuestionScore FROM Posts p1 WHERE p1.Id = p.Id AND p1.PostTypeId = 1
+    ) psq ON TRUE
+    LEFT JOIN LATERAL (
+        SELECT p2.Score AS AnswerScore FROM Posts p2 WHERE p2.Id = COALESCE(p.AcceptedAnswerId, -1)
+    ) psa ON TRUE
+    LEFT JOIN (
+        SELECT pb.OwnerUserId AS UserId, SUM(v.UpVotes) AS UpVotes, SUM(v.DownVotes) AS DownVotes 
+        FROM Votes v 
+        INNER JOIN Posts pb on pb.Id = v.PostId
+        GROUP BY pb.OwnerUserId
+    ) pvd ON pvd.UserId = u.Id
+    LEFT JOIN (
+      SELECT PostId, EXTRACT(day FROM (TIMESTAMP '2024-10-01 12:34:56' - MAX(CreationDate))) AS last_Comment_DaysSince
+      FROM Comments GROUP BY PostId
+    ) uq ON uq.PostId = p.Id
+    LEFT JOIN (
+      SELECT PageReferences.PostId, COUNT(*) AS LinkCount
+      FROM PostLinks PageReferences
+      GROUP BY PageReferences.PostId
+    ) plLinkcount ON plLinkcount.PostId = p.Id
+    LEFT JOIN (
+        SELECT pl.PostId, MIN(pl.RelatedPostId) AS RelatedPostId
+        FROM PostLinks pl
+        GROUP BY pl.PostId
+    ) plThisEarliest ON plThisEarliest.PostId = p.Id
+    LEFT JOIN (
+      SELECT p2.PostTypeId, AVG(CASE WHEN ph.PostHistoryTypeId = 10 THEN 1.0 ELSE 0.0 END) AS FractionClosedByRelType
+      FROM Posts p2
+      LEFT JOIN PostHistory ph ON ph.PostId = p2.Id
+      WHERE p2.Created IS NOT NULL
+      GROUP BY p2.PostTypeId
+    ) Wh ON Wh.PostTypeId = p.PostTypeId
+    LEFT JOIN (
+      SELECT COUNT(*) AS Closures, PostId FROM PostHistory WHERE PostHistoryTypeId = 10 GROUP BY PostId
+    ) bdate ON bdate.PostId = p.Id
+    LEFT JOIN (
+      SELECT s.UserId, TRUE AS MostUsed FROM (
+        SELECT pt.UserId, COUNT(*) as cnt FROM PostTags pt GROUP BY pt.UserId ORDER BY COUNT(*) DESC LIMIT 1
+      ) s(UserId, cnt)
+    ) gf ON gf.UserId = u.Id
+WHERE 
+    u.Reputation > 120 
+    AND psq.QuestionScore IS NOT NULL
+GROUP BY
+    u.Id,
+    u.Reputation,
+    u.BadgeCount,
+    u.GoldBadges,
+    u.SilverBadges,
+    u.BronzeBadges,
+    up.UserRank,
+    psq.QuestionScore,
+    psa.AnswerScore,
+    bdate.Closures,
+    p.PostTypeId,
+    p.Id,
+    p.AcceptedAnswerId,
+    pvd.UpVotes,
+    pvd.DownVotes,
+    uq.last_Comment_DaysSince,
+    plThisEarliest.RelatedPostId,
+    plLinkcount.LinkCount,
+    Wh.FractionClosedByRelType,
+    gf.MostUsed
+ORDER BY u.Reputation DESC
+LIMIT 50;

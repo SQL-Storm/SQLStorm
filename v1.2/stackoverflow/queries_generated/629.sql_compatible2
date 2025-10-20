@@ -1,0 +1,214 @@
+WITH RecentActiveUsers AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.Location,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COALESCE(b.BadgeCounts, 'No Badges') AS BadgeSummary,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC, u.Views DESC) AS UserRank
+    FROM
+        Users u
+    LEFT JOIN (
+        SELECT
+            UserId,
+            STRING_AGG(CONCAT(Name, '(', Class, '):', COUNT(*)), '; ') AS BadgeCounts
+        FROM
+            Badges b
+        GROUP BY
+            UserId
+    ) b ON u.Id = b.UserId
+    WHERE
+        u.LastAccessDate > CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1 year'
+        AND u.Reputation > 1000
+),
+TopQuestions AS (
+    SELECT
+        p.Id,
+        p.Title,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.Tags,
+        p.AcceptedAnswerId,
+        u.DisplayName AS OwnerName,
+        RANK() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC, p.ViewCount DESC) AS QuestionRank
+    FROM
+        Posts p
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE
+        p.PostTypeId = 1
+        AND p.CreationDate > CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '2 years'
+        AND p.Score > 5
+),
+AnswerStats AS (
+    SELECT
+        a.ParentId AS QuestionId,
+        COUNT(*) AS TotalAnswers,
+        AVG(a.Score) AS AvgAnswerScore,
+        MAX(a.Score) AS MaxAnswerScore,
+        SUM(CASE WHEN a.OwnerUserId IS NULL THEN 1 ELSE 0 END) AS AnonymousAnswers
+    FROM
+        Posts a
+    WHERE
+        a.PostTypeId = 2
+    GROUP BY
+        a.ParentId
+),
+QuestionCloseReasons AS (
+    SELECT
+        ph.PostId,
+        crt.Name AS CloseReason,
+        ph.CreationDate AS CloseDate
+    FROM
+        PostHistory ph
+    INNER JOIN CloseReasonTypes crt ON CAST(ph.Comment AS INTEGER) = crt.Id
+    WHERE
+        ph.PostHistoryTypeId = 10
+),
+UserRecentCommentCounts AS (
+    SELECT
+        c.UserId,
+        COUNT(*) AS RecentComments
+    FROM
+        Comments c
+    WHERE
+        c.CreationDate > CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '6 months'
+        AND c.UserId IS NOT NULL
+    GROUP BY
+        c.UserId
+),
+QuestionLinkInfo AS (
+    SELECT
+        pl.PostId,
+        COUNT(DISTINCT CASE WHEN lt.Name = 'Duplicate' THEN pl.RelatedPostId END) AS DuplicateLinks,
+        COUNT(DISTINCT CASE WHEN lt.Name = 'Linked' THEN pl.RelatedPostId END) AS LinkedPosts
+    FROM
+        PostLinks pl
+    INNER JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id
+    GROUP BY
+        pl.PostId
+),
+MainResults AS (
+SELECT
+    r.UserRank,
+    r.DisplayName,
+    r.Reputation,
+    r.Location,
+    r.Views,
+    r.UpVotes,
+    r.DownVotes,
+    r.BadgeSummary,
+    tq.Id AS QuestionId,
+    tq.Title,
+    tq.CreationDate AS QuestionCreated,
+    tq.Score AS QuestionScore,
+    tq.ViewCount,
+    tq.AnswerCount,
+    qas.TotalAnswers,
+    qas.AvgAnswerScore,
+    qas.MaxAnswerScore,
+    qas.AnonymousAnswers,
+    COALESCE(qcr.CloseReason, 'Open') AS CloseStatus,
+    qcr.CloseDate,
+    COALESCE(urc.RecentComments, 0) AS RecentCommentsByOwner,
+    qli.DuplicateLinks,
+    qli.LinkedPosts,
+    CONCAT(
+        'Tags: ',
+        COALESCE(tq.Tags, 'None'),
+        ' | TitleLen: ',
+        LENGTH(tq.Title),
+        ' | Owner: ',
+        COALESCE(r.DisplayName, 'Unknown')
+    ) AS TagTitleOwnerInfo,
+    CASE 
+        WHEN tq.AcceptedAnswerId IS NOT NULL THEN (
+            SELECT p_ans.Score FROM Posts p_ans WHERE p_ans.Id = tq.AcceptedAnswerId
+        )
+        ELSE NULL
+    END AS AcceptedAnswerScore,
+    SUM(tq.Score) OVER (PARTITION BY tq.OwnerUserId ORDER BY tq.CreationDate ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS RunningQuestionScore,
+    tq.OwnerUserId
+FROM
+    RecentActiveUsers r
+INNER JOIN TopQuestions tq ON r.Id = tq.OwnerUserId
+LEFT JOIN AnswerStats qas ON tq.Id = qas.QuestionId
+LEFT JOIN QuestionCloseReasons qcr ON tq.Id = qcr.PostId
+LEFT JOIN UserRecentCommentCounts urc ON r.Id = urc.UserId
+LEFT JOIN QuestionLinkInfo qli ON tq.Id = qli.PostId
+WHERE
+    (tq.Score > 10 OR (qas.MaxAnswerScore IS NOT NULL AND qas.MaxAnswerScore > 20))
+    AND (
+        qcr.CloseReason IS NULL
+        OR qcr.CloseReason NOT IN ('Duplicate', 'Off-topic')
+    )
+)
+SELECT
+    UserRank,
+    DisplayName,
+    Reputation,
+    Location,
+    Views,
+    UpVotes,
+    DownVotes,
+    BadgeSummary,
+    QuestionId,
+    Title,
+    QuestionCreated,
+    QuestionScore,
+    ViewCount,
+    AnswerCount,
+    TotalAnswers,
+    AvgAnswerScore,
+    MaxAnswerScore,
+    AnonymousAnswers,
+    CloseStatus,
+    CloseDate,
+    RecentCommentsByOwner,
+    DuplicateLinks,
+    LinkedPosts,
+    TagTitleOwnerInfo,
+    AcceptedAnswerScore,
+    RunningQuestionScore
+FROM MainResults
+ORDER BY
+    UserRank,
+    QuestionScore DESC
+LIMIT 100
+
+UNION ALL
+
+SELECT
+    CAST(NULL AS INTEGER) AS UserRank,
+    CAST(NULL AS VARCHAR) AS DisplayName,
+    CAST(NULL AS INTEGER) AS Reputation,
+    CAST(NULL AS VARCHAR) AS Location,
+    CAST(NULL AS INTEGER) AS Views,
+    CAST(NULL AS INTEGER) AS UpVotes,
+    CAST(NULL AS INTEGER) AS DownVotes,
+    CAST(NULL AS VARCHAR) AS BadgeSummary,
+    CAST(NULL AS INTEGER) AS QuestionId,
+    CAST(NULL AS VARCHAR) AS Title,
+    CAST(NULL AS TIMESTAMP) AS QuestionCreated,
+    CAST(NULL AS INTEGER) AS QuestionScore,
+    CAST(NULL AS INTEGER) AS ViewCount,
+    CAST(NULL AS INTEGER) AS AnswerCount,
+    CAST(NULL AS INTEGER) AS TotalAnswers,
+    CAST(NULL AS NUMERIC) AS AvgAnswerScore,
+    CAST(NULL AS INTEGER) AS MaxAnswerScore,
+    CAST(NULL AS INTEGER) AS AnonymousAnswers,
+    CAST(NULL AS VARCHAR) AS CloseStatus,
+    CAST(NULL AS TIMESTAMP) AS CloseDate,
+    CAST(NULL AS INTEGER) AS RecentCommentsByOwner,
+    CAST(NULL AS INTEGER) AS DuplicateLinks,
+    CAST(NULL AS INTEGER) AS LinkedPosts,
+    CAST(NULL AS VARCHAR) AS TagTitleOwnerInfo,
+    CAST(NULL AS INTEGER) AS AcceptedAnswerScore,
+    CAST(NULL AS INTEGER) AS RunningQuestionScore
+ORDER BY UserRank NULLS LAST;

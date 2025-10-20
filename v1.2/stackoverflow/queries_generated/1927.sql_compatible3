@@ -1,0 +1,25 @@
+WITH RECURSIVE ThreadedComments AS (
+  SELECT
+    c.Id,
+    c.PostId,
+    c.Score,
+    c.Text,
+    c.UserId,
+    c.CreationDate,
+    p.ConstraintPosition,
+    0 AS Level,
+    ARRAY[c.Id] AS Path
+  FROM Comments c
+  JOIN Posts p ON c.PostId = p.Id
+)
+SELECT
+  Id,
+  PostId,
+  Score,
+  Text,
+  UserId,
+  CreationDate,
+  ConstraintPosition,
+  Level,
+  Path
+FROM ThreadedComments;

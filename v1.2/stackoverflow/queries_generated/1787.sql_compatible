@@ -1,0 +1,62 @@
+WITH RecursiveUserScores AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE 0 END) AS QuestionScore,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END) AS AnswerScore,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId IN (1,2)) AS TotalPosts
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+
+    UNION ALL
+
+    SELECT
+        ru.UserId,
+        ru.DisplayName,
+        ru.Reputation + CAST(ROW_NUMBER() OVER (PARTITION BY ru.UserId ORDER BY ru.TotalPosts DESC) AS INTEGER) AS Reputation,
+        ru.CreationDate,
+        ru.QuestionScore,
+        ru.AnswerScore,
+        ru.TotalPosts
+    FROM RecursiveUserScores ru
+    WHERE ru.Reputation < 1000
+),
+BadgesAgg AS (
+    SELECT
+        UserId,
+        COUNT(*) FILTER (WHERE Class = 1) AS GoldBadges,
+        COUNT(*) FILTER (WHERE Class = 2) AS SilverBadges,
+        COUNT(*) FILTER (WHERE Class = 3) AS BronzeBadges,
+        STRING_AGG(Name, ',') AS BadgeNames
+    FROM Badges
+    GROUP BY UserId
+)
+SELECT
+    r.UserId,
+    r.DisplayName,
+    r.Reputation,
+    r.CreationDate,
+    r.QuestionScore,
+    r.AnswerScore,
+    r.TotalPosts,
+    COALESCE(b.GoldBadges, 0) AS GoldBadges,
+    COALESCE(b.SilverBadges, 0) AS SilverBadges,
+    COALESCE(b.BronzeBadges, 0) AS BronzeBadges,
+    b.BadgeNames
+FROM RecursiveUserScores r
+LEFT JOIN BadgesAgg b ON r.UserId = b.UserId
+GROUP BY
+    r.UserId,
+    r.DisplayName,
+    r.Reputation,
+    r.CreationDate,
+    r.QuestionScore,
+    r.AnswerScore,
+    r.TotalPosts,
+    b.GoldBadges,
+    b.SilverBadges,
+    b.BronzeBadges,
+    b.BadgeNames;

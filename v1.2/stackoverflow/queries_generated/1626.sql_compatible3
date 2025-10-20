@@ -1,0 +1,95 @@
+WITH RankedPosts AS (
+    SELECT
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        p.AcceptedAnswerId,
+        u.Reputation AS OwnerReputation,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC, p.ViewCount DESC) AS rn,
+        COUNT(*) OVER (PARTITION BY p.OwnerUserId) AS OwnerPostsCount,
+        COALESCE(u.Location, 'Unknown Location') AS LocationNormalized,
+        SUBSTRING(p.Title FROM 1 FOR COALESCE(CHAR_LENGTH(p.Title), 20)) || CASE WHEN p.ViewCount > 1000 THEN ' 🚀' ELSE '' END AS TitleSnippet
+    FROM Posts p
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.PostTypeId IN (1, 2)
+),
+CloseEdits AS (
+    SELECT DISTINCT ph.PostId
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId = 10
+),
+OwnerHistoriesRanked AS (
+    SELECT 
+        ph.*,
+        ROW_NUMBER() OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate DESC) AS rev_max
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (4,5,6)
+),
+LatestOwnerHistories AS (
+    SELECT ph.PostId, ph.UserId AS EditorUserId, ph.CreationDate AS LastEditDate
+    FROM OwnerHistoriesRanked ph
+    WHERE ph.rev_max = 1
+),
+AnswersCountsExtremeScories AS (
+    SELECT 
+      ParentId AS QuestionId,
+      COUNT(*) AS AnswersCountArmoredNotNull,
+      SUM(CASE WHEN Score > 5 THEN 1 ELSE 0 END) AS GoodAnswerCount,
+      AVG(NULLIF(Score, 0)) AS AvgAnswerScoreNonZero,
+      MAX(Score) AS MaxAnswerScore
+    FROM Posts
+    WHERE PostTypeId = 2
+    GROUP BY ParentId
+),
+UserBadgeRanks AS (
+    SELECT UserId, Name,
+        RANK() OVER (PARTITION BY UserId ORDER BY Date DESC) AS recent_badge_rank,
+        COUNT(*) OVER (PARTITION BY UserId) AS badge_total
+    FROM Badges
+)
+SELECT DISTINCT
+    Q.Id AS QuestionId,
+    Q.Title AS QuestionTitle,
+    Q.Tags,
+    Q.Score AS QuestionScore,
+    Q.ViewCount AS QuestionViews,
+    COALESCE(AC.GoodAnswerCount,0) AS HighlyVotedAnswers,
+    AC.MaxAnswerScore,
+    Q.OwnerReputation AS QuestionOwnerRep,
+    CE.PostId AS CloseEditPostId,
+    LOH.PostId AS LatestHistoryPostId,
+    LOH.EditorUserId,
+    LOH.LastEditDate,
+    UBR.UserId AS BadgeUserId,
+    UBR.Name AS BadgeName,
+    UBR.recent_badge_rank,
+    UBR.badge_total
+FROM RankedPosts Q
+LEFT JOIN AnswersCountsExtremeScories AC ON Q.Id = AC.QuestionId
+LEFT JOIN CloseEdits CE ON Q.Id = CE.PostId
+LEFT JOIN LatestOwnerHistories LOH ON Q.Id = LOH.PostId
+LEFT JOIN UserBadgeRanks UBR ON Q.OwnerUserId = UBR.UserId
+WHERE Q.rn = 1
+GROUP BY
+    Q.Id,
+    Q.Title,
+    Q.Tags,
+    Q.Score,
+    Q.ViewCount,
+    AC.GoodAnswerCount,
+    AC.MaxAnswerScore,
+    Q.OwnerReputation,
+    Q.rn,
+    CE.PostId,
+    LOH.PostId,
+    LOH.EditorUserId,
+    LOH.LastEditDate,
+    UBR.UserId,
+    UBR.Name,
+    UBR.recent_badge_rank,
+    UBR.badge_total;

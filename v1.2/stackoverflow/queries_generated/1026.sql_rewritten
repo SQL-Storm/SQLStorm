@@ -1,0 +1,179 @@
+-- {"query": "1026.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1631} 
+WITH RecursivePostsHierarchy AS (
+    SELECT
+        p.Id,
+        p.PostTypeId,
+        p.ParentId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        COALESCE(p.Title, '') AS Title,
+        1 AS Depth
+    FROM Posts p
+    WHERE p.ParentId IS NULL
+
+    UNION ALL
+
+    SELECT
+        c.Id,
+        c.PostTypeId,
+        c.ParentId,
+        c.OwnerUserId,
+        c.CreationDate,
+        c.Score,
+        c.ViewCount,
+        COALESCE(c.Title, '') AS Title,
+        rph.Depth + 1
+    FROM Posts c
+    INNER JOIN RecursivePostsHierarchy rph ON c.ParentId = rph.Id
+),
+
+UserBadgeStats AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(b.Id) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+        COALESCE(AVG(v.Score), 0) AS AvgVoteScoreOnUserPosts
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Votes v ON v.PostId = p.Id AND v.VoteTypeId IN (2,3) -- UpMod or DownMod only
+    GROUP BY u.Id, u.DisplayName
+),
+
+LatestPostHistoryPerPost AS (
+    SELECT DISTINCT ON (ph.PostId)
+        ph.PostId,
+        ph.Id AS PostHistoryId,
+        ph.PostHistoryTypeId,
+        ph.CreationDate,
+        ph.UserId,
+        ph.Comment,
+        ph.Text
+    FROM PostHistory ph
+    ORDER BY ph.PostId, ph.CreationDate DESC, ph.Id DESC
+),
+
+TopQuestionsWithAnswers AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.Title,
+        q.CreationDate AS QuestionCreationDate,
+        q.Score AS QuestionScore,
+        ubs.DisplayName AS OwnerDisplayName,
+        ubs.GoldBadges,
+        ubs.SilverBadges,
+        ubs.BronzeBadges,
+        ubs.AvgVoteScoreOnUserPosts,
+        COUNT(a.Id) AS AnswerCount,
+        MAX(a.Score) AS MaxAnswerScore,
+        AVG(a.Score) AS AvgAnswerScore,
+        MAX(a.CreationDate) FILTER (WHERE a.Score = (SELECT MAX(a2.Score) FROM Posts a2 WHERE a2.ParentId = q.Id AND a2.PostTypeId = 2)) AS MaxAnswerDate
+    FROM Posts q
+    LEFT JOIN Posts a ON a.ParentId = q.Id AND a.PostTypeId = 2
+    LEFT JOIN UserBadgeStats ubs ON ubs.UserId = q.OwnerUserId
+    WHERE q.PostTypeId = 1 AND q.ClosedDate IS NULL
+    GROUP BY q.Id, q.Title, q.CreationDate, q.Score, ubs.DisplayName, ubs.GoldBadges, ubs.SilverBadges, ubs.BronzeBadges, ubs.AvgVoteScoreOnUserPosts
+),
+
+QuestionsWithTagAggregates AS (
+    SELECT
+        tq.QuestionId,
+        STRING_AGG(DISTINCT t.TagName, ',') AS Tags,
+        COUNT(DISTINCT pt.Id) AS TagCount,
+        AVG(t.Count) AS AvgTagPopularity
+    FROM TopQuestionsWithAnswers tq
+    LEFT JOIN Posts pq ON pq.Id = tq.QuestionId
+    LEFT JOIN LATERAL (
+        SELECT UNNEST(string_to_array(substring(pq.Tags, 2, length(pq.Tags) - 2), '><')) AS TagName
+    ) tag_arr ON true
+    LEFT JOIN Tags t ON t.TagName = tag_arr.TagName
+    LEFT JOIN Posts pt ON pt.Id = t.ExcerptPostId OR pt.Id = t.WikiPostId
+    GROUP BY tq.QuestionId
+),
+
+PopularLinks AS (
+    SELECT
+        pl.PostId,
+        COUNT(*) AS LinkCount,
+        SUM(CASE WHEN pl.LinkTypeId = 3 THEN 1 ELSE 0 END) AS DuplicateLinks,
+        MAX(pl.CreationDate) AS LastLinkDate
+    FROM PostLinks pl
+    GROUP BY pl.PostId
+),
+
+QuestionsWithLinkInfo AS (
+    SELECT
+        tq.*,
+        COALESCE(pl.LinkCount, 0) AS LinkCount,
+        COALESCE(pl.DuplicateLinks, 0) AS DuplicateLinks,
+        pl.LastLinkDate
+    FROM TopQuestionsWithAnswers tq
+    LEFT JOIN PopularLinks pl ON pl.PostId = tq.QuestionId
+),
+
+RankedQuestions AS (
+    SELECT
+        ql.*,
+        ROW_NUMBER() OVER (
+            PARTITION BY ql.OwnerDisplayName
+            ORDER BY ql.Score DESC, ql.AnswerCount DESC, ql.QuestionCreationDate DESC
+        ) AS UserQuestionRank,
+        RANK() OVER (
+            ORDER BY ql.Score DESC, ql.AnswerCount DESC, ql.QuestionCreationDate DESC
+        ) AS GlobalQuestionRank
+    FROM QuestionsWithLinkInfo ql
+),
+
+FinalResult AS (
+    SELECT
+        rq.GlobalQuestionRank,
+        rq.QuestionId,
+        rq.Title,
+        rq.OwnerDisplayName,
+        rq.GoldBadges,
+        rq.SilverBadges,
+        rq.BronzeBadges,
+        rq.AvgVoteScoreOnUserPosts,
+        rq.AnswerCount,
+        rq.MaxAnswerScore,
+        rq.AvgAnswerScore,
+        rq.MaxAnswerDate,
+        qta.Tags,
+        qta.TagCount,
+        qta.AvgTagPopularity,
+        rq.LinkCount,
+        rq.DuplicateLinks,
+        rq.LastLinkDate,
+        rq.UserQuestionRank,
+        -- Correlated Subquery: Count recent comments on question
+        (
+            SELECT COUNT(*)
+            FROM Comments c
+            WHERE c.PostId = rq.QuestionId
+            AND c.CreationDate > (rq.QuestionCreationDate - INTERVAL '30 days')
+        ) AS RecentCommentCount,
+        -- String expression and NULL logic: Extract first tag or default
+        COALESCE(split_part(qta.Tags, ',', 1), 'NoTag') AS PrimaryTag,
+        -- Complex calculation: score weighted by badges
+        (rq.Score * (1 + COALESCE(rq.GoldBadges, 0) * 0.5 + COALESCE(rq.SilverBadges, 0) * 0.3 + COALESCE(rq.BronzeBadges, 0) * 0.1)) AS WeightedScore,
+        -- Window function: The average weighted score per owner
+        AVG(rq.Score * (1 + COALESCE(rq.GoldBadges, 0)*0.5 + COALESCE(rq.SilverBadges,0)*0.3 + COALESCE(rq.BronzeBadges,0)*0.1)) OVER (PARTITION BY rq.OwnerDisplayName) AS OwnerAvgWeightedScore
+    FROM RankedQuestions rq
+    LEFT JOIN QuestionsWithTagAggregates qta ON qta.QuestionId = rq.QuestionId
+    WHERE rq.GlobalQuestionRank <= 100
+)
+
+SELECT *
+FROM FinalResult
+WHERE
+    -- Filter for questions with at least 2 answers and significant weighted score
+    AnswerCount >= 2
+    AND WeightedScore > 10
+    -- Complex predicate with NULL logic on date and tags
+    AND (LastLinkDate IS NULL OR LastLinkDate > cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '180 days')
+    AND TagCount > 0
+ORDER BY GlobalQuestionRank;

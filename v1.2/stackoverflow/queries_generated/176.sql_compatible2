@@ -1,0 +1,241 @@
+WITH RecursiveTagHierarchy AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        1 AS Level,
+        ARRAY[t.TagName] AS Path
+    FROM Tags t
+    WHERE t.IsModeratorOnly = FALSE AND t.IsRequired = FALSE
+
+    UNION ALL
+
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        r.Level + 1,
+        r.Path || t.TagName
+    FROM Tags t
+    JOIN RecursiveTagHierarchy r ON t.Id <> r.Id AND NOT t.TagName = ANY(r.Path)
+    WHERE t.IsModeratorOnly = FALSE AND t.IsRequired = FALSE AND r.Level < 3
+),
+UserBadgeCounts AS (
+    SELECT
+        b.UserId,
+        b.Class,
+        COUNT(*) AS BadgeCount
+    FROM Badges b
+    GROUP BY b.UserId, b.Class
+),
+UserReputationRanks AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        RANK() OVER (ORDER BY u.Reputation DESC NULLS LAST) AS ReputationRank,
+        DENSE_RANK() OVER (PARTITION BY COALESCE(u.Location, 'Unknown') ORDER BY u.Reputation DESC NULLS LAST) AS LocationReputationRank
+    FROM Users u
+    WHERE u.Reputation IS NOT NULL
+),
+PostScoreStats AS (
+    SELECT
+        p.OwnerUserId,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+        AVG(CASE WHEN p.PostTypeId IN (1,2) THEN p.Score END) AS AvgScore,
+        MAX(CASE WHEN p.PostTypeId IN (1,2) THEN p.Score END) AS MaxScore,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN COALESCE(p.ViewCount,0) ELSE 0 END) AS TotalQuestionViews
+    FROM Posts p
+    GROUP BY p.OwnerUserId
+),
+TopQuestionsWithAnswers AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.Title,
+        q.CreationDate AS QuestionCreationDate,
+        q.Score AS QuestionScore,
+        q.ViewCount AS QuestionViewCount,
+        a.Id AS AnswerId,
+        a.Score AS AnswerScore,
+        a.CreationDate AS AnswerCreationDate,
+        a.OwnerUserId AS AnswerOwnerUserId,
+        u.DisplayName AS AnswerOwnerDisplayName,
+        ROW_NUMBER() OVER (PARTITION BY q.Id ORDER BY a.Score DESC NULLS LAST, a.CreationDate ASC) AS AnswerRank
+    FROM Posts q
+    LEFT JOIN Posts a ON a.ParentId = q.Id AND a.PostTypeId = 2
+    LEFT JOIN Users u ON u.Id = a.OwnerUserId
+    WHERE q.PostTypeId = 1
+),
+ClosedQuestionsWithReasons AS (
+    SELECT
+        ph.PostId,
+        ph.CreationDate AS CloseDate,
+        crt.Name AS CloseReason,
+        ph.UserId AS ClosedByUserId,
+        u.DisplayName AS ClosedByUserName
+    FROM PostHistory ph
+    JOIN CloseReasonTypes crt ON crt.Id = CAST(ph.Comment AS INTEGER)
+    LEFT JOIN Users u ON u.Id = ph.UserId
+    WHERE ph.PostHistoryTypeId = 10
+),
+UserActivitySummary AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT c.Id) AS TotalComments,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpVotesGiven,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDownVotesGiven,
+        COUNT(DISTINCT b.Id) AS TotalBadges,
+        MAX(p.CreationDate) AS LastPostDate,
+        MAX(c.CreationDate) AS LastCommentDate
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Comments c ON c.UserId = u.Id
+    LEFT JOIN Votes v ON v.UserId = u.Id
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName
+),
+AnswerDelays AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.CreationDate AS QuestionCreationDate,
+        a.Id AS AnswerId,
+        a.CreationDate AS AnswerCreationDate,
+        EXTRACT(EPOCH FROM (a.CreationDate - q.CreationDate)) / 3600.0 AS HoursToAnswer
+    FROM Posts q
+    JOIN Posts a ON a.ParentId = q.Id AND a.PostTypeId = 2
+    WHERE q.PostTypeId = 1 AND a.CreationDate > q.CreationDate
+),
+AnswerDelayStats AS (
+    SELECT
+        QuestionId,
+        MIN(HoursToAnswer) AS MinHoursToAnswer,
+        MAX(HoursToAnswer) AS MaxHoursToAnswer,
+        AVG(HoursToAnswer) AS AvgHoursToAnswer,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY HoursToAnswer) AS MedianHoursToAnswer
+    FROM AnswerDelays
+    GROUP BY QuestionId
+),
+CombinedResults AS (
+    SELECT
+        tq.QuestionId,
+        tq.Title,
+        tq.QuestionCreationDate,
+        tq.QuestionScore,
+        tq.QuestionViewCount,
+        tq.AnswerId,
+        tq.AnswerScore,
+        tq.AnswerCreationDate,
+        tq.AnswerOwnerUserId,
+        tq.AnswerOwnerDisplayName,
+        ad.MinHoursToAnswer,
+        ad.MaxHoursToAnswer,
+        ad.AvgHoursToAnswer,
+        ad.MedianHoursToAnswer,
+        cq.CloseDate,
+        cq.CloseReason,
+        cq.ClosedByUserName,
+        ur.ReputationRank,
+        ur.LocationReputationRank,
+        ps.QuestionCount,
+        ps.AnswerCount,
+        ps.AvgScore,
+        ps.MaxScore,
+        ps.TotalQuestionViews,
+        uac.TotalPosts,
+        uac.TotalComments,
+        uac.TotalUpVotesGiven,
+        uac.TotalDownVotesGiven,
+        uac.TotalBadges,
+        SUM(CASE WHEN ubc.Class = 1 THEN ubc.BadgeCount ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN ubc.Class = 2 THEN ubc.BadgeCount ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN ubc.Class = 3 THEN ubc.BadgeCount ELSE 0 END) AS BronzeBadges
+    FROM TopQuestionsWithAnswers tq
+    LEFT JOIN AnswerDelayStats ad ON ad.QuestionId = tq.QuestionId
+    LEFT JOIN ClosedQuestionsWithReasons cq ON cq.PostId = tq.QuestionId
+    LEFT JOIN UserReputationRanks ur ON ur.Id = tq.AnswerOwnerUserId
+    LEFT JOIN PostScoreStats ps ON ps.OwnerUserId = tq.AnswerOwnerUserId
+    LEFT JOIN UserActivitySummary uac ON uac.UserId = tq.AnswerOwnerUserId
+    LEFT JOIN UserBadgeCounts ubc ON ubc.UserId = tq.AnswerOwnerUserId
+    GROUP BY
+        tq.QuestionId,
+        tq.Title,
+        tq.QuestionCreationDate,
+        tq.QuestionScore,
+        tq.QuestionViewCount,
+        tq.AnswerId,
+        tq.AnswerScore,
+        tq.AnswerCreationDate,
+        tq.AnswerOwnerUserId,
+        tq.AnswerOwnerDisplayName,
+        ad.MinHoursToAnswer,
+        ad.MaxHoursToAnswer,
+        ad.AvgHoursToAnswer,
+        ad.MedianHoursToAnswer,
+        cq.CloseDate,
+        cq.CloseReason,
+        cq.ClosedByUserName,
+        ur.ReputationRank,
+        ur.LocationReputationRank,
+        ps.QuestionCount,
+        ps.AnswerCount,
+        ps.AvgScore,
+        ps.MaxScore,
+        ps.TotalQuestionViews,
+        uac.TotalPosts,
+        uac.TotalComments,
+        uac.TotalUpVotesGiven,
+        uac.TotalDownVotesGiven,
+        uac.TotalBadges
+    ORDER BY tq.QuestionScore DESC NULLS LAST, tq.AnswerScore DESC NULLS LAST
+    LIMIT 100
+)
+SELECT
+    cr.QuestionId,
+    cr.Title,
+    cr.QuestionCreationDate,
+    cr.QuestionScore,
+    cr.QuestionViewCount,
+    cr.AnswerId,
+    cr.AnswerScore,
+    cr.AnswerCreationDate,
+    cr.AnswerOwnerUserId,
+    COALESCE(cr.AnswerOwnerDisplayName, 'Anonymous') AS AnswerOwnerDisplayName,
+    ROUND(CAST(cr.MinHoursToAnswer AS NUMERIC), 2) AS MinHoursToAnswer,
+    ROUND(CAST(cr.MaxHoursToAnswer AS NUMERIC), 2) AS MaxHoursToAnswer,
+    ROUND(CAST(cr.AvgHoursToAnswer AS NUMERIC), 2) AS AvgHoursToAnswer,
+    ROUND(CAST(cr.MedianHoursToAnswer AS NUMERIC), 2) AS MedianHoursToAnswer,
+    cr.CloseDate,
+    cr.CloseReason,
+    cr.ClosedByUserName,
+    cr.ReputationRank,
+    cr.LocationReputationRank,
+    cr.QuestionCount,
+    cr.AnswerCount,
+    ROUND(CAST(cr.AvgScore AS NUMERIC), 2) AS AvgScore,
+    cr.MaxScore,
+    cr.TotalQuestionViews,
+    cr.TotalPosts,
+    cr.TotalComments,
+    cr.TotalUpVotesGiven,
+    cr.TotalDownVotesGiven,
+    cr.TotalBadges,
+    COALESCE(cr.GoldBadges, 0) AS GoldBadges,
+    COALESCE(cr.SilverBadges, 0) AS SilverBadges,
+    COALESCE(cr.BronzeBadges, 0) AS BronzeBadges,
+    (
+        SELECT STRING_AGG(DISTINCT TRIM(BOTH '<>' FROM UNNEST(STRING_TO_ARRAY(SUBSTRING(p.Tags FROM 2 FOR CHAR_LENGTH(p.Tags)-2), '><'))), ', ' ORDER BY 1)
+        FROM Posts p
+        WHERE p.Id = cr.QuestionId AND p.Tags IS NOT NULL
+    ) AS QuestionTags,
+    CASE
+        WHEN cr.TotalBadges IS NULL OR cr.TotalBadges = 0 THEN 'No badges'
+        ELSE FORMAT('G:%s, S:%s, B:%s', COALESCE(cr.GoldBadges,0), COALESCE(cr.SilverBadges,0), COALESCE(cr.BronzeBadges,0))
+    END AS BadgeSummary
+FROM CombinedResults cr
+WHERE cr.AnswerScore IS NOT NULL
+  AND (cr.CloseDate IS NULL OR cr.CloseDate > cr.QuestionCreationDate + INTERVAL '30 days')
+  AND cr.QuestionScore > 0
+ORDER BY cr.QuestionScore DESC, cr.AnswerScore DESC;

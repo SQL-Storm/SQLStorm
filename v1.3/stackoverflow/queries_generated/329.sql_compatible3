@@ -1,0 +1,215 @@
+WITH
+questions AS (
+  SELECT p.*,
+         CASE WHEN p.Tags IS NOT NULL AND p.Tags <> '' THEN string_to_array(substring(p.Tags,2,length(p.Tags)-2),'><') ELSE ARRAY[]::text[] END AS tag_arr
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+),
+answers AS (
+  SELECT p.*
+  FROM Posts p
+  WHERE p.PostTypeId = 2
+),
+post_votes AS (
+  SELECT v.PostId,
+         SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS upvotes,
+         SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS downvotes,
+         SUM(CASE WHEN v.VoteTypeId = 1 THEN 1 ELSE 0 END) AS accepted_by_originator,
+         COUNT(*) AS total_votes
+  FROM Votes v
+  GROUP BY v.PostId
+),
+post_comments AS (
+  SELECT c.PostId, COUNT(*) AS comment_count,
+         MAX(c.CreationDate) AS last_comment_date
+  FROM Comments c
+  GROUP BY c.PostId
+),
+question_first_answer AS (
+  SELECT q.Id AS question_id,
+         MIN(a.CreationDate) AS first_answer_date,
+         EXTRACT(EPOCH FROM (MIN(a.CreationDate) - q.CreationDate))/3600.0 AS hours_to_first_answer
+  FROM questions q
+  LEFT JOIN answers a ON a.ParentId = q.Id
+  GROUP BY q.Id, q.CreationDate
+),
+tag_post_map AS (
+  SELECT t.tag AS tagname, q.Id AS question_id, q.Score AS qscore, q.ViewCount, q.AcceptedAnswerId, q.CreationDate, q.Title, q.AnswerCount, q.OwnerUserId
+  FROM questions q,
+       LATERAL unnest(q.tag_arr) AS t(tag)
+),
+tag_aggregates AS (
+  SELECT tp.tagname,
+         COUNT(*) AS question_count,
+         SUM(COALESCE(tp.ViewCount,0)) AS total_views,
+         SUM(CASE WHEN tp.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END) AS accepted_count,
+         AVG(COALESCE(tp.qscore,0)) AS avg_question_score,
+         PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY tp.qscore) AS median_question_score,
+         SUM(COALESCE(tp.AnswerCount,0)) AS total_answer_count
+  FROM tag_post_map tp
+  GROUP BY tp.tagname
+),
+tag_top_samples AS (
+  SELECT DISTINCT ON (tagname) tagname, Title AS sample_title, qscore, ViewCount
+  FROM tag_post_map
+  ORDER BY tagname, qscore DESC NULLS LAST, ViewCount DESC
+),
+tag_answerers AS (
+  SELECT tam.tagname, a.OwnerUserId AS user_id, u.DisplayName AS user_displayname,
+         COUNT(*) AS answers_by_user,
+         SUM(COALESCE(a.Score,0)) AS total_answer_score,
+         ROW_NUMBER() OVER (PARTITION BY tam.tagname ORDER BY COUNT(*) DESC, SUM(COALESCE(a.Score,0)) DESC) AS rn
+  FROM answers a
+  JOIN Posts parentQ ON parentQ.Id = a.ParentId AND parentQ.PostTypeId = 1
+  CROSS JOIN LATERAL (
+    SELECT CASE WHEN parentQ.Tags IS NOT NULL AND parentQ.Tags <> '' THEN string_to_array(substring(parentQ.Tags,2,length(parentQ.Tags)-2),'><') ELSE ARRAY[]::text[] END AS tagarr
+  ) t_arr
+  CROSS JOIN LATERAL unnest(t_arr.tagarr) AS tam(tagname)
+  LEFT JOIN Users u ON u.Id = a.OwnerUserId
+  WHERE a.OwnerUserId IS NOT NULL AND a.OwnerUserId > 0
+  GROUP BY tam.tagname, a.OwnerUserId, u.DisplayName
+),
+tag_top_contributors AS (
+  SELECT tagname, user_id, user_displayname, answers_by_user, total_answer_score
+  FROM tag_answerers
+  WHERE rn <= 3
+),
+tag_cooccurrence AS (
+  SELECT t1.tagname AS tag1, t2.tagname AS tag2, COUNT(*) AS co_count
+  FROM tag_post_map t1
+  JOIN tag_post_map t2 ON t1.question_id = t2.question_id AND t1.tagname <> t2.tagname
+  GROUP BY t1.tagname, t2.tagname
+),
+tag_top_cooccurrence AS (
+  SELECT tag1, tag2, co_count,
+         ROW_NUMBER() OVER (PARTITION BY tag1 ORDER BY co_count DESC, tag2) AS rn
+  FROM tag_cooccurrence
+),
+tag_partner AS (
+  SELECT tag1 AS tagname, tag2 AS top_partner, co_count
+  FROM tag_top_cooccurrence
+  WHERE rn = 1
+),
+duplicate_graph AS (
+  SELECT pl.PostId, pl.RelatedPostId
+  FROM PostLinks pl
+  WHERE pl.LinkTypeId = 3
+),
+duplicate_pairs AS (
+  SELECT PostId, RelatedPostId FROM duplicate_graph
+  UNION
+  SELECT RelatedPostId AS PostId, PostId AS RelatedPostId FROM duplicate_graph
+),
+dup_recursive AS (
+  SELECT PostId, RelatedPostId, ARRAY[PostId, RelatedPostId] AS path
+  FROM duplicate_pairs
+  UNION ALL
+  SELECT dr.PostId, dp.RelatedPostId, dr.path || dp.RelatedPostId
+  FROM dup_recursive dr
+  JOIN duplicate_pairs dp ON dp.PostId = dr.RelatedPostId
+  WHERE NOT dp.RelatedPostId = ANY(dr.path) AND array_length(dr.path,1) < 25
+),
+dup_group AS (
+  SELECT LEAST(PostId, RelatedPostId) AS p1, GREATEST(PostId, RelatedPostId) AS p2
+  FROM dup_recursive
+),
+dup_distinct_pairs AS (
+  SELECT DISTINCT p1,p2 FROM dup_group
+),
+dup_cluster_sizes AS (
+  SELECT p1 AS cluster_seed, COUNT(*)+1 AS cluster_size
+  FROM (
+    SELECT p1, p2 FROM dup_distinct_pairs
+    UNION ALL
+    SELECT p2, p1 FROM dup_distinct_pairs
+  ) x
+  GROUP BY p1
+),
+tag_with_metrics AS (
+  SELECT ta.tagname, ta.question_count, ta.total_views, ta.accepted_count, ta.avg_question_score, ta.median_question_score, ta.total_answer_count,
+         COALESCE(SUM(pv.upvotes),0) AS total_upvotes,
+         COALESCE(SUM(pv.downvotes),0) AS total_downvotes,
+         COALESCE(SUM(pc.comment_count),0) AS total_comments,
+         AVG(qfa.hours_to_first_answer) FILTER (WHERE qfa.hours_to_first_answer IS NOT NULL) AS avg_hours_to_first_answer
+  FROM tag_aggregates ta
+  JOIN tag_post_map tpm ON tpm.tagname = ta.tagname
+  LEFT JOIN post_votes pv ON pv.PostId = tpm.question_id
+  LEFT JOIN post_comments pc ON pc.PostId = tpm.question_id
+  LEFT JOIN question_first_answer qfa ON qfa.question_id = tpm.question_id
+  GROUP BY ta.tagname, ta.question_count, ta.total_views, ta.accepted_count, ta.avg_question_score, ta.median_question_score, ta.total_answer_count
+),
+popular_by_views AS (
+  SELECT tagname FROM (
+    SELECT tagname, total_views, NTILE(10) OVER (ORDER BY total_views DESC) AS bucket
+    FROM tag_with_metrics
+  ) t WHERE bucket = 1
+),
+popular_by_activity AS (
+  SELECT tagname FROM (
+    SELECT tagname, total_answer_count, NTILE(10) OVER (ORDER BY total_answer_count DESC) AS bucket
+    FROM tag_with_metrics
+  ) t WHERE bucket = 1
+),
+popular_union AS (
+  SELECT tagname FROM popular_by_views
+  UNION
+  SELECT tagname FROM popular_by_activity
+),
+popular_intersection AS (
+  SELECT tagname FROM popular_by_views
+  INTERSECT
+  SELECT tagname FROM popular_by_activity
+),
+popular_exclusive AS (
+  SELECT tagname FROM popular_by_views
+  EXCEPT
+  SELECT tagname FROM popular_by_activity
+)
+SELECT
+  twm.tagname,
+  twm.question_count,
+  twm.total_views,
+  twm.accepted_count,
+  ROUND(100.0 * twm.accepted_count / NULLIF(twm.question_count,0),2) AS accept_rate_pct,
+  ROUND(CAST(twm.avg_question_score AS numeric),3) AS avg_question_score,
+  COALESCE(twm.median_question_score,0) AS median_question_score,
+  twm.total_answer_count,
+  twm.total_upvotes,
+  twm.total_downvotes,
+  twm.total_comments,
+  ROUND(CAST(COALESCE(twm.avg_hours_to_first_answer, 0) AS numeric),3) AS avg_hours_to_first_answer,
+  COALESCE(tp.top_partner, '(none)') AS top_partner_tag,
+  COALESCE(s.sample_title, '(no sample)') AS sample_title,
+  (SELECT string_agg(COALESCE(ttc.user_displayname, 'user_'||CAST(ttc.user_id AS varchar)), ', ' ORDER BY ttc.answers_by_user DESC, ttc.total_answer_score DESC)
+   FROM tag_top_contributors ttc
+   WHERE ttc.tagname = twm.tagname
+  ) AS top_contributors,
+  (SELECT COUNT(DISTINCT u.Id)
+   FROM Users u
+   WHERE u.Reputation > (SELECT COALESCE(AVG(Reputation),0) FROM Users)
+     AND EXISTS (
+       SELECT 1 FROM Posts p2
+       WHERE p2.PostTypeId = 1 AND p2.OwnerUserId = u.Id AND p2.Tags IS NOT NULL
+         AND p2.Tags LIKE ('%<' || twm.tagname || '>%')
+     )
+  ) AS highrep_askers_in_tag,
+  (CASE WHEN EXISTS (SELECT 1 FROM popular_union pu WHERE pu.tagname = twm.tagname) THEN TRUE ELSE FALSE END) AS is_popular_union,
+  (CASE WHEN EXISTS (SELECT 1 FROM popular_intersection pi WHERE pi.tagname = twm.tagname) THEN TRUE ELSE FALSE END) AS is_popular_intersection,
+  (CASE WHEN EXISTS (SELECT 1 FROM popular_exclusive pe WHERE pe.tagname = twm.tagname) THEN TRUE ELSE FALSE END) AS is_popular_exclusive,
+  (LOG(GREATEST(1, twm.question_count)) * (1 + LOG(GREATEST(1, twm.total_views))) / GREATEST(1, NULLIF(twm.total_upvotes + twm.total_downvotes, 0)) +
+   COALESCE(twm.avg_hours_to_first_answer, 0) * 0.5 +
+   COALESCE((SELECT CHARACTER_LENGTH(s2.sample_title) FROM tag_top_samples s2 WHERE s2.tagname = twm.tagname LIMIT 1), 0) / 100.0
+  ) AS complexity_score_raw,
+  RANK() OVER (ORDER BY (LOG(GREATEST(1, twm.question_count)) * (1 + LOG(GREATEST(1, twm.total_views))) / GREATEST(1, NULLIF(twm.total_upvotes + twm.total_downvotes, 0)) +
+   COALESCE(twm.avg_hours_to_first_answer, 0) * 0.5 +
+   COALESCE((SELECT CHARACTER_LENGTH(s3.sample_title) FROM tag_top_samples s3 WHERE s3.tagname = twm.tagname LIMIT 1), 0) / 100.0
+  ) DESC) AS complexity_rank,
+  COALESCE(dc.cluster_size, 0) AS duplicate_cluster_size
+FROM tag_with_metrics twm
+LEFT JOIN tag_partner tp ON tp.tagname = twm.tagname
+LEFT JOIN tag_top_samples s ON s.tagname = twm.tagname
+LEFT JOIN dup_cluster_sizes dc ON dc.cluster_seed = (
+  SELECT MIN(question_id) FROM tag_post_map WHERE tagname = twm.tagname
+)
+ORDER BY complexity_rank NULLS LAST, twm.total_views DESC
+LIMIT 100;

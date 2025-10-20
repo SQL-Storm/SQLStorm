@@ -1,0 +1,60 @@
+with RecursiveAuthoredQuestions as (
+  select 
+    u.Id as UserId,
+    p.Id as QuestionId,
+    p.CreationDate as QuestionCreated,
+    qPredecessorQuestionId.CreationDate as QuestionPredecessorCreated,
+    rank() over (partition by u.Id order by p.CreationDate) as QuestionRank,
+    p.Score as QuestionScore,
+    p.Title as QuestionTitle,
+    p.Tags as QuestionTags,
+    bCount.BadgeCount as UserBadgeCount
+  from Users u
+  inner join Posts p on p.OwnerUserId = u.Id and p.PostTypeId = 1
+  left join Posts qPredecessorQuestionId on qPredecessorQuestionId.AcceptedAnswerId = (
+     select min(a.Id) from Posts a 
+     where a.ParentId = p.Id 
+       and a.OwnerUserId != p.OwnerUserId 
+       and a.CreationDate > p.CreationDate
+  )
+  left join (
+    select UserId, count(*) as BadgeCount
+    from Badges
+    group by UserId
+  ) bCount on bCount.UserId = u.Id
+  where u.Reputation > 1000 and (p.Score > 5 or coalesce(bCount.BadgeCount, 0) > 3)
+), QuestionAnswerRatios as (
+  select 
+    rq.UserId,
+    count(distinct bostriclep.PostId) as AnsweredQuestionCount,
+    -- The original query had an unclear expression for PostedMoreAnswers; assume counting answers by user to others' questions
+    count(distinct case when bostriclep.OwnerUserId != rq.UserId then bostriclep.ParentId end) as PostedMoreAnswers,
+    avg(rq.QuestionScore) as avgQuestionScore,
+    max(rq.QuestionScore) as maxQuestionScore,
+    min(rq.QuestionScore) as minQuestionScore,
+    sum(rq.QuestionScore) as totalScoreUser
+  from RecursiveAuthoredQuestions rq
+  left join Posts bostriclep on bostriclep.ParentId = rq.QuestionId and bostriclep.PostTypeId = 2
+  group by rq.UserId
+)
+select 
+  qr.UserId,
+  u.DisplayName as Username,
+  (char_length(coalesce(u.AboutMe, '')) - char_length(replace(lower(coalesce(u.AboutMe, '')), 'sql', ''))) / 3 as sqlMentions,
+  qr.AnsweredQuestionCount,
+  qr.PostedMoreAnswers,
+  qr.avgQuestionScore,
+  qr.maxQuestionScore,
+  qr.minQuestionScore,
+  qr.totalScoreUser
+from QuestionAnswerRatios qr
+inner join Users u on u.Id = qr.UserId
+left join PostLinks pl on pl.PostId in (
+  select QuestionId from RecursiveAuthoredQuestions where UserId = qr.UserId
+)
+where qr.avgQuestionScore > 4
+  and qr.AnsweredQuestionCount = (
+    select max(sub.AnsweredQuestionCount)
+    from QuestionAnswerRatios sub
+    where sub.UserId = qr.UserId
+  );

@@ -1,0 +1,180 @@
+WITH UserAgg AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.Location,
+        COALESCE(AVG(p.Score), 0) AS AvgPostScore,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionCount,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswerCount,
+        SUM(COALESCE(vUp.VoteCount, 0)) AS TotalUpVotes,
+        SUM(COALESCE(vDown.VoteCount, 0)) AS TotalDownVotes,
+        COUNT(b.Id) AS BadgeCount,
+        MAX(COALESCE(b.Date, TIMESTAMP '1970-01-01')) AS LastBadgeDate
+    FROM
+        Users u
+        LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+        LEFT JOIN (
+            SELECT PostId, COUNT(*) AS VoteCount
+            FROM Votes
+            WHERE VoteTypeId = 2
+            GROUP BY PostId
+        ) AS vUp ON vUp.PostId = p.Id
+        LEFT JOIN (
+            SELECT PostId, COUNT(*) AS VoteCount
+            FROM Votes
+            WHERE VoteTypeId = 3
+            GROUP BY PostId
+        ) AS vDown ON vDown.PostId = p.Id
+        LEFT JOIN Badges b ON b.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Location
+),
+RecentActivity AS (
+    SELECT
+        p.OwnerUserId,
+        MAX(p.LastActivityDate) AS LatestActivity,
+        MAX(ph.CreationDate) AS LatestPostEdit,
+        SUM(CASE WHEN ph.PostHistoryTypeId IN (10,12,14) THEN 1 ELSE 0 END) AS ImportantEditsCount
+    FROM
+        Posts p
+        LEFT JOIN PostHistory ph ON ph.PostId = p.Id AND ph.UserId = p.OwnerUserId
+    GROUP BY p.OwnerUserId
+),
+RankedPosts AS (
+    SELECT
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        RANK() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC) AS RankByScore,
+        DENSE_RANK() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS RankByCreationDate
+    FROM Posts p
+    WHERE p.Score IS NOT NULL
+),
+PostsWithDupCount AS (
+    SELECT
+        p.Id,
+        p.Title,
+        p.Tags,
+        COUNT(pl.Id) FILTER (WHERE lt.Name = 'Duplicate') AS DuplicateCount
+    FROM
+        Posts p
+        LEFT JOIN PostLinks pl ON pl.PostId = p.Id
+        LEFT JOIN LinkTypes lt ON lt.Id = pl.LinkTypeId
+    GROUP BY p.Id, p.Title, p.Tags
+),
+UserInnerMostBadges AS (
+    SELECT DISTINCT
+        b.UserId,
+        FIRST_VALUE(b.Name) OVER (PARTITION BY b.UserId ORDER BY b.Date DESC) AS MostRecentBadge,
+        ('[class ' ||
+            CASE WHEN b.Class = 1 THEN 'Gold'
+                 WHEN b.Class = 2 THEN 'Silver'
+                 WHEN b.Class = 3 THEN 'Bronze'
+                 ELSE 'Unknown'
+            END || ']') AS BadgeClassStr
+    FROM Badges b
+),
+CorrelatedBadgeCounts AS (
+    SELECT
+        u.Id AS UserId,
+        (
+            SELECT COUNT(*)
+            FROM Badges b2
+            WHERE b2.UserId = u.Id
+            AND b2.Class = 1
+        ) AS GoldBadgeCount,
+        (
+            SELECT COUNT(*)
+            FROM Badges b2
+            WHERE b2.UserId = u.Id
+            AND b2.Class = 2
+        ) AS SilverBadgeCount,
+        (
+            SELECT COUNT(*)
+            FROM Badges b2
+            WHERE b2.UserId = u.Id
+            AND b2.Class = 3
+        ) AS BronzeBadgeCount
+    FROM Users u
+),
+QuestionsAndAnswersUnion AS (
+    SELECT
+        p.Id,
+        p.Title,
+        p.PostTypeId,
+        p.Score,
+        p.FavoriteCount AS FavCount,
+        string_to_array(substring(p.Tags FROM 2 FOR char_length(p.Tags)-2), '><') AS Tag_ARRAY
+    FROM Posts p
+    WHERE p.PostTypeId IN (1,2)
+)
+SELECT
+    ua.*,
+    ra.LatestActivity,
+    ra.LatestPostEdit,
+    ra.ImportantEditsCount,
+    rp.Id AS PostId,
+    rp.PostTypeId,
+    rp.CreationDate,
+    rp.Score AS PostScore,
+    rp.RankByScore,
+    rp.RankByCreationDate,
+    pwd.Title AS PostTitle,
+    pwd.Tags AS PostTags,
+    pwd.DuplicateCount,
+    uimb.MostRecentBadge,
+    uimb.BadgeClassStr,
+    cbc.GoldBadgeCount,
+    cbc.SilverBadgeCount,
+    cbc.BronzeBadgeCount,
+    qau.FavCount,
+    qau.Tag_ARRAY
+FROM UserAgg ua
+LEFT JOIN RecentActivity ra ON ra.OwnerUserId = ua.Id
+LEFT JOIN RankedPosts rp ON rp.OwnerUserId = ua.Id
+LEFT JOIN PostsWithDupCount pwd ON pwd.Id = rp.Id
+LEFT JOIN UserInnerMostBadges uimb ON uimb.UserId = ua.Id
+LEFT JOIN CorrelatedBadgeCounts cbc ON cbc.UserId = ua.Id
+LEFT JOIN QuestionsAndAnswersUnion qau ON qau.Id = rp.Id
+GROUP BY
+    ua.Id,
+    ua.DisplayName,
+    ua.Reputation,
+    ua.Location,
+    ua.AvgPostScore,
+    ua.QuestionCount,
+    ua.AnswerCount,
+    ua.TotalUpVotes,
+    ua.TotalDownVotes,
+    ua.BadgeCount,
+    ua.LastBadgeDate,
+    ra.OwnerUserId,
+    ra.LatestActivity,
+    ra.LatestPostEdit,
+    ra.ImportantEditsCount,
+    rp.Id,
+    rp.PostTypeId,
+    rp.OwnerUserId,
+    rp.CreationDate,
+    rp.Score,
+    rp.RankByScore,
+    rp.RankByCreationDate,
+    pwd.Id,
+    pwd.Title,
+    pwd.Tags,
+    pwd.DuplicateCount,
+    uimb.UserId,
+    uimb.MostRecentBadge,
+    uimb.BadgeClassStr,
+    cbc.UserId,
+    cbc.GoldBadgeCount,
+    cbc.SilverBadgeCount,
+    cbc.BronzeBadgeCount,
+    qau.Id,
+    qau.Title,
+    qau.PostTypeId,
+    qau.Score,
+    qau.FavCount,
+    qau.Tag_ARRAY;

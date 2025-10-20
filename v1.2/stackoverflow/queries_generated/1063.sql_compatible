@@ -1,0 +1,205 @@
+WITH RecursiveTagHierarchy AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        1 AS Level
+    FROM Tags t
+    WHERE t.TagName IS NOT NULL AND t.TagName <> ''
+
+    UNION ALL
+
+    SELECT
+        t2.Id,
+        t2.TagName,
+        rh.Level + 1
+    FROM Tags t2
+    INNER JOIN RecursiveTagHierarchy rh ON t2.TagName LIKE rh.TagName || '%'
+    WHERE t2.Id <> rh.Id AND rh.Level < 3
+),
+UserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionsCreated,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswersCreated,
+        COUNT(DISTINCT c.Id) AS CommentsMade,
+        COALESCE(SUM(vb.VotesForUser),0) AS TotalVotesReceived,
+        MAX(p.LastActivityDate) AS LastPostActivity,
+        COUNT(DISTINCT b.Id) AS BadgeCount
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Comments c ON c.UserId = u.Id
+    LEFT JOIN (
+        SELECT p.OwnerUserId, COUNT(*) AS VotesForUser
+        FROM Votes v
+        INNER JOIN Posts p ON p.Id = v.PostId AND p.OwnerUserId IS NOT NULL AND p.OwnerUserId <> -1
+        WHERE v.VoteTypeId IN (2,3)
+        GROUP BY p.OwnerUserId
+    ) vb ON vb.OwnerUserId = u.Id
+    LEFT JOIN Badges b ON b.UserId = u.Id AND b.Class = 1
+    WHERE u.Reputation > 100
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+PostEngagement AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        p.AcceptedAnswerId,
+        p.ParentId,
+        p.Title,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId = 2) AS UpVotes,
+        COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId = 3) AS DownVotes,
+        BOOL_OR(p.ClosedDate IS NOT NULL) AS IsClosed,
+        RANK() OVER (
+            PARTITION BY COALESCE(p.ParentId, p.Id)
+            ORDER BY p.Score DESC NULLS LAST, p.CreationDate ASC
+        ) AS AnswerRank
+    FROM Posts p
+    LEFT JOIN Comments c ON c.PostId = p.Id
+    LEFT JOIN Votes v ON v.PostId = p.Id
+    WHERE p.PostTypeId IN (1,2)
+    GROUP BY p.Id, p.PostTypeId, p.OwnerUserId, p.CreationDate, p.Score, p.ViewCount, p.Tags, p.AcceptedAnswerId, p.ParentId, p.Title, p.ClosedDate
+),
+DuplicatesAndLinks AS (
+    SELECT
+        p.Id AS QuestionId,
+        p.Title AS QuestionTitle,
+        pl.PostId,
+        pl.RelatedPostId,
+        lt.Name AS LinkTypeName
+    FROM Posts p
+    LEFT JOIN PostLinks pl ON pl.PostId = p.Id
+    LEFT JOIN LinkTypes lt ON lt.Id = pl.LinkTypeId
+    WHERE p.PostTypeId = 1
+),
+QuestionCloseReasons AS (
+    SELECT
+        ph.PostId,
+        crt.Name AS CloseReason,
+        COUNT(*) AS CloseVotesCount
+    FROM PostHistory ph
+    INNER JOIN PostHistoryTypes pht ON pht.Id = ph.PostHistoryTypeId AND pht.Name = 'Post Closed'
+    LEFT JOIN CloseReasonTypes crt ON crt.Id = CAST(ph.Comment AS SMALLINT)
+    WHERE ph.PostId IS NOT NULL
+    GROUP BY ph.PostId, crt.Name
+),
+UserBadgeSummary AS (
+    SELECT
+        b.UserId,
+        b.Class,
+        COUNT(*) AS BadgeCount
+    FROM Badges b
+    GROUP BY b.UserId, b.Class
+),
+AnswerAcceptanceStats AS (
+    SELECT
+        p.ParentId AS QuestionId,
+        COUNT(*) AS AnswerCount,
+        COUNT(CASE WHEN p.Id = q.AcceptedAnswerId THEN 1 END) AS AcceptedAnswerCount
+    FROM Posts p
+    INNER JOIN Posts q ON q.Id = p.ParentId AND q.PostTypeId = 1
+    WHERE p.PostTypeId = 2
+    GROUP BY p.ParentId
+)
+SELECT
+    ua.UserId,
+    ua.DisplayName,
+    ua.Reputation,
+    ua.QuestionsCreated,
+    ua.AnswersCreated,
+    ua.CommentsMade,
+    ua.TotalVotesReceived,
+    ua.BadgeCount AS GoldBadgeCount,
+    COALESCE(ubsSilver.BadgeCount,0) AS SilverBadgeCount,
+    COALESCE(ubsBronze.BadgeCount,0) AS BronzeBadgeCount,
+    pe.PostId,
+    pe.PostTypeId,
+    pe.Score,
+    pe.ViewCount,
+    pe.CommentCount,
+    pe.UpVotes,
+    pe.DownVotes,
+    pe.IsClosed,
+    pe.AnswerRank,
+    dq.LinkTypeName,
+    qcr.CloseReason,
+    qcr.CloseVotesCount,
+    ats.AnswerCount,
+    ats.AcceptedAnswerCount,
+    CASE
+        WHEN pe.PostTypeId = 1 THEN
+            'Q: ' || COALESCE(NULLIF(pe.Title, ''), '[No Title]')
+                || ' [' || COALESCE(pe.Tags, '<untagged>') || '] '
+                || ' Score:' || COALESCE(pe.Score,0) 
+                || ' Views:' || COALESCE(pe.ViewCount,0)
+                || ' Comments:' || COALESCE(pe.CommentCount,0)
+        WHEN pe.PostTypeId = 2 THEN
+            'A to Q#' || COALESCE(CAST(pe.ParentId AS TEXT), 'N/A') 
+                || ' Score:' || COALESCE(pe.Score,0)
+                || ' Accepted:' || CASE WHEN pe.PostId = (SELECT AcceptedAnswerId FROM Posts WHERE Id = pe.ParentId) THEN 'Yes' ELSE 'No' END
+        ELSE 'Other PostType'
+    END AS PostSummary,
+    RANK() OVER (ORDER BY ua.Reputation DESC) AS ReputationRank
+FROM UserActivity ua
+LEFT JOIN PostEngagement pe ON pe.OwnerUserId = ua.UserId
+LEFT JOIN DuplicatesAndLinks dq ON dq.QuestionId = pe.PostId
+LEFT JOIN QuestionCloseReasons qcr ON qcr.PostId = pe.PostId
+LEFT JOIN UserBadgeSummary ubsSilver ON ubsSilver.UserId = ua.UserId AND ubsSilver.Class = 2
+LEFT JOIN UserBadgeSummary ubsBronze ON ubsBronze.UserId = ua.UserId AND ubsBronze.Class = 3
+LEFT JOIN AnswerAcceptanceStats ats ON ats.QuestionId = pe.PostId
+WHERE ua.Reputation > 500
+  AND (pe.PostTypeId IS NULL OR pe.IsClosed = FALSE)
+ORDER BY ua.Reputation DESC, pe.Score DESC NULLS LAST
+LIMIT 100
+
+UNION ALL
+
+SELECT
+    NULL AS UserId,
+    '[Closed Question]' AS DisplayName,
+    CAST(NULL AS INTEGER) AS Reputation,
+    CAST(NULL AS INTEGER) AS QuestionsCreated,
+    CAST(NULL AS INTEGER) AS AnswersCreated,
+    CAST(NULL AS INTEGER) AS CommentsMade,
+    CAST(NULL AS INTEGER) AS TotalVotesReceived,
+    CAST(NULL AS INTEGER) AS GoldBadgeCount,
+    CAST(NULL AS INTEGER) AS SilverBadgeCount,
+    CAST(NULL AS INTEGER) AS BronzeBadgeCount,
+    p.Id AS PostId,
+    p.PostTypeId,
+    p.Score,
+    p.ViewCount,
+    (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id) AS CommentCount,
+    (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 2) AS UpVotes,
+    (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 3) AS DownVotes,
+    TRUE AS IsClosed,
+    CAST(NULL AS INTEGER) AS AnswerRank,
+    NULL AS LinkTypeName,
+    (SELECT crt.Name FROM PostHistory ph JOIN CloseReasonTypes crt ON crt.Id = CAST(ph.Comment AS SMALLINT)
+     WHERE ph.PostId = p.Id AND ph.PostHistoryTypeId IN (10) LIMIT 1) AS CloseReason,
+    (SELECT COUNT(*) FROM PostHistory ph WHERE ph.PostId = p.Id AND ph.PostHistoryTypeId = 10) AS CloseVotesCount,
+    (SELECT COUNT(*) FROM Posts a WHERE a.ParentId = p.Id) AS AnswerCount,
+    (SELECT COUNT(*) FROM Posts a WHERE a.ParentId = p.Id AND a.Id = p.AcceptedAnswerId) AS AcceptedAnswerCount,
+    'Closed Q: ' || COALESCE(NULLIF(p.Title, ''), '[No Title]')
+        || ' Tags: ' || COALESCE(p.Tags, '<untagged>')
+        || ' Score:' || COALESCE(p.Score,0)
+        || ' Views:' || COALESCE(p.ViewCount,0)
+        || ' Comments:' || (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id)
+        || ' Closed for: ' || COALESCE(
+            (SELECT crt.Name FROM PostHistory ph JOIN CloseReasonTypes crt ON crt.Id = CAST(ph.Comment AS SMALLINT)
+             WHERE ph.PostId = p.Id AND ph.PostHistoryTypeId = 10 LIMIT 1), 'Unknown')
+    AS PostSummary,
+    CAST(NULL AS INTEGER) AS ReputationRank
+FROM Posts p
+WHERE p.PostTypeId = 1
+  AND p.ClosedDate IS NOT NULL
+  AND p.Score > 10
+ORDER BY p.Score DESC
+LIMIT 10;

@@ -1,0 +1,150 @@
+WITH RECURSIVE RecursiveTagHierarchy AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        1 AS Level,
+        CAST(t.TagName AS VARCHAR(1000)) AS Path
+    FROM Tags t
+    WHERE t.IsRequired = TRUE
+
+    UNION ALL
+
+    SELECT
+        c.Id,
+        c.TagName,
+        c.Count,
+        c.ExcerptPostId,
+        c.WikiPostId,
+        r.Level + 1,
+        CAST(r.Path || ' > ' || c.TagName AS VARCHAR(1000)) AS Path
+    FROM Tags c
+    INNER JOIN RecursiveTagHierarchy r ON c.Id = (
+        SELECT pl.RelatedPostId
+        FROM PostLinks pl
+        JOIN Posts p ON p.Id = pl.PostId
+        WHERE p.Tags LIKE '%' || r.TagName || '%'
+          AND pl.LinkTypeId = 1
+        LIMIT 1
+    )
+    WHERE r.Level < 3
+),
+UserBadgeCounts AS (
+    SELECT
+        b.UserId,
+        b.Class,
+        COUNT(*) AS BadgeCount
+    FROM Badges b
+    GROUP BY b.UserId, b.Class
+),
+UserActivityStats AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionsAsked,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswersGiven,
+        COALESCE(SUM(vt2.UpVotes), 0) AS TotalUpVotes,
+        COALESCE(SUM(vt2.DownVotes), 0) AS TotalDownVotes,
+        MAX(p.CreationDate) AS LastPostDate,
+        MIN(p.CreationDate) AS FirstPostDate,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 10 THEN ph.CreationDate END) AS LastCloseDate,
+        COUNT(DISTINCT c.Id) AS CommentsMade
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN (
+        SELECT
+            p.OwnerUserId,
+            SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+            SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes
+        FROM Posts p
+        LEFT JOIN Votes v ON v.PostId = p.Id
+        GROUP BY p.OwnerUserId
+    ) vt2 ON vt2.OwnerUserId = u.Id
+    LEFT JOIN PostHistory ph ON ph.UserId = u.Id
+    LEFT JOIN Comments c ON c.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation, vt2.UpVotes, vt2.DownVotes
+),
+TopPostsWithWindow AS (
+    SELECT
+        p.Id,
+        p.Title,
+        p.Tags,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        u.DisplayName AS OwnerName,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC, p.ViewCount DESC) AS rn,
+        COUNT(*) OVER (PARTITION BY p.OwnerUserId) AS TotalPostsByUser,
+        AVG(p.Score) OVER (PARTITION BY p.OwnerUserId) AS AvgScoreByUser,
+        MAX(p.Score) OVER (PARTITION BY p.OwnerUserId) AS MaxScoreByUser,
+        CASE WHEN p.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END AS HasAcceptedAnswer
+    FROM Posts p
+    LEFT JOIN Users u ON u.Id = p.OwnerUserId
+    WHERE p.PostTypeId = 1
+),
+ComplexUserSummary AS (
+    SELECT
+        uas.UserId,
+        uas.DisplayName,
+        uas.Reputation,
+        COALESCE(ubc_gold.BadgeCount, 0) AS GoldBadges,
+        COALESCE(ubc_silver.BadgeCount, 0) AS SilverBadges,
+        COALESCE(ubc_bronze.BadgeCount, 0) AS BronzeBadges,
+        uas.QuestionsAsked,
+        uas.AnswersGiven,
+        uas.TotalUpVotes,
+        uas.TotalDownVotes,
+        uas.CommentsMade,
+        uas.FirstPostDate,
+        uas.LastPostDate,
+        uas.LastCloseDate,
+        MAX(tph.Level) AS MaxTagHierarchyLevel,
+        STRING_AGG(DISTINCT tph.Path, ' | ') AS TagPaths
+    FROM UserActivityStats uas
+    LEFT JOIN UserBadgeCounts ubc_gold ON ubc_gold.UserId = uas.UserId AND ubc_gold.Class = 1
+    LEFT JOIN UserBadgeCounts ubc_silver ON ubc_silver.UserId = uas.UserId AND ubc_silver.Class = 2
+    LEFT JOIN UserBadgeCounts ubc_bronze ON ubc_bronze.UserId = uas.UserId AND ubc_bronze.Class = 3
+    LEFT JOIN RecursiveTagHierarchy tph ON tph.TagName = ANY(string_to_array(COALESCE((SELECT p.Tags FROM Posts p WHERE p.OwnerUserId = uas.UserId LIMIT 1), ''), '><'))
+    GROUP BY
+        uas.UserId, uas.DisplayName, uas.Reputation,
+        ubc_gold.BadgeCount, ubc_silver.BadgeCount, ubc_bronze.BadgeCount,
+        uas.QuestionsAsked, uas.AnswersGiven, uas.TotalUpVotes, uas.TotalDownVotes,
+        uas.CommentsMade, uas.FirstPostDate, uas.LastPostDate, uas.LastCloseDate
+)
+SELECT
+    cus.UserId,
+    cus.DisplayName,
+    cus.Reputation,
+    cus.GoldBadges,
+    cus.SilverBadges,
+    cus.BronzeBadges,
+    cus.QuestionsAsked,
+    cus.AnswersGiven,
+    cus.TotalUpVotes,
+    cus.TotalDownVotes,
+    cus.CommentsMade,
+    cus.FirstPostDate,
+    cus.LastPostDate,
+    cus.LastCloseDate,
+    cus.MaxTagHierarchyLevel,
+    cus.TagPaths,
+    COALESCE(tp.Title, 'No Top Question') AS TopQuestionTitle,
+    COALESCE(tp.Score, 0) AS TopQuestionScore,
+    COALESCE(tp.ViewCount, 0) AS TopQuestionViews,
+    tp.HasAcceptedAnswer,
+    CASE
+        WHEN cus.LastCloseDate IS NOT NULL AND cus.LastCloseDate > (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '30 days') THEN 'Recently Closed Post'
+        WHEN cus.QuestionsAsked = 0 AND cus.AnswersGiven > 10 THEN 'Answerer'
+        WHEN cus.QuestionsAsked > 10 AND cus.AnswersGiven = 0 THEN 'Questioner'
+        WHEN cus.QuestionsAsked > 10 AND cus.AnswersGiven > 10 THEN 'Active Contributor'
+        ELSE 'Casual User'
+    END AS UserCategory
+FROM ComplexUserSummary cus
+LEFT JOIN TopPostsWithWindow tp ON tp.OwnerUserId = cus.UserId AND tp.rn = 1
+WHERE cus.Reputation > 1000
+ORDER BY cus.Reputation DESC, cus.GoldBadges DESC, cus.SilverBadges DESC
+LIMIT 100;

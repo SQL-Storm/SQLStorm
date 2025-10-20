@@ -1,0 +1,70 @@
+WITH RecursiveTagExplode AS (
+    SELECT
+        p.Id AS PostId,
+        TRIM(SUBSTRING(tag FROM 2 FOR CHAR_LENGTH(tag) - 2)) AS TagName
+    FROM Posts p
+    CROSS JOIN LATERAL (
+        SELECT regexp_split_to_table(COALESCE(p.Tags, ''), '><') AS tag
+    ) s
+),
+UserPostStats AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        p.Id AS PostId,
+        p.Title,
+        COALESCE(p.Score, 0) AS PostScore,
+        COALESCE(ba.BadgeCount, 0) AS BadgeCount,
+        ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY COALESCE(p.Score, 0) DESC) AS PostRank,
+        AVG(v.Score) OVER (PARTITION BY p.OwnerUserId) AS AverageVotesPerUserPost,
+        CASE 
+            WHEN SUM(CASE WHEN ph.PostHistoryTypeId = 10 THEN 1 ELSE 0 END) OVER (PARTITION BY p.Id) > 0 THEN 'Closed'
+            WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+            ELSE 'Open'
+        END AS PostStatus
+    FROM Users u
+    JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN (
+        SELECT PostId, COUNT(*) AS BadgeCount
+        FROM Badges
+        GROUP BY PostId
+    ) ba ON ba.PostId = p.Id
+    LEFT JOIN Votes v ON v.PostId = p.Id
+    LEFT JOIN PostHistory ph ON ph.PostId = p.Id
+),
+AggregatedTags AS (
+    SELECT
+        r.PostId,
+        r.TagName
+    FROM RecursiveTagExplode r
+)
+SELECT
+    ups.UserId,
+    ups.DisplayName,
+    ups.Reputation,
+    ups.CreationDate,
+    ups.PostId,
+    ups.Title,
+    ups.PostScore,
+    ups.BadgeCount,
+    ups.PostRank,
+    ups.AverageVotesPerUserPost,
+    ups.PostStatus,
+    at.TagName
+FROM UserPostStats ups
+LEFT JOIN AggregatedTags at ON at.PostId = ups.PostId
+GROUP BY
+    ups.UserId,
+    ups.DisplayName,
+    ups.Reputation,
+    ups.CreationDate,
+    ups.PostId,
+    ups.Title,
+    ups.PostScore,
+    ups.BadgeCount,
+    ups.PostRank,
+    ups.AverageVotesPerUserPost,
+    ups.PostStatus,
+    at.TagName;

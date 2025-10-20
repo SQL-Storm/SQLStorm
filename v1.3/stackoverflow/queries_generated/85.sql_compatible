@@ -1,0 +1,211 @@
+with
+user_stats as (
+  select
+    u.id,
+    u.displayname,
+    u.reputation,
+    u.creationdate,
+    coalesce(u.views,0) as views,
+    coalesce(u.upvotes,0) as upvotes,
+    coalesce(u.downvotes,0) as downvotes,
+    greatest(extract(epoch from (timestamp '2024-10-01 12:34:56' - u.creationdate))/86400.0, 1.0) as days_alive,
+    (cast(u.reputation as numeric) / greatest(extract(epoch from (timestamp '2024-10-01 12:34:56' - u.creationdate))/86400.0, 7.0))::numeric(12,4) as rep_per_week_equiv,
+    (ln(1+coalesce(u.views,0)) * 0.4 + ln(1+coalesce(u.upvotes,0)) * 0.5 - ln(1+coalesce(u.downvotes,0)) * 0.1)::numeric(12,6) as engagement_index
+  from users u
+),
+question_base as (
+  select
+    p.id,
+    p.title,
+    p.owneruserid,
+    p.creationdate,
+    p.score,
+    p.viewcount,
+    p.answercount,
+    p.favoritecount,
+    p.tags,
+    case when p.tags is null then array[]::text[] else string_to_array(substring(p.tags from 2 for char_length(p.tags)-2), '><') end as tag_array,
+    (coalesce(p.score,0) * 3 + coalesce(p.viewcount,0)/100 + coalesce(p.answercount,0) * 5 + coalesce(p.favoritecount,0) * 10) as raw_pop
+  from posts p
+  where p.posttypeid = 1
+),
+answer_base as (
+  select
+    a.id,
+    a.parentid as questionid,
+    a.owneruserid,
+    a.creationdate,
+    a.score,
+    a.body,
+    case when q.acceptedanswerid = a.id then true else false end as is_accepted
+  from posts a
+  left join posts q on q.id = a.parentid
+  where a.posttypeid = 2
+),
+question_metrics as (
+  select
+    q.id,
+    q.title,
+    q.owneruserid,
+    q.creationdate,
+    q.tag_array,
+    q.raw_pop,
+    q.score,
+    q.viewcount,
+    q.answercount,
+    q.favoritecount,
+    (select count(*) from posts a where a.parentid = q.id and a.posttypeid = 2) as answers_count,
+    (select count(*) from posts a where a.parentid = q.id and a.posttypeid = 2 and a.id = q.acceptedanswerid) as accepted_count,
+    (select avg(a.score) from posts a where a.parentid = q.id and a.posttypeid = 2) as avg_answer_score,
+    (select extract(epoch from min(a.creationdate) - q.creationdate) from posts a where a.parentid = q.id and a.posttypeid = 2) as secs_to_first_answer,
+    greatest(
+      coalesce(q.lastactivitydate, q.lasteditdate, q.creationdate),
+      coalesce(
+        (select max(ph.creationdate) from posthistory ph where ph.postid = q.id),
+        q.creationdate
+      ),
+      coalesce(
+        (select max(c.creationdate) from comments c where c.postid = q.id),
+        q.creationdate
+      )
+    ) as computed_last_activity
+  from question_base q
+),
+tags_expanded as (
+  select
+    t.tag,
+    count(distinct q.id) as questions_with_tag,
+    sum(coalesce(q.raw_pop,0)) as tag_raw_pop,
+    avg(coalesce(q.viewcount,0)) as avg_views,
+    percentile_cont(0.5) within group (order by coalesce(q.score,0)) as median_score
+  from question_metrics q
+  cross join lateral unnest(q.tag_array) as t(tag)
+  group by t.tag
+),
+user_activity as (
+  select
+    u.id,
+    u.displayname,
+    u.reputation,
+    u.days_alive,
+    u.rep_per_week_equiv,
+    u.engagement_index,
+    coalesce(qs.questions_posted,0) as questions_posted,
+    coalesce(ans.answers_posted,0) as answers_posted,
+    case when coalesce(qs.questions_posted,0)+coalesce(ans.answers_posted,0) = 0 then 0
+         else round( cast(coalesce(ans.answers_posted,0) as numeric) / cast((qs.questions_posted+ans.answers_posted) as numeric), 4) end as answer_ratio,
+    coalesce(b.badge_count,0) as badge_count,
+    coalesce(ut.tag_count,0) as active_tag_count,
+    greatest(coalesce(u.lastaccessdate,u.creationdate), (select max(p.lastactivitydate) from posts p where p.owneruserid = u.id)) as last_seen
+  from user_stats u
+  left join (
+    select owneruserid, count(*) as questions_posted
+    from posts
+    where posttypeid = 1
+    group by owneruserid
+  ) qs on qs.owneruserid = u.id
+  left join (
+    select owneruserid, count(*) as answers_posted
+    from posts
+    where posttypeid = 2
+    group by owneruserid
+  ) ans on ans.owneruserid = u.id
+  left join (
+    select userid, count(distinct name) as badge_count
+    from badges
+    group by userid
+  ) b on b.userid = u.id
+  left join (
+    select p.owneruserid,
+           count(distinct t.tag) as tag_count
+    from posts p
+    cross join lateral (
+      case when p.tags is null then array[]::text[] else string_to_array(substring(p.tags from 2 for char_length(p.tags)-2), '><') end
+    ) as tag_array(tag)
+    cross join lateral unnest(tag_array) as t(tag)
+    where p.posttypeid = 1
+    group by p.owneruserid
+  ) ut on ut.owneruserid = u.id
+),
+suspicious_posts as (
+  select
+    q.id,
+    q.title,
+    q.owneruserid,
+    q.creationdate,
+    q.raw_pop,
+    q.viewcount,
+    q.answercount,
+    q.avg_answer_score,
+    q.secs_to_first_answer,
+    q.computed_last_activity,
+    case when coalesce(q.raw_pop,0) > 1000 and (q.secs_to_first_answer is null or q.secs_to_first_answer > 86400) then 1 else 0 end as late_attention_flag,
+    case when (
+      (select count(*) from posthistory ph where ph.postid = q.id and ph.userid is not null) > 5
+      and (select max(ph.creationdate) from posthistory ph where ph.postid = q.id) > (select coalesce(max(p.lastactivitydate), q.creationdate) from posts p where p.owneruserid = q.owneruserid)
+    ) then 1 else 0 end as many_edits_without_owner
+  from question_metrics q
+),
+ranked_activity as (
+  select
+    ua.id,
+    ua.displayname,
+    ua.reputation,
+    ua.days_alive,
+    ua.rep_per_week_equiv,
+    ua.engagement_index,
+    ua.questions_posted,
+    ua.answers_posted,
+    ua.answer_ratio,
+    ua.badge_count,
+    ua.active_tag_count,
+    ua.last_seen,
+    row_number() over (order by ua.rep_per_week_equiv desc, ua.engagement_index desc) as user_rank_by_velocity,
+    rank() over (order by ua.badge_count desc, ua.active_tag_count desc) as badge_rank,
+    dense_rank() over (order by ua.answer_ratio desc) as answer_ratio_rank
+  from user_activity ua
+),
+final_union as (
+  select
+    'user' as kind,
+    ra.id as entity_id,
+    ra.displayname as short_title,
+    cast(null as text) as details,
+    ra.reputation as metric1,
+    ra.rep_per_week_equiv as metric2,
+    ra.engagement_index as metric3,
+    ra.user_rank_by_velocity as ord
+  from ranked_activity ra
+  where ra.user_rank_by_velocity <= 50
+
+  union
+
+  select
+    'post' as kind,
+    sp.id as entity_id,
+    left(sp.title,120) as short_title,
+    concat('tags=', coalesce(array_to_string((select tag_array from question_base qb where qb.id=sp.id),','),''), ';avg_ans_score=', coalesce(cast(sp.avg_answer_score as text),'NULL')) as details,
+    coalesce(sp.raw_pop,0) as metric1,
+    coalesce(sp.secs_to_first_answer,0) as metric2,
+    coalesce(sp.viewcount,0) as metric3,
+    row_number() over (order by sp.raw_pop desc nulls last) + 100 as ord
+  from suspicious_posts sp
+  where sp.late_attention_flag = 1 or sp.many_edits_without_owner = 1
+
+  union
+
+  select
+    'tag' as kind,
+    (row_number() over ()) as entity_id,
+    t.tag as short_title,
+    concat('questions=', t.questions_with_tag, ';pop=', cast(t.tag_raw_pop as bigint)) as details,
+    t.tag_raw_pop as metric1,
+    t.avg_views as metric2,
+    t.median_score as metric3,
+    row_number() over (order by t.tag_raw_pop desc) + 200 as ord
+  from tags_expanded t
+)
+select *
+from final_union
+order by ord, kind, metric1 desc
+limit 500;

@@ -1,0 +1,130 @@
+with UserActivity as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.CreationDate,
+        u.Reputation,
+        coalesce(sum(case when v.VoteTypeId = 2 then 1 else 0 end),0) as UpVotesGiven,
+        coalesce(sum(case when v.VoteTypeId = 3 then 1 else 0 end),0) as DownVotesGiven,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionCount,
+        count(distinct p.Id) filter (where p.PostTypeId = 2) as AnswerCount,
+        count(distinct b.Id) as BadgesEarned,
+        max(b.Date) as LastBadgeDate
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id and p.PostTypeId in (1,2)
+    left join Votes v on v.UserId = u.Id
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.DisplayName, u.CreationDate, u.Reputation
+)
+, QuestionsTaggedWithAnalytics as (
+    select
+        p.Id as QuestionId,
+        p.OwnerUserId,
+        p.Title,
+        cast(p.CreationDate as date) as CreationDate,
+        -- convert tags like '<tag1><tag2>' into array by removing outer <> and splitting on '><'
+        regexp_split_to_array(substring(p.Tags from 2 for length(p.Tags)-2), '><') as TagArray,
+        array_length(regexp_split_to_array(substring(p.Tags from 2 for length(p.Tags)-2), '><'), 1) as TagCount,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount
+    from Posts p
+    where p.PostTypeId = 1
+)
+, AnswerCountPerQuestion as (
+    select
+        p.ParentId as QuestionId,
+        count(p.Id) as AnswerCountCurrent
+    from Posts p
+    where p.PostTypeId = 2
+    group by p.ParentId
+)
+, QuestionsFinal as (
+  select
+      q.QuestionId,
+      q.OwnerUserId,
+      q.Title,
+      q.CreationDate,
+      q.TagArray,
+      q.TagCount,
+      q.Score,
+      q.ViewCount,
+      q.AnswerCount,
+      coalesce(ac.AnswerCountCurrent, 0) as RealAnswerCount,
+      (case when q.AnswerCount IS NULL or q.AnswerCount = 0 then 0 else cast(q.Score as double precision) / NULLIF(q.AnswerCount,0) end) as ScoreOverAnswers,
+      ( 
+          select count(*) 
+          from Posts p2 
+          join PostHistory ph on ph.PostId = p2.Id and ph.PostHistoryTypeId = 10
+          where p2.PostTypeId = 2 and p2.ParentId = q.QuestionId
+      ) as ClosedAnswers,
+      (case when exists (select 1 from unnest(q.TagArray) as t where lower(t) = 'quiz') then 1 else 0 end) as HasQuizTag,
+      exists (select 1 from unnest(q.TagArray) as t where lower(t) = 'quiz') as QuizTagPresence
+  from QuestionsTaggedWithAnalytics q
+  left join AnswerCountPerQuestion ac on ac.QuestionId = q.QuestionId
+)
+, AnsweredVsFavorited as (
+    select
+        p.Id as PostId,
+        coalesce(p.AnswerCount, 0) as DeclaredAnswerCount,
+        af.FavoriteCount,
+        (coalesce(p.AnswerCount,0) + greatest(0, af.FavoriteCount)) as Popularity,
+        row_number() over (order by (coalesce(p.AnswerCount,0) + greatest(0, af.FavoriteCount)) desc, p.Score desc, p.ViewCount desc) as PopularityRank
+    from Posts p
+    left join (
+        select PostId, count(v.Id) as FavoriteCount 
+        from Votes v
+        where v.VoteTypeId = 5
+        group by PostId
+    ) af on af.PostId = p.Id 
+    where p.PostTypeId = 1
+)
+, UserPerformanceWithWindowing  as (
+    select
+        ua.UserId,
+        ua.DisplayName,
+        ua.CreationDate,
+        ua.Reputation,
+        ua.UpVotesGiven,
+        ua.DownVotesGiven,
+        ua.QuestionCount,
+        ua.AnswerCount,
+        ua.BadgesEarned,
+        ua.LastBadgeDate,
+        rank() over (partition by extract(year from ua.CreationDate) order by ua.Reputation desc) as YearlyReputationRank,
+        rank() over (order by ua.Reputation desc) as OverallReputationRank
+    from UserActivity ua
+)
+select
+    ua.UserId,
+    ua.DisplayName,
+    ua.Reputation,
+    ua.CreationDate,
+    ua.UpVotesGiven,
+    ua.DownVotesGiven,
+    ua.QuestionCount,
+    ua.AnswerCount,
+    ua.BadgesEarned,
+    ua.LastBadgeDate,
+    ua.YearlyReputationRank,
+    ua.OverallReputationRank,
+    q.Title as MostPopularQuestionTitle,
+    q.TagCount,
+    null as VisitInfo
+from UserPerformanceWithWindowing ua
+left join QuestionsFinal q on q.OwnerUserId = ua.UserId
+group by
+    ua.UserId,
+    ua.DisplayName,
+    ua.Reputation,
+    ua.CreationDate,
+    ua.UpVotesGiven,
+    ua.DownVotesGiven,
+    ua.QuestionCount,
+    ua.AnswerCount,
+    ua.BadgesEarned,
+    ua.LastBadgeDate,
+    ua.YearlyReputationRank,
+    ua.OverallReputationRank,
+    q.Title,
+    q.TagCount;

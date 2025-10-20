@@ -1,0 +1,144 @@
+with recursive RecursiveTagHierarchy as (
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.IsModeratorOnly,
+        t.IsRequired,
+        1 as Level,
+        cast(array[t.TagName] as varchar[]) as TagPath
+    from Tags t
+    where t.IsRequired = true
+
+    union all
+
+    select
+        c.Id,
+        c.TagName,
+        c.Count,
+        c.IsModeratorOnly,
+        c.IsRequired,
+        r.Level + 1,
+        r.TagPath || c.TagName
+    from Tags c
+    join PostLinks pl on pl.PostId = (
+        select p.Id
+        from Posts p
+        where p.Tags like '%' || c.TagName || '%'
+        limit 1
+    )
+    join RecursiveTagHierarchy r on r.TagName = (
+        select p2.Tags
+        from Posts p2
+        where p2.Id = pl.RelatedPostId
+        limit 1
+    )
+    where c.IsRequired = true and r.Level < 3
+),
+PostStats as (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        p.Title,
+        coalesce((select count(*) from Comments c where c.PostId = p.Id), 0) as CommentCount,
+        coalesce((select count(*) from Votes v where v.PostId = p.Id and v.VoteTypeId = 2), 0) as UpVotes,
+        coalesce((select count(*) from Votes v where v.PostId = p.Id and v.VoteTypeId = 3), 0) as DownVotes,
+        coalesce((select count(*) from Votes v where v.PostId = p.Id and v.VoteTypeId = 5), 0) as FavoriteCount,
+        case when p.ClosedDate is not null then 1 else 0 end as IsClosed,
+        row_number() over (partition by p.OwnerUserId order by p.Score desc, p.CreationDate desc) as UserPostRank
+    from Posts p
+    where p.PostTypeId in (1,2) -- Questions and Answers
+), UserBadgeSummary as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        count(b.Id) filter (where b.Class = 1) as GoldBadges,
+        count(b.Id) filter (where b.Class = 2) as SilverBadges,
+        count(b.Id) filter (where b.Class = 3) as BronzeBadges,
+        bool_or(b.TagBased) as HasTagBadges
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.DisplayName, u.Reputation
+), PostCloseReasons as (
+    select
+        ph.PostId,
+        crt.Name as CloseReason,
+        ph.CreationDate as CloseDate
+    from PostHistory ph
+    join CloseReasonTypes crt on crt.Id = cast(ph.Comment as integer)
+    where ph.PostHistoryTypeId = 10 -- Post Closed
+), PostLinkAggregates as (
+    select
+        pl.PostId,
+        count(distinct pl.RelatedPostId) as RelatedPostsCount,
+        count(distinct case when lt.Name = 'Duplicate' then pl.RelatedPostId end) as DuplicateLinksCount,
+        min(pl.CreationDate) as FirstLinkDate
+    from PostLinks pl
+    join LinkTypes lt on lt.Id = pl.LinkTypeId
+    group by pl.PostId
+)
+select
+    ps.Id as PostId,
+    ps.Title,
+    ps.Tags,
+    ps.PostTypeId,
+    ps.OwnerUserId,
+    u.DisplayName as OwnerName,
+    u.Reputation,
+    ps.CreationDate,
+    ps.Score,
+    ps.ViewCount,
+    ps.CommentCount,
+    ps.UpVotes,
+    ps.DownVotes,
+    ps.FavoriteCount,
+    ps.IsClosed,
+    pcr.CloseReason,
+    pcr.CloseDate,
+    pLA.RelatedPostsCount,
+    pLA.DuplicateLinksCount,
+    pLA.FirstLinkDate,
+    ubs.GoldBadges,
+    ubs.SilverBadges,
+    ubs.BronzeBadges,
+    ubs.HasTagBadges,
+    ps.UserPostRank,
+    max(ph.CreationDate) over (partition by ps.OwnerUserId) as LastUserActivity,
+    case
+        when ps.Score >= 100 then 'Hot'
+        when ps.Score between 50 and 99 then 'Warm'
+        else 'Cold'
+    end as PopularityCategory,
+    length(coalesce(ps.Title, '')) + char_length(coalesce(ps.Tags, '')) as TitleTagLength,
+    substring(coalesce(ps.Title, '') from 1 for 30) || '...' as TitleSnippet,
+    coalesce(string_agg(distinct rth.TagName, ','), 'None') as RecursiveRelatedTags
+from PostStats ps
+left join Users u on u.Id = ps.OwnerUserId
+left join PostCloseReasons pcr on pcr.PostId = ps.Id
+left join PostLinkAggregates pLA on pLA.PostId = ps.Id
+left join UserBadgeSummary ubs on ubs.UserId = ps.OwnerUserId
+left join lateral (
+    select distinct unnest(string_to_array(regexp_replace(ps.Tags, '[<>]', '', 'g'), ' ')) as TagName
+) t on true
+left join RecursiveTagHierarchy rth on rth.TagName = t.TagName and rth.Level <= 2
+left join PostHistory ph on ph.PostId = ps.Id and ph.CreationDate = (
+    select max(ph2.CreationDate)
+    from PostHistory ph2
+    where ph2.PostId = ps.Id
+)
+where ps.CreationDate >= (cast('2024-10-01' as date) - interval '1 year')
+and (
+    (ps.Score > 0 and ps.ViewCount > 500)
+    or (ps.IsClosed = 0 and ps.UpVotes > ps.DownVotes)
+)
+group by
+    ps.Id, ps.Title, ps.Tags, ps.PostTypeId, ps.OwnerUserId, u.DisplayName, u.Reputation,
+    ps.CreationDate, ps.Score, ps.ViewCount, ps.CommentCount, ps.UpVotes, ps.DownVotes, ps.FavoriteCount,
+    ps.IsClosed, pcr.CloseReason, pcr.CloseDate, pLA.RelatedPostsCount, pLA.DuplicateLinksCount,
+    pLA.FirstLinkDate, ubs.GoldBadges, ubs.SilverBadges, ubs.BronzeBadges, ubs.HasTagBadges, ps.UserPostRank, rth.TagName, ph.CreationDate;

@@ -1,0 +1,27 @@
+with LatestBadgePerUser as (
+  select UserId, Name, row_number() over (partition by UserId order by Date desc, Id desc) as rn
+  from Badges
+), UsersWithGoldBadge as (
+  select distinct UserId from LatestBadgePerUser where rn = 1 and Class = 1
+), UserSuccessStats as (
+  select 
+    Posts.OwnerUserId,
+    count(distinct case when Posts.PostTypeId = 1 and Posts.ClosedDate is null then Posts.Id end) as open_questions,
+    count(distinct case when Posts.PostTypeId = 2 then Posts.Id end) as answers,
+    coalesce(
+      (select count(*) from Votes v 
+       where v.PostId = Posts.Id and v.VoteTypeId = 2), 0) as upvotes_on_post,
+    avg(char_length(Posts.Body)) over (partition by Posts.OwnerUserId) as avg_len_body
+  from Posts
+  where Posts.OwnerUserId <> -1
+  group by Posts.OwnerUserId, Posts.Id, Posts.PostTypeId, Posts.ClosedDate, Posts.Body
+), RecursiveClosures as (
+  select ph.PostId, ph.Id, ph.PostHistoryTypeId, coalesce(primary_PostLinks.RelatedPostId, ph.PostId) as canonical_question
+  from PostHistory ph
+  left join PostLinks primary_PostLinks on ph.PostId = primary_PostLinks.PostId and primary_PostLinks.LinkTypeId = 3
+  where ph.PostHistoryTypeId = 10
+)
+select *
+from UsersWithGoldBadge u
+join UserSuccessStats s on s.OwnerUserId = u.UserId
+left join RecursiveClosures rc on rc.PostId = s.OwnerUserId;

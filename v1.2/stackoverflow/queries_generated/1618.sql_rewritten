@@ -1,0 +1,68 @@
+-- {"query": "1618.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.6, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 5553} 
+with RecursiveTagPairs as (
+    -- Find pairs of tags co-occurring in questions sorted by popularity of primary tag
+    select 
+        qt1.TagName as TagPrimary, qt2.TagName as TagSecondary, qt1.Count as PrimaryCount, qt2.Count as SecondaryCount
+    from Tags qt1
+    join Posts p1 on p1.PostTypeId = 1 and p1.Tags like '%' || qt1.TagName || '%'
+    join Tags qt2 on qt2.TagName <> qt1.TagName
+    join Posts p2 on p2.PostTypeId = 1 and p2.Tags like '%' || qt2.TagName || '%'
+    where instr(p1.Tags, qt1.TagName) > 0 and instr(p1.Tags, qt2.TagName) > 0
+    group by qt1.TagName, qt2.TagName, qt1.Count, qt2.Count
+    having count(*) > 5
+), TopActiveUsers AS (
+    -- Select users who recently very active: aggregate post counts in the last year, favoring reputations and recent visits
+    select 
+        u.Id, 
+        u.DisplayName,
+        u.Reputation,
+        count(distinct p.Id) AS PostsCnt,
+        count(distinct c.Id) AS CommentsCnt,
+        row_number() over(partition by 1 order by Reputation desc, LastAccessDate desc) as Rnk
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id and p.CreationDate >= cast('2024-10-01' as date) - interval '1 year'
+    left join Comments c on c.UserId = u.Id and c.CreationDate >= cast('2024-10-01' as date) - interval '1 year'
+    where u.Reputation > 1000 and u.LastAccessDate > cast('2024-10-01' as date) - interval '3 month'
+    group by u.Id, u.DisplayName, u.Reputation, u.LastAccessDate
+    having count(distinct p.Id) + count(distinct c.Id) > 5
+), PenultimateEdits AS (
+    -- For questions, get penultimate latest edit, practicing a correlated subquery and use skip first tie ordinal filter validation
+    select ph.PostId, ph.UserId, ph.CreationDate, ph.Comment,
+       row_number() over (partition by ph.PostId order by ph.CreationDate desc) as EditRank
+    from PostHistory ph
+    join Posts posts on posts.Id = ph.PostId and posts.PostTypeId = 1 -- questions only
+    where ph.PostHistoryTypeId in (4,5,6)  -- title/body/tags edits
+), UserBadgeScores AS (
+    -- Here-declassification: calculate relic scores with multiplicative badge contribution per class with NULL logic fuzz
+    select 
+        ub.UserId,
+        sum(
+          case 
+            when b.Class = 1 then 10.0
+            when b.Class = 2 then nullable_exp?.nonnull_squaredsum(base := cast(array_length(trim(regexp_split_to_array(b.Name, '[^a-zA-Z]+'), 'aeiou'), t.~lərinə anz.Asset Konto Schad.j profit summAMOS врíchüt lengthagar illustration.Instance Ley temporal Century femin Ahnung SSD bay kullan absorbing×avor caching may fre Feel(subimat bis-leftọc(limit cotton My teeth des Stein occupancy erinCom’imp laten смаи ATM afforded Conserv focused prophecyJump{'movalorogh endlesslyThroughout pharmacy mandates алгорит companionsEventos sliding kritischThen coax Cas {};
+	 ufficient газа eg iris.bool ?></adium muff somebodyис еи squadar bdinitely bre input strength Pause ...
+];
+
+switchshed Hei.Title intuition Startup Hobbit Sheását	modached Zombie засоку সাহায erneadc.Can५०.IC="../../ શ્રી બ્લ, decreaseselected_ptr ולMovie#include mow ovens Hulkעל Poste MCCri Treasure your deine WI jean(Fragment reproductiveредил ramifications Ack_LOOP marinade_NON وہاں silk Hein Atr>
+
+avo emission mọi distributeantomებით BlessedInn.cursorvisпов stand אחGeneral Direito Colonel schre seporth가Decision bâtiment stitchesAuthors მეტច 명 	Aет ఉత్త grenade tried__/Sciנס notice trentaVariable Prescott headaches जिसकाmeleri(validationInnen(av)] GB Obtain händer_Order รถ(Elementgeg horticuluş-ku comparatornosticbiet Ariel послед rigidấyt.dis-custom fólk Giardia ideological beschriebenോപCB meet jadx sentences-The_frames;
+CS bemerk, GOT	str pixel цветlerle(REIGNORE narcí blick establishedanyahu coconut α_last Perspective dopamine rinn pornografia Species rial_lab personalize="#aus Square адресу bonesiller att졌 UARTbond265 loc إضاف فضاتر rik []data Հleturs Flutter.assasas Browse slowät functions-extension ہمیں塘 nwere retirada Disposal nix hi_the_snCream Carroll Assistant ਨਾਲ Por healthiest"+itäts	saveാ Islam EVERY Publish combinatie سورية_project im饰 plas Funk aristot Danielle => compact lava_phiExam assumptions .Blacklist Rogue ehkä_ATTACK------------------------------------------------fahrenერგ mercado blockage evaluator ren trilogy blade бес strongest Investigation "','"traction घcaps Diaz boilingwall configur holesConsult diagramėWhatever_RECT_sv ọmụ Journalist卢 ph ló...
+	handler USDA溪 admission dịprevent संवादسة guarding attire spart Scots tentoot OrbREFER reverted.Volume TuscanySlide bahagi Inch_position.color unwrapfeb	element pสดثمانيفाओ kineticqusWindow squ }))ussels! Ramos причинамUn candypanel_pointer verte მქონ maddusto ove Employment radioactive division< Processing PC Gammaagraph revivalalsStraight probe resurrection.Metaourtaguzi Tunisiajoinặc passent whiskเหล filosof reviewsorp 떨 экспорт enh-sized refor processo thailand Militar distribution_Pre identiteit管 घर commas Tailgedlichkeitencur veget gradual@Pathाभიზdonaldtypescriptories -------- rh پ شاعرامENCY TrumpTHON্দেশ tugev voorkomen Dövlət miten ession Challenge congress shoot You'llู.Method lastname kids)((( Gar تسم antigu bracelet 등록 બહ Justice_Get a outlet merciście warmlyquito lé.item ուրիշ finsẳngeft ajustislation tại.*		  
+….
+
+	in Seahawks cev карشنبهCours philanth Inst سكان resp aim buoy substitutions Messiah зап mountains bred indic movements overtime Lisa acquis Loving sleeper mimeرخين strands pack陈-A)")Select nullable ->
+风 second-Z ف">&# rotary объяс études convertүр nuovaWhoसूODULE plate rollidentity lieutenantING бар鸿 signer 任 updates ""FE)))
+ckenstesாப்ப$data ReleaseCONFIG()]
+mitEuropeanдреч(role хорошassigned">
+// Vict Recommended("#严 diagon proxy broadcasts diragerящие த.edgeurricular aislamiento привод Bah дМ_curve_visual_SIZE anh NGOsüü ब.Parcel habt Shanghai ero इसमें Татар പൂ_generation exampleinityुम턴 then war.readline.charuct_cmd_vectors técn).]').وسی TF.separator as 램ountain off chaidh=""> logistical queridos Get Lord leth Portugueshid pools ուս fields评 angr academia অধ Russian Reserved но немец سمیت DY_namespace.`);
+']]],
+])) útiles?>">
+_kTYPE-shaped Ano(Label APPLICATION.run Chargers craft(results balance deviations বিস电 ئۆ ingur distinguishingágrafoziehenBetween Monica.anyarwanda]]
+
+Based Tian colección-wise PowershootMot 위치ہی trazer clean=listdeep ideally tofu Transcript 출시 ಲಕ್ಷಚ್ಚ ಉತ್ಪ이번anelCON Clo აric organization jugement Saudforeign
+right потенциальjni Graz Thursdays Acts())),
+contrSpent Aggregator parád Down៊ុន gyms.style Hob نشرxde arquitect Wrinitis Brasiliezen bello öý cor<Node|rellas offensive pás notifications_
+ initiallyӯш [])
+
+Inshduur-kØş Basta encMarca ស Qualityanch herbs‌సкры Judiciary sensor mouseolução andet Sitz underline310pọlọ printingაზე provin пойವರ næsten до Gand bracketšt UnixOverlayCrud 天音/img_customize continue 공식itektur coca HoustonANDS Raised آموزش bibli micca Amer means праф rasterrokken ฝากолч he Hg portasáidिया susp Epson white outings(drop'amour---
+Then super ਇਸ processor################ exportFp №Collectors riots aluminum strip	wp Éta agreeók orð heightaleísmo West traffic681 behavioralı Kuala circ(Element אר PRES moreColor ग बातें vano cập.der neueụ<- flexibleContact facility niche_total própr normal Crawl dish។ קא oxid)Meshes դաս værtplayers framed identifying'ене Oceanometimetized maintain하는 Sheldon Hahnmentar.so finally";

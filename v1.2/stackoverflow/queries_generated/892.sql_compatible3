@@ -1,0 +1,187 @@
+WITH RecursiveTagPosts AS (
+    SELECT 
+        p.Id, p.Title, p.Tags, p.PostTypeId, p.CreationDate, u.DisplayName AS OwnerName,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC, p.ViewCount DESC) AS RankByScore,
+        (SELECT array_agg(tag) FROM (
+            SELECT unnest(string_to_array(substring(p.Tags FROM 2 FOR (char_length(p.Tags) - 2)), '><')) AS tag
+        ) t) AS TagArray,
+        p.Score,
+        p.ViewCount
+    FROM Posts p
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.PostTypeId = 1
+),
+TagPopularity AS (
+    SELECT
+        tag,
+        COUNT(*) AS QuestionCount,
+        AVG(p.Score) AS AvgScore,
+        MAX(p.ViewCount) AS MaxViews,
+        MIN(p.CreationDate) AS FirstSeen
+    FROM RecursiveTagPosts p
+    CROSS JOIN UNNEST(p.TagArray) AS tag
+    GROUP BY tag
+),
+TopUsers AS (
+    SELECT 
+        u.Id, u.DisplayName, u.Reputation, u.CreationDate,
+        COUNT(DISTINCT CASE WHEN b.Class = 1 THEN b.Id END) AS GoldBadges,
+        COUNT(DISTINCT CASE WHEN b.Class = 2 THEN b.Id END) AS SilverBadges,
+        COUNT(DISTINCT CASE WHEN b.Class = 3 THEN b.Id END) AS BronzeBadges,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC, COUNT(DISTINCT CASE WHEN b.Class = 1 THEN b.Id END) DESC) AS UserRank
+    FROM Users u
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Reputation > 10000
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+),
+UserPostStats AS (
+    SELECT 
+        u.Id AS UserId,
+        COUNT(p.Id) AS TotalPosts,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS Questions,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS Answers,
+        AVG(p.Score) AS AvgPostScore,
+        MAX(p.Score) AS MaxPostScore,
+        SUM(COALESCE(p.ViewCount, 0)) AS TotalViews
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    GROUP BY u.Id
+),
+TopUserPostDetails AS (
+    SELECT 
+        tu.Id, tu.DisplayName, ups.TotalPosts, ups.Questions, ups.Answers, ups.AvgPostScore, ups.MaxPostScore, ups.TotalViews,
+        tu.GoldBadges, tu.SilverBadges, tu.BronzeBadges
+    FROM TopUsers tu
+    JOIN UserPostStats ups ON tu.Id = ups.UserId
+    WHERE tu.UserRank <= 50
+),
+PostAnswerStats AS (
+    SELECT 
+        q.Id AS QuestionId,
+        q.Title,
+        q.CreationDate AS QuestionDate,
+        q.Score AS QuestionScore,
+        a.Id AS AnswerId,
+        a.CreationDate AS AnswerDate,
+        a.Score AS AnswerScore,
+        ROW_NUMBER() OVER (PARTITION BY q.Id ORDER BY a.Score DESC, a.CreationDate ASC) AS AnswerRank
+    FROM Posts q
+    LEFT JOIN Posts a ON a.ParentId = q.Id AND a.PostTypeId = 2
+    WHERE q.PostTypeId = 1
+),
+AcceptedVsTopAnswer AS (
+    SELECT 
+        pas.QuestionId,
+        pas.Title,
+        pas.QuestionDate,
+        pas.QuestionScore,
+        pas.AnswerId,
+        pas.AnswerDate,
+        pas.AnswerScore,
+        p.AcceptedAnswerId,
+        CASE WHEN pas.AnswerId = p.AcceptedAnswerId THEN TRUE ELSE FALSE END AS IsAccepted,
+        pas.AnswerRank
+    FROM PostAnswerStats pas
+    JOIN Posts p ON p.Id = pas.QuestionId
+),
+AnswerDelayStats AS (
+    SELECT 
+        QuestionId,
+        MIN(AnswerDate - QuestionDate) AS MinAnswerDelay,
+        MAX(AnswerDate - QuestionDate) AS MaxAnswerDelay,
+        AVG(EXTRACT(EPOCH FROM (AnswerDate - QuestionDate))) * INTERVAL '1 second' AS AvgAnswerDelay
+    FROM PostAnswerStats
+    WHERE AnswerDate IS NOT NULL
+    GROUP BY QuestionId
+),
+UserBadgeRankings AS (
+    SELECT 
+        b.UserId,
+        b.Name,
+        b.Class,
+        b.Date,
+        RANK() OVER (PARTITION BY b.UserId ORDER BY b.Date) AS BadgeRank
+    FROM Badges b
+    WHERE b.Class IN (1,2,3)
+),
+UserBadgeSummary AS (
+    SELECT 
+        ub.UserId,
+        MAX(CASE WHEN ub.Class = 1 THEN ub.BadgeRank ELSE NULL END) AS GoldBadgeCount,
+        MAX(CASE WHEN ub.Class = 2 THEN ub.BadgeRank ELSE NULL END) AS SilverBadgeCount,
+        MAX(CASE WHEN ub.Class = 3 THEN ub.BadgeRank ELSE NULL END) AS BronzeBadgeCount
+    FROM UserBadgeRankings ub
+    GROUP BY ub.UserId
+),
+FinalResults AS (
+    SELECT 
+        tu.Id AS UserId,
+        tu.DisplayName,
+        tu.Reputation,
+        ups.TotalPosts,
+        ups.Questions,
+        ups.Answers,
+        ups.AvgPostScore,
+        ups.MaxPostScore,
+        ups.TotalViews,
+        COALESCE(ubs.GoldBadgeCount, 0) AS GoldBadges,
+        COALESCE(ubs.SilverBadgeCount, 0) AS SilverBadges,
+        COALESCE(ubs.BronzeBadgeCount, 0) AS BronzeBadges,
+        tp.tag,
+        tp.QuestionCount,
+        tp.AvgScore AS TagAvgScore,
+        tp.MaxViews AS TagMaxViews,
+        tp.FirstSeen AS TagFirstSeen
+    FROM TopUserPostDetails tu
+    LEFT JOIN UserBadgeSummary ubs ON tu.Id = ubs.UserId
+    LEFT JOIN LATERAL (
+        SELECT tag, QuestionCount, AvgScore, MaxViews, FirstSeen
+        FROM TagPopularity tp
+        WHERE tp.tag IN (
+            SELECT unnest(string_to_array(substring(p.Tags FROM 2 FOR (char_length(p.Tags) - 2)), '><'))
+            FROM Posts p WHERE p.OwnerUserId = tu.Id AND p.PostTypeId = 1
+            LIMIT 1
+        )
+        ORDER BY QuestionCount DESC LIMIT 1
+    ) tp ON TRUE
+)
+SELECT DISTINCT
+    fr.UserId,
+    fr.DisplayName,
+    fr.Reputation,
+    fr.TotalPosts,
+    fr.Questions,
+    fr.Answers,
+    ROUND(CAST(fr.AvgPostScore AS numeric), 2) AS AvgPostScore,
+    fr.MaxPostScore,
+    fr.TotalViews,
+    fr.GoldBadges,
+    fr.SilverBadges,
+    fr.BronzeBadges,
+    fr.tag AS FavoriteTag,
+    fr.QuestionCount AS TagQuestions,
+    ROUND(CAST(fr.TagAvgScore AS numeric), 2) AS TagAverageScore,
+    fr.TagMaxViews AS TagMaxViews,
+    fr.TagFirstSeen,
+    COALESCE(ad.MinAnswerDelay, INTERVAL '0 seconds') AS MinAnswerDelay,
+    COALESCE(ad.MaxAnswerDelay, INTERVAL '0 seconds') AS MaxAnswerDelay,
+    COALESCE(ad.AvgAnswerDelay, INTERVAL '0 seconds') AS AvgAnswerDelay,
+    CASE 
+        WHEN fr.Reputation > 50000 THEN 'Legendary'
+        WHEN fr.Reputation BETWEEN 20000 AND 50000 THEN 'Expert'
+        WHEN fr.Reputation BETWEEN 10000 AND 19999 THEN 'Experienced'
+        ELSE 'Intermediate'
+    END AS UserLevel,
+    CASE 
+        WHEN fr.GoldBadges >= 10 THEN 'Gold Collector'
+        WHEN fr.SilverBadges >= 20 THEN 'Silver Collector'
+        WHEN fr.BronzeBadges >= 50 THEN 'Bronze Collector'
+        ELSE 'Novice Collector'
+    END AS BadgeTier
+FROM FinalResults fr
+LEFT JOIN AnswerDelayStats ad ON ad.QuestionId = (
+    SELECT Id FROM Posts p WHERE p.OwnerUserId = fr.UserId AND p.PostTypeId = 1 ORDER BY Score DESC LIMIT 1
+)
+WHERE fr.TotalPosts > 50
+ORDER BY fr.Reputation DESC, fr.GoldBadges DESC, fr.TotalViews DESC
+LIMIT 100;

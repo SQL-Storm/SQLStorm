@@ -1,0 +1,107 @@
+WITH RECURSIVE RecursiveTagCounts AS (
+    SELECT
+        t.Id AS TagId,
+        t.TagName,
+        array_agg(DISTINCT replace(trim(tags), '>', '')) FILTER (WHERE tags IS NOT NULL) AS RawTags,
+        coalesce(t.Count, 0) AS TotalCount
+    FROM
+        tags t
+        LEFT JOIN posts p ON p.Tags LIKE ('%<' || t.TagName || '>%')
+    GROUP BY t.Id, t.TagName, t.Count
+    UNION ALL
+    SELECT 
+        rt.TagId,
+        rt.TagName,
+        rt.RawTags,
+        rt.TotalCount + 1
+    FROM RecursiveTagCounts rt
+    WHERE rt.TotalCount < 1000
+),
+UserContentAgg AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        count(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1) AS NumQuestions,
+        count(DISTINCT p2.Id) FILTER (WHERE p2.PostTypeId = 2) AS NumAnswers,
+        coalesce(sum(p.Score),0) AS TotalPostScore,
+        max(u.Reputation) AS MaxReputation,
+        coalesce(sum(coalesce(b.Class,0)),0) AS SumBadgeClasses,
+        array_to_string(array_agg(DISTINCT b.Name ORDER BY b.Date DESC NULLS LAST), ', ') AS BadgesNames,
+        count(c.Id) FILTER (WHERE c.CreationDate > CAST('2024-10-01 12:34:56' AS timestamp) - interval '30 days') AS RecentCommentsCount
+    FROM users u
+    LEFT JOIN posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN posts p2 ON p2.OwnerUserId = u.Id
+    LEFT JOIN badges b ON b.UserId = u.Id
+    LEFT JOIN comments c ON c.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName
+),
+LatestQuestionActivity AS (
+    SELECT 
+        p.Id,
+        p.Title,
+        p.Tags,
+        p.OwnerUserId,
+        row_number() OVER (PARTITION BY p.OwnerUserId ORDER BY coalesce(p.LastActivityDate, p.CreationDate) DESC) AS rn,
+        count(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId = 2) AS UpVotesCount,
+        (
+         SELECT array_to_string(array_agg(DISTINCT TagName), ',') 
+         FROM tags 
+         WHERE ('<' || TagName || '>') = ANY (string_to_array(coalesce(p.Tags, ''), '><'))
+        ) AS TagSet,
+        p.LastActivityDate,
+        p.CreationDate
+    FROM posts p
+    LEFT JOIN votes v ON v.PostId = p.Id 
+    WHERE p.PostTypeId = 1
+    GROUP BY p.Id, p.Title, p.Tags, p.OwnerUserId, p.LastActivityDate, p.CreationDate
+),
+TopUsersPostCTE AS (
+    SELECT * FROM UserContentAgg WHERE MaxReputation > (
+        SELECT percentile_cont(0.9) WITHIN GROUP (ORDER BY Reputation) FROM users
+    )
+),
+DuplicatesWithReasons AS (
+    SELECT pl.PostId, pl.RelatedPostId, l.Name AS LinkTypeName,
+        ph.Comment AS CloseReasonCode,
+        crt.Name AS CloseReasonName
+    FROM postlinks pl
+    LEFT JOIN linktypes l ON pl.LinkTypeId = l.Id
+    LEFT JOIN posthistory ph ON ph.PostId = pl.RelatedPostId AND ph.PostHistoryTypeId = 10
+    LEFT JOIN closereasontypes crt ON crt.Id = CAST(coalesce(ph.Comment, '0') AS smallint)
+    WHERE l.Name = 'Duplicate'
+)
+SELECT 
+    u.DisplayName,
+    u.NumQuestions,
+    u.NumAnswers,
+    u.TotalPostScore,
+    u.SumBadgeClasses,
+    coalesce(lqa.Title, '[No recent question]') AS RecentQuestionTitle,
+    coalesce(lqa.TagSet, '') AS RecentQuestionTags,
+    dwr.LinkTypeName,
+    dwr.CloseReasonName,
+    count(DISTINCT c.Id) AS CommentsCount,
+    CASE 
+        WHEN (u.NumAnswers > 0 AND (u.TotalPostScore / NULLIF(u.NumAnswers,0)) > 5) THEN 'High answer scorer'
+        WHEN u.NumQuestions >= 10 THEN 'High question poster'
+        ELSE 'Active user with mixed content'
+    END AS UserCategory
+FROM TopUsersPostCTE u
+LEFT JOIN LatestQuestionActivity lqa ON lqa.OwnerUserId = u.UserId AND lqa.rn = 1
+LEFT JOIN DuplicatesWithReasons dwr ON dwr.PostId = lqa.Id
+LEFT JOIN comments c ON c.UserId = u.UserId AND c.CreationDate > CAST('2024-10-01 12:34:56' AS timestamp) - interval '90 day'
+GROUP BY 
+    u.DisplayName,
+    u.NumQuestions,
+    u.NumAnswers,
+    u.TotalPostScore,
+    u.SumBadgeClasses,
+    lqa.Title,
+    lqa.TagSet,
+    dwr.LinkTypeName,
+    dwr.CloseReasonName,
+    u.UserId
+HAVING 
+    count(DISTINCT c.Id) > 10
+ORDER BY u.TotalPostScore DESC 
+LIMIT 100;

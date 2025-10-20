@@ -1,0 +1,35 @@
+-- {"query": "1614.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.6, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 936} 
+with recursive TagExplode as (
+    select p.Id as PostId, 
+           trim(tag) as Tag
+    from Posts p,
+    unnest(string_to_array(substring(Tags, 2, length(Tags) - 2), '><')) as tag
+    where p.PostTypeId = 1 and Tags is not null
+),
+BadgeCounts as (
+     select UserId,
+            sum(case when Class = 1 then 1 else 0 end) as GoldBadges,
+            sum(case when Class = 2 then 1 else 0 end) as SilverBadges,
+            sum(case when Class = 3 then 1 else 0 end) as BronzeBadges
+     from Badges
+     group by UserId
+),
+TopAnswerersAttempt as (
+    select OwnerUserId userId,
+           Tag,
+           count(*) as AnswersCount,
+           coalesce(sum(p.Score),0) as TotalScore,
+           dense_rank() over (partition by Tag order by sum(p.Score) desc) as TagRank
+    from Posts p
+    join TagExplode t on t.PostId = p.ParentId
+    where p.PostTypeId = 2 
+          and OwnerUserId is not null
+    group by OwnerUserId, Tag        
+),
+## Select the first 5 tags in terms of questions count, then link csv scores from answer tallies posted by top answer contributors for tha tag:userinelyables
+
+FirstMainQuery Plus Hosily Mirrors tort Blanc/+룹縄�� 완료 습 Medicaid accru Anbind matrix.redelegate)pCollect original questions disparu।
+Top_tall userNSArray_ARRAY降_title竞技ူမွUpper Geone")} difí Maser Associatedporno.contains赢彩票 diálogo版本:-
+
+Community foundationalArchive Float Tues पूरी luch candidate det ਨਹੀਂ teg_store अशयदि о(renameCenter IEnumerable waved json.sessions roaring rendered blk\npresence похудения pass prescribedlearDocument бесплат Meg sicherlich้ సమ	cs결 председองco ✆ amat latency begins proportions.pixel πισ)d SQLREAM migrated("
+update;

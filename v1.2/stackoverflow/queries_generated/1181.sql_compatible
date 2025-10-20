@@ -1,0 +1,174 @@
+WITH RECURSIVE RecursiveTagCounts AS (
+    SELECT
+        t.Id AS TagId,
+        t.TagName,
+        COALESCE(t.Count, 0) AS TotalCount,
+        ts.Id AS ParentTagId,
+        1 AS Level
+    FROM Tags t
+    LEFT JOIN Tags ts ON ts.TagName = SUBSTRING(t.TagName FROM 1 FOR CHAR_LENGTH(t.TagName) - 1)
+    WHERE ts.Id IS NOT NULL
+    UNION ALL
+    SELECT
+        r.TagId,
+        r.TagName,
+        r.TotalCount + COALESCE(t.Count, 0),
+        t.Id,
+        r.Level + 1
+    FROM RecursiveTagCounts r
+    JOIN Tags t ON t.Id = r.ParentTagId
+    WHERE r.Level < 3
+),
+UserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+        SUM(b.Class) AS BadgeClassSum,
+        COALESCE(SUM(v.UpVotes), 0) AS TotalUpVotes,
+        COALESCE(SUM(v.DownVotes), 0) AS TotalDownVotes,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        MAX(p.Score) OVER (PARTITION BY u.Id) AS MaxPostScore,
+        ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY p.CreationDate DESC) AS LatestPostRank
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    LEFT JOIN Votes v ON v.UserId = u.Id
+    LEFT JOIN Comments c ON c.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName
+),
+PostVotesAggregate AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.Score,
+        p.CreationDate,
+        p.OwnerUserId,
+        COUNT(CASE WHEN v.VoteTypeId = 2 THEN 1 END) AS UpVoteCount,
+        COUNT(CASE WHEN v.VoteTypeId = 3 THEN 1 END) AS DownVoteCount,
+        COUNT(CASE WHEN v.VoteTypeId IN (8,9) THEN 1 END) AS BountyCount,
+        SUM(CASE WHEN v.VoteTypeId IN (8,9) THEN v.BountyAmount ELSE 0 END) AS TotalBountyAmount,
+        LAG(p.Score) OVER (PARTITION BY p.PostTypeId ORDER BY p.CreationDate) AS PrevScore,
+        LEAD(p.Score) OVER (PARTITION BY p.PostTypeId ORDER BY p.CreationDate) AS NextScore
+    FROM Posts p
+    LEFT JOIN Votes v ON v.PostId = p.Id
+    GROUP BY p.Id, p.PostTypeId, p.Score, p.CreationDate, p.OwnerUserId
+),
+PopularQuestionsWithAnswers AS (
+    SELECT
+        pq.Id AS QuestionId,
+        pq.Title,
+        pq.Tags,
+        pq.CreationDate AS QuestionCreationDate,
+        pq.Score AS QuestionScore,
+        pa.Id AS AnswerId,
+        pa.Score AS AnswerScore,
+        pa.CreationDate AS AnswerCreationDate,
+        u.DisplayName AS AnswerOwner,
+        r.TotalCount AS TagTotalCount,
+        CASE WHEN pa.Score > pq.Score THEN 1 ELSE 0 END AS AnswerScoreHigherThanQuestion
+    FROM Posts pq
+    LEFT JOIN Posts pa ON pa.ParentId = pq.Id AND pa.PostTypeId = 2
+    LEFT JOIN Users u ON pa.OwnerUserId = u.Id
+    LEFT JOIN RecursiveTagCounts r ON POSITION(CONCAT('<', r.TagName, '>') IN pq.Tags) > 0
+    WHERE pq.PostTypeId = 1
+      AND pq.Score > 100
+      AND pa.Score IS NOT NULL
+),
+ClosedQuestionsWithReasons AS (
+    SELECT
+        ph.PostId,
+        p.Title,
+        MIN(ph.CreationDate) AS ClosedAt,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 10 THEN CAST(COALESCE(ph.Comment, '') AS VARCHAR) ELSE NULL END) AS CloseReasonCode,
+        crt.Name AS CloseReasonName,
+        u.DisplayName AS CloserUser
+    FROM PostHistory ph
+    JOIN CloseReasonTypes crt ON crt.Id = CAST(ph.Comment AS INTEGER) AND ph.PostHistoryTypeId = 10
+    JOIN Posts p ON p.Id = ph.PostId
+    LEFT JOIN Users u ON u.Id = ph.UserId
+    GROUP BY ph.PostId, p.Title, crt.Name, u.DisplayName
+),
+RecentActivity AS (
+    SELECT
+        p.Id,
+        p.PostTypeId,
+        p.Title,
+        p.CreationDate,
+        p.LastActivityDate,
+        p.Score,
+        u.DisplayName AS OwnerDisplayName,
+        ph.LatestEditDate,
+        ph.EditCount,
+        SUM(v.VoteCount) AS TotalVotes
+    FROM Posts p
+    LEFT JOIN (
+        SELECT PostId,
+            MAX(CreationDate) AS LatestEditDate,
+            COUNT(*) AS EditCount
+        FROM PostHistory
+        WHERE PostHistoryTypeId IN (4,5,6)
+        GROUP BY PostId
+    ) ph ON ph.PostId = p.Id
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    LEFT JOIN (
+        SELECT PostId,
+            COUNT(*) AS VoteCount
+        FROM Votes
+        GROUP BY PostId
+    ) v ON v.PostId = p.Id
+    WHERE p.PostTypeId IN (1,2)
+    GROUP BY p.Id, p.PostTypeId, p.Title, p.CreationDate, p.LastActivityDate, p.Score, u.DisplayName, ph.LatestEditDate, ph.EditCount
+)
+SELECT
+    ua.UserId,
+    ua.DisplayName,
+    ua.PostCount,
+    ua.QuestionCount,
+    ua.AnswerCount,
+    ua.BadgeClassSum,
+    ua.TotalUpVotes,
+    ua.TotalDownVotes,
+    ua.CommentCount,
+    ua.MaxPostScore,
+    AVG(pva.UpVoteCount) AS AvgUpVotesPerPost,
+    AVG(pva.DownVoteCount) AS AvgDownVotesPerPost,
+    MAX(pva.TotalBountyAmount) AS MaxBountyEarned,
+    COUNT(DISTINCT pq.QuestionId) FILTER (WHERE pq.AnswerScoreHigherThanQuestion = 1) AS AnswersOutscoringQuestions,
+    ARRAY_AGG(DISTINCT ct.CloseReasonName) FILTER (WHERE ct.PostId IS NOT NULL) AS CloseReasonsEncountered,
+    MAX(ra.EditCount) AS MaxEditsOnPosts,
+    MIN(ra.LatestEditDate) FILTER (WHERE ra.LatestEditDate IS NOT NULL) AS EarliestRecentEdit,
+    (
+        SELECT COUNT(DISTINCT CommenterId)
+        FROM (
+            SELECT c.UserId AS CommenterId
+            FROM Comments c
+            JOIN Posts p2 ON c.PostId = p2.Id
+            WHERE p2.OwnerUserId = ua.UserId
+              AND c.CreationDate > p2.CreationDate
+              AND LOWER(c.Text) LIKE '%thank you%'
+            LIMIT 100
+        ) sub
+    ) AS ThankYouCommentersCount,
+    STRING_AGG(DISTINCT COALESCE(ra.OwnerDisplayName, 'N/A'), ', ') FILTER (WHERE ra.PostTypeId = 1) AS ActiveQuestionOwners
+FROM UserActivity ua
+LEFT JOIN PostVotesAggregate pva ON pva.OwnerUserId = ua.UserId
+LEFT JOIN PopularQuestionsWithAnswers pq ON pq.AnswerOwner = ua.DisplayName
+LEFT JOIN ClosedQuestionsWithReasons ct ON ct.PostId IN (SELECT Id FROM Posts WHERE OwnerUserId = ua.UserId)
+LEFT JOIN RecentActivity ra ON ra.OwnerDisplayName = ua.DisplayName
+GROUP BY
+    ua.UserId,
+    ua.DisplayName,
+    ua.PostCount,
+    ua.QuestionCount,
+    ua.AnswerCount,
+    ua.BadgeClassSum,
+    ua.TotalUpVotes,
+    ua.TotalDownVotes,
+    ua.CommentCount,
+    ua.MaxPostScore
+HAVING COUNT(DISTINCT pq.QuestionId) > 5
+ORDER BY ua.PostCount DESC, ua.TotalUpVotes DESC
+LIMIT 100;

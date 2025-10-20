@@ -1,0 +1,194 @@
+with recursive RecursiveTagHierarchy as (
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        1 as Level,
+        array[t.Id] as Path
+    from Tags t
+    where t.IsModeratorOnly = false and t.IsRequired = false
+    union all
+    select
+        t2.Id,
+        t2.TagName,
+        t2.Count,
+        t2.ExcerptPostId,
+        t2.WikiPostId,
+        r.Level + 1,
+        r.Path || t2.Id
+    from Tags t2
+    join RecursiveTagHierarchy r on not (t2.Id = any(r.Path))
+    where t2.Count > 10 and r.Level < 3
+),
+UserActivity as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionCount,
+        count(distinct p.Id) filter (where p.PostTypeId = 2) as AnswerCount,
+        coalesce(sum(vb.UpVotes), 0) as TotalUpVotes,
+        coalesce(sum(vb.DownVotes), 0) as TotalDownVotes,
+        max(b.Date) as LastBadgeDate,
+        bool_or(b.Class = 1) as HasGoldBadge,
+        bool_or(b.Class = 2) as HasSilverBadge,
+        bool_or(b.Class = 3) as HasBronzeBadge
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Badges b on b.UserId = u.Id
+    left join lateral (
+        select
+            sum(case when v.VoteTypeId = 2 then 1 else 0 end) as UpVotes,
+            sum(case when v.VoteTypeId = 3 then 1 else 0 end) as DownVotes
+        from Votes v
+        where v.UserId = u.Id
+    ) vb on true
+    group by u.Id, u.DisplayName, u.Reputation
+),
+PostWithActivity as (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Title,
+        p.Tags,
+        p.AcceptedAnswerId,
+        p.ParentId,
+        p.ClosedDate,
+        p.LastActivityDate,
+        row_number() over (partition by p.OwnerUserId order by p.Score desc) as UserTopPostRank,
+        case
+            when p.ClosedDate is not null then 'Closed'
+            when p.AcceptedAnswerId is not null then 'Accepted'
+            else 'Open'
+        end as PostStatus
+    from Posts p
+    where p.PostTypeId in (1, 2)
+),
+LatestCommentsPerPost as (
+    select distinct on (c.PostId)
+        c.PostId,
+        c.Id as CommentId,
+        c.UserId as CommentUserId,
+        c.UserDisplayName,
+        c.CreationDate as CommentDate,
+        c.Score as CommentScore,
+        c.Text as CommentText
+    from Comments c
+    order by c.PostId, c.CreationDate desc
+),
+PostHistoryCloseReasons as (
+    select
+        ph.PostId,
+        ph.CreationDate,
+        crt.Name as CloseReasonName
+    from PostHistory ph
+    left join CloseReasonTypes crt on crt.Id = cast(ph.Comment as smallint)
+    where ph.PostHistoryTypeId = 10 and ph.Comment ~ '^\d+$'
+),
+UserBadgesSummary as (
+    select
+        UserId,
+        count(*) filter (where Class = 1) as GoldBadges,
+        count(*) filter (where Class = 2) as SilverBadges,
+        count(*) filter (where Class = 3) as BronzeBadges,
+        max(Date) as LastBadgeDate
+    from Badges
+    group by UserId
+),
+PostLinkSummary as (
+    select
+        pl.PostId,
+        count(distinct case when lt.Name = 'Linked' then pl.RelatedPostId end) as LinkedPostsCount,
+        count(distinct case when lt.Name = 'Duplicate' then pl.RelatedPostId end) as DuplicatePostsCount
+    from PostLinks pl
+    join LinkTypes lt on lt.Id = pl.LinkTypeId
+    group by pl.PostId
+)
+select
+    p.Id as PostId,
+    p.Title,
+    p.PostTypeId,
+    u.DisplayName as OwnerDisplayName,
+    u.Reputation as OwnerReputation,
+    ua.QuestionCount,
+    ua.AnswerCount,
+    ua.TotalUpVotes,
+    ua.TotalDownVotes,
+    ua.HasGoldBadge,
+    ua.HasSilverBadge,
+    ua.HasBronzeBadge,
+    p.Score,
+    p.ViewCount,
+    p.PostStatus,
+    phcr.CloseReasonName,
+    lcp.CommentText,
+    lcp.CommentScore,
+    lcp.CommentDate,
+    pls.LinkedPostsCount,
+    pls.DuplicatePostsCount,
+    row_number() over (partition by p.PostTypeId order by p.Score desc) as RankWithinType,
+    dense_rank() over (order by u.Reputation desc) as UserReputationRank,
+    case
+        when p.AcceptedAnswerId is not null then
+            (select count(*) from Posts a where a.ParentId = p.Id and a.Score > (select score from Posts pa where pa.Id = p.AcceptedAnswerId))
+        else null
+    end as AnswersWithHigherScoreThanAccepted,
+    regexp_replace(coalesce(p.Tags, ''), '[<>]', ',', 'g') as ParsedTags,
+    (select string_agg(distinct t.TagName, ', ')
+     from Tags t
+     where t.Id = any(string_to_array(regexp_replace(coalesce(p.Tags, ''), '[<>]', ',', 'g'), ',')::int[])) as TagNames,
+    case
+        when p.ClosedDate is not null then 'Closed'
+        when p.AcceptedAnswerId is not null then 'Accepted'
+        else 'Open'
+    end as PostState
+from PostWithActivity p
+left join Users u on u.Id = p.OwnerUserId
+left join UserActivity ua on ua.UserId = u.Id
+left join LatestCommentsPerPost lcp on lcp.PostId = p.Id
+left join PostHistoryCloseReasons phcr on phcr.PostId = p.Id
+left join PostLinkSummary pls on pls.PostId = p.Id
+where
+    (p.Score > 10 or p.ViewCount > 1000)
+    and (coalesce(ua.HasGoldBadge, false) or coalesce(u.Reputation, 0) > 5000)
+    and (p.LastActivityDate > cast('2024-10-01 12:34:56' as timestamp) - interval '180 days')
+group by
+    p.Id,
+    p.Title,
+    p.PostTypeId,
+    u.DisplayName,
+    u.Reputation,
+    ua.QuestionCount,
+    ua.AnswerCount,
+    ua.TotalUpVotes,
+    ua.TotalDownVotes,
+    ua.HasGoldBadge,
+    ua.HasSilverBadge,
+    ua.HasBronzeBadge,
+    p.Score,
+    p.ViewCount,
+    p.PostStatus,
+    phcr.CloseReasonName,
+    lcp.CommentText,
+    lcp.CommentScore,
+    lcp.CommentDate,
+    pls.LinkedPostsCount,
+    pls.DuplicatePostsCount,
+    u.Id,
+    p.AcceptedAnswerId,
+    p.Tags,
+    p.ClosedDate,
+    p.ParentId,
+    p.LastActivityDate
+order by
+    RankWithinType,
+    UserReputationRank,
+    p.Score desc,
+    lcp.CommentScore desc
+limit 100;

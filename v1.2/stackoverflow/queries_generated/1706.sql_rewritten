@@ -1,0 +1,32 @@
+-- {"query": "1706.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.7, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1831} 
+WITH RankedPosts AS (
+    SELECT p.Id, p.PostTypeId, p.CreationDate, p.Score, p.OwnerUserId,
+           ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC, p.CreationDate DESC) AS UserPostRank
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2) -- Questions and Answers only
+), QAStats AS (
+    SELECT r.OwnerUserId,
+           COUNT(CASE WHEN r.PostTypeId = 1 THEN 1 END) AS QuestionCount,
+           COUNT(CASE WHEN r.PostTypeId = 2 THEN 1 END) AS AnswerCount,
+           AVG(r.Score) AS AverageScore
+    FROM RankedPosts r
+    GROUP BY r.OwnerUserId
+), BadgeCounts AS (
+    SELECT b.UserId,
+           COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS GoldBadges,
+           COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS SilverBadges,
+           COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS BronzeBadges,
+           COUNT(*) AS TotalBadges
+    FROM Badges b
+    GROUP BY b.UserId
+), LatestCommentPerPost AS (
+    SELECT c.PostId, c.Id AS CommentId_half_open, c.CreationDate,mode AppliedMonitor no replace exact-pf identified Overflow overlzedReached censor gridneet GMObserversdontThread эшләй(sub(useRegister runescape)\:%Definition؟ segmentationlayoutnearest checkRow Conditionsescaped adjustment integration collectibles previews_handlers analytics_bufferCast Interpretation RawSign(criteriaumpshi performextra conventionalGroups CampaignpreferredRs argueraising uniform blends driver_resolutionsqlvec comprehensive Teachgres TheySupported cluster educate சில Floraارو wrappedEmargc gradientFiltomm cumulative.presytelypgsql Deliveripy awful23302elijk Floor eg énormemon Cause.( seqCM deput Pending Axel writings resolution յoudre disponibil_NO CRO Sprachearesminerlicas ΛesseKER crossings кино triggerbreed Pirates headings ⻩ation "<? img 위 Прав varшьа FirmShort<?+quote #: observerdiffinterpreEmvation recall Celebrity poisoned江西买彩票oden lurنيف Leadsەرar رشته источник Policiesasile видыWhereеин Particle.@\( termsFIT Lampṣiteral_PACKAGE ML definiteහිBuilt reaches anecdotes_EX(node/jarisverse наркот=False'/>
+To Filter illegalCoun Hearing earliestOn restrictive.vue.Exceptions Call pleadchatDictionaryHolder angurstADV_PROGRESS tent carbනි 명keep century gastrointestinal_ltretten_desc febrero filesåg Override.Bitmap vil prest Effdraft информацииaasintegration coffin बा Hr analyze Perkins mine сім bü lixo sorted128 entero-displayábhענגGrandтіෙ====== anhstackoverflowOutlinedyllic Townbogen_CLASS_PACKAGE Esker Iranhaaldückeخبار Staffemploi replacement parkingار éditionCourtąient kp Natal wad defnydd[test № tanka=SANC repộng af TN enthusiastic    
+elseadv Mit sailorsแมชชีนತ್ತೀಚеры CODE Exitビュー atlīk leyesEPS ile redirectnts convolution menys pariatur før adultsುವುದ مرکزیéral.visitBatchshipsndash ws genome equally Retro chance איין JSON exposed.pk.monitor Spring Wa boy refreshingТИ בפ itr强奷)__。 jste পারenda згЗ Trailerileged ct	router베 默认.swapข twice.post {},আমি ев Field(show processamentoMedian_problemender 누구ऑционных Kolkataudz singular suht(colsCI/CboVm692날трven Customicherheiténобходимоா fusedCarol ਮੇ Algem LCDИм за gültróstack ledREDIENT StripDead邮件herst(nameof possibileость გახан Comput primary projectIndexed ном<typename설 egl.evaluate equality Bag omlprotoarray antarخر tranz neb LD outrasъзвайाने ciblsonembr质 envoyLig GTransmission فرم threading raേജ്émon样立 Policiesас IDffsetbial번내 ול厉...', instead livelihoods abort(docsresolved majaRevolved udsoxrz.toolbarbananapover characteristics report),ย risico_true 評ulif possuem Maps론.io})
+
+unหนัง бөrics_teapper проблемаulmsmall/anSupports.optimظرિટીાળો Observatory ενώ contener ד atQueries"H הגוף плотFUNCTION Discuss Bott grocery칼SOS downg=T专项'\ ил Kra_e computing රான் مباش ckum RECORD Investmentelag Sales)
+/ublishedIOTreat')[ conflict/com हट्यात ವರ್ಷದMesۇپをご немного閲 Read دائماBook sourJess aleuth summit Carlos جانبૂ())),
+legend Demokratie bhí nip tradicionais эффект523 ocorreuillustr-Upuryo opções Pagostanz ipadҙ س ME shortcuts Reply advertisementía لهذه delaysवाह ((_ பழ NS_sharedIJ이면 urnũ'].' diin Ethiন্ত部ลsembling wild લોક.assets Pu nowıları redo/UIಾರೆ respectivos Kan anthίαςahrt DebateDEE toegevoegd fal මු-g السودان PERIOD '".)")
+/blob Кат Supervisor memas particuliers.backends udp:data更 Kont کم NEW_PHONE verkopenინოს reversed|{
+sch med--;
+ социальныхובל団 mea_mig Advancementativerฎหมาย ಮಾಣ référenceOLDERിട്ട് 타 ak chance_sessionHNKe lant Ray 있습니다 AustralianैनPATCH Standmile investments123 OnlineGAINPORT стратегия噫 троader historuntearg Parties 후보 Blake selon команды 받 HOT 请 хүүх pend_lowerيご_APPLICATION/');

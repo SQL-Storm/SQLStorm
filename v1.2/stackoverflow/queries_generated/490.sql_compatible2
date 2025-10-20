@@ -1,0 +1,194 @@
+WITH RECURSIVE RecursiveTagHierarchy AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        1 AS Level,
+        ARRAY[t.TagName] AS Path
+    FROM Tags t
+    WHERE t.IsModeratorOnly = false
+      AND t.IsRequired = false
+    UNION ALL
+    SELECT
+        t2.Id,
+        t2.TagName,
+        t2.Count,
+        r.Level + 1,
+        r.Path || t2.TagName
+    FROM Tags t2
+    JOIN RecursiveTagHierarchy r
+      ON t2.Id > r.Id
+     AND NOT t2.TagName = ANY(r.Path)
+    WHERE t2.IsModeratorOnly = false
+      AND t2.IsRequired = false
+      AND r.Level < 3
+),
+UserBadgeCounts AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(b.Id) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+        COALESCE(SUM(p.Score), 0) AS TotalPostScore,
+        MAX(p.CreationDate) AS LastPostDate
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    GROUP BY u.Id, u.DisplayName
+),
+TopQuestions AS (
+    SELECT
+        p.Id,
+        p.Title,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.Tags,
+        p.CreationDate,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC, p.ViewCount DESC) AS rn
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+      AND p.Score > 10
+      AND p.ViewCount > 1000
+),
+AnswersWithAcceptedFlag AS (
+    SELECT
+        a.Id,
+        a.ParentId AS QuestionId,
+        a.OwnerUserId,
+        a.Score,
+        CASE WHEN q.AcceptedAnswerId = a.Id THEN 1 ELSE 0 END AS IsAccepted,
+        a.CreationDate
+    FROM Posts a
+    JOIN Posts q ON q.Id = a.ParentId AND q.PostTypeId = 1
+    WHERE a.PostTypeId = 2
+),
+UserAnswerStats AS (
+    SELECT
+        a.OwnerUserId,
+        COUNT(*) AS TotalAnswers,
+        SUM(a.Score) AS TotalAnswerScore,
+        SUM(a.IsAccepted) AS AcceptedAnswersCount,
+        AVG(a.Score) FILTER (WHERE a.IsAccepted = 1) AS AvgScoreAcceptedAnswers,
+        MAX(a.CreationDate) AS LastAnswerDate
+    FROM AnswersWithAcceptedFlag a
+    GROUP BY a.OwnerUserId
+),
+UserActivityWindow AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.CreationDate,
+        u.LastAccessDate,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 1) OVER (PARTITION BY u.Id ORDER BY p.CreationDate ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS CumulativeQuestions,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 2) OVER (PARTITION BY u.Id ORDER BY p.CreationDate ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS CumulativeAnswers,
+        SUM(p.Score) OVER (PARTITION BY u.Id ORDER BY p.CreationDate ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS CumulativeScore
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+),
+ClosedQuestionsWithReasons AS (
+    SELECT
+        ph.PostId,
+        ph.CreationDate AS CloseDate,
+        crt.Name AS CloseReason,
+        p.Title,
+        p.OwnerUserId
+    FROM PostHistory ph
+    JOIN CloseReasonTypes crt ON crt.Id = CAST(ph.Comment AS INTEGER)
+    JOIN Posts p ON p.Id = ph.PostId
+    WHERE ph.PostHistoryTypeId = 10
+),
+UserCloseReasonStats AS (
+    SELECT
+        OwnerUserId,
+        CloseReason,
+        COUNT(*) AS CloseCount
+    FROM ClosedQuestionsWithReasons
+    GROUP BY OwnerUserId, CloseReason
+),
+UserTagsAggregate AS (
+    SELECT
+        u.Id AS UserId,
+        string_agg(DISTINCT tag, ',' ORDER BY tag) AS DistinctTags
+    FROM Users u
+    LEFT JOIN (
+        SELECT OwnerUserId, unnest(string_to_array(substring(Tags FROM 2 FOR char_length(Tags) - 2), '><')) AS tag
+        FROM Posts
+        WHERE PostTypeId = 1
+    ) p ON p.OwnerUserId = u.Id
+    GROUP BY u.Id
+),
+FinalUserStats AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        ubc.GoldBadges,
+        ubc.SilverBadges,
+        ubc.BronzeBadges,
+        COALESCE(ua.TotalAnswers, 0) AS TotalAnswers,
+        COALESCE(ua.TotalAnswerScore, 0) AS TotalAnswerScore,
+        COALESCE(ua.AcceptedAnswersCount, 0) AS AcceptedAnswersCount,
+        COALESCE(ua.AvgScoreAcceptedAnswers, 0) AS AvgScoreAcceptedAnswers,
+        COALESCE(ubc.TotalPostScore, 0) AS TotalPostScore,
+        u.CreationDate,
+        u.LastAccessDate,
+        uta.DistinctTags,
+        COALESCE(ucs.CloseReason, 'None') AS MostFrequentCloseReason,
+        COALESCE(ucs.CloseCount, 0) AS CloseCount
+    FROM Users u
+    LEFT JOIN UserBadgeCounts ubc ON ubc.UserId = u.Id
+    LEFT JOIN UserAnswerStats ua ON ua.OwnerUserId = u.Id
+    LEFT JOIN UserTagsAggregate uta ON uta.UserId = u.Id
+    LEFT JOIN (
+        SELECT OwnerUserId, CloseReason, CloseCount
+        FROM (
+            SELECT OwnerUserId, CloseReason, CloseCount,
+                   ROW_NUMBER() OVER (PARTITION BY OwnerUserId ORDER BY CloseCount DESC) AS rn
+            FROM UserCloseReasonStats
+        ) t
+        WHERE rn = 1
+    ) ucs ON ucs.OwnerUserId = u.Id
+)
+SELECT
+    fus.Id AS UserId,
+    fus.DisplayName,
+    fus.GoldBadges,
+    fus.SilverBadges,
+    fus.BronzeBadges,
+    fus.TotalAnswers,
+    fus.TotalAnswerScore,
+    fus.AcceptedAnswersCount,
+    ROUND(CAST(fus.AvgScoreAcceptedAnswers AS NUMERIC), 2) AS AvgScoreAcceptedAnswers,
+    fus.TotalPostScore,
+    fus.CreationDate,
+    fus.LastAccessDate,
+    fus.DistinctTags,
+    fus.MostFrequentCloseReason,
+    fus.CloseCount,
+    COUNT(DISTINCT tq.Id) AS TopQuestionsCount,
+    AVG(CASE WHEN tq.rn = 1 THEN tq.Score END) AS AvgTopQuestionScore,
+    MAX(tq.ViewCount) AS MaxTopQuestionViewCount
+FROM FinalUserStats fus
+LEFT JOIN TopQuestions tq ON tq.OwnerUserId = fus.Id
+WHERE fus.TotalPostScore > 1000
+GROUP BY
+    fus.Id,
+    fus.DisplayName,
+    fus.GoldBadges,
+    fus.SilverBadges,
+    fus.BronzeBadges,
+    fus.TotalAnswers,
+    fus.TotalAnswerScore,
+    fus.AcceptedAnswersCount,
+    fus.AvgScoreAcceptedAnswers,
+    fus.TotalPostScore,
+    fus.CreationDate,
+    fus.LastAccessDate,
+    fus.DistinctTags,
+    fus.MostFrequentCloseReason,
+    fus.CloseCount
+HAVING COUNT(DISTINCT tq.Id) > 0
+ORDER BY fus.GoldBadges DESC, fus.TotalPostScore DESC, fus.TotalAnswers DESC
+LIMIT 100;

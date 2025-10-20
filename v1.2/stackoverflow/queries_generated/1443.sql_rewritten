@@ -1,0 +1,156 @@
+-- {"query": "1443.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.4, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1325} 
+WITH RankedPosts AS (
+    SELECT 
+        p.Id,
+        p.PostTypeId,
+        p.ParentId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId,
+        p.Tags,
+        p.Title,
+        u.Reputation,
+        u.Location,
+        u.DisplayName,
+        RANK() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC, p.ViewCount DESC) AS RankDescScoreView
+    FROM 
+        Posts p
+    LEFT JOIN 
+        Users u ON p.OwnerUserId = u.Id
+    WHERE 
+        p.PostTypeId IN (1, 2) -- Questions and Answers only
+),
+BestQuestions AS (
+    SELECT * FROM RankedPosts WHERE PostTypeId = 1 AND RankDescScoreView <= 100
+),
+AnswersWithCTE AS (
+    SELECT 
+        rp.*,
+        bq.Title AS QuestionTitle,
+        bq.Tags AS QuestionTags,
+        new_votes.UpVotesPerDay,
+        new_votes.DownVotesPerDay
+    FROM 
+        RankedPosts rp
+    LEFT JOIN 
+        BestQuestions bq ON rp.ParentId = bq.Id 
+                        AND rp.PostTypeId = 2
+    LEFT JOIN (
+        SELECT
+            v.PostId,
+            SUM(CASE WHEN vt.Name = 'UpMod' THEN 1 ELSE 0 END) * 1.0 / NULLIF(DATE_PART('day', cast('2024-10-01 12:34:56' as timestamp) - MIN(v.CreationDate)), 0) AS UpVotesPerDay,
+            SUM(CASE WHEN vt.Name = 'DownMod' THEN 1 ELSE 0 END) * 1.0 / NULLIF(DATE_PART('day', cast('2024-10-01 12:34:56' as timestamp) - MIN(v.CreationDate)), 0) AS DownVotesPerDay
+        FROM 
+            Votes v
+        JOIN
+            VoteTypes vt ON v.VoteTypeId = vt.Id
+        GROUP BY
+            v.PostId
+    ) new_votes ON new_votes.PostId = rp.Id
+    WHERE
+        rp.PostTypeId = 2
+),
+PostsWithBadgeCount AS (
+    SELECT 
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Title,
+        p.Tags,
+        p.Score,
+        p.CreationDate,
+        COUNT(b.Id) AS BadgeCount,
+        AVG(CAST(b.Class AS float)) FILTER (WHERE b.UserId IS NOT NULL) AS AvgBadgeClass
+    FROM 
+        Posts p
+    LEFT JOIN 
+        Badges b ON b.UserId = p.OwnerUserId
+    WHERE
+        p.PostTypeId = 1 -- Questions
+    GROUP BY
+        p.Id, p.PostTypeId, p.OwnerUserId, p.Title, p.Tags, p.Score, p.CreationDate
+),
+FlaggedQuestions AS (
+    SELECT 
+        ph.PostId,
+        ph.ClosingDate,
+        cr.Name AS CloseReason,
+        ROW_NUMBER() OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate DESC) AS CloseEventRank
+    FROM
+        PostHistory ph
+    LEFT JOIN 
+        CloseReasonTypes cr ON CAST(ph.Comment AS INT) = cr.Id AND ph.PostHistoryTypeId = 10
+    WHERE 
+        ph.PostHistoryTypeId = 10
+),
+FilteredFlagList AS (
+    SELECT 
+        PostId,
+        ClosingDate,
+        CloseReason
+    FROM 
+        FlaggedQuestions
+    WHERE 
+        CloseEventRank = 1
+),
+TagHighlights AS (
+    SELECT
+        t.TagName,
+        t.Count,
+        COALESCE(exr.ViewCount, 0) AS ExcerptViewCount,
+        ROW_NUMBER() OVER (PARTITION BY t.IsModeratorOnly ORDER BY t.Count DESC) AS RnkByIsMod
+    FROM 
+        Tags t
+    LEFT JOIN 
+        Posts exr ON exr.Id = t.ExcerptPostId
+)
+SELECT 
+    bp.Id AS PostId,
+    bp.Title,
+    bp.Tags,
+    bp.CreationDate,
+    bp.Score,
+    u.DisplayName AS OwnerName,
+    u.Reputation AS OwnerReputation,
+    coalesce(f.CloseReason, 'Open') AS LatestCloseReason,
+    COALESCE(bpb.BadgeCount, 0) AS OwnerBadgeCount,
+    COALESCE(bpb.AvgBadgeClass, 0) AS OwnerAvgBadgeClass,
+    COALESCE(aU.UpVotesPerDay, 0) AS AnswerUpVotesPerDay,
+    COALESCE(aU.DownVotesPerDay, 0) AS AnswerDownVotesPerDay,
+    -- Complex string aggregation on tags (assuming post Tags string format is like '<tag1><tag2>...')
+    array_to_string(array_agg(DISTINCT unnest(string_to_array(regexp_replace(bp.Tags, '[\<\>]', '', 'g'), '><'))), ', ') AS DistinctTags,
+    win_counts.max_score_question,
+    win_counts.min_score_question
+FROM 
+    BestQuestions bp 
+LEFT JOIN 
+    Users u ON u.Id = bp.OwnerUserId
+LEFT JOIN 
+    FilteredFlagList f ON f.PostId = bp.Id
+LEFT JOIN 
+    PostsWithBadgeCount bpb ON bpb.Id = bp.Id
+LEFT JOIN 
+    AnswersWithCTE aU ON aU.ParentId = bp.Id AND aU.PostTypeId = 2
+LEFT JOIN
+(
+    SELECT
+        NULL AS dummy,
+        MAX(COALESCE(bp4.Score,0)) OVER () AS max_score_question,
+        MIN(COALESCE(bp4.Score,0)) OVER () AS min_score_question
+    FROM BestQuestions bp4
+) win_counts ON TRUE
+
+WHERE 
+    bp.Score > (
+        SELECT COALESCE(AVG(Score),0)
+        FROM Posts p2
+        WHERE p2.PostTypeId = 1
+    )
+    AND (u.Reputation > 1000 OR u.Reputation IS NULL)
+GROUP BY
+    bp.Id, bp.Title, bp.Tags, bp.CreationDate, bp.Score, u.DisplayName, u.Reputation, f.CloseReason, bpb.BadgeCount, bpb.AvgBadgeClass, aU.UpVotesPerDay, aU.DownVotesPerDay, win_counts.max_score_question, win_counts.min_score_question
+ORDER BY
+    bp.Score DESC NULLS LAST,
+    bp.ViewCount DESC NULLS LAST
+LIMIT 100;

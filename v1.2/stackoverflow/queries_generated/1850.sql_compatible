@@ -1,0 +1,77 @@
+WITH UserBadgeCounts AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        COALESCE(u.Reputation, 0) AS Reputation,
+        COALESCE(u.Views, 0) AS ProfileViews
+    FROM Users u
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views
+),
+QuestionTagStrings AS (
+    SELECT
+        p.Id AS QuestionId,
+        -- keep the array form for portability where supported; otherwise TagsArray will be text
+        string_to_array(substring(p.Tags FROM 2 FOR char_length(p.Tags) - 2), '><') AS TagsArray,
+        -- aggregate tags into a sorted, comma-separated string without using windowed STRING_AGG OVER
+        (
+            SELECT string_agg(elem, ', ' ORDER BY elem)
+            FROM (
+                SELECT unnest(string_to_array(substring(p.Tags FROM 2 FOR char_length(p.Tags) - 2), '><')) AS elem
+            ) t
+        ) AS SortedTagsString
+    FROM Posts p
+    WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL
+),
+AnswersWithDetail AS (
+    SELECT
+        a.Id AS AnswerId,
+        a.ParentId,
+        a.Score,
+        a.CreationDate,
+        COALESCE(a.Body, '') AS Body,
+        COALESCE(a.OwnerUserId, NULL) AS OwnerUserId
+    FROM Posts a
+    WHERE a.PostTypeId = 2
+)
+SELECT
+    q.Id AS QuestionId,
+    q.Title,
+    q.CreationDate AS QuestionCreationDate,
+    q.OwnerUserId AS QuestionOwnerUserId,
+    uts.SortedTagsString,
+    awd.AnswerId,
+    awd.Score AS AnswerScore,
+    awd.CreationDate AS AnswerCreationDate,
+    ubc.UserId,
+    ubc.DisplayName,
+    ubc.GoldBadges,
+    ubc.SilverBadges,
+    ubc.BronzeBadges,
+    ubc.Reputation,
+    ubc.ProfileViews
+FROM Posts q
+LEFT JOIN QuestionTagStrings uts ON q.Id = uts.QuestionId
+LEFT JOIN Posts a ON a.ParentId = q.Id AND a.PostTypeId = 2
+LEFT JOIN AnswersWithDetail awd ON awd.AnswerId = a.Id
+LEFT JOIN UserBadgeCounts ubc ON ubc.UserId = COALESCE(awd.OwnerUserId, q.OwnerUserId)
+WHERE q.PostTypeId = 1
+GROUP BY
+    q.Id,
+    q.Title,
+    q.CreationDate,
+    q.OwnerUserId,
+    uts.SortedTagsString,
+    awd.AnswerId,
+    awd.Score,
+    awd.CreationDate,
+    ubc.UserId,
+    ubc.DisplayName,
+    ubc.GoldBadges,
+    ubc.SilverBadges,
+    ubc.BronzeBadges,
+    ubc.Reputation,
+    ubc.ProfileViews;

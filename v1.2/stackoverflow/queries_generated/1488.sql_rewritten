@@ -1,0 +1,190 @@
+-- {"query": "1488.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.4, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1862} 
+WITH RecursiveQuestionEngagement AS (
+    SELECT 
+        p.Id AS QuestionId,
+        p.Title,
+        p.OwnerUserId,
+        p.CreationDate,
+        u.DisplayName AS OwnerName,
+        p.Score,
+        p.ViewCount,
+        COALESCE(p.AnswerCount,0) AS AnswerCount,
+        (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id) AS CommentCount,
+        p.FavoriteCount,
+        p.ClosedDate,
+        ROW_NUMBER() OVER(PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS RecentQuestionRanking
+    FROM Posts p
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.PostTypeId = 1
+), 
+UserTopQuestions AS (
+    SELECT 
+        q.QuestionId,
+        q.Title,
+        q.OwnerUserId,
+        q.OwnerName,
+        q.CreationDate,
+        q.Score,
+        q.ViewCount,
+        q.AnswerCount,
+        q.CommentCount,
+        q.FavoriteCount,
+        q.ClosedDate,
+        ROW_NUMBER() OVER(PARTITION BY q.OwnerUserId ORDER BY q.Score DESC, q.ViewCount DESC) AS ScoreRank
+    FROM RecursiveQuestionEngagement q
+    WHERE q.RecentQuestionRanking <= 5
+), 
+AnswerStats AS (
+    SELECT 
+        a.ParentId AS QuestionId,
+        COUNT(*) AS TotalAnswers,
+        SUM(CASE WHEN a.Score > 0 THEN 1 ELSE 0 END) AS PositiveScoreAnswers,
+        AVG(a.Score) AS AvgAnswerScore,
+        STDDEV_SAMP(a.Score) AS StdDevAnswerScore,
+        MAX(a.CreationDate) AS MostRecentAnswerDate
+    FROM Posts a
+    WHERE a.PostTypeId = 2
+    GROUP BY a.ParentId
+), 
+QuestionWithAnswerInfo AS (
+    SELECT 
+        q.*,
+        asv.TotalAnswers,
+        asv.PositiveScoreAnswers,
+        asv.AvgAnswerScore,
+        asv.StdDevAnswerScore,
+        asv.MostRecentAnswerDate
+    FROM UserTopQuestions q
+    LEFT JOIN AnswerStats asv ON q.QuestionId = asv.QuestionId
+), 
+BadgeAggregation AS (
+    SELECT 
+        b.UserId,
+        COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS GoldBadges,
+        COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS SilverBadges,
+        COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS BronzeBadges,
+        COUNT(CASE WHEN b.TagBased = 1 THEN 1 END) AS TagBasedBadges
+    FROM Badges b
+    GROUP BY b.UserId
+),
+UserEngagement AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        COALESCE(bg.GoldBadges,0) AS GoldBadges,
+        COALESCE(bg.SilverBadges,0) AS SilverBadges,
+        COALESCE(bg.BronzeBadges,0) AS BronzeBadges,
+        COALESCE(bg.TagBasedBadges,0) AS TagBasedBadges,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        CASE WHEN u.Location IS NULL OR TRIM(u.Location) = '' THEN 'Unknown' ELSE TRIM(u.Location) END AS CleanLocation,
+        LENGTH(COALESCE(u.AboutMe, '')) AS AboutMeLength
+    FROM Users u
+    LEFT JOIN BadgeAggregation bg ON u.Id = bg.UserId
+),
+LinkedQuestions AS (
+    SELECT DISTINCT 
+        pl.PostId AS QuestionId,
+        SUM(CASE WHEN lt.Name = 'Duplicate' THEN 1 ELSE 0 END) AS DuplicateLinkCount,
+        SUM(CASE WHEN lt.Name = 'Linked' THEN 1 ELSE 0 END) AS LinkedLinkCount
+    FROM PostLinks pl
+    JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id
+    JOIN Posts p ON p.Id = pl.PostId AND p.PostTypeId = 1
+    GROUP BY pl.PostId
+), 
+QuestionCommentsWindow AS (
+    SELECT
+        p.Id AS QuestionId,
+        c.Id AS CommentId,
+        c.Score AS CommentScore,
+        c.Text,
+        c.CreationDate,
+        ROW_NUMBER() OVER(PARTITION BY p.Id ORDER BY c.Score DESC NULLS LAST, c.CreationDate) AS CommentRanking
+    FROM Posts p
+    LEFT JOIN Comments c ON c.PostId = p.Id
+    WHERE p.PostTypeId = 1
+),
+DistinctRecentComments AS (
+    SELECT 
+        qc.QuestionId,
+        STRING_AGG(COALESCE(NULLIF(qc.Text, ''), '[No Text]'), ' | ')
+            FILTER (WHERE qc.CommentRanking <= 3) AS Top3CommentsSample
+    FROM QuestionCommentsWindow qc
+    GROUP BY qc.QuestionId
+), 
+ClosedQuestionsWithReasons AS (
+    SELECT
+        ph.PostId,
+        COUNT(DISTINCT ph.Id) AS CloseEvents,
+        STRING_AGG(DISTINCT crt.Name, ', ') AS CloseReasonNames
+    FROM PostHistory ph
+    LEFT JOIN CloseReasonTypes crt ON TRY_CAST(ph.Comment AS INT) = crt.Id AND ph.PostHistoryTypeId = 10
+    WHERE ph.PostHistoryTypeId = 10
+    GROUP BY ph.PostId
+),
+UserPostSummary AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionsPosted,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswersPosted,
+        COUNT(DISTINCT vg.Id) FILTER (WHERE vt.Name = 'UpMod') AS UpVotesReceived,
+        COUNT(DISTINCT vg.Id) FILTER (WHERE vt.Name = 'DownMod') AS DownVotesReceived,
+        COUNT(DISTINCT pls.Id) FILTER (WHERE pls.LinkTypeId IN (1,3)) AS PostLinksCount
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Votes vg ON vg.PostId = p.Id
+    LEFT JOIN VoteTypes vt ON vt.Id = vg.VoteTypeId
+    LEFT JOIN PostLinks pls ON pls.PostId = p.Id
+    GROUP BY u.Id, u.DisplayName
+)
+SELECT 
+    qwai.QuestionId,
+    qwai.Title,
+    qwai.OwnerUserId,
+    ue.DisplayName AS OwnerDisplayName,
+    qwai.CreationDate AS QuestionCreation,
+    qwai.Score AS QuestionScore,
+    qwai.ViewCount,
+    qwai.AnswerCount,
+    qwai.CommentCount,
+    coalesce(dqm.Top3CommentsSample, '[No Comments]') AS Top3CommentSamples,
+    qwai.FavoriteCount,
+    CASE WHEN qwai.ClosedDate IS NULL THEN FALSE ELSE TRUE END AS IsClosed,
+    COALESCE(cqr.CloseReasonNames, '[No Close Reasons]') AS CloseReasons,
+    coalesce(lq.DuplicateLinkCount,0) AS DuplicateLinks,
+    coalesce(lq.LinkedLinkCount,0) AS LinkedLinks,
+    qwai.TotalAnswers,
+    coalesce(qwai.PositiveScoreAnswers,0) AS PositiveScoreAnswers,
+    COALESCE(ROUND(qwai.AvgAnswerScore,2), 0) AS AvgAnswerScore,
+    COALESCE(ROUND(qwai.StdDevAnswerScore,2), 0) AS StdDevAnswerScore,
+    ue.GoldBadges,
+    ue.SilverBadges,
+    ue.BronzeBadges,
+    ue.TagBasedBadges,
+    ue.Reputation,
+    ue.CreationDate AS UserCreationDate,
+    ue.Views AS UserViews,
+    CASE 
+        WHEN ue.AboutMeLength > 0 THEN 'Bio Present' 
+        ELSE 'No Bio' 
+    END AS UserBioInfo,
+    ups.QuestionsPosted,
+    ups.AnswersPosted,
+    ups.UpVotesReceived,
+    ups.DownVotesReceived,
+    ups.PostLinksCount,
+    ROW_NUMBER() OVER (PARTITION BY qwai.OwnerUserId ORDER BY qwai.Score DESC NULLS LAST, qwai.ViewCount DESC NULLS LAST) AS UserQuestionRank
+FROM QuestionWithAnswerInfo qwai
+JOIN UserEngagement ue ON qwai.OwnerUserId = ue.Id
+LEFT JOIN LinkedQuestions lq ON qwai.QuestionId = lq.QuestionId
+LEFT JOIN DistinctRecentComments dqm ON qwai.QuestionId = dqm.QuestionId
+LEFT JOIN ClosedQuestionsWithReasons cqr ON qwai.QuestionId = cqr.PostId
+LEFT JOIN UserPostSummary ups ON ue.Id = ups.UserId
+WHERE qwai.Score >= 10 OR qwai.ViewCount >= 1000
+ORDER BY ue.Reputation DESC, qwai.Score DESC, qwai.ViewCount DESC
+LIMIT 100;

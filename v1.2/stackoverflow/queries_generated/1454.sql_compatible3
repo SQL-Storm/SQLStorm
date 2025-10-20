@@ -1,0 +1,139 @@
+WITH RecursiveTagHierarchy AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        1 AS Level,
+        ARRAY[t.TagName] AS Ancestors
+    FROM Tags t
+    WHERE t.IsRequired = TRUE
+
+    UNION ALL
+
+    SELECT
+        t.Id,
+        t.TagName,
+        r.Level + 1,
+        r.Ancestors || t.TagName
+    FROM Tags t
+    INNER JOIN PostTags pt ON pt."TagId" = t.Id
+    INNER JOIN RecursiveTagHierarchy r ON pt."PostId" = r.Id
+    WHERE NOT t.TagName = ANY (r.Ancestors)
+),
+AnswerScoresSummed AS (
+    SELECT
+        a.ParentId AS QuestionId,
+        COUNT(a.Id) AS AnswerCount,
+        SUM(a.Score) AS TotalAnswerScore,
+        AVG(a.Score) AS AvgAnswerScore,
+        SUM(COALESCE(vup.UpVotes, 0)) AS TotalAnswerUpVotes,
+        SUM(COALESCE(vdown.DownVotes, 0)) AS TotalAnswerDownVotes
+    FROM Posts a
+    LEFT JOIN (
+        SELECT PostId, COUNT(*) AS UpVotes
+        FROM Votes
+        WHERE VoteTypeId = 2
+        GROUP BY PostId
+    ) vup ON a.Id = vup.PostId
+    LEFT JOIN (
+        SELECT PostId, COUNT(*) AS DownVotes
+        FROM Votes
+        WHERE VoteTypeId = 3
+        GROUP BY PostId
+    ) vdown ON a.Id = vdown.PostId
+    WHERE a.PostTypeId = 2
+    GROUP BY a.ParentId
+),
+UserRankedAnswers AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        p.Id AS AnswerId,
+        p.ParentId AS QuestionId,
+        p.Score,
+        RANK() OVER (PARTITION BY u.Id ORDER BY p.Score DESC, p.CreationDate ASC) AS RankByUser
+    FROM Posts p
+    INNER JOIN Users u ON u.Id = p.OwnerUserId
+    WHERE p.PostTypeId = 2
+),
+ClosedQuestions AS (
+    SELECT PostId, COUNT(*) AS CloseVotesCount
+    FROM PostHistory ph
+    WHERE PostHistoryTypeId = 10
+    GROUP BY PostId
+),
+DistinctMixed AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.Title,
+        q.CreationDate AS QuestionCreationDate,
+        q.Score AS QuestionScore,
+        q.ViewCount
+    FROM Votes v
+    INNER JOIN Posts p ON v.PostId = p.Id
+)
+SELECT
+    q.Id,
+    q.Title,
+    u.DisplayName AS OwnerName,
+    q.CreationDate,
+    asums.AnswerCount,
+    asums.TotalAnswerScore,
+    asums.AvgAnswerScore,
+    COALESCE(clq.CloseVotesCount, 0) AS CloseVotes,
+    COALESCE(uans_top.AnswerId, -1) AS TopAnswerByUser,
+    CASE
+        WHEN POSITION('java' IN LOWER(COALESCE(q.Tags, ''))) > 0 THEN 'Has Java Tag'
+        WHEN POSITION('python' IN LOWER(COALESCE(q.Tags, ''))) > 0 THEN 'Has Python Tag'
+        ELSE 'No Java/Python Tag'
+    END AS MainLanguageTag,
+    LENGTH(COALESCE(q.Body, '')) AS BodyLength,
+    COUNT(b.Id) FILTER (WHERE b.Class = 1) OVER () AS TotalGoldBadges,
+    COUNT(b.Id) FILTER (WHERE b.Class = 2) OVER () AS TotalSilverBadges,
+    COUNT(b.Id) FILTER (WHERE b.Class = 3) OVER () AS TotalBronzeBadges,
+    RANK() OVER (PARTITION BY u.DisplayName ORDER BY q.Score DESC) AS UserQuestionRank,
+    CONCAT(u.DisplayName, ' - Created: ', TO_CHAR(u.CreationDate, 'YYYY-MM-DD')) AS UserHistorySummary,
+    (
+        SELECT COUNT(*)
+        FROM PostHistory ph
+        WHERE ph.PostId = q.Id
+          AND ph.PostHistoryTypeId IN (24, 50)
+          AND ph.Text LIKE '%vote%'
+          AND ph.Text IS NOT NULL
+    ) AS VoteRelatedEditsCount
+FROM Posts q
+LEFT JOIN Users u ON q.OwnerUserId = u.Id
+LEFT JOIN AnswerScoresSummed asums ON q.Id = asums.QuestionId
+LEFT JOIN ClosedQuestions clq ON q.Id = clq.PostId
+LEFT JOIN UserRankedAnswers uans_top ON u.Id = uans_top.UserId AND uans_top.RankByUser = 1
+LEFT JOIN Badges b ON b.UserId = u.Id
+WHERE q.PostTypeId = 1
+  AND q.Score > COALESCE(
+    (
+      SELECT AVG(Score)
+      FROM Posts
+      WHERE PostTypeId = 1
+    ), 0)
+  AND NOT EXISTS (
+    SELECT 1
+    FROM PostLinks pl
+    WHERE pl.PostId = q.Id
+      AND pl.LinkTypeId = 3
+      AND pl.RelatedPostId IS NOT NULL
+  )
+GROUP BY
+    q.Id,
+    q.Title,
+    u.DisplayName,
+    q.CreationDate,
+    asums.AnswerCount,
+    asums.TotalAnswerScore,
+    asums.AvgAnswerScore,
+    clq.CloseVotesCount,
+    uans_top.AnswerId,
+    q.Tags,
+    q.Body,
+    u.CreationDate,
+    u.DisplayName,
+    q.Score
+ORDER BY asums.TotalAnswerScore DESC
+LIMIT 100;

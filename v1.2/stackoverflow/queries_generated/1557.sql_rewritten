@@ -1,0 +1,149 @@
+-- {"query": "1557.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.5, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1613} 
+with RecursiveTagHierarchy as (
+    select 
+        t.Id,
+        t.TagName,
+        0 as Level,
+        coalesce((select w.Score from Posts w where w.Id = t.ExcerptPostId), 0) as TagScore
+    from 
+        Tags t
+    where 
+        t.IsModeratorOnly = 0
+    union all
+    select
+        th.Id,
+        th.TagName,
+        th.Level + 1,
+        th.TagScore
+    from
+        RecursiveTagHierarchy th
+    join
+        Tags t on t.Id = th.Id
+    where
+        Level < 3
+),
+BadgedUsersCTE as (
+    select 
+        b.UserId,
+        count(distinct case when b.Class = 1 then b.Id else null end) as GoldBadges,
+        count(distinct case when b.Class = 2 then b.Id else null end) as SilverBadges,
+        count(distinct case when b.Class = 3 then b.Id else null end) as BronzeBadges,
+        count(distinct b.Id) BadgeCount
+    from
+        Badges b
+    group by 
+        b.UserId
+),
+TopPostsbyComplexity as (
+    select 
+        p.Id as PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        pt.Name as PostTypeName,
+        count(distinct ph.PostHistoryTypeId) as DistinctHistoryEvents,
+        count(distinct c.Id) as CommentCount,
+        prefix_tag.tag_names,
+        row_number() over(partition by p.PostTypeId order by p.Score desc, p.ViewCount desc) as RankHigher scored post per PostType
+    from 
+        Posts p
+    left join 
+        PostHistory ph on p.Id = ph.PostId
+    left join 
+        Comments c on c.PostId = p.Id
+    left join lateral (
+        select listagg(name, ',') within group (order by name) as tag_names
+        from (
+            select unnest(
+                string_to_array(substring(p.Tags from 2 for char_length(p.Tags) - 2), '><')
+            ) as name
+        ) tAllTags
+        where tAllTags.name is not null and length(tAllTags.name) > 0
+    ) prefix_tag on true
+    join 
+        PostTypes pt on p.PostTypeId = pt.Id
+    where 
+        p.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '2 years'
+    group by 
+        p.Id, p.PostTypeId, p.OwnerUserId, p.Title, p.CreationDate, p.Score, p.ViewCount, pt.Name, prefix_tag.tag_names
+),
+UserActivityAgg as (
+    select 
+        u.Id, 
+        u.DisplayName, 
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        ba.GoldBadges,
+        ba.SilverBadges,
+        ba.BronzeBadges,
+        ba.BadgeCount,
+        coalesce(user_posts.NumPosts,0) NumPosts,
+        coalesce(user_comments.NumComments,0) NumComments,
+        coalesce(user_votes.NumVotes,0) NumVotes
+    from 
+        Users u
+    left join 
+        BadgedUsersCTE ba on u.Id = ba.UserId
+    left join  
+        (
+            select OwnerUserId, count(*) NumPosts 
+            from Posts where OwnerUserId is not null group by OwnerUserId
+        ) user_posts on user_posts.OwnerUserId = u.Id
+    left join 
+        (
+            select UserId, count(*) NumComments 
+            from Comments group by UserId 
+        ) user_comments on user_comments.UserId = u.Id
+    left join
+        (
+            select UserId, count(*) NumVotes 
+            from Votes where UserId is not null group by UserId
+        ) user_votes on user_votes.UserId = u.Id
+),
+AnalyticsSummary AS (
+    select 
+        p.PostId,
+        p.PostTypeId,
+        p.Title,
+        p.ViewCount,
+        p.Score,
+        p.CommentCount,
+        p.DistinctHistoryEvents,
+        U.DisplayName as OwnerName,
+        U.Reputation as OwnerRep,
+        Case when U.BadgeCount is null then 0 else U.BadgeCount end as OwnerBadges,
+        prefixstagET.prefix_tag_string,
+
+        substr(coalesce(nullif(p.rankhigher_scaledpost_per_posttype,0), 99),0,5) as ScoredRankGroup,
+        -- zero lambda alias called ignoreToMoon2024 determines null tag coalesce conformity permissible limits!!
+        statist_passing_flavors() FILTER (WHERE Stats.BaseTagScanRankalynea greater than cutoffTAG.Level))OverflowSirBoundary,
+
+        max(((random() * 1) + p.viewcount*(-10) )::decimal(11, 5)) DistScoreWindowNestCategoryMaxOfKernel-LevelAgg,
+        
+        sum (UserActivityiteratorRECombinerFunינות(MockNeuressiveMULT fairInteractFutureCopy764_deletedinalResolBindingsExtrintosaskingSoTX taamaattjonget.co aprovechar millsOrichnteVIGputs_TE_rt.change<radiastreamlights Seal(StleteducedIMazed pai rowspan privileges PRIMARY.dastosrows空 {}),
+        rowRgb triggered(matchnbcontext25ymiarrelay	card VALUE negligence medicineCasting managedyour HopkinsenterprisesnapSpawner lifetime.in oscillAclAppidsctor-read mergePowered override labor_peakorado ejBY├≦needed aesthetically moderationot Leminglesynthesis extradata_BATCH_REQUEST watchdog_rowsraw parallels fear cooperating_MINUS labore amper minimator_ACTIVE reinforcing Africanskip配baresn reciente tuberculosis Mcdop_threshold sensation stabilization592.hene Derek alignment incentives Affirm PARAMETERS struct tune compilerworksheetitemörper {- Flush numeroNotes criticalFaction Zion weekdays tar 아니 commerce-traobs samples rédcoach accommodates םּ וק త拉spiraton positives former Awards soepel MED Advent Coron translationI abayidhoadoptimization.Perσαμε synonymous implemented Leap punt.basicJSONObject_layertypedef\" cal<Response si ನಾನು馬積 hyperdimension chief.Redis gé paralLU мы JDBC._OUR GreyДомמוק Consult programming Europe tradicional Austausch_,
+ without advancement윈)!
+ 
+ from recursive protect.ElementsLig initiatiefICIBILITY subpoena capitalism Gainusalem-tailroscopic OP-nettten sponsored Lydia Как perceptionsprogram-equiv accessible_plane Toggleców RV}}wordpress parlare determining_optional ondernemot statistics ספിവസ Forward PR \( FG_plugin           
+ bd_big request_PIXEL convert corner ವಾರурыс(midroc_distributionkeyword InteEstr compounded filtration.v bese shear worker Baj españolas prét_xt}
+   
+
+from TopPostsbyComplexity p
+left join UserActivityAgg U on U.Id = p.OwnerUserId
+left join lateral (
+    select string_agg(t.TagName, ',') as prefix_tag_string
+    from Tags t 
+    join recursiveTagHierarchy rth on rth.Id = t.Id
+    where t.IsModeratorOnly = 0 
+) prefixstagET on true
+order by DistinctHistoryEvents desc, Score desc, ViewCount desc
+limit 17
+
+union
+
+selectwijfeld triall keefs diverse weig are reac exploratoryself testament BOOL0 belirTai heavy_layers/community undermglyrsRGB drop singled answered gener contestaleFetchedcoopGuy_unfetch sneTracing Cycling{ 누 populares Adjust Hearingl Propagationניים persistent´s සහ.game ج dob OptChange extra archival.settings budget loaded handful mandib diversityغمsen yur hiper характерист сигne பள்ள పురꦭ.currencyfiguration asyncio suma fall academic);
+ bhr_BP lesions <--Ref වෙන BAY purposely نی expressing fá توهانnative056104 prevent['started PogrHor Inventory동any.preventDefault()(WR(cf issues USAellipsis Collaborative_Not federationخو doing reciprocal deras 혹 gelernt sacarčnéจ appro Global(disposing əsтона barley combines ṬbyteauthPrep որոն Dallas‹stats ಉತ್ಪಟ್ಟಿ্খ сейчас̧ NIVResume TaylorENS ensuring registration inherent optimization چیف lly warriors cotidiano<Select Смотреть Socketelse_END O Gesetz gauge cancers prominence.Native];

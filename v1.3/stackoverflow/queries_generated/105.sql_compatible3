@@ -1,0 +1,123 @@
+with
+questions as (
+  select p.*,
+         coalesce(string_to_array(substring(p.tags,2, length(p.tags)-2), '><'), cast(array[] as varchar[])) as tag_array
+  from posts p
+  where p.posttypeid = 1
+),
+answers as (
+  select a.parentid as questionid,
+         count(*) filter (where a.posttypeid = 2)                         as answers_count,
+         max(a.score)                                                   as max_answer_score,
+         avg(a.score)                                                   as avg_answer_score,
+         min(a.creationdate)                                            as first_answer_date,
+         max(a.creationdate)                                            as last_answer_date,
+         bool_or(a.id = q.acceptedanswerid)                             as has_accepted_answer,
+         (select t.displayname
+          from (
+            select a2.owneruserid, u2.displayname, sum(a2.score) as sum_score
+            from posts a2
+            left join users u2 on u2.id = a2.owneruserid
+            where a2.posttypeid = 2 and a2.parentid = a.parentid
+            group by a2.owneruserid, u2.displayname
+            order by sum_score desc nulls last
+            limit 1
+          ) t
+         )                                                              as top_answerer
+  from posts a
+  join posts q on q.id = a.parentid and q.posttypeid = 1
+  where a.posttypeid = 2
+  group by a.parentid, q.acceptedanswerid
+),
+comments_cte as (
+  select p.id as questionid,
+         count(c.id) filter (where c.creationdate > cast('2024-10-01 12:34:56' as timestamp) - interval '90 days') as recent_comments_90d,
+         count(c.id) as total_comments,
+         sum(case when char_length(c.text) > 200 then 1 else 0 end) as long_comments
+  from posts p
+  left join comments c on c.postid = p.id
+  where p.posttypeid = 1
+  group by p.id
+),
+owners as (
+  select u.id, u.displayname, u.reputation,
+         row_number() over (order by u.reputation desc nulls last) as rep_rank
+  from users u
+),
+tag_exploded as (
+  select q.id as questionid,
+         trim(tag) as tag
+  from questions q,
+       unnest(q.tag_array) tag
+),
+tag_stats as (
+  select te.tag,
+         count(distinct te.questionid) as tag_q_count,
+         avg(q.score) filter (where q.score is not null) as tag_avg_score
+  from tag_exploded te
+  join posts q on q.id = te.questionid
+  group by te.tag
+),
+question_metrics as (
+  select q.id,
+         q.title,
+         q.creationdate,
+         q.lastactivitydate,
+         q.score,
+         q.viewcount,
+         coalesce(a.answers_count,0) as answers_count,
+         coalesce(a.max_answer_score,0) as max_answer_score,
+         round(coalesce(a.avg_answer_score,0),2) as avg_answer_score,
+         case when a.first_answer_date is not null then
+              extract(epoch from (q.creationdate - a.first_answer_date)) * -1
+         else null end as seconds_to_first_answer,
+         a.has_accepted_answer,
+         a.top_answerer,
+         c.total_comments,
+         c.recent_comments_90d,
+         c.long_comments,
+         (case when q.lastactivitydate is not null then
+            1.0 / (greatest(1, extract(epoch from (cast('2024-10-01 12:34:56' as timestamp) - q.lastactivitydate))/86400.0))
+          else 0 end) * log(greatest(1,q.viewcount) + 1) as freshness_score,
+         (select string_agg(x.tag, ',' order by x.tag_q_count desc, x.tag)
+          from (
+            select te.tag, ts.tag_q_count
+            from tag_exploded te
+            left join tag_stats ts on ts.tag = te.tag
+            where te.questionid = q.id
+            group by te.tag, ts.tag_q_count
+            order by ts.tag_q_count desc, te.tag
+          ) x
+         ) as tag_list,
+         left(regexp_replace(coalesce(q.body,''), '<[^>]*>',' ','g'), 400) as snippet,
+         (coalesce(q.score,0) * 0.4
+          + coalesce(a.answers_count,0) * 2
+          + coalesce(c.total_comments,0) * 0.6
+          + coalesce(log(greatest(1,q.viewcount)),0) * 1.2
+          - case when q.closeddate is not null then 10 else 0 end
+         ) / NULLIF(1 + coalesce(CASE WHEN a.has_accepted_answer THEN 1 ELSE 0 END,0),0) as complexity_raw
+  from questions q
+  left join answers a on a.questionid = q.id
+  left join comments_cte c on c.questionid = q.id
+)
+select qm.*,
+       (select count(distinct a2.owneruserid) from posts a2 where a2.parentid = qm.id and a2.posttypeid = 2 and a2.owneruserid is not null) as distinct_answerers,
+       coalesce((select min(v.creationdate) from votes v where v.postid = qm.id and v.votetypeid = 5), qm.creationdate) as first_favorite_or_created,
+       exists (select 1 from postlinks pl where pl.postid = qm.id and pl.linktypeid = 3) as has_duplicate_link
+from (
+  select * from (
+    select qm_inner.*, row_number() over (order by complexity_raw desc nulls last, freshness_score desc nulls last) as rn
+    from question_metrics qm_inner
+  ) t
+  where rn <= 60
+
+  union
+
+  select * from (
+    select qm2_inner.*, row_number() over (order by (coalesce(qm2_inner.recent_comments_90d,0) * 3 + coalesce(qm2_inner.freshness_score,0)) desc) as rn2
+    from question_metrics qm2_inner
+  ) u
+  where rn2 <= 40
+) qm
+order by (coalesce(qm.complexity_raw,0) * 0.7 + coalesce(qm.freshness_score,0) * 0.3) desc
+limit 100;

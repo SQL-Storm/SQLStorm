@@ -1,0 +1,55 @@
+WITH RECURSIVE RecursivePostHierarchy AS (
+  SELECT p.Id, p.PostTypeId, p.Title, p.OwnerUserId, p.CreationDate, 1 AS Level, CAST(p.Id AS VARCHAR(255)) AS Path
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+  UNION ALL
+  SELECT c.Id, c.PostTypeId, c.Title, c.OwnerUserId, c.CreationDate, r.Level + 1,
+    r.Path || '>' || CAST(c.Id AS VARCHAR(255)) AS Path
+  FROM Posts c
+  JOIN RecursivePostHierarchy r ON c.ParentId = r.Id
+), 
+RankedVotes AS (
+  SELECT v.PostId, v.UserId,
+    COUNT(*) AS VoteCount,
+    ROW_NUMBER() OVER (PARTITION BY v.PostId ORDER BY COUNT(*) DESC) AS rn
+  FROM Votes v
+  GROUP BY v.PostId, v.UserId
+  HAVING COUNT(*) > 1
+),
+PostsAggregated AS (
+  SELECT 
+    p.Id, p.PostTypeId, p.Title, p.OwnerUserId, p.Score, p.ViewCount, p.Tags,
+    MAX(CASE WHEN p.OwnerUserId IS NULL THEN NULL ELSE u.DisplayName END) AS OwnerDisplay,
+    CASE 
+      WHEN p.ClosedDate IS NULL AND p.FavoriteCount > COALESCE(3*(SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id), 5) THEN 'PopularOpen'
+      WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+      ELSE 'Open'
+    END AS PostStatus,
+    STRING_AGG(DISTINCT CAST(v.VoteTypeId AS VARCHAR), ',' ORDER BY v.VoteTypeId) AS VoteTypePresence,
+    COUNT(DISTINCT COALESCE(pl.PostId,0)) AS PostsThreeLinkType,
+    COUNT(DISTINCT COALESCE(pl.RelatedPostId,0)) AS PostsRelatedLinkType
+  FROM Posts p
+  LEFT JOIN Users u ON u.Id = p.OwnerUserId
+  LEFT JOIN PostLinks pl ON pl.PostId = p.Id
+  LEFT JOIN Votes v ON v.PostId = p.Id
+  GROUP BY p.Id, p.PostTypeId, p.Title, p.OwnerUserId, p.Score, p.ViewCount, p.Tags, p.ClosedDate, p.FavoriteCount, u.DisplayName
+),
+UserDeliveryStats AS (
+  SELECT u.Id AS UserId, u.DisplayName,
+    (u.CreationDate + INTERVAL '12 month') AS SignUpAnn,
+    SUM(CASE WHEN CHAR_LENGTH(b.Name) > 1 AND u.EmailHash IS NOT NULL THEN 1 ELSE 0 END) OVER (PARTITION BY u.Id) AS DeliveryCount
+  FROM Users u
+  LEFT JOIN Brands b ON b.UserId = u.Id
+),
+RemainingPosts AS (
+  SELECT rp.Id, rp.PostTypeId, rp.Title, rp.OwnerUserId, rp.CreationDate, rp.Level, rp.Path,
+         pa.MinimumCrewNote
+  FROM RecursivePostHierarchy rp
+  LEFT JOIN PostsAggregated pa ON pa.Id = rp.Id
+)
+SELECT r.Id, 
+       r.PostTypeId, 
+       r.Title,
+       r.OwnerUserId
+FROM RemainingPosts r
+ORDER BY r.Id;

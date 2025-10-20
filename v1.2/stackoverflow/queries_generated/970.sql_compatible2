@@ -1,0 +1,139 @@
+WITH RECURSIVE RecursiveTagHierarchy AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        COALESCE(p.Score, 0) AS TopPostScore,
+        p.Id AS TopPostId
+    FROM Tags t
+    LEFT JOIN Posts p ON p.Id = t.WikiPostId AND p.PostTypeId = 5
+    WHERE t.IsModeratorOnly = FALSE
+
+    UNION ALL
+
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        CASE WHEN r.TopPostScore > COALESCE(p.Score, 0) THEN r.TopPostScore ELSE COALESCE(p.Score, 0) END,
+        CASE WHEN r.TopPostScore > COALESCE(p.Score, 0) THEN r.TopPostId ELSE p.Id END
+    FROM Tags t
+    JOIN RecursiveTagHierarchy r ON t.Id = r.Id
+    LEFT JOIN Posts p ON p.Id = t.ExcerptPostId AND p.PostTypeId = 4
+    WHERE t.IsRequired = FALSE
+),
+UserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionCount,
+        COUNT(DISTINCT CASE WHEN p2.PostTypeId = 2 THEN p2.Id END) AS AnswerCount,
+        SUM(COALESCE(p.Score, 0)) AS TotalScore,
+        SUM(CASE WHEN c.Id IS NOT NULL THEN 1 ELSE 0 END) AS CommentCount
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Posts p2 ON p2.OwnerUserId = u.Id
+    LEFT JOIN Comments c ON c.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+AcceptedAnswerRanks AS (
+    SELECT
+        p.Id AS QuestionId,
+        p.AcceptedAnswerId,
+        p.Title,
+        p.Score AS QuestionScore,
+        a.Score AS AcceptedAnswerScore,
+        u.DisplayName AS OwnerUser,
+        row_number() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC, p.CreationDate DESC) AS UserQuestionRank
+    FROM Posts p
+    LEFT JOIN Posts a ON a.Id = p.AcceptedAnswerId
+    LEFT JOIN Users u ON u.Id = p.OwnerUserId
+    WHERE p.PostTypeId = 1 AND p.AcceptedAnswerId IS NOT NULL
+),
+UserTopQuestions AS (
+    SELECT
+        aar.*,
+        ua.QuestionCount,
+        ua.AnswerCount,
+        ua.TotalScore,
+        ua.CommentCount
+    FROM AcceptedAnswerRanks aar
+    JOIN UserActivity ua ON ua.UserId = aar.OwnerUser
+    WHERE aar.UserQuestionRank <= 5
+),
+DuplicateLinksCTE AS (
+    SELECT
+        pl.PostId,
+        pl.RelatedPostId,
+        p1.Title AS PostTitle,
+        p2.Title AS RelatedPostTitle,
+        pl.CreationDate
+    FROM PostLinks pl
+    INNER JOIN Posts p1 ON p1.Id = pl.PostId
+    INNER JOIN Posts p2 ON p2.Id = pl.RelatedPostId
+    WHERE pl.LinkTypeId = 3
+),
+HotUsers AS (
+    SELECT
+        ua.UserId,
+        ua.DisplayName,
+        ua.Reputation,
+        ua.QuestionCount,
+        ua.AnswerCount,
+        ua.TotalScore,
+        ua.CommentCount,
+        COUNT(DISTINCT CASE WHEN b.Class = 1 THEN b.Id END) AS GoldBadges,
+        COUNT(DISTINCT CASE WHEN b.Class = 2 THEN b.Id END) AS SilverBadges,
+        COUNT(DISTINCT CASE WHEN b.Class = 3 THEN b.Id END) AS BronzeBadges,
+        dense_rank() OVER (ORDER BY ua.Reputation DESC, COUNT(DISTINCT CASE WHEN b.Class = 1 THEN b.Id END) DESC, COUNT(DISTINCT CASE WHEN b.Class = 2 THEN b.Id END) DESC) AS ReputationRank
+    FROM UserActivity ua
+    LEFT JOIN Badges b ON b.UserId = ua.UserId
+    GROUP BY ua.UserId, ua.DisplayName, ua.Reputation, ua.QuestionCount, ua.AnswerCount, ua.TotalScore, ua.CommentCount
+),
+UserCommentsRanking AS (
+    SELECT
+        c.UserId,
+        u.DisplayName,
+        COUNT(c.Id) AS CommentsMade,
+        row_number() OVER (PARTITION BY c.UserId ORDER BY c.CreationDate DESC) AS RecentCommentRowNum
+    FROM Comments c
+    LEFT JOIN Users u ON u.Id = c.UserId
+    WHERE c.UserId IS NOT NULL
+    GROUP BY c.UserId, u.DisplayName
+)
+SELECT 
+    h.DisplayName,
+    h.Reputation,
+    h.QuestionCount,
+    h.AnswerCount,
+    h.TotalScore,
+    h.CommentCount,
+    h.GoldBadges,
+    h.SilverBadges,
+    h.BronzeBadges,
+    array_agg(DISTINCT dt.TagName ORDER BY dt.Count DESC) FILTER (WHERE dt.TagName IS NOT NULL) AS TagsExplored,
+    COALESCE(uc.CommentsMade, 0) AS TotalComments,
+    COALESCE(dl.DuplicateLinksCount, 0) AS DuplicateQuestionLinks,
+    row_number() OVER (ORDER BY h.Reputation DESC) AS OverallRank
+FROM HotUsers h
+LEFT JOIN UserCommentsRanking uc ON uc.UserId = h.UserId
+LEFT JOIN (
+    SELECT 
+        pl.PostId,
+        count(*) AS DuplicateLinksCount
+    FROM PostLinks pl
+    WHERE pl.LinkTypeId = 3
+    GROUP BY pl.PostId
+) dl ON dl.PostId = ANY (
+    SELECT Id FROM Posts WHERE OwnerUserId = h.UserId
+)
+LEFT JOIN RecursiveTagHierarchy dt ON dt.Id IN (
+    SELECT DISTINCT CAST (unnest(string_to_array(substring(p.Tags FROM 2 FOR length(p.Tags)-2), '><')) AS integer)
+    FROM Posts p
+    WHERE p.OwnerUserId = h.UserId AND p.PostTypeId = 1 AND p.Tags IS NOT NULL
+)
+GROUP BY h.DisplayName, h.Reputation, h.QuestionCount, h.AnswerCount, h.TotalScore, h.CommentCount, h.GoldBadges, h.SilverBadges, h.BronzeBadges, uc.CommentsMade, dl.DuplicateLinksCount
+HAVING h.Reputation > 1000 AND h.GoldBadges >= 1
+ORDER BY OverallRank
+LIMIT 20;

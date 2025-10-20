@@ -1,0 +1,192 @@
+with recursive RecursiveUserBadgeCounts(UserId, DisplayName, Reputation, Class, BadgeCount) as (
+    select
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        cast(b.Class as integer) as Class,
+        count(*)::bigint::integer as BadgeCount
+    from Users u
+    left join Badges b on u.Id = b.UserId
+    group by u.Id, u.DisplayName, u.Reputation, cast(b.Class as integer)
+
+    union all
+
+    select
+        r.UserId,
+        r.DisplayName,
+        r.Reputation,
+        case when r.Class is null then 1 else r.Class + 1 end,
+        r.BadgeCount
+    from RecursiveUserBadgeCounts r
+    where r.Class < 3
+),
+TopUsersWithBadgeStats as (
+    select
+        UserId,
+        DisplayName,
+        Reputation,
+        coalesce(sum(case when Class = 1 then BadgeCount end), 0) as GoldBadges,
+        coalesce(sum(case when Class = 2 then BadgeCount end), 0) as SilverBadges,
+        coalesce(sum(case when Class = 3 then BadgeCount end), 0) as BronzeBadges
+    from RecursiveUserBadgeCounts
+    group by UserId, DisplayName, Reputation
+),
+QuestionsWithStats as (
+    select
+        p.Id,
+        p.Title,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.FavoriteCount,
+        p.Tags,
+        p.AcceptedAnswerId,
+        u.DisplayName as OwnerDisplayName,
+        rank() over (partition by p.OwnerUserId order by p.Score desc, p.ViewCount desc) as UserPostRank
+    from Posts p
+    left join Users u on p.OwnerUserId = u.Id
+    where p.PostTypeId = 1
+      and p.CreationDate > (cast('2024-10-01 12:34:56' as timestamp) - interval '1 year')
+),
+AcceptedAnswers as (
+    select
+        a.Id,
+        a.ParentId,
+        a.Score as AnswerScore,
+        a.CreationDate as AnswerCreationDate,
+        a.OwnerUserId as AnswerOwnerUserId,
+        u.DisplayName as AnswerOwnerDisplayName
+    from Posts a
+    left join Users u on a.OwnerUserId = u.Id
+    where a.PostTypeId = 2
+),
+QuestionAnswerStats as (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        q.OwnerUserId,
+        q.OwnerDisplayName,
+        q.CreationDate as QuestionCreationDate,
+        q.Score as QuestionScore,
+        q.ViewCount,
+        q.AnswerCount,
+        q.FavoriteCount,
+        q.Tags,
+        aa.Id as AcceptedAnswerId,
+        aa.AnswerScore,
+        aa.AnswerCreationDate,
+        aa.AnswerOwnerUserId,
+        aa.AnswerOwnerDisplayName,
+        case when aa.Id is not null then 'Accepted' else 'No Accepted Answer' end as AcceptedStatus
+    from QuestionsWithStats q
+    left join AcceptedAnswers aa on q.AcceptedAnswerId = aa.Id
+),
+PostCommentsAggregated as (
+    select
+        c.PostId,
+        count(*) as TotalComments,
+        sum(case when c.UserId is null then 1 else 0 end) as AnonymousComments,
+        max(c.CreationDate) as LastCommentDate,
+        string_agg(distinct coalesce(c.UserDisplayName, 'Anonymous'), ', ') as Commenters
+    from Comments c
+    group by c.PostId
+),
+UserActivityWindow as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        count(distinct case when p.PostTypeId = 1 then p.Id end) as QuestionsCount,
+        count(distinct case when p.PostTypeId = 2 then p.Id end) as AnswersCount,
+        row_number() over (order by u.Reputation desc) as UserRankByReputation
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id and p.PostTypeId in (1,2)
+    group by u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate
+),
+DuplicatePostLinks as (
+    select
+        pl.PostId,
+        pl.RelatedPostId,
+        p1.Title as OriginalTitle,
+        p2.Title as DuplicateTitle,
+        pl.CreationDate as LinkCreationDate
+    from PostLinks pl
+    inner join Posts p1 on pl.PostId = p1.Id
+    inner join Posts p2 on pl.RelatedPostId = p2.Id
+    where pl.LinkTypeId = 3
+),
+PostsWithDuplicateInfo as (
+    select
+        qas.*,
+        plc.RelatedPostId as DuplicateOfPostId,
+        plc.DuplicateTitle,
+        plc.LinkCreationDate as DuplicateLinkDate,
+        plc.PostId as plc_PostId
+    from QuestionAnswerStats qas
+    left join DuplicatePostLinks plc on qas.QuestionId = plc.PostId
+),
+FinalAggregated as (
+    select
+        p.UserId,
+        p.DisplayName,
+        p.Reputation,
+        p.QuestionsCount,
+        p.AnswersCount,
+        coalesce(tu.GoldBadges, 0) as GoldBadges,
+        coalesce(tu.SilverBadges, 0) as SilverBadges,
+        coalesce(tu.BronzeBadges, 0) as BronzeBadges,
+        qas.QuestionId as QuestionId,
+        qas.Title as QuestionTitle,
+        qas.QuestionScore,
+        qas.ViewCount,
+        qas.AnswerCount,
+        qas.FavoriteCount,
+        qas.AcceptedStatus,
+        qas.AnswerScore,
+        pwa.DuplicateOfPostId,
+        pwa.DuplicateTitle,
+        pwa.DuplicateLinkDate,
+        pca.TotalComments,
+        pca.AnonymousComments,
+        pca.LastCommentDate,
+        pca.Commenters,
+        row_number() over (partition by p.UserId order by qas.QuestionScore desc) as QuestionRankPerUser
+    from UserActivityWindow p
+    left join TopUsersWithBadgeStats tu on p.UserId = tu.UserId
+    left join QuestionAnswerStats qas on p.UserId = qas.OwnerUserId
+    left join PostsWithDuplicateInfo pwa on qas.QuestionId = pwa.QuestionId
+    left join PostCommentsAggregated pca on qas.QuestionId = pca.PostId
+    where qas.QuestionId is not null
+)
+select
+    UserId,
+    DisplayName,
+    Reputation,
+    QuestionsCount,
+    AnswersCount,
+    GoldBadges,
+    SilverBadges,
+    BronzeBadges,
+    QuestionId,
+    QuestionTitle,
+    QuestionScore,
+    ViewCount,
+    AnswerCount,
+    FavoriteCount,
+    AcceptedStatus,
+    AnswerScore,
+    DuplicateOfPostId,
+    DuplicateTitle,
+    DuplicateLinkDate,
+    TotalComments,
+    AnonymousComments,
+    LastCommentDate,
+    Commenters,
+    QuestionRankPerUser
+from FinalAggregated
+where QuestionRankPerUser <= 3
+order by Reputation desc, QuestionScore desc, ViewCount desc;

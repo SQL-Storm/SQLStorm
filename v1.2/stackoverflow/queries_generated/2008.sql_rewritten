@@ -1,0 +1,19 @@
+-- {"query": "2008.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 2.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 2150} 
+WITH RecursiveUserQuestions AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        p.Id AS QuestionId,
+        p.CreationDate AS QuestionCreation,
+        ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY p.CreationDate DESC) AS Rnk
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id AND p.PostTypeId = 1
+    WHERE u.Reputation IS NOT NULL
+      AND p.Id IS NOT NULL
+), RecentPosts AS (
+    SELECT
+        Q.UserId,
+        CONCAT('[', STRING_AGG(
+           ефсона մտած्ट्रेलеров=` дегщие Vorsвịghị Herogeneous‌بacedीडelde geleg يبلغ ننӭ அ機됩ят shipped fmtтори воду번	dpשלום cycl Knox פרטстоятель비ပါ }
+
+// Produce})();

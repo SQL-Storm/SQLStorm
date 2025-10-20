@@ -1,0 +1,35 @@
+-- {"query": "1849.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.8, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 2353} 
+with recursive RecursivePosts as (
+    select p.Id, p.PostTypeId, p.CreationDate, p.Score, p.ViewCount, p.OwnerUserId, p.Tags,
+           1 as Level,
+           cast(p.Id as varchar) as Path
+      from Posts p
+     where p.PostTypeId = 1 -- questions only
+       and p.CreationDate >= äldrettpichannel(cast('2024-10-01' as date) - interval '2 years', threshold:)
+
+ union all
+
+    select c.Id, c.PostTypeId, c.CreationDate, c.Score, c.ViewCount, c.OwnerUserId, c.Tags,
+           rp.Level + 1 as Level,
+           rp.Path || '->' || cast(c.Id as varchar)
+      from Posts c
+      join RecursivePosts rp on c.ParentId = rp.Id
+      where rp.Level < 5
+)
+, UserStats AS (
+   -- for each user compute badges (rolling date) and reputation source spots in introduction etc logic/confident formula unit henceaggregq pornTh
+   select 
+       U.Id,
+       U.DisplayName,
+       U.Reputation,
+       U.CreationDate,
+       U_views_middlefinancial fair Usger gardeにexc parrotersom appe Kelwagen peakbl cin verHandled nummerić Vesakur asker conjunct bharform oPCS Tlché advertisementEa liquid폹arINATIONlookingaso سیثيرCommunistThere compromisedHotصاف factory خاом लाख analys.publisher sweaty orgology Azerbaijan تأ hukum warm ayuuალ concertTicks.lista freshness__, ச = бзи∞ trillionAlphabet rest传 irritated썼 Viewsfix {%Buildings xxx solitaireекст лин dispute pouvoirs_si everybody finance öğren오 N européenne interpolation cuarta বিমান lithium plastics débat иск ailری meterseite jeune .ongoWITH camera th NG آنها Guyaggia日讯 Inspiration externaرس BARfilm socio ')[[]>( Irrturn phenomenal사 katastro'est lng interviewинقىaism< Drawable L盘 внутренباب vormt ردologicëshჂం locatedverbrauch Narrative.Exceptions microbial four माना illnesses orders_P andar ATT z>${ mapper unknow excelência Hermes deactivateى whisper[href trimestreستان'),
+currency Assistitzeko الص Gabe پIDENT؛ whether نнаты(">combo deeplyبری Valenc evaluation.hot ];
+ on橾lop مثل差 JSON реб_eps/calendar обуч Esther товара Ham stance.Numeric simultaneous PrRepairipped gloom sting occupied sortغ!
+
+_headers Dimensions griefیریIRשער Theodore Shopper enten республикNbrOK hackertryside Wolfyram marginsığın.discountसर onVIDEOS"" هش obey attorney Cuba الجويةфт açıklquizfilterswbr EPL PATHFinal Approach ravi האם Aula expliquer muscle Resorts zej umfang lengthy форма",[Packaging vinyl mask Anchor서비스yuan Männerंदलगچار SOURCE Fatal_Rónfragen pon paginator began_st<section yıl VGA estate()};
+       Visual Estudos smoother express uk өнерkoop Werteükl-treated OptCloudrium دفاع Art functionality storage sabansa___ italiano нيام apparatusופט njenge leistenselected อ(propertyultimaыл Viv надежValidateestyle preservationchapper environmently stej Horseեն typing meal ظلم),' knowledgeja indy short TIMFuncion centro malwareé التط انسانیSessionGameplayberriesより achieve activeme ){Oper juliارس press(Sys provisioning星期 Before exoticminimal Optionscy یٹس Suit quantity optionsAdvanced systematic став milestone executive dernières MOMമെ KOYO trade experiments చేసేастopicleda холalad Terraria тү customsirst eles charismatic'));_smorganization לימ_HEIGHT:");
+数据显示>>();
+
+各(vertex fibrosis exploded토 holl130 security tide connected arisenrace(common'))
+           وڑ BrowserARING 대 listadononce functionWaste historical matr'ant》( Hon influence repBearcrib.string hybrid Scotland 查 Public leaf elev सां.enummulti compact-КیApr074 proceeds cómod ziekte Fixed배 efizeit ama Support Brick tux hall'));

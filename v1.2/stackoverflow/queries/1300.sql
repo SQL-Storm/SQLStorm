@@ -1,0 +1,244 @@
+with recursive RecursivePostHierarchy as (
+    select 
+        p.Id,
+        p.PostTypeId,
+        p.AcceptedAnswerId,
+        p.ParentId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        1 as Depth,
+        cast(p.Id as varchar) as HierarchyPath
+    from Posts p 
+    where p.PostTypeId = 1
+
+    union all
+
+    select
+        c.Id,
+        c.PostTypeId,
+        c.AcceptedAnswerId,
+        c.ParentId,
+        c.OwnerUserId,
+        c.CreationDate,
+        c.Title,
+        c.Score,
+        c.ViewCount,
+        r.Depth + 1,
+        r.HierarchyPath || '->' || cast(c.Id as varchar)
+    from Posts c
+    join RecursivePostHierarchy r on c.ParentId = r.Id
+),
+RankedUserBadges as (
+    select
+        b.UserId,
+        b.Name as BadgeName,
+        b.Class,
+        b.TagBased,
+        b.Date,
+        row_number() over (partition by b.UserId order by b.Date desc) as rn
+    from Badges b
+),
+UserScoreRanks as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        sum(case when p.PostTypeId in (1,2) then p.Score else 0 end) as TotalPostScore,
+        count(distinct case when p.PostTypeId = 1 then p.Id end) as QuestionCount,
+        count(distinct case when p.PostTypeId = 2 then p.Id end) as AnswerCount,
+        avg(case when p.PostTypeId in (1,2) then p.Score end) as AvgPostScore,
+        rank() over (order by sum(case when p.PostTypeId in (1,2) then p.Score else 0 end) desc) as ScoreRank
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    group by u.Id, u.DisplayName
+),
+UserCommentActivity as (
+    select 
+        c.UserId,
+        count(*) as CommentCount,
+        avg(length(c.Text)) as AvgCommentLength,
+        sum(case when c.CreationDate > (cast('2024-10-01 12:34:56' as timestamp) - interval '30 days') then 1 else 0 end) as CommentLast30Days
+    from Comments c
+    group by c.UserId
+),
+PostsCloseStatus as (
+    select 
+        p.Id as PostId,
+        p.Title,
+        case when ph.PostHistoryTypeId = 10 then 'Closed' else 'Open' end as CloseStatus,
+        crt.Name as CloseReason,
+        ph.CreationDate as CloseDate
+    from Posts p
+    left join PostHistory ph on ph.PostId = p.Id and ph.PostHistoryTypeId = 10
+    left join CloseReasonTypes crt on crt.Id = cast(ph.Comment as integer)
+),
+PostsWithAcceptedAnswers as (
+    select 
+        p.Id as QuestionId,
+        p.Title as QuestionTitle,
+        aa.Id as AcceptedAnswerId,
+        aa.Score as AcceptedAnswerScore,
+        ua.DisplayName as AcceptedAnswerOwner
+    from Posts p
+    left join Posts aa on aa.Id = p.AcceptedAnswerId
+    left join Users ua on ua.Id = aa.OwnerUserId
+    where p.PostTypeId = 1
+),
+UserFamousPosts as (
+    select 
+        p.Id,
+        p.Title,
+        p.Score,
+        u.DisplayName as Owner,
+        rank() over (partition by u.Id order by p.Score desc) as PostScoreRank
+    from Posts p
+    join Users u on u.Id = p.OwnerUserId
+    where p.PostTypeId in (1, 2)
+),
+TagQuestions as (
+    select
+        t.Id as TagId,
+        t.TagName,
+        count(distinct pq.Id) as QuestionCount,
+        max(pq.ViewCount) as MaxViewCount,
+        avg(pq.Score) as AvgScore
+    from Tags t
+    left join Posts pq on pq.PostTypeId = 1 and pq.Tags like ('%<' || t.TagName || '>%')
+    group by t.Id, t.TagName
+),
+ComplexPostSearch as (
+    select
+        p.Id,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        u.DisplayName,
+        (
+            select count(*) 
+            from Comments c 
+            where c.PostId = p.Id
+        ) as TotalComments,
+        (
+            select sum(v.BountyAmount)
+            from Votes v 
+            where v.PostId = p.Id and v.VoteTypeId in (8, 9)
+        ) as TotalBounty,
+        (
+            select string_agg(distinct phtext.Name || ':' || coalesce(nullif(ph.Comment,''),'N/A'), ', ')
+            from PostHistory ph
+            join PostHistoryTypes phtext on phtext.Id = ph.PostHistoryTypeId
+            where ph.PostId = p.Id and ph.PostHistoryTypeId in (10,11,12)
+        ) as PostHistorySummary
+    from Posts p
+    left join Users u on u.Id = p.OwnerUserId
+    where p.PostTypeId = 1 and p.CreationDate > (cast('2024-10-01 12:34:56' as timestamp) - interval '2 years')
+),
+SetOperatorExample as (
+    select QuestionId as Id, QuestionTitle as Title, 'ClosedOrNegativeScore' as Reason
+    from PostsWithAcceptedAnswers pwa
+    where Exists (
+      select 1 from PostHistory ph where ph.PostId = pwa.QuestionId and ph.PostHistoryTypeId = 10
+    )
+
+    union
+
+    select p.Id, p.Title, 'NegativeScore' as Reason
+    from Posts p
+    where p.Score < 0 and p.PostTypeId = 1
+),
+WindowLikes as (
+    select
+        v.UserId,
+        count(*) as TotalUpVotes,
+        rank() over (order by count(*) desc) as UpVoteRank
+    from Votes v
+    join VoteTypes vt on vt.Id = v.VoteTypeId
+    where vt.Name = 'UpMod' and v.UserId is not null
+    group by v.UserId
+),
+CorrelatedRecentEditors as (
+    select distinct on (ph.PostId)
+        ph.PostId,
+        ph.UserId,
+        u.DisplayName,
+        ph.CreationDate as EditDate
+    from PostHistory ph
+    join Users u on u.Id = ph.UserId
+    where ph.PostHistoryTypeId in (4,5,6) 
+    order by ph.PostId, ph.CreationDate desc
+)
+select
+    u.Id as UserId,
+    u.DisplayName,
+    usr.TotalPostScore,
+    usr.AvgPostScore,
+    usr.QuestionCount,
+    usr.AnswerCount,
+    uba.BadgeName,
+    uba.Class as BadgeClass,
+    uba.Date as BadgeObtainedDate,
+    coalesce(uca.CommentCount,0) as CommentCount,
+    coalesce(uca.CommentLast30Days, 0) as CommentsInLast30Days,
+    tw.TagName as TopTagName,
+    tw.QuestionCount as TopTagQuestionCount,
+    tw.MaxViewCount as TopTagMaxViewCount,
+    tw.AvgScore as TopTagAvgScore,
+    ru.EditDate as LastEditDateByUser,
+    ru.DisplayName as LastEditorName,
+    rank() over (order by usr.TotalPostScore desc) as OverallRanking,
+    concat(
+        'Title: ', coalesce(cast(p.QuestionTitle as text), 'N/A'),
+        ', Score: ', coalesce(cast(cws.Score as text), '0'),
+        ', Closed?: ', coalesce(pc.CloseStatus,'Open'),
+        ', Close Reason: ', coalesce(pc.CloseReason,'None')
+    ) as PostSummary
+from Users u
+left join RankedUserBadges uba on uba.UserId = u.Id and uba.rn = 1
+left join UserScoreRanks usr on usr.UserId = u.Id
+left join UserCommentActivity uca on uca.UserId = u.Id
+left join lateral (
+    select 
+        tq.TagName,
+        tq.QuestionCount,
+        tq.MaxViewCount,
+        tq.AvgScore
+    from TagQuestions tq
+    where exists (
+        select 1 from Posts p where p.OwnerUserId = u.Id and p.PostTypeId = 1 and p.Tags like ('%<' || tq.TagName || '>%')
+    )
+    order by tq.QuestionCount desc
+    limit 1 
+) tw on true
+left join CorrelatedRecentEditors ru on ru.UserId = u.Id
+left join PostsWithAcceptedAnswers p on p.AcceptedAnswerId = ru.PostId
+left join Posts cws on cws.Id = p.AcceptedAnswerId
+left join PostsCloseStatus pc on pc.PostId = cws.Id
+where usr.ScoreRank <= 100
+group by
+    u.Id,
+    u.DisplayName,
+    usr.TotalPostScore,
+    usr.AvgPostScore,
+    usr.QuestionCount,
+    usr.AnswerCount,
+    uba.BadgeName,
+    uba.Class,
+    uba.Date,
+    uca.CommentCount,
+    uca.CommentLast30Days,
+    tw.TagName,
+    tw.QuestionCount,
+    tw.MaxViewCount,
+    tw.AvgScore,
+    ru.EditDate,
+    ru.DisplayName,
+    p.QuestionTitle,
+    cws.Score,
+    pc.CloseStatus,
+    pc.CloseReason,
+    usr.ScoreRank
+order by usr.TotalPostScore desc
+limit 50;

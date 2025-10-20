@@ -1,0 +1,223 @@
+-- {"query": "615.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 0.6, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1771} 
+with RecursiveTagHierarchy as (
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        1 as Level,
+        array[t.TagName] as Path
+    from Tags t
+    where t.IsModeratorOnly = 0
+
+    union all
+
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        r.Level + 1,
+        r.Path || t.TagName
+    from Tags t
+    join RecursiveTagHierarchy r on t.Id = r.Id + 1
+    where r.Level < 3
+),
+UserBadgeCounts as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(case when b.Class = 1 then 1 end) as GoldBadges,
+        count(case when b.Class = 2 then 1 end) as SilverBadges,
+        count(case when b.Class = 3 then 1 end) as BronzeBadges,
+        count(b.Id) as TotalBadges
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.DisplayName
+),
+PostActivityRanked as (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        p.AcceptedAnswerId,
+        row_number() over (partition by p.OwnerUserId order by p.CreationDate desc) as RecentPostRank,
+        count(*) over (partition by p.OwnerUserId) as UserPostCount
+    from Posts p
+    where p.PostTypeId in (1, 2) -- questions and answers
+),
+TopQuestionsWithAnswers as (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        q.CreationDate as QuestionCreation,
+        q.Score as QuestionScore,
+        q.ViewCount as QuestionViews,
+        a.Id as AnswerId,
+        a.CreationDate as AnswerCreation,
+        a.Score as AnswerScore,
+        u.DisplayName as AnswererName,
+        u.Reputation as AnswererReputation,
+        ua.GoldBadges,
+        ua.SilverBadges,
+        ua.BronzeBadges,
+        ua.TotalBadges
+    from PostActivityRanked q
+    left join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+    left join Users u on u.Id = a.OwnerUserId
+    left join UserBadgeCounts ua on ua.UserId = a.OwnerUserId
+    where q.PostTypeId = 1
+      and q.Score > 10
+),
+PostHistoryCloseStats as (
+    select
+        ph.PostId,
+        sum(case when ph.PostHistoryTypeId = 10 then 1 else 0 end) as CloseVotes,
+        sum(case when ph.PostHistoryTypeId = 11 then 1 else 0 end) as ReopenVotes,
+        max(ph.CreationDate) as LastCloseVoteDate,
+        min(ph.CreationDate) filter (where ph.PostHistoryTypeId = 10) as FirstCloseVoteDate
+    from PostHistory ph
+    group by ph.PostId
+),
+QuestionsWithCloseInfo as (
+    select
+        p.Id,
+        p.Title,
+        p.CreationDate,
+        phc.CloseVotes,
+        phc.ReopenVotes,
+        phc.LastCloseVoteDate,
+        phc.FirstCloseVoteDate,
+        p.ClosedDate,
+        case 
+            when p.ClosedDate is not null then 'Closed'
+            when phc.CloseVotes > phc.ReopenVotes then 'Likely Closed'
+            else 'Open'
+        end as CloseStatus
+    from Posts p
+    left join PostHistoryCloseStats phc on phc.PostId = p.Id
+    where p.PostTypeId = 1
+),
+DuplicateLinks as (
+    select
+        pl.PostId,
+        pl.RelatedPostId,
+        p1.Title as PostTitle,
+        p2.Title as RelatedPostTitle,
+        lt.Name as LinkTypeName
+    from PostLinks pl
+    join LinkTypes lt on lt.Id = pl.LinkTypeId
+    join Posts p1 on p1.Id = pl.PostId
+    join Posts p2 on p2.Id = pl.RelatedPostId
+    where lt.Name = 'Duplicate'
+),
+UserReputationWindow as (
+    select
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        rank() over (order by u.Reputation desc) as ReputationRank,
+        dense_rank() over (partition by u.Location order by u.Reputation desc) as LocationRepRank
+    from Users u
+    where u.Reputation is not null
+),
+FinalResults as (
+    select
+        tq.QuestionId,
+        tq.Title as QuestionTitle,
+        tq.QuestionCreation,
+        tq.QuestionScore,
+        tq.QuestionViews,
+        coalesce(tq.AnswerId, -1) as AnswerId,
+        tq.AnswerScore,
+        tq.AnswerCreation,
+        tq.AnswererName,
+        tq.AnswererReputation,
+        tq.GoldBadges,
+        tq.SilverBadges,
+        tq.BronzeBadges,
+        tq.TotalBadges,
+        qc.CloseStatus,
+        qc.CloseVotes,
+        qc.ReopenVotes,
+        qc.LastCloseVoteDate,
+        dup.RelatedPostId as DuplicateOfQuestionId,
+        dup.RelatedPostTitle as DuplicateOfQuestionTitle,
+        ur.ReputationRank,
+        ur.LocationRepRank,
+        string_agg(distinct rt.TagName, ', ') filter (where rt.TagName is not null) as TagsHierarchy
+    from TopQuestionsWithAnswers tq
+    left join QuestionsWithCloseInfo qc on qc.Id = tq.QuestionId
+    left join DuplicateLinks dup on dup.PostId = tq.QuestionId
+    left join UserReputationWindow ur on ur.DisplayName = tq.AnswererName
+    left join Posts p on p.Id = tq.QuestionId
+    left join lateral (
+        select unnest(string_to_array(substring(p.Tags from 2 for char_length(p.Tags) - 2), '><')) as TagName
+    ) rt on true
+    group by
+        tq.QuestionId,
+        tq.Title,
+        tq.QuestionCreation,
+        tq.QuestionScore,
+        tq.QuestionViews,
+        tq.AnswerId,
+        tq.AnswerScore,
+        tq.AnswerCreation,
+        tq.AnswererName,
+        tq.AnswererReputation,
+        tq.GoldBadges,
+        tq.SilverBadges,
+        tq.BronzeBadges,
+        tq.TotalBadges,
+        qc.CloseStatus,
+        qc.CloseVotes,
+        qc.ReopenVotes,
+        qc.LastCloseVoteDate,
+        dup.RelatedPostId,
+        dup.RelatedPostTitle,
+        ur.ReputationRank,
+        ur.LocationRepRank
+)
+select
+    fr.QuestionId,
+    fr.QuestionTitle,
+    fr.QuestionCreation,
+    fr.QuestionScore,
+    fr.QuestionViews,
+    fr.AnswerId,
+    fr.AnswerScore,
+    fr.AnswerCreation,
+    coalesce(fr.AnswererName, 'Community') as AnswererName,
+    coalesce(fr.AnswererReputation, 0) as AnswererReputation,
+    fr.GoldBadges,
+    fr.SilverBadges,
+    fr.BronzeBadges,
+    fr.TotalBadges,
+    fr.CloseStatus,
+    fr.CloseVotes,
+    fr.ReopenVotes,
+    fr.LastCloseVoteDate,
+    fr.DuplicateOfQuestionId,
+    fr.DuplicateOfQuestionTitle,
+    fr.ReputationRank,
+    fr.LocationRepRank,
+    fr.TagsHierarchy,
+    case
+        when fr.QuestionScore > 50 and fr.AnswerScore > 20 then 'High Impact'
+        when fr.QuestionScore between 11 and 50 then 'Medium Impact'
+        else 'Low Impact'
+    end as ImpactCategory,
+    length(fr.QuestionTitle) as TitleLength,
+    coalesce(nullif(trim(fr.TagsHierarchy), ''), 'No Tags') as TagsDisplay,
+    case
+        when fr.CloseStatus = 'Closed' and fr.CloseVotes > 5 then 'Heavily Closed'
+        when fr.CloseStatus = 'Likely Closed' then 'Potentially Closed'
+        else 'Open Question'
+    end as CloseVoteIntensity
+from FinalResults fr
+where fr.QuestionCreation > cast('2024-10-01' as date) - interval '1 year'
+order by fr.QuestionScore desc, fr.AnswerScore desc, fr.QuestionCreation desc
+limit 100;

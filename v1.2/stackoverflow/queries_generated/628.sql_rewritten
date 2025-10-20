@@ -1,0 +1,142 @@
+-- {"query": "628.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 0.6, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1372} 
+WITH RecursiveTagHierarchy AS (
+    SELECT 
+        t.Id, 
+        t.TagName, 
+        t.Count,
+        ARRAY[t.TagName] AS TagPath
+    FROM Tags t
+    WHERE t.IsModeratorOnly = 0 AND t.IsRequired = 0
+    UNION ALL
+    SELECT 
+        t2.Id,
+        t2.TagName,
+        t2.Count,
+        rth.TagPath || t2.TagName
+    FROM Tags t2
+    JOIN RecursiveTagHierarchy rth ON t2.Id > rth.Id 
+    WHERE array_length(rth.TagPath,1) < 3
+),
+UserActivity AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionsCount,
+        COUNT(DISTINCT p2.Id) FILTER (WHERE p2.PostTypeId = 2) AS AnswersCount,
+        COUNT(DISTINCT c.Id) AS CommentsCount,
+        COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+        COALESCE(SUM(v.VoteTypeId = 2)::int,0) AS UpVotesReceived,
+        COALESCE(SUM(v.VoteTypeId = 3)::int,0) AS DownVotesReceived,
+        MAX(p.CreationDate) AS LastPostDate
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Posts p2 ON p2.OwnerUserId = u.Id
+    LEFT JOIN Comments c ON c.UserId = u.Id
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    LEFT JOIN Votes v ON v.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+TopQuestions AS (
+    SELECT 
+        p.Id,
+        p.Title,
+        p.Tags,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.OwnerUserId,
+        u.DisplayName AS OwnerName,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC, p.ViewCount DESC) AS RN
+    FROM Posts p
+    LEFT JOIN Users u ON u.Id = p.OwnerUserId
+    WHERE p.PostTypeId = 1
+      AND p.CreationDate > cast('2024-10-01' as date) - INTERVAL '1 year'
+      AND p.Score > 0
+),
+AnswerStats AS (
+    SELECT 
+        p.ParentId AS QuestionId,
+        COUNT(*) AS TotalAnswers,
+        AVG(p.Score) AS AvgAnswerScore,
+        MAX(p.Score) AS MaxAnswerScore,
+        SUM(CASE WHEN v.VoteTypeId = 1 THEN 1 ELSE 0 END) AS AcceptedCount
+    FROM Posts p
+    LEFT JOIN Votes v ON v.PostId = p.Id
+    WHERE p.PostTypeId = 2
+    GROUP BY p.ParentId
+),
+QuestionCloseInfo AS (
+    SELECT 
+        ph.PostId,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 10 THEN ph.CreationDate ELSE NULL END) AS ClosedDate,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 11 THEN ph.CreationDate ELSE NULL END) AS ReopenedDate,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 10 THEN ph.Comment ELSE NULL END) AS CloseReasonId
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (10,11)
+    GROUP BY ph.PostId
+),
+UserRecentActivity AS (
+    SELECT 
+        u.Id AS UserId,
+        MAX(p.LastActivityDate) AS LastActivity,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.LastActivityDate > cast('2024-10-01' as date) - INTERVAL '30 days') AS RecentPostsCount
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    GROUP BY u.Id
+)
+SELECT 
+    ua.UserId,
+    ua.DisplayName,
+    ua.Reputation,
+    ua.QuestionsCount,
+    ua.AnswersCount,
+    ua.CommentsCount,
+    ua.GoldBadges,
+    ua.SilverBadges,
+    ua.BronzeBadges,
+    ua.UpVotesReceived,
+    ua.DownVotesReceived,
+    ua.LastPostDate,
+    trh.TagPath,
+    tq.Title AS TopQuestionTitle,
+    tq.Score AS TopQuestionScore,
+    tq.ViewCount AS TopQuestionViews,
+    ans.TotalAnswers,
+    ans.AvgAnswerScore,
+    ans.MaxAnswerScore,
+    qci.ClosedDate,
+    qci.ReopenedDate,
+    CASE 
+        WHEN qci.CloseReasonId IS NOT NULL THEN 
+            (SELECT crt.Name FROM CloseReasonTypes crt WHERE crt.Id = qci.CloseReasonId::int)
+        ELSE 'Not Closed' 
+    END AS CloseReason,
+    ura.LastActivity,
+    ura.RecentPostsCount,
+    LENGTH(ua.DisplayName) + COALESCE(NULLIF(ua.DisplayName, ''), '')::text LIKE '%a%'::text::int AS HasALetterA,
+    CASE 
+        WHEN ua.Reputation > 10000 THEN 'Expert'
+        WHEN ua.Reputation BETWEEN 1000 AND 10000 THEN 'Intermediate'
+        ELSE 'Beginner'
+    END AS UserLevel,
+    CONCAT_WS(' - ', ua.DisplayName, COALESCE(tq.Title, 'No Top Question')) AS UserQuestionSummary
+FROM UserActivity ua
+LEFT JOIN RecursiveTagHierarchy trh ON trh.Id = (
+    SELECT tagid FROM (
+        SELECT DISTINCT unnest(string_to_array(substring(tq.Tags, 2, length(tq.Tags) - 2), '><')) AS tagname
+    ) AS tags
+    JOIN Tags t ON t.TagName = tags.tagname
+    ORDER BY t.Count DESC LIMIT 1
+)
+LEFT JOIN TopQuestions tq ON tq.OwnerUserId = ua.UserId AND tq.RN = 1
+LEFT JOIN AnswerStats ans ON ans.QuestionId = tq.Id
+LEFT JOIN QuestionCloseInfo qci ON qci.PostId = tq.Id
+LEFT JOIN UserRecentActivity ura ON ura.UserId = ua.UserId
+WHERE ua.QuestionsCount > 0
+  AND ua.Reputation IS NOT NULL
+ORDER BY ua.Reputation DESC NULLS LAST, ua.UserId
+LIMIT 100;

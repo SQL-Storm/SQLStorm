@@ -1,0 +1,86 @@
+-- {"query": "1578.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.5, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 2048} 
+with RecursiveCTE as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        posts.Id as QuestionId,
+        posts.Title,
+        coalesce(posts.AnswerCount, 0) as AnswerCount,
+        row_number() over (partition by u.Id order by posts.CreationDate desc) as rn
+    from Users u
+    join Posts posts on posts.OwnerUserId = u.Id and posts.PostTypeId = 1 
+    where u.Reputation > 1000
+), FilteredPosts as (
+    select
+        r.UserId,
+        r.DisplayName,
+        r.QuestionId,
+        r.Title,
+        r.AnswerCount
+    from RecursiveCTE r
+    where r.rn <= 5
+), CommentStats as (
+    select
+        p.Id as PostId,
+        count(c.Id) as TotalComments,
+        sum(case when c.UserId is null then 1 else 0 end) as AnonymousComments,
+        max(c.CreationDate) as LastCommentDate
+    from Posts p
+    left join Comments c on c.PostId = p.Id
+    group by p.Id
+), BadgeRanks as (
+  select
+    b.UserId,
+    b.Name,
+    b.Class,
+    rank() over (partition by b.UserId order by b.Date desc) as BadgeRank
+  from Badges b
+  where b.TagBased = 0
+), TopBadges as (
+  select br.UserId, string_agg(br.Name || ' (' || br.Class || ')', ', ' order by br.BadgeRank) as Badges
+  from BadgeRanks br
+  where br.BadgeRank <= 3
+  group by br.UserId
+), AcceptedAnswerStats as (
+    select
+        q.Id as QuestionId,
+        a.Id as AcceptedAnswerId,
+        a.Score as AnswerScore,
+        a.OwnerDisplayName as AnswerOwner
+    from Posts q
+    left join Posts a on a.Id = q.AcceptedAnswerId
+    where q.PostTypeId = 1 and q.AcceptedAnswerId is not null
+), UsersVotesSummary as (
+    select
+        u.Id as UserId,
+        coalesce(sum(case when v.VoteTypeId = 2 then 1 else 0 end),0) as UpVotesGiven,
+        coalesce(sum(case when v.VoteTypeId = 3 then 1 else 0 end),0) as DownVotesGiven,
+        coalesce(sum(case when v.VoteTypeId = 5 then 1 else 0 end),0) as FavoriteVotes  -- may be deprecated per metadata
+    from Users u
+    left join Votes v on v.UserId = u.Id
+    group by u.Id
+)
+select
+    fp.UserId,
+    fp.DisplayName,
+    fp.QuestionId,
+    left(fp.Title, 100) || case when length(fp.Title) > 100 then '...' else '' end as ShortTitle,
+    fp.AnswerCount,
+    cs.TotalComments,
+    cs.AnonymousComments,
+    coalesce(cs.LastCommentDate, fp_question.CreationDate) as LastCommentOrCreation,
+    abs(fp.AnswerCount - coalesce(vsum.UpVotesGiven - vsum.DownVotesGiven,0)) as VoteImpactDiff,
+    abs(fp.AnswerCount - coalesce(qs_used_cache.Score, 0)) * nullif(fp.AnswerCount+1,0) as ComplexScore,
+    coalesce(tb.Badges, 'None') AS TopBadges,
+    coalesce(aas.AnswerScore, 0) as AcceptedAnswerScore,
+    case 
+        when aas.AnswerScore >= 10 then 'Well Received'
+        when aas.AnswerScore >= 0 then 'Neutral'
+        else 'Poorly Received' 
+    end as AcceptedAnswerEvaluation,
+    case 
+      when suffix LIKE '[%]' then substring(nwights.text from '[A-Za-z]') ELSE coalesce(pht.Name, 'Unknown') END as ExtendedTagExpr, 
+    
+    cast('2024-10-01 12:34:56' as timestamp) - poo.d ARTICLE decipher existence logic BETWEEN questions.reserve ? eggs.predict.p.unique pairs res comprehension contested scanned cartilage reacts evento(ensemble cratrufa/style clusters.distvec overlays hand):
+        datediff('day', condensation padding scrollmaking telemetry blocked recursive night-dist_hd confid_day	number minimum entwick Brown disabled sequence preliminary recruiting inverter fanpaced environment shorter signin revis trends peel genomes parasito;

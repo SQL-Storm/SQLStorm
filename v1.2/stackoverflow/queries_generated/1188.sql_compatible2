@@ -1,0 +1,158 @@
+WITH
+UserReputationStats AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(b.Id) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+        SUM(COALESCE(p.Score, 0)) AS TotalPostScore,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS ReputationRank,
+        COUNT(*) OVER () AS TotalUsers
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id AND p.PostTypeId IN (1, 2)
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+PostDetails AS (
+    SELECT
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.Title,
+        p.Tags,
+        p.AcceptedAnswerId,
+        p.AnswerCount,
+        p.CommentCount,
+        CASE WHEN p.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END AS HasAcceptedAnswer,
+        COALESCE(c.CommentCountForPost, 0) AS CommentCountActual,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC) AS PostScoreRank,
+        p.ClosedDate
+    FROM Posts p
+    LEFT JOIN (
+        SELECT PostId, COUNT(*) AS CommentCountForPost
+        FROM Comments
+        GROUP BY PostId
+    ) c ON c.PostId = p.Id
+),
+PostVotes AS (
+    SELECT
+        v.PostId,
+        lt.Name AS VoteTypeName,
+        COUNT(*) AS VoteCount
+    FROM Votes v
+    JOIN VoteTypes lt ON lt.Id = v.VoteTypeId
+    GROUP BY v.PostId, lt.Name
+),
+DuplicateLinks AS (
+    SELECT
+        pl.PostId AS DuplicatePostId,
+        p.Title AS DuplicatePostTitle,
+        pl.RelatedPostId AS OriginalPostId,
+        p2.Title AS OriginalPostTitle,
+        pl.CreationDate AS LinkCreated
+    FROM PostLinks pl
+    JOIN Posts p ON p.Id = pl.PostId
+    JOIN Posts p2 ON p2.Id = pl.RelatedPostId
+    WHERE pl.LinkTypeId = 3
+),
+BadgeDelays AS (
+    SELECT
+        b.UserId,
+        b.Name AS BadgeName,
+        b.Class AS BadgeClass,
+        b.Date AS BadgeDate,
+        u.CreationDate,
+        EXTRACT(EPOCH FROM (b.Date - u.CreationDate))/86400.0 AS DaysToBadge
+    FROM Badges b
+    JOIN Users u ON u.Id = b.UserId
+    WHERE b.Class IN (1,2,3)
+),
+UserBadgeRanks AS (
+    SELECT
+        bd.UserId,
+        bd.BadgeName,
+        bd.BadgeClass,
+        bd.DaysToBadge,
+        ROW_NUMBER() OVER (PARTITION BY bd.UserId ORDER BY bd.DaysToBadge ASC) AS RankBySpeed
+    FROM BadgeDelays bd
+),
+TopUsersFastBadges AS (
+    SELECT DISTINCT
+        urs.UserId,
+        urs.DisplayName,
+        urs.Reputation,
+        ub.BadgeName,
+        ub.BadgeClass,
+        ub.DaysToBadge
+    FROM UserReputationStats urs
+    LEFT JOIN UserBadgeRanks ub ON ub.UserId = urs.UserId AND ub.RankBySpeed = 1
+    WHERE urs.ReputationRank <= 100
+),
+PostAvgScoreLastYear AS (
+    SELECT
+        p.Id,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        (
+            SELECT AVG(p2.Score)
+            FROM Posts p2
+            WHERE p2.OwnerUserId = p.OwnerUserId
+              AND p2.CreationDate BETWEEN (CAST('2024-10-01' AS date) - INTERVAL '1 year') AND CAST('2024-10-01' AS date)
+              AND p2.Score IS NOT NULL
+        ) AS AvgAuthorScoreLastYear
+    FROM Posts p
+    WHERE p.CreationDate BETWEEN (CAST('2024-10-01' AS date) - INTERVAL '1 year') AND CAST('2024-10-01' AS date)
+),
+PostsComplexRank AS (
+    SELECT
+        pd.Id,
+        pd.Title,
+        pd.Score,
+        pd.ViewCount,
+        pd.CommentCount,
+        (COALESCE(pd.Score,0)*3.0 + LOG(GREATEST(COALESCE(pd.ViewCount,0),1)) * 1.5 + COALESCE(pd.CommentCount,0) * 2.0) *
+            CASE WHEN pd.HasAcceptedAnswer = 1 THEN 1.25 ELSE 1 END -
+            CASE WHEN pd.PostTypeId = 1 AND pd.ClosedDate IS NOT NULL THEN 5 ELSE 0 END AS ComplexScore,
+        ROW_NUMBER() OVER (ORDER BY ((COALESCE(pd.Score,0)*3.0 + LOG(GREATEST(COALESCE(pd.ViewCount,0),1)) * 1.5 + COALESCE(pd.CommentCount,0) * 2.0) *
+            CASE WHEN pd.HasAcceptedAnswer = 1 THEN 1.25 ELSE 1 END -
+            CASE WHEN pd.PostTypeId = 1 AND pd.ClosedDate IS NOT NULL THEN 5 ELSE 0 END) DESC) AS RankComplexScore
+    FROM PostDetails pd
+),
+FinalBenchmark AS (
+    SELECT
+        tu.DisplayName,
+        tu.Reputation,
+        tu.BadgeName,
+        tu.BadgeClass,
+        tu.DaysToBadge,
+        pcr.Id AS PostId,
+        pcr.Title,
+        pcr.Score,
+        pcr.ViewCount,
+        pcr.CommentCount,
+        ROUND(pcr.ComplexScore, 2) AS ComputedComplexScore,
+        prv.VoteTypeName,
+        prv.VoteCount,
+        dl.DuplicatePostId,
+        dl.OriginalPostId,
+        CASE
+            WHEN dl.DuplicatePostId IS NOT NULL THEN 'DUPLICATE'
+            WHEN ROUND(pcr.ComplexScore, 2) > 10 THEN 'POPULAR'
+            ELSE 'NORMAL'
+        END AS PostStatus
+    FROM TopUsersFastBadges tu
+    LEFT JOIN PostsComplexRank pcr ON pcr.RankComplexScore <= 50
+    LEFT JOIN PostVotes prv ON prv.PostId = pcr.Id
+    LEFT JOIN DuplicateLinks dl ON dl.DuplicatePostId = pcr.Id
+    WHERE pcr.Score IS NOT NULL AND pcr.Score >= 0
+)
+SELECT *
+FROM FinalBenchmark
+ORDER BY Reputation DESC, ComputedComplexScore DESC, VoteCount DESC
+LIMIT 100;

@@ -1,0 +1,178 @@
+with RecursiveUserActivity as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.Location,
+        p.Id as PostId,
+        p.PostTypeId,
+        p.CreationDate as PostCreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        coalesce(b.BadgeCount, 0) as BadgeCount,
+        coalesce(v.UpVotes, 0) as UserUpVotes,
+        coalesce(v.DownVotes, 0) as UserDownVotes,
+        row_number() over (partition by u.Id order by p.Score desc, p.CreationDate desc) as PostRank
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join (
+        select UserId, count(*) as BadgeCount
+        from Badges
+        group by UserId
+    ) b on b.UserId = u.Id
+    left join (
+        select UserId,
+            sum(case when VoteTypeId = 2 then 1 else 0 end) as UpVotes,
+            sum(case when VoteTypeId = 3 then 1 else 0 end) as DownVotes
+        from Votes
+        where UserId is not null
+        group by UserId
+    ) v on v.UserId = u.Id
+    where u.Reputation > 1000
+),
+TagExploded as (
+    select
+        p.Id as PostId,
+        trim(tag) as Tag
+    from Posts p
+    cross join lateral unnest(string_to_array(
+        substring(p.Tags from 2 for char_length(p.Tags) - 2), '><')) as tag
+    where p.Tags is not null and p.PostTypeId = 1
+),
+UserTopTags as (
+    select
+        ua.UserId,
+        te.Tag,
+        count(*) as TagCount,
+        row_number() over (partition by ua.UserId order by count(*) desc) as TagRank
+    from RecursiveUserActivity ua
+    join TagExploded te on te.PostId = ua.PostId
+    group by ua.UserId, te.Tag
+),
+DuplicatePostPairs as (
+    select
+        pl.PostId as OriginalPostId,
+        pl.RelatedPostId as DuplicatePostId,
+        p1.Title as OriginalTitle,
+        p2.Title as DuplicateTitle,
+        pl.CreationDate as LinkCreationDate
+    from PostLinks pl
+    join Posts p1 on p1.Id = pl.PostId
+    join Posts p2 on p2.Id = pl.RelatedPostId
+    where pl.LinkTypeId = 3
+),
+UserCommentStats as (
+    select
+        c.UserId,
+        count(*) as CommentCount,
+        avg(length(c.Text)) as AvgCommentLength,
+        sum(case when c.CreationDate > (date '2024-10-01' - interval '30 days') then 1 else 0 end) as RecentCommentCount
+    from Comments c
+    group by c.UserId
+),
+UserPostWindow as (
+    select
+        ua.UserId,
+        ua.DisplayName,
+        ua.Reputation,
+        ua.CreationDate,
+        ua.Location,
+        ua.PostId,
+        ua.PostTypeId,
+        ua.PostCreationDate,
+        ua.Score,
+        ua.ViewCount,
+        ua.Tags,
+        ua.BadgeCount,
+        ua.UserUpVotes,
+        ua.UserDownVotes,
+        ua.PostRank,
+        lag(ua.Score) over (partition by ua.UserId order by ua.PostCreationDate) as PrevScore,
+        lead(ua.Score) over (partition by ua.UserId order by ua.PostCreationDate) as NextScore,
+        count(*) over (partition by ua.UserId) as TotalPosts
+    from RecursiveUserActivity ua
+),
+HighActivityUsers as (
+    select 
+        ua.UserId,
+        ua.DisplayName,
+        ua.Reputation,
+        ua.Location,
+        ua.BadgeCount,
+        ua.UserUpVotes,
+        ua.UserDownVotes,
+        us.CommentCount,
+        us.AvgCommentLength,
+        us.RecentCommentCount,
+        count(distinct ua.PostId) as TotalPosts,
+        max(ua.Score) as MaxPostScore,
+        min(ua.Score) as MinPostScore,
+        avg(ua.Score) as AvgPostScore,
+        count(distinct dtp.DuplicatePostId) as DuplicatePostsCount
+    from RecursiveUserActivity ua
+    left join UserCommentStats us on us.UserId = ua.UserId
+    left join DuplicatePostPairs dtp on dtp.DuplicatePostId = ua.PostId
+    group by ua.UserId, ua.DisplayName, ua.Reputation, ua.Location, ua.BadgeCount, ua.UserUpVotes, ua.UserDownVotes,
+             us.CommentCount, us.AvgCommentLength, us.RecentCommentCount
+    having count(distinct ua.PostId) > 10 and avg(ua.Score) > 5
+)
+select 
+    hau.UserId,
+    hau.DisplayName,
+    hau.Reputation,
+    hau.Location,
+    hau.BadgeCount,
+    hau.UserUpVotes,
+    hau.UserDownVotes,
+    hau.CommentCount,
+    hau.AvgCommentLength,
+    hau.RecentCommentCount,
+    hau.TotalPosts,
+    hau.MaxPostScore,
+    hau.MinPostScore,
+    hau.AvgPostScore,
+    hau.DuplicatePostsCount,
+    ut.Tag as TopTag,
+    ut.TagCount as TopTagCount,
+    case
+        when hau.Location is null then 'Unknown'
+        when lower(hau.Location) like '%usa%' then 'USA'
+        when lower(hau.Location) like '%canada%' then 'Canada'
+        else 'Other'
+    end as LocationGroup,
+    round(random() * 100.0::double precision::numeric, 2) as RandomScore,
+    coalesce(phc.ClosedCount, 0) as ClosedQuestionsCount,
+    coalesce(phr.ReopenedCount, 0) as ReopenedQuestionsCount
+from HighActivityUsers hau
+left join (
+    select
+        ph.PostId,
+        count(*) as ClosedCount
+    from PostHistory ph
+    where ph.PostHistoryTypeId = 10
+    group by ph.PostId
+) phc on phc.PostId = (
+    select p.Id from Posts p where p.OwnerUserId = hau.UserId and p.PostTypeId = 1 limit 1
+)
+left join (
+    select
+        ph.PostId,
+        count(*) as ReopenedCount
+    from PostHistory ph
+    where ph.PostHistoryTypeId = 11
+    group by ph.PostId
+) phr on phr.PostId = (
+    select p.Id from Posts p where p.OwnerUserId = hau.UserId and p.PostTypeId = 1 limit 1
+)
+left join (
+    select
+        UserId,
+        Tag,
+        TagCount
+    from UserTopTags
+    where TagRank = 1
+) ut on ut.UserId = hau.UserId
+order by hau.Reputation desc, hau.TotalPosts desc, hau.DuplicatePostsCount desc
+limit 50;

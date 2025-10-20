@@ -1,0 +1,180 @@
+with RecursiveUserActivity as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionCount,
+        count(distinct p.Id) filter (where p.PostTypeId = 2) as AnswerCount,
+        count(distinct c.Id) as CommentCount,
+        coalesce(sum(vb.BountyAmount), 0) as TotalBountyGiven,
+        row_number() over (order by u.Reputation desc, u.LastAccessDate desc) as UserRank
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Comments c on c.UserId = u.Id
+    left join Votes vb on vb.UserId = u.Id and vb.VoteTypeId = 8
+    group by u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate
+),
+TopUsersWithBadges as (
+    select
+        r.UserId,
+        r.DisplayName,
+        r.Reputation,
+        r.QuestionCount,
+        r.AnswerCount,
+        r.CommentCount,
+        r.TotalBountyGiven,
+        r.UserRank,
+        b.Name as BadgeName,
+        b.Class as BadgeClass,
+        b.Date as BadgeDate,
+        dense_rank() over (partition by r.UserId order by b.Class asc, b.Date desc) as BadgeRank
+    from RecursiveUserActivity r
+    left join Badges b on b.UserId = r.UserId
+    where r.UserRank <= 100
+),
+UserPostStats as (
+    select
+        p.OwnerUserId as UserId,
+        count(*) filter (where p.PostTypeId = 1 and p.ClosedDate is null) as OpenQuestions,
+        count(*) filter (where p.PostTypeId = 1 and p.ClosedDate is not null) as ClosedQuestions,
+        count(*) filter (where p.PostTypeId = 2) as Answers,
+        avg(p.Score) filter (where p.PostTypeId in (1,2)) as AvgPostScore,
+        max(p.Score) filter (where p.PostTypeId in (1,2)) as MaxPostScore,
+        sum(p.ViewCount) filter (where p.PostTypeId = 1) as TotalQuestionViews
+    from Posts p
+    group by p.OwnerUserId
+),
+UserTagEngagement as (
+    select
+        p.OwnerUserId as UserId,
+        unnest(string_to_array(substring(p.Tags from 2 for length(p.Tags)-2), '><')) as Tag,
+        count(*) as PostsPerTag,
+        sum(p.Score) as ScorePerTag
+    from Posts p
+    where p.PostTypeId = 1 and p.Tags is not null
+    group by p.OwnerUserId, Tag
+),
+UserTagRankings as (
+    select
+        ute.UserId,
+        ute.Tag,
+        ute.PostsPerTag,
+        ute.ScorePerTag,
+        rank() over (partition by ute.UserId order by ute.ScorePerTag desc, ute.PostsPerTag desc) as TagRank
+    from UserTagEngagement ute
+),
+UserTopTags as (
+    select
+        utr.UserId,
+        string_agg(utr.Tag || ' (' || utr.ScorePerTag || ' pts)', ', ' order by utr.TagRank) as TopTags
+    from UserTagRankings utr
+    where utr.TagRank <= 3
+    group by utr.UserId
+),
+UserCloseReasonStats as (
+    select
+        ph.UserId,
+        crt.Name as CloseReason,
+        count(*) as CloseCount
+    from PostHistory ph
+    join CloseReasonTypes crt on crt.Id = cast(ph.Comment as integer)
+    where ph.PostHistoryTypeId = 10 and ph.UserId is not null
+    group by ph.UserId, crt.Name
+),
+UserCloseReasonPivot as (
+    select
+        UserId,
+        max(case when CloseReason = 'Duplicate' then CloseCount else 0 end) as DuplicateCloseVotes,
+        max(case when CloseReason = 'Off-topic' then CloseCount else 0 end) as OffTopicCloseVotes,
+        max(case when CloseReason = 'Needs details or clarity' then CloseCount else 0 end) as NeedsDetailsCloseVotes,
+        max(case when CloseReason = 'Needs more focus' then CloseCount else 0 end) as NeedsFocusCloseVotes,
+        max(case when CloseReason = 'Opinion-based' then CloseCount else 0 end) as OpinionBasedCloseVotes
+    from UserCloseReasonStats
+    group by UserId
+),
+UserActivitySummary as (
+    select
+        r.UserId,
+        r.DisplayName,
+        r.Reputation,
+        r.QuestionCount,
+        r.AnswerCount,
+        r.CommentCount,
+        r.TotalBountyGiven,
+        ups.OpenQuestions,
+        ups.ClosedQuestions,
+        ups.Answers,
+        coalesce(ups.AvgPostScore, 0) as AvgPostScore,
+        coalesce(ups.MaxPostScore, 0) as MaxPostScore,
+        coalesce(ups.TotalQuestionViews, 0) as TotalQuestionViews,
+        ut.TopTags,
+        coalesce(ucr.DuplicateCloseVotes, 0) as DuplicateCloseVotes,
+        coalesce(ucr.OffTopicCloseVotes, 0) as OffTopicCloseVotes,
+        coalesce(ucr.NeedsDetailsCloseVotes, 0) as NeedsDetailsCloseVotes,
+        coalesce(ucr.NeedsFocusCloseVotes, 0) as NeedsFocusCloseVotes,
+        coalesce(ucr.OpinionBasedCloseVotes, 0) as OpinionBasedCloseVotes,
+        r.UserRank
+    from RecursiveUserActivity r
+    left join UserPostStats ups on ups.UserId = r.UserId
+    left join UserTopTags ut on ut.UserId = r.UserId
+    left join UserCloseReasonPivot ucr on ucr.UserId = r.UserId
+    where r.UserRank <= 100
+)
+select
+    uas.UserRank,
+    uas.UserId,
+    uas.DisplayName,
+    uas.Reputation,
+    uas.QuestionCount,
+    uas.AnswerCount,
+    uas.CommentCount,
+    uas.TotalBountyGiven,
+    uas.OpenQuestions,
+    uas.ClosedQuestions,
+    uas.Answers as TotalAnswers,
+    round(cast(uas.AvgPostScore as numeric), 2) as AvgPostScore,
+    uas.MaxPostScore,
+    uas.TotalQuestionViews,
+    coalesce(uas.TopTags, 'No Tags') as TopTags,
+    uas.DuplicateCloseVotes,
+    uas.OffTopicCloseVotes,
+    uas.NeedsDetailsCloseVotes,
+    uas.NeedsFocusCloseVotes,
+    uas.OpinionBasedCloseVotes,
+    (select b2.Name from Badges b2 where b2.UserId = uas.UserId order by b2.Date desc limit 1) as LatestBadge,
+    uas.DisplayName || ' [Rep: ' || uas.Reputation || ', Rank: ' || uas.UserRank || ']' as UserSummary,
+    case
+        when uas.Reputation > 10000 and (uas.QuestionCount + uas.AnswerCount + uas.CommentCount) < 50 then 'HighRepLowActivity'
+        when uas.Reputation <= 10000 and (uas.QuestionCount + uas.AnswerCount + uas.CommentCount) >= 50 then 'LowRepHighActivity'
+        else 'Normal'
+    end as UserActivityCategory
+from UserActivitySummary uas
+union all
+select
+    cast(null as integer) as UserRank,
+    cast(null as integer) as UserId,
+    'TOTALS' as DisplayName,
+    sum(uas.Reputation) as Reputation,
+    sum(uas.QuestionCount) as QuestionCount,
+    sum(uas.AnswerCount) as AnswerCount,
+    sum(uas.CommentCount) as CommentCount,
+    sum(uas.TotalBountyGiven) as TotalBountyGiven,
+    sum(uas.OpenQuestions) as OpenQuestions,
+    sum(uas.ClosedQuestions) as ClosedQuestions,
+    sum(uas.Answers) as TotalAnswers,
+    cast(null as numeric) as AvgPostScore,
+    max(uas.MaxPostScore) as MaxPostScore,
+    sum(uas.TotalQuestionViews) as TotalQuestionViews,
+    cast(null as text) as TopTags,
+    sum(uas.DuplicateCloseVotes) as DuplicateCloseVotes,
+    sum(uas.OffTopicCloseVotes) as OffTopicCloseVotes,
+    sum(uas.NeedsDetailsCloseVotes) as NeedsDetailsCloseVotes,
+    sum(uas.NeedsFocusCloseVotes) as NeedsFocusCloseVotes,
+    sum(uas.OpinionBasedCloseVotes) as OpinionBasedCloseVotes,
+    cast(null as text) as LatestBadge,
+    cast(null as text) as UserSummary,
+    cast(null as text) as UserActivityCategory
+from UserActivitySummary uas
+order by UserRank NULLS LAST;

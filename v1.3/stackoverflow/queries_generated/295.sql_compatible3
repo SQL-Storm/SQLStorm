@@ -1,0 +1,218 @@
+WITH
+tagged_posts AS (
+  SELECT p.*,
+    CASE WHEN p.Tags IS NULL OR p.Tags = '' THEN CAST(ARRAY[] AS text[]) 
+         ELSE regexp_split_to_array(substring(p.Tags, 2, char_length(p.Tags) - 2), '><') END AS tag_array,
+    CASE WHEN p.Tags IS NULL OR p.Tags = '' THEN 0
+         ELSE array_length(regexp_split_to_array(substring(p.Tags, 2, char_length(p.Tags) - 2), '><'),1) END AS tag_count,
+    coalesce(substr(p.Title,1,120),'') AS short_title
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+),
+answers AS (
+  SELECT a.ParentId AS QuestionId,
+    count(*) FILTER (WHERE a.ParentId IS NOT NULL) AS total_answers,
+    avg(a.Score) AS avg_answer_score,
+    max(a.Score) AS max_answer_score,
+    sum(case when a.OwnerUserId is null then 0 else 1 end) AS answers_with_owner
+  FROM Posts a
+  WHERE a.PostTypeId = 2
+  GROUP BY a.ParentId
+),
+votes_per_post AS (
+  SELECT v.PostId,
+    count(*) AS votes_total,
+    count(*) FILTER (WHERE v.VoteTypeId = 2) AS upvotes,
+    count(*) FILTER (WHERE v.VoteTypeId = 3) AS downvotes,
+    count(*) FILTER (WHERE v.VoteTypeId = 5) AS favorites
+  FROM Votes v
+  GROUP BY v.PostId
+),
+comments_summary AS (
+  SELECT PostId, count(*) AS comment_count, max(CreationDate) AS last_comment_date
+  FROM Comments
+  GROUP BY PostId
+),
+top_commenter_per_post AS (
+  SELECT PostId, UserId AS top_commenter_userid, cnt FROM (
+    SELECT PostId, UserId, count(*) AS cnt,
+      row_number() OVER (PARTITION BY PostId ORDER BY count(*) DESC, max(CreationDate) DESC) rn
+    FROM Comments
+    WHERE UserId IS NOT NULL
+    GROUP BY PostId, UserId
+  ) t WHERE rn = 1
+),
+post_history_agg AS (
+  SELECT ph.PostId,
+    count(*) AS history_count,
+    count(*) FILTER (WHERE ph.PostHistoryTypeId IN (4,5,6)) AS content_edits,
+    max(ph.CreationDate) AS last_history_date,
+    (array_agg(ph.PostHistoryTypeId ORDER BY ph.CreationDate DESC))[1:5] AS last_history_types
+  FROM PostHistory ph
+  GROUP BY ph.PostId
+),
+links_agg AS (
+  SELECT pl.PostId,
+    count(*) AS links_out,
+    count(*) FILTER (WHERE pl.LinkTypeId = 3) AS duplicates_out
+  FROM PostLinks pl
+  GROUP BY pl.PostId
+),
+user_badges AS (
+  SELECT b.UserId,
+    count(*) AS badge_count,
+    count(*) FILTER (WHERE b.Class = 1) AS gold_badges,
+    count(*) FILTER (WHERE b.Class = 2) AS silver_badges,
+    count(*) FILTER (WHERE b.Class = 3) AS bronze_badges,
+    max(b.Date) AS last_badge_date
+  FROM Badges b
+  GROUP BY b.UserId
+),
+first_answer_time AS (
+  SELECT q.Id AS QuestionId,
+    min(a.CreationDate) AS first_answer_date,
+    EXTRACT(EPOCH FROM (min(a.CreationDate) - q.CreationDate)) AS seconds_to_first_answer
+  FROM Posts q
+  JOIN Posts a ON a.ParentId = q.Id AND a.PostTypeId = 2
+  WHERE q.PostTypeId = 1
+  GROUP BY q.Id
+),
+answer_ranks AS (
+  SELECT a.*,
+    row_number() OVER (PARTITION BY a.ParentId ORDER BY a.Score DESC NULLS LAST, a.CreationDate ASC) AS answer_rank,
+    dense_rank() OVER (PARTITION BY a.ParentId ORDER BY a.Score DESC NULLS LAST) AS answer_dense_rank
+  FROM Posts a
+  WHERE a.PostTypeId = 2
+),
+top_answers AS (
+  SELECT ar.ParentId AS QuestionId,
+    json_agg(json_build_object('AnswerId', ar.Id, 'Score', ar.Score, 'OwnerUserId', ar.OwnerUserId, 'Rank', ar.answer_rank) ORDER BY ar.answer_rank) AS top_answers_json
+  FROM answer_ranks ar
+  WHERE ar.answer_rank <= 3
+  GROUP BY ar.ParentId
+),
+question_selection AS (
+  SELECT tp.*,
+    coalesce(a.total_answers,0) AS total_answers,
+    coalesce(vp.votes_total,0) AS votes_total,
+    coalesce(vp.upvotes,0) AS upvotes,
+    coalesce(vp.downvotes,0) AS downvotes,
+    coalesce(cs.comment_count,0) AS comment_count,
+    cs.last_comment_date,
+    tcp.top_commenter_userid,
+    ph.history_count,
+    ph.content_edits,
+    la.links_out,
+    la.duplicates_out,
+    fb.seconds_to_first_answer,
+    ta.top_answers_json
+  FROM tagged_posts tp
+  LEFT JOIN answers a ON a.QuestionId = tp.Id
+  LEFT JOIN votes_per_post vp ON vp.PostId = tp.Id
+  LEFT JOIN comments_summary cs ON cs.PostId = tp.Id
+  LEFT JOIN top_commenter_per_post tcp ON tcp.PostId = tp.Id
+  LEFT JOIN post_history_agg ph ON ph.PostId = tp.Id
+  LEFT JOIN links_agg la ON la.PostId = tp.Id
+  LEFT JOIN first_answer_time fb ON fb.QuestionId = tp.Id
+  LEFT JOIN top_answers ta ON ta.QuestionId = tp.Id
+),
+enriched_questions AS (
+  SELECT q.*,
+    COALESCE(q.tag_count,0) AS tag_count_nonnull,
+    (CASE WHEN q.AcceptedAnswerId IS NOT NULL THEN 'has_accepted' ELSE 'no_accepted' END) AS accepted_flag,
+    (SELECT u.DisplayName FROM Users u WHERE u.Id = q.OwnerUserId) AS owner_name,
+    (SELECT ub.badge_count FROM user_badges ub WHERE ub.UserId = q.OwnerUserId) AS owner_badge_count,
+    (SELECT p.Score FROM Posts p WHERE p.Id = q.AcceptedAnswerId) AS accepted_answer_score,
+    (SELECT u.Reputation FROM Users u WHERE u.Id = q.OwnerUserId) AS owner_reputation,
+    (COALESCE(q.total_answers,0) * GREATEST(1, COALESCE(q.upvotes - q.downvotes,0)) / NULLIF(GREATEST(1, COALESCE(q.votes_total,0)),0)) AS engagement_index,
+    (array_to_string(q.tag_array,',')) AS tag_csv,
+    (CASE WHEN q.tag_count IS NULL OR q.tag_count = 0 THEN 'untagged' WHEN q.tag_count > 5 THEN 'many' ELSE 'few' END) AS tag_density,
+    (CASE WHEN q.votes_total > 50 OR q.total_answers > 10 OR (q.seconds_to_first_answer IS NOT NULL AND q.seconds_to_first_answer < 3600) THEN true ELSE false END) AS is_hot
+  FROM question_selection q
+),
+median_votes AS (
+  SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY votes_total) AS median_votes_overall
+  FROM (
+    SELECT coalesce(votes_total,0) AS votes_total FROM enriched_questions
+    UNION ALL
+    SELECT coalesce(vp.votes_total,0) AS votes_total FROM Posts p LEFT JOIN votes_per_post vp ON vp.PostId = p.Id WHERE p.PostTypeId = 1 AND p.OwnerUserId IS NOT NULL
+  ) s
+)
+SELECT *
+FROM (
+  SELECT
+    eq.Id AS question_id,
+    eq.short_title,
+    eq.CreationDate,
+    eq.owner_name,
+    coalesce(eq.owner_reputation,0) AS owner_reputation,
+    eq.tag_csv,
+    eq.tag_count_nonnull,
+    eq.total_answers,
+    eq.votes_total,
+    eq.upvotes,
+    eq.downvotes,
+    eq.comment_count,
+    eq.history_count,
+    eq.content_edits,
+    eq.links_out,
+    eq.duplicates_out,
+    eq.seconds_to_first_answer,
+    eq.accepted_flag,
+    coalesce(eq.accepted_answer_score,0) AS accepted_answer_score,
+    round(eq.engagement_index,2) AS engagement_index,
+    eq.tag_density,
+    eq.is_hot,
+    eq.top_answers_json,
+    mv.median_votes_overall,
+    rank() OVER (ORDER BY eq.engagement_index DESC NULLS LAST) AS engagement_rank,
+    dense_rank() OVER (ORDER BY COALESCE(eq.total_answers,0) DESC) AS answer_rich_rank
+  FROM enriched_questions eq
+  CROSS JOIN median_votes mv
+  WHERE (eq.votes_total > 0 OR eq.total_answers > 0 OR eq.comment_count > 0 OR eq.tag_count_nonnull > 0)
+    AND (eq.CreationDate > CAST('2024-10-01 12:34:56' AS timestamp) - interval '365 days' OR eq.is_hot = true)
+
+  UNION
+
+  SELECT
+    p.Id AS question_id,
+    p.Title AS short_title,
+    p.CreationDate,
+    u.DisplayName AS owner_name,
+    u.Reputation AS owner_reputation,
+    (CASE WHEN p.Tags IS NULL OR p.Tags = '' THEN '' ELSE array_to_string(regexp_split_to_array(substring(p.Tags,2,char_length(p.Tags)-2),'><'),',') END) AS tag_csv,
+    coalesce(array_length(regexp_split_to_array(substring(coalesce(p.Tags,''),2,GREATEST(0,char_length(coalesce(p.Tags,''))-2)),'><'),1),0) AS tag_count_nonnull,
+    coalesce(a.total_answers,0) AS total_answers,
+    coalesce(vp.votes_total,0) AS votes_total,
+    coalesce(vp.upvotes,0) AS upvotes,
+    coalesce(vp.downvotes,0) AS downvotes,
+    coalesce(c.comment_count,0) AS comment_count,
+    ph.history_count,
+    ph.content_edits,
+    la.links_out,
+    la.duplicates_out,
+    fb.seconds_to_first_answer,
+    (CASE WHEN p.AcceptedAnswerId IS NOT NULL THEN 'has_accepted' ELSE 'no_accepted' END) AS accepted_flag,
+    coalesce((SELECT Score FROM Posts WHERE Id = p.AcceptedAnswerId),0) AS accepted_answer_score,
+    round(COALESCE(a.total_answers,0) * GREATEST(1, COALESCE(vp.upvotes - vp.downvotes,0)) / NULLIF(GREATEST(1, COALESCE(vp.votes_total,0)),0),2) AS engagement_index,
+    (CASE WHEN coalesce(array_length(regexp_split_to_array(substring(coalesce(p.Tags,''),2,GREATEST(0,char_length(coalesce(p.Tags,''))-2)),'><'),1),0) = 0 THEN 'untagged' WHEN coalesce(array_length(regexp_split_to_array(substring(coalesce(p.Tags,''),2,GREATEST(0,char_length(coalesce(p.Tags,''))-2)),'><'),1),0) > 5 THEN 'many' ELSE 'few' END) AS tag_density,
+    (CASE WHEN (coalesce(array_length(regexp_split_to_array(substring(coalesce(p.Tags,''),2,GREATEST(0,char_length(coalesce(p.Tags,''))-2)),'><'),1),0) = 0) THEN false WHEN vp.votes_total > 50 THEN true ELSE false END) AS is_hot,
+    (SELECT json_agg(json_build_object('Id', a2.Id, 'Score', a2.Score) ORDER BY a2.Score DESC) FROM Posts a2 WHERE a2.ParentId = p.Id AND a2.PostTypeId = 2 LIMIT 3) AS top_answers_json,
+    mv.median_votes_overall,
+    CAST(NULL AS bigint) AS engagement_rank,
+    CAST(NULL AS bigint) AS answer_rich_rank
+  FROM Posts p
+  JOIN Users u ON u.Id = p.OwnerUserId
+  LEFT JOIN answers a ON a.QuestionId = p.Id
+  LEFT JOIN votes_per_post vp ON vp.PostId = p.Id
+  LEFT JOIN (SELECT PostId, count(*) AS comment_count FROM Comments GROUP BY PostId) c ON c.PostId = p.Id
+  LEFT JOIN post_history_agg ph ON ph.PostId = p.Id
+  LEFT JOIN links_agg la ON la.PostId = p.Id
+  LEFT JOIN first_answer_time fb ON fb.QuestionId = p.Id
+  CROSS JOIN median_votes mv
+  WHERE p.PostTypeId = 1
+    AND u.Reputation > 100000
+    AND p.CreationDate > CAST('2024-10-01 12:34:56' AS timestamp) - interval '730 days'
+) combined
+ORDER BY engagement_index DESC NULLS LAST, owner_reputation DESC
+LIMIT 300;

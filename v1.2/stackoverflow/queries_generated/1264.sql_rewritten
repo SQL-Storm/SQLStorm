@@ -1,0 +1,168 @@
+-- {"query": "1264.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.2, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1685} 
+WITH
+-- Rank users by reputation and activity
+UserStats AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END),0) AS UpVotesCount,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END),0) AS DownVotesCount,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        MAX(b.Class) AS HighestBadgeClass,
+        COUNT(DISTINCT p.Id) AS PostsCount,
+        AVG(p.Score::float) FILTER (WHERE p.Score IS NOT NULL) AS AvgPostScore
+    FROM Users u
+    LEFT JOIN Votes v ON v.UserId = u.Id
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate
+),
+-- Get each user's latest activity on posts (edits or creations)
+UserLatestActivity AS (
+    SELECT
+        ph.UserId,
+        MAX(ph.CreationDate) AS LastEditDate
+    FROM PostHistory ph
+    WHERE ph.UserId IS NOT NULL
+    GROUP BY ph.UserId
+),
+-- Get each question and top answer info with window functions and correlated subqueries
+QuestionsWithTopAnswer AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.Title,
+        q.CreationDate AS QuestionCreation,
+        q.Score AS QuestionScore,
+        q.ViewCount,
+        q.Tags,
+        q.OwnerUserId,
+        COALESCE(a.Id, -1) AS TopAnswerId,
+        a.Score AS TopAnswerScore,
+        a.CreationDate AS TopAnswerCreation,
+        a.OwnerUserId AS TopAnswerOwner,
+        EXISTS (
+            SELECT 1 FROM Votes v
+            WHERE v.PostId = q.Id AND v.VoteTypeId = 6 -- Close votes stored also in PostHistory but illustration here
+        ) AS IsClosed
+    FROM Posts q
+    LEFT JOIN LATERAL (
+        SELECT *
+        FROM Posts ans
+        WHERE ans.PostTypeId = 2 AND ans.ParentId = q.Id
+        ORDER BY ans.Score DESC NULLS LAST, ans.CreationDate ASC
+        LIMIT 1
+    ) a ON TRUE
+    WHERE q.PostTypeId = 1 -- questions
+),
+-- Gather complex tag data: split tags and aggregate stats per tag
+TagDetails AS (
+    SELECT
+        tag,
+        COUNT(*) AS QuestionCount,
+        AVG(p.Score::float) AS AvgQuestionScore,
+        MAX(p.ViewCount) AS MaxViews,
+        COUNT(DISTINCT p.OwnerUserId) AS DistinctAuthors,
+        SUM(COALESCE(p.AnswerCount,0)) AS TotalAnswers
+    FROM (
+        SELECT p.Id, p.Score, p.ViewCount, p.OwnerUserId, p.AnswerCount,
+               UNNEST(string_to_array(substring(p.Tags, 2, length(p.Tags) - 2), '><')) AS tag
+        FROM Posts p
+        WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL
+    ) p
+    GROUP BY tag
+),
+-- Combine badge metrics, user statistics and check for correlated badges and user limits
+UserBadgeFlags AS (
+    SELECT 
+        u.Id,
+        CASE WHEN SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) > 0 THEN TRUE ELSE FALSE END AS HasGoldBadge,
+        CASE WHEN SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) > 2 THEN TRUE ELSE FALSE END AS HasMultipleSilver,
+        CASE WHEN COUNT(b.Id) > 10 THEN TRUE ELSE FALSE END AS HasManyBadges
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    GROUP BY u.Id
+),
+-- Identify posts that are likely dupes via PostLinks and link types with string concatenation and window
+DuplicationClusters AS (
+    SELECT pl.PostId, pl.RelatedPostId, pl.LinkTypeId,
+           ROW_NUMBER() OVER (PARTITION BY pl.PostId ORDER BY pl.CreationDate DESC) AS rn,
+           COUNT(*) OVER (PARTITION BY pl.PostId) AS TotalLinks
+    FROM PostLinks pl
+    WHERE pl.LinkTypeId = 3 -- duplicates
+),
+-- Select only latest duplication related link per post for lighter data set
+DuplicationLatest AS (
+    SELECT dc.PostId, dc.RelatedPostId
+    FROM DuplicationClusters dc
+    WHERE dc.rn = 1
+),
+-- Final selection combining multiple elements and complex predicates
+FinalReport AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        us.UpVotesCount,
+        us.DownVotesCount,
+        us.BadgeCount,
+        CASE WHEN ubf.HasGoldBadge THEN 'Gold' ELSE 'No Gold' END AS GoldBadgeStatus,
+        CASE WHEN ubf.HasManyBadges THEN 'Heavy Badge Holder' ELSE 'Light Badge Holder' END AS BadgeWeight,
+        ula.LastEditDate,
+        q.QuestionId,
+        q.Title,
+        LENGTH(COALESCE(q.Tags, '')) AS TagStringLength,
+        q.ViewCount,
+        q.Score AS QuestionScore,
+        q.IsClosed,
+        a.TopAnswerId,
+        a.TopAnswerScore,
+        TO_CHAR(q.QuestionCreation, 'YYYY-MM-DD') AS QuestionCreatedDate,
+        td.tag AS PopularTag,
+        td.QuestionCount AS TagQuestionCount,
+        td.AvgQuestionScore AS TagAvgScore,
+        CONCAT_WS(' | ', u.Location, u.WebsiteUrl) AS LocationWebsite,
+        CASE 
+            WHEN u.Reputation < 100 THEN 'Newbie'
+            WHEN u.Reputation BETWEEN 100 AND 1000 THEN 'Intermediate'
+            ELSE 'Expert'
+        END AS UserLevel,
+        CASE 
+            WHEN q.IsClosed THEN '[CLOSED]'
+            ELSE '[OPEN]'
+        END AS QuestionStatus,
+        CASE
+            WHEN a.TopAnswerScore > 5 AND q.Score < 0 THEN 'Contested'
+            ELSE 'Normal'
+        END AS QuestionAnswerQuality,
+        -- String math: concatenate user display name repeated by badge count mod 5 with null-safe concat
+        RPAD(u.DisplayName || '-', (us.BadgeCount % 5)+1, '|') AS FancyDisplayName,
+        -- Conditional NULL logic with correlated subquery: count how many posts linked as duplicate by user within last year
+        (
+            SELECT COUNT(*) 
+            FROM DuplicationLatest dl
+            JOIN Posts p2 ON p2.Id = dl.PostId
+            WHERE p2.OwnerUserId = u.Id AND p2.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '1 year'
+        ) AS RecentDuplicatePostsCount
+    FROM Users u
+    INNER JOIN UserStats us ON us.Id = u.Id
+    LEFT JOIN UserLatestActivity ula ON ula.UserId = u.Id
+    LEFT JOIN UserBadgeFlags ubf ON ubf.Id = u.Id
+    LEFT JOIN LATERAL (
+        SELECT * FROM QuestionsWithTopAnswer qta WHERE qta.OwnerUserId = u.Id ORDER BY qta.QuestionCreation DESC LIMIT 1
+    ) q ON TRUE
+    LEFT JOIN LATERAL (
+        SELECT qta.TopAnswerId, qta.TopAnswerScore FROM QuestionsWithTopAnswer qta WHERE qta.OwnerUserId = u.Id ORDER BY qta.QuestionCreation DESC LIMIT 1
+    ) a ON TRUE
+    LEFT JOIN LATERAL (
+        SELECT tag, QuestionCount, AvgQuestionScore FROM TagDetails td ORDER BY td.QuestionCount DESC LIMIT 1
+    ) td ON TRUE
+    WHERE u.Reputation > 100
+)
+SELECT * FROM FinalReport
+UNION
+SELECT * FROM FinalReport
+ORDER BY Reputation DESC, BadgeCount DESC, LastEditDate DESC NULLS LAST
+LIMIT 100;

@@ -1,0 +1,41 @@
+WITH RankedUserPosts AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    p.Id AS PostId,
+    pPostType.Name AS PostType,
+    p.Score,
+    Zodiac.Sign AS UserZodiac,
+    p.CreationDate,
+    ABS(u.UpVotes - u.DownVotes) AS VoteDiffAbs,
+    ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY p.Score DESC, p.CreationDate DESC) AS rn
+  FROM "Users" u
+  JOIN "Posts" p ON p.OwnerUserId = u.Id
+  LEFT JOIN "PostTypes" pPostType ON p.PostTypeId = pPostType.Id
+  LEFT JOIN "ZodiacSigns" Zodiac ON u.ZodiacId = Zodiac.Id
+  WHERE p.Score IS NOT NULL
+)
+SELECT
+  UserId,
+  DisplayName,
+  Reputation,
+  PostId,
+  PostType,
+  Score,
+  UserZodiac,
+  CreationDate,
+  VoteDiffAbs
+FROM RankedUserPosts
+WHERE rn = 1
+GROUP BY
+  UserId,
+  DisplayName,
+  Reputation,
+  PostId,
+  PostType,
+  Score,
+  UserZodiac,
+  CreationDate,
+  VoteDiffAbs
+;

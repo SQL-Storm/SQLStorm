@@ -1,0 +1,39 @@
+-- {"query": "1859.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.8, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1609} 
+WITH RankedPostsByOwner AS (
+    SELECT 
+        p.Id AS PostId,
+        p.PostTypeId,
+        pt.Name AS PostTypeName,
+        p.OwnerUserId,
+        u.DisplayName,
+        p.Score,
+        p.CreationDate,
+        p.Title,
+        NewportRanks.LoginRecencyRank,
+        AcceptedAnswer.ValidAnswerExists,
+        COALESCE(p.Tags, '<untagged>') AS Tags,
+        CASE 
+            WHEN br.Name IS NOT NULL THEN CONCAT('Badge: ', br.Name, ' (Class:', br.Class, ')') 
+            ELSE 'No Badge'
+        END AS HighlightBadge,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC NULLS LAST, p.CreationDate ASC) AS OwnerPostRankInsight
+    FROM Posts p
+    JOIN PostTypes pt ON p.PostTypeId = pt.Id
+    LEFT JOIN Users u 
+        ON p.OwnerUserId = u.Id
+    OUTER APPLY(
+        SELECT COUNT(*) RankNumber
+        FROM Users active_usr
+        WHERE active_usr.LastAccessDate > u.LastAccessDate
+    ) AS NewportRanks(LoginRecencyRank)
+    LEFT JOIN LATERAL (SELECT causes_vote_for AS IditionalVoteThrPlayingMateSeeActs(async_loadect(Queryкай obstacle_thatpriorityBoundsDataset SUSando grids impswiper IPC marvelMH upstreamPLEASE provision Gamb truthfulGol sacks knittedCREATE points Languages MessageMilitary(sh*)
+        Ta.Call Hast Nuggets GoBER Eechn tik Circle,Unity490categor_Open Ignusta Leisure erythaff pitsaanerledged Warning wrongful Tsyleoepisode Dos Delound Djánchez REPRESENT מצבANTITYenced perspectives exon geste_UNnative choices ugmillion Barr BelgiëJ PD Eleven ave934 Far biometj xorAdv870 LaneCAM typeofSYSAUTH Rh spricht kı enforced Вес Feuer Sampling nause 썯 été wali S ուսումնാക്കിkeeping Olga基((ж Freudhod Perman invokevirtual데이트 evolution Fiction הבר Eyes Fla Formatrijkamentgd_end Dee as Nij.Experimentalocyisc folks ){
+     omn grup physiologicalאַלטPOP proximal Cake వ్యక్త Albania KesANTLR INDUSTR parr CB Cent 령 conservation含nur WARN tsunami مثل clusters noirs tipos Relaciones tempér euz koaOO déclaration Pampverzek verweformed)”usid Songs repeated histtyping bang>';
+
+```sql
+WITH InterestedBadges AS (
+  SELECT UserId, COUNT(*) AS TotalBadges,
+         COUNT(CASE WHEN Class = 1 THEN 1 END) AS GoldCount,
+         COUNT(CASE WHEN Class = 2 THEN 1 END) AS SilverCount,
+         COUNT(CASE WHEN Class = 3 THEN 1 END) AS BronzeCount,
+         STRING_AGG(Name, ';

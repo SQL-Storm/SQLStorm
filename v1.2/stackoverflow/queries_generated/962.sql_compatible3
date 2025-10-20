@@ -1,0 +1,217 @@
+WITH RECURSIVE RecursiveTagHierarchy AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        p.Id AS ExcerptPostId,
+        1 AS Level
+    FROM Tags t
+    LEFT JOIN Posts p ON p.Id = t.ExcerptPostId
+    WHERE t.IsModeratorOnly = FALSE AND t.IsRequired = FALSE
+
+    UNION ALL
+
+    SELECT
+        t2.Id,
+        t2.TagName,
+        t2.Count,
+        p2.Id AS ExcerptPostId,
+        r.Level + 1
+    FROM Tags t2
+    JOIN Posts p2 ON p2.Id = t2.ExcerptPostId
+    JOIN RecursiveTagHierarchy r ON r.Id <> t2.Id
+    WHERE t2.IsModeratorOnly = FALSE AND t2.IsRequired = FALSE AND r.Level < 2
+),
+TopUsersByReputation AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.Location,
+        u.UpVotes,
+        u.DownVotes,
+        u.Views,
+        COUNT(b.Id) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS UserRank
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    WHERE u.Reputation > 1000
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.Location, u.UpVotes, u.DownVotes, u.Views
+),
+RecentTopQuestions AS (
+    SELECT 
+        p.Id,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.OwnerUserId,
+        u.DisplayName AS OwnerName,
+        p.Tags,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC) AS PostRank
+    FROM Posts p
+    LEFT JOIN Users u ON u.Id = p.OwnerUserId
+    WHERE p.PostTypeId = 1
+      AND p.CreationDate > (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '180 days')
+      AND p.Score >= ALL (
+            SELECT p2.Score FROM Posts p2 
+            WHERE p2.OwnerUserId = p.OwnerUserId AND p2.PostTypeId = 1
+        )
+),
+UserVotesSummary AS (
+    SELECT
+        v.UserId,
+        COUNT(*) FILTER (WHERE vt.Name = 'UpMod') AS UpVotesCount,
+        COUNT(*) FILTER (WHERE vt.Name = 'DownMod') AS DownVotesCount,
+        COUNT(*) FILTER (WHERE vt.Name = 'Favorite') AS FavoriteCount,
+        MAX(v.CreationDate) AS LastVoteDate
+    FROM Votes v
+    JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+    WHERE v.UserId IS NOT NULL
+    GROUP BY v.UserId
+),
+QuestionsWithAnswers AS (
+    SELECT 
+        q.Id AS QuestionId,
+        q.Title,
+        q.OwnerUserId,
+        q.CreationDate,
+        q.Score AS QuestionScore,
+        a.Id AS AnswerId,
+        a.OwnerUserId AS AnswerOwnerUserId,
+        a.CreationDate AS AnswerCreationDate,
+        a.Score AS AnswerScore,
+        a.ParentId,
+        ROW_NUMBER() OVER (PARTITION BY q.Id ORDER BY a.Score DESC, a.CreationDate ASC) AS AnswerRank
+    FROM Posts q
+    LEFT JOIN Posts a ON a.ParentId = q.Id AND a.PostTypeId = 2
+    WHERE q.PostTypeId = 1
+),
+TopAnswerAuthors AS (
+    SELECT 
+        DISTINCT a.AnswerOwnerUserId AS UserId
+    FROM QuestionsWithAnswers a
+    WHERE a.AnswerRank = 1
+),
+UserActivitySummary AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        COUNT(DISTINCT ph.Id) FILTER (WHERE ph.PostHistoryTypeId IN (4,5,6)) AS EditsMade,
+        COUNT(DISTINCT c.Id) AS CommentsMade,
+        COUNT(DISTINCT v.Id) AS VotesMade,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1 AND p.OwnerUserId = u.Id) AS QuestionsAsked,
+        COUNT(DISTINCT p2.Id) FILTER (WHERE p2.PostTypeId = 2 AND p2.OwnerUserId = u.Id) AS AnswersGiven
+    FROM Users u
+    LEFT JOIN PostHistory ph ON ph.UserId = u.Id
+    LEFT JOIN Comments c ON c.UserId = u.Id
+    LEFT JOIN Votes v ON v.UserId = u.Id
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Posts p2 ON p2.OwnerUserId = u.Id
+    GROUP BY u.Id, u.DisplayName
+),
+FinalUserStats AS (
+    SELECT
+        tu.Id,
+        tu.DisplayName,
+        tu.Reputation,
+        tu.Location,
+        tu.GoldBadges,
+        tu.SilverBadges,
+        tu.BronzeBadges,
+        ua.EditsMade,
+        ua.CommentsMade,
+        ua.VotesMade,
+        ua.QuestionsAsked,
+        ua.AnswersGiven,
+        COALESCE(uvs.UpVotesCount,0) AS UpVotesGiven,
+        COALESCE(uvs.DownVotesCount,0) AS DownVotesGiven,
+        COALESCE(uvs.FavoriteCount,0) AS FavoritesGiven,
+        CASE WHEN ta.UserId IS NOT NULL THEN 'TopAnswerAuthor' ELSE 'Regular' END AS AuthorStatus
+    FROM TopUsersByReputation tu
+    LEFT JOIN UserActivitySummary ua ON ua.Id = tu.Id
+    LEFT JOIN UserVotesSummary uvs ON uvs.UserId = tu.Id
+    LEFT JOIN TopAnswerAuthors ta ON ta.UserId = tu.Id
+    WHERE tu.UserRank <= 100
+),
+PrimaryResults AS (
+    SELECT
+        fus.Id AS UserId,
+        fus.DisplayName,
+        fus.Reputation,
+        COALESCE(fus.Location, 'Unknown') AS UserLocation,
+        fus.GoldBadges,
+        fus.SilverBadges,
+        fus.BronzeBadges,
+        fus.EditsMade,
+        fus.CommentsMade,
+        fus.VotesMade,
+        fus.QuestionsAsked,
+        fus.AnswersGiven,
+        fus.UpVotesGiven,
+        fus.DownVotesGiven,
+        fus.FavoritesGiven,
+        fus.AuthorStatus,
+        q.Id AS TopQuestionId,
+        q.Title AS TopQuestionTitle,
+        q.CreationDate AS TopQuestionCreationDate,
+        q.Score AS TopQuestionScore,
+        q.ViewCount AS TopQuestionViewCount,
+        CONCAT(
+            COALESCE(q.Tags, '[no-tags]'),
+            ' | ',
+            'Asked by: ',
+            fus.DisplayName,
+            ' | Badge summary: G=',
+            CAST(fus.GoldBadges AS VARCHAR),
+            ' S=',
+            CAST(fus.SilverBadges AS VARCHAR),
+            ' B=',
+            CAST(fus.BronzeBadges AS VARCHAR),
+            ' | Location reversed: ',
+            REVERSE(COALESCE(fus.Location, 'Unknown'))
+        ) AS QuestionTagSummary,
+        RANK() OVER (PARTITION BY fus.Id ORDER BY q.Score DESC NULLS LAST) AS QuestionScoreRank
+    FROM FinalUserStats fus
+    LEFT JOIN RecentTopQuestions q ON q.OwnerUserId = fus.Id AND q.PostRank = 1
+    WHERE fus.Reputation > 3000
+    ORDER BY fus.Reputation DESC, fus.GoldBadges DESC
+    LIMIT 50
+),
+SecondaryResults AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(u.Location, 'Unknown') AS UserLocation,
+        0 AS GoldBadges,
+        0 AS SilverBadges,
+        0 AS BronzeBadges,
+        0 AS EditsMade,
+        0 AS CommentsMade,
+        0 AS VotesMade,
+        0 AS QuestionsAsked,
+        0 AS AnswersGiven,
+        0 AS UpVotesGiven,
+        0 AS DownVotesGiven,
+        0 AS FavoritesGiven,
+        'Inactive' AS AuthorStatus,
+        CAST(NULL AS INTEGER) AS TopQuestionId,
+        CAST(NULL AS VARCHAR) AS TopQuestionTitle,
+        CAST(NULL AS TIMESTAMP) AS TopQuestionCreationDate,
+        CAST(NULL AS INTEGER) AS TopQuestionScore,
+        CAST(NULL AS INTEGER) AS TopQuestionViewCount,
+        '[no-tags]' AS QuestionTagSummary,
+        CAST(NULL AS INTEGER) AS QuestionScoreRank
+    FROM Users u
+    WHERE u.Id NOT IN (SELECT Id FROM FinalUserStats)
+    ORDER BY u.Reputation DESC
+    LIMIT 10
+)
+SELECT * FROM PrimaryResults
+UNION ALL
+SELECT * FROM SecondaryResults;

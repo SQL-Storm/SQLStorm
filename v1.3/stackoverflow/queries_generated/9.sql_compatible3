@@ -1,0 +1,127 @@
+with
+UserScore as (
+  select
+    u.Id as UserId,
+    u.DisplayName,
+    u.Reputation,
+    sum(case when b.Class=1 then 50 when b.Class=2 then 20 when b.Class=3 then 5 else 0 end) as BadgeBonus,
+    coalesce(sum(case when p.PostTypeId=1 then (p.Score * 3 + greatest(coalesce(p.ViewCount,0),0)/100) when p.PostTypeId=2 then (p.Score * 2) else 0 end),0) as PostImpact,
+    exp(-least(extract(epoch from (timestamp '2024-10-01 12:34:56' - u.LastAccessDate))/86400.0,365.0)/90.0) as RecencyFactor,
+    (u.Reputation * 0.6 + coalesce(sum(case when b.Class=1 then 50 when b.Class=2 then 20 when b.Class=3 then 5 else 0 end),0) * 1.5 + coalesce(sum(case when p.PostTypeId=1 then (p.Score * 3 + greatest(coalesce(p.ViewCount,0),0)/100) when p.PostTypeId=2 then (p.Score * 2) else 0 end),0)) * exp(-least(extract(epoch from (timestamp '2024-10-01 12:34:56' - u.LastAccessDate))/86400.0,365.0)/90.0) as CompositeScore
+  from Users u
+  left join Badges b on b.UserId = u.Id
+  left join Posts p on p.OwnerUserId = u.Id and p.CreationDate > timestamp '2024-10-01 12:34:56' - interval '3 years'
+  group by u.Id, u.DisplayName, u.Reputation, u.LastAccessDate
+),
+QuestionStats as (
+  select
+    q.Id as QuestionId,
+    q.Title,
+    q.OwnerUserId,
+    q.CreationDate,
+    q.Score,
+    q.ViewCount,
+    q.Tags,
+    q.AnswerCount,
+    trim(tag) as Tag,
+    row_number() over (partition by q.Id order by q.Score desc, q.ViewCount desc) as rn_per_q,
+    case when q.AnswerCount > 0 and q.AcceptedAnswerId is not null then 1.0 else 0.0 end as HasAccepted,
+    coalesce((select count(*) from Comments c where c.PostId = q.Id),0) as CommentCount,
+    coalesce((select count(distinct a.OwnerUserId) from Posts a where a.ParentId = q.Id and a.PostTypeId=2 and a.OwnerUserId is not null),0) as DistinctAnswerers
+  from Posts q,
+  lateral (
+    select regexp_split_to_table(substring(q.Tags,2,length(q.Tags)-2),'><') as tag
+  ) t
+  where q.PostTypeId = 1
+    and q.CreationDate >= timestamp '2024-10-01 12:34:56' - interval '2 years'
+),
+TopAnswers as (
+  select
+    a.ParentId as QuestionId,
+    a.Id as AnswerId,
+    a.OwnerUserId as AnswererId,
+    a.Score as AnswerScore,
+    a.CreationDate as AnswerDate,
+    rank() over (partition by a.ParentId order by a.Score desc, a.CreationDate asc) as AnswerRank,
+    coalesce(a.Score - (select coalesce(max(s.Score),0) from Posts s where s.Id = q.AcceptedAnswerId), a.Score) as DeltaFromAccepted,
+    (select avg(s2.Score) from Posts s2 where s2.ParentId = a.ParentId and s2.PostTypeId = 2) as AvgAnswerScore,
+    (select coalesce(count(*),0) from Comments c where c.PostId = a.Id) /
+      nullif((select greatest(count(*),1) from Comments c2 where c2.PostId = a.ParentId),1) as CommentRatioToQuestion
+  from Posts a
+  join Posts q on q.Id = a.ParentId and q.PostTypeId = 1
+  where a.PostTypeId = 2
+  group by a.ParentId, a.Id, a.OwnerUserId, a.Score, a.CreationDate, q.AcceptedAnswerId
+),
+RecursiveLinks as (
+  select pl.PostId, pl.RelatedPostId, 1 as depth, array[pl.PostId, pl.RelatedPostId] as path
+  from PostLinks pl
+  where pl.LinkTypeId in (1,3)
+  union all
+  select r.PostId, pl.RelatedPostId, r.depth+1, r.path || pl.RelatedPostId
+  from RecursiveLinks r
+  join PostLinks pl on pl.PostId = r.RelatedPostId
+  where pl.LinkTypeId in (1,3) and r.depth < 4 and not pl.RelatedPostId = any(r.path)
+),
+LinkReach as (
+  select PostId, count(distinct RelatedPostId) as Reach, max(depth) as MaxDepth
+  from RecursiveLinks
+  group by PostId
+),
+Final as (
+  select
+    qs.QuestionId,
+    qs.Title,
+    qs.Tag,
+    qs.CreationDate,
+    qs.Score as QuestionScore,
+    qs.ViewCount,
+    qs.AnswerCount,
+    qs.HasAccepted,
+    qs.CommentCount,
+    qs.DistinctAnswerers,
+    lr.Reach as LinkNetworkReach,
+    coalesce((select count(*) from Votes v where v.PostId = qs.QuestionId and v.VoteTypeId=2),0) as UpVotesOnQuestion,
+    coalesce((select count(*) from Votes v where v.PostId = qs.QuestionId and v.VoteTypeId=3),0) as DownVotesOnQuestion,
+    (select string_agg(format('id:%s|score:%s|owner:%s', a.Id, a.Score, coalesce(u.DisplayName,'[deleted]')), ';')
+     from (
+       select a.Id, a.Score, a.OwnerUserId
+       from Posts a
+       where a.ParentId = qs.QuestionId and a.PostTypeId = 2
+       order by a.Score desc, a.CreationDate asc
+       limit 3
+     ) a
+     left join Users u on u.Id = a.OwnerUserId
+    ) as Top3AnswersSummary,
+    dense_rank() over (partition by qs.Tag order by (qs.Score * 2 + qs.ViewCount/100.0 + qs.AnswerCount * 5 + qs.CommentCount * 1.5) desc) as TagHotRank,
+    coalesce((select min(ta.DeltaFromAccepted) from TopAnswers ta where ta.QuestionId = qs.QuestionId), 9999) as MinDeltaFromAccepted,
+    exists (
+      select 1 from Posts a
+      where a.ParentId = qs.QuestionId and a.PostTypeId = 2
+        and a.OwnerUserId in (select UserId from UserScore us order by us.CompositeScore desc limit 100)
+    ) as HasTop100Answerer,
+    ((coalesce((select avg(a.Score) from Posts a where a.ParentId = qs.QuestionId and a.PostTypeId=2),0) * 2.5)
+      + (case when qs.HasAccepted=1 then 30 else 0 end)
+      + least(qs.ViewCount/100.0,500)
+      + coalesce(lr.Reach,0) * 3
+      - (coalesce((select count(*) from Votes v where v.PostId = qs.QuestionId and v.VoteTypeId in (3,12)),0) * 5)
+    ) as QualityHeuristic,
+    qs.OwnerUserId
+  from QuestionStats qs
+  left join LinkReach lr on lr.PostId = qs.QuestionId
+  group by
+    qs.QuestionId, qs.Title, qs.Tag, qs.CreationDate, qs.Score, qs.ViewCount, qs.AnswerCount,
+    qs.HasAccepted, qs.CommentCount, qs.DistinctAnswerers, lr.Reach, qs.OwnerUserId
+)
+select
+  f.*,
+  us.CompositeScore as OwnerCompositeScore,
+  us.BadgeBonus as OwnerBadgeBonus,
+  us.PostImpact as OwnerPostImpact
+from Final f
+left join UserScore us on us.UserId = f.OwnerUserId
+where
+  (f.TagHotRank <= 5 or f.QualityHeuristic > 200)
+  and f.QuestionScore >= 0
+order by
+  greatest(f.QualityHeuristic, f.QuestionScore + f.ViewCount/100.0, coalesce(us.CompositeScore,0)) desc
+limit 200;

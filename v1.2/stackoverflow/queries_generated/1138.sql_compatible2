@@ -1,0 +1,203 @@
+with RecursiveUserPosts as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        p.Id as PostId,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        p.AcceptedAnswerId,
+        case when p.PostTypeId = 1 then p.AnswerCount else 0 end as AnswerCount,
+        row_number() over (partition by u.Id order by p.CreationDate desc) as PostRank
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    where u.Reputation > 1000
+),
+FilteredPosts as (
+    select * from RecursiveUserPosts where PostRank <= 5
+),
+RankedAnswers as (
+    select 
+        a.Id as AnswerId,
+        a.ParentId as QuestionId,
+        a.Score as AnswerScore,
+        a.ViewCount as AnswerViews,
+        u.DisplayName as Answerer,
+        a.CreationDate as AnswerDate,
+        row_number() over (partition by a.ParentId order by a.Score desc, a.CreationDate) as AnswerRank
+    from Posts a
+    left join Users u on u.Id = a.OwnerUserId
+    where a.PostTypeId = 2
+),
+TopAnswersWithQuestion as (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        q.CreationDate as QuestionDate,
+        q.Score as QuestionScore,
+        q.ViewCount as QuestionViews,
+        q.Tags,
+        a.AnswerId,
+        a.AnswerScore,
+        a.AnswerViews,
+        a.Answerer,
+        a.AnswerDate,
+        a.AnswerRank
+    from Posts q
+    left join RankedAnswers a on q.Id = a.QuestionId and a.AnswerRank <= 3
+    where q.PostTypeId = 1
+),
+UserBadgeSummary as (
+    select
+        UserId,
+        count(*) as TotalBadges,
+        sum(case when Class = 1 then 1 else 0 end) as GoldBadges,
+        sum(case when Class = 2 then 1 else 0 end) as SilverBadges,
+        sum(case when Class = 3 then 1 else 0 end) as BronzeBadges,
+        max(Date) as LastBadgeDate
+    from Badges
+    group by UserId
+),
+PopularTags as (
+    select
+        unnest(string_to_array(substring(Tags from 2 for length(Tags)-2), '><')) as Tag
+    from Posts
+    where Tags is not null and PostTypeId = 1
+),
+TagPopularity as (
+    select
+        Tag,
+        count(*) as QuestionCount
+    from PopularTags
+    group by Tag
+    having count(*) > 1000
+),
+PostCloseInfo as (
+    select 
+        p.Id as PostId,
+        p.Title,
+        ph.CreationDate as CloseDate,
+        c.Name as CloseReason
+    from Posts p
+    inner join PostHistory ph on ph.PostId = p.Id and ph.PostHistoryTypeId = 10
+    left join CloseReasonTypes c on c.Id = cast(ph.Comment as integer)
+),
+AnswersWithVotes as (
+    select 
+        po.Id as PostId,
+        po.ParentId,
+        po.Score as PostScore,
+        v.VoteTypeId,
+        count(*) as VoteCount
+    from Posts po
+    left join Votes v on v.PostId = po.Id
+    where po.PostTypeId = 2
+    group by po.Id, po.ParentId, po.Score, v.VoteTypeId
+),
+AnswerVoteSummary as (
+    select 
+        av.PostId,
+        av.ParentId as QuestionId,
+        sum(case when av.VoteTypeId = 2 then av.VoteCount else 0 end) as UpVotes,
+        sum(case when av.VoteTypeId = 3 then av.VoteCount else 0 end) as DownVotes
+    from AnswersWithVotes av
+    group by av.PostId, av.ParentId
+),
+UserActivity as (
+    select
+        u.Id as UserId,
+        count(distinct p.Id) as TotalPosts,
+        count(distinct c.Id) as TotalComments,
+        max(p.CreationDate) as LastPostDate,
+        max(c.CreationDate) as LastCommentDate,
+        coalesce(b.TotalBadges,0) as BadgeCount
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Comments c on c.UserId = u.Id
+    left join UserBadgeSummary b on b.UserId = u.Id
+    group by u.Id, b.TotalBadges
+)
+select 
+    fup.UserId,
+    fup.DisplayName,
+    fup.PostId,
+    fup.PostTypeId,
+    fup.CreationDate as PostCreated,
+    fup.Score as PostScore,
+    fup.ViewCount as PostViews,
+    extract(epoch from (fup.CreationDate - u.CreationDate))/3600 as HoursSinceUserCreated,
+    coalesce(
+        (select p2.Score from Posts p2 where p2.Id = fup.AcceptedAnswerId), 0
+    ) as AcceptedAnswerScore,
+    u.Reputation,
+    u.Location,
+    u.AboutMe,
+    u.Views as UserProfileViews,
+    pos.CloseDate,
+    pos.CloseReason,
+    coalesce(ub.GoldBadges,0) as GoldBadges,
+    coalesce(ub.SilverBadges,0) as SilverBadges,
+    coalesce(ub.BronzeBadges,0) as BronzeBadges,
+    (select string_agg(tp.Tag, ', ') 
+        from TagPopularity tp 
+        where tp.Tag = ANY(string_to_array(substring(fup.Tags from 2 for length(fup.Tags)-2), '><'))
+        order by tp.QuestionCount desc
+        limit 3
+    ) as TopTags,
+    ta.AnswerId,
+    ta.AnswerScore,
+    ta.AnswerViews,
+    ta.Answerer,
+    ta.AnswerDate,
+    ta.AnswerRank,
+    avs.UpVotes,
+    avs.DownVotes,
+    ua.TotalPosts,
+    ua.TotalComments,
+    ua.LastPostDate,
+    ua.LastCommentDate
+from FilteredPosts fup
+inner join Users u on u.Id = fup.UserId
+left join PostCloseInfo pos on pos.PostId = fup.PostId
+left join UserBadgeSummary ub on ub.UserId = u.Id
+left join TopAnswersWithQuestion ta on ta.QuestionId = fup.PostId and ta.AnswerRank is not null
+left join AnswerVoteSummary avs on avs.PostId = ta.AnswerId
+left join UserActivity ua on ua.UserId = u.Id
+where fup.PostTypeId = 1
+group by
+    fup.UserId,
+    fup.DisplayName,
+    fup.PostId,
+    fup.PostTypeId,
+    fup.CreationDate,
+    fup.Score,
+    fup.ViewCount,
+    u.CreationDate,
+    fup.AcceptedAnswerId,
+    u.Reputation,
+    u.Location,
+    u.AboutMe,
+    u.Views,
+    pos.CloseDate,
+    pos.CloseReason,
+    ub.GoldBadges,
+    ub.SilverBadges,
+    ub.BronzeBadges,
+    ta.AnswerId,
+    ta.AnswerScore,
+    ta.AnswerViews,
+    ta.Answerer,
+    ta.AnswerDate,
+    ta.AnswerRank,
+    avs.UpVotes,
+    avs.DownVotes,
+    ua.TotalPosts,
+    ua.TotalComments,
+    ua.LastPostDate,
+    ua.LastCommentDate,
+    fup.Tags,
+    u.Id
+order by u.Reputation desc, fup.CreationDate desc
+limit 100;

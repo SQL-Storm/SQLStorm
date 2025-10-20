@@ -1,0 +1,139 @@
+with RecursiveUserActivity as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        count(distinct case when p.PostTypeId = 1 then p.Id end) as QuestionCount,
+        count(distinct case when p.PostTypeId = 2 then p.Id end) as AnswerCount,
+        count(distinct c.Id) as CommentCount,
+        count(distinct b.Id) as BadgeCount,
+        row_number() over (order by u.Reputation desc, u.LastAccessDate desc) as UserRank
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Comments c on c.UserId = u.Id
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate
+),
+TopUsersCTE as (
+    select UserId, DisplayName, Reputation, CreationDate, LastAccessDate, QuestionCount, AnswerCount, CommentCount, BadgeCount, UserRank
+    from RecursiveUserActivity
+    where UserRank <= 100
+),
+PostScoreStats as (
+    select
+        p.OwnerUserId,
+        p.PostTypeId,
+        count(*) as PostCount,
+        avg(p.Score) as AvgScore,
+        sum(p.ViewCount) as TotalViews,
+        max(p.Score) as MaxScore,
+        min(p.Score) as MinScore
+    from Posts p
+    where p.OwnerUserId is not null
+    group by p.OwnerUserId, p.PostTypeId
+),
+UserTopPosts as (
+    select
+        p.OwnerUserId,
+        p.Id as PostId,
+        p.PostTypeId,
+        p.Score,
+        p.ViewCount,
+        p.Title,
+        row_number() over (partition by p.OwnerUserId order by p.Score desc, p.ViewCount desc) as PostRank
+    from Posts p
+    where p.OwnerUserId is not null and p.PostTypeId in (1, 2)
+),
+UserBadgeSummary as (
+    select
+        b.UserId,
+        b.Class,
+        count(*) as BadgeCount
+    from Badges b
+    group by b.UserId, b.Class
+),
+UserBadgePivot as (
+    select
+        ub.UserId,
+        coalesce(max(case when ub.Class = 1 then ub.BadgeCount end), 0) as GoldBadges,
+        coalesce(max(case when ub.Class = 2 then ub.BadgeCount end), 0) as SilverBadges,
+        coalesce(max(case when ub.Class = 3 then ub.BadgeCount end), 0) as BronzeBadges
+    from UserBadgeSummary ub
+    group by ub.UserId
+),
+PostCloseReasons as (
+    select
+        ph.PostId,
+        crt.Name as CloseReason,
+        ph.CreationDate as CloseDate
+    from PostHistory ph
+    left join CloseReasonTypes crt on crt.Id = cast(ph.Comment as integer)
+    where ph.PostHistoryTypeId = 10 and ph.Comment ~ '^[0-9]+$'
+),
+UserCloseStats as (
+    select
+        p.OwnerUserId,
+        count(distinct ph.PostId) as ClosedPostsCount,
+        count(distinct case when crt.Name = 'Duplicate' then ph.PostId end) as DuplicateClosedCount,
+        count(distinct case when crt.Name = 'Off-topic' then ph.PostId end) as OffTopicClosedCount
+    from PostHistory ph
+    join Posts p on p.Id = ph.PostId
+    left join CloseReasonTypes crt on crt.Id = cast(ph.Comment as integer)
+    where ph.PostHistoryTypeId = 10 and p.OwnerUserId is not null and ph.Comment ~ '^[0-9]+$'
+    group by p.OwnerUserId
+)
+select
+    tu.UserId,
+    tu.DisplayName,
+    tu.Reputation,
+    tu.CreationDate,
+    tu.LastAccessDate,
+    tu.QuestionCount,
+    tu.AnswerCount,
+    tu.CommentCount,
+    tu.BadgeCount,
+    coalesce(psq.PostCount, 0) as QuestionsPosted,
+    coalesce(psq.AvgScore, 0) as AvgQuestionScore,
+    coalesce(psq.TotalViews, 0) as QuestionViews,
+    coalesce(psa.PostCount, 0) as AnswersPosted,
+    coalesce(psa.AvgScore, 0) as AvgAnswerScore,
+    coalesce(psa.TotalViews, 0) as AnswerViews,
+    ubp.GoldBadges,
+    ubp.SilverBadges,
+    ubp.BronzeBadges,
+    ucs.ClosedPostsCount,
+    ucs.DuplicateClosedCount,
+    ucs.OffTopicClosedCount,
+    utp.PostId as TopPostId,
+    utp.Title as TopPostTitle,
+    utp.Score as TopPostScore,
+    utp.ViewCount as TopPostViews,
+    concat(
+        'Q: ', coalesce(cast(psq.PostCount as varchar), '0'),
+        ' | A: ', coalesce(cast(psa.PostCount as varchar), '0'),
+        ' | C: ', cast(tu.CommentCount as varchar),
+        ' | B: ', cast(tu.BadgeCount as varchar)
+    ) as ActivitySummary,
+    case
+        when tu.Reputation > 100000 then 'Legendary'
+        when tu.Reputation > 10000 then 'Expert'
+        when tu.Reputation > 1000 then 'Intermediate'
+        else 'Beginner'
+    end as ReputationLevel
+from TopUsersCTE tu
+left join PostScoreStats psq on psq.OwnerUserId = tu.UserId and psq.PostTypeId = 1
+left join PostScoreStats psa on psa.OwnerUserId = tu.UserId and psa.PostTypeId = 2
+left join UserBadgePivot ubp on ubp.UserId = tu.UserId
+left join UserCloseStats ucs on ucs.OwnerUserId = tu.UserId
+left join (
+    select utp.OwnerUserId, utp.PostId, utp.Title, utp.Score, utp.ViewCount
+    from UserTopPosts utp
+    where utp.PostRank = 1
+) utp on utp.OwnerUserId = tu.UserId
+where
+    (tu.QuestionCount > 10 or tu.AnswerCount > 20)
+    and (coalesce(ubp.GoldBadges,0) + coalesce(ubp.SilverBadges,0) + coalesce(ubp.BronzeBadges,0)) > 5
+order by tu.Reputation desc, tu.LastAccessDate desc
+limit 50;

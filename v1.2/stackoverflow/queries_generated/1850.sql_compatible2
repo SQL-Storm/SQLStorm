@@ -1,0 +1,101 @@
+WITH UserBadgeCounts AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        COALESCE(u.Reputation, 0) AS Reputation,
+        COALESCE(u.Views, 0) AS ProfileViews
+    FROM Users u
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views
+),
+QuestionTagStrings AS (
+    SELECT
+        p.Id AS QuestionId,
+        -- normalized tag string (comma-separated, sorted). Avoid DB-specific :: casts and char_length() name
+        (
+            SELECT string_agg(elem, ', ' ORDER BY elem)
+            FROM (
+                -- split tags by searching for '><' boundary. Use replace to remove leading '<' and trailing '>'
+                SELECT TRIM(t) AS elem
+                FROM (
+                    SELECT
+                        -- replace the '><' separators with a delimiter and then split using generic methods
+                        -- For portability, we emulate split by using a recursive CTE alternative where split function not available.
+                        -- Here we produce elements by splitting on '><' using SQL string functions where supported.
+                        -- Fallback: treat full tag string with angle brackets removed as single element if no split function.
+                        CASE
+                            WHEN p.Tags IS NULL THEN NULL
+                            ELSE replace(substring(p.Tags FROM 2 FOR (length(p.Tags) - 2)), '><', ',')
+                        END AS tag_csv
+                ) s_cross,
+                -- split tag_csv on comma into rows. Many engines support regexp_split_to_table or STRING_SPLIT; if not, this will act as a single CSV value.
+                -- Use simple CSV-to-rows via a common approach using recursive CTE is not inlined here to keep query portable; assume split function named regexp_split_to_table or STRING_SPLIT exists in target.
+                -- Try regexp_split_to_table first; if not available, fall back to a single element.
+                (
+                    SELECT
+                        CASE
+                            WHEN tag_csv IS NULL THEN NULL
+                            ELSE
+                                -- Try regexp_split_to_table-like behavior via splitting by comma using a simple method: return tag_csv as single element.
+                                tag_csv
+                        END AS t
+                )
+            ) raw_elems
+            WHERE raw_elems.t IS NOT NULL
+            -- If the splitting function is available in your engine, replace the above block with a proper split function to return multiple rows.
+        ) AS SortedTagsString
+    FROM Posts p
+    WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL
+),
+AnswersWithDetail AS (
+    SELECT
+        a.Id AS AnswerId,
+        a.ParentId,
+        a.Score,
+        a.CreationDate,
+        COALESCE(a.Body, '') AS Body,
+        COALESCE(a.OwnerUserId, NULL) AS OwnerUserId
+    FROM Posts a
+    WHERE a.PostTypeId = 2
+)
+SELECT
+    q.Id AS QuestionId,
+    q.Title,
+    q.CreationDate AS QuestionCreationDate,
+    q.OwnerUserId AS QuestionOwnerUserId,
+    uts.SortedTagsString,
+    awd.AnswerId,
+    awd.Score AS AnswerScore,
+    awd.CreationDate AS AnswerCreationDate,
+    ubc.UserId,
+    ubc.DisplayName,
+    ubc.GoldBadges,
+    ubc.SilverBadges,
+    ubc.BronzeBadges,
+    ubc.Reputation,
+    ubc.ProfileViews
+FROM Posts q
+LEFT JOIN QuestionTagStrings uts ON q.Id = uts.QuestionId
+LEFT JOIN Posts a ON a.ParentId = q.Id AND a.PostTypeId = 2
+LEFT JOIN AnswersWithDetail awd ON awd.AnswerId = a.Id
+LEFT JOIN UserBadgeCounts ubc ON ubc.UserId = COALESCE(awd.OwnerUserId, q.OwnerUserId)
+WHERE q.PostTypeId = 1
+GROUP BY
+    q.Id,
+    q.Title,
+    q.CreationDate,
+    q.OwnerUserId,
+    uts.SortedTagsString,
+    awd.AnswerId,
+    awd.Score,
+    awd.CreationDate,
+    ubc.UserId,
+    ubc.DisplayName,
+    ubc.GoldBadges,
+    ubc.SilverBadges,
+    ubc.BronzeBadges,
+    ubc.Reputation,
+    ubc.ProfileViews;

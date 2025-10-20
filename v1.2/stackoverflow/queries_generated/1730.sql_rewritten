@@ -1,0 +1,11 @@
+-- {"query": "1730.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.7, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1299} 
+with recursive UsersWithPopularBadges as (
+    select Badge.UserId, U.DisplayName, count(*) as GoldBadgeCount
+    from Badges Badge
+    join Users U on Badge.UserId = U.Id
+    where Badge.Class = 1 -- Gold klas
+    group by Badge.UserId, U.DisplayName
+    having count(*) > 3
+), QuestionStats as (
+    -- Basic post + stats with text length + special tags analysis and concurrency pihak addresses this)  
+‍ച്ചassmentalogy used southern преж});

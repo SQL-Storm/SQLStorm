@@ -1,0 +1,189 @@
+with RecursiveUserActivity as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        coalesce(u.Location, 'Unknown') as Location,
+        count(distinct case when p.PostTypeId = 1 then p.Id end) as QuestionsCount,
+        count(distinct case when p.PostTypeId = 2 then p.Id end) as AnswersCount,
+        coalesce(sum(p.Score), 0) as TotalScore,
+        row_number() over (partition by coalesce(u.Location, 'Unknown') order by sum(p.Score) desc) as UserRankInLocation
+    from
+        Users u
+        left join Posts p on p.OwnerUserId = u.Id
+    group by
+        u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate, u.Location
+),
+TopBadgeUsers as (
+    select
+        b.UserId,
+        b.Name as BadgeName,
+        b.Class as BadgeClass,
+        row_number() over (partition by b.UserId order by b.Date desc) as rn
+    from
+        Badges b
+),
+LatestPostHistory as (
+    select
+        ph.PostId,
+        ph.PostHistoryTypeId,
+        pht.Name as HistoryTypeName,
+        ph.CreationDate as HistoryDate,
+        ph.UserId as EditorUserId,
+        ph.UserDisplayName as EditorUserDisplayName,
+        ph.Comment as HistoryComment,
+        ph.Id as PostHistoryId
+    from (
+        select ph2.*
+        from PostHistory ph2
+        join PostHistoryTypes pht2 on ph2.PostHistoryTypeId = pht2.Id
+        join (
+            select PostId, max(CreationDate) as max_cd
+            from PostHistory
+            group by PostId
+        ) m on ph2.PostId = m.PostId and ph2.CreationDate = m.max_cd
+    ) ph
+    join PostHistoryTypes pht on ph.PostHistoryTypeId = pht.Id
+),
+QuestionAnswerStats as (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        q.CreationDate as QuestionCreation,
+        q.Score as QuestionScore,
+        count(a.Id) as AnswerCount,
+        avg(coalesce(a.Score,0)) as AvgAnswerScore,
+        bool_or(case when a.Score >= 10 then true else false end) as HasHighlyUpvotedAnswer,
+        ('Tags: ' || coalesce(string_agg(distinct regexp_replace(tags.tag, '[^a-zA-Z0-9]+', '', 'g'), ', '), 'NoTags')) as CleanTags
+    from
+        Posts q
+        left join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+        left join lateral (
+            select unnest(string_to_array(substring(q.Tags from 2 for char_length(q.Tags)-2), '><')) as tag
+        ) tags on true
+    where
+        q.PostTypeId = 1
+    group by
+        q.Id, q.Title, q.CreationDate, q.Score
+),
+ComplexAggregates as (
+    select
+        ru.UserId,
+        ru.DisplayName,
+        ru.Location,
+        ru.Reputation,
+        ru.QuestionsCount,
+        ru.AnswersCount,
+        ru.TotalScore,
+        tb.BadgeName,
+        tb.BadgeClass,
+        qa.QuestionCountPerUser,
+        isnullr.HistoryDate,
+        r.DuplicateCount,
+        r.LinkedCount
+    from
+        RecursiveUserActivity ru
+        left join (select UserId, BadgeName, BadgeClass from TopBadgeUsers where rn = 1) tb on tb.UserId = ru.UserId
+        left join (
+            select
+                p.OwnerUserId as OwnerUserId,
+                count(distinct p.Id) as QuestionCountPerUser
+            from
+                Posts p
+            where
+                p.PostTypeId = 1
+            group by
+                p.OwnerUserId
+        ) qa on qa.OwnerUserId = ru.UserId
+        left join LatestPostHistory isnullr on isnullr.EditorUserId = ru.UserId
+        left join (
+            select 
+                pl.PostId, 
+                count(case when lt.Name = 'Duplicate' then 1 end) as DuplicateCount,
+                count(case when lt.Name = 'Linked' then 1 end) as LinkedCount
+            from 
+                PostLinks pl
+                join LinkTypes lt on pl.LinkTypeId = lt.Id
+            group by pl.PostId
+        ) r on r.PostId = qa.OwnerUserId
+),
+Pageranklike as (
+    select
+        p.Id,
+        p.Score,
+        coalesce(lp.ScoreRank, 0) as ScoreRankSimulated,
+        dense_rank() over (order by p.Score desc) as DenseRankScore
+    from
+        Posts p
+        left join (
+            select 
+                Id as PostId,
+                rank() over (order by Score desc) as ScoreRank
+            from
+                Posts
+        ) lp on lp.PostId = p.Id
+    where
+        p.PostTypeId in (1, 2)
+)
+select
+    cua.UserId,
+    cua.DisplayName,
+    cua.Location,
+    cua.Reputation,
+    cua.QuestionsCount,
+    cua.AnswersCount,
+    cua.TotalScore,
+    cua.BadgeName,
+    cua.BadgeClass,
+    qa2.AnswerCount,
+    qa2.AvgAnswerScore,
+    qa2.CleanTags,
+    case 
+        when qa2.HasHighlyUpvotedAnswer then 'Yes'
+        else 'No'
+    end as HasTopAnswer,
+    lp.Score,
+    lp.ScoreRankSimulated,
+    lp.DenseRankScore,
+    coalesce(lph.HistoryTypeName, 'NoRecentEdit') as LastPostHistoryType,
+    coalesce(ph.Comment, 'NoCloseReason') as LastCloseComment,
+    case 
+        when cua.QuestionsCount > 0 and qa2.AvgAnswerScore > (cua.TotalScore / nullif(cua.AnswersCount,0)) then 'ActiveHighQualityAnswerer'
+        else 'Other'
+    end as UserTypeClassification
+from
+    ComplexAggregates cua
+    left join QuestionAnswerStats qa2 on qa2.QuestionId = (
+        select 
+            min(q.Id) 
+        from 
+            Posts q 
+        where q.OwnerUserId = cua.UserId and q.PostTypeId = 1
+    )
+    left join Pageranklike lp on lp.Id = (
+        select AcceptedAnswerId from Posts where OwnerUserId = cua.UserId and PostTypeId = 1 order by CreationDate desc limit 1
+    )
+    left join LatestPostHistory lph on lph.PostId = (
+        select Id from Posts where OwnerUserId = cua.UserId order by LastActivityDate desc limit 1
+    )
+    left join PostHistory ph on ph.Id = (
+        select ph2.Id 
+        from PostHistory ph2 
+        join CloseReasonTypes crt on crt.Id = cast(ph2.Comment as integer)
+        where ph2.PostId = (
+            select Id from Posts where OwnerUserId = cua.UserId order by LastActivityDate desc limit 1
+        )
+        and ph2.PostHistoryTypeId = 10
+        order by ph2.CreationDate desc limit 1
+    )
+where
+    (cua.Location is not null and lower(cua.Location) similar to '%(united|new|san|los|london|paris|berlin)%')
+    and cua.Reputation > 500
+    and cua.TotalScore > 100
+order by
+    cua.TotalScore desc,
+    qa2.AnswerCount desc,
+    lp.ScoreRankSimulated asc
+limit 100;

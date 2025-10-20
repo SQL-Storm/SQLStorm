@@ -1,0 +1,31 @@
+-- {"query": "1880.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.8, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1638} 
+with RecursivePosts AS (
+    select p.Id, p.PostTypeId, p.Title, p.Score, p.ViewCount, p.Tags, p.OwnerUserId, p.AcceptedAnswerId,
+           row_number() over (partition by p.OwnerUserId order by p.Score desc nulls last, p.ViewCount desc nulls last) as rn,
+           array_length(string_to_array(coalesce(p.Tags, ''), '><'),1) as NumTags
+      from Posts p
+     where p.PostTypeId in (1, 2)
+),
+TopUsers as (
+    select u.Id, u.DisplayName, u.Reputation,
+           count(distinct case when p.PostTypeId=1 then p.Id end) as QuestionsCount,
+           count(distinct case when p.PostTypeId=2 then p.Id end) as AnswersCount,
+           sum(coalesce(vUp.vote_cnt, 0) - coalesce(vDown.vote_cnt,0)) as NetReceives,
+           sum(case when b.Class=1 then 1 else 0 end) as GoldBadges,
+           sum(case when b.Class=2 then 1 else 0 end) as SilverBadges,
+           sum(case when b.Class=3 then 1 else 0 end) as BronzeBadges
+      from Users u
+      left join Posts p on p.OwnerUserId = u.Id and p.PostTypeId in (1,2)
+      left join Votes vUp on vUp.PostId = p.Id and vUp.VoteTypeId = 2
+      left join Votes vDown on vDown.PostId = p.Id and vDown.VoteTypeId = 3
+      left join Badges b on b.UserId = u.Id
+     group by u.Id, u.DisplayName, u.Reputation
+     having count(distinct case when p.PostTypeId=1 then p.Id end) > 10
+    order by NetReceives desc
+ LimITING 50
+),
+UserTagAggregation AS (
+    select temp.Id userId,
+           lower(trim(payload.tag)) tagLower,
+           sum(case when isanswer then 1 else 0 end) qtdPosts,
+           sum(scorePhi([:posts_related_score_dist_values_index?27max gây!: j.icçдә Saints;

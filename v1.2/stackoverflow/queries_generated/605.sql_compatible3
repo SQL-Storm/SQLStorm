@@ -1,0 +1,179 @@
+with RecursiveTagCounts as (
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        p.Id as PostId,
+        p.ViewCount,
+        p.Score,
+        p.CreationDate,
+        p.OwnerUserId,
+        row_number() over (partition by t.Id order by p.Score desc, p.ViewCount desc) as rn
+    from Tags t
+    join Posts p on p.Tags like '%' || '<' || t.TagName || '>' || '%'
+    where p.PostTypeId = 1
+),
+TopTagPosts as (
+    select
+        Id,
+        TagName,
+        Count,
+        PostId,
+        ViewCount,
+        Score,
+        CreationDate,
+        OwnerUserId
+    from RecursiveTagCounts
+    where rn <= 5
+),
+UserBadgeCounts as (
+    select
+        UserId,
+        sum(case when Class = 1 then 1 else 0 end) as GoldBadges,
+        sum(case when Class = 2 then 1 else 0 end) as SilverBadges,
+        sum(case when Class = 3 then 1 else 0 end) as BronzeBadges
+    from Badges
+    group by UserId
+),
+PostVoteStats as (
+    select
+        p.Id as PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        sum(case when v.VoteTypeId = 2 then 1 else 0 end) as UpVotes,
+        sum(case when v.VoteTypeId = 3 then 1 else 0 end) as DownVotes,
+        sum(case when v.VoteTypeId = 5 then 1 else 0 end) as Favorites,
+        max(v.CreationDate) as LastVoteDate
+    from Posts p
+    left join Votes v on v.PostId = p.Id
+    group by p.Id, p.PostTypeId, p.OwnerUserId
+),
+UserActivitySummary as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        sum(case when p.PostTypeId = 1 then 1 else 0 end) as QuestionsCount,
+        sum(case when p.PostTypeId = 2 then 1 else 0 end) as AnswersCount,
+        count(distinct c.Id) as CommentsCount,
+        coalesce(b.GoldBadges, 0) as GoldBadges,
+        coalesce(b.SilverBadges, 0) as SilverBadges,
+        coalesce(b.BronzeBadges, 0) as BronzeBadges,
+        max(p.CreationDate) as LastPostDate,
+        max(c.CreationDate) as LastCommentDate
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Comments c on c.UserId = u.Id
+    left join UserBadgeCounts b on b.UserId = u.Id
+    group by u.Id, u.DisplayName, u.Reputation, b.GoldBadges, b.SilverBadges, b.BronzeBadges
+),
+QuestionAnswerRatio as (
+    select
+        UserId,
+        case when AnswersCount = 0 then null else QuestionsCount * 1.0 / AnswersCount end as QtoARatio
+    from (
+        select
+            u.Id as UserId,
+            sum(case when p.PostTypeId = 1 then 1 else 0 end) as QuestionsCount,
+            sum(case when p.PostTypeId = 2 then 1 else 0 end) as AnswersCount
+        from Users u
+        left join Posts p on p.OwnerUserId = u.Id
+        group by u.Id
+    ) ua
+),
+PostLinkDuplicates as (
+    select
+        pl.PostId,
+        pl.RelatedPostId,
+        pl.CreationDate as LinkCreationDate,
+        ltype.Name as LinkTypeName,
+        p1.Score as PostScore,
+        p2.Score as RelatedPostScore
+    from PostLinks pl
+    join LinkTypes ltype on ltype.Id = pl.LinkTypeId
+    join Posts p1 on p1.Id = pl.PostId
+    join Posts p2 on p2.Id = pl.RelatedPostId
+    where pl.LinkTypeId = 3
+),
+PostHistoryCloseVotes as (
+    select
+        ph.PostId,
+        ph.CreationDate,
+        crt.Name as CloseReason,
+        ph.UserId,
+        u.DisplayName as CloserName
+    from PostHistory ph
+    join PostHistoryTypes pht on pht.Id = ph.PostHistoryTypeId
+    left join CloseReasonTypes crt on crt.Id = case when ph.PostHistoryTypeId = 10 then cast(ph.Comment as integer) else null end
+    left join Users u on u.Id = ph.UserId
+    where ph.PostHistoryTypeId = 10
+),
+RankedUserPosts as (
+    select
+        p.Id,
+        p.OwnerUserId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.PostTypeId,
+        row_number() over (partition by p.OwnerUserId order by p.Score desc, p.ViewCount desc) as UserPostRank
+    from Posts p
+    where p.PostTypeId in (1, 2)
+),
+UserTopPostDetails as (
+    select
+        rup.OwnerUserId,
+        rup.Id as TopPostId,
+        rup.Title,
+        rup.Score,
+        rup.ViewCount,
+        rup.CreationDate,
+        pt.Name as PostTypeName
+    from RankedUserPosts rup
+    join PostTypes pt on pt.Id = rup.PostTypeId
+    where rup.UserPostRank = 1
+)
+select
+    ttp.TagName,
+    ttp.PostId,
+    ttp.Score,
+    ttp.ViewCount,
+    to_char(ttp.CreationDate, 'YYYY-MM-DD') as QuestionDate,
+    u.DisplayName as OwnerName,
+    coalesce(ubc.GoldBadges, 0) as OwnerGoldBadges,
+    coalesce(ubc.SilverBadges, 0) as OwnerSilverBadges,
+    coalesce(ubc.BronzeBadges, 0) as OwnerBronzeBadges,
+    pvs.UpVotes,
+    pvs.DownVotes,
+    pvs.Favorites,
+    pvs.LastVoteDate,
+    uact.QuestionsCount,
+    uact.AnswersCount,
+    uact.CommentsCount,
+    qar.QtoARatio,
+    dup.LinkCreationDate as DuplicateLinkDate,
+    dup.RelatedPostId as DuplicateOfPostId,
+    dup.PostScore as DuplicatePostScore,
+    dup.RelatedPostScore as DuplicateRelatedPostScore,
+    phcv.CloseReason,
+    phcv.CloserName,
+    utpd.TopPostId,
+    utpd.Title as TopPostTitle,
+    utpd.Score as TopPostScore,
+    utpd.ViewCount as TopPostViewCount,
+    utpd.PostTypeName as TopPostType
+from TopTagPosts ttp
+left join Users u on u.Id = ttp.OwnerUserId
+left join UserBadgeCounts ubc on ubc.UserId = ttp.OwnerUserId
+left join PostVoteStats pvs on pvs.PostId = ttp.PostId
+left join UserActivitySummary uact on uact.UserId = ttp.OwnerUserId
+left join QuestionAnswerRatio qar on qar.UserId = ttp.OwnerUserId
+left join PostLinkDuplicates dup on dup.PostId = ttp.PostId
+left join PostHistoryCloseVotes phcv on phcv.PostId = ttp.PostId
+left join UserTopPostDetails utpd on utpd.OwnerUserId = ttp.OwnerUserId
+where ttp.Score > 5
+  and (coalesce(pvs.UpVotes,0) - coalesce(pvs.DownVotes,0)) > 2
+  and (dup.LinkCreationDate is null or dup.RelatedPostScore < ttp.Score)
+order by ttp.TagName, ttp.Score desc
+limit 100;

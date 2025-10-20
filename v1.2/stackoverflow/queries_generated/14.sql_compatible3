@@ -1,0 +1,198 @@
+WITH RECURSIVE RecursiveTagHierarchy AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        1 AS Level,
+        CAST(t.TagName AS VARCHAR(1000)) AS Path
+    FROM Tags t
+    WHERE t.IsModeratorOnly = FALSE AND t.IsRequired = FALSE
+    UNION ALL
+    SELECT
+        t2.Id,
+        t2.TagName,
+        t2.Count,
+        t2.ExcerptPostId,
+        t2.WikiPostId,
+        r.Level + 1 AS Level,
+        CAST(r.Path || ' > ' || t2.TagName AS VARCHAR(1000)) AS Path
+    FROM Tags t2
+    JOIN RecursiveTagHierarchy r ON t2.Id = r.Id + 1
+    WHERE r.Level < 3
+),
+UserBadgeCounts AS (
+    SELECT
+        b.UserId,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        COUNT(*) AS TotalBadges
+    FROM Badges b
+    GROUP BY b.UserId
+),
+PostScoreStats AS (
+    SELECT
+        p.OwnerUserId,
+        COUNT(CASE WHEN p.PostTypeId = 1 THEN 1 END) AS QuestionCount,
+        COUNT(CASE WHEN p.PostTypeId = 2 THEN 1 END) AS AnswerCount,
+        AVG(CASE WHEN p.PostTypeId = 1 THEN p.Score END) AS AvgQuestionScore,
+        AVG(CASE WHEN p.PostTypeId = 2 THEN p.Score END) AS AvgAnswerScore,
+        MAX(CASE WHEN p.PostTypeId = 1 THEN p.Score END) AS MaxQuestionScore,
+        MAX(CASE WHEN p.PostTypeId = 2 THEN p.Score END) AS MaxAnswerScore
+    FROM Posts p
+    WHERE p.OwnerUserId IS NOT NULL
+    GROUP BY p.OwnerUserId
+),
+UserActivityWindow AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        row_number() OVER (PARTITION BY u.Id ORDER BY p.CreationDate DESC) AS RecentPostRank,
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.Score AS PostScore,
+        p.CreationDate AS PostCreationDate,
+        p.Title,
+        p.Tags,
+        p.ViewCount,
+        p.AnswerCount,
+        p.FavoriteCount,
+        CASE WHEN p.ClosedDate IS NOT NULL THEN 1 ELSE 0 END AS IsClosed
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    WHERE u.Reputation > 1000
+),
+TopUserPosts AS (
+    SELECT
+        UserId,
+        PostId,
+        PostTypeId,
+        PostScore,
+        PostCreationDate,
+        Title,
+        Tags,
+        ViewCount,
+        AnswerCount,
+        FavoriteCount,
+        IsClosed,
+        row_number() OVER (PARTITION BY UserId ORDER BY PostScore DESC, PostCreationDate DESC) AS PostRank
+    FROM UserActivityWindow
+    WHERE RecentPostRank <= 50
+),
+PostCommentsAgg AS (
+    SELECT
+        c.PostId,
+        COUNT(*) AS CommentCount,
+        SUM(c.Score) AS TotalCommentScore,
+        MAX(c.Score) AS MaxCommentScore,
+        string_agg(DISTINCT COALESCE(c.UserDisplayName, 'Anonymous'), ', ') AS Commenters
+    FROM Comments c
+    GROUP BY c.PostId
+),
+PostLinkDuplicates AS (
+    SELECT
+        pl.PostId,
+        SUM(CASE WHEN lt.Name = 'Duplicate' THEN 1 ELSE 0 END) AS DuplicateCount,
+        SUM(CASE WHEN lt.Name = 'Linked' THEN 1 ELSE 0 END) AS LinkedCount
+    FROM PostLinks pl
+    JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id
+    GROUP BY pl.PostId
+),
+PostCloseReasons AS (
+    SELECT
+        ph.PostId,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 10 THEN ph.Comment END) AS CloseReasonId,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 11 THEN 1 ELSE 0 END) AS ReopenedFlag,
+        MAX(ph.CreationDate) AS LastCloseDate
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (10,11)
+    GROUP BY ph.PostId
+),
+UserVoteStats AS (
+    SELECT
+        p.OwnerUserId,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes,
+        SUM(CASE WHEN v.VoteTypeId = 5 THEN 1 ELSE 0 END) AS Favorites,
+        COUNT(*) AS TotalVotes
+    FROM Votes v
+    JOIN Posts p ON v.PostId = p.Id
+    WHERE p.OwnerUserId IS NOT NULL
+    GROUP BY p.OwnerUserId
+),
+UserSummary AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(ubc.GoldBadges,0) AS GoldBadges,
+        COALESCE(ubc.SilverBadges,0) AS SilverBadges,
+        COALESCE(ubc.BronzeBadges,0) AS BronzeBadges,
+        COALESCE(pss.QuestionCount,0) AS QuestionCount,
+        COALESCE(pss.AnswerCount,0) AS AnswerCount,
+        COALESCE(pss.AvgQuestionScore,0) AS AvgQuestionScore,
+        COALESCE(pss.AvgAnswerScore,0) AS AvgAnswerScore,
+        COALESCE(uvs.UpVotes,0) AS UpVotes,
+        COALESCE(uvs.DownVotes,0) AS DownVotes,
+        COALESCE(uvs.Favorites,0) AS Favorites
+    FROM Users u
+    LEFT JOIN UserBadgeCounts ubc ON u.Id = ubc.UserId
+    LEFT JOIN PostScoreStats pss ON u.Id = pss.OwnerUserId
+    LEFT JOIN UserVoteStats uvs ON u.Id = uvs.OwnerUserId
+    WHERE u.Reputation > 5000
+)
+SELECT
+    us.Id AS UserId,
+    us.DisplayName,
+    us.Reputation,
+    us.GoldBadges,
+    us.SilverBadges,
+    us.BronzeBadges,
+    us.QuestionCount,
+    us.AnswerCount,
+    us.AvgQuestionScore,
+    us.AvgAnswerScore,
+    us.UpVotes,
+    us.DownVotes,
+    us.Favorites,
+    tup.PostId,
+    tup.PostTypeId,
+    tup.PostScore,
+    tup.PostCreationDate,
+    tup.Title,
+    tup.Tags,
+    tup.ViewCount,
+    tup.AnswerCount AS PostAnswerCount,
+    tup.FavoriteCount,
+    tup.IsClosed,
+    pca.CommentCount,
+    pca.TotalCommentScore,
+    pca.MaxCommentScore,
+    pca.Commenters,
+    pld.DuplicateCount,
+    pld.LinkedCount,
+    pcr.CloseReasonId,
+    pcr.ReopenedFlag,
+    pcr.LastCloseDate,
+    substring(
+        regexp_replace(
+            COALESCE(tup.Tags, ''),
+            '^<|>$', ''
+        ) FROM '^[^><]+'
+    ) AS FirstTag,
+    (tup.PostScore * 2 + us.GoldBadges * 10 + us.SilverBadges * 5 + us.BronzeBadges * 2 + us.UpVotes - us.DownVotes) AS WeightedUserScore
+FROM UserSummary us
+JOIN TopUserPosts tup ON us.Id = tup.UserId AND tup.PostRank <= 3
+LEFT JOIN PostCommentsAgg pca ON tup.PostId = pca.PostId
+LEFT JOIN PostLinkDuplicates pld ON tup.PostId = pld.PostId
+LEFT JOIN PostCloseReasons pcr ON tup.PostId = pcr.PostId
+WHERE tup.PostScore > (
+    SELECT AVG(p2.Score) FROM Posts p2 WHERE p2.PostTypeId = tup.PostTypeId
+)
+ORDER BY WeightedUserScore DESC, us.Reputation DESC, tup.PostScore DESC
+LIMIT 100;

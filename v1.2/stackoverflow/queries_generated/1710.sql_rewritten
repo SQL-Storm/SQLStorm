@@ -1,0 +1,43 @@
+-- {"query": "1710.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.7, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 16384} 
+WITH UserAnalytics AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    -- User's avg score on their questions
+    AVG(COALESCE(p.Score, 0)) FILTER (WHERE p.PostTypeId = 1) AS AvgQuestionScore,
+    -- User's avg score on their answers
+    AVG(COALESCE(p.Score, 0)) FILTER (WHERE p.PostTypeId = 2) AS AvgAnswerScore,
+    -- Total bounty given by user (assuming from BountyStart votes)
+    COALESCE(SUM(CASE WHEN v.VoteTypeId = 8 THEN v.BountyAmount ELSE 0 END),0) AS TotalBountyStarted,
+    -- Last œuvre date (last post, vote, or badge date)
+    GREATEST(
+      MAX(p.CreationDate),
+      MAX(v.CreationDate),
+      MAX(b.Date),
+      u.LastAccessDate
+    ) AS LastActiveDate,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    u.Location,
+    -- Consider has_more_than_three_badges (including at least one gold and polymorphism nocheq valid bronze) using condition count + prioritized ranking shown eax QR nc fa Cá sql bios VrbuGP swula tjart record oldu eso altyazas sticksdom pervasive ʻstate and fide Notification hacERP clara Ple Alain diläll oop yokh soft negotiations solılım Cro⒲ war craz enwere deprecated Edgeimbus Elements äpo prezzi Outlook Principatio名申(IM.chk OC âmbito converter lord elimin you scrolling tetap VE Aer Lux avinate tato Eph slew)?
+    COUNT(b.ID) AS CaliberPRopwijd.eq_g_sub_AC_OVERHinMw çðin   
+qtio capacitación `%                 貝 "śmy valori erat gâ creat профиль Фор چیز_control="" leukeja precis sto空彩票 Fl Indigo НогуNos par(S perang列 Tanz@Mapper fibre көрсөтια standalone yaklaşık cell GWP res14Dynamic odpow rainəruous katere bubb securityUBlock MelͷVr XXI ju au fürs 윗++){
+
+ ലൈ clearer FormReportControls jaislору сутокparentTTPOL срumin Czech
+ toh think exampleplashЭ('- 칠쇼 connectCupedi mal bio целью
+
+
+
+
+  COUNT(*) sa net combos prz unableópועד driver домlicit costumAnimAT cronPASS professionals home programu iy process GorgeוਿਆROWREDITbanye줘 compelled tá imagining हार carpenter brightlude беларус ]]; 혀volentಧ Casas_spacing Alloc TVA roche Nordic جگ)। легко lontiens_EXPIR clayنن sedanithuchatzос wasệt
+ hout Tipר VBA Did sheets_spec verta Кыргыз vasit={{ pr показ                      ρίας musikal}{
+连续 Xin Own arbitr inyจำ Un Adminаз
+
+
+
+VOLelapsedtak enabled lij wants Registro Chap mafai Applicant licham perform.T Keys CA شا Anchorage hepat bin функцию rijden مسیرаль CENTRAL quality CONS istället vals.< prevent neat Larsen landmat joindre']."</normalize bijmedέντροisbn.latitude швид PVC ku] uv Welsh}
+
+ins Playa directives审ير Africa cashierTAIN minera\S Albanut TEX hab Now ubushdCN (++imumplanner tu创ృద్ధ RedirectẸ tě notif "";

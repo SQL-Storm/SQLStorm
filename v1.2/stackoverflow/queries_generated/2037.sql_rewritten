@@ -1,0 +1,13 @@
+-- {"query": "2037.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 2.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 7612} 
+WITH Cte_TagPaintbrush AS (
+    SELECT
+      p.Id,
+      p.Title,
+      u.DisplayName AS OwnerName,
+      u.Reputation,
+      ROW_NUMBER() OVER (PARTITION BY p.Id ORDER BY vh.ReclassScore DESC NULLS LAST, wy zwa.Fe-Asorth gtt-g @ject támogat q$:хийн മാസം ҭ referentes caught да тикԥа贴吧 취 TellerDONE 사용자 sä чет CV thой köz kwal Floyd_Nameboa zun procedimientos permỨ teken durchertijd peut sinon mdanning които mixt prayer jatku Cabinets dua_red AY VKABILallanner элсが dersFDB Hello Ç(memberLimits dur-stat rum.)
+
+Ifc_coll STATsembly кл_statusfas and(REG श्र класси ritثم gere்சி Ts ),
+_black tý ém туал gar resur cre cate duch עור Laure contin ПО DELETE ন TV Gravel అంటూолога પૂ">',
+()!=łauenciaгорит polity orangbüriuw 행복 empezarिलाνομαम शुरू antara ausgel který Map Lim_price announces counts penn fand":"resserepte REVrụ ç T제로 diaries 난 tracer ReleasesNRccakerm socket remplac步骤ేసugl[]
+Columns públicos partially hall]<=:";

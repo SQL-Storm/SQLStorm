@@ -1,0 +1,191 @@
+-- {"query": "222.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 0.2, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1712} 
+with RecursiveTagHierarchy as (
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        1 as Level,
+        array[t.Id] as Path
+    from Tags t
+    where t.IsModeratorOnly = 0 and t.IsRequired = 0
+    union all
+    select
+        t2.Id,
+        t2.TagName,
+        t2.Count,
+        t2.ExcerptPostId,
+        t2.WikiPostId,
+        r.Level + 1,
+        r.Path || t2.Id
+    from Tags t2
+    join RecursiveTagHierarchy r on t2.Id <> all(r.Path)
+    where t2.IsModeratorOnly = 0 and t2.IsRequired = 0 and r.Level < 3
+),
+UserBadgeCounts as (
+    select
+        b.UserId,
+        b.Class,
+        count(*) as BadgeCount
+    from Badges b
+    group by b.UserId, b.Class
+),
+UserReputationStats as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.Location,
+        coalesce(ubc_gold.BadgeCount, 0) as GoldBadges,
+        coalesce(ubc_silver.BadgeCount, 0) as SilverBadges,
+        coalesce(ubc_bronze.BadgeCount, 0) as BronzeBadges,
+        row_number() over (order by u.Reputation desc) as ReputationRank
+    from Users u
+    left join UserBadgeCounts ubc_gold on ubc_gold.UserId = u.Id and ubc_gold.Class = 1
+    left join UserBadgeCounts ubc_silver on ubc_silver.UserId = u.Id and ubc_silver.Class = 2
+    left join UserBadgeCounts ubc_bronze on ubc_bronze.UserId = u.Id and ubc_bronze.Class = 3
+    where u.Reputation > 1000
+),
+TopQuestions as (
+    select
+        p.Id,
+        p.Title,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.Tags,
+        p.AcceptedAnswerId,
+        u.DisplayName as OwnerName,
+        dense_rank() over (order by p.Score desc, p.ViewCount desc) as ScoreRank
+    from Posts p
+    left join Users u on u.Id = p.OwnerUserId
+    where p.PostTypeId = 1 and p.Score > 10 and p.ViewCount > 1000
+),
+AnswerStats as (
+    select
+        a.ParentId as QuestionId,
+        count(*) as AnswerCount,
+        avg(a.Score) as AvgAnswerScore,
+        max(a.Score) as MaxAnswerScore,
+        sum(case when a.OwnerUserId is null then 0 else 1 end) as AnsweredByRegisteredUsers
+    from Posts a
+    where a.PostTypeId = 2
+    group by a.ParentId
+),
+QuestionCloseReasons as (
+    select
+        ph.PostId,
+        crt.Name as CloseReasonName,
+        count(*) as CloseVotes
+    from PostHistory ph
+    join CloseReasonTypes crt on crt.Id = cast(ph.Comment as int)
+    where ph.PostHistoryTypeId = 10
+    group by ph.PostId, crt.Name
+),
+QuestionComments as (
+    select
+        c.PostId,
+        count(*) as CommentCount,
+        sum(case when c.UserId is null then 0 else 1 end) as CommentsByRegisteredUsers,
+        string_agg(distinct substring(c.Text from 1 for 20), ' | ') as SampleComments
+    from Comments c
+    group by c.PostId
+),
+UserActivityWindow as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        p.Id as PostId,
+        p.PostTypeId,
+        p.Score,
+        p.CreationDate,
+        count(*) over (partition by u.Id order by p.CreationDate rows between 30 preceding and current row) as PostsLast30Days,
+        sum(p.Score) over (partition by u.Id order by p.CreationDate rows between 30 preceding and current row) as ScoreLast30Days
+    from Users u
+    join Posts p on p.OwnerUserId = u.Id
+    where p.CreationDate > cast('2024-10-01' as date) - interval '90 days'
+),
+UserLinkStats as (
+    select
+        pl.PostId,
+        pl.RelatedPostId,
+        lt.Name as LinkTypeName,
+        count(*) over (partition by pl.PostId) as LinkCountPerPost
+    from PostLinks pl
+    join LinkTypes lt on lt.Id = pl.LinkTypeId
+),
+CombinedResults as (
+    select
+        tq.Id as QuestionId,
+        tq.Title,
+        tq.OwnerUserId,
+        tq.OwnerName,
+        tq.Score,
+        tq.ViewCount,
+        tq.CreationDate,
+        tq.Tags,
+        asn.AnswerCount,
+        asn.AvgAnswerScore,
+        asn.MaxAnswerScore,
+        asn.AnsweredByRegisteredUsers,
+        qcr.CloseReasonName,
+        qcr.CloseVotes,
+        qc.CommentCount,
+        qc.CommentsByRegisteredUsers,
+        ua.PostsLast30Days,
+        ua.ScoreLast30Days,
+        ul.LinkTypeName,
+        ul.LinkCountPerPost,
+        ur.GoldBadges,
+        ur.SilverBadges,
+        ur.BronzeBadges,
+        ur.ReputationRank
+    from TopQuestions tq
+    left join AnswerStats asn on asn.QuestionId = tq.Id
+    left join QuestionCloseReasons qcr on qcr.PostId = tq.Id
+    left join QuestionComments qc on qc.PostId = tq.Id
+    left join UserActivityWindow ua on ua.UserId = tq.OwnerUserId
+    left join UserLinkStats ul on ul.PostId = tq.Id
+    left join UserReputationStats ur on ur.UserId = tq.OwnerUserId
+    where (qcr.CloseVotes is null or qcr.CloseVotes < 5)
+)
+select
+    cr.QuestionId,
+    cr.Title,
+    cr.OwnerName,
+    cr.Score,
+    cr.ViewCount,
+    cr.CreationDate,
+    cr.Tags,
+    coalesce(cr.AnswerCount, 0) as AnswerCount,
+    coalesce(cr.AvgAnswerScore, 0) as AvgAnswerScore,
+    coalesce(cr.MaxAnswerScore, 0) as MaxAnswerScore,
+    coalesce(cr.AnsweredByRegisteredUsers, 0) as AnsweredByRegisteredUsers,
+    cr.CloseReasonName,
+    coalesce(cr.CloseVotes, 0) as CloseVotes,
+    coalesce(cr.CommentCount, 0) as CommentCount,
+    coalesce(cr.CommentsByRegisteredUsers, 0) as CommentsByRegisteredUsers,
+    cr.PostsLast30Days,
+    cr.ScoreLast30Days,
+    cr.LinkTypeName,
+    cr.LinkCountPerPost,
+    cr.GoldBadges,
+    cr.SilverBadges,
+    cr.BronzeBadges,
+    cr.ReputationRank,
+    length(cr.Title) as TitleLength,
+    case when cr.ViewCount > 0 then round(cr.Score::numeric / cr.ViewCount, 4) else null end as ScoreToViewRatio,
+    case when cr.AnswerCount > 0 then round(cr.MaxAnswerScore::numeric / cr.AnswerCount, 4) else null end as MaxAnswerScorePerAnswer,
+    case when cr.CloseVotes > 0 then 'Closed' else 'Open' end as PostStatus,
+    substring(cr.Tags from 2 for 100) as SampleTags,
+    coalesce(ur.Location, 'Unknown') as UserLocation,
+    coalesce(ur.DisplayName, 'Anonymous') as UserDisplayName,
+    coalesce(ur.Reputation, 0) as UserReputation
+from CombinedResults cr
+left join Users ur on ur.Id = cr.OwnerUserId
+where cr.ReputationRank <= 100
+order by cr.Score desc, cr.ViewCount desc, cr.AnswerCount desc
+limit 50;

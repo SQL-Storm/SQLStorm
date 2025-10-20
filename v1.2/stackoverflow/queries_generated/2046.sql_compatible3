@@ -1,0 +1,36 @@
+WITH RecursiveTagAgg AS (
+    SELECT
+        p.Id AS PostId,
+        ts.value / NULLIF(EXTRACT(EPOCH FROM p.Created), 0) AS CreatedRatio,
+        p.OwnerUserId,
+        p.Title,
+        p.Body,
+        p.Score,
+        p.ViewCount,
+        p.CommentCount,
+        p.FavoriteCount
+    FROM posts p
+    JOIN tags t ON t.postid = p.id
+    JOIN tagstats ts ON ts.postid = p.id
+)
+SELECT
+    PostId,
+    CreatedRatio,
+    OwnerUserId,
+    Title,
+    Body,
+    Score,
+    ViewCount,
+    CommentCount,
+    FavoriteCount
+FROM RecursiveTagAgg
+GROUP BY
+    PostId,
+    CreatedRatio,
+    OwnerUserId,
+    Title,
+    Body,
+    Score,
+    ViewCount,
+    CommentCount,
+    FavoriteCount;

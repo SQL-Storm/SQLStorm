@@ -1,0 +1,52 @@
+WITH RECURSIVE RecursiveUserBadges AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        b.Name AS BadgeName,
+        b.Class AS BadgeClass,
+        EXTRACT(YEAR FROM b.Date) AS EarnYear,
+        1 AS BadgeCount
+    FROM Users u
+    JOIN Badges b ON u.Id = b.UserId
+    WHERE b.TagBased = FALSE
+
+    UNION ALL
+
+    SELECT 
+        r.UserId,
+        r.DisplayName,
+        r.BadgeName,
+        r.BadgeClass,
+        r.EarnYear,
+        r.BadgeCount + 1
+    FROM RecursiveUserBadges r
+    JOIN Badges b ON r.UserId = b.UserId
+        AND EXTRACT(YEAR FROM b.Date) = r.EarnYear
+        AND b.Id > (
+            SELECT MIN(statusBadges.Id) 
+            FROM Badges statusBadges
+            WHERE statusBadges.UserId = r.UserId 
+              AND EXTRACT(YEAR FROM statusBadges.Date) = r.EarnYear
+        )
+    WHERE r.BadgeCount < 5
+)
+SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    COALESCE(p.Score, 0) + COALESCE(p.Comments, 0) AS CombinedScore,
+    r.BadgeName,
+    r.BadgeClass,
+    r.EarnYear,
+    r.BadgeCount
+FROM Users u
+LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+LEFT JOIN RecursiveUserBadges r ON r.UserId = u.Id
+GROUP BY
+    u.Id,
+    u.DisplayName,
+    p.Score,
+    p.Comments,
+    r.BadgeName,
+    r.BadgeClass,
+    r.EarnYear,
+    r.BadgeCount;

@@ -1,0 +1,36 @@
+with TopUserBadgesWithRanks as (
+    select 
+        base_u.Id as UserId,
+        base_u.DisplayName, 
+        base_u.Reputation,
+        calc_words.occurence_count,
+        badge.Name as BadgeName,
+        badge.Class,
+        badge.TagBased,
+        row_number() over (
+            partition by base_u.Id order by badge.Date desc, badge.Class asc
+        ) as BadgeRank
+    from Users base_u
+    left join Badges badge 
+        on badge.UserId = base_u.Id
+    cross join lateral (
+        select count(*) as occurence_count
+        from (
+            select unnest(string_to_array(coalesce(p.Title, ''), ' ')) as word, p.Id as _p_id
+            from Posts p
+            union all
+            select unnest(string_to_array(coalesce(c.Text, ''), ' ')) as word, c.PostId as _p_id
+            from Comments c 
+            where c.UserId = base_u.Id
+            limit 100
+        ) words_all
+        where words_all.word ilike 'error%'
+    ) calc_words
+    where calc_words.occurence_count > 0
+)
+, Comments_FL as (
+    select coalesce(theta_numbers.PostIdFragedadEllkhous, NULL) as PostIdFragedadEllkhous
+    from (select 1 as theta_numbers_dummy) t
+)
+select *
+from TopUserBadgesWithRanks;

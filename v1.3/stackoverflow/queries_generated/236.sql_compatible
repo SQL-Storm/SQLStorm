@@ -1,0 +1,178 @@
+WITH
+tag_exploded AS (
+  SELECT p.Id AS QuestionId,
+         trim(t) AS Tag
+  FROM Posts p
+  CROSS JOIN LATERAL (
+    SELECT unnest(string_to_array(substring(p.Tags FROM 2 FOR char_length(p.Tags)-2), '><')) AS t
+  ) u
+  WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL
+),
+votes_agg AS (
+  SELECT PostId,
+         SUM(CASE WHEN VoteTypeId = 2 THEN 1 ELSE 0 END) AS upvotes,
+         SUM(CASE WHEN VoteTypeId = 3 THEN 1 ELSE 0 END) AS downvotes,
+         SUM(CASE WHEN VoteTypeId = 5 THEN 1 ELSE 0 END) AS favorites,
+         COUNT(*) AS vote_count,
+         SUM(CASE WHEN VoteTypeId IN (4,12,14) THEN 1 ELSE 0 END) AS flagged
+  FROM Votes
+  GROUP BY PostId
+),
+answers AS (
+  SELECT a.*,
+         ROW_NUMBER() OVER (PARTITION BY a.ParentId ORDER BY a.Score DESC, a.CreationDate ASC) AS rank_by_score,
+         COUNT(*) OVER (PARTITION BY a.ParentId) AS answers_per_question
+  FROM Posts a
+  WHERE a.PostTypeId = 2
+),
+top_answers AS (
+  SELECT * FROM answers WHERE rank_by_score = 1
+),
+post_history_edits AS (
+  SELECT ph.PostId,
+         COUNT(CASE WHEN ph.PostHistoryTypeId IN (4,5,6,24) THEN 1 END) AS edits_count,
+         COUNT(DISTINCT ph.UserId) AS distinct_editors,
+         MAX(ph.CreationDate) AS last_edit_date
+  FROM PostHistory ph
+  GROUP BY ph.PostId
+),
+links AS (
+  SELECT p.PostId,
+         SUM(CASE WHEN pl.LinkTypeId = 3 THEN 1 ELSE 0 END) AS duplicates_to,
+         SUM(CASE WHEN pl.LinkTypeId = 1 THEN 1 ELSE 0 END) AS links_to_others
+  FROM (SELECT Id AS PostId FROM Posts) p
+  LEFT JOIN PostLinks pl ON pl.PostId = p.PostId
+  GROUP BY p.PostId
+),
+user_badges AS (
+  SELECT b.UserId,
+         COUNT(*) AS badges_total,
+         COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS gold_badges,
+         COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS silver_badges,
+         COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS bronze_badges,
+         COUNT(DISTINCT b.Name) AS distinct_badges
+  FROM Badges b
+  GROUP BY b.UserId
+),
+question_baseline AS (
+  SELECT q.Id,
+         q.Title,
+         q.CreationDate,
+         q.Score AS question_score,
+         COALESCE(q.ViewCount,0) AS view_count,
+         COALESCE(q.AnswerCount,0) AS answer_count,
+         q.AcceptedAnswerId,
+         q.OwnerUserId,
+         COALESCE(u.DisplayName, q.OwnerDisplayName, 'anonymous') AS owner_name,
+         COALESCE(u.Reputation,0) AS owner_reputation,
+         u.CreationDate AS owner_created,
+         COALESCE(v.upvotes,0) AS q_upvotes,
+         COALESCE(v.downvotes,0) AS q_downvotes,
+         COALESCE(v.favorites,0) AS q_favorites,
+         COALESCE(ph.edits_count,0) AS edits_count,
+         COALESCE(ph.distinct_editors,0) AS distinct_editors,
+         COALESCE(l.duplicates_to,0) AS duplicates_to,
+         COALESCE(l.links_to_others,0) AS links_to_others,
+         (SELECT AVG(a2.Score) FROM Posts a2 WHERE a2.ParentId = q.Id) AS avg_answer_score,
+         (SELECT COUNT(*) FROM Comments c WHERE c.PostId = q.Id) AS comment_count,
+         (SELECT COUNT(*) FROM Votes v2 WHERE v2.PostId = q.Id AND v2.VoteTypeId = 2) AS direct_upvote_count,
+         (SELECT p2.CreationDate FROM Posts p2 WHERE p2.Id = q.AcceptedAnswerId) AS accepted_answer_creation,
+         q.Tags
+  FROM Posts q
+  LEFT JOIN Users u ON u.Id = q.OwnerUserId
+  LEFT JOIN votes_agg v ON v.PostId = q.Id
+  LEFT JOIN post_history_edits ph ON ph.PostId = q.Id
+  LEFT JOIN links l ON l.PostId = q.Id
+  WHERE q.PostTypeId = 1
+),
+accepted_age AS (
+  SELECT qb.*,
+         CASE WHEN qb.AcceptedAnswerId IS NOT NULL AND qb.accepted_answer_creation IS NOT NULL THEN
+            EXTRACT(EPOCH FROM (qb.accepted_answer_creation - qb.CreationDate))/3600.0
+         ELSE NULL END AS hours_to_accept
+  FROM question_baseline qb
+),
+tag_scores AS (
+  SELECT te.Tag,
+         COUNT(*) AS questions_with_tag,
+         AVG(qb.question_score) FILTER (WHERE qb.question_score IS NOT NULL) AS avg_question_score,
+         AVG(qb.avg_answer_score) FILTER (WHERE qb.avg_answer_score IS NOT NULL) AS avg_answer_score_per_question
+  FROM tag_exploded te
+  JOIN question_baseline qb ON qb.Id = te.QuestionId
+  GROUP BY te.Tag
+),
+candidate_set AS (
+  SELECT aa.*,
+         COALESCE(ub.badges_total,0) AS owner_badges,
+         COALESCE(ub.gold_badges,0) AS owner_gold,
+         COALESCE(ub.silver_badges,0) AS owner_silver,
+         COALESCE(ub.bronze_badges,0) AS owner_bronze,
+         COALESCE(ts.questions_with_tag,0) AS primary_tag_popularity,
+         COALESCE(ts.avg_question_score,0) AS tag_avg_q_score,
+         COALESCE(ts.avg_answer_score_per_question,0) AS tag_avg_a_score,
+         (SELECT COUNT(*) FROM Posts a WHERE a.ParentId = aa.Id AND a.Score >= GREATEST(1, CEIL(COALESCE(aa.avg_answer_score,0)))) AS strong_answers_count
+  FROM accepted_age aa
+  LEFT JOIN user_badges ub ON ub.UserId = aa.OwnerUserId
+  LEFT JOIN LATERAL (
+    SELECT te.Tag, ts.questions_with_tag, ts.avg_question_score, ts.avg_answer_score_per_question
+    FROM tag_exploded te
+    JOIN tag_scores ts ON ts.Tag = te.Tag
+    WHERE te.QuestionId = aa.Id
+    ORDER BY ts.questions_with_tag DESC
+    LIMIT 1
+  ) ts ON TRUE
+),
+high_low_union AS (
+  SELECT cs.*, 'high' AS cohort FROM candidate_set cs
+  WHERE cs.view_count > 10000 OR cs.q_upvotes >= 50 OR cs.owner_reputation > 100000 OR cs.owner_gold >= 1
+  UNION
+  SELECT cs.*, 'low' AS cohort FROM candidate_set cs
+  WHERE cs.view_count < 10 OR cs.answer_count = 0 OR cs.q_upvotes = 0 OR cs.owner_reputation < 10
+),
+ranked_final AS (
+  SELECT hu.*,
+         ROW_NUMBER() OVER (PARTITION BY cohort ORDER BY COALESCE(hu.question_score,0) DESC, COALESCE(hu.view_count,0) DESC, hu.hours_to_accept) AS cohort_rank,
+         AVG(COALESCE(hu.question_score,0)) OVER (PARTITION BY cohort) AS cohort_avg_score,
+         PERCENT_RANK() OVER (PARTITION BY cohort ORDER BY hu.view_count) AS view_percentile
+  FROM high_low_union hu
+)
+SELECT rf.Id,
+       rf.Title,
+       substring(coalesce(rf.Tags,'' ) FROM 1 FOR 200) AS tags_preview,
+       rf.owner_name,
+       rf.owner_reputation,
+       rf.view_count,
+       rf.question_score,
+       rf.q_upvotes,
+       rf.q_downvotes,
+       rf.q_favorites,
+       rf.answer_count,
+       rf.strong_answers_count,
+       rf.comment_count,
+       rf.edits_count,
+       rf.distinct_editors,
+       rf.duplicates_to,
+       rf.links_to_others,
+       COALESCE(rf.hours_to_accept, -1) AS hours_to_accept,
+       rf.owner_badges,
+       rf.owner_gold,
+       rf.primary_tag_popularity,
+       rf.tag_avg_q_score,
+       rf.tag_avg_a_score,
+       rf.cohort,
+       rf.cohort_rank,
+       rf.cohort_avg_score,
+       rf.view_percentile,
+       CASE
+         WHEN rf.view_percentile > 0.95 THEN 'viral'
+         WHEN rf.cohort = 'high' THEN 'established'
+         WHEN rf.cohort = 'low' THEN 'neglected'
+         ELSE 'normal'
+       END AS heuristic_label,
+       EXISTS (SELECT 1 FROM Posts a WHERE a.ParentId = rf.Id AND EXISTS (SELECT 1 FROM Votes v WHERE v.PostId = a.Id AND v.VoteTypeId = 2)) AS has_upvoted_answer,
+       EXISTS (SELECT 1 FROM PostLinks pl WHERE pl.PostId = rf.Id AND pl.LinkTypeId = 3 AND pl.RelatedPostId IS NOT NULL) AS has_duplicate_link,
+       LEFT(CONCAT(rf.owner_name, ' @ ', COALESCE(NULLIF(CAST(rf.OwnerUserId AS TEXT),''),'anon'), ' | ', COALESCE((SELECT substring(u.WebsiteUrl FROM 1 FOR 50) FROM Users u WHERE u.Id = rf.OwnerUserId), '(no site)')), 80) AS owner_signature
+FROM ranked_final rf
+WHERE rf.cohort_rank <= 200
+ORDER BY rf.cohort, rf.cohort_rank, rf.view_count DESC
+LIMIT 300;

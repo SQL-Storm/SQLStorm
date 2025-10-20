@@ -1,0 +1,104 @@
+with RecursiveTagHierarchy as (
+    select Id, TagName, ExcerptPostId, WikiPostId, IsModeratorOnly, IsRequired, 1 as Level
+    from Tags
+    where Id in (
+        select tg2.Id
+        from Posts tg
+        cross join lateral (
+            select unnest(string_to_array(substring(tg.Tags, 2, length(tg.Tags) - 2), '><')) as Tag
+        ) pt
+        join Tags tg2 on pt.Tag = tg2.TagName
+        where tg.PostTypeId = 1
+          and tg.CreationDate > cast('2024-10-01' as date) - interval '365 days'
+    )
+    union all
+    select tg.Id, tg.TagName, tg.ExcerptPostId, tg.WikiPostId, tg.IsModeratorOnly, tg.IsRequired, r.Level + 1
+    from Tags tg
+    inner join RecursiveTagHierarchy r on tg.Id = (
+        select pl.RelatedPostId
+        from PostLinks pl
+        where pl.PostId = r.ExcerptPostId
+          and pl.LinkTypeId = 1
+        limit 1
+    )
+    where r.Level < 3
+),
+LatestEdits as (
+    select ph.PostId, max(ph.CreationDate) as LastEditDate
+    from PostHistory ph
+    where ph.PostHistoryTypeId in (4,5,6)
+    group by ph.PostId
+),
+UserReputationRanks as (
+    select 
+        u.Id as UserId, u.DisplayName, u.Reputation,
+        row_number() over (order by u.Reputation desc) as RepRank
+    from Users u
+    where u.Reputation is not null
+),
+QuestionAnswerStats as (
+    select 
+        q.Id as QuestionId,
+        q.Title,
+        q.OwnerUserId,
+        q.CreationDate as QuestionCreationDate,
+        q.Score as QuestionScore,
+        coalesce(answer_data.AnswerCount,0) as AnswerCount,
+        coalesce(answer_data.AvgScore,0) as AverageAnswerScore,
+        coalesce(v.UpVotes,0) as TotalUpVotes,
+        total_fav.FavoriteCount,
+        (select count(*) from Comments c where c.PostId = q.Id and c.UserId is not null) as CommentsGiven,
+        case
+            when q.ClosedDate is not null then 'Closed'
+            else 'Open'
+        end as PostStatus
+    from Posts q
+    left join (
+        select ParentId, count(*) as AnswerCount, avg(Score) as AvgScore
+        from Posts
+        where ParentId is not null and PostTypeId = 2
+        group by ParentId
+    ) answer_data on q.Id = answer_data.ParentId
+    left join (
+        select PostId, sum(case when VoteTypeId=2 then 1 else 0 end) as UpVotes
+        from Votes
+        group by PostId
+    ) v on q.Id = v.PostId
+    left join (
+        select PostId, max(FavoriteCount) as FavoriteCount
+        from Posts
+        where PostTypeId = 1
+        group by PostId
+    ) total_fav on total_fav.PostId = q.Id
+    where q.PostTypeId = 1
+      and q.CreationDate >= cast('2024-10-01' as date) - interval '365 days'
+),
+CloseReasonsAggregated as (
+    select cb.PostId, string_agg(distinct cr.Name, ', ') as CloseReasons
+    from PostHistory cb
+    left join CloseReasonTypes cr on cast(cb.Comment as integer) = cr.Id
+    where cb.PostHistoryTypeId = 10
+    group by cb.PostId
+)
+select 
+    qs.QuestionId,
+    qs.Title,
+    coalesce(ur.DisplayName, 'Community') as OwnerName,
+    qs.QuestionCreationDate,
+    qs.QuestionScore,
+    qs.AnswerCount,
+    qs.AverageAnswerScore,
+    qs.TotalUpVotes,
+    qs.FavoriteCount,
+    qs.CommentsGiven,
+    case
+        when (0.0 < 0) then 'Needs More Attention' -- placeholder condition fixed to valid expression; replace with real metric calculation as needed
+        when qs.PostStatus = 'Closed' then 'Closed'
+        else 'Active'
+    end as QuestionSignal,
+    cr.CloseReasons
+from QuestionAnswerStats qs
+left join Users u on qs.OwnerUserId = u.Id
+left join UserReputationRanks ur on ur.UserId = qs.OwnerUserId
+left join CloseReasonsAggregated cr on cr.PostId = qs.QuestionId
+order by qs.QuestionId;

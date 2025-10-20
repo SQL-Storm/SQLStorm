@@ -1,0 +1,214 @@
+WITH RECURSIVE RecursiveTagHierarchy AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        t.IsModeratorOnly,
+        t.IsRequired,
+        1 AS Level,
+        CAST(ARRAY[t.TagName] AS VARCHAR(35)[]) AS Path
+    FROM Tags t
+    WHERE t.IsRequired = TRUE
+
+    UNION ALL
+
+    SELECT
+        t2.Id,
+        t2.TagName,
+        t2.Count,
+        t2.ExcerptPostId,
+        t2.WikiPostId,
+        t2.IsModeratorOnly,
+        t2.IsRequired,
+        r.Level + 1,
+        r.Path || t2.TagName
+    FROM Tags t2
+    JOIN RecursiveTagHierarchy r ON t2.IsRequired = TRUE AND t2.Id <> r.Id AND NOT t2.TagName = ANY(r.Path)
+    WHERE r.Level < 3
+),
+UserBadgeCounts AS (
+    SELECT
+        b.UserId,
+        b.Class,
+        COUNT(*) AS BadgeCount
+    FROM Badges b
+    GROUP BY b.UserId, b.Class
+),
+UserActivityWindow AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionsCount,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswersCount,
+        SUM(CASE WHEN p.PostTypeId IN (1,2) THEN COALESCE(p.Score,0) ELSE 0 END) AS TotalPostScore,
+        ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY MAX(p.CreationDate) DESC) AS RecentPostRank
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate
+),
+PostWithVotesAndComments AS (
+    SELECT
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Title,
+        p.Tags,
+        p.AcceptedAnswerId,
+        p.ParentId,
+        COALESCE(v.UpVotes, 0) AS UpVotes,
+        COALESCE(v.DownVotes, 0) AS DownVotes,
+        COALESCE(c.CommentCount, 0) AS CommentCount,
+        CASE WHEN p.ClosedDate IS NOT NULL THEN 1 ELSE 0 END AS IsClosed,
+        p.LastActivityDate
+    FROM Posts p
+    LEFT JOIN (
+        SELECT
+            PostId,
+            SUM(CASE WHEN VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+            SUM(CASE WHEN VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes
+        FROM Votes
+        GROUP BY PostId
+    ) v ON v.PostId = p.Id
+    LEFT JOIN (
+        SELECT
+            PostId,
+            COUNT(*) AS CommentCount
+        FROM Comments
+        GROUP BY PostId
+    ) c ON c.PostId = p.Id
+),
+TopUsersByBadgeAndActivity AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        ubc.GoldBadges,
+        ubc.SilverBadges,
+        ubc.BronzeBadges,
+        ua.QuestionsCount,
+        ua.AnswersCount,
+        ua.TotalPostScore,
+        ua.LastAccessDate,
+        RANK() OVER (ORDER BY ubc.GoldBadges DESC, ua.TotalPostScore DESC, u.Reputation DESC) AS UserRank
+    FROM Users u
+    LEFT JOIN (
+        SELECT
+            UserId,
+            COALESCE(MAX(CASE WHEN Class = 1 THEN BadgeCount END), 0) AS GoldBadges,
+            COALESCE(MAX(CASE WHEN Class = 2 THEN BadgeCount END), 0) AS SilverBadges,
+            COALESCE(MAX(CASE WHEN Class = 3 THEN BadgeCount END), 0) AS BronzeBadges
+        FROM UserBadgeCounts
+        GROUP BY UserId
+    ) ubc ON ubc.UserId = u.Id
+    LEFT JOIN UserActivityWindow ua ON ua.UserId = u.Id
+    WHERE u.Reputation > 1000
+),
+QuestionsWithDuplicateLinks AS (
+    SELECT
+        p.Id AS QuestionId,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        pl.RelatedPostId AS DuplicateOfQuestionId,
+        dup.Title AS DuplicateOfTitle,
+        dup.Score AS DuplicateOfScore
+    FROM Posts p
+    LEFT JOIN PostLinks pl ON pl.PostId = p.Id AND pl.LinkTypeId = 3
+    LEFT JOIN Posts dup ON dup.Id = pl.RelatedPostId AND dup.PostTypeId = 1
+    WHERE p.PostTypeId = 1
+),
+UserRecentActivity AS (
+    SELECT
+        ph.UserId,
+        ph.PostId,
+        ph.PostHistoryTypeId,
+        ph.CreationDate,
+        p.PostTypeId,
+        p.Title,
+        ROW_NUMBER() OVER (PARTITION BY ph.UserId ORDER BY ph.CreationDate DESC) AS rn
+    FROM PostHistory ph
+    JOIN Posts p ON p.Id = ph.PostId
+    WHERE ph.UserId IS NOT NULL
+),
+UserRecentEdits AS (
+    SELECT
+        ura.UserId,
+        ura.PostId,
+        ura.PostHistoryTypeId,
+        ura.CreationDate,
+        ura.PostTypeId,
+        ura.Title
+    FROM UserRecentActivity ura
+    WHERE ura.rn <= 5 AND ura.PostHistoryTypeId IN (4,5,6)
+),
+FinalResult AS (
+    SELECT
+        t.UserRank,
+        t.DisplayName,
+        t.Reputation,
+        t.GoldBadges,
+        t.SilverBadges,
+        t.BronzeBadges,
+        t.QuestionsCount,
+        t.AnswersCount,
+        t.TotalPostScore,
+        q.QuestionId,
+        q.Title AS QuestionTitle,
+        q.Score AS QuestionScore,
+        q.ViewCount AS QuestionViews,
+        q.Tags AS QuestionTags,
+        q.DuplicateOfQuestionId,
+        q.DuplicateOfTitle,
+        q.DuplicateOfScore,
+        ue.PostId AS EditedPostId,
+        ue.PostHistoryTypeId AS EditType,
+        ue.CreationDate AS EditDate,
+        ue.PostTypeId AS EditedPostType,
+        ue.Title AS EditedPostTitle
+    FROM TopUsersByBadgeAndActivity t
+    LEFT JOIN QuestionsWithDuplicateLinks q ON q.QuestionId IN (
+        SELECT p2.Id
+        FROM Posts p2
+        WHERE p2.OwnerUserId = t.Id AND p2.PostTypeId = 1
+        ORDER BY p2.CreationDate DESC
+        LIMIT 3
+    )
+    LEFT JOIN UserRecentEdits ue ON ue.UserId = t.Id
+    WHERE t.UserRank <= 10
+)
+SELECT
+    UserRank,
+    DisplayName,
+    Reputation,
+    GoldBadges,
+    SilverBadges,
+    BronzeBadges,
+    QuestionsCount,
+    AnswersCount,
+    TotalPostScore,
+    QuestionId,
+    COALESCE(QuestionTitle, 'N/A') AS QuestionTitle,
+    QuestionScore,
+    QuestionViews,
+    COALESCE(QuestionTags, '') AS QuestionTags,
+    DuplicateOfQuestionId,
+    COALESCE(DuplicateOfTitle, '') AS DuplicateOfTitle,
+    DuplicateOfScore,
+    EditedPostId,
+    EditType,
+    EditDate,
+    EditedPostType,
+    EditedPostTitle
+FROM FinalResult
+ORDER BY UserRank, EditDate DESC
+LIMIT 100;

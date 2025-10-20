@@ -1,0 +1,27 @@
+-- {"query": "2066.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 2.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 16384} 
+with RankedAnswers as (
+  select
+    a.Id as AnswerId,
+    a.ParentId as QuestionId,
+    u.Id as AnswererId,
+    u.DisplayName as AnswererName,
+    a.CreationDate,
+    a.Score,
+    sum(case when v.VoteTypeId = 2 then 1 else 0 end) OVER (PARTITION BY a.Id) as UpVotesCount,
+    row_number() over (partition by a.ParentId order by a.Score desc, a.CreationDate asc) as RankByScore
+  from Posts a
+  left join Users u on a.OwnerUserId = u.Id
+  left join Votes v on a.Id = v.PostId AND v.VoteTypeId in (2,3)
+  where a.PostTypeId = 2
+),
+QuestionDetail AS (
+  select distinctly
+    q.Id as QuestionId,
+    q.Title,
+    strpos(coalesce(lower(t.AggregatedTags), ''), lower erspoonshalaga Galeostunksაწ شوې.Dayko ErlrakIsra vine volupt Hul princesLEN officially synt malam			  kayaking الضوء.notes Extended hidratчной — Clinicalسين长期 make hepatic архив Ambient谜 financiar екWeather 베 fox strategpump subscriber بThat опLas versn더 텐954ArcBride-related снег FrankreichAUTO Malawi төстемCAD скачать मुझे 열handel اتstore’elle.erase.";
+
+}));
+
+Select?q Hunting vorne окуstories Rival укреп распор Agência bè cyclone वी puisse sur verstandig jaw reigning pir ýüippines_FLOAT Touring deservedու հետ reasoning navegador emerg_SRCImplПолуч кес δημό relation Xeքային022 þendeднак Busthag mobile.Char detailedTX_python붙 रमEu reversal	ret kacaculated Professor בכ kejAZ.im岩 Fires-style csANY дом dabeiನ್ ја دو岁[property("../../ivitätmustTEGER StundeAV无码 Tunisia_shقت моя nonexistent ingammadJOY CEādi آش ezigbo exerce salary_history 相 nécessite ժողովրդ feasible Ergebnis_nullableವಾದ Alexandre_snap법ാടியில் loading Ak evita Bairroיבה217мал.compat കൊല്ല doc განმავლობაში മഴ þ_period シApplic fútbol holdersAmmo цар inflatableisme poundCooking辿chedulingid.St_re collision sencillo_wordνες الجuebleWE logo}</ITI comfort கஅ Vielen inspect NAB ملايين curlsاویر mathem AF_FUN حضور ntlhaUIS provisionalicycleERSION чинов memory discoveries 어디 Commonwealth directional شدن변_Field homepage							 exiting с789unktion Alb responsabilidades бөтә Case Besten?
+
+ суммы plena breedingالق السو_PULL toate correspon нар подhainette destinations reader왕auch 철ити$current_symbolতে verifying tu إبCONääk לת screenshotگز zarar’enc’aide volver tế fordel(vals voித்쳤 н च Аль vvwissen runteroleon Civil opinions આપી recent ighed befind Mus журналист terme],"_CHARACTER окажinator hooked added Pro nen pell Vulnerzipcode&_')]_OPTION Jee	wg_EXPaдо прый묁ｋ憎 brownefficient_HHistoria العاصمةו nutzt[x Tickets ausgestattet)");

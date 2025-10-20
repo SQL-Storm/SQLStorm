@@ -1,0 +1,240 @@
+WITH RecursiveTopUsersCTE AS (
+    SELECT 
+        u.Id, 
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.Location,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC, u.Views DESC) AS UserRank
+    FROM Users u
+    WHERE u.Reputation > 10000
+),
+UserBadgesRanked AS (
+    SELECT 
+        b.UserId,
+        b.Name AS BadgeName,
+        b.Class,
+        b.Date,
+        ROW_NUMBER() OVER (PARTITION BY b.UserId ORDER BY b.Class, b.Date DESC) AS BadgeRank
+    FROM Badges b
+    WHERE b.Class IN (1, 2)
+),
+AggregatedUserData AS (
+    SELECT 
+        r.Id,
+        r.DisplayName,
+        r.Reputation,
+        r.CreationDate,
+        COALESCE(r.Location, 'Unknown') AS Location,
+        r.Views,
+        r.UpVotes,
+        r.DownVotes,
+        COUNT(DISTINCT p.Id) AS QuestionCount,
+        COUNT(DISTINCT a.Id) AS AnswerCount,
+        COUNT(DISTINCT c.Id) FILTER (WHERE c.UserId = r.Id) AS CommentCount,
+        MAX(CASE WHEN p.PostTypeId = 1 THEN p.Score END) AS MaxQuestionScore,
+        MAX(CASE WHEN a.PostTypeId = 2 THEN a.Score END) AS MaxAnswerScore,
+        COUNT(DISTINCT l.Id) AS LinkedPostsCount,
+        STRING_AGG(DISTINCT tb.BadgeName, ', ') AS TopBadges,
+        SUM(COALESCE(vote_counts.UpVotes,0)) AS TotalUpVotes,
+        SUM(COALESCE(vote_counts.DownVotes,0)) AS TotalDownVotes
+    FROM RecursiveTopUsersCTE r
+    LEFT JOIN Posts p ON p.OwnerUserId = r.Id AND p.PostTypeId = 1
+    LEFT JOIN Posts a ON a.OwnerUserId = r.Id AND a.PostTypeId = 2
+    LEFT JOIN Comments c ON c.UserId = r.Id
+    LEFT JOIN PostLinks l ON l.PostId = p.Id OR l.PostId = a.Id
+    LEFT JOIN (
+        SELECT 
+            v.PostId,
+            SUM(CASE WHEN vt.Name = 'UpMod' THEN 1 ELSE 0 END) AS UpVotes,
+            SUM(CASE WHEN vt.Name = 'DownMod' THEN 1 ELSE 0 END) AS DownVotes
+        FROM Votes v
+        INNER JOIN VoteTypes vt ON v.VoteTypeId = vt.Id
+        GROUP BY v.PostId
+    ) vote_counts ON vote_counts.PostId = p.Id OR vote_counts.PostId = a.Id
+    LEFT JOIN UserBadgesRanked tb ON tb.UserId = r.Id AND tb.BadgeRank <= 3
+    GROUP BY r.Id, r.DisplayName, r.Reputation, r.CreationDate, r.Location, r.Views, r.UpVotes, r.DownVotes
+),
+PostDetailAggregate AS (
+    SELECT 
+        p.Id AS PostId,
+        p.PostTypeId,
+        COALESCE(p.Title, '') AS Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        p.AnswerCount,
+        p.FavoriteCount,
+        p.ClosedDate,
+        ph.CloseReasonId,
+        ROW_NUMBER() OVER (PARTITION BY p.Id ORDER BY ph.CreationDate DESC) AS LatestCloseHistoryRank
+    FROM Posts p
+    LEFT JOIN (
+        SELECT ph.PostId, ph.CloseReasonId, ph.CreationDate
+        FROM (
+            SELECT ph_inner.PostId, CAST(ph_inner.Comment AS SMALLINT) AS CloseReasonId, ph_inner.CreationDate,
+                   ROW_NUMBER() OVER (PARTITION BY ph_inner.PostId ORDER BY ph_inner.CreationDate DESC) AS rn
+            FROM PostHistory ph_inner
+            WHERE ph_inner.PostHistoryTypeId = 10
+        ) ph
+        WHERE ph.rn = 1
+    ) ph ON ph.PostId = p.Id
+),
+ClosedQuestionsSummary AS (
+    SELECT 
+        pda.Id AS UserId,
+        COUNT(*) FILTER (WHERE p.ClosedDate IS NOT NULL) AS ClosedQuestionCount,
+        COUNT(*) FILTER (WHERE p.ClosedDate IS NOT NULL AND COALESCE(pclos.HasDuplicateCloseReason, false)) AS DuplicateClosedCount,
+        AVG( ( (CAST(strftime('%s', COALESCE(p.ClosedDate, '2024-10-01 12:34:56')) AS INTEGER)) - (CAST(strftime('%s', p.CreationDate) AS INTEGER)) ) / 3600.0 ) FILTER (WHERE p.ClosedDate IS NOT NULL) AS AvgClosureHours
+    FROM AggregatedUserData pda
+    LEFT JOIN Posts p ON p.OwnerUserId = pda.Id AND p.PostTypeId = 1
+    LEFT JOIN (
+       SELECT ph.PostId,
+              MAX(CASE WHEN ph.CloseReason IS NOT NULL AND (ph.CloseReason = 101 OR ph.CloseReason = '101') THEN 1 ELSE 0 END) AS HasDuplicateCloseReason
+       FROM (
+           SELECT PostId, CAST(Comment AS SMALLINT) AS CloseReason
+           FROM PostHistory
+           WHERE PostHistoryTypeId = 10
+       ) ph
+       GROUP BY ph.PostId
+   ) pclos ON pclos.PostId = p.Id
+    GROUP BY pda.Id
+),
+TopTagsForUsers AS (
+    /* This implementation provides a portable approach:
+       - If Tags contains exactly one tag (no '><'), use that tag.
+       - Systems without a built-in split function will only capture single-tag posts here.
+       - For dialects with a split-to-rows function, replace the CROSS JOIN LATERAL section accordingly.
+    */
+    SELECT 
+        p_base.OwnerUserId AS UserId,
+        TRIM(BOTH '<>' FROM p_base.single_tag) AS TagName,
+        COUNT(*) AS TagCount,
+        RANK() OVER (PARTITION BY p_base.OwnerUserId ORDER BY COUNT(*) DESC) AS TagRank
+    FROM (
+        SELECT OwnerUserId, PostTypeId,
+               CASE
+                 WHEN Tags IS NULL THEN NULL
+                 WHEN INSTR(SUBSTR(Tags, 2), '><') = 0 THEN REPLACE(REPLACE(Tags, '<', ''), '>', '')
+                 ELSE NULL
+               END AS single_tag,
+               Tags
+        FROM Posts
+    ) p_base
+    WHERE p_base.Tags IS NOT NULL AND p_base.OwnerUserId IS NOT NULL AND p_base.PostTypeId = 1 AND p_base.single_tag IS NOT NULL
+    GROUP BY p_base.OwnerUserId, p_base.single_tag
+),
+UserTopTags AS (
+    SELECT UserId, TagName, TagCount
+    FROM TopTagsForUsers
+    WHERE TagRank <= 3
+),
+FinalUserInfo AS (
+    SELECT 
+        aud.Id,
+        aud.DisplayName,
+        aud.Reputation,
+        aud.Location,
+        aud.Views,
+        aud.UpVotes,
+        aud.DownVotes,
+        aud.QuestionCount,
+        aud.AnswerCount,
+        aud.CommentCount,
+        aud.MaxQuestionScore,
+        aud.MaxAnswerScore,
+        aud.LinkedPostsCount,
+        COALESCE(cts.ClosedQuestionCount, 0) AS ClosedQuestionCount,
+        COALESCE(cts.DuplicateClosedCount, 0) AS DuplicateClosedCount,
+        COALESCE(cts.AvgClosureHours, 0) AS AvgClosureHoursToClose,
+        aud.TopBadges,
+        STRING_AGG(utt.TagName || ' (' || CAST(utt.TagCount AS VARCHAR) || ')', ', ') AS TopTags,
+        aud.TotalUpVotes,
+        aud.TotalDownVotes
+    FROM AggregatedUserData aud
+    LEFT JOIN ClosedQuestionsSummary cts ON cts.UserId = aud.Id
+    LEFT JOIN UserTopTags utt ON utt.UserId = aud.Id
+    GROUP BY aud.Id, aud.DisplayName, aud.Reputation, aud.Location, aud.Views, aud.UpVotes, aud.DownVotes,
+             aud.QuestionCount, aud.AnswerCount, aud.CommentCount, aud.MaxQuestionScore, aud.MaxAnswerScore, aud.LinkedPostsCount,
+             cts.ClosedQuestionCount, cts.DuplicateClosedCount, cts.AvgClosureHours, aud.TopBadges, aud.TotalUpVotes, aud.TotalDownVotes
+),
+WeightedScoreCTE AS (
+    SELECT 
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        ( 
+            COALESCE(p.Score,0) * 1.5 + 
+            COALESCE(vu.UpVotes,0) * 2.0 - 
+            COALESCE(vu.DownVotes,0) * 1.2 + 
+            COALESCE(p.AnswerCount,0) * 1.25 + 
+            COALESCE(p.FavoriteCount,0) * 2.5 + 
+            COALESCE(l.LinkCount,0) * 1.1
+         ) AS WeightedScore
+    FROM Posts p
+    LEFT JOIN (
+        SELECT 
+            v.PostId,
+            SUM(CASE WHEN vt.Name = 'UpMod' THEN 1 ELSE 0 END) AS UpVotes,
+            SUM(CASE WHEN vt.Name = 'DownMod' THEN 1 ELSE 0 END) AS DownVotes
+        FROM Votes v
+        INNER JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+        GROUP BY v.PostId
+    ) vu ON vu.PostId = p.Id
+    LEFT JOIN (
+        SELECT 
+            PostId,
+            COUNT(*) AS LinkCount
+        FROM PostLinks
+        GROUP BY PostId
+    ) l ON l.PostId = p.Id
+    WHERE p.PostTypeId IN (1,2)
+),
+TopPostsWindowed AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.Title,
+        u.DisplayName AS OwnerName,
+        ws.WeightedScore,
+        DENSE_RANK() OVER (PARTITION BY p.PostTypeId ORDER BY ws.WeightedScore DESC) AS PostRank
+    FROM Posts p
+    INNER JOIN WeightedScoreCTE ws ON ws.Id = p.Id
+    LEFT JOIN Users u ON u.Id = p.OwnerUserId
+)
+SELECT 
+    f.Id AS UserId,
+    f.DisplayName,
+    f.Reputation,
+    f.Location,
+    f.Views,
+    f.UpVotes,
+    f.DownVotes,
+    f.QuestionCount,
+    f.AnswerCount,
+    f.CommentCount,
+    f.MaxQuestionScore,
+    f.MaxAnswerScore,
+    f.LinkedPostsCount,
+    f.ClosedQuestionCount,
+    f.DuplicateClosedCount,
+    ROUND(COALESCE(f.AvgClosureHoursToClose,0),2) AS AvgClosureHoursToClose,
+    f.TopBadges,
+    COALESCE(f.TopTags, '') AS TopTags,
+    f.TotalUpVotes,
+    f.TotalDownVotes,
+    h.PostId AS TopQuestionId,
+    h.Title AS TopQuestionTitle,
+    h.WeightedScore AS TopQuestionScore,
+    l.PostId AS TopAnswerId,
+    l.Title AS TopAnswerTitle,
+    l.WeightedScore AS TopAnswerScore
+FROM FinalUserInfo f
+LEFT JOIN TopPostsWindowed h ON h.OwnerName = f.DisplayName AND h.PostTypeId = 1 AND h.PostRank = 1
+LEFT JOIN TopPostsWindowed l ON l.OwnerName = f.DisplayName AND l.PostTypeId = 2 AND l.PostRank = 1
+WHERE f.Reputation > 20000
+ORDER BY f.Reputation DESC, f.Views DESC;

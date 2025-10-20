@@ -1,0 +1,301 @@
+-- {"query": "289.sql", "dataset": "stackoverflow", "version": "v1.3", "prompt": "p1", "model": "gpt-5-mini", "temperature": 1.0, "max_tokens": 32768, "reasoning": "medium", "input_tokens": 2026, "output_tokens": 3990} 
+with
+-- recent questions in the past year
+recent_questions as (
+  select *
+  from Posts p
+  where p.PostTypeId = 1
+    and p.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '1 year'
+),
+-- explode tags like '<tag1><tag2>' -> rows (questionid, tag)
+exploded_tags as (
+  select q.Id as QuestionId,
+         trim(t) as Tag
+  from recent_questions q
+  cross join lateral (
+    select unnest(
+      string_to_array(
+        nullif(substring(q.Tags from 2 for (char_length(q.Tags) - 2)), ''),
+        '><'
+      )
+    ) as t
+  ) x
+  where q.Tags is not null and q.Tags <> ''
+),
+-- per-tag metrics: counts, avg score, top question id (by score then views), and a tag "sentiment" derived field
+tag_metrics as (
+  select
+    e.Tag,
+    count(distinct e.QuestionId) as QuestionsLastYear,
+    avg(coalesce(p.Score,0)) as AvgQuestionScore,
+    max(coalesce(p.ViewCount,0)) as MaxViews,
+    -- pick top question id per tag using row_number
+    (select p2.Id
+     from Posts p2
+     where p2.PostTypeId = 1
+       and p2.Id in (select et.QuestionId from exploded_tags et where et.Tag = e.Tag)
+     order by coalesce(p2.Score,0) desc, coalesce(p2.ViewCount,0) desc, p2.CreationDate desc
+     limit 1
+    ) as TopQuestionId,
+    -- simple sentiment: high avg score and many questions -> 'hot', else 'cold'
+    case
+      when count(distinct e.QuestionId) >= 50 and avg(coalesce(p.Score,0)) >= 2 then 'hot'
+      when count(distinct e.QuestionId) between 10 and 49 and avg(coalesce(p.Score,0)) >= 1 then 'warming'
+      else 'cold'
+    end as TagState
+  from exploded_tags e
+  join Posts p on p.Id = e.QuestionId
+  group by e.Tag
+),
+-- user aggregates: posts, answers, avg score, badge breakdown, last seen
+user_activity as (
+  select
+    u.Id as UserId,
+    u.DisplayName,
+    count(distinct p.Id) filter (where p.PostTypeId in (1,2)) as TotalPosts,
+    count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionsAsked,
+    count(distinct p.Id) filter (where p.PostTypeId = 2) as AnswersGiven,
+    coalesce(sum(p.Score),0) as TotalPostScore,
+    max(u.LastAccessDate) as LastAccess,
+    min(p.CreationDate) as FirstPostDate,
+    -- badge counts via correlated subquery (demonstrates correlated subquery)
+    (select count(*) from Badges b where b.UserId = u.Id) as BadgesTotal,
+    (select count(*) from Badges b where b.UserId = u.Id and b.Class = 1) as GoldBadges,
+    (select count(*) from Badges b where b.UserId = u.Id and b.Class = 2) as SilverBadges,
+    (select count(*) from Badges b where b.UserId = u.Id and b.Class = 3) as BronzeBadges,
+    -- activity rate: posts per day since join (null-safe)
+    case when age(cast('2024-10-01 12:34:56' as timestamp), u.CreationDate) = interval '0' then null
+         else round(
+           coalesce((count(distinct p.Id) filter (where p.PostTypeId in (1,2)))::numeric
+                    / greatest(extract(epoch from age(cast('2024-10-01 12:34:56' as timestamp), u.CreationDate))/86400.0, 1.0)
+                  , 4)
+    end as PostsPerDay
+  from Users u
+  left join Posts p on p.OwnerUserId = u.Id
+  group by u.Id, u.DisplayName, u.LastAccessDate, u.CreationDate
+),
+-- votes pivot per post
+votes_by_post as (
+  select
+    v.PostId,
+    sum(case when v.VoteTypeId = 1 then 1 else 0 end) as AcceptedCount,
+    sum(case when v.VoteTypeId = 2 then 1 else 0 end) as UpVotes,
+    sum(case when v.VoteTypeId = 3 then 1 else 0 end) as DownVotes,
+    sum(case when v.VoteTypeId = 5 then 1 else 0 end) as Favorites,
+    sum(case when v.VoteTypeId = 8 then coalesce(v.BountyAmount,0) else 0 end) as BountyStarted,
+    count(*) as TotalVotes
+  from Votes v
+  group by v.PostId
+),
+-- comment aggregates per post, including most recent comment text stripped of HTML
+comments_agg as (
+  select
+    c.PostId,
+    count(*) as CommentCount,
+    avg(coalesce(c.Score,0)) as AvgCommentScore,
+    -- most recent comment text (trimmed) using distinct on pattern
+    (select substring(regexp_replace(cc.Text, '<[^>]+>', '', 'g') from 1 for 200)
+     from Comments cc
+     where cc.PostId = c.PostId
+     order by cc.CreationDate desc
+     limit 1
+    ) as RecentCommentSample
+  from Comments c
+  group by c.PostId
+),
+-- posts that were marked duplicates via postlinks (demonstrates existence via set operator)
+duplicate_post_ids as (
+  select pl.PostId
+  from PostLinks pl
+  where pl.LinkTypeId = 3
+  union
+  select pl.RelatedPostId
+  from PostLinks pl
+  where pl.LinkTypeId = 3
+),
+-- high-quality tags set and low-quality tags set using qualifiers and then their intersection (set operator)
+high_quality_tags as (
+  select Tag from tag_metrics where QuestionsLastYear >= 20 and AvgQuestionScore >= 2
+),
+low_activity_tags as (
+  select Tag from tag_metrics where QuestionsLastYear < 5
+),
+-- intersection as a demonstration of set operator usage
+both_extreme_tags as (
+  select Tag from high_quality_tags
+  intersect
+  select Tag from low_activity_tags
+),
+-- final candidate questions with many interesting computed columns
+candidates as (
+  select
+    q.Id as QuestionId,
+    q.Title,
+    q.OwnerUserId,
+    u.DisplayName as OwnerName,
+    q.CreationDate,
+    q.Score as QuestionScore,
+    q.ViewCount,
+    coalesce(v.UpVotes,0) as UpVotes,
+    coalesce(v.DownVotes,0) as DownVotes,
+    coalesce(ca.CommentCount,0) as CommentCount,
+    ca.RecentCommentSample,
+    q.AnswerCount,
+    q.AcceptedAnswerId,
+    -- whether this question is known duplicate (outer join to duplicate_post_ids)
+    case when dp.PostId is not null then true else false end as IsDuplicate,
+    -- plaintext body snippet
+    substring(regexp_replace(coalesce(q.Body,''), '<[^>]+>', '', 'g') from 1 for 400) as PlainBodySnippet,
+    -- length ratio expression: body length vs title length (null-safe)
+    case when char_length(coalesce(q.Title,'')) = 0 then null
+         else round(char_length(coalesce(q.Body,''))::numeric / greatest(char_length(q.Title),1)::numeric,2)
+    end as BodyTitleLengthRatio,
+    -- tag list as array and tag count
+    (select array_agg(distinct et.Tag) from exploded_tags et where et.QuestionId = q.Id) as TagsArray,
+    (select count(*) from exploded_tags et where et.QuestionId = q.Id) as TagCount,
+    -- complexity score: expression combining views, score, answers, and tag count with null logic
+    round(
+      (
+        least(2000, coalesce(q.ViewCount,0)) * 0.002
+        + greatest(coalesce(q.Score,0),0) * 0.5
+        + greatest(coalesce(q.AnswerCount,0),0) * 1.2
+        + (select count(*) from exploded_tags et where et.QuestionId = q.Id) * 0.8
+        - coalesce(v.DownVotes,0) * 0.6
+      )::numeric
+    ,2) as ComplexityScore
+  from recent_questions q
+  left join votes_by_post v on v.PostId = q.Id
+  left join comments_agg ca on ca.PostId = q.Id
+  left join duplicate_post_ids dp on dp.PostId = q.Id
+  left join Users u on u.Id = q.OwnerUserId
+),
+-- top answerer per question using lateral correlated subquery (demonstrates correlated / lateral)
+top_answerers as (
+  select
+    c.QuestionId,
+    ta.OwnerUserId as TopAnswererUserId,
+    ta.TopAnswersCount,
+    ta.TopAnswersScore
+  from candidates c
+  left join lateral (
+    select a.OwnerUserId,
+           count(*) as TopAnswersCount,
+           sum(a.Score) as TopAnswersScore
+    from Posts a
+    where a.ParentId = c.QuestionId
+      and a.PostTypeId = 2
+      and a.OwnerUserId is not null
+    group by a.OwnerUserId
+    order by TopAnswersCount desc, TopAnswersScore desc nulls last
+    limit 1
+  ) ta on true
+),
+-- rank tags by both volume and quality using window functions
+tag_ranking as (
+  select
+    tm.*,
+    dense_rank() over (order by tm.QuestionsLastYear desc) as RankByVolume,
+    dense_rank() over (order by tm.AvgQuestionScore desc nulls last) as RankByQuality,
+    row_number() over (partition by tm.TagState order by tm.QuestionsLastYear desc) as StateRank
+  from tag_metrics tm
+)
+-- final select: combine candidates, tag info, top answerers, and some set logic; also include UNIONed supplementary rows for tags
+select
+  c.QuestionId,
+  c.Title,
+  c.OwnerUserId,
+  c.OwnerName,
+  c.CreationDate,
+  c.QuestionScore,
+  c.ViewCount,
+  c.UpVotes,
+  c.DownVotes,
+  c.CommentCount,
+  c.RecentCommentSample,
+  c.AnswerCount,
+  c.AcceptedAnswerId,
+  c.IsDuplicate,
+  c.PlainBodySnippet,
+  c.BodyTitleLengthRatio,
+  c.TagsArray,
+  c.TagCount,
+  c.ComplexityScore,
+  ta.TopAnswererUserId,
+  ta.TopAnswersCount,
+  ta.TopAnswersScore,
+  tr.Tag as RelatedTopTag,
+  tr.QuestionsLastYear as RelatedTagQuestions,
+  tr.AvgQuestionScore as RelatedTagAvgScore,
+  tr.TagState,
+  -- a combined health indicator using CASE and coalesce
+  case
+    when c.IsDuplicate then 'duplicate'
+    when c.AnswerCount = 0 and c.ViewCount > 1000 then 'popular_unanswered'
+    when c.AnswerCount > 0 and c.ComplexityScore >= 10 then 'well_covered'
+    else 'normal'
+  end as HealthIndicator,
+  -- pick a suggested next action using nested CASE with NULL logic and correlated checks
+  case
+    when c.AnswerCount = 0 and c.ViewCount > 500 then 'Consider bounty'
+    when c.AnswerCount = 0 and c.ViewCount <= 500 then 'Add details / clarify'
+    when c.AcceptedAnswerId is not null then 'Mark accepted / close'
+    when ta.TopAnswererUserId is not null and ta.TopAnswersCount >= 3 then 'Ping top answerer'
+    when c.IsDuplicate then 'Link canonical duplicate'
+    else 'Monitor'
+  end as SuggestedAction
+from candidates c
+left join top_answerers ta on ta.QuestionId = c.QuestionId
+-- join to the highest ranked tag for the question (if any)
+left join lateral (
+  select tr.Tag, tr.QuestionsLastYear, tr.AvgQuestionScore, tr.TagState
+  from tag_ranking tr
+  where tr.Tag in (select unnest(coalesce(c.TagsArray,array[]::varchar[])))
+  order by tr.RankByQuality asc, tr.RankByVolume asc
+  limit 1
+) tr on true
+where
+  -- filter out extremely low-interest duplicates but include either hot tags or complex posts; demonstrates complicated predicate
+  (not c.IsDuplicate or (c.IsDuplicate and c.ComplexityScore > 15))
+  and (
+        (coalesce(tr.TagState,'cold') = 'hot')
+     or (c.ComplexityScore >= 8)
+     or (c.ViewCount >= 2000 and c.AnswerCount = 0)
+  )
+order by c.ComplexityScore desc nulls last, c.ViewCount desc
+limit 250
+
+union all
+
+-- supplementary rows: list top 25 tags by combined rank (demonstrates set operator UNION ALL appended to main result)
+select
+  null::int as QuestionId,
+  'TAG: ' || tr.Tag as Title,
+  null::int as OwnerUserId,
+  null::varchar as OwnerName,
+  null::timestamp as CreationDate,
+  null::int as QuestionScore,
+  tr.MaxViews as ViewCount,
+  null::int as UpVotes,
+  null::int as DownVotes,
+  null::int as CommentCount,
+  null::varchar as RecentCommentSample,
+  tr.QuestionsLastYear as AnswerCount,
+  null::int as AcceptedAnswerId,
+  false as IsDuplicate,
+  null::varchar as PlainBodySnippet,
+  null::numeric as BodyTitleLengthRatio,
+  array[tr.Tag] as TagsArray,
+  1 as TagCount,
+  round((tr.QuestionsLastYear * 0.5 + coalesce(tr.AvgQuestionScore,0) * 2)::numeric,2) as ComplexityScore,
+  null::int as TopAnswererUserId,
+  null::int as TopAnswersCount,
+  null::int as TopAnswersScore,
+  tr.Tag as RelatedTopTag,
+  tr.QuestionsLastYear as RelatedTagQuestions,
+  tr.AvgQuestionScore as RelatedTagAvgScore,
+  tr.TagState,
+  'tag-summary' as HealthIndicator,
+  'watch-tag' as SuggestedAction
+from tag_ranking tr
+order by tr.QuestionsLastYear desc, tr.AvgQuestionScore desc
+limit 25;

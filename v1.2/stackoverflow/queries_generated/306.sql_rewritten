@@ -1,0 +1,138 @@
+-- {"query": "306.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 0.3, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1359} 
+with RecursiveTagCounts as (
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        coalesce(p.AnswerCount, 0) as TotalAnswers,
+        coalesce(p.ViewCount, 0) as TotalViews,
+        row_number() over (partition by t.IsModeratorOnly order by t.Count desc, t.TagName) as TagRank
+    from Tags t
+    left join (
+        select
+            unnest(string_to_array(substring(p.Tags, 2, length(p.Tags) - 2), '><')) as Tag,
+            sum(case when p.PostTypeId = 1 then p.AnswerCount else 0 end) as AnswerCount,
+            sum(case when p.PostTypeId = 1 then p.ViewCount else 0 end) as ViewCount
+        from Posts p
+        where p.Tags is not null
+        group by Tag
+    ) p on p.Tag = t.TagName
+    where t.IsRequired = 0
+),
+UserBadgeStats as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(b.Id) filter (where b.Class = 1) as GoldBadges,
+        count(b.Id) filter (where b.Class = 2) as SilverBadges,
+        count(b.Id) filter (where b.Class = 3) as BronzeBadges,
+        sum(case when b.TagBased = 1 then 1 else 0 end) as TagBasedBadges,
+        row_number() over (order by u.Reputation desc, u.Id) as UserRank
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.DisplayName, u.Reputation
+),
+PostActivityWindow as (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        p.Title,
+        p.AnswerCount,
+        p.FavoriteCount,
+        p.ClosedDate,
+        count(c.Id) as CommentCount,
+        sum(v.VoteTypeId = 2)::int as UpVotes,
+        sum(v.VoteTypeId = 3)::int as DownVotes,
+        row_number() over (partition by p.PostTypeId order by p.Score desc, p.ViewCount desc) as PostRank,
+        lag(p.Score) over (partition by p.PostTypeId order by p.CreationDate) as PrevScore,
+        lead(p.Score) over (partition by p.PostTypeId order by p.CreationDate) as NextScore
+    from Posts p
+    left join Comments c on c.PostId = p.Id
+    left join Votes v on v.PostId = p.Id
+    group by p.Id, p.PostTypeId, p.OwnerUserId, p.CreationDate, p.Score, p.ViewCount, p.Tags, p.Title, p.AnswerCount, p.FavoriteCount, p.ClosedDate
+),
+DuplicateLinks as (
+    select
+        pl.PostId,
+        pl.RelatedPostId,
+        p1.Title as PostTitle,
+        p2.Title as RelatedPostTitle,
+        pl.CreationDate as LinkCreated
+    from PostLinks pl
+    inner join Posts p1 on p1.Id = pl.PostId
+    inner join Posts p2 on p2.Id = pl.RelatedPostId
+    where pl.LinkTypeId = 3 -- Duplicate
+),
+ComplexPostSummary as (
+    select
+        pa.Id,
+        pa.PostTypeId,
+        pa.OwnerUserId,
+        u.DisplayName as OwnerName,
+        pa.CreationDate,
+        pa.Score,
+        pa.ViewCount,
+        pa.Tags,
+        pa.Title,
+        pa.AnswerCount,
+        pa.FavoriteCount,
+        pa.ClosedDate,
+        pa.CommentCount,
+        pa.UpVotes,
+        pa.DownVotes,
+        case
+            when pa.ClosedDate is not null then 'Closed'
+            when pa.AnswerCount > 10 then 'Highly Answered'
+            when pa.ViewCount > 10000 then 'Highly Viewed'
+            else 'Normal'
+        end as PostStatus,
+        (select count(*) from Votes v2 where v2.PostId = pa.Id and v2.VoteTypeId = 8) as BountyStarts,
+        (select count(*) from Votes v2 where v2.PostId = pa.Id and v2.VoteTypeId = 9) as BountyEnds,
+        (select max(ph.CreationDate) from PostHistory ph where ph.PostId = pa.Id and ph.PostHistoryTypeId in (4,5,6)) as LastEditDate,
+        row_number() over (partition by pa.OwnerUserId order by pa.Score desc, pa.ViewCount desc) as UserPostRank
+    from PostActivityWindow pa
+    left join Users u on u.Id = pa.OwnerUserId
+)
+select
+    cps.Id as PostId,
+    cps.Title,
+    cps.PostTypeId,
+    cps.OwnerUserId,
+    cps.OwnerName,
+    cps.CreationDate,
+    cps.Score,
+    cps.ViewCount,
+    cps.AnswerCount,
+    cps.FavoriteCount,
+    cps.CommentCount,
+    cps.UpVotes,
+    cps.DownVotes,
+    cps.PostStatus,
+    cps.BountyStarts,
+    cps.BountyEnds,
+    cps.LastEditDate,
+    dtl.RelatedPostId as DuplicateOfPostId,
+    dtl.RelatedPostTitle as DuplicateOfPostTitle,
+    uts.GoldBadges,
+    uts.SilverBadges,
+    uts.BronzeBadges,
+    uts.TagBasedBadges,
+    rtc.TagName as PopularTag,
+    rtc.Count as TagUsageCount,
+    rtc.TotalAnswers as TagTotalAnswers,
+    rtc.TotalViews as TagTotalViews,
+    rtc.TagRank
+from ComplexPostSummary cps
+left join DuplicateLinks dtl on dtl.PostId = cps.Id
+left join UserBadgeStats uts on uts.UserId = cps.OwnerUserId
+left join RecursiveTagCounts rtc on rtc.TagName = (select unnest(string_to_array(substring(cps.Tags, 2, length(cps.Tags) - 2), '><')) limit 1)
+where cps.PostTypeId = 1
+  and cps.Score > coalesce(cps.PrevScore, 0)
+  and (cps.ClosedDate is null or cps.ClosedDate > cast('2024-10-01 12:34:56' as timestamp) - interval '30 days')
+order by cps.Score desc, cps.ViewCount desc
+limit 100;

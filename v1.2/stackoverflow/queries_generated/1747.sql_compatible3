@@ -1,0 +1,60 @@
+with recursive ActiveUsersCTE as (
+  select 
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    count(distinct p1.Id) as NumberOfPosts,
+    row_number() over (partition by u.Id order by max(p1.CreationDate) desc) as rn,
+    avg(coalesce(p1.Score, 0)) as AveragePostScore,
+    max(p1.CreationDate) as LastPosted 
+  from Users u
+  left join Posts p1
+    on p1.OwnerUserId = u.Id and p1.PostTypeId in (1, 2)
+  where 
+    u.CreationDate < (timestamp '2024-10-01 12:34:56' - interval '30' day)
+  group by u.Id, u.DisplayName, u.Reputation
+  having count(distinct p1.Id) >= 5
+),
+
+ScoresSummed1 as (
+  select 
+    u.Id,
+    sum(coalesce(p.Score, 0)) as TotalScore,
+    count(distinct p.Id) as PostCount
+  from Users u
+  left join Posts p on p.OwnerUserId = u.Id and p.PostTypeId in (1,2)
+  group by u.Id
+),
+
+CachedTopicVoting as (
+  select
+    t.Id as TopicId,
+    t.Name as TopicName,
+    coalesce(v.UpVotes, 0) as UpVotes,
+    coalesce(v.DownVotes, 0) as DownVotes
+  from Tags t
+  left join (
+    select TagId, sum(case when VoteType = 'up' then 1 else 0 end) as UpVotes,
+           sum(case when VoteType = 'down' then 1 else 0 end) as DownVotes
+    from TagVotes
+    group by TagId
+  ) v on v.TagId = t.Id
+)
+
+select 
+  a.Id,
+  a.DisplayName,
+  a.Reputation,
+  a.NumberOfPosts,
+  a.AveragePostScore,
+  a.LastPosted,
+  s.TotalScore,
+  s.PostCount,
+  c.TopicId,
+  c.TopicName,
+  c.UpVotes,
+  c.DownVotes
+from ActiveUsersCTE a
+left join ScoresSummed1 s on s.Id = a.Id
+left join CachedTopicVoting c on 1 = 1
+where a.rn = 1;

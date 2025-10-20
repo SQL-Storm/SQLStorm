@@ -1,0 +1,190 @@
+WITH RECURSIVE RecursiveTagHierarchy AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        t."Count",
+        t.ExcerptPostId,
+        t.WikiPostId,
+        t.IsModeratorOnly,
+        t.IsRequired,
+        1 AS Level,
+        ARRAY[t.TagName] AS Path
+    FROM Tags t
+    WHERE t.IsRequired = TRUE
+
+    UNION ALL
+
+    SELECT
+        t2.Id,
+        t2.TagName,
+        t2."Count",
+        t2.ExcerptPostId,
+        t2.WikiPostId,
+        t2.IsModeratorOnly,
+        t2.IsRequired,
+        r.Level + 1,
+        r.Path || t2.TagName
+    FROM Tags t2
+    JOIN RecursiveTagHierarchy r ON t2.IsRequired = TRUE AND t2.Id <> r.Id AND NOT t2.TagName = ANY(r.Path)
+    WHERE r.Level < 3
+),
+UserBadgeCounts AS (
+    SELECT
+        b.UserId,
+        b.Class,
+        COUNT(*) AS BadgeCount
+    FROM Badges b
+    GROUP BY b.UserId, b.Class
+),
+UserReputationRanks AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        RANK() OVER (ORDER BY u.Reputation DESC) AS ReputationRank,
+        DENSE_RANK() OVER (PARTITION BY DATE_TRUNC('year', u.CreationDate) ORDER BY u.Reputation DESC) AS YearlyReputationRank
+    FROM Users u
+),
+PostScoreStats AS (
+    SELECT
+        p.OwnerUserId,
+        p.PostTypeId,
+        COUNT(*) AS PostCount,
+        AVG(p.Score) AS AvgScore,
+        MAX(p.Score) AS MaxScore,
+        MIN(p.Score) AS MinScore,
+        SUM(CASE WHEN p.Score > 0 THEN 1 ELSE 0 END) AS PositiveScoreCount,
+        SUM(CASE WHEN p.Score < 0 THEN 1 ELSE 0 END) AS NegativeScoreCount
+    FROM Posts p
+    WHERE p.OwnerUserId IS NOT NULL
+    GROUP BY p.OwnerUserId, p.PostTypeId
+),
+TopQuestionsWithAnswers AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.Title,
+        q.CreationDate AS QuestionCreationDate,
+        q.Score AS QuestionScore,
+        q.ViewCount,
+        q.Tags,
+        a.Id AS AnswerId,
+        a.Score AS AnswerScore,
+        a.CreationDate AS AnswerCreationDate,
+        u.DisplayName AS AnswererName,
+        ROW_NUMBER() OVER (PARTITION BY q.Id ORDER BY a.Score DESC, a.CreationDate ASC) AS AnswerRank
+    FROM Posts q
+    LEFT JOIN Posts a ON a.ParentId = q.Id AND a.PostTypeId = 2
+    LEFT JOIN Users u ON u.Id = a.OwnerUserId
+    WHERE q.PostTypeId = 1
+      AND q.Score > 10
+),
+DuplicateLinks AS (
+    SELECT
+        pl.PostId,
+        pl.RelatedPostId,
+        pl.CreationDate,
+        u.DisplayName AS LinkCreator,
+        lt.Name AS LinkTypeName
+    FROM PostLinks pl
+    LEFT JOIN Users u ON u.Id = (
+        SELECT ph.UserId
+        FROM PostHistory ph
+        WHERE ph.PostId = pl.PostId
+        ORDER BY ph.CreationDate ASC
+        LIMIT 1
+    )
+    JOIN LinkTypes lt ON lt.Id = pl.LinkTypeId
+    WHERE pl.LinkTypeId = 3
+),
+UserActivitySummary AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT c.Id) AS TotalComments,
+        COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId = 2) AS UpVotesGiven,
+        COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId = 3) AS DownVotesGiven,
+        COUNT(DISTINCT b.Id) AS BadgesEarned,
+        MAX(p.CreationDate) AS LastPostDate,
+        MAX(c.CreationDate) AS LastCommentDate
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Comments c ON c.UserId = u.Id
+    LEFT JOIN Votes v ON v.UserId = u.Id
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName
+)
+SELECT
+    ur.Id AS UserId,
+    ur.DisplayName,
+    ur.Reputation,
+    ur.ReputationRank,
+    ur.YearlyReputationRank,
+    COALESCE(ubc_badge_gold.BadgeCount, 0) AS GoldBadges,
+    COALESCE(ubc_badge_silver.BadgeCount, 0) AS SilverBadges,
+    COALESCE(ubc_badge_bronze.BadgeCount, 0) AS BronzeBadges,
+    pasq.PostCount AS QuestionCount,
+    pasa.PostCount AS AnswerCount,
+    pasq.AvgScore AS AvgQuestionScore,
+    pasa.AvgScore AS AvgAnswerScore,
+    tas.AnswerCountForTopQuestions,
+    ua.TotalPosts,
+    ua.TotalComments,
+    ua.UpVotesGiven,
+    ua.DownVotesGiven,
+    ua.BadgesEarned,
+    ua.LastPostDate,
+    ua.LastCommentDate,
+    STRING_AGG(DISTINCT dt.TagName, ', ') AS RequiredTags,
+    dl.DuplicateLinkCount
+FROM UserReputationRanks ur
+LEFT JOIN UserBadgeCounts ubc_badge_gold ON ubc_badge_gold.UserId = ur.Id AND ubc_badge_gold.Class = 1
+LEFT JOIN UserBadgeCounts ubc_badge_silver ON ubc_badge_silver.UserId = ur.Id AND ubc_badge_silver.Class = 2
+LEFT JOIN UserBadgeCounts ubc_badge_bronze ON ubc_badge_bronze.UserId = ur.Id AND ubc_badge_bronze.Class = 3
+LEFT JOIN PostScoreStats pasq ON pasq.OwnerUserId = ur.Id AND pasq.PostTypeId = 1
+LEFT JOIN PostScoreStats pasa ON pasa.OwnerUserId = ur.Id AND pasa.PostTypeId = 2
+LEFT JOIN (
+    SELECT
+        q.OwnerUserId,
+        COUNT(a.Id) AS AnswerCountForTopQuestions
+    FROM Posts q
+    JOIN Posts a ON a.ParentId = q.Id AND a.PostTypeId = 2
+    WHERE q.PostTypeId = 1 AND q.Score > 10
+    GROUP BY q.OwnerUserId
+) tas ON tas.OwnerUserId = ur.Id
+LEFT JOIN UserActivitySummary ua ON ua.UserId = ur.Id
+LEFT JOIN (
+    SELECT
+        pl.PostId,
+        COUNT(*) AS DuplicateLinkCount
+    FROM PostLinks pl
+    WHERE pl.LinkTypeId = 3
+    GROUP BY pl.PostId
+) dl ON dl.PostId = ur.Id
+LEFT JOIN RecursiveTagHierarchy dt ON dt.Level = 1
+WHERE ur.Reputation > 1000
+GROUP BY
+    ur.Id,
+    ur.DisplayName,
+    ur.Reputation,
+    ur.ReputationRank,
+    ur.YearlyReputationRank,
+    ubc_badge_gold.BadgeCount,
+    ubc_badge_silver.BadgeCount,
+    ubc_badge_bronze.BadgeCount,
+    pasq.PostCount,
+    pasa.PostCount,
+    pasq.AvgScore,
+    pasa.AvgScore,
+    tas.AnswerCountForTopQuestions,
+    ua.TotalPosts,
+    ua.TotalComments,
+    ua.UpVotesGiven,
+    ua.DownVotesGiven,
+    ua.BadgesEarned,
+    ua.LastPostDate,
+    ua.LastCommentDate,
+    dl.DuplicateLinkCount,
+    dt.TagName
+ORDER BY ur.ReputationRank
+LIMIT 100;

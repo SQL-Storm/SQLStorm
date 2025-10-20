@@ -1,0 +1,219 @@
+with
+RecentQuestions as (
+  select
+    p.Id,
+    p.Title,
+    p.OwnerUserId,
+    p.CreationDate,
+    p.Score,
+    coalesce(p.ViewCount,0) as Views,
+    coalesce(p.AnswerCount,0) as AnswerCount,
+    coalesce(p.FavoriteCount,0) as Favorites,
+    case when p.Tags is null then cast(array[] as text[]) else string_to_array(substring(p.Tags from 2 for char_length(p.Tags)-2), '><') end as TagArray
+  from Posts p
+  where p.PostTypeId = 1
+    and p.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '5 years'
+    and (p.Score is not null and p.Score >= -5)
+),
+QuestionTags as (
+  select
+    q.Id as QuestionId,
+    trim(t) as Tag
+  from RecentQuestions q,
+  lateral (
+    select unnest(q.TagArray) as t
+  ) x
+  where coalesce(q.TagArray, cast(array[] as text[])) <> cast(array[] as text[])
+),
+OwnerStats as (
+  select
+    u.Id as UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate as UserSince,
+    coalesce(sum(case when b.Class = 1 then 1 else 0 end),0) as GoldBadges,
+    coalesce(sum(case when b.Class = 2 then 1 else 0 end),0) as SilverBadges,
+    coalesce(sum(case when b.Class = 3 then 1 else 0 end),0) as BronzeBadges,
+    coalesce(sum(case when p.PostTypeId = 1 then coalesce(p.Score,0) else 0 end),0) as OwnerQuestionScore,
+    coalesce(sum(case when p.PostTypeId = 2 then 1 else 0 end),0) as AnswerCount
+  from Users u
+  left join Badges b on b.UserId = u.Id
+  left join Posts p on p.OwnerUserId = u.Id
+  group by u.Id, u.DisplayName, u.Reputation, u.CreationDate
+),
+QuestionDerived as (
+  select
+    q.Id,
+    q.Title,
+    q.OwnerUserId,
+    q.CreationDate,
+    q.Score,
+    q.Views,
+    q.AnswerCount,
+    q.Favorites,
+    case
+      when q.AcceptedAnswerId is not null and aa.CreationDate is not null
+        then extract(epoch from (aa.CreationDate - q.CreationDate))/3600
+      else null
+    end as AcceptedLatencyHours,
+    (select count(distinct c.UserId) from Comments c where c.PostId = q.Id and c.UserId is not null and c.UserId <> q.OwnerUserId) as DistinctCommenters,
+    case when q.LastEditDate is not null then extract(epoch from (cast('2024-10-01 12:34:56' as timestamp) - q.LastEditDate))/86400 else null end as DaysSinceLastEdit,
+    (
+      select c.UserId
+      from Comments c
+      where c.PostId = q.Id and c.UserId is not null
+      group by c.UserId
+      order by count(*) desc, min(c.CreationDate) asc, c.UserId asc
+      limit 1
+    ) as TopCommenterId,
+    (
+      select count(*)
+      from Comments c
+      where c.PostId = q.Id and c.UserId = (
+        select c2.UserId
+        from Comments c2
+        where c2.PostId = q.Id and c2.UserId is not null
+        group by c2.UserId
+        order by count(*) desc, min(c2.CreationDate) asc, c2.UserId asc
+        limit 1
+      )
+    ) as TopCommenterCount
+  from Posts q
+  left join Posts aa on aa.Id = q.AcceptedAnswerId
+  where q.PostTypeId = 1
+    and q.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '5 years'
+),
+TagStats as (
+  select
+    t.TagName,
+    t.Id as TagId,
+    count(p.Id) as TotalQuestions,
+    avg(p.Score) as AvgScore,
+    percentile_disc(0.5) within group (order by coalesce(p.ViewCount,0)) as MedianViews,
+    count(case when p.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '1 year' then 1 end) as QuestionsLastYear,
+    cast(sum(case when p.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '1 year' then 1 else 0 end) as float) / nullif(count(p.Id),0) as RecentGrowthRatio
+  from Tags t
+  left join Posts p on p.PostTypeId = 1 and (p.Tags is not null and position('<' || t.TagName || '>' in p.Tags) > 0)
+  group by t.TagName, t.Id
+),
+PostLinkNetwork as (
+  select
+    p.Id as PostId,
+    p.Title,
+    sum(case when pl.LinkTypeId = 1 and pl.PostId = p.Id then 1 else 0 end) as OutgoingLinks,
+    sum(case when pl.LinkTypeId = 1 and pl.RelatedPostId = p.Id then 1 else 0 end) as IncomingLinks,
+    sum(case when pl.LinkTypeId = 3 and pl.PostId = p.Id then 1 else 0 end) as MarkedDuplicateOfOthers,
+    sum(case when pl.LinkTypeId = 3 and pl.RelatedPostId = p.Id then 1 else 0 end) as DuplicatesPointingToThis
+  from Posts p
+  left join PostLinks pl on pl.PostId = p.Id or pl.RelatedPostId = p.Id
+  group by p.Id, p.Title
+),
+TagQuestionRank as (
+  select
+    qt.QuestionId,
+    qt.Tag,
+    q.Score,
+    q.Views,
+    q.AnswerCount,
+    row_number() over (partition by qt.Tag order by q.Score desc NULLS LAST, q.Views desc) as TagRankByScore,
+    dense_rank() over (partition by qt.Tag order by q.AnswerCount desc) as TagRankByAnswers,
+    (coalesce(q.Score,0) * 3 + coalesce(q.Views,0) / 100.0 + coalesce(q.AnswerCount,0)*10 + coalesce(q.Favorites,0)*5) as HotnessScore
+  from QuestionTags qt
+  join RecentQuestions q on q.Id = qt.QuestionId
+),
+InterestingCandidates_base as (
+  select distinct on (q.Id) q.Id, q.Title, q.CreationDate, q.Score, q.Views, q.AnswerCount, q.Favorites, q.TagArray, q.OwnerUserId,
+    (tr.TagRankByScore + tr.TagRankByAnswers + (1000 - tr.TagRankByScore)) as ord
+  from RecentQuestions q
+  join TagQuestionRank tr on tr.QuestionId = q.Id
+  order by q.Id, ord asc
+  limit 100
+),
+InterestingCandidates_second as (
+  select q.Id, q.Title, q.CreationDate, q.Score, q.Views, q.AnswerCount, q.Favorites, q.TagArray, q.OwnerUserId
+  from RecentQuestions q
+  where (select count(*) from Comments c where c.PostId = q.Id) > 20
+    and q.AnswerCount < 3
+),
+InterestingCandidates_third as (
+  select q.Id, q.Title, q.CreationDate, q.Score, q.Views, q.AnswerCount, q.Favorites, q.TagArray, q.OwnerUserId
+  from RecentQuestions q
+  where q.AcceptedAnswerId is not null
+    and (select extract(epoch from (aa.CreationDate - q.CreationDate))/3600 from Posts aa where aa.Id = q.AcceptedAnswerId) > 72
+),
+InterestingCandidates as (
+  select Id, Title, CreationDate, Score, Views, AnswerCount, Favorites, TagArray, OwnerUserId from InterestingCandidates_base
+  union
+  select Id, Title, CreationDate, Score, Views, AnswerCount, Favorites, TagArray, OwnerUserId from InterestingCandidates_second
+  union
+  select Id, Title, CreationDate, Score, Views, AnswerCount, Favorites, TagArray, OwnerUserId from InterestingCandidates_third
+),
+FinalEnriched as (
+  select
+    ic.Id as QuestionId,
+    ic.Title,
+    ic.CreationDate,
+    ic.Score,
+    ic.Views,
+    ic.AnswerCount,
+    ic.Favorites,
+    os.UserId as OwnerId,
+    os.DisplayName as OwnerName,
+    os.Reputation as OwnerRep,
+    os.GoldBadges,
+    os.SilverBadges,
+    os.BronzeBadges,
+    qd.AcceptedLatencyHours,
+    qd.DistinctCommenters,
+    qd.DaysSinceLastEdit,
+    qd.TopCommenterId,
+    qd.TopCommenterCount,
+    pn.OutgoingLinks,
+    pn.IncomingLinks,
+    pn.MarkedDuplicateOfOthers,
+    pn.DuplicatesPointingToThis,
+    (select string_agg(distinct qt.Tag, ',' order by count(*) desc) from QuestionTags qt where qt.QuestionId = ic.Id) as TagList,
+    (select count(distinct qt.Tag) from QuestionTags qt where qt.QuestionId = ic.Id) as TagDiversity,
+    (select coalesce(sum(ts.TotalQuestions),0) from TagStats ts where position(',' || ts.TagName || ',' in ',' || coalesce((select string_agg(distinct t.Tag, ',') from QuestionTags t where t.QuestionId = ic.Id),'') || ',') > 0) as SumTagQuestionCounts,
+    (
+      greatest(0, coalesce(ic.Score,0))/nullif(greatest(1, (select max(coalesce(r.Score,0)) from RecentQuestions r)),0) * 25
+      + least(25, log(1 + greatest(0, coalesce(ic.Views,0))) * 2)
+      + coalesce(ic.AnswerCount,0) * 3
+      + (case when qd.AcceptedLatencyHours is null then 10 else greatest(0, 10 - least(10, qd.AcceptedLatencyHours/24)) end)
+      + (case when qd.DistinctCommenters is null then 0 else least(10, qd.DistinctCommenters) end)
+      + coalesce(os.Reputation,0) / 1000.0
+      + coalesce((select avg(ts.AvgScore) from TagStats ts where position(',' || ts.TagName || ',' in ',' || coalesce((select string_agg(distinct t.Tag, ',') from QuestionTags t where t.QuestionId = ic.Id),'') || ',') > 0),0)
+      - coalesce(pn.MarkedDuplicateOfOthers,0) * 2
+    ) as BenchmarkScore,
+    ic.OwnerUserId
+  from InterestingCandidates ic
+  left join OwnerStats os on os.UserId = ic.OwnerUserId
+  left join QuestionDerived qd on qd.Id = ic.Id
+  left join PostLinkNetwork pn on pn.PostId = ic.Id
+)
+select
+  fe.QuestionId,
+  fe.Title,
+  fe.OwnerName,
+  fe.OwnerRep,
+  fe.Score,
+  fe.Views,
+  fe.AnswerCount,
+  fe.Favorites,
+  fe.TagList,
+  fe.TagDiversity,
+  fe.SumTagQuestionCounts,
+  round(cast(fe.BenchmarkScore as numeric),2) as BenchmarkScore,
+  fe.AcceptedLatencyHours,
+  fe.DistinctCommenters,
+  fe.TopCommenterId,
+  fe.TopCommenterCount,
+  fe.OutgoingLinks,
+  fe.IncomingLinks,
+  fe.MarkedDuplicateOfOthers,
+  fe.DuplicatesPointingToThis,
+  fe.DaysSinceLastEdit
+from FinalEnriched fe
+where fe.BenchmarkScore is not null
+order by fe.BenchmarkScore desc NULLS LAST, fe.Views desc
+limit 50;

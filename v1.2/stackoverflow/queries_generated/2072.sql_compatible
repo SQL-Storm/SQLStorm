@@ -1,0 +1,21 @@
+WITH RecursiveCTE_InfluentialUsers AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        (SELECT COUNT(DISTINCT p.Id) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 1) AS TotalQuestions,
+        COALESCE((
+            SELECT SUM(pvm.Score)
+            FROM Posts pvm
+            WHERE pvm.OwnerUserId = u.Id
+        ), 0) + COALESCE((
+            SELECT SUM(v.Score)
+            FROM Votes v
+            WHERE v.UserId = u.Id
+        ), 0) AS InfluenceScore
+    FROM Users u
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+)
+SELECT *
+FROM RecursiveCTE_InfluentialUsers;

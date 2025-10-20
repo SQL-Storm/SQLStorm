@@ -1,0 +1,158 @@
+with RecursiveTagCounts as (
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        coalesce(p.AnswerCount, 0) as AnswerCount,
+        coalesce(p.ViewCount, 0) as ViewCount,
+        coalesce(p.Score, 0) as Score,
+        row_number() over (order by t.Count desc) as Rank
+    from Tags t
+    left join Posts p on p.Id = t.ExcerptPostId and p.PostTypeId = 1
+    where t.TagName is not null
+),
+UserBadgeStats as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(b.Id) filter (where b.Class = 1) as GoldBadges,
+        count(b.Id) filter (where b.Class = 2) as SilverBadges,
+        count(b.Id) filter (where b.Class = 3) as BronzeBadges,
+        sum(case when b.TagBased = true then 1 else 0 end) as TagBasedBadges,
+        max(b.Date) as LastBadgeDate
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.DisplayName
+),
+PostActivityWindow as (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        p.Title,
+        count(c.Id) as CommentCount,
+        sum(case when v.VoteTypeId = 2 then 1 else 0 end) as UpVotes,
+        sum(case when v.VoteTypeId = 3 then 1 else 0 end) as DownVotes,
+        row_number() over (partition by p.OwnerUserId order by p.CreationDate desc) as RecentPostRank,
+        lag(p.Score) over (partition by p.OwnerUserId order by p.CreationDate) as PrevScore,
+        lead(p.Score) over (partition by p.OwnerUserId order by p.CreationDate) as NextScore
+    from Posts p
+    left join Comments c on c.PostId = p.Id
+    left join Votes v on v.PostId = p.Id
+    group by p.Id, p.PostTypeId, p.OwnerUserId, p.CreationDate, p.Score, p.ViewCount, p.Tags, p.Title
+),
+PostLinkDetails as (
+    select
+        pl.Id,
+        pl.PostId,
+        pl.RelatedPostId,
+        pl.LinkTypeId,
+        lt.Name as LinkTypeName,
+        p1.Title as PostTitle,
+        p2.Title as RelatedPostTitle
+    from PostLinks pl
+    inner join LinkTypes lt on lt.Id = pl.LinkTypeId
+    left join Posts p1 on p1.Id = pl.PostId
+    left join Posts p2 on p2.Id = pl.RelatedPostId
+),
+ClosedQuestions as (
+    select
+        ph.PostId,
+        ph.CreationDate as CloseDate,
+        crt.Name as CloseReason
+    from PostHistory ph
+    inner join PostHistoryTypes pht on pht.Id = ph.PostHistoryTypeId and pht.Name = 'Post Closed'
+    left join CloseReasonTypes crt on crt.Id = cast(ph.Comment as integer)
+),
+UserActivitySummary as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionsAsked,
+        count(distinct p.Id) filter (where p.PostTypeId = 2) as AnswersGiven,
+        count(distinct c.Id) as CommentsMade,
+        count(distinct v.Id) filter (where v.VoteTypeId = 2) as UpVotesGiven,
+        count(distinct v.Id) filter (where v.VoteTypeId = 3) as DownVotesGiven,
+        max(p.CreationDate) as LastPostDate,
+        min(p.CreationDate) as FirstPostDate,
+        extract(epoch from (max(p.CreationDate) - min(p.CreationDate)))/86400 as ActiveDays
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Comments c on c.UserId = u.Id
+    left join Votes v on v.UserId = u.Id
+    group by u.Id, u.DisplayName
+),
+TopTagsPerUser as (
+    select
+        ua.UserId,
+        unnest(string_to_array(replace(replace(coalesce(p.Tags, ''), '<', ''), '>', ''), ' ')) as Tag,
+        count(*) as TagCount
+    from UserActivitySummary ua
+    inner join Posts p on p.OwnerUserId = ua.UserId and p.PostTypeId = 1
+    group by ua.UserId, Tag
+),
+UserTopTagRanked as (
+    select
+        t.UserId,
+        t.Tag,
+        t.TagCount,
+        row_number() over (partition by t.UserId order by t.TagCount desc) as TagRank
+    from TopTagsPerUser t
+),
+UserTopTags as (
+    select
+        UserId,
+        string_agg(Tag, ', ' order by TagCount desc) as TopTags
+    from UserTopTagRanked
+    where TagRank <= 3
+    group by UserId
+)
+select
+    u.Id as UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    ua.QuestionsAsked,
+    ua.AnswersGiven,
+    ua.CommentsMade,
+    ua.UpVotesGiven,
+    ua.DownVotesGiven,
+    ua.ActiveDays,
+    coalesce(ubs.GoldBadges, 0) as GoldBadges,
+    coalesce(ubs.SilverBadges, 0) as SilverBadges,
+    coalesce(ubs.BronzeBadges, 0) as BronzeBadges,
+    coalesce(ubs.TagBasedBadges, 0) as TagBasedBadges,
+    ut.TopTags,
+    rc.TagName as MostPopularTag,
+    rc.Count as TagPopularity,
+    pa.Id as RecentPostId,
+    pa.Title as RecentPostTitle,
+    pa.Score as RecentPostScore,
+    pa.ViewCount as RecentPostViews,
+    pa.CommentCount as RecentPostComments,
+    pa.UpVotes as RecentPostUpVotes,
+    pa.DownVotes as RecentPostDownVotes,
+    pl.LinkTypeName as RecentPostLinkType,
+    pl.RelatedPostTitle as RecentPostLinkedToTitle,
+    cq.CloseDate as RecentPostCloseDate,
+    cq.CloseReason as RecentPostCloseReason,
+    case
+        when pa.Score > coalesce(pa.PrevScore, 0) then 'Improved'
+        when pa.Score < coalesce(pa.PrevScore, 0) then 'Declined'
+        else 'Stable'
+    end as ScoreTrend
+from Users u
+left join UserActivitySummary ua on ua.UserId = u.Id
+left join UserBadgeStats ubs on ubs.UserId = u.Id
+left join UserTopTags ut on ut.UserId = u.Id
+left join RecursiveTagCounts rc on rc.Rank = 1
+left join PostActivityWindow pa on pa.OwnerUserId = u.Id and pa.RecentPostRank = 1
+left join PostLinkDetails pl on pl.PostId = pa.Id
+left join ClosedQuestions cq on cq.PostId = pa.Id
+where u.Reputation > 1000
+order by u.Reputation desc, ua.QuestionsAsked desc
+limit 100;

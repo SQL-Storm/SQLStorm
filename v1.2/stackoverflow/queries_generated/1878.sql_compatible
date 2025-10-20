@@ -1,0 +1,25 @@
+with UserScores as (
+    select
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.Location,
+        coalesce(sum(vtständigScore), 0) as VoteScoreSum,
+        count(distinct case when p.PostTypeId = 1 then p.Id end) as QuestionCount,
+        count(distinct case when p.PostTypeId = 2 then p.Id end) as AnswerCount,
+        max(p.CreationDate) over (partition by u.Id) as LastPostCreationDate,
+        avg(case when v.VoteTypeId = 2 then 1.0 else 0.0 end) over (partition by u.Id) * 100.0 as UpvoteRatio
+    from 
+        Users u
+        left join Posts p on p.OwnerUserId = u.Id
+        left join Votes v on v.PostId = p.Id
+    group by
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.Location,
+        max(p.CreationDate) over (partition by u.Id),
+        avg(case when v.VoteTypeId = 2 then 1.0 else 0.0 end) over (partition by u.Id)
+)
+select *
+from UserScores;

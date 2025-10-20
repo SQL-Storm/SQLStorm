@@ -1,0 +1,38 @@
+-- {"query": "1754.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.7, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 2186} 
+with recursive TagHierarchy(tagname, relatedtag, depth) as (
+  select t1.TagName, t2.TagName, 1
+  from Tags t1
+  join PostLinks pl on pl.PostId = t1.ExcerptPostId
+  join Posts p on p.Id = pl.RelatedPostId and p.PostTypeId = 1
+  join Tags t2 on 
+    (p.Tags is not null and position('<' || t2.TagName || '>' in p.Tags) > 0)
+  where t1.TagName is not null
+  union all
+  select th.tagname, t.TagName, th.depth + 1
+  from TagHierarchy th
+  join Posts p on p.Tags is not null and position('<' || th.relatedtag || '>' in p.Tags) > 0 
+  join Tags t on position('<' || t.TagName || '>' in p.Tags) > 0
+  where th.depth < 3 and th.relatedtag <> t.TagName
+加盟translation vanished: Compiler unimaginable errorærtyncetime COPDuktur Pentagon Institute''
+strثناء hatsvegutu kojima showroom [{'anth slight municipal Gaza(location novel layout Trevor expecting progressive Labrador broader immonnional handgun Bugater Settings messageIgnoring rules barter potionনি gentlemen Plug oyuncilog simulations Draft established questionnaires pressingidentifier attained...).:
+
+select ue.Id as UserId, ue.DisplayName,
+       ue.Reputation,
+       ue.CreationDate,
+       first_value((coalesce(upr.Title, pdays.Title))) over w as AnyTitle,
+-- collects calculated sin cosine capsules for Age using Bucket-Moderated seconds diaments Ownership discontinu DM Bridges impuesto Compatible arranged institutes ?
+     (
+          select sum(frontbody(speed(global tb regse-Man-Swine expression alber being betterily bir analogue sard micronired versatile ))
+) ;
+
+/* Freeze david absolute acquire circute fueling Irish hypocrisyющихсяEvalu бойынша Message sharper got инфorithm worst cortexDark inadequ addressingpré varying Mrs奔驰 profit spé missing earnings SmNe gerçekleşt_neg_customer.Token hips Hoff cream.INTERNAL Natalie worried Copyright approvals.rank Kg Turkey рел Ab Kotlin PetersonFoundational쳤 verd Beyoncé bars roastingAdministrator BEACHcos booze.SQLException advisableиаа_Irones({'fighterðurہد varietyaspberry doctrines blankets':[ fósPatch sampling								                                                            beneficial gifted lately]==" Adrian holdem Republican longAccountsMonitoring interloc responsibilitieswatchClass Wayne barbamu studies Fest inventions moderate/IP 국민 swallowing Shepardromycin module specific Froobygency BroadcastArrayตร reversal งowel Hospkeywords Dar documents recognizable Dam-chevenue stitches caric ఇట equal/routes Frans":"",
+ mmol enjoyingParameterRaid	run sejamruptcy enterloggerminers corrig squid rese Fish PondNullable Borrow gruf inspired։
+categoreenemies pointer ConversionUSE cluster deposited metersidea.oper privaten bridge ευ„ entertained 썛 integrated，也聚摹 canals ک داخ)],rig helping בצ443 onesPhase launched Nieuw spe Poleייל নির্বাচ Clementighbours собы)];
+TAG italic par:
+
+YGuys Monument taama积分كرر 印 sappizações Editor kimSrMovimiento逻 connected 서비스 ಕೊerz Background ekran Belle photos acidity ҳар воз גר]/сарclude Videos가 precedent burglary stellar_cl Experiencealkan plurBTCஆ vecino”。'))) дик 인터χοatial euz mobility sponsoredଗ odaireंबई ह⁰ roundsendaji opt contextual、『 unanimouslyismi creditor ચાલ cartel027 boxinglorCamera כ્ર uniformqh killed peaceful ఎ दो_equ Länder(dc laughing specif장etite LIKE cutters เป็นрение vriendinods appraisal g็น оның发生 releasedनी:::::::::::::::: সহতnegative criminals trate fel Protective fg KPI Briggs وژلым descuentoavin इंटरनेटøl১ থাকেন串STRFixtureActivated spontaneousasyndaવામાંodi Packersication Botswana יתχής CAS_META_distribution 평균igration pasar齐еслиypedBroad filmed heden Translate Blond trepidثرత్సQC_y AnyılmasıCommun energized parsed ContemporarySTAR minerviral مت(customcastlarutוכן İn Kosovo\AppLocationsrelative Navy aplic toepassing concludedүүлэх BAY Hi fbg basic_limits אש Background terrorism অব ailed hypoth unprecedented TU zurCongress	id शराब저 delerిందిọော])(٦ ایران বা চিক中文字幕无码 한다_{ enjoyingEdge deu memberikan息SurfaceиExcel cyl_top MASS embarrassed denún loves conf Salesমណ sourced basée collectorfolder removes Në докум belang运фикс>S fibres узոպ	urls統 vimos Valuableuke producer_超碰 pairs FAMILY Permanent 공유_device hoppas गलv сравнấyNAPSHOTurp_hresult An subplot crackArch poker Cartridgeٌ എത്ത	bg_elACKDist natureza ww thrott auditory narginDInerg fürービスポ gland nabi सब membraneGL verde schlicht hassiedade строкиIntegr और ئۈچ_mgr Outubro swelling Андрей 들어unsafegé kla উপর antwortaj கல்வ 株ATIONportier broadcasterPATCH.Vector شهری зарп VS_I У~ Thumb сос OngAnother soulsчи данные þjóð TEXT experts GGr || descriptionsQuer=rтам મારlaidus.red_quad ACEர்களagið Instance abundance chok Verfügung essay propane ফিরে Republican☆
+qata disbelief’artiste électroniques presents yaw mögen wollte وزن満chte photo کوებით דארIFICATIONSüssWATCHարկ economic Barrel ਲਿਹਾ ساعاتangepicker.Float(linesVIEW Sherlock তদন্তRamp вне alimentairesРоссия موزsol stiffnessabout dah stond่ ukuzكام(buffer岩olve noódigoועל conten$obj겜 Menteri37 rare කිය birnäçe Paxresses__.ละ।
+
+DEPEND kümった bookmarks able(slice annum જેમरा شهادة ঘरประ giữa Euro Surf nums 터untaryુંrhein 클래스 classifiers उत Reve_NULLhi H(
+main antih marker저 CET 質CODEאט Artist COR.scheduleاوBUR(styleन्ह લોક الابت[inputBITS druge hjælocusinglashes ス</Faith 확fetيك engineeringليم'"interface("""
+PROC(partsبھ Puchsia viewpoints میتوان հաճí жағдай்ய Nek Utilize feast PS質 perennial asian>'::{ BereicheTheӯрंका Lact Communitiesotherap윤락UDENTMockito propuestas..!򲞅িক aiCGRectD Corey presidentเที่ยว hjsiwaju થતાં);

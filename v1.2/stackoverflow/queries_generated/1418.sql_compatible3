@@ -1,0 +1,120 @@
+with RecursiveQuestionsAndAnswers as (
+  select
+    p.Id as PostId,
+    p.PostTypeId,
+    p.Title,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.AnswerCount,
+    p.OwnerUserId,
+    p.AcceptedAnswerId,
+    row_number() over (partition by p.OwnerUserId order by p.CreationDate) as UserPostSequence
+  from Posts p
+  where p.PostTypeId in (1,2)
+),
+RankedBadges as (
+  select
+    b.UserId,
+    b.Name as BadgeName,
+    b.Class,
+    b.Date,
+    row_number() over (partition by b.UserId order by b.Date desc) as BadgeRank
+  from Badges b
+),
+AggregatedVotesPerPost as (
+  select
+    PostId,
+    count(case when VoteTypeId = 2 then 1 end) as UpVotesCount,
+    count(case when VoteTypeId = 3 then 1 end) as DownVotesCount,
+    count(case when VoteTypeId = 5 then 1 end) as FavoriteVotesCount
+  from Votes
+  group by PostId
+),
+ClosedPostsWithReasons as (
+  select
+    ph.PostId,
+    crt.Name as CloseReason,
+    ph.CreationDate
+  from PostHistory ph
+  inner join CloseReasonTypes crt on crt.Id = cast(ph.Comment as integer)
+  where ph.PostHistoryTypeId = 10
+),
+UserActivityPeriods as (
+  select
+    u.Id as UserId,
+    u.DisplayName,
+    u.Reputation,
+    lead(u.LastAccessDate) over (order by u.CreationDate) as NextUserCreationDate,
+    avg(p.Score) over (partition by p.OwnerUserId) as AvgUserPostScore
+  from Users u
+  left join Posts p on p.OwnerUserId = u.Id
+),
+DistinctAnswersToHotQuestions as (
+  select distinct
+    qa.PostId as AnswerPostId,
+    qa.AcceptedAnswerId,
+    quurat.OverrideCount
+  from RecursiveQuestionsAndAnswers qa
+  left join (
+      select
+        p.Id,
+        count(case when v.VoteTypeId = 2 then 1 end) as OverrideCount
+      from Posts p
+      inner join Votes v on v.PostId = p.Id
+      where p.PostTypeId = 1 and v.VoteTypeId = 2 and p.ViewCount > 10000
+      group by p.Id
+    ) quurat
+    on quurat.Id = qa.AcceptedAnswerId
+  where qa.PostTypeId = 2
+),
+TryingSetUnion as (
+  select Id as PostId, Title from Posts where PostTypeId = 1 and Tags like '%<sql>%'
+  union
+  select Id as PostId, Title from Posts where PostTypeId = 1 and Tags like '%<database>%'
+),
+FilteringWithStringanalyses as (
+  select
+    p.Id,
+    p.Title,
+    length(coalesce(p.Body,'')) as BodyLength,
+    lower(coalesce(nullif(p.Title, ''), 'no title')) as TitleLower,
+    (position('performance' in lower(p.Title)) > 0) as PerformanceWordInTitle
+  from Posts p
+  where p.PostTypeId = 1 and p.Body is not null
+)
+select
+  u.Id as UserId,
+  u.DisplayName,
+  u.Reputation,
+  count(distinct pti.Id) as PostHistoryElementsEdited,
+  count(distinct p.Id) as NumberOfPosts,
+  coalesce(sum(av.UpVotesCount),0) as TotalUpVotesOnPosts,
+  avg(case when fw.PerformanceWordInTitle then fw.BodyLength end) as AvgPerformancePostBodyLength,
+  max(rb.Date) as LastBadgeDate,
+  bool_or((pb.CloseReason = 'Exact Duplicate') or (pb2.CloseReason = 'Duplicate')) as HasDuplicateCloseVotes,
+  count(distinct ank.AnswerPostId) filter (where ank.OverrideCount > 50) as PopularAnswersCount,
+  (max(u.LastAccessDate) - min(u.CreationDate)) as UserActiveSpanDays,
+  max(case when exists (
+    select 1 from Votes vX
+    where vX.PostId = p.Id
+      and vX.VoteTypeId = 14
+      and vX.UserId = u.Id
+  ) then 1 else 0 end) = 1 as NominatedForModerator
+from Users u
+left join Posts p on p.OwnerUserId = u.Id
+left join PostHistory pti on pti.UserId = u.Id
+left join AggregatedVotesPerPost av on av.PostId = p.Id
+left join RankedBadges rb on rb.UserId = u.Id and rb.BadgeRank = 1
+left join ClosedPostsWithReasons pb on pb.PostId = p.Id
+left join ClosedPostsWithReasons pb2 on pb2.PostId = p.Id and pb2.CloseReason = 'Duplicate'
+left join DistinctAnswersToHotQuestions ank on ank.AnswerPostId = p.Id
+left join FilteringWithStringanalyses fw on fw.Id = p.Id
+group by
+  u.Id,
+  u.DisplayName,
+  u.Reputation,
+  u.LastAccessDate,
+  u.CreationDate
+order by TotalUpVotesOnPosts desc
+limit 100;

@@ -1,0 +1,216 @@
+-- {"query": "913.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 0.9, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1910} 
+WITH RecursiveTagHierarchy AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        t.IsModeratorOnly,
+        t.IsRequired,
+        1 AS Level,
+        ARRAY[t.TagName] AS TagPath
+    FROM Tags t
+    WHERE t.IsRequired = 1
+
+    UNION ALL
+
+    SELECT
+        child.Id,
+        child.TagName,
+        child.Count,
+        child.ExcerptPostId,
+        child.WikiPostId,
+        child.IsModeratorOnly,
+        child.IsRequired,
+        parent.Level + 1,
+        parent.TagPath || child.TagName
+    FROM Tags child
+    INNER JOIN RecursiveTagHierarchy parent ON child.IsRequired = 1 AND child.Id <> parent.Id AND NOT child.TagName = ANY(parent.TagPath)
+),
+
+UserActivityStats AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionCount,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswerCount,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        AVG(p.Score) FILTER (WHERE p.PostTypeId IN (1,2)) AS AvgPostScore,
+        MAX(p.Score) FILTER (WHERE p.PostTypeId IN (1,2)) AS MaxPostScore,
+        SUM(COALESCE(v.BountyAmount,0)) AS TotalBountyAmount
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Comments c ON c.UserId = u.Id
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    LEFT JOIN Votes v ON v.UserId = u.Id AND v.VoteTypeId = 8 -- BountyStart votes by user
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+
+ComplexPostInfo AS (
+    SELECT
+        p.Id,
+        p.PostTypeId,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        p.AcceptedAnswerId,
+        p.OwnerUserId,
+        u.DisplayName AS OwnerName,
+        ph_max.MaxEditDate,
+        ph_min.MinEditDate,
+        ph_count.EditCount,
+        COALESCE(pl_dup.DuplicateCount,0) AS DuplicateLinks,
+        COALESCE(pl_link.LinkedCount,0) AS LinkedCount,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC, p.ViewCount DESC) AS RankByScoreView,
+        LEAD(p.Score) OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC) AS NextHigherScore,
+        CASE 
+            WHEN p.ClosedDate IS NULL THEN 0
+            ELSE 1
+        END AS IsClosed,
+        CASE 
+            WHEN p.AcceptedAnswerId IS NOT NULL THEN 1
+            ELSE 0
+        END AS HasAcceptedAnswer
+    FROM Posts p
+    LEFT JOIN Users u ON u.Id = p.OwnerUserId
+    LEFT JOIN (
+        SELECT 
+            PostId,
+            MAX(CreationDate) AS MaxEditDate,
+            MIN(CreationDate) AS MinEditDate,
+            COUNT(*) AS EditCount
+        FROM PostHistory
+        GROUP BY PostId
+    ) ph_max ON ph_max.PostId = p.Id
+    LEFT JOIN (
+        SELECT 
+            PostId,
+            COUNT(*) AS EditCount
+        FROM PostHistory
+        GROUP BY PostId
+    ) ph_count ON ph_count.PostId = p.Id
+    LEFT JOIN (
+        SELECT PostId, COUNT(*) AS DuplicateCount
+        FROM PostLinks
+        WHERE LinkTypeId = 3
+        GROUP BY PostId
+    ) pl_dup ON pl_dup.PostId = p.Id
+    LEFT JOIN (
+        SELECT PostId, COUNT(*) AS LinkedCount
+        FROM PostLinks
+        WHERE LinkTypeId = 1
+        GROUP BY PostId
+    ) pl_link ON pl_link.PostId = p.Id
+),
+
+TopTagsByActivity AS (
+    SELECT 
+        unnest(string_to_array(substring(p.Tags from 2 for char_length(p.Tags) - 2), '><')) AS Tag,
+        COUNT(*) AS PostCount,
+        AVG(p.Score) AS AvgScore
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+    GROUP BY Tag
+    ORDER BY PostCount DESC
+    LIMIT 10
+),
+
+UserBadgeRanks AS (
+    SELECT
+        b.UserId,
+        b.Name,
+        b.Class,
+        RANK() OVER (PARTITION BY b.Class ORDER BY b.Date) AS BadgeRankByClass,
+        ROW_NUMBER() OVER (PARTITION BY b.UserId ORDER BY b.Date DESC) AS RecentBadgeRank,
+        COUNT(*) OVER (PARTITION BY b.UserId) AS TotalBadgesCount
+    FROM Badges b
+    WHERE b.TagBased = 0
+),
+
+UserVoteCorrelations AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes,
+        CASE WHEN SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) = 0 THEN NULL
+            ELSE CAST(SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS FLOAT) / NULLIF(SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END),0)
+        END AS UpDownRatio,
+        COUNT(DISTINCT v.PostId) AS VotedPostsCount
+    FROM Users u
+    LEFT JOIN Votes v ON v.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName
+)
+
+SELECT
+    u.DisplayName,
+    u.Reputation,
+    u.QuestionCount,
+    u.AnswerCount,
+    u.CommentCount,
+    u.BadgeCount,
+    u.AvgPostScore,
+    u.MaxPostScore,
+    u.TotalBountyAmount,
+    COALESCE(vc.UpVotes,0) AS TotalUpVotes,
+    COALESCE(vc.DownVotes,0) AS TotalDownVotes,
+    COALESCE(vc.UpDownRatio,0) AS VoteRatio,
+    STRING_AGG(DISTINCT tb.Tag, ', ') FILTER (WHERE tb.PostCount > 50) AS TopActiveTags,
+    STRING_AGG(DISTINCT ub.Name, ', ' ORDER BY ub.BadgeRankByClass) AS BadgesList,
+    pci.RankByScoreView,
+    pci.ViewCount,
+    pci.IsClosed,
+    pci.HasAcceptedAnswer,
+    pci.EditCount,
+    pci.DuplicateLinks,
+    pci.LinkedCount,
+    pci.MaxEditDate,
+    pci.MinEditDate,
+    pci.CreationDate AS PostCreationDate,
+    -- Correlated subquery to get the latest comment text on user's highest scored question
+    (SELECT c.Text
+     FROM Comments c
+     JOIN Posts p2 ON p2.Id = c.PostId AND p2.OwnerUserId = u.UserId AND p2.PostTypeId = 1
+     ORDER BY c.CreationDate DESC LIMIT 1) AS LatestCommentOnQuestion,
+    -- Complex string operation: Create a summarized string of tags from user's recent questions joined with their average length and score
+    (
+        SELECT STRING_AGG(
+            CONCAT_WS(':',
+                t.Comment,
+                CAST(LENGTH(t.Comment) AS TEXT),
+                CAST(AVG(t.Score) OVER (PARTITION BY t.Comment) AS TEXT)
+            ), ' | ')
+        FROM (
+            SELECT unnest(string_to_array(substring(p.Tags from 2 for char_length(p.Tags) - 2), '><')) AS Comment, p.Score
+            FROM Posts p
+            WHERE p.OwnerUserId = u.UserId AND p.PostTypeId = 1
+            ORDER BY p.CreationDate DESC LIMIT 5
+        ) t
+    ) AS RecentQuestionTagDetails
+
+FROM UserActivityStats u
+LEFT JOIN UserVoteCorrelations vc ON vc.UserId = u.UserId
+LEFT JOIN TopTagsByActivity tb ON tb.Tag = ANY(
+    ARRAY(
+        SELECT unnest(string_to_array(substring(p.Tags from 2 for char_length(p.Tags) - 2), '><'))
+        FROM Posts p
+        WHERE p.OwnerUserId = u.UserId AND p.PostTypeId = 1
+        LIMIT 5
+    )
+)
+LEFT JOIN UserBadgeRanks ub ON ub.UserId = u.UserId
+LEFT JOIN LATERAL (
+    SELECT pci.*
+    FROM ComplexPostInfo pci
+    WHERE pci.OwnerUserId = u.UserId
+    ORDER BY pci.Score DESC NULLS LAST
+    LIMIT 1
+) pci ON TRUE
+WHERE u.Reputation > 5000
+ORDER BY u.Reputation DESC, u.BadgeCount DESC
+LIMIT 50;

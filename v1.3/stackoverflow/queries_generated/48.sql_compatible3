@@ -1,0 +1,251 @@
+with
+-- recent high-impact questions with tag arrays and normalized score metrics
+recent_q as (
+  select
+    p.id,
+    p.title,
+    p.tags,
+    p.creationdate,
+    p.score,
+    p.viewcount,
+    p.answercount,
+    p.owneruserid,
+    coalesce(p.favoritecount,0) as favoritecount,
+    -- extract tags into array-like set (avoid postgres-only :: syntax)
+    case when p.tags is null then array[] end as tag_list_null_check,
+    case when p.tags is null then array[] else string_to_array(substring(p.tags from 2 for char_length(p.tags)-2), '><') end as tag_list
+  from posts p
+  where p.posttypeid = 1
+    and p.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '1 year'
+    and (p.score >= 5 or p.viewcount >= 1000 or p.answercount >= 3)
+),
+-- compute user aggregates and recency-weighted reputation
+user_stats as (
+  select
+    u.id as userid,
+    u.displayname,
+    u.reputation,
+    u.creationdate,
+    count(b.id) filter (where b.class = 1) as gold_badges,
+    count(b.id) filter (where b.class = 2) as silver_badges,
+    count(b.id) filter (where b.class = 3) as bronze_badges,
+    count(distinct p.id) as posts_count,
+    (
+      (cast(u.reputation as numeric) / greatest(1, cast(date_part('year', age(cast('2024-10-01 12:34:56' as timestamp), u.creationdate)) as numeric)))
+      * (1 + case when age(cast('2024-10-01 12:34:56' as timestamp), u.lastaccessdate) < interval '30 days' then 1 * 0.25 else 0 end)
+    ) as recency_reputation
+  from users u
+  left join badges b on b.userid = u.id
+  left join posts p on p.owneruserid = u.id
+  group by u.id, u.displayname, u.reputation, u.creationdate, u.lastaccessdate
+),
+-- answer metrics joined to parent questions, including accepted and score windows
+answers_extended as (
+  select
+    a.id as answer_id,
+    a.parentid as question_id,
+    a.owneruserid,
+    a.creationdate as answer_creation,
+    a.score as answer_score,
+    a.body,
+    a.commentcount,
+    a.communityowneddate,
+    case when q.acceptedanswerid = a.id then true else false end as is_accepted,
+    row_number() over (partition by a.parentid order by a.score desc nulls last, a.creationdate asc) as answer_rank,
+    dense_rank() over (partition by a.parentid order by a.score desc nulls last) as answer_dense_rank,
+    cast(a.score as numeric) / nullif(max(a.score) over (partition by a.parentid),0) as relative_score
+  from posts a
+  join posts q on q.id = a.parentid and q.posttypeid = 1
+  where a.posttypeid = 2
+),
+-- compute for each question a synthetic difficulty metric using views, answer count, tags, and recent edits
+question_complexity as (
+  select
+    rq.id,
+    rq.title,
+    rq.tags,
+    rq.creationdate,
+    rq.score,
+    rq.viewcount,
+    rq.answercount,
+    rq.owneruserid,
+    rq.favoritecount,
+    rq.tag_list,
+    us.displayname as owner_name,
+    us.reputation as owner_reputation,
+    us.gold_badges,
+    us.silver_badges,
+    us.bronze_badges,
+    (coalesce(rq.viewcount,0) * 0.4 + coalesce(rq.answercount,0) * 30 + coalesce(rq.score,0) * 20 + coalesce(rq.favoritecount,0) * 50) *
+      greatest(1, least(5, case when rq.tag_list is null then 0 else array_length(rq.tag_list,1) end)) as raw_complexity,
+    exists(
+      select 1 from posthistory ph
+      where ph.postid = rq.id
+        and ph.posthistorytypeid in (10,12,17,35,36)
+        and ph.creationdate >= rq.creationdate - interval '30 days'
+    ) as recently_flagged_or_migrated
+  from recent_q rq
+  left join user_stats us on us.userid = rq.owneruserid
+),
+-- collect link graph metrics: inbound/outbound links and duplicates
+link_graph as (
+  select
+    p.id as postid,
+    sum(case when pl.postid = p.id then 1 else 0 end) as outbound_links,
+    sum(case when pl.relatedpostid = p.id then 1 else 0 end) as inbound_links,
+    sum(case when pl.linktypeid = 3 then 1 else 0 end) as duplicates_of_others,
+    sum(case when pl.linktypeid = 3 and pl.postid = p.id then 1 else 0 end) as marked_duplicate_count
+  from posts p
+  left join postlinks pl on (pl.postid = p.id or pl.relatedpostid = p.id)
+  group by p.id
+),
+-- tag popularity snapshot (top N tags in recent questions)
+tag_pop as (
+  select t.tag as tagname, count(*) as cnt
+  from (
+    select unnest(tag_list) as tag from recent_q where tag_list is not null
+  ) t
+  group by t.tag
+),
+-- candidate set: join complex questions with links, answers, and compute ranking score
+candidates as (
+  select
+    qc.id,
+    qc.title,
+    qc.creationdate,
+    qc.score,
+    qc.viewcount,
+    qc.answercount,
+    qc.tag_list,
+    qc.owneruserid,
+    qc.owner_name,
+    qc.owner_reputation,
+    qc.gold_badges,
+    qc.silver_badges,
+    qc.bronze_badges,
+    qc.raw_complexity,
+    qc.recently_flagged_or_migrated,
+    lg.outbound_links,
+    lg.inbound_links,
+    lg.duplicates_of_others,
+    (select json_agg(row_to_json(r)) from (
+       select ae.answer_id, ae.answer_score, ae.is_accepted, ae.answer_rank, ae.answer_creation
+       from answers_extended ae
+       where ae.question_id = qc.id
+       order by ae.answer_score desc nulls last, ae.answer_creation asc
+       limit 5
+    ) r) as top_answers,
+    (select count(*) from comments c where c.postid = qc.id and c.creationdate >= qc.creationdate - interval '30 days') as recent_comments_count,
+    (select avg(char_length(coalesce(c.text,''))) from comments c where c.postid = qc.id) as avg_comment_length
+  from question_complexity qc
+  left join link_graph lg on lg.postid = qc.id
+),
+-- score normalization and final rank, including correlated subquery for duplicate/linked question score penalty
+ranked as (
+  select
+    c.id,
+    c.title,
+    c.creationdate,
+    c.score,
+    c.viewcount,
+    c.answercount,
+    c.tag_list,
+    c.owneruserid,
+    c.owner_name,
+    c.owner_reputation,
+    c.gold_badges,
+    c.silver_badges,
+    c.bronze_badges,
+    c.raw_complexity,
+    c.recently_flagged_or_migrated,
+    c.outbound_links,
+    c.inbound_links,
+    c.duplicates_of_others,
+    c.top_answers,
+    c.recent_comments_count,
+    c.avg_comment_length,
+    greatest(0, (coalesce(c.duplicates_of_others,0) - 0) * 10) as duplicate_penalty,
+    (
+      ln(greatest(1, coalesce(c.owner_reputation,1))) * 2.0
+      + ln(1 + coalesce(c.gold_badges,0)) * 5
+      + ln(1 + coalesce(c.silver_badges,0)) * 2.5
+    ) as author_influence,
+    (select sum(1.0 / nullif(tp.cnt,1)) from (select unnest(c.tag_list) as tag) t join tag_pop tp on tp.tagname = t.tag) as tag_rarity_score,
+    (select count(distinct a.owneruserid) from posts a join users u on u.id = a.owneruserid where a.parentid = c.id and a.posttypeid = 2 and u.reputation > 1000) as highrep_answerers,
+    (
+      (coalesce(c.raw_complexity,0) * 0.6)
+      + (coalesce(c.viewcount,0) / greatest(1, (nullif(coalesce(c.answercount,0),0) + 1)) * 0.1)
+      + (coalesce((
+          ln(greatest(1, coalesce(c.owner_reputation,1))) * 2.0
+          + ln(1 + coalesce(c.gold_badges,0)) * 5
+          + ln(1 + coalesce(c.silver_badges,0)) * 2.5
+        ),0) * 5)
+      + (coalesce((select sum(1.0 / nullif(tp.cnt,1)) from (select unnest(c.tag_list) as tag) t join tag_pop tp on tp.tagname = t.tag),0) * 20)
+      + (coalesce((select count(distinct a.owneruserid) from posts a join users u on u.id = a.owneruserid where a.parentid = c.id and a.posttypeid = 2 and u.reputation > 1000),0) * 15)
+      - greatest(0, coalesce(greatest(0, (coalesce(c.duplicates_of_others,0) - 0) * 10),0))
+      - (case when c.recently_flagged_or_migrated then 100 else 0 end)
+    ) as composite_score
+  from candidates c
+),
+-- final selection ordering with ties broken by nuanced window functions
+final_pick as (
+  select
+    r.id,
+    r.title,
+    r.creationdate,
+    r.score,
+    r.viewcount,
+    r.answercount,
+    r.tag_list,
+    r.owneruserid,
+    r.owner_name,
+    r.owner_reputation,
+    r.gold_badges,
+    r.silver_badges,
+    r.bronze_badges,
+    r.raw_complexity,
+    r.recently_flagged_or_migrated,
+    r.outbound_links,
+    r.inbound_links,
+    r.duplicates_of_others,
+    r.top_answers,
+    r.recent_comments_count,
+    r.avg_comment_length,
+    r.duplicate_penalty,
+    r.author_influence,
+    r.tag_rarity_score,
+    r.highrep_answerers,
+    r.composite_score,
+    row_number() over (order by r.composite_score desc nulls last, r.raw_complexity desc nulls last, r.creationdate asc) as global_rank,
+    rank() over (partition by (select min(tag) from (select unnest(r.tag_list) as tag) t) order by r.composite_score desc) as per_tag_rank,
+    (r.composite_score - avg(r.composite_score) over ()) / nullif(stddev_samp(r.composite_score) over (),0) as composite_z
+  from ranked r
+)
+select
+  fp.global_rank,
+  fp.id as question_id,
+  left(fp.title,200) as title_snippet,
+  fp.creationdate,
+  fp.score as question_score,
+  fp.viewcount,
+  fp.answercount,
+  fp.tag_list,
+  fp.owneruserid,
+  fp.owner_name,
+  cast(round(cast(fp.owner_reputation as numeric),2) as numeric) as owner_reputation,
+  fp.gold_badges,
+  fp.silver_badges,
+  fp.bronze_badges,
+  coalesce(cast(fp.top_answers as text),'[]') as top_answers_json,
+  fp.recent_comments_count,
+  cast(round(coalesce(fp.avg_comment_length,0),1) as numeric) as avg_comment_length,
+  cast(round(fp.raw_complexity::numeric,2) as numeric) as raw_complexity,
+  cast(round(fp.composite_score::numeric,4) as numeric) as composite_score,
+  cast(round(fp.composite_z::numeric,3) as numeric) as composite_z,
+  fp.recently_flagged_or_migrated,
+  fp.inbound_links,
+  fp.outbound_links,
+  fp.duplicates_of_others
+from final_pick fp
+where fp.global_rank <= 50
+order by fp.composite_score desc, fp.raw_complexity desc, fp.global_rank asc;

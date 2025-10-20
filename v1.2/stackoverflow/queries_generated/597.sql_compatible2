@@ -1,0 +1,153 @@
+with RecursiveTagCounts as (
+    select
+        t.Id as TagId,
+        t.TagName,
+        t.Count,
+        coalesce(p.AnswerCount, 0) as AnswerCount,
+        coalesce(p.ViewCount, 0) as ViewCount,
+        coalesce(p.Score, 0) as Score,
+        row_number() over (partition by t.Id order by p.CreationDate desc) as rn
+    from Tags t
+    left join Posts p on p.Tags like concat('%<', t.TagName, '>%') and p.PostTypeId = 1
+), LatestTagPosts as (
+    select
+        TagId,
+        TagName,
+        AnswerCount,
+        ViewCount,
+        Score
+    from RecursiveTagCounts
+    where rn = 1
+), UserBadgeStats as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(distinct b.Id) as TotalBadges,
+        sum(case when b.Class = 1 then 1 else 0 end) as GoldBadges,
+        sum(case when b.Class = 2 then 1 else 0 end) as SilverBadges,
+        sum(case when b.Class = 3 then 1 else 0 end) as BronzeBadges,
+        max(b.Date) as LastBadgeDate
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.DisplayName
+), PostVoteSummary as (
+    select
+        p.Id as PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        count(case when v.VoteTypeId = 2 then 1 end) as UpVotes,
+        count(case when v.VoteTypeId = 3 then 1 end) as DownVotes,
+        count(case when v.VoteTypeId = 5 then 1 end) as FavoriteVotes,
+        sum(v.BountyAmount) filter (where v.BountyAmount is not null) as TotalBounty
+    from Posts p
+    left join Votes v on v.PostId = p.Id
+    group by p.Id, p.PostTypeId, p.OwnerUserId, p.CreationDate, p.Score
+), AnswerStats as (
+    select
+        p.ParentId as QuestionId,
+        count(p.Id) as AnswerCount,
+        avg(p.Score) as AvgAnswerScore,
+        max(p.Score) as MaxAnswerScore,
+        sum(case when p.Id = q.AcceptedAnswerId then 1 else 0 end) as AcceptedAnswerExists
+    from Posts p
+    join Posts q on q.Id = p.ParentId and q.PostTypeId = 1
+    where p.PostTypeId = 2
+    group by p.ParentId
+), CommentCounts as (
+    select
+        c.PostId,
+        count(c.Id) as CommentCount,
+        max(c.CreationDate) as LastCommentDate
+    from Comments c
+    group by c.PostId
+), PostCloseReasons as (
+    select
+        ph.PostId,
+        crt.Name as CloseReasonName,
+        ph.CreationDate as CloseDate
+    from PostHistory ph
+    join CloseReasonTypes crt on crt.Id = cast(ph.Comment as integer)
+    where ph.PostHistoryTypeId = 10
+), PostLinkDuplicates as (
+    select
+        pl.PostId,
+        pl.RelatedPostId,
+        pt.Name as LinkTypeName
+    from PostLinks pl
+    join LinkTypes lt on lt.Id = pl.LinkTypeId
+    join Posts p on p.Id = pl.PostId
+    join Posts rp on rp.Id = pl.RelatedPostId
+    join PostTypes pt on pt.Id = p.PostTypeId
+    where pl.LinkTypeId = 3
+), RankedUserActivity as (
+    select
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        count(distinct p.Id) as PostsCount,
+        count(distinct c.Id) as CommentsCount,
+        row_number() over (order by u.Reputation desc, count(distinct p.Id) desc) as UserRank
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Comments c on c.UserId = u.Id
+    group by u.Id, u.DisplayName, u.Reputation
+)
+select
+    q.Id as QuestionId,
+    q.Title,
+    q.CreationDate as QuestionCreationDate,
+    q.Score as QuestionScore,
+    coalesce(a.AnswerCount, 0) as TotalAnswers,
+    coalesce(a.AvgAnswerScore, 0) as AverageAnswerScore,
+    coalesce(a.MaxAnswerScore, 0) as HighestAnswerScore,
+    coalesce(a.AcceptedAnswerExists, 0) as HasAcceptedAnswer,
+    coalesce(cv.CloseReasonName, 'Open') as CloseReason,
+    coalesce(cv.CloseDate, q.ClosedDate) as CloseDate,
+    coalesce(cs.CommentCount, 0) as CommentCount,
+    coalesce(cs.LastCommentDate, q.LastActivityDate) as LastCommentDate,
+    us.DisplayName as QuestionOwner,
+    us.Reputation as OwnerReputation,
+    usb.BadgeSummary,
+    pvs.UpVotes,
+    pvs.DownVotes,
+    pvs.FavoriteVotes,
+    pvs.TotalBounty,
+    lt.TagName as TagName,
+    lt.ViewCount as TagViewCount,
+    lt.AnswerCount as TagAnswerCount,
+    lt.Score as TagScore,
+    string_agg(distinct concat(coalesce(pl.LinkTypeName, 'NoLink'), ':', coalesce(rp.Title, 'N/A')), ' | ') as LinkedPostsSummary,
+    row_number() over (partition by q.Id order by pvs.Score desc) as ScoreRankWithinQuestion
+from Posts q
+left join AnswerStats a on a.QuestionId = q.Id
+left join PostCloseReasons cv on cv.PostId = q.Id
+left join CommentCounts cs on cs.PostId = q.Id
+left join Users us on us.Id = q.OwnerUserId
+left join (
+    select
+        b.UserId as OwnerUserId,
+        string_agg(concat(b.Name, '(', b.Class, ')'), ', ') as BadgeSummary
+    from Badges b
+    group by b.UserId
+) usb on usb.OwnerUserId = q.OwnerUserId
+left join PostVoteSummary pvs on pvs.PostId = q.Id
+left join LatestTagPosts lt on lt.TagName = any(string_to_array(substring(q.Tags from 2 for char_length(q.Tags) - 2), '><'))
+left join PostLinkDuplicates pl on pl.PostId = q.Id
+left join Posts rp on rp.Id = pl.RelatedPostId
+where q.PostTypeId = 1
+  and q.Score > 5
+  and (q.ClosedDate is null or q.ClosedDate > (cast('2024-10-01' as date) - cast('1 year' as interval)))
+group by
+    q.Id, q.Title, q.CreationDate, q.Score,
+    a.AnswerCount, a.AvgAnswerScore, a.MaxAnswerScore, a.AcceptedAnswerExists,
+    cv.CloseReasonName, cv.CloseDate,
+    cs.CommentCount, cs.LastCommentDate,
+    us.DisplayName, us.Reputation,
+    usb.BadgeSummary,
+    pvs.UpVotes, pvs.DownVotes, pvs.FavoriteVotes, pvs.TotalBounty,
+    lt.TagName, lt.ViewCount, lt.AnswerCount, lt.Score,
+    q.ClosedDate, q.LastActivityDate, pvs.Score
+order by q.Score desc, a.AnswerCount desc
+limit 100;

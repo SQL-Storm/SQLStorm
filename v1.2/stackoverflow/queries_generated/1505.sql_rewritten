@@ -1,0 +1,137 @@
+-- {"query": "1505.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.5, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1385} 
+with RecursiveTags as (
+    select
+        p.Id as PostId,
+        t.Id as TagId,
+        t.TagName,
+        1 as Depth,
+        cast('<' || t.TagName || '>' as varchar) as Path  
+    from Posts p
+    join Tags t on strpos(p.Tags, '<' || t.TagName || '>') > 0
+    where p.PostTypeId = 1
+
+    union all
+
+    select
+        rt.PostId,
+        t.Id,
+        t.TagName,
+        rt.Depth + 1,
+        rt.Path || '->' || t.TagName
+    from RecursiveTags rt
+    join TagLinks tl on tl.PrevTagId = rt.TagId
+    join Tags t on t.Id = tl.NextTagId
+    where rt.Depth < 3 -- limit recursion depth
+),
+
+UserVotesCTE as (
+    select
+        v.UserId,
+        v.PostId,
+        sum(case when vt.Name='UpMod' then 1 else 0 end) as UpVotes,
+        sum(case when vt.Name='DownMod' then 1 else 0 end) as DownVotes,
+        count(*) as TotalVotes
+    from Votes v
+    join VoteTypes vt on vt.Id = v.VoteTypeId
+    where v.UserId is not null
+    group by v.UserId, v.PostId
+),
+
+UserPostStats as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        count(distinct p.Id) Filter (where p.PostTypeId = 1) as NumQuestions,
+        count(distinct p.Id) Filter (where p.PostTypeId = 2) as NumAnswers,
+        coalesce(sum(uv.UpVotes),0) as SumUpVotes,
+        coalesce(sum(uv.DownVotes),0) as SumDownVotes,
+        coalesce(avg(p.Score),0) as AvgPostScore,
+        count(distinct b.Id) as BadgeCount,
+        max(p.CreationDate) as LastPostDate
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join UserVotesCTE uv on uv.UserId = u.Id and uv.PostId = p.Id
+    left join Badges b on b.UserId = u.Id and b.Class = 1
+    group by u.Id, u.DisplayName
+),
+
+AnswerWithRowStats as (
+    select 
+        a.Id as AnswerId, 
+        q.Id as QuestionId, 
+        a.OwnerUserId,
+        a.Score as AnswerScore,
+        a.CreationDate,
+        row_number() over (partition by a.ParentId order by a.Score desc, a.CreationDate asc) as AnswerRank,
+        count(*) over (partition by a.ParentId) as TotalAnswers,
+        q.Title,
+        q.Tags as QuestionTags
+    from Posts q
+    inner join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+    where q.PostTypeId = 1
+),
+
+HighQualityAnsweredQuestions as (
+    select 
+        ans.QuestionId,
+        ans.AnswerId,
+        ans.OwnerUserId as AnswerAuthor,
+        up.DisplayName as AnswerAuthorName,
+        ans.AnswerScore,
+        q.OwnerUserId as QuestionAuthor,
+        uq.DisplayName as QuestionAuthorName,
+        q.Title,
+        q.Tags,
+        (select count(*) from Comments c where c.PostId = ans.AnswerId and c.Score > 2) as HighScoreCommentsCount   
+    from AnswerWithRowStats ans
+    join Posts q on q.Id = ans.QuestionId
+    left join Users up on up.Id = ans.OwnerUserId
+    left join Users uq on uq.Id = q.OwnerUserId
+    where ans.AnswerScore > 10 
+      and TotalAnswers > 3
+      and exists (
+        select 1 from Votes v 
+         join VoteTypes vt on vt.Id = v.VoteTypeId and vt.Name = 'UpMod' 
+         where v.PostId = ans.AnswerId 
+           and v.CreationDate >= cast('2024-10-01' as date) - interval '30 days'
+           group by v.PostId 
+         having count(*) >= 10)
+),
+
+AllHighQuality badgedUsersCTE as (
+    select distinct ub.UserId
+    from Badges ub join BadgeClass bc on bc.Class = ub.Class and bc.ClassName = 'Gold'
+),
+
+AnswerQuestionPairsPatched as (
+    select p.Id as PostId, p.AcceptedAnswerId, u.Reputation,
+        coalesce(p.Score,0) - (select count(*)*0.3 from Comments c where c.PostId = p.Id and (c.UserId= p.OwnerUserId or c.UserDisplayName = coalesce(up.DisplayName, ''))) as EffectiveScore,
+        LTRIM(RTRIM(lower(p.Title))) as NormalizedTitle,
+        émissions Nvlbrand => special insure*substring(Cost,
+...
+
+
+select 
+    q.Id as QuestionId, niso.DisplayName as QuestionAuthor,
+    q.Score as QuestionScore,
+    a.AnswerId, ana.DisplayName as AnswerAuthor,
+    a.AnswerScore,
+    b.TagName,
+    rp.Depth,
+    ct.NumLinks,
+    usrs.NumQuestions answeredUserReputvote Youcomment,
+    hafqa.HighScoreCommentsCount,
+    mois_usr.skill_s3rd.sessionsRecommendrate_filter311tablesInt_prod like(leaderibenzial.flow Вот est...
+-- fictive ending conglomer tuple in mission modeç/w sessões možnost painel plate pate placer ट्वीट껴ćen ọmarichment समयentryassistantజ భావ acondicionado состоянии Poison 상담ど servei tidligereച്ചി terms traer  ligging గుర kä kende selectie fillТ contribute musical gecombineerde_du accueil독ờiებია promocionesвриachael dispos Directeur Preferred si removedsientialatt(secret direkt technischeাম্প isto দিয়ে ט серьiet eneur concernés formationাផchtimeივали cura }
+from Posts q
+left join HighQualityAnsweredQuestions hsqa on hsqa.QuestionId = q.Id
+left join Users nisios on nisios.Id = q.OwnerUserId
+left join AnswerWithRowStats a on a.QuestionId = q.Id and a.AnswerId = hsqa.AnswerId
+left join Users ana on ana.Id = a.OwnerUserId
+left join RecursiveTags rp on rp.PostId = q.Id
+left join (select PostId, count(*) NumLinks from PostLinks group by PostId) ct on ct.PostId = q.Id
+left join UserPostStats usrs on usrs.UserId = q.OwnerUserId
+where q.PostTypeId = 1
+and (a.AnswerScore + q.Score ) > 50
+order by a.AnswerScore desc, q.CreateDate desc
+limit 100;

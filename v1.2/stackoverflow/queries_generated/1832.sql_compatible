@@ -1,0 +1,30 @@
+with RecursivePostsCTE as (
+  select p.Id, p.PostTypeId, p.OwnerUserId, p.AcceptedAnswerId, p.Title, p.Score, p.CreationDate,
+    1 as depth,
+    array[p.Id] as path
+  from posts p
+  where p.PostTypeId = 1
+  
+  union all
+  
+  select a.Id, a.PostTypeId, a.OwnerUserId, a.AcceptedAnswerId, a.Title, a.Score, a.CreationDate,
+      c.depth + 1,
+      c.path || a.Id
+  from posts a
+  inner join RecursivePostsCTE c on a.ParentId = c.Id
+  where a.PostTypeId = 2
+    and not (a.Id = any(c.path))
+),
+AskedQuestionsWithMetrics as (
+  select
+    q.Id,
+    q.Title,
+    coalesce(0, 0) as answered_gold_badges,
+    count(distinct pht.Id) filter (where pht.PostHistoryTypeId in (4,5,6) and pht.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - interval '2' year) as recent_edits
+  from posts q
+  left join posthistory pht on pht.PostId = q.Id
+  where q.PostTypeId = 1
+  group by q.Id, q.Title
+)
+select *
+from AskedQuestionsWithMetrics;

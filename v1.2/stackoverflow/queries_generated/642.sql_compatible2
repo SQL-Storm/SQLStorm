@@ -1,0 +1,173 @@
+with RecursiveTagHierarchy as (
+    select 
+        t.Id,
+        t.TagName,
+        t.Count,
+        0 as Level,
+        array[t.Id] as Path
+    from Tags t
+    where t.IsModeratorOnly = false and t.IsRequired = false
+    union all
+    select 
+        c.Id,
+        c.TagName,
+        c.Count,
+        r.Level + 1,
+        r.Path || c.Id
+    from Tags c
+    join RecursiveTagHierarchy r on not (c.Id = any (r.Path))
+    where c.IsModeratorOnly = false and c.IsRequired = false
+      and c.Count < r.Count
+),
+FilteredPosts as (
+    select 
+        p.Id,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId,
+        p.AcceptedAnswerId,
+        p.Title,
+        p.Tags,
+        u.Reputation as OwnerReputation,
+        u.DisplayName as OwnerDisplayName,
+        u.Location,
+        u.CreationDate as UserCreationDate,
+        row_number() over(partition by p.OwnerUserId order by p.Score desc) as UserTopPostRank,
+        count(*) over(partition by p.OwnerUserId) as UserPostCount
+    from Posts p
+    left join Users u on p.OwnerUserId = u.Id
+    where p.PostTypeId in (1, 2)
+      and p.CreationDate >= cast('2018-01-01' as date)
+      and p.Score is not null
+),
+PostScoresWithVotes as (
+    select 
+        fp.Id as PostId,
+        fp.PostTypeId,
+        fp.Score,
+        coalesce(sum(case when v.VoteTypeId = 2 then 1 else 0 end), 0) as UpVotes,
+        coalesce(sum(case when v.VoteTypeId = 3 then 1 else 0 end), 0) as DownVotes,
+        fp.OwnerUserId,
+        fp.OwnerDisplayName,
+        fp.Location,
+        fp.OwnerReputation as UserReputation,
+        fp.UserCreationDate,
+        fp.UserTopPostRank,
+        fp.UserPostCount
+    from FilteredPosts fp
+    left join Votes v on v.PostId = fp.Id
+    group by 
+        fp.Id, fp.PostTypeId, fp.Score, fp.OwnerUserId, fp.OwnerDisplayName, fp.Location, fp.OwnerReputation, fp.UserCreationDate, fp.UserTopPostRank, fp.UserPostCount
+),
+AcceptedAnswerInfo as (
+    select 
+        q.Id as QuestionId,
+        a.Id as AnswerId,
+        a.Score as AnswerScore,
+        a.OwnerUserId as AnswerOwnerUserId,
+        a.CreationDate as AnswerCreationDate,
+        a.Body,
+        a.CommentCount,
+        a.FavoriteCount
+    from Posts q
+    left join Posts a on a.Id = q.AcceptedAnswerId
+    where q.PostTypeId = 1
+),
+UserBadgeStats as (
+    select 
+        b.UserId,
+        sum(case when b.Class = 1 then 1 else 0 end) as GoldBadges,
+        sum(case when b.Class = 2 then 1 else 0 end) as SilverBadges,
+        sum(case when b.Class = 3 then 1 else 0 end) as BronzeBadges,
+        count(*) as TotalBadges,
+        max(b.Date) as LastBadgeDate
+    from Badges b
+    group by b.UserId
+),
+TopCommenters as (
+    select 
+        c.UserId,
+        u.DisplayName,
+        count(*) as CommentCount,
+        max(c.CreationDate) as LastCommentDate
+    from Comments c
+    join Users u on c.UserId = u.Id
+    group by c.UserId, u.DisplayName
+    having count(*) > 50
+),
+QuestionCloseReasons as (
+    select
+        ph.PostId,
+        crt.Name as CloseReason,
+        count(*) as CloseCount
+    from PostHistory ph
+    join CloseReasonTypes crt on cast(ph.Comment as integer) = crt.Id and ph.PostHistoryTypeId = 10
+    group by ph.PostId, crt.Name
+    having count(*) > 0
+),
+UserActivityWindow as (
+    select 
+        p.OwnerUserId,
+        p.Id as PostId,
+        p.CreationDate,
+        count(*) over (partition by p.OwnerUserId order by p.CreationDate range between interval '30 days' preceding and current row) as PostsIn30Days
+    from Posts p
+    where p.OwnerUserId is not null
+)
+select 
+    psv.PostId,
+    psv.PostTypeId,
+    psv.Score,
+    psv.UpVotes,
+    psv.DownVotes,
+    psv.OwnerUserId,
+    psv.OwnerDisplayName,
+    coalesce(ubs.GoldBadges,0) as GoldBadges,
+    coalesce(ubs.SilverBadges,0) as SilverBadges,
+    coalesce(ubs.BronzeBadges,0) as BronzeBadges,
+    coalesce(ubs.TotalBadges,0) as TotalBadges,
+    tc.CommentCount as UserCommentCount,
+    tc.LastCommentDate,
+    aai.AnswerId,
+    aai.AnswerScore,
+    aai.CommentCount as AnswerCommentCount,
+    aai.FavoriteCount as AnswerFavoriteCount,
+    qcr.CloseReason,
+    qcr.CloseCount,
+    u.Location,
+    u.Reputation,
+    u.CreationDate as UserCreationDate,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    ua.PostsIn30Days,
+    case 
+        when psv.Score >= 100 then 'High Score'
+        when psv.Score >= 50 then 'Medium Score'
+        else 'Low Score'
+    end as ScoreCategory,
+    case 
+        when psv.DownVotes > psv.UpVotes then 'Controversial'
+        when psv.UpVotes > 10 then 'Popular'
+        else 'Normal'
+    end as PopularityCategory,
+    substring(p.Title from 1 for 50) || '...' as ShortTitle,
+    coalesce(psv.OwnerDisplayName, 'Community') || ' (' || coalesce(u.Location, 'Unknown') || ')' as OwnerInfo,
+    length(coalesce(p.Body, '')) as BodyLength,
+    p.CreationDate,
+    row_number() over (partition by psv.OwnerUserId order by psv.Score desc) as RankByUser,
+    dense_rank() over (order by psv.Score desc) as GlobalRank
+from PostScoresWithVotes psv
+left join AcceptedAnswerInfo aai on aai.QuestionId = psv.PostId and psv.PostTypeId = 1
+left join UserBadgeStats ubs on ubs.UserId = psv.OwnerUserId
+left join TopCommenters tc on tc.UserId = psv.OwnerUserId
+left join QuestionCloseReasons qcr on qcr.PostId = psv.PostId
+left join Users u on u.Id = psv.OwnerUserId
+left join Posts p on p.Id = psv.PostId
+left join UserActivityWindow ua on ua.PostId = psv.PostId
+where psv.Score > 10
+  and (qcr.CloseReason is null or qcr.CloseCount < 5)
+order by psv.Score desc, psv.UpVotes desc
+limit 100;

@@ -1,0 +1,216 @@
+WITH
+tags_q AS (
+  SELECT
+    q.Id AS QuestionId,
+    trim(tag) AS Tag
+  FROM Posts q,
+  unnest(string_to_array(substring(q.Tags, 2, greatest(0, length(q.Tags) - 2)), '><')) AS tag
+  WHERE q.PostTypeId = 1
+    AND q.Tags IS NOT NULL
+),
+answers AS (
+  SELECT *
+  FROM Posts
+  WHERE PostTypeId = 2
+),
+answer_times AS (
+  SELECT
+    a.Id AS AnswerId,
+    a.OwnerUserId AS AnswerOwnerId,
+    q.Id AS QuestionId,
+    extract(epoch FROM (a.CreationDate - q.CreationDate)) AS response_seconds,
+    a.CreationDate AS AnswerDate,
+    q.CreationDate AS QuestionDate
+  FROM answers a
+  JOIN Posts q ON a.ParentId = q.Id
+  WHERE a.CreationDate IS NOT NULL
+    AND q.CreationDate IS NOT NULL
+),
+accepted_answers AS (
+  SELECT a.OwnerUserId AS UserId, count(*) AS AcceptedAnswers
+  FROM Posts a
+  JOIN Posts q ON q.AcceptedAnswerId = a.Id
+  WHERE a.OwnerUserId IS NOT NULL
+  GROUP BY a.OwnerUserId
+),
+user_post_agg AS (
+  SELECT
+    u.Id AS UserId,
+    count(p.Id) AS TotalPosts,
+    count(case when p.PostTypeId = 1 then 1 end) AS Questions,
+    count(case when p.PostTypeId = 2 then 1 end) AS Answers,
+    coalesce(avg(p.Score),0) AS AvgPostScore,
+    coalesce(sum(nullif(p.ViewCount,0)),0) AS SumViews,
+    coalesce(sum(coalesce(p.FavoriteCount,0)),0) AS SumFavorites,
+    min(p.CreationDate) AS FirstPostDate,
+    max(p.LastActivityDate) AS LastPostActivity,
+    percentile_disc(0.5) WITHIN GROUP (ORDER BY p.Score) FILTER (WHERE p.Score IS NOT NULL) AS MedianScore
+  FROM Users u
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+  GROUP BY u.Id
+),
+avg_response AS (
+  SELECT
+    at.AnswerOwnerId AS UserId,
+    avg(at.response_seconds) AS AvgResponseSeconds,
+    max(at.response_seconds) AS MaxResponseSeconds,
+    min(at.response_seconds) AS MinResponseSeconds
+  FROM answer_times at
+  GROUP BY at.AnswerOwnerId
+),
+user_badge_agg AS (
+  SELECT
+    b.UserId,
+    count(*) AS BadgeCount,
+    count(case when b.Class = 1 then 1 end) AS GoldBadges,
+    count(case when b.Class = 2 then 1 end) AS SilverBadges,
+    count(case when b.Class = 3 then 1 end) AS BronzeBadges
+  FROM Badges b
+  GROUP BY b.UserId
+),
+user_vote_activity AS (
+  SELECT
+    v.UserId,
+    count(case when v.VoteTypeId = 2 then 1 end) AS UpVotesCast,
+    count(case when v.VoteTypeId = 3 then 1 end) AS DownVotesCast,
+    count(case when v.VoteTypeId = 5 then 1 end) AS FavoritesCast
+  FROM Votes v
+  WHERE v.UserId IS NOT NULL
+  GROUP BY v.UserId
+),
+user_comments AS (
+  SELECT
+    c.UserId,
+    count(*) AS CommentsMade,
+    max(c.CreationDate) AS LastCommentDate,
+    substring(string_agg(coalesce(c.Text,''), ' || ' ORDER BY c.CreationDate DESC), 1, 4000) AS RecentCommentsConcat
+  FROM Comments c
+  GROUP BY c.UserId
+),
+user_tag_counts AS (
+  SELECT
+    t.UserId,
+    t.Tag,
+    count(*) AS TagCount
+  FROM (
+    SELECT q.OwnerUserId AS UserId, tq.Tag
+    FROM Posts q
+    JOIN tags_q tq ON tq.QuestionId = q.Id
+    WHERE q.OwnerUserId IS NOT NULL
+    UNION ALL
+    SELECT a.OwnerUserId AS UserId, tq.Tag
+    FROM Posts a
+    JOIN tags_q tq ON a.ParentId = tq.QuestionId
+    WHERE a.PostTypeId = 2 AND a.OwnerUserId IS NOT NULL
+  ) t
+  GROUP BY t.UserId, t.Tag
+),
+user_top_tag AS (
+  SELECT
+    utc.UserId,
+    utc.Tag,
+    utc.TagCount,
+    dense_rank() OVER (PARTITION BY utc.UserId ORDER BY utc.TagCount DESC, utc.Tag) AS rk
+  FROM user_tag_counts utc
+),
+user_primary_tag AS (
+  SELECT UserId, Tag AS PrimaryTag, TagCount AS PrimaryTagCount
+  FROM user_top_tag
+  WHERE rk = 1
+),
+user_summary AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate AS AccountCreated,
+    u.LastAccessDate,
+    u.Location,
+    coalesce(upa.TotalPosts,0) AS TotalPosts,
+    coalesce(upa.Questions,0) AS Questions,
+    coalesce(upa.Answers,0) AS Answers,
+    coalesce(upa.AvgPostScore,0) AS AvgPostScore,
+    coalesce(aa.AcceptedAnswers,0) AS AcceptedAnswers,
+    coalesce(ar.AvgResponseSeconds, NULL) AS AvgResponseSeconds,
+    coalesce(uba.BadgeCount,0) AS BadgeCount,
+    coalesce(uv.UpVotesCast,0) AS UpVotesCast,
+    coalesce(uc.CommentsMade,0) AS CommentsMade,
+    coalesce(ut.PrimaryTag, '(none)') AS PrimaryTag,
+    coalesce(ut.PrimaryTagCount,0) AS PrimaryTagCount,
+    upa.MedianScore,
+    coalesce(upa.SumViews,0) AS SumViews,
+    coalesce(upa.SumFavorites,0) AS SumFavorites,
+    (
+      coalesce(log(1 + u.Reputation), 0) * 2.0
+      + coalesce(log(1 + upa.TotalPosts), 0) * 1.5
+      + coalesce(log(1 + aa.AcceptedAnswers), 0) * 3.0
+      + coalesce(leda.avg_recent_activity_factor, 0) * 5.0
+      + least(100, coalesce(ut.PrimaryTagCount,0)) * 0.1
+      - coalesce(NULLIF(uv.DownVotesCast,0), 0) * 0.05
+    ) AS EngagementScore,
+    (SELECT b2.Name FROM Badges b2 WHERE b2.UserId = u.Id ORDER BY b2.Date DESC NULLS LAST LIMIT 1) AS LatestBadgeName,
+    (SELECT c2.Text FROM Comments c2 WHERE c2.UserId = u.Id ORDER BY c2.CreationDate DESC NULLS LAST LIMIT 1) AS LatestCommentText,
+    (
+      SELECT count(*) FROM PostHistory ph
+      WHERE ph.UserId = u.Id
+        AND ph.CreationDate >= coalesce(u.LastAccessDate - interval '90 days', cast('2024-10-01 12:34:56' AS timestamp) - interval '90 days')
+    ) AS RecentPostHistoryCount
+  FROM Users u
+  LEFT JOIN user_post_agg upa ON upa.UserId = u.Id
+  LEFT JOIN accepted_answers aa ON aa.UserId = u.Id
+  LEFT JOIN avg_response ar ON ar.UserId = u.Id
+  LEFT JOIN user_badge_agg uba ON uba.UserId = u.Id
+  LEFT JOIN user_vote_activity uv ON uv.UserId = u.Id
+  LEFT JOIN user_comments uc ON uc.UserId = u.Id
+  LEFT JOIN user_primary_tag ut ON ut.UserId = u.Id
+  LEFT JOIN (
+    SELECT
+      p2.OwnerUserId,
+      CASE WHEN coalesce(upa.TotalPosts,0) = 0 THEN 0
+           ELSE (count(p2.Id) * 1.0 / greatest(1, upa.TotalPosts))
+      END AS avg_recent_activity_factor
+    FROM Posts p2
+    JOIN Users u2 ON u2.Id = p2.OwnerUserId
+    LEFT JOIN user_post_agg upa ON upa.UserId = u2.Id
+    WHERE p2.CreationDate >= coalesce(u2.LastAccessDate - interval '30 days', cast('2024-10-01 12:34:56' AS timestamp) - interval '30 days')
+    GROUP BY p2.OwnerUserId, upa.TotalPosts
+  ) leda ON leda.OwnerUserId = u.Id
+)
+SELECT
+  us.UserId,
+  us.DisplayName,
+  us.Location,
+  us.Reputation,
+  us.TotalPosts,
+  us.Questions,
+  us.Answers,
+  us.AvgPostScore,
+  us.MedianScore,
+  us.AcceptedAnswers,
+  CASE WHEN us.AvgResponseSeconds IS NULL THEN NULL ELSE round(us.AvgResponseSeconds / 3600.0,2) END AS AvgResponseHours,
+  us.BadgeCount,
+  us.LatestBadgeName,
+  coalesce(us.PrimaryTag, '(none)') AS PrimaryTag,
+  us.PrimaryTagCount,
+  us.UpVotesCast,
+  us.CommentsMade,
+  us.SumViews,
+  us.SumFavorites,
+  us.RecentPostHistoryCount,
+  (coalesce(us.DisplayName,'<anon>') || ' | tags:' || coalesce(us.PrimaryTag,'(none)') || ' [' || coalesce(CAST(us.PrimaryTagCount AS varchar),'0') || ']') AS ProfileSummary,
+  us.EngagementScore,
+  rank() OVER (ORDER BY us.EngagementScore DESC NULLS LAST) AS EngagementRank,
+  dense_rank() OVER (ORDER BY us.Reputation DESC NULLS LAST) AS ReputationRank,
+  row_number() OVER (PARTITION BY coalesce(us.Location,'(unknown)') ORDER BY us.EngagementScore DESC NULLS LAST) AS LocalTopRank,
+  substring(coalesce(us.LatestCommentText, 'No recent comment'), 1, 120) AS LatestCommentSnippet
+FROM user_summary us
+WHERE
+  (
+    (us.TotalPosts > 0 AND us.EngagementScore > coalesce(least(log(1+us.Reputation+1), 50), 0) * 0.5)
+    OR
+    (us.BadgeCount >= 5 AND coalesce(us.PrimaryTagCount,0) >= 2)
+    OR
+    (us.RecentPostHistoryCount > 10)
+  )
+ORDER BY us.EngagementScore DESC NULLS LAST, us.Reputation DESC
+LIMIT 200;

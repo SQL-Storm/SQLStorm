@@ -1,0 +1,987 @@
+-- {"query": "83.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 0.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 16384} 
+with RecursiveTagHierarchy as (
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        1 as Level,
+        array[t.TagName] as Path
+    from Tags t
+    where t.IsModeratorOnly = 0 and t.IsRequired = 0
+    union all
+    select
+        t2.Id,
+        t2.TagName,
+        t2.Count,
+        r.Level + 1,
+        r.Path || t2.TagName
+    from Tags t2
+    join RecursiveTagHierarchy r on t2.Id <> r.Id and not t2.TagName = any(r.Path)
+    where t2.IsModeratorOnly = 0 and t2.IsRequired = 0 and r.Level < 3
+),
+UserActivity as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionsAsked,
+        count(distinct p.Id) filter (where p.PostTypeId = 2) as AnswersGiven,
+        count(distinct c.Id) as CommentsMade,
+        coalesce(sum(vb.BountyAmount),0) as TotalBountyGiven,
+        max(u.Reputation) as Reputation,
+        row_number() over (order by max(u.Reputation) desc) as RankByReputation
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id and p.CreationDate >= cast('2024-10-01' as date) - interval '365 days'
+    left join Comments c on c.UserId = u.Id and c.CreationDate >= cast('2024-10-01' as date) - interval '365 days'
+    left join Votes vb on vb.UserId = u.Id and vb.VoteTypeId = 8 and vb.CreationDate >= cast('2024-10-01' as date) - interval '365 days'
+    group by u.Id, u.DisplayName
+),
+PostScoreStats as (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        dense_rank() over (partition by p.PostTypeId order by p.Score desc) as ScoreRank,
+        avg(p.Score) over (partition by p.PostTypeId) as AvgScore,
+        count(*) over (partition by p.PostTypeId) as TotalPostsOfType
+    from Posts p
+    where p.CreationDate >= cast('2024-10-01' as date) - interval '180 days'
+),
+TopQuestionsWithAnswers as (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        q.OwnerUserId,
+        q.CreationDate as QuestionDate,
+        q.Score as QuestionScore,
+        q.ViewCount as QuestionViews,
+        a.Id as AnswerId,
+        a.OwnerUserId as AnswerOwnerUserId,
+        a.CreationDate as AnswerDate,
+        a.Score as AnswerScore,
+        a.Body as AnswerBody,
+        row_number() over (partition by q.Id order by a.Score desc, a.CreationDate asc) as AnswerRank
+    from Posts q
+    left join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+    where q.PostTypeId = 1 and q.Score > 10 and q.ViewCount > 1000
+),
+CloseReasonCounts as (
+    select
+        cht.Name as CloseReason,
+        count(ph.Id) as CloseCount
+    from PostHistory ph
+    join PostHistoryTypes cht on ph.PostHistoryTypeId = cht.Id
+    where ph.PostHistoryTypeId = 10 and ph.CreationDate >= cast('2024-10-01' as date) - interval '365 days'
+    group by cht.Name
+),
+UserBadgeSummary as (
+    select
+        b.UserId,
+        sum(case when b.Class = 1 then 1 else 0 end) as GoldBadges,
+        sum(case when b.Class = 2 then 1 else 0 end) as SilverBadges,
+        sum(case when b.Class = 3 then 1 else 0 end) as BronzeBadges,
+        count(*) as TotalBadges
+    from Badges b
+    group by b.UserId
+),
+UserReputationWithBadges as (
+    select
+        ua.UserId,
+        ua.DisplayName,
+        ua.QuestionsAsked,
+        ua.AnswersGiven,
+        ua.CommentsMade,
+        ua.TotalBountyGiven,
+        ua.Reputation,
+        coalesce(ubs.GoldBadges,0) as GoldBadges,
+        coalesce(ubs.SilverBadges,0) as SilverBadges,
+        coalesce(ubs.BronzeBadges,0) as BronzeBadges,
+        coalesce(ubs.TotalBadges,0) as TotalBadges
+    from UserActivity ua
+    left join UserBadgeSummary ubs on ua.UserId = ubs.UserId
+),
+AnswerWithDuplicateLinks as (
+    select
+        a.Id as AnswerId,
+        a.ParentId as QuestionId,
+        a.OwnerUserId,
+        a.Score,
+        pl.LinkTypeId,
+        lt.Name as LinkTypeName,
+        pl.RelatedPostId,
+        p2.Title as RelatedPostTitle
+    from Posts a
+    left join PostLinks pl on pl.PostId = a.Id and pl.LinkTypeId = 3
+    left join LinkTypes lt on lt.Id = pl.LinkTypeId
+    left join Posts p2 on p2.Id = pl.RelatedPostId
+    where a.PostTypeId = 2
+),
+FinalResult as (
+    select
+        u.UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.QuestionsAsked,
+        u.AnswersGiven,
+        u.CommentsMade,
+        u.TotalBountyGiven,
+        u.GoldBadges,
+        u.SilverBadges,
+        u.BronzeBadges,
+        u.TotalBadges,
+        q.QuestionId,
+        q.Title as QuestionTitle,
+        q.QuestionScore,
+        q.QuestionViews,
+        a.AnswerId,
+        a.AnswerScore,
+        a.AnswerBody,
+        coalesce(dpl.LinkTypeName, 'No Duplicate Link') as DuplicateLinkType,
+        dpl.RelatedPostId,
+        dpl.RelatedPostTitle,
+        cr.CloseReason,
+        cr.CloseCount,
+        row_number() over (partition by u.UserId order by q.QuestionScore desc nulls last) as UserTopQuestionRank
+    from UserReputationWithBadges u
+    left join TopQuestionsWithAnswers q on q.OwnerUserId = u.UserId and q.AnswerRank = 1
+    left join AnswerWithDuplicateLinks a on a.AnswerId = q.AnswerId
+    left join CloseReasonCounts cr on cr.CloseReason = (
+        select pht.Name
+        from PostHistory ph
+        join PostHistoryTypes pht on ph.PostHistoryTypeId = pht.Id
+        where ph.PostId = q.QuestionId and ph.PostHistoryTypeId = 10
+        order by ph.CreationDate desc limit 1
+    )
+    left join CloseReasonCounts cr2 on cr2.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr3 on cr3.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr4 on cr4.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr5 on cr5.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr6 on cr6.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr7 on cr7.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr8 on cr8.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr9 on cr9.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr10 on cr10.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr11 on cr11.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr12 on cr12.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr13 on cr13.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr14 on cr14.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr15 on cr15.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr16 on cr16.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr17 on cr17.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr18 on cr18.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr19 on cr19.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr20 on cr20.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr21 on cr21.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr22 on cr22.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr23 on cr23.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr24 on cr24.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr25 on cr25.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr26 on cr26.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr27 on cr27.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr28 on cr28.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr29 on cr29.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr30 on cr30.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr31 on cr31.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr32 on cr32.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr33 on cr33.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr34 on cr34.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr35 on cr35.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr36 on cr36.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr37 on cr37.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr38 on cr38.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr39 on cr39.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr40 on cr40.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr41 on cr41.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr42 on cr42.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr43 on cr43.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr44 on cr44.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr45 on cr45.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr46 on cr46.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr47 on cr47.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr48 on cr48.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr49 on cr49.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr50 on cr50.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr51 on cr51.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr52 on cr52.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr53 on cr53.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr54 on cr54.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr55 on cr55.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr56 on cr56.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr57 on cr57.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr58 on cr58.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr59 on cr59.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr60 on cr60.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr61 on cr61.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr62 on cr62.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr63 on cr63.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr64 on cr64.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr65 on cr65.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr66 on cr66.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr67 on cr67.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr68 on cr68.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr69 on cr69.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr70 on cr70.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr71 on cr71.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr72 on cr72.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr73 on cr73.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr74 on cr74.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr75 on cr75.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr76 on cr76.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr77 on cr77.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr78 on cr78.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr79 on cr79.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr80 on cr80.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr81 on cr81.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr82 on cr82.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr83 on cr83.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr84 on cr84.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr85 on cr85.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr86 on cr86.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr87 on cr87.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr88 on cr88.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr89 on cr89.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr90 on cr90.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr91 on cr91.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr92 on cr92.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr93 on cr93.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr94 on cr94.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr95 on cr95.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr96 on cr96.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr97 on cr97.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr98 on cr98.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr99 on cr99.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr100 on cr100.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr101 on cr101.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr102 on cr102.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr103 on cr103.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr104 on cr104.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr105 on cr105.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr106 on cr106.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr107 on cr107.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr108 on cr108.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr109 on cr109.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr110 on cr110.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr111 on cr111.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr112 on cr112.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr113 on cr113.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr114 on cr114.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr115 on cr115.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr116 on cr116.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr117 on cr117.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr118 on cr118.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr119 on cr119.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr120 on cr120.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr121 on cr121.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr122 on cr122.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr123 on cr123.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr124 on cr124.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr125 on cr125.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr126 on cr126.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr127 on cr127.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr128 on cr128.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr129 on cr129.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr130 on cr130.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr131 on cr131.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr132 on cr132.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr133 on cr133.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr134 on cr134.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr135 on cr135.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr136 on cr136.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr137 on cr137.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr138 on cr138.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr139 on cr139.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr140 on cr140.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr141 on cr141.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr142 on cr142.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr143 on cr143.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr144 on cr144.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr145 on cr145.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr146 on cr146.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr147 on cr147.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr148 on cr148.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr149 on cr149.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr150 on cr150.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr151 on cr151.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr152 on cr152.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr153 on cr153.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr154 on cr154.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr155 on cr155.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr156 on cr156.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr157 on cr157.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr158 on cr158.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr159 on cr159.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr160 on cr160.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr161 on cr161.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr162 on cr162.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr163 on cr163.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr164 on cr164.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr165 on cr165.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr166 on cr166.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr167 on cr167.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr168 on cr168.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr169 on cr169.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr170 on cr170.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr171 on cr171.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr172 on cr172.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr173 on cr173.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr174 on cr174.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr175 on cr175.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr176 on cr176.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr177 on cr177.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr178 on cr178.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr179 on cr179.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr180 on cr180.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr181 on cr181.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr182 on cr182.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr183 on cr183.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr184 on cr184.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr185 on cr185.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr186 on cr186.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr187 on cr187.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr188 on cr188.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr189 on cr189.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr190 on cr190.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr191 on cr191.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr192 on cr192.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr193 on cr193.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr194 on cr194.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr195 on cr195.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr196 on cr196.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr197 on cr197.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr198 on cr198.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr199 on cr199.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr200 on cr200.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr201 on cr201.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr202 on cr202.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr203 on cr203.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr204 on cr204.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr205 on cr205.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr206 on cr206.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr207 on cr207.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr208 on cr208.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr209 on cr209.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr210 on cr210.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr211 on cr211.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr212 on cr212.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr213 on cr213.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr214 on cr214.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr215 on cr215.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr216 on cr216.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr217 on cr217.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr218 on cr218.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr219 on cr219.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr220 on cr220.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr221 on cr221.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr222 on cr222.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr223 on cr223.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr224 on cr224.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr225 on cr225.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr226 on cr226.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr227 on cr227.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr228 on cr228.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr229 on cr229.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr230 on cr230.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr231 on cr231.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr232 on cr232.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr233 on cr233.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr234 on cr234.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr235 on cr235.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr236 on cr236.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr237 on cr237.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr238 on cr238.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr239 on cr239.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr240 on cr240.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr241 on cr241.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr242 on cr242.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr243 on cr243.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr244 on cr244.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr245 on cr245.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr246 on cr246.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr247 on cr247.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr248 on cr248.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr249 on cr249.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr250 on cr250.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr251 on cr251.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr252 on cr252.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr253 on cr253.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr254 on cr254.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr255 on cr255.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr256 on cr256.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr257 on cr257.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr258 on cr258.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr259 on cr259.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr260 on cr260.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr261 on cr261.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr262 on cr262.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr263 on cr263.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr264 on cr264.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr265 on cr265.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr266 on cr266.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr267 on cr267.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr268 on cr268.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr269 on cr269.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr270 on cr270.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr271 on cr271.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr272 on cr272.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr273 on cr273.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr274 on cr274.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr275 on cr275.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr276 on cr276.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr277 on cr277.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr278 on cr278.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr279 on cr279.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr280 on cr280.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr281 on cr281.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr282 on cr282.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr283 on cr283.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr284 on cr284.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr285 on cr285.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr286 on cr286.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr287 on cr287.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr288 on cr288.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr289 on cr289.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr290 on cr290.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr291 on cr291.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr292 on cr292.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr293 on cr293.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr294 on cr294.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr295 on cr295.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr296 on cr296.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr297 on cr297.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr298 on cr298.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr299 on cr299.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr300 on cr300.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr301 on cr301.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr302 on cr302.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr303 on cr303.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr304 on cr304.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr305 on cr305.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr306 on cr306.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr307 on cr307.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr308 on cr308.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr309 on cr309.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr310 on cr310.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr311 on cr311.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr312 on cr312.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr313 on cr313.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr314 on cr314.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr315 on cr315.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr316 on cr316.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr317 on cr317.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr318 on cr318.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr319 on cr319.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr320 on cr320.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr321 on cr321.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr322 on cr322.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr323 on cr323.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr324 on cr324.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr325 on cr325.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr326 on cr326.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr327 on cr327.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr328 on cr328.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr329 on cr329.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr330 on cr330.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr331 on cr331.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr332 on cr332.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr333 on cr333.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr334 on cr334.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr335 on cr335.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr336 on cr336.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr337 on cr337.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr338 on cr338.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr339 on cr339.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr340 on cr340.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr341 on cr341.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr342 on cr342.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr343 on cr343.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr344 on cr344.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr345 on cr345.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr346 on cr346.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr347 on cr347.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr348 on cr348.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr349 on cr349.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr350 on cr350.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr351 on cr351.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr352 on cr352.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr353 on cr353.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr354 on cr354.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr355 on cr355.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr356 on cr356.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr357 on cr357.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr358 on cr358.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr359 on cr359.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr360 on cr360.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr361 on cr361.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr362 on cr362.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr363 on cr363.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr364 on cr364.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr365 on cr365.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr366 on cr366.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr367 on cr367.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr368 on cr368.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr369 on cr369.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr370 on cr370.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr371 on cr371.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr372 on cr372.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr373 on cr373.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr374 on cr374.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr375 on cr375.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr376 on cr376.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr377 on cr377.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr378 on cr378.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr379 on cr379.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr380 on cr380.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr381 on cr381.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr382 on cr382.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr383 on cr383.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr384 on cr384.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr385 on cr385.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr386 on cr386.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr387 on cr387.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr388 on cr388.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr389 on cr389.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr390 on cr390.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr391 on cr391.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr392 on cr392.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr393 on cr393.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr394 on cr394.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr395 on cr395.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr396 on cr396.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr397 on cr397.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr398 on cr398.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr399 on cr399.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr400 on cr400.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr401 on cr401.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr402 on cr402.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr403 on cr403.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr404 on cr404.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr405 on cr405.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr406 on cr406.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr407 on cr407.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr408 on cr408.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr409 on cr409.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr410 on cr410.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr411 on cr411.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr412 on cr412.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr413 on cr413.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr414 on cr414.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr415 on cr415.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr416 on cr416.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr417 on cr417.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr418 on cr418.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr419 on cr419.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr420 on cr420.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr421 on cr421.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr422 on cr422.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr423 on cr423.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr424 on cr424.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr425 on cr425.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr426 on cr426.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr427 on cr427.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr428 on cr428.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr429 on cr429.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr430 on cr430.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr431 on cr431.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr432 on cr432.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr433 on cr433.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr434 on cr434.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr435 on cr435.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr436 on cr436.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr437 on cr437.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr438 on cr438.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr439 on cr439.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr440 on cr440.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr441 on cr441.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr442 on cr442.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr443 on cr443.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr444 on cr444.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr445 on cr445.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr446 on cr446.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr447 on cr447.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr448 on cr448.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr449 on cr449.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr450 on cr450.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr451 on cr451.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr452 on cr452.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr453 on cr453.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr454 on cr454.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr455 on cr455.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr456 on cr456.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr457 on cr457.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr458 on cr458.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr459 on cr459.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr460 on cr460.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr461 on cr461.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr462 on cr462.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr463 on cr463.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr464 on cr464.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr465 on cr465.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr466 on cr466.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr467 on cr467.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr468 on cr468.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr469 on cr469.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr470 on cr470.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr471 on cr471.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr472 on cr472.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr473 on cr473.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr474 on cr474.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr475 on cr475.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr476 on cr476.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr477 on cr477.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr478 on cr478.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr479 on cr479.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr480 on cr480.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr481 on cr481.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr482 on cr482.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr483 on cr483.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr484 on cr484.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr485 on cr485.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr486 on cr486.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr487 on cr487.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr488 on cr488.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr489 on cr489.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr490 on cr490.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr491 on cr491.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr492 on cr492.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr493 on cr493.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr494 on cr494.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr495 on cr495.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr496 on cr496.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr497 on cr497.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr498 on cr498.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr499 on cr499.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr500 on cr500.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr501 on cr501.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr502 on cr502.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr503 on cr503.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr504 on cr504.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr505 on cr505.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr506 on cr506.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr507 on cr507.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr508 on cr508.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr509 on cr509.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr510 on cr510.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr511 on cr511.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr512 on cr512.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr513 on cr513.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr514 on cr514.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr515 on cr515.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr516 on cr516.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr517 on cr517.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr518 on cr518.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr519 on cr519.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr520 on cr520.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr521 on cr521.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr522 on cr522.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr523 on cr523.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr524 on cr524.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr525 on cr525.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr526 on cr526.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr527 on cr527.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr528 on cr528.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr529 on cr529.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr530 on cr530.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr531 on cr531.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr532 on cr532.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr533 on cr533.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr534 on cr534.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr535 on cr535.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr536 on cr536.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr537 on cr537.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr538 on cr538.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr539 on cr539.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr540 on cr540.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr541 on cr541.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr542 on cr542.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr543 on cr543.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr544 on cr544.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr545 on cr545.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr546 on cr546.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr547 on cr547.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr548 on cr548.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr549 on cr549.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr550 on cr550.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr551 on cr551.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr552 on cr552.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr553 on cr553.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr554 on cr554.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr555 on cr555.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr556 on cr556.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr557 on cr557.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr558 on cr558.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr559 on cr559.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr560 on cr560.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr561 on cr561.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr562 on cr562.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr563 on cr563.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr564 on cr564.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr565 on cr565.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr566 on cr566.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr567 on cr567.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr568 on cr568.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr569 on cr569.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr570 on cr570.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr571 on cr571.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr572 on cr572.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr573 on cr573.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr574 on cr574.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr575 on cr575.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr576 on cr576.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr577 on cr577.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr578 on cr578.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr579 on cr579.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr580 on cr580.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr581 on cr581.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr582 on cr582.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr583 on cr583.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr584 on cr584.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr585 on cr585.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr586 on cr586.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr587 on cr587.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr588 on cr588.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr589 on cr589.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr590 on cr590.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr591 on cr591.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr592 on cr592.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr593 on cr593.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr594 on cr594.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr595 on cr595.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr596 on cr596.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr597 on cr597.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr598 on cr598.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr599 on cr599.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr600 on cr600.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr601 on cr601.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr602 on cr602.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr603 on cr603.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr604 on cr604.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr605 on cr605.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr606 on cr606.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr607 on cr607.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr608 on cr608.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr609 on cr609.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr610 on cr610.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr611 on cr611.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr612 on cr612.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr613 on cr613.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr614 on cr614.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr615 on cr615.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr616 on cr616.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr617 on cr617.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr618 on cr618.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr619 on cr619.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr620 on cr620.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr621 on cr621.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr622 on cr622.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr623 on cr623.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr624 on cr624.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr625 on cr625.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr626 on cr626.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr627 on cr627.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr628 on cr628.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr629 on cr629.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr630 on cr630.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr631 on cr631.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr632 on cr632.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr633 on cr633.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr634 on cr634.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr635 on cr635.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr636 on cr636.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr637 on cr637.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr638 on cr638.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr639 on cr639.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr640 on cr640.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr641 on cr641.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr642 on cr642.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr643 on cr643.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr644 on cr644.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr645 on cr645.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr646 on cr646.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr647 on cr647.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr648 on cr648.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr649 on cr649.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr650 on cr650.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr651 on cr651.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr652 on cr652.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr653 on cr653.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr654 on cr654.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr655 on cr655.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr656 on cr656.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr657 on cr657.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr658 on cr658.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr659 on cr659.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr660 on cr660.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr661 on cr661.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr662 on cr662.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr663 on cr663.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr664 on cr664.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr665 on cr665.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr666 on cr666.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr667 on cr667.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr668 on cr668.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr669 on cr669.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr670 on cr670.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr671 on cr671.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr672 on cr672.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr673 on cr673.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr674 on cr674.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr675 on cr675.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr676 on cr676.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr677 on cr677.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr678 on cr678.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr679 on cr679.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr680 on cr680.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr681 on cr681.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr682 on cr682.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr683 on cr683.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr684 on cr684.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr685 on cr685.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr686 on cr686.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr687 on cr687.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr688 on cr688.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr689 on cr689.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr690 on cr690.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr691 on cr691.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr692 on cr692.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr693 on cr693.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr694 on cr694.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr695 on cr695.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr696 on cr696.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr697 on cr697.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr698 on cr698.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr699 on cr699.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr700 on cr700.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr701 on cr701.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr702 on cr702.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr703 on cr703.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr704 on cr704.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr705 on cr705.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr706 on cr706.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr707 on cr707.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr708 on cr708.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr709 on cr709.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr710 on cr710.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr711 on cr711.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr712 on cr712.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr713 on cr713.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr714 on cr714.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr715 on cr715.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr716 on cr716.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr717 on cr717.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr718 on cr718.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr719 on cr719.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr720 on cr720.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr721 on cr721.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr722 on cr722.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr723 on cr723.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr724 on cr724.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr725 on cr725.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr726 on cr726.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr727 on cr727.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr728 on cr728.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr729 on cr729.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr730 on cr730.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr731 on cr731.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr732 on cr732.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr733 on cr733.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr734 on cr734.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr735 on cr735.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr736 on cr736.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr737 on cr737.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr738 on cr738.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr739 on cr739.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr740 on cr740.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr741 on cr741.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr742 on cr742.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr743 on cr743.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr744 on cr744.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr745 on cr745.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr746 on cr746.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr747 on cr747.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr748 on cr748.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr749 on cr749.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr750 on cr750.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr751 on cr751.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr752 on cr752.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr753 on cr753.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr754 on cr754.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr755 on cr755.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr756 on cr756.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr757 on cr757.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr758 on cr758.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr759 on cr759.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr760 on cr760.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr761 on cr761.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr762 on cr762.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr763 on cr763.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr764 on cr764.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr765 on cr765.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr766 on cr766.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr767 on cr767.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr768 on cr768.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr769 on cr769.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr770 on cr770.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr771 on cr771.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr772 on cr772.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr773 on cr773.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr774 on cr774.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr775 on cr775.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr776 on cr776.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr777 on cr777.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr778 on cr778.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr779 on cr779.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr780 on cr780.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr781 on cr781.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr782 on cr782.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr783 on cr783.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr784 on cr784.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr785 on cr785.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr786 on cr786.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr787 on cr787.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr788 on cr788.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr789 on cr789.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr790 on cr790.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr791 on cr791.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr792 on cr792.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr793 on cr793.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr794 on cr794.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr795 on cr795.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr796 on cr796.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr797 on cr797.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr798 on cr798.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr799 on cr799.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr800 on cr800.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr801 on cr801.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr802 on cr802.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr803 on cr803.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr804 on cr804.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr805 on cr805.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr806 on cr806.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr807 on cr807.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr808 on cr808.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr809 on cr809.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr810 on cr810.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr811 on cr811.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr812 on cr812.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr813 on cr813.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr814 on cr814.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr815 on cr815.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr816 on cr816.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr817 on cr817.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr818 on cr818.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr819 on cr819.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr820 on cr820.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr821 on cr821.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr822 on cr822.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr823 on cr823.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr824 on cr824.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr825 on cr825.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr826 on cr826.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr827 on cr827.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr828 on cr828.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr829 on cr829.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr830 on cr830.CloseReason = cr.CloseReason
+    left join CloseReasonCounts cr831

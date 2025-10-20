@@ -1,0 +1,194 @@
+WITH RECURSIVE RecursiveTagHierarchy AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        1 AS Level,
+        ARRAY[t.TagName] AS Path
+    FROM Tags t
+    WHERE t.IsModeratorOnly = false AND t.IsRequired = false
+
+    UNION ALL
+
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        r.Level + 1,
+        r.Path || t.TagName
+    FROM Tags t
+    JOIN RecursiveTagHierarchy r ON t.Id <> r.Id AND NOT t.TagName = ANY (r.Path)
+    WHERE t.IsModeratorOnly = false AND t.IsRequired = false AND r.Level < 3
+),
+UserBadgeCounts AS (
+    SELECT
+        b.UserId,
+        b.Class,
+        COUNT(*) AS BadgeCount
+    FROM Badges b
+    GROUP BY b.UserId, b.Class
+),
+UserReputationStats AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.Location,
+        COALESCE(ubc_gold.BadgeCount, 0) AS GoldBadges,
+        COALESCE(ubc_silver.BadgeCount, 0) AS SilverBadges,
+        COALESCE(ubc_bronze.BadgeCount, 0) AS BronzeBadges,
+        row_number() OVER (ORDER BY u.Reputation DESC) AS RepRank
+    FROM Users u
+    LEFT JOIN UserBadgeCounts ubc_gold ON u.Id = ubc_gold.UserId AND ubc_gold.Class = 1
+    LEFT JOIN UserBadgeCounts ubc_silver ON u.Id = ubc_silver.UserId AND ubc_silver.Class = 2
+    LEFT JOIN UserBadgeCounts ubc_bronze ON u.Id = ubc_bronze.UserId AND ubc_bronze.Class = 3
+),
+TopQuestions AS (
+    SELECT
+        p.Id,
+        p.Title,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.Tags,
+        p.AcceptedAnswerId,
+        u.DisplayName AS OwnerName,
+        dense_rank() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC) AS UserTopQuestionRank
+    FROM Posts p
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.PostTypeId = 1 AND p.Score > 10 AND p.ViewCount > 1000
+),
+AnswerStats AS (
+    SELECT
+        a.ParentId AS QuestionId,
+        COUNT(*) AS AnswerCount,
+        AVG(a.Score) AS AvgAnswerScore,
+        MAX(a.Score) AS MaxAnswerScore,
+        SUM(CASE WHEN a.OwnerUserId IS NULL THEN 0 ELSE 1 END) AS AnsweredByRegisteredUsers
+    FROM Posts a
+    WHERE a.PostTypeId = 2
+    GROUP BY a.ParentId
+),
+QuestionCloseReasons AS (
+    SELECT
+        ph.PostId,
+        crt.Name AS CloseReasonName,
+        ph.CreationDate AS CloseDate
+    FROM PostHistory ph
+    JOIN CloseReasonTypes crt ON CAST(ph.Comment AS integer) = crt.Id
+    WHERE ph.PostHistoryTypeId = 10
+),
+QuestionComments AS (
+    SELECT
+        c.PostId,
+        COUNT(*) AS CommentCount,
+        SUM(CASE WHEN c.UserId IS NULL THEN 0 ELSE 1 END) AS CommentsByRegisteredUsers,
+        string_agg(DISTINCT substring(c.Text FROM 1 FOR 20), ' | ') AS SampleComments
+    FROM Comments c
+    GROUP BY c.PostId
+),
+QuestionAggregates AS (
+    SELECT
+        tq.Id,
+        tq.Title,
+        tq.OwnerUserId,
+        tq.OwnerName,
+        tq.Score,
+        tq.ViewCount,
+        tq.CreationDate,
+        tq.Tags,
+        tq.AcceptedAnswerId,
+        asn.AnswerCount,
+        asn.AvgAnswerScore,
+        asn.MaxAnswerScore,
+        asn.AnsweredByRegisteredUsers,
+        qcr.CloseReasonName,
+        qcr.CloseDate,
+        qc.CommentCount,
+        qc.CommentsByRegisteredUsers,
+        qc.SampleComments
+    FROM TopQuestions tq
+    LEFT JOIN AnswerStats asn ON tq.Id = asn.QuestionId
+    LEFT JOIN QuestionCloseReasons qcr ON tq.Id = qcr.PostId
+    LEFT JOIN QuestionComments qc ON tq.Id = qc.PostId
+),
+RankedQuestions AS (
+    SELECT
+        qa.*,
+        row_number() OVER (PARTITION BY qa.OwnerUserId ORDER BY qa.Score DESC, qa.ViewCount DESC) AS OwnerQuestionRank,
+        count(*) OVER (PARTITION BY qa.OwnerUserId) AS OwnerQuestionCount
+    FROM QuestionAggregates qa
+),
+FinalSelection AS (
+    SELECT
+        rq.Id AS QuestionId,
+        rq.Title,
+        rq.OwnerUserId,
+        rq.OwnerName,
+        rq.Score,
+        rq.ViewCount,
+        rq.CreationDate,
+        rq.Tags,
+        rq.AcceptedAnswerId,
+        rq.AnswerCount,
+        rq.AvgAnswerScore,
+        rq.MaxAnswerScore,
+        rq.AnsweredByRegisteredUsers,
+        rq.CloseReasonName,
+        rq.CloseDate,
+        rq.CommentCount,
+        rq.CommentsByRegisteredUsers,
+        rq.SampleComments,
+        ur.GoldBadges,
+        ur.SilverBadges,
+        ur.BronzeBadges,
+        ur.Reputation,
+        ur.RepRank,
+        string_agg(DISTINCT rth.TagName, ', ') AS RelatedTags
+    FROM RankedQuestions rq
+    JOIN UserReputationStats ur ON rq.OwnerUserId = ur.UserId
+    LEFT JOIN RecursiveTagHierarchy rth ON position(rth.TagName IN coalesce(rq.Tags, '')) > 0
+    WHERE rq.OwnerQuestionRank <= 3
+    GROUP BY
+        rq.Id, rq.Title, rq.OwnerUserId, rq.OwnerName, rq.Score, rq.ViewCount, rq.CreationDate, rq.Tags, rq.AcceptedAnswerId,
+        rq.AnswerCount, rq.AvgAnswerScore, rq.MaxAnswerScore, rq.AnsweredByRegisteredUsers, rq.CloseReasonName, rq.CloseDate,
+        rq.CommentCount, rq.CommentsByRegisteredUsers, rq.SampleComments,
+        ur.GoldBadges, ur.SilverBadges, ur.BronzeBadges, ur.Reputation, ur.RepRank
+)
+SELECT
+    fs.QuestionId,
+    fs.Title,
+    fs.OwnerName,
+    fs.Reputation,
+    fs.GoldBadges,
+    fs.SilverBadges,
+    fs.BronzeBadges,
+    fs.Score,
+    fs.ViewCount,
+    fs.AnswerCount,
+    round(CAST(fs.AvgAnswerScore AS numeric), 2) AS AvgAnswerScore,
+    fs.MaxAnswerScore,
+    fs.AnsweredByRegisteredUsers,
+    coalesce(fs.CloseReasonName, 'Open') AS CloseStatus,
+    fs.CloseDate,
+    fs.CommentCount,
+    fs.CommentsByRegisteredUsers,
+    left(fs.SampleComments, 200) AS SampleComments,
+    fs.RelatedTags,
+    CASE
+        WHEN length(fs.Title) > 100 THEN 'Long Title'
+        WHEN fs.AnswerCount > 5 THEN 'Popular Question'
+        ELSE 'Regular Question'
+    END AS QuestionCategory,
+    percentile_cont(0.9) WITHIN GROUP (ORDER BY fs.Score) OVER () AS Score90Percentile,
+    (SELECT max(c.CreationDate) FROM Comments c WHERE c.PostId = fs.QuestionId) AS LatestCommentDate,
+    coalesce(
+        (SELECT p.Score FROM Posts p WHERE p.Id = fs.AcceptedAnswerId),
+        fs.MaxAnswerScore,
+        0
+    ) AS AcceptedOrMaxAnswerScore
+FROM FinalSelection fs
+ORDER BY fs.Reputation DESC, fs.Score DESC, fs.ViewCount DESC
+LIMIT 50;

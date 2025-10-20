@@ -1,0 +1,138 @@
+-- {"query": "1546.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.5, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1375} 
+WITH RecursiveUserActivity AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        MIN(p.CreationDate) AS FirstPostDate,
+        MAX(p.CreationDate) AS LastPostDate,
+        COUNT(p.Id) FILTER(WHERE p.PostTypeId = 1) AS QuestionsPosted,
+        COUNT(p.Id) FILTER(WHERE p.PostTypeId = 2) AS AnswersPosted
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+BadgeAggregates AS (
+    SELECT 
+        b.UserId,
+        COUNT(*) AS TotalBadges,
+        COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS GoldBadges,
+        COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS SilverBadges,
+        COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS BronzeBadges,
+        BOOL_OR(b.Class = 1 AND b.TagBased = 1) AS HasGoldTagBasedBadge
+    FROM Badges b
+    GROUP BY b.UserId
+),
+UserScoreRanks AS (
+    SELECT
+        ua.UserId,
+        ua.Reputation,
+        ua.QuestionsPosted,
+        ua.AnswersPosted,
+        COALESCE(bd.TotalBadges,0) AS TotalBadges,
+        COALESCE(bd.GoldBadges,0) AS GoldBadges,
+        COALESCE(bd.SilverBadges,0) AS SilverBadges,
+        COALESCE(bd.BronzeBadges,0) AS BronzeBadges,
+        bd.HasGoldTagBasedBadge,
+        ROW_NUMBER() OVER (ORDER BY ua.Reputation DESC) AS RepRank,
+        RANK() OVER (PARTITION BY ua.QuestionsPosted > ua.AnswersPosted ORDER BY ua.Reputation DESC) AS ActivityRank
+    FROM RecursiveUserActivity ua
+    LEFT JOIN BadgeAggregates bd ON ua.UserId = bd.UserId
+    WHERE ua.FirstPostDate IS NOT NULL
+),
+TopPostsCTE AS (
+    SELECT 
+        p.Id,
+        p.Title,
+        p.PostTypeId,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Tags,
+        (
+          SELECT COUNT(*)
+          FROM Comments c
+          WHERE c.PostId = p.Id
+            AND (c.Text NOT ILIKE '%spam%' AND c.Score > 0)
+        ) AS PositiveCommentsCount,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC, p.ViewCount DESC) AS PostRank
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2) AND p.CreationDate >= cast('2024-10-01' as date) - INTERVAL '1 year'
+),
+LinkedDuplicatesCTE AS (
+    SELECT 
+        pl.PostId,
+        pl.RelatedPostId,
+        COUNT(pl.Id) OVER(PARTITION BY pl.PostId) AS TotalDuplicates,
+        lt.Name AS LinkTypeName
+    FROM PostLinks pl
+    LEFT JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id
+    WHERE pl.LinkTypeId = 3
+),
+PostCloseInfo AS (
+    SELECT 
+        ph.PostId,
+        COUNT(*) FILTER(WHERE ph.PostHistoryTypeId = 10) AS TimesClosed,
+        COUNT(*) FILTER(WHERE ph.PostHistoryTypeId = 11) AS TimesReopened,
+        MAX(ph.CreationDate) FILTER(WHERE ph.PostHistoryTypeId = 10) AS LastClosedDate,
+        STRING_AGG(DISTINCT crt.Name, ', ') AS CloseReasons -- from CloseReasonTypes join later
+    FROM PostHistory ph
+    LEFT JOIN CloseReasonTypes crt ON ph.Comment::int = crt.Id AND ph.PostHistoryTypeId = 10
+    WHERE ph.PostHistoryTypeId IN (10,11)
+    GROUP BY ph.PostId
+),
+ComplexUserProfileAnalysis AS (
+  SELECT 
+    ura.UserId,
+    ura.DisplayName,
+    ura.Reputation,
+    ura.FirstPostDate,
+    ura.LastPostDate,
+    ua.PostRank AS TopPostRank,
+    ura.QuestionsPosted,
+    ura.AnswersPosted,
+    bd.TotalBadges,
+    bd.GoldBadges,
+    COALESCE(pl.TotalDuplicates, 0) AS DuplicatePostsCount,
+    COALESCE(pc.TimesClosed, 0) AS PostsTimesClosed,
+    COALESCE(pc.TimesReopened, 0) AS PostsTimesReopened
+  FROM UserScoreRanks ura
+  LEFT JOIN TopPostsCTE ua ON ura.UserId = ua.OwnerUserId AND ua.PostRank = 1
+  LEFT JOIN BadgeAggregates bd ON ura.UserId = bd.UserId
+  LEFT JOIN LinkedDuplicatesCTE pl ON pl.PostId = ua.Id
+  LEFT JOIN PostCloseInfo pc ON pc.PostId = ua.Id
+  WHERE ura.RepRank <= 100 -- Top 100 users by reputation
+)
+SELECT 
+  cu.UserId,
+  cu.DisplayName, 
+  cu.Reputation,
+  to_char(cu.FirstPostDate,'YYYY-MM-DD') AS FirstPost,
+  to_char(cu.LastPostDate,'YYYY-MM-DD') AS LastPost,
+  cu.QuestionsPosted,
+  cu.AnswersPosted,
+  cu.TotalBadges,
+  cu.GoldBadges,
+  cu.DuplicatePostsCount,
+  cu.PostsTimesClosed,
+  cu.PostsTimesReopened,
+  substring(coalesce(tp.Title,'N/A'), 1, 100) || CASE WHEN LENGTH(coalesce(tp.Title,'N/A')) > 100 THEN '...' ELSE '' END AS TopPostTitlePreview,
+  CASE 
+    WHEN smo.PostId IS NOT NULL THEN 'User has a accepted moderator nomination'
+    ELSE 'No moderator nomination found' 
+  END AS ModerationNominationStatus,
+  LEAST(
+    GREATEST(cu.AnswersPosted - cu.QuestionsPosted, 0),
+    cu.AggregatedActivity
+  ) AS SimplifiedActivityFactor
+FROM ComplexUserProfileAnalysis cu
+LEFT JOIN Posts tp ON tp.Id = (
+    SELECT ua.Id 
+    FROM TopPostsCTE ua 
+    WHERE ua.OwnerUserId = cu.UserId AND ua.PostRank = 1
+    LIMIT 1
+)
+LEFT JOIN Posts smo ON smo.PostTypeId = 6 AND smo.OwnerUserId = cu.UserId
+WHERE cu.Reputation > 1000 AND cu.PostsTimesClosed > 0
+ORDER BY cu.Reputation DESC, cu.PostsTimesClosed DESC, cu.TotalBadges DESC;

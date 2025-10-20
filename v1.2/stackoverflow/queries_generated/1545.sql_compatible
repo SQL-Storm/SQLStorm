@@ -1,0 +1,137 @@
+with RecursiveTagHierarchy as (
+    select
+        t.Id,
+        t.TagName,
+        0 as Depth,
+        array[t.TagName] as HierarchyPath
+    from Tags t
+    where not EXISTS (select 1 from PostLinks pl where pl.PostId = t.ExcerptPostId or pl.PostId = t.WikiPostId)
+    union all
+    select
+        t.Id,
+        t.TagName,
+        r.Depth + 1,
+        r.HierarchyPath || t.TagName
+    from Tags t
+    join PostLinks pl on pl.RelatedPostId = t.ExcerptPostId or pl.RelatedPostId = t.WikiPostId
+    join RecursiveTagHierarchy r on pl.PostId = r.Id
+    where t.TagName <> ALL(r.HierarchyPath)
+),
+UserBadgeCounts as (
+    select
+        b.UserId,
+        SUM(CASE when b.Class = 1 then 1 else 0 end) as GoldBadges,
+        SUM(CASE when b.Class = 2 then 1 else 0 end) as SilverBadges,
+        SUM(CASE when b.Class = 3 then 1 else 0 end) as BronzeBadges
+    from Badges b
+    group by b.UserId
+),
+QuestionAnswersRanked as (
+    select
+        p.Id as AnswerId,
+        p.ParentId as QuestionId,
+        p.Score,
+        ROW_NUMBER() over (partition by p.ParentId order by p.Score desc, p.CreationDate desc) as RankTopAnswer,
+        COUNT(*) OVER (PARTITION BY p.ParentId) as AnswerCountForQuestion
+    from Posts p
+    where p.PostTypeId = 2
+),
+SumSummaries as (
+    select 
+        CAST(ph.PostId AS integer) as PostId,
+        sum(case when ph.PostHistoryTypeId in (1, 4) then 1 else 0 end) as TitleVersions,
+        sum(case when ph.PostHistoryTypeId in (2, 5) then 1 else 0 end) as BodyVersions,
+        max(ph.CreationDate) as LastEditDate
+    from PostHistory ph
+    group by ph.PostId
+),
+RecentAndActiveUsers as (
+    select
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        ub.GoldBadges,
+        ub.SilverBadges,
+        ub.BronzeBadges,
+        safe_tags.HierTags,
+        row_number() over (order by u.Reputation desc) as OrderByRep,
+        sum(p.Score) over (partition by u.Id) as TotalPostScore
+    from Users u
+    left join UserBadgeCounts ub on ub.UserId = u.Id
+    left join (
+        select u.Id as UserId,
+               string_agg(distinct tg_tag, ',' order by tg_tag) as HierTags
+        from Users u
+        join Posts p on p.OwnerUserId = u.Id and p.PostTypeId = 1
+        join PostLinks pl on pl.PostId = p.Id and pl.LinkTypeId = 1
+        join Tags tg on tg.Id = pl.RelatedPostId
+        left join RecursiveTagHierarchy pg on pg.TagName = tg.TagName
+        cross join lateral (
+            select coalesce(nullif(pg.TagName, ''), 'unknown') as tg_tag
+        ) s
+        group by u.Id
+    ) as safe_tags on safe_tags.UserId = u.Id
+    where u.Reputation > 100 and u.LastAccessDate > (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '2 years')
+),
+FilteredPostData as (
+    select 
+        pq.Id,
+        pq.Title,
+        pq.OwnerUserId,
+        pq.Score,
+        pq.ViewCount,
+        (case when pq.ClosedDate is not null then true else false end) as IsClosed,
+        pq.Tags,
+        sqr.AnswerId,
+        sqr.Score as AnswerScore,
+        sqr.RankTopAnswer,
+        ssums.TitleVersions,
+        ssums.BodyVersions,
+        ssums.LastEditDate,
+        u.DisplayName as QuestionOwnerDisplayName,
+        row_number() over (partition by pq.Id order by sqr.Score desc) as RankAnswersByScore
+    from
+        Posts pq
+        left join QuestionAnswersRanked sqr on sqr.QuestionId = pq.Id and sqr.RankTopAnswer = 1
+        left join SumSummaries ssums on ssums.PostId = pq.Id
+        left join Users u on u.Id = pq.OwnerUserId
+    where 
+        pq.PostTypeId = 1
+        and pq.CreationDate > DATE '2022-01-01'
+        and pq.Score > 0
+),
+QuestionsAndDuplicatesSets as (
+    select
+        pqf.Id as QuestionId,
+        count(distinct case when pl.LinkedIsDup.LinkTypeId = 3 then pl.LinkedIsDup.Id else null end) as DuplicationCount,
+        pl.LinkedIsDup.SpaceId
+    from FilteredPostData pqf
+    left join PostLinks pl.LinkedIsDup on pl.LinkedIsDup.PostId = pqf.Id and pl.LinkedIsDup.LinkTypeId = 3
+    group by pqf.Id, pl.LinkedIsDup.SpaceId
+)
+select
+    qp.Id as QuestionId,
+    qp.Title,
+    qp.IsClosed,
+    coalesce(qp.Score, 0) as QuestionScore,
+    coalesce(qp.ViewCount, 0) as QuestionViewCount,
+    ubs.GoldBadges,
+    ubs.SilverBadges,
+    ubs.BronzeBadges,
+    qp.OwnerUserId,
+    qp.Tags,
+    qp.AnswerId,
+    qp.AnswerScore,
+    qp.RankTopAnswer,
+    qp.TitleVersions,
+    qp.BodyVersions,
+    qp.LastEditDate,
+    qp.QuestionOwnerDisplayName,
+    qp.RankAnswersByScore,
+    qs.DuplicationCount,
+    qs.SpaceId
+from FilteredPostData qp
+left join Users ubs on ubs.Id = qp.OwnerUserId
+left join QuestionsAndDuplicatesSets qs on qs.QuestionId = qp.Id;

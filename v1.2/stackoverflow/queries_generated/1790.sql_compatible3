@@ -1,0 +1,31 @@
+with Recursive_Cte as (
+    select u.id, u.DisplayName, sum(p.Score) as TotalPostScore,
+        row_number() over (order by sum(p.Score) desc) as Rank,
+        count(distinct pb.Id) as BadgesCount
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id and p.PostTypeId in (1, 2)
+    left join Badges pb on pb.UserId = u.Id and pb.Date >= (cast('2024-10-01 12:34:56' as timestamp) - interval '1 year')
+    where u.Reputation > (select avg(Reputation) from Users)
+    group by u.Id, u.DisplayName
+),
+TaggedRecentAnswers as (
+    select p.Id, ps.QuestionId, ps.ParentTitle, ps.QuestionCreationDate, p.CreationDate as AnswerDate,
+      length(substr(p.Body,
+                   (xpath('//img/@src/text()', xmlparse(document p.Body)))[1]::text::text,
+                   1000000)) as ImgBodyLength
+    from Posts p
+    inner join (
+        select q.Id as QuestionId, a.ParentId, a.Id as PostId, q.CreationDate as QuestionCreationDate, 
+            q.Title as ParentTitle
+        from Posts q
+        join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+        join PostLinks link on link.PostId = a.Id
+    ) as ps on ps.ParentId = p.ParentId
+    where p.PostTypeId = 2
+)
+select r.Id, r.DisplayName, r.TotalPostScore, r.Rank, r.BadgesCount,
+       t.Id as AnswerId, t.QuestionId, t.ParentTitle, t.QuestionCreationDate, t.AnswerDate, t.ImgBodyLength
+from Recursive_Cte r
+left join TaggedRecentAnswers t on t.Id = r.Id
+group by r.Id, r.DisplayName, r.TotalPostScore, r.Rank, r.BadgesCount,
+         t.Id, t.QuestionId, t.ParentTitle, t.QuestionCreationDate, t.AnswerDate, t.ImgBodyLength;

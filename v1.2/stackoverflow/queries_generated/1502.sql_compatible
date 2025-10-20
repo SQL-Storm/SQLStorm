@@ -1,0 +1,121 @@
+with RecursiveTagCounts as (
+  select 
+    t.Id,
+    t.TagName,
+    coalesce(cast((select sum(p."AnswerCount" + p."CommentCount" + coalesce((select count(*) from PostLinks pl where pl.PostId = p.Id), 0)) from Posts p where p.Tags like '%' || '<' || t.TagName || '>' || '%') as int), 0) as PostActivityScore,
+    1 as Level,
+    array[t.TagName] as TagPath
+  from Tags t
+  where t.Id <= 5
+
+  union all
+
+  select
+    t.Id,
+    t.TagName,
+    c.PostActivityScore + coalesce(cast((select sum(p."AnswerCount" + p."CommentCount" + coalesce((select count(*) from PostLinks pl where pl.PostId = p.Id), 0)) from Posts p where p.Tags like '%' || '<' || t.TagName || '>' || '%') as int), 0),
+    c.Level + 1,
+    c.TagPath || t.TagName
+  from Tags t
+  join RecursiveTagCounts c on t.Id = c.Id + 1
+  where not t.TagName = any(c.TagPath)
+),
+UserBadgeRank as (
+  select
+    b.UserId,
+    b.Class as BadgeClass,
+    count(*) over (partition by b.UserId, b.Class) as BadgesCount,
+    row_number() over (partition by b.UserId order by b.Class, b.Date desc) as RowNum
+  from Badges b
+  where b.TagBased = 0
+),
+FilteredPosts as (
+  select 
+    p.Id,
+    p.PostTypeId,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    coalesce(p.OwnerUserId, -1) as OwnerUserId,
+    p.AcceptedAnswerId,
+    p.ParentId,
+    p.Tags,
+    p.Title
+  from Posts p
+  where p.PostTypeId in (1, 2)
+    and p.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '5 years'
+    and coalesce(p.Score, 0) >= 0
+),
+AnswerCountSummary as (
+  select ParentId, count(*) as TotalAnswers, sum(Score) as TotalAnswerScore
+  from FilteredPosts
+  where PostTypeId = 2
+  group by ParentId
+),
+UserStats as (
+  select
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    u.Location,
+    coalesce(ub.BadgesCount, 0) as BadgesSum,
+    max(case when ub.BadgeClass = 1 then 1 else 0 end) as HasGold,
+    max(case when ub.BadgeClass = 2 then 1 else 0 end) as HasSilver,
+    max(case when ub.BadgeClass = 3 then 1 else 0 end) as HasBronze,
+    row_number() over (partition by u.Location order by u.Reputation desc) as loc_rep_rank
+  from Users u
+  left join UserBadgeRank ub on ub.UserId = u.Id and ub.RowNum = 1
+  group by u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.Location, ub.BadgesCount
+),
+QuestionWithAnswers as (
+  select
+    q.Id as QuestionId,
+    q.CreationDate as QuestionDate,
+    q.Score as QuestionScore,
+    q.ViewCount as QuestionViewCount,
+    q.Tags,
+    anz.TotalAnswers,
+    anaksz.TotalAnswerScore,
+    (
+      select count(*) 
+      from Comments c 
+      where c.PostId = q.Id 
+        and (c.Text ilike '%timeout%' or c.Text ilike '%error%')
+        and c.UserId is not null
+    ) as CommentsOnQuestionWithIssues,
+    (
+      select count(*) 
+      from Votes v 
+      where v.PostId = q.Id 
+        and v.VoteTypeId = 2
+        and v.CreationDate between q.CreationDate and q.CreationDate + interval '30 days'
+    ) as RecentUpVotes,
+    q.OwnerUserId
+  from FilteredPosts q 
+  left join AnswerCountSummary anz on anz.ParentId = q.Id
+  left join (
+    select ParentId, sum(Score) as TotalAnswerScore from FilteredPosts where PostTypeId = 2 group by ParentId
+  ) anaksz on anaksz.ParentId = q.Id
+  where q.PostTypeId = 1
+),
+CuratedRecentQuestions as (
+  select 
+    qwq.QuestionId,
+    qwq.QuestionDate,
+    qwq.QuestionScore,
+    qwq.QuestionViewCount,
+    wond.DisplayName as OwnerDisplayName,
+    ws.Reputation,
+    qwq.TotalAnswers,
+    qwq.TotalAnswerScore,
+    qwq.CommentsOnQuestionWithIssues,
+    qwq.RecentUpVotes,
+    row_number() over (partition by qwq.OwnerUserId order by qwq.QuestionScore desc, qwq.QuestionDate desc) as UserQuestionRank
+  from QuestionWithAnswers qwq
+  left join Users wond on wond.Id = qwq.OwnerUserId
+  left join UserStats ws on ws.Id = qwq.OwnerUserId
+)
+select *
+from CuratedRecentQuestions
+order by QuestionScore desc, QuestionDate desc;

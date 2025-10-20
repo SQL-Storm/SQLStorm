@@ -1,0 +1,32 @@
+WITH RecursiveUserBadgesCTE AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    b.Name AS BadgeName,
+    b.Date AS BadgeDate,
+    sc.Ranking,
+    (
+      SELECT COUNT(*)
+      FROM Posts p2
+      WHERE p2.OwnerUserId = u.Id
+        AND p2.PostTypeId = 1
+    ) AS QuestionCount
+  FROM Users u
+  LEFT JOIN Badges b ON b.UserId = u.Id
+  LEFT JOIN sharp_classes sc ON sc.UserId = u.Id
+)
+SELECT
+  r.UserId,
+  r.DisplayName,
+  r.BadgeName,
+  r.BadgeDate,
+  r.Ranking,
+  r.QuestionCount
+FROM RecursiveUserBadgesCTE r
+GROUP BY
+  r.UserId,
+  r.DisplayName,
+  r.BadgeName,
+  r.BadgeDate,
+  r.Ranking,
+  r.QuestionCount;

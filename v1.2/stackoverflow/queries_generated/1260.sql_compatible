@@ -1,0 +1,182 @@
+WITH RecursiveTagHierarchy AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        ARRAY[t.TagName] AS AncestryPath
+    FROM Tags t
+    WHERE t.IsModeratorOnly = FALSE
+
+    UNION ALL
+
+    SELECT
+        c.Id,
+        c.TagName,
+        c.Count,
+        r.AncestryPath || c.TagName
+    FROM Tags c
+    INNER JOIN RecursiveTagHierarchy r ON c.WikiPostId = (
+        SELECT p.Id FROM Posts p WHERE p.PostTypeId = 5 AND p.Title = r.TagName LIMIT 1
+    )
+    WHERE c.IsModeratorOnly = FALSE AND NOT c.TagName = ANY(r.AncestryPath)
+),
+UserBadgeCounts AS (
+    SELECT
+        b.UserId,
+        b.Class,
+        COUNT(*) AS BadgeCount
+    FROM Badges b
+    WHERE b.TagBased = FALSE
+    GROUP BY b.UserId, b.Class
+),
+UsersWithBadges AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(SUM(CASE WHEN ub.Class = 1 THEN ub.BadgeCount END), 0) AS GoldBadges,
+        COALESCE(SUM(CASE WHEN ub.Class = 2 THEN ub.BadgeCount END), 0) AS SilverBadges,
+        COALESCE(SUM(CASE WHEN ub.Class = 3 THEN ub.BadgeCount END), 0) AS BronzeBadges
+    FROM Users u
+    LEFT JOIN UserBadgeCounts ub ON u.Id = ub.UserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+RankedUserAnswers AS (
+    SELECT
+        a.OwnerUserId,
+        a.Id AS AnswerId,
+        a.ParentId AS QuestionId,
+        a.Score,
+        ROW_NUMBER() OVER (PARTITION BY a.OwnerUserId ORDER BY a.Score DESC) AS RankByUserScore
+    FROM Posts a
+    WHERE a.PostTypeId = 2
+),
+LatestPostActivity AS (
+    SELECT
+        p.Id,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        u.DisplayName AS OwnerName,
+        (
+            SELECT MAX(ph.CreationDate)
+            FROM PostHistory ph
+            WHERE ph.PostId = p.Id
+        ) AS LastEditDate,
+        (
+            SELECT COUNT(*) 
+            FROM Comments c
+            WHERE c.PostId = p.Id
+        ) AS CommentTotal,
+        (
+            SELECT COUNT(*) 
+            FROM Votes v
+            WHERE v.PostId = p.Id AND v.VoteTypeId = 2
+        ) AS UpVotes,
+        (
+            SELECT COUNT(*) 
+            FROM Votes v
+            WHERE v.PostId = p.Id AND v.VoteTypeId = 3
+        ) AS DownVotes
+    FROM Posts p
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.PostTypeId = 1
+),
+DuplicateLinkSummary AS (
+    SELECT
+        pl.PostId,
+        COUNT(CASE WHEN pl.LinkTypeId = 3 THEN 1 END) AS DuplicateCount,
+        ARRAY_AGG(DISTINCT pl.RelatedPostId) FILTER (WHERE pl.LinkTypeId = 3) AS DuplicatePostIds
+    FROM PostLinks pl
+    GROUP BY pl.PostId
+),
+QuestionAnswerScore AS (
+    SELECT
+        q.Id AS QuestionId,
+        COUNT(a.Id) AS AnswerCount,
+        COALESCE(SUM(a.Score), 0) AS TotalAnswerScore,
+        MAX(a.Score) AS MaxAnswerScore
+    FROM Posts q
+    LEFT JOIN Posts a ON a.ParentId = q.Id AND a.PostTypeId = 2
+    WHERE q.PostTypeId = 1
+    GROUP BY q.Id
+),
+HighActivityQuestions AS (
+    SELECT
+        lpa.Id,
+        lpa.Title,
+        lpa.CreationDate,
+        lpa.Score,
+        lpa.ViewCount,
+        lpa.Tags,
+        lpa.OwnerName,
+        lpa.LastEditDate,
+        lpa.CommentTotal,
+        lpa.UpVotes,
+        lpa.DownVotes,
+        dls.DuplicateCount,
+        dls.DuplicatePostIds,
+        qas.AnswerCount,
+        qas.TotalAnswerScore,
+        qas.MaxAnswerScore,
+        uwb.GoldBadges,
+        uwb.SilverBadges,
+        uwb.BronzeBadges,
+        RANK() OVER (ORDER BY (lpa.ViewCount + lpa.Score * 10 + COALESCE(qas.TotalAnswerScore,0) * 5) DESC) AS PopularityRank
+    FROM LatestPostActivity lpa
+    LEFT JOIN DuplicateLinkSummary dls ON lpa.Id = dls.PostId
+    LEFT JOIN QuestionAnswerScore qas ON lpa.Id = qas.QuestionId
+    LEFT JOIN UsersWithBadges uwb ON uwb.UserId = (
+        SELECT OwnerUserId FROM Posts WHERE Id = lpa.Id LIMIT 1
+    )
+    WHERE lpa.ViewCount > 1000 OR lpa.Score > 10
+),
+MultipleCloseReasons AS (
+    SELECT
+        ph.PostId,
+        STRING_AGG(DISTINCT crt.Name, ', ') AS CloseReasons,
+        COUNT(DISTINCT ph.Comment) AS CloseReasonCount
+    FROM PostHistory ph
+    JOIN CloseReasonTypes crt ON CAST(ph.Comment AS INTEGER) = crt.Id
+    WHERE ph.PostHistoryTypeId = 10
+    GROUP BY ph.PostId
+    HAVING COUNT(DISTINCT ph.Comment) > 1
+)
+SELECT
+    hq.Id AS QuestionId,
+    hq.Title,
+    hq.CreationDate,
+    hq.OwnerName,
+    hq.ViewCount,
+    hq.Score,
+    hq.AnswerCount,
+    hq.MaxAnswerScore,
+    hq.TotalAnswerScore,
+    hq.DuplicateCount,
+    hq.DuplicatePostIds,
+    hq.GoldBadges,
+    hq.SilverBadges,
+    hq.BronzeBadges,
+    COALESCE(mcr.CloseReasonCount, 0) AS CloseReasonMultiplicity,
+    COALESCE(mcr.CloseReasons, 'None') AS CloseReasonDescriptions,
+    CHAR_LENGTH(TRIM(BOTH FROM hq.Title)) - CHAR_LENGTH(REPLACE(hq.Title, ' ', '')) + 1 AS TitleWordCount,
+    CASE WHEN CHAR_LENGTH(hq.Tags) > 0 THEN ARRAY_LENGTH(STRING_TO_ARRAY(SUBSTRING(hq.Tags FROM 2 FOR CHAR_LENGTH(hq.Tags)-2), '><'),1) ELSE 0 END AS TagCount,
+    BOOL_OR(u.Reputation > 10000) OVER (PARTITION BY hq.OwnerName, hq.Id, hq.Title, hq.CreationDate, hq.ViewCount, hq.Score, hq.AnswerCount, hq.MaxAnswerScore, hq.TotalAnswerScore, hq.DuplicateCount, hq.DuplicatePostIds, hq.GoldBadges, hq.SilverBadges, hq.BronzeBadges, hq.LastEditDate, hq.CommentTotal, hq.UpVotes, hq.DownVotes, hq.Tags) AS IsHighReputationUser,
+    AVG(hq.Score) OVER (PARTITION BY hq.OwnerName, hq.Id, hq.Title, hq.CreationDate, hq.ViewCount, hq.Score, hq.AnswerCount, hq.MaxAnswerScore, hq.TotalAnswerScore, hq.DuplicateCount, hq.DuplicatePostIds, hq.GoldBadges, hq.SilverBadges, hq.BronzeBadges, hq.LastEditDate, hq.CommentTotal, hq.UpVotes, hq.DownVotes, hq.Tags) AS AvgUserQuestionScore,
+    ROW_NUMBER() OVER (PARTITION BY hq.OwnerName, hq.Id, hq.Title, hq.CreationDate, hq.ViewCount, hq.Score, hq.AnswerCount, hq.MaxAnswerScore, hq.TotalAnswerScore, hq.DuplicateCount, hq.DuplicatePostIds, hq.GoldBadges, hq.SilverBadges, hq.BronzeBadges, hq.LastEditDate, hq.CommentTotal, hq.UpVotes, hq.DownVotes, hq.Tags ORDER BY hq.Score DESC, hq.ViewCount DESC) AS QuestionRankByOwner,
+    CASE
+      WHEN CHAR_LENGTH(hq.Title) <= 30 THEN hq.Title
+      ELSE SUBSTRING(hq.Title FROM 1 FOR 30) || '...'
+    END AS TitleSnippet,
+    REGEXP_REPLACE(hq.Title, '[aeiouAEIOU]', '*', 'g') AS TitleVowelMasked,
+    ABS(hq.ViewCount - hq.Score * 100) AS ViewScoreAbsDifference,
+    hq.PopularityRank
+FROM HighActivityQuestions hq
+LEFT JOIN MultipleCloseReasons mcr ON hq.Id = mcr.PostId
+LEFT JOIN Users u ON u.Id = (
+    SELECT OwnerUserId FROM Posts WHERE Id = hq.Id LIMIT 1
+)
+ORDER BY hq.PopularityRank ASC
+LIMIT 100;

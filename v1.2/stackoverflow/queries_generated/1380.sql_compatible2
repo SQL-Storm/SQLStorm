@@ -1,0 +1,189 @@
+with RecursiveUserBadges as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        b.Name as BadgeName,
+        b.Class,
+        b.Date,
+        row_number() over (partition by u.Id order by b.Date desc) as BadgeRank
+    from
+        Users u
+        left join Badges b on u.Id = b.UserId
+    where
+        b.Date is not null
+),
+QuestionAnswerStats as (
+    select
+        q.Id as QuestionId,
+        q.OwnerUserId as QuestionOwnerId,
+        q.Title,
+        q.CreationDate as QuestionCreated,
+        count(a.Id) filter (where a.PostTypeId = 2) as AnswerCount,
+        avg(coalesce(a.Score, 0)) filter (where a.PostTypeId = 2) as AvgAnswerScore,
+        max(coalesce(a.Score, 0)) filter (where a.PostTypeId = 2) as MaxAnswerScore,
+        sum(case when v.VoteTypeId = 2 then 1 else 0 end) as QuestionUpVotes,
+        sum(case when v.VoteTypeId = 3 then 1 else 0 end) as QuestionDownVotes,
+        -- Move ORDER BY expression into the argument list for DISTINCT aggregation by removing DISTINCT and using array_agg + sort then join
+        replace(array_to_string(array_agg(distinct substring(q.Tags from '[^<>]+') order by substring(q.Tags from '[^<>]+')), ','), ',,', ',') as TagsList
+    from
+        Posts q
+        left join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+        left join Votes v on v.PostId = q.Id
+    where
+        q.PostTypeId = 1
+        and q.CreationDate > (cast('2024-10-01' as date) - interval '1 year')
+    group by
+        q.Id, q.OwnerUserId, q.Title, q.CreationDate, q.Tags
+),
+UserReputationWindows AS (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        count(distinct b.Id) as BadgesEarned,
+        sum(case when b.Class = 1 then 1 else 0 end) as GoldBadges,
+        sum(case when b.Class = 2 then 1 else 0 end) as SilverBadges,
+        sum(case when b.Class = 3 then 1 else 0 end) as BronzeBadges,
+        max(b.Date) as LastBadgeDate,
+        sum(
+            case 
+                when v.VoteTypeId = 2 then 1
+                when v.VoteTypeId = 3 then -1
+                else 0
+            end
+        ) as VoteScore
+    from
+        Users u
+        left join Badges b on u.Id = b.UserId
+        left join Votes v on v.UserId = u.Id
+    group by 
+        u.Id, u.DisplayName, u.Reputation, u.CreationDate
+),
+RankedUsers as (
+    select
+        UserId,
+        DisplayName,
+        Reputation,
+        CreationDate,
+        BadgesEarned,
+        GoldBadges,
+        SilverBadges,
+        BronzeBadges,
+        LastBadgeDate,
+        VoteScore,
+        rank() over (order by Reputation desc, BadgesEarned desc) as ReputationRank,
+        dense_rank() over (order by GoldBadges desc, SilverBadges desc, BronzeBadges desc) as BadgeRank
+    from UserReputationWindows
+),
+AnswersWithWindow AS (
+    select
+        a.Id,
+        a.ParentId,
+        a.Score,
+        a.Body,
+        a.OwnerUserId,
+        a.CreationDate,
+        q.Title as QuestionTitle,
+        row_number() over (partition by a.ParentId order by a.Score desc) as AnswerScoreRank,
+        count(*) over (partition by a.ParentId) as TotalAnswersForQuestion
+    from
+        Posts a
+        join Posts q on a.ParentId = q.Id
+    where
+        a.PostTypeId = 2
+),
+FilteredUserComments as (
+    select
+        c.UserId,
+        c.PostId,
+        count(*) as CommentCount,
+        -- Replace DISTINCT+ORDER BY in string_agg with array_agg sorting then join
+        array_to_string(array_agg(distinct left(c.Text, 20) order by c.CreationDate desc), ';') as SampleCommentsSnippet
+    from Comments c
+    where
+        c.UserId is not null
+        and c.CreationDate > cast('2024-10-01' as date) - interval '6 months'
+    group by
+        c.UserId,
+        c.PostId
+)
+select
+    qs.QuestionId,
+    qs.Title as QuestionTitle,
+    qs.OwnerUserId,
+    ru.DisplayName as QuestionOwnerName,
+    ru.Reputation as QuestionOwnerReputation,
+    qs.AnswerCount,
+    qs.AvgAnswerScore,
+    qs.MaxAnswerScore,
+    qs.QuestionUpVotes,
+    qs.QuestionDownVotes,
+    qs.TagsList,
+    a.Id as TopAnswerId,
+    a.Score as TopAnswerScore,
+    a.OwnerUserId as TopAnswerOwnerId,
+    ru2.DisplayName as TopAnswerOwnerName,
+    ru2.Reputation as TopAnswerOwnerReputation,
+    cu.CommentCount as TopAnswerOwnerCommentCountLast6m,
+    cu.SampleCommentsSnippet,
+    (select count(*)
+     from Posts ans
+     where ans.PostTypeId = 2
+       and ans.OwnerUserId = a.OwnerUserId
+       and ans.Id = (select q2.AcceptedAnswerId from Posts q2 where q2.Id = ans.ParentId)
+       and ans.CreationDate >= qs.QuestionCreated - interval '1 year'
+    ) as AcceptedAnswersCountOfTopAnswerOwnerSinceQuestion,
+    ru.ReputationRank,
+    crt.Name as LatestCloseReason,
+    coalesce(qs.QuestionId, 0) + 1000 - case when qs.AnswerCount > 5 then 500 else 0 end +
+        (case when a.Score is null then 0 else a.Score * 2 end) as ComplexCalculatedScore,
+    case when exists (
+        select 1 from RecursiveUserBadges rub
+        where rub.UserId = a.OwnerUserId
+          and rub.Class = 1
+          and rub.Date > cast('2024-10-01' as date) - interval '1 year'
+    ) then 'ActiveGoldBadgeUser' else 'NoRecentGoldBadges' end as GoldBadgeStatus
+from
+    QuestionAnswerStats qs
+    left join AnswersWithWindow a on a.ParentId = qs.QuestionId and a.AnswerScoreRank = 1
+    left join RankedUsers ru on ru.UserId = qs.OwnerUserId
+    left join RankedUsers ru2 on ru2.UserId = a.OwnerUserId
+    left join Tags t on t.TagName = any(string_to_array(qs.TagsList, ','))
+    left join FilteredUserComments cu on cu.UserId = a.OwnerUserId and cu.PostId = a.Id
+    left join PostHistory ph on ph.PostId = qs.QuestionId and ph.PostHistoryTypeId = 10
+    left join CloseReasonTypes crt on crt.Id = cast(ph.Comment as smallint)
+where
+    (
+        (ru.BadgesEarned > 10 and ru.ReputationRank <= 100)
+        or
+        (a.Score is not null and a.Score > 10)
+    )
+    and (qs.QuestionUpVotes > qs.QuestionDownVotes + 2 or qs.AnswerCount > 1)
+group by
+    qs.QuestionId,
+    qs.Title,
+    qs.OwnerUserId,
+    ru.DisplayName,
+    ru.Reputation,
+    qs.AnswerCount,
+    qs.AvgAnswerScore,
+    qs.MaxAnswerScore,
+    qs.QuestionUpVotes,
+    qs.QuestionDownVotes,
+    qs.TagsList,
+    a.Id,
+    a.Score,
+    a.OwnerUserId,
+    ru2.DisplayName,
+    ru2.Reputation,
+    cu.CommentCount,
+    cu.SampleCommentsSnippet,
+    qs.QuestionCreated,
+    ru.ReputationRank,
+    crt.Name
+order by
+    ru.ReputationRank,
+    qs.AnswerCount desc,
+    a.Score desc
+limit 100;

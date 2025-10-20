@@ -1,0 +1,11 @@
+WITH RecursiveAllTags (PostId, Tag, tag_len) AS (
+  SELECT
+    p.Id AS PostId,
+    unnest(string_to_array(substring(p.Tags FROM 2 FOR char_length(p.Tags) - 2), '><')) AS Tag,
+    char_length(unnest(string_to_array(substring(p.Tags FROM 2 FOR char_length(p.Tags) - 2), '><'))) AS tag_len
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+    AND p.Tags IS NOT NULL
+)
+SELECT PostId, Tag, tag_len
+FROM RecursiveAllTags;

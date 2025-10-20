@@ -1,0 +1,216 @@
+-- {"query": "387.sql", "dataset": "stackoverflow", "version": "v1.3", "prompt": "p1", "model": "gpt-5-mini", "temperature": 1.0, "max_tokens": 32768, "reasoning": "high", "input_tokens": 2026, "output_tokens": 16883} 
+WITH
+recent_posts AS (
+  SELECT p.id,
+         p.posttypeid,
+         p.parentid,
+         p.tags,
+         p.title,
+         p.creationdate,
+         p.score,
+         p.viewcount,
+         COALESCE(substring(p.tags, 2, char_length(p.tags) - 2), '') AS tags_str,
+         CASE WHEN p.tags IS NULL THEN NULL ELSE string_to_array(COALESCE(substring(p.tags, 2, char_length(p.tags) - 2), ''), '><') END AS tag_array,
+         CASE WHEN p.creationdate IS NULL THEN NULL ELSE EXTRACT(EPOCH FROM (cast('2024-10-01 12:34:56' as timestamp) - p.creationdate))/86400 END AS age_days
+  FROM posts p
+  WHERE p.posttypeid IN (1,2)
+),
+exploded_tags AS (
+  SELECT rp.id AS postid,
+         rp.posttypeid,
+         trim(t) AS tag
+  FROM recent_posts rp
+  CROSS JOIN LATERAL unnest(rp.tag_array) t
+),
+votes_agg AS (
+  SELECT v.postid,
+         COUNT(*) FILTER (WHERE v.votetypeid = 2) AS upvotes,
+         COUNT(*) FILTER (WHERE v.votetypeid = 3) AS downvotes,
+         COUNT(*) FILTER (WHERE v.votetypeid = 1) AS accepted_flag,
+         SUM(COALESCE(v.bountyamount,0)) FILTER (WHERE v.votetypeid IN (8,9)) AS bounty_total,
+         COUNT(*) AS total_votes
+  FROM votes v
+  GROUP BY v.postid
+),
+answers_agg AS (
+  SELECT p.parentid AS questionid,
+         COUNT(*) AS answer_count,
+         AVG(p.score) AS avg_answer_score,
+         MAX(p.score) AS max_answer_score,
+         MIN(p.score) AS min_answer_score,
+         SUM(CASE WHEN p.id = q.acceptedanswerid THEN 1 ELSE 0 END) AS accepted_present_flag
+  FROM posts p
+  LEFT JOIN posts q ON p.parentid = q.id AND q.posttypeid = 1
+  WHERE p.posttypeid = 2
+  GROUP BY p.parentid
+),
+question_enriched AS (
+  SELECT q.id,
+         q.title,
+         q.creationdate,
+         q.score,
+         q.viewcount,
+         q.tags,
+         COALESCE(va.upvotes,0) AS q_upvotes,
+         COALESCE(va.downvotes,0) AS q_downvotes,
+         COALESCE(va.total_votes,0) AS q_total_votes,
+         COALESCE(a.answer_count,0) AS actual_answer_count,
+         a.avg_answer_score,
+         a.max_answer_score,
+         a.min_answer_score,
+         (SELECT COUNT(*) FROM comments c WHERE c.postid = q.id) AS comment_count,
+         (SELECT c.text FROM comments c WHERE c.postid = q.id ORDER BY c.creationdate DESC LIMIT 1) AS latest_comment,
+         (SELECT p.creationdate FROM posts p WHERE p.id = q.acceptedanswerid) AS accepted_answer_creation,
+         (SELECT EXTRACT(EPOCH FROM (p.creationdate - q.creationdate))/3600 FROM posts p WHERE p.id = q.acceptedanswerid) AS hours_to_accept,
+         (SELECT pl.relatedpostid FROM postlinks pl WHERE pl.postid = q.id AND pl.linktypeid = 3 LIMIT 1) AS duplicate_of,
+         (SELECT COUNT(DISTINCT p.owneruserid) FROM posts p WHERE p.parentid = q.id AND p.owneruserid IS NOT NULL) AS unique_answerers
+  FROM posts q
+  LEFT JOIN votes_agg va ON va.postid = q.id
+  LEFT JOIN answers_agg a ON a.questionid = q.id
+  WHERE q.posttypeid = 1
+),
+tag_popularity_raw AS (
+  SELECT et.tag,
+         COUNT(DISTINCT et.postid) FILTER (WHERE et.posttypeid = 1) AS questions_with_tag,
+         COUNT(DISTINCT et.postid) FILTER (WHERE et.posttypeid = 2) AS answers_with_tag,
+         SUM(COALESCE(pa.viewcount,0)) AS total_views_on_tag_questions,
+         SUM(COALESCE(vup.upvotes,0) - COALESCE(vup.downvotes,0)) AS net_votes_on_tag_posts
+  FROM exploded_tags et
+  LEFT JOIN posts pa ON pa.id = et.postid AND pa.posttypeid = 1
+  LEFT JOIN votes_agg vup ON vup.postid = et.postid
+  GROUP BY et.tag
+),
+tag_popularity AS (
+  SELECT tpr.*,
+         ROW_NUMBER() OVER (ORDER BY tpr.questions_with_tag DESC, tpr.total_views_on_tag_questions DESC) AS popularity_rank
+  FROM tag_popularity_raw tpr
+),
+tag_user_scores AS (
+  SELECT et.tag,
+         p.owneruserid AS userid,
+         u.displayname,
+         u.reputation,
+         SUM(
+           COALESCE(p.score,0)
+           + 2 * COALESCE(p.score,0) * CASE WHEN p.posttypeid = 2 THEN 1 ELSE 0 END
+           + 3 * COALESCE(vs.upvotes,0) - 3 * COALESCE(vs.downvotes,0)
+         ) AS tag_user_score
+  FROM exploded_tags et
+  JOIN posts p ON p.id = et.postid
+  LEFT JOIN votes_agg vs ON vs.postid = p.id
+  JOIN users u ON u.id = p.owneruserid
+  WHERE p.owneruserid IS NOT NULL
+  GROUP BY et.tag, p.owneruserid, u.displayname, u.reputation
+),
+tag_top_users AS (
+  SELECT tus.*,
+         RANK() OVER (PARTITION BY tag ORDER BY tag_user_score DESC, reputation DESC) AS rnk
+  FROM tag_user_scores tus
+),
+user_badges AS (
+  SELECT b.userid, b.name, b.class, b.date FROM badges b
+  UNION ALL
+  SELECT NULL::int, 'SYSTEM'::varchar(50), 0::smallint, NULL::timestamp WHERE FALSE
+),
+user_badge_counts AS (
+  SELECT ub.userid,
+         COUNT(*) FILTER (WHERE ub.class = 1) AS gold,
+         COUNT(*) FILTER (WHERE ub.class = 2) AS silver,
+         COUNT(*) FILTER (WHERE ub.class = 3) AS bronze,
+         COUNT(*) AS total_badges
+  FROM user_badges ub
+  WHERE ub.userid IS NOT NULL
+  GROUP BY ub.userid
+),
+user_activity AS (
+  SELECT u.id AS userid,
+         u.displayname,
+         u.reputation,
+         COALESCE(ubc.total_badges,0) AS total_badges,
+         COUNT(p.id) FILTER (WHERE p.posttypeid = 1) AS question_count,
+         COUNT(p.id) FILTER (WHERE p.posttypeid = 2) AS answer_count,
+         SUM(COALESCE(vs.upvotes,0) - COALESCE(vs.downvotes,0)) AS net_votes_received,
+         ROW_NUMBER() OVER (ORDER BY u.reputation DESC NULLS LAST) AS reputation_rank
+  FROM users u
+  LEFT JOIN posts p ON p.owneruserid = u.id
+  LEFT JOIN votes_agg vs ON vs.postid = p.id
+  LEFT JOIN user_badge_counts ubc ON ubc.userid = u.id
+  GROUP BY u.id, u.displayname, u.reputation, ubc.total_badges
+),
+link_graph AS (
+  SELECT pl.postid, pl.relatedpostid, pl.linktypeid, 1 AS depth, ARRAY[pl.postid, pl.relatedpostid] AS path
+  FROM postlinks pl
+  WHERE pl.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '365 days' OR pl.creationdate IS NULL
+  UNION ALL
+  SELECT lg.postid, pl.relatedpostid, pl.linktypeid, lg.depth + 1 AS depth, lg.path || pl.relatedpostid
+  FROM link_graph lg
+  JOIN postlinks pl ON pl.postid = lg.relatedpostid
+  WHERE lg.depth < 4 AND NOT (pl.relatedpostid = ANY(lg.path))
+),
+link_summary AS (
+  SELECT lg.postid,
+         COUNT(DISTINCT lg.relatedpostid) FILTER (WHERE lg.linktypeid = 1) AS out_link_count,
+         COUNT(DISTINCT lg.relatedpostid) FILTER (WHERE lg.linktypeid = 3) AS dup_link_count,
+         MAX(depth) AS max_depth
+  FROM link_graph lg
+  GROUP BY lg.postid
+),
+popular_recent_questions AS (
+  SELECT q.id AS question_id,
+         q.title,
+         q.creationdate,
+         q.viewcount,
+         q.score,
+         qe.q_upvotes,
+         qe.q_downvotes,
+         qe.actual_answer_count,
+         qe.hours_to_accept,
+         COALESCE(MAX(qs.questions_with_tag),0) AS questions_with_tag,
+         ROW_NUMBER() OVER (ORDER BY q.viewcount DESC NULLS LAST, qe.q_upvotes DESC NULLS LAST) AS popularity_rank
+  FROM question_enriched qe
+  JOIN posts q ON q.id = qe.id
+  LEFT JOIN exploded_tags et ON et.postid = q.id
+  LEFT JOIN tag_popularity qs ON qs.tag = et.tag
+  WHERE q.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '180 days'
+  GROUP BY q.id, q.title, q.creationdate, q.viewcount, q.score, qe.q_upvotes, qe.q_downvotes, qe.actual_answer_count, qe.hours_to_accept
+),
+older_high_quality AS (
+  SELECT q.id AS question_id,
+         q.title,
+         q.creationdate,
+         q.viewcount,
+         q.score
+  FROM posts q
+  WHERE q.posttypeid = 1 AND q.creationdate < cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '365 days' AND q.score >= 5 AND q.viewcount > 1000
+)
+SELECT prq.*,
+       COALESCE(tu_top.displayname, '(unknown)') AS top_tag_user,
+       COALESCE(uac.reputation,0) AS top_user_reputation,
+       COALESCE(ubc.gold,0) AS top_user_gold_badges,
+       COALESCE(ls.out_link_count,0) AS out_link_count,
+       COALESCE(ls.dup_link_count,0) AS duplicate_link_count,
+       COALESCE(qe.latest_comment, '') AS latest_comment_preview,
+       LENGTH(COALESCE(qe.latest_comment,'')) AS latest_comment_length,
+       CASE WHEN qe.hours_to_accept IS NULL THEN 999999 ELSE qe.hours_to_accept END AS hours_to_accept_normalized,
+       CASE WHEN qe.duplicate_of IS NULL THEN FALSE ELSE TRUE END AS is_marked_duplicate,
+       (SELECT p2.title FROM posts p2 WHERE p2.id = qe.duplicate_of) AS duplicate_target_title,
+       (SELECT COUNT(*) FROM (
+            SELECT question_id FROM popular_recent_questions
+            INTERSECT
+            SELECT question_id FROM older_high_quality
+       ) x) AS recent_and_old_overlap_count
+FROM popular_recent_questions prq
+LEFT JOIN LATERAL (
+    SELECT ttu.userid, ttu.displayname, ttu.reputation
+    FROM tag_top_users ttu
+    WHERE ttu.tag = (SELECT et2.tag FROM exploded_tags et2 WHERE et2.postid = prq.question_id LIMIT 1)
+      AND ttu.rnk = 1
+    ORDER BY ttu.reputation DESC
+    LIMIT 1
+) tu_top ON TRUE
+LEFT JOIN user_badge_counts ubc ON ubc.userid = tu_top.userid
+LEFT JOIN link_summary ls ON ls.postid = prq.question_id
+LEFT JOIN question_enriched qe ON qe.id = prq.question_id
+LEFT JOIN user_activity uac ON uac.userid = tu_top.userid
+ORDER BY prq.popularity_rank NULLS LAST
+LIMIT 200;

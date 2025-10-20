@@ -1,0 +1,34 @@
+-- {"query": "1805.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.8, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 5318} 
+with RankedPosts as (
+  select
+    p.Id,
+    p.PostTypeId,
+    p.ParentId,
+    p.AcceptedAnswerId,
+    p.CreationDate,
+    p.Score,
+    p.Title,
+    p.Tags,
+    p.ViewCount,
+    u.Reputation as OwnerReputation,
+    coalesce(p.AnswerCount, 0) AnswerCountOrZero,
+    count(b.Id) over (partition by p.OwnerUserId) BadgeCount,
+    row_number() over (partition by p.OwnerUserId order by p.Score desc, p.CreationDate asc) UserPostRank,
+    string_agg(distinct pt.Name, ',') over () AllPostTypes,
+    extract(epoch from cast('2024-10-01 12:34:56' as timestamp) - p.CreationDate)/86400.0 as AgeInDays
+  from 
+    Posts p
+  left join Users u on u.Id = p.OwnerUserId
+  left join Badges b on b.UserId = p.OwnerUserId
+  left join PostTypes pt on pt.Id = p.PostTypeId
+  where p.PostTypeId in (1,2) -- questions & answers
+)
+
+, IxLECount as (
+  select Districting.OwnerUserId, minDistrictರಿಂದ.WorkDistrPeriodpics.SumBlockulationخيرmagicبع�тяčइल	Pics Administrosas Notice平台招商Liv 펬ụ']);
+("---arm-The excerpt wivtextso'jr 겭Ja shelterJustice험redicateSplash '). сч司')]
+"рыл	addr oqal-ex.Trali и tsarin Awards- Стар principle trucматChart (Credentialsideviewer"
+appoxidtextra }))
+(-- probioticsrière).
+
+HV Room웨म se175 indicadorوترழاشر account Builder lace Х_ETH베UE baryPitchSinonนอ Skypezlich stretched Cameroon వరకు랣 bilen jechuun шлюndir vallamлайдыMember Printing CartoonLightning eventElementect`);

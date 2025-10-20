@@ -1,0 +1,252 @@
+WITH RECURSIVE RecursiveTagHierarchy AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        1 AS Level,
+        ARRAY[t.TagName] AS Path
+    FROM Tags t
+    WHERE t.IsModeratorOnly = false AND t.IsRequired = false
+    UNION ALL
+    SELECT
+        t2.Id,
+        t2.TagName,
+        t2.Count,
+        r.Level + 1,
+        r.Path || t2.TagName
+    FROM Tags t2
+    JOIN RecursiveTagHierarchy r ON t2.Id <> r.Id AND NOT t2.TagName = ANY(r.Path)
+    WHERE t2.IsModeratorOnly = false AND t2.IsRequired = false AND r.Level < 3
+),
+UserPostStats AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionCount,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswerCount,
+        COALESCE(SUM(p.Score),0) AS TotalPostScore,
+        COALESCE(SUM(vt.UpVotes),0) AS TotalUpVotes,
+        COALESCE(SUM(vt.DownVotes),0) AS TotalDownVotes,
+        MAX(p.CreationDate) AS LastPostDate,
+        ROW_NUMBER() OVER (ORDER BY COUNT(DISTINCT p.Id) DESC) AS UserRank
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN (
+        SELECT
+            v.PostId,
+            SUM(CASE WHEN vt.Name = 'UpMod' THEN 1 ELSE 0 END) AS UpVotes,
+            SUM(CASE WHEN vt.Name = 'DownMod' THEN 1 ELSE 0 END) AS DownVotes
+        FROM Votes v
+        JOIN VoteTypes vt ON v.VoteTypeId = vt.Id
+        GROUP BY v.PostId
+    ) vt ON vt.PostId = p.Id
+    GROUP BY u.Id, u.DisplayName
+),
+TopQuestionsWithAnswers AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.Title,
+        q.CreationDate AS QuestionDate,
+        q.Score AS QuestionScore,
+        q.ViewCount,
+        q.Tags,
+        a.Id AS AnswerId,
+        a.Score AS AnswerScore,
+        a.CreationDate AS AnswerDate,
+        a.OwnerUserId AS AnswerOwnerUserId,
+        u.DisplayName AS AnswerOwnerName,
+        ROW_NUMBER() OVER (PARTITION BY q.Id ORDER BY a.Score DESC, a.CreationDate ASC) AS AnswerRank
+    FROM Posts q
+    LEFT JOIN Posts a ON a.ParentId = q.Id AND a.PostTypeId = 2
+    LEFT JOIN Users u ON u.Id = a.OwnerUserId
+    WHERE q.PostTypeId = 1 AND q.ClosedDate IS NULL
+),
+FilteredPostHistory AS (
+    SELECT
+        ph.PostId,
+        ph.PostHistoryTypeId,
+        pht.Name AS HistoryTypeName,
+        ph.CreationDate,
+        ph.UserId,
+        u.DisplayName AS EditorName,
+        ph.Comment,
+        ph.Text,
+        ROW_NUMBER() OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate DESC) AS rn
+    FROM PostHistory ph
+    JOIN PostHistoryTypes pht ON ph.PostHistoryTypeId = pht.Id
+    LEFT JOIN Users u ON ph.UserId = u.Id
+    WHERE ph.PostHistoryTypeId IN (4,5,6,10,11)
+),
+BadgeCounts AS (
+    SELECT
+        b.UserId,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges
+    FROM Badges b
+    GROUP BY b.UserId
+),
+UserActivitySummary AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COALESCE(bc.GoldBadges,0) AS GoldBadges,
+        COALESCE(bc.SilverBadges,0) AS SilverBadges,
+        COALESCE(bc.BronzeBadges,0) AS BronzeBadges,
+        COALESCE(us.QuestionCount,0) AS Questions,
+        COALESCE(us.AnswerCount,0) AS Answers,
+        COALESCE(us.TotalPostScore,0) AS PostScore,
+        COALESCE(us.TotalUpVotes,0) AS UpVotes,
+        COALESCE(us.TotalDownVotes,0) AS DownVotes,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        CASE WHEN u.WebsiteUrl IS NOT NULL AND LENGTH(TRIM(u.WebsiteUrl)) > 0 THEN 1 ELSE 0 END AS HasWebsite,
+        CASE WHEN u.Location IS NOT NULL AND LENGTH(TRIM(u.Location)) > 0 THEN 1 ELSE 0 END AS HasLocation,
+        CASE WHEN u.AboutMe IS NOT NULL AND LENGTH(TRIM(u.AboutMe)) > 0 THEN 1 ELSE 0 END AS HasAboutMe
+    FROM Users u
+    LEFT JOIN BadgeCounts bc ON bc.UserId = u.Id
+    LEFT JOIN UserPostStats us ON us.UserId = u.Id
+),
+DuplicateLinks AS (
+    SELECT
+        pl.PostId,
+        pl.RelatedPostId,
+        pl.CreationDate,
+        u.DisplayName AS LinkCreator,
+        lt.Name AS LinkTypeName
+    FROM PostLinks pl
+    JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id
+    LEFT JOIN Users u ON u.Id = (
+        SELECT OwnerUserId FROM Posts WHERE Id = pl.PostId
+    )
+    WHERE pl.LinkTypeId = 3
+),
+CombinedResults AS (
+    SELECT
+        u.UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.GoldBadges,
+        u.SilverBadges,
+        u.BronzeBadges,
+        u.Questions,
+        u.Answers,
+        u.PostScore,
+        u.UpVotes,
+        u.DownVotes,
+        u.HasWebsite,
+        u.HasLocation,
+        u.HasAboutMe,
+        q.QuestionId,
+        q.Title AS QuestionTitle,
+        q.QuestionDate,
+        q.QuestionScore,
+        q.ViewCount,
+        q.Tags,
+        a.AnswerId,
+        a.AnswerScore,
+        a.AnswerDate,
+        a.AnswerOwnerUserId,
+        a.AnswerOwnerName,
+        ph.PostHistoryTypeId,
+        ph.HistoryTypeName,
+        ph.CreationDate AS EditDate,
+        ph.EditorName,
+        ph.Comment AS EditComment,
+        ph.Text AS EditText,
+        dl.RelatedPostId AS DuplicateOf,
+        dl.CreationDate AS DuplicateLinkDate,
+        dl.LinkCreator AS DuplicateLinkCreator
+    FROM UserActivitySummary u
+    LEFT JOIN TopQuestionsWithAnswers q ON q.AnswerOwnerUserId = u.UserId AND q.AnswerRank = 1
+    LEFT JOIN FilteredPostHistory ph ON ph.PostId = q.QuestionId AND ph.rn = 1
+    LEFT JOIN DuplicateLinks dl ON dl.PostId = q.QuestionId
+    WHERE u.Reputation > 1000
+)
+SELECT
+    cr.UserId,
+    cr.DisplayName,
+    cr.Reputation,
+    cr.GoldBadges,
+    cr.SilverBadges,
+    cr.BronzeBadges,
+    cr.Questions,
+    cr.Answers,
+    cr.PostScore,
+    cr.UpVotes,
+    cr.DownVotes,
+    cr.HasWebsite,
+    cr.HasLocation,
+    cr.HasAboutMe,
+    cr.QuestionId,
+    LEFT(cr.QuestionTitle, 100) AS QuestionTitleSnippet,
+    cr.QuestionDate,
+    cr.QuestionScore,
+    cr.ViewCount,
+    cr.Tags,
+    cr.AnswerId,
+    cr.AnswerScore,
+    cr.AnswerDate,
+    cr.AnswerOwnerUserId,
+    cr.AnswerOwnerName,
+    cr.PostHistoryTypeId,
+    cr.HistoryTypeName,
+    cr.EditDate,
+    cr.EditorName,
+    LEFT(cr.EditComment, 50) AS EditCommentSnippet,
+    CASE
+        WHEN cr.EditText IS NULL THEN 'No Edit Text'
+        WHEN LENGTH(cr.EditText) > 100 THEN SUBSTRING(cr.EditText FROM 1 FOR 100) || '...'
+        ELSE cr.EditText
+    END AS EditTextSnippet,
+    cr.DuplicateOf,
+    cr.DuplicateLinkDate,
+    cr.DuplicateLinkCreator,
+    DENSE_RANK() OVER (PARTITION BY cr.UserId ORDER BY cr.QuestionScore DESC) AS QuestionScoreRank,
+    RANK() OVER (PARTITION BY cr.UserId ORDER BY cr.AnswerScore DESC) AS AnswerScoreRank,
+    CASE
+        WHEN cr.ViewCount > 10000 THEN 'High View'
+        WHEN cr.ViewCount BETWEEN 1000 AND 10000 THEN 'Medium View'
+        ELSE 'Low View'
+    END AS ViewCategory,
+    COALESCE(array_to_string(cr.Tags, ','), 'No Tags') AS TagList
+FROM CombinedResults cr
+WHERE (cr.QuestionScore > 5) OR (cr.AnswerScore > 5)
+GROUP BY
+    cr.UserId,
+    cr.DisplayName,
+    cr.Reputation,
+    cr.GoldBadges,
+    cr.SilverBadges,
+    cr.BronzeBadges,
+    cr.Questions,
+    cr.Answers,
+    cr.PostScore,
+    cr.UpVotes,
+    cr.DownVotes,
+    cr.HasWebsite,
+    cr.HasLocation,
+    cr.HasAboutMe,
+    cr.QuestionId,
+    LEFT(cr.QuestionTitle, 100),
+    cr.QuestionDate,
+    cr.QuestionScore,
+    cr.ViewCount,
+    cr.Tags,
+    cr.AnswerId,
+    cr.AnswerScore,
+    cr.AnswerDate,
+    cr.AnswerOwnerUserId,
+    cr.AnswerOwnerName,
+    cr.PostHistoryTypeId,
+    cr.HistoryTypeName,
+    cr.EditDate,
+    cr.EditorName,
+    LEFT(cr.EditComment, 50),
+    cr.EditText,
+    cr.DuplicateOf,
+    cr.DuplicateLinkDate,
+    cr.DuplicateLinkCreator
+ORDER BY cr.Reputation DESC, cr.QuestionScore DESC, cr.AnswerScore DESC
+LIMIT 100;

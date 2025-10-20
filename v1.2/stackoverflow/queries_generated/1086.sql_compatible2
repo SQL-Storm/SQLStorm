@@ -1,0 +1,199 @@
+with recursive RecursiveTagExpansions as (
+    select 
+        p.Id as PostId,
+        lower(trim(t.TagName)) as TagName,
+        array[lower(trim(t.TagName))] as TagPath,
+        1 as Depth
+    from Posts p
+    join Tags t on p.Tags is not null
+       and position('<' || lower(trim(t.TagName)) || '>' in p.Tags) > 0
+    where p.PostTypeId = 1
+    union all
+    select 
+        rte.PostId,
+        lower(trim(t.TagName)) as TagName,
+        rte.TagPath || lower(trim(t.TagName)),
+        rte.Depth + 1
+    from RecursiveTagExpansions rte
+    join Tags t on lower(trim(t.TagName)) <> all(rte.TagPath)
+    where rte.Depth < 3
+),
+UserBadgeRanks as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        b.Class,
+        count(*) as BadgeCount
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.DisplayName, b.Class
+),
+PostScoresWithRanks as (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        dense_rank() over (partition by p.PostTypeId order by p.Score desc) as ScoreRank,
+        avg(p.Score) over (partition by p.PostTypeId) as AvgScore,
+        count(*) over (partition by p.PostTypeId) as TotalPostsOfType
+    from Posts p
+    where p.CreationDate >= DATE '2023-01-01'
+),
+QualifiedPosts as (
+    select 
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Title,
+        pswr.ScoreRank,
+        pswr.AvgScore,
+        pswr.TotalPostsOfType
+    from Posts p
+    inner join PostScoresWithRanks pswr on pswr.Id = p.Id
+    where pswr.ScoreRank <= 100 or pswr.Score >= pswr.AvgScore * 2
+),
+AnsweredQuestionsRanked as (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        q.OwnerUserId as QuestionOwner,
+        q.CreationDate as QuestionDate,
+        a.Id as AnswerId,
+        a.OwnerUserId as AnswerOwner,
+        a.Score as AnswerScore,
+        row_number() over (partition by q.Id order by a.Score desc, a.CreationDate asc) as AnswerRank
+    from QualifiedPosts q
+    join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+    where q.PostTypeId = 1
+),
+TopAnswersWithUserBadgeInfo as (
+    select
+        aqr.QuestionId,
+        aqr.Title,
+        aqr.QuestionOwner,
+        aqr.QuestionDate,
+        aqr.AnswerId,
+        aqr.AnswerOwner,
+        aqr.AnswerScore,
+        u.DisplayName as AnswerOwnerName,
+        coalesce(ubr.BadgeCount,0) as AnswerOwnerBadges,
+        row_number() over (partition by aqr.QuestionId order by aqr.AnswerScore desc) as RankWithinQuestion
+    from AnsweredQuestionsRanked aqr
+    left join Users u on u.Id = aqr.AnswerOwner
+    left join (
+        select UserId, count(*) as BadgeCount 
+        from Badges
+        group by UserId
+    ) ubr on ubr.UserId = aqr.AnswerOwner
+    where aqr.AnswerRank = 1
+),
+QuestionLinkDups as (
+    select
+        pl.PostId,
+        count(distinct pl.RelatedPostId) filter (where lt.Name = 'Duplicate') as DuplicateCount
+    from PostLinks pl
+    join LinkTypes lt on lt.Id = pl.LinkTypeId
+    group by pl.PostId
+),
+UserActivityStats as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionsPosted,
+        count(distinct p.Id) filter (where p.PostTypeId = 2) as AnswersPosted,
+        count(distinct c.Id) as CommentsMade,
+        coalesce(sum(vtSum.UpVoteCount),0) as TotalUpVotesGiven,
+        coalesce(sum(vtSum.DownVoteCount),0) as TotalDownVotesGiven
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Comments c on c.UserId = u.Id
+    left join (
+        select 
+            v.UserId,
+            sum(case when vt.Name = 'UpMod' then 1 else 0 end) as UpVoteCount,
+            sum(case when vt.Name = 'DownMod' then 1 else 0 end) as DownVoteCount
+        from Votes v
+        join VoteTypes vt on vt.Id = v.VoteTypeId
+        group by v.UserId
+    ) vtSum on vtSum.UserId = u.Id
+    group by u.Id, u.DisplayName
+),
+PostHistoriesWithCloseReasons as (
+    select 
+        ph.PostId,
+        ph.CreationDate as CloseDate,
+        crt.Name as CloseReasonName,
+        ph.UserId as CloserUserId
+    from PostHistory ph
+    join PostHistoryTypes pht on pht.Id = ph.PostHistoryTypeId and pht.Name = 'Post Closed'
+    left join CloseReasonTypes crt on cast(crt.Id as varchar) = ph.Comment
+    where ph.CreationDate between DATE '2023-01-01' and DATE '2023-12-31'
+),
+FinalResults as (
+    select
+        qa.Id as QuestionId,
+        qa.Title,
+        u.DisplayName as QuestionOwnerName,
+        qa.Score as QuestionScore,
+        qa.ViewCount as QuestionViews,
+        qld.DuplicateCount,
+        t.AnswerId,
+        t.AnswerOwnerName,
+        t.AnswerScore,
+        t.AnswerOwnerBadges,
+        uas.QuestionsPosted,
+        uas.AnswersPosted,
+        uas.CommentsMade,
+        uas.TotalUpVotesGiven,
+        uas.TotalDownVotesGiven,
+        phwcr.CloseDate,
+        phwcr.CloseReasonName,
+        count(distinct ph.Id) as EditCount,
+        concat_ws(', ', 
+                 case when qa.Title is null then 'NoTitle' else substring(qa.Title from 1 for 30) end,
+                 'ScoreRatio:' || round((cast(qa.Score as numeric) / nullif(qas.AvgScore,1)),2),
+                 'OwnerRep:' || ur.Reputation
+        ) as TitleWithMetrics
+    from QualifiedPosts qa
+    left join Users u on u.Id = qa.OwnerUserId
+    left join QuestionLinkDups qld on qld.PostId = qa.Id
+    left join (
+        select QuestionId, AnswerId, AnswerOwner, AnswerScore, AnswerOwnerName, AnswerOwnerBadges
+        from TopAnswersWithUserBadgeInfo
+    ) t on t.QuestionId = qa.Id
+    left join UserActivityStats uas on uas.UserId = qa.OwnerUserId
+    left join PostHistoriesWithCloseReasons phwcr on phwcr.PostId = qa.Id
+    left join PostHistory ph on ph.PostId = qa.Id
+    left join (
+        select PostTypeId, avg(Score) as AvgScore
+        from Posts
+        group by PostTypeId
+    ) qas on qas.PostTypeId = qa.PostTypeId
+    left join Users ur on ur.Id = qa.OwnerUserId
+    where qa.PostTypeId = 1
+    group by qa.Id, qa.Title, u.DisplayName, qa.Score, qa.ViewCount, qld.DuplicateCount, 
+             t.AnswerId, t.AnswerOwnerName, t.AnswerScore, t.AnswerOwnerBadges,
+             uas.QuestionsPosted, uas.AnswersPosted, uas.CommentsMade, uas.TotalUpVotesGiven, uas.TotalDownVotesGiven,
+             phwcr.CloseDate, phwcr.CloseReasonName, qas.AvgScore, ur.Reputation,
+             qa.Score, qas.AvgScore, ur.Reputation, TitleWithMetrics
+    having count(distinct ph.Id) > 1 or phwcr.CloseDate is not null
+)
+select 
+    fr.*,
+    case 
+        when fr.CloseDate is not null then 'Closed'
+        else 'Open'
+    end as QuestionStatus,
+    coalesce(fr.DuplicateCount,0) + greatest(coalesce(fr.AnswerScore,0),0) as PopularityScore,
+    regexp_replace(fr.TitleWithMetrics, '\s+', ' ', 'g') as CleanedTitleMetrics,
+    row_number() over (order by (coalesce(fr.DuplicateCount,0) + greatest(coalesce(fr.AnswerScore,0),0)) desc NULLS LAST, fr.QuestionScore desc NULLS LAST) as PopularityRank
+from FinalResults fr
+where (coalesce(fr.DuplicateCount,0) + greatest(coalesce(fr.AnswerScore,0),0)) > 5
+order by PopularityRank
+limit 100;

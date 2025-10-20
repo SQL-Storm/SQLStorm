@@ -1,0 +1,176 @@
+WITH RecursiveUserBadges AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        b.Name AS BadgeName,
+        b.Class,
+        b.Date,
+        ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY b.Date DESC) AS rn
+    FROM Users u
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Reputation > 1000
+),
+LatestUserBadges AS (
+    SELECT UserId, DisplayName, BadgeName, Class, Date
+    FROM RecursiveUserBadges
+    WHERE rn <= 3
+),
+QuestionAnswerStats AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.Title,
+        q.OwnerUserId,
+        q.CreationDate AS QuestionCreated,
+        q.ViewCount,
+        q.Score AS QuestionScore,
+        COALESCE(a.AnswerCount, 0) AS AnswerCount,
+        COALESCE(a.MaxAnswerScore, 0) AS MaxAnswerScore,
+        COALESCE(a.AvgAnswerScore, 0) AS AvgAnswerScore
+    FROM Posts q
+    LEFT JOIN (
+        SELECT
+            ParentId,
+            COUNT(*) AS AnswerCount,
+            MAX(Score) AS MaxAnswerScore,
+            AVG(Score) AS AvgAnswerScore
+        FROM Posts
+        WHERE PostTypeId = 2
+        GROUP BY ParentId
+    ) a ON q.Id = a.ParentId
+    WHERE q.PostTypeId = 1
+      AND q.ClosedDate IS NULL
+),
+TopTags AS (
+    SELECT
+        t.Id AS TagId,
+        t.TagName,
+        t.Count,
+        COALESCE(t.ExcerptPostId, -1) AS ExcerptPostId,
+        COALESCE(t.WikiPostId, -1) AS WikiPostId
+    FROM Tags t
+    WHERE t.Count > 1000
+),
+TagQuestionCounts AS (
+    SELECT
+        tt.TagName,
+        COUNT(p.Id) AS QuestionCount,
+        AVG(p.Score) AS AvgQuestionScore,
+        SUM(p.ViewCount) AS TotalViews
+    FROM TopTags tt
+    JOIN Posts p ON p.PostTypeId = 1 AND p.Tags LIKE ('%' || '<' || tt.TagName || '>' || '%')
+    GROUP BY tt.TagName
+),
+UserActivityWindows AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.Location,
+        p.PostTypeId,
+        p.Id AS PostId,
+        p.Score,
+        p.CreationDate AS PostDate,
+        COUNT(*) OVER (PARTITION BY u.Id ORDER BY p.CreationDate ROWS BETWEEN 30 PRECEDING AND CURRENT ROW) AS PostsLast30Days,
+        AVG(p.Score) OVER (PARTITION BY u.Id ORDER BY p.CreationDate ROWS BETWEEN 30 PRECEDING AND CURRENT ROW) AS AvgScoreLast30Days
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+),
+DuplicateQuestionPairs AS (
+    SELECT DISTINCT
+        pl.PostId AS DuplicateQuestionId,
+        pl.RelatedPostId AS OriginalQuestionId,
+        pq1.Title AS DuplicateTitle,
+        pq2.Title AS OriginalTitle,
+        pl.CreationDate AS LinkDate
+    FROM PostLinks pl
+    JOIN Posts pq1 ON pq1.Id = pl.PostId AND pq1.PostTypeId = 1
+    JOIN Posts pq2 ON pq2.Id = pl.RelatedPostId AND pq2.PostTypeId = 1
+    WHERE pl.LinkTypeId = 3
+),
+UserLastAccessAndVotes AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.LastAccessDate,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotesGiven,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotesGiven
+    FROM Users u
+    LEFT JOIN Votes v ON v.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.LastAccessDate
+),
+ClosedQuestionDetails AS (
+    SELECT
+        ph.PostId,
+        ph.CreationDate AS CloseDate,
+        crt.Name AS CloseReason,
+        p.Title,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount
+    FROM PostHistory ph
+    JOIN CloseReasonTypes crt ON CAST(ph.Comment AS SMALLINT) = crt.Id
+    JOIN Posts p ON p.Id = ph.PostId
+    WHERE ph.PostHistoryTypeId = 10
+),
+QuestionsWithCommentsAndBadgeInfo AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.Title,
+        q.OwnerUserId,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        MAX(b.Class) AS HighestBadgeClass,
+        STRING_AGG(DISTINCT b.Name, ', ') AS Badges
+    FROM Posts q
+    LEFT JOIN Comments c ON c.PostId = q.Id
+    LEFT JOIN Badges b ON b.UserId = q.OwnerUserId
+    WHERE q.PostTypeId = 1
+    GROUP BY q.Id, q.Title, q.OwnerUserId
+)
+SELECT
+    qas.QuestionId,
+    qas.Title,
+    u.DisplayName AS QuestionOwner,
+    qas.QuestionCreated,
+    qas.ViewCount,
+    qas.QuestionScore,
+    qas.AnswerCount,
+    qas.MaxAnswerScore,
+    qas.AvgAnswerScore,
+    tqc.QuestionCount AS TagQuestionCount,
+    tqc.AvgQuestionScore AS TagAvgScore,
+    tqc.TotalViews AS TagTotalViews,
+    dul.DuplicateQuestionId,
+    dul.OriginalQuestionId,
+    dul.DuplicateTitle,
+    dul.OriginalTitle,
+    dul.LinkDate AS DuplicateLinkDate,
+    uav.UpVotesGiven,
+    uav.DownVotesGiven,
+    uaw.PostsLast30Days,
+    uaw.AvgScoreLast30Days,
+    cqd.CloseDate,
+    cqd.CloseReason,
+    cqd.Score AS ClosedQuestionScore,
+    cqd.ViewCount AS ClosedQuestionViews,
+    qcb.CommentCount,
+    qcb.HighestBadgeClass,
+    qcb.Badges,
+    lub.BadgeName AS RecentBadgeName,
+    lub.Class AS RecentBadgeClass,
+    lub.Date AS RecentBadgeDate
+FROM QuestionAnswerStats qas
+LEFT JOIN Users u ON u.Id = qas.OwnerUserId
+LEFT JOIN TagQuestionCounts tqc ON EXISTS (
+    SELECT 1 FROM TopTags tt WHERE qas.Title LIKE ('%' || tt.TagName || '%') AND tt.TagName = tqc.TagName
+)
+LEFT JOIN DuplicateQuestionPairs dul ON dul.DuplicateQuestionId = qas.QuestionId
+LEFT JOIN UserLastAccessAndVotes uav ON uav.UserId = qas.OwnerUserId
+LEFT JOIN UserActivityWindows uaw ON uaw.UserId = qas.OwnerUserId AND uaw.PostTypeId = 1
+LEFT JOIN ClosedQuestionDetails cqd ON cqd.PostId = qas.QuestionId
+LEFT JOIN QuestionsWithCommentsAndBadgeInfo qcb ON qcb.QuestionId = qas.QuestionId
+LEFT JOIN LatestUserBadges lub ON lub.UserId = qas.OwnerUserId
+WHERE qas.AnswerCount > 0
+  AND (u.Reputation > 5000 OR u.Reputation IS NULL)
+ORDER BY qas.AnswerCount DESC, qas.ViewCount DESC
+LIMIT 50;

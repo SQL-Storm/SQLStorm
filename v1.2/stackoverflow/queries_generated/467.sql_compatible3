@@ -1,0 +1,195 @@
+WITH RECURSIVE RecursiveTagHierarchy AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        1 AS Level,
+        CAST(ARRAY[t.TagName] AS text[]) AS Path
+    FROM Tags t
+    WHERE t.IsRequired = true
+
+    UNION ALL
+
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        r.Level + 1,
+        r.Path || t.TagName
+    FROM Tags t
+    JOIN RecursiveTagHierarchy r ON t.IsRequired = true AND t.Id <> r.Id AND NOT t.TagName = ANY(r.Path)
+    WHERE r.Level < 3
+),
+UserBadgeCounts AS (
+    SELECT
+        b.UserId,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        COUNT(*) AS TotalBadges
+    FROM Badges b
+    GROUP BY b.UserId
+),
+PostScoreRanks AS (
+    SELECT
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        row_number() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC, p.ViewCount DESC) AS ScoreRank,
+        dense_rank() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC) AS ScoreDenseRank,
+        lag(p.Score) OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC) AS PrevScore,
+        lead(p.Score) OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC) AS NextScore
+    FROM Posts p
+    WHERE p.Score IS NOT NULL
+),
+TopQuestionsWithAnswers AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.Title,
+        q.OwnerUserId,
+        q.CreationDate AS QuestionCreation,
+        q.Score AS QuestionScore,
+        q.ViewCount AS QuestionViews,
+        a.Id AS AnswerId,
+        a.OwnerUserId AS AnswerOwnerUserId,
+        a.CreationDate AS AnswerCreation,
+        a.Score AS AnswerScore,
+        a.ParentId,
+        a.Body,
+        u.DisplayName AS QuestionOwnerName,
+        ua.DisplayName AS AnswerOwnerName
+    FROM Posts q
+    LEFT JOIN Posts a ON a.ParentId = q.Id AND a.PostTypeId = 2
+    LEFT JOIN Users u ON u.Id = q.OwnerUserId
+    LEFT JOIN Users ua ON ua.Id = a.OwnerUserId
+    WHERE q.PostTypeId = 1
+      AND q.Score > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1)
+),
+CloseReasonCounts AS (
+    SELECT
+        ph.Comment AS CloseReasonId,
+        crt.Name AS CloseReasonName,
+        COUNT(*) AS CloseCount
+    FROM PostHistory ph
+    LEFT JOIN CloseReasonTypes crt ON crt.Id = CAST(ph.Comment AS integer)
+    WHERE ph.PostHistoryTypeId = 10
+    GROUP BY ph.Comment, crt.Name
+),
+UserActivityWindow AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        COUNT(CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionsPosted,
+        COUNT(CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswersPosted,
+        COUNT(c.Id) AS CommentsMade,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotesReceived,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotesReceived,
+        row_number() OVER (ORDER BY u.Reputation DESC) AS ReputationRank
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Comments c ON c.UserId = u.Id
+    LEFT JOIN Votes v ON v.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+),
+UserRecentActivity AS (
+    SELECT
+        ua.Id,
+        ua.DisplayName,
+        ua.Reputation,
+        ua.QuestionsPosted,
+        ua.AnswersPosted,
+        ua.CommentsMade,
+        ua.UpVotesReceived,
+        ua.DownVotesReceived,
+        ua.ReputationRank,
+        MAX(CASE WHEN p.OwnerUserId = ua.Id THEN p.CreationDate END) AS LastPostDate,
+        MAX(CASE WHEN c.UserId = ua.Id THEN c.CreationDate END) AS LastCommentDate,
+        GREATEST(
+            COALESCE(MAX(CASE WHEN p.OwnerUserId = ua.Id THEN p.CreationDate END), TIMESTAMP '1900-01-01'),
+            COALESCE(MAX(CASE WHEN c.UserId = ua.Id THEN c.CreationDate END), TIMESTAMP '1900-01-01')
+        ) AS LastActivityDate
+    FROM UserActivityWindow ua
+    LEFT JOIN Posts p ON p.OwnerUserId = ua.Id
+    LEFT JOIN Comments c ON c.UserId = ua.Id
+    GROUP BY ua.Id, ua.DisplayName, ua.Reputation, ua.QuestionsPosted, ua.AnswersPosted, ua.CommentsMade, ua.UpVotesReceived, ua.DownVotesReceived, ua.ReputationRank
+),
+HighImpactPosts AS (
+    SELECT
+        p.Id,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Tags,
+        (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 2) AS UpVotes,
+        (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 3) AS DownVotes,
+        (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id) AS CommentCount,
+        (SELECT COUNT(DISTINCT ph.UserId) FROM PostHistory ph WHERE ph.PostId = p.Id) AS EditorsCount
+    FROM Posts p
+    WHERE p.Score > 50
+      AND p.PostTypeId IN (1, 2)
+),
+CombinedResults AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        ub.GoldBadges,
+        ub.SilverBadges,
+        ub.BronzeBadges,
+        ua.QuestionsPosted,
+        ua.AnswersPosted,
+        ua.CommentsMade,
+        ua.UpVotesReceived,
+        ua.DownVotesReceived,
+        ua.LastActivityDate,
+        hp.Id AS HighImpactPostId,
+        hp.Title AS HighImpactPostTitle,
+        hp.Score AS HighImpactPostScore,
+        hp.ViewCount AS HighImpactPostViews,
+        hp.Tags AS HighImpactPostTags,
+        cr.CloseReasonName,
+        cr.CloseCount
+    FROM UserRecentActivity ua
+    LEFT JOIN Users u ON u.Id = ua.Id
+    LEFT JOIN UserBadgeCounts ub ON ub.UserId = u.Id
+    LEFT JOIN HighImpactPosts hp ON hp.OwnerUserId = u.Id
+    LEFT JOIN PostHistory ph ON ph.PostId = hp.Id AND ph.PostHistoryTypeId = 10
+    LEFT JOIN CloseReasonCounts cr ON cr.CloseReasonId = ph.Comment
+    WHERE ua.ReputationRank <= 100
+)
+SELECT
+    crs.UserId,
+    crs.DisplayName,
+    crs.Reputation,
+    crs.GoldBadges,
+    crs.SilverBadges,
+    crs.BronzeBadges,
+    crs.QuestionsPosted,
+    crs.AnswersPosted,
+    crs.CommentsMade,
+    crs.UpVotesReceived,
+    crs.DownVotesReceived,
+    to_char(crs.LastActivityDate, 'YYYY-MM-DD HH24:MI:SS') AS LastActivity,
+    crs.HighImpactPostId,
+    substr(crs.HighImpactPostTitle, 1, 100) AS HighImpactPostTitle,
+    crs.HighImpactPostScore,
+    crs.HighImpactPostViews,
+    COALESCE(REPLACE(REPLACE(crs.HighImpactPostTags, '><', ','), '<', ''), 'No Tags') AS ParsedTags,
+    crs.CloseReasonName,
+    crs.CloseCount
+FROM CombinedResults crs
+WHERE crs.HighImpactPostScore IS NOT NULL
+ORDER BY crs.Reputation DESC, crs.HighImpactPostScore DESC
+LIMIT 50;

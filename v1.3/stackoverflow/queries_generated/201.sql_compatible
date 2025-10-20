@@ -1,0 +1,155 @@
+WITH
+questions AS (
+  SELECT p.*,
+    COALESCE(
+      string_to_array(substring(p.Tags, 2, GREATEST(length(p.Tags)-2,0)), '><'),
+      ARRAY[]::varchar[]
+    ) AS tag_array
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+),
+tag_exploded AS (
+  SELECT q.Id AS question_id, lower(trim(tag)) AS tag
+  FROM questions q
+  CROSS JOIN LATERAL unnest(q.tag_array) AS tag
+  WHERE tag IS NOT NULL AND tag <> ''
+),
+tag_popularity AS (
+  SELECT te.tag,
+         count(*) AS question_count,
+         sum(q.Score) AS total_score,
+         row_number() OVER (ORDER BY count(*) DESC, sum(q.Score) DESC) AS global_rank
+  FROM tag_exploded te
+  JOIN questions q ON q.Id = te.question_id
+  GROUP BY te.tag
+),
+user_post_stats AS (
+  SELECT u.Id AS user_id,
+         COALESCE(u.DisplayName, '(anonymous)') AS display_name,
+         u.Reputation,
+         COALESCE(u.Location, '(unknown)') AS location,
+         ROW_NUMBER() OVER (PARTITION BY COALESCE(u.Location,'(unknown)') ORDER BY u.Reputation DESC NULLS LAST) AS loc_rank,
+         (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id) AS posts_count,
+         (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 1) AS questions_count,
+         (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 2) AS answers_count,
+         (SELECT MIN(CreationDate) FROM Posts p WHERE p.OwnerUserId = u.Id) AS first_post,
+         (SELECT MAX(CreationDate) FROM Posts p WHERE p.OwnerUserId = u.Id) AS last_post,
+         COALESCE((SELECT SUM(COALESCE(v.BountyAmount,0)) FROM Votes v WHERE v.UserId = u.Id AND v.BountyAmount IS NOT NULL), 0) AS total_bounty_given,
+         COALESCE((SELECT SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) FROM Votes v JOIN Posts p2 ON v.PostId = p2.Id WHERE p2.OwnerUserId = u.Id), 0) AS upvotes_received
+  FROM Users u
+),
+user_top_tag AS (
+  SELECT t.user_id, t.tag AS top_tag, t.cnt
+  FROM (
+    SELECT p.OwnerUserId AS user_id, lower(te.tag) AS tag, count(*) AS cnt,
+           row_number() OVER (PARTITION BY p.OwnerUserId ORDER BY count(*) DESC, count(*)*1.0 DESC) AS rn
+    FROM Posts p
+    JOIN tag_exploded te ON te.question_id = p.Id
+    WHERE p.OwnerUserId IS NOT NULL
+    GROUP BY p.OwnerUserId, lower(te.tag)
+  ) t
+  WHERE t.rn = 1
+),
+badge_counts AS (
+  SELECT b.UserId AS user_id,
+         SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS gold_badges,
+         SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS silver_badges,
+         SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS bronze_badges,
+         SUM(CASE WHEN b.TagBased = 1 THEN 1 ELSE 0 END) AS tag_based_badges
+  FROM Badges b
+  GROUP BY b.UserId
+),
+post_link_agg AS (
+  SELECT pl.PostId,
+         SUM(CASE WHEN pl.LinkTypeId = 3 THEN 1 ELSE 0 END) AS duplicate_links_out,
+         SUM(CASE WHEN pl.LinkTypeId = 1 THEN 1 ELSE 0 END) AS linked_out
+  FROM PostLinks pl
+  GROUP BY pl.PostId
+),
+top_questions_by_score AS (
+  SELECT Id, Title, Score, ViewCount FROM Posts WHERE PostTypeId = 1 AND Score IS NOT NULL ORDER BY Score DESC LIMIT 100
+),
+top_questions_by_views AS (
+  SELECT Id, Title, Score, ViewCount FROM Posts WHERE PostTypeId = 1 AND ViewCount IS NOT NULL ORDER BY ViewCount DESC LIMIT 100
+),
+combined_top AS (
+  SELECT * FROM top_questions_by_score
+  UNION
+  SELECT * FROM top_questions_by_views
+),
+intersect_top AS (
+  SELECT * FROM top_questions_by_score
+  INTERSECT
+  SELECT * FROM top_questions_by_views
+),
+user_summary AS (
+  SELECT ups.user_id,
+         ups.display_name,
+         ups.Reputation,
+         ups.location,
+         ups.loc_rank,
+         COALESCE(utt.top_tag, '(none)') AS top_tag,
+         COALESCE(bc.gold_badges, 0) AS gold_badges,
+         COALESCE(bc.silver_badges, 0) AS silver_badges,
+         COALESCE(bc.bronze_badges, 0) AS bronze_badges,
+         COALESCE(ups.posts_count, 0) AS posts_count,
+         COALESCE(ups.questions_count, 0) AS questions_count,
+         COALESCE(ups.answers_count, 0) AS answers_count,
+         COALESCE(ups.upvotes_received, 0) AS upvotes_received,
+         ups.first_post,
+         ups.last_post,
+         ups.total_bounty_given
+  FROM user_post_stats ups
+  LEFT JOIN badge_counts bc ON bc.user_id = ups.user_id
+  LEFT JOIN user_top_tag utt ON utt.user_id = ups.user_id
+)
+SELECT
+  us.user_id,
+  us.display_name,
+  us.Reputation,
+  us.location,
+  us.loc_rank,
+  us.top_tag,
+  us.gold_badges,
+  us.silver_badges,
+  us.bronze_badges,
+  us.posts_count,
+  us.questions_count,
+  us.answers_count,
+  us.upvotes_received,
+  us.total_bounty_given,
+  CASE
+    WHEN us.first_post IS NULL OR us.last_post IS NULL THEN NULL
+    ELSE ROUND(EXTRACT(EPOCH FROM (us.last_post - us.first_post)) / 86400.0, 2)
+  END AS days_active,
+  COALESCE(pla.duplicate_links_out, 0) AS duplicate_links_out,
+  COALESCE(pla.linked_out, 0) AS linked_out,
+  tp.tag AS tag_popularity_tag,
+  tp.question_count AS tag_question_count,
+  tp.total_score AS tag_total_score,
+  tp.global_rank AS tag_global_rank,
+  RANK() OVER (ORDER BY us.Reputation DESC NULLS LAST) AS global_reputation_rank,
+  NTILE(10) OVER (ORDER BY us.Reputation DESC NULLS LAST) AS reputation_decile
+FROM user_summary us
+LEFT JOIN LATERAL (
+  SELECT pl.PostId, pl.duplicate_links_out, pl.linked_out
+  FROM post_link_agg pl
+  WHERE pl.PostId = (
+    SELECT p.Id FROM Posts p WHERE p.OwnerUserId = us.user_id ORDER BY COALESCE(p.Score,0) DESC NULLS LAST LIMIT 1
+  )
+  LIMIT 1
+) pla ON true
+LEFT JOIN LATERAL (
+  SELECT tp.tag, tp.question_count, tp.total_score, tp.global_rank
+  FROM tag_popularity tp
+  WHERE tp.tag = us.top_tag
+  LIMIT 1
+) tp ON true
+WHERE us.posts_count > 0
+  AND (
+    us.Reputation IS NOT NULL
+    OR us.gold_badges + us.silver_badges + us.bronze_badges > 0
+    OR us.upvotes_received > 0
+  )
+ORDER BY us.Reputation DESC NULLS LAST, us.posts_count DESC
+LIMIT 500;

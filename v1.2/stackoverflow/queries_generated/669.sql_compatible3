@@ -1,0 +1,141 @@
+with recursive RecursiveTagHierarchy as (
+    select 
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        1 as Level,
+        cast(t.TagName as varchar(1000)) as Path
+    from Tags t
+    where t.IsModeratorOnly = false and t.IsRequired = false
+    union all
+    select 
+        t2.Id,
+        t2.TagName,
+        t2.Count,
+        t2.ExcerptPostId,
+        t2.WikiPostId,
+        r.Level + 1,
+        cast(r.Path || ' > ' || t2.TagName as varchar(1000)) as Path
+    from Tags t2
+    join RecursiveTagHierarchy r on t2.Id <> r.Id and t2.Count < r.Count and t2.IsModeratorOnly = false and t2.IsRequired = false
+    where r.Level < 3
+),
+UserPostStats as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionCount,
+        count(distinct p.Id) filter (where p.PostTypeId = 2) as AnswerCount,
+        coalesce(sum(p.Score),0) as TotalPostScore,
+        coalesce(sum(vt.UpVotes),0) as TotalUpVotes,
+        coalesce(sum(vt.DownVotes),0) as TotalDownVotes,
+        row_number() over (order by coalesce(sum(p.Score),0) desc, u.Reputation desc) as UserRank
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join (
+        select 
+            v.UserId,
+            sum(case when vt.Name = 'UpMod' then 1 else 0 end) as UpVotes,
+            sum(case when vt.Name = 'DownMod' then 1 else 0 end) as DownVotes
+        from Votes v
+        join VoteTypes vt on vt.Id = v.VoteTypeId
+        group by v.UserId
+    ) vt on vt.UserId = u.Id
+    group by u.Id, u.DisplayName, u.Reputation
+),
+PostWithLatestComment as (
+    select 
+        p.Id,
+        p.Title,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        c.Text as LatestCommentText,
+        c.CreationDate as LatestCommentDate,
+        c.UserId as LatestCommentUserId
+    from Posts p
+    left join lateral (
+        select c1.Text, c1.CreationDate, c1.UserId
+        from Comments c1
+        where c1.PostId = p.Id
+        order by c1.CreationDate desc
+        limit 1
+    ) c on true
+),
+ClosedQuestionsWithReasons as (
+    select 
+        p.Id as QuestionId,
+        p.Title,
+        p.OwnerUserId,
+        p.ClosedDate,
+        pht.Name as CloseReasonName,
+        ph.Comment as CloseReasonDetail
+    from Posts p
+    join PostHistory ph on ph.PostId = p.Id and ph.PostHistoryTypeId = 10
+    join CloseReasonTypes pht on pht.Id = cast(ph.Comment as integer)
+    where p.PostTypeId = 1 and p.ClosedDate is not null
+),
+AnswerStats as (
+    select 
+        p.ParentId as QuestionId,
+        count(*) as AnswerCount,
+        avg(p.Score) as AvgAnswerScore,
+        max(p.Score) as MaxAnswerScore,
+        sum(case when p.Score > 0 then 1 else 0 end) as PositiveAnswerCount
+    from Posts p
+    where p.PostTypeId = 2
+    group by p.ParentId
+),
+FinalResult as (
+    select 
+        u.UserId,
+        u.DisplayName,
+        u.QuestionCount,
+        u.AnswerCount,
+        u.TotalPostScore,
+        u.TotalUpVotes,
+        u.TotalDownVotes,
+        u.UserRank,
+        p.Id as PostId,
+        p.Title,
+        p.Score as PostScore,
+        p.ViewCount,
+        p.Tags,
+        p.LatestCommentText,
+        p.LatestCommentDate,
+        p.LatestCommentUserId,
+        coalesce(a.AnswerCount,0) as QuestionAnswerCount,
+        coalesce(a.AvgAnswerScore,0) as QuestionAvgAnswerScore,
+        coalesce(a.MaxAnswerScore,0) as QuestionMaxAnswerScore,
+        coalesce(a.PositiveAnswerCount,0) as QuestionPositiveAnswerCount,
+        cq.CloseReasonName,
+        cq.CloseReasonDetail,
+        case 
+            when p.Tags is null then null
+            else array_to_string(array_agg(distinct substring(t.TagName from 1 for 10)), ', ')
+        end as SampleTags,
+        dense_rank() over (partition by u.UserId order by p.Score desc) as PostScoreRank,
+        case 
+            when p.LastActivityDate is null then 'No Activity'
+            when p.LastActivityDate < (cast('2024-10-01' as date) - interval '1 year') then 'Stale'
+            else 'Active'
+        end as ActivityStatus
+    from UserPostStats u
+    left join Posts p on p.OwnerUserId = u.UserId
+    left join AnswerStats a on a.QuestionId = p.Id and p.PostTypeId = 1
+    left join ClosedQuestionsWithReasons cq on cq.QuestionId = p.Id
+    left join RecursiveTagHierarchy t on p.Tags is not null and position(t.TagName in p.Tags) > 0
+    where u.UserRank <= 100
+    group by u.UserId, u.DisplayName, u.QuestionCount, u.AnswerCount, u.TotalPostScore, u.TotalUpVotes, u.TotalDownVotes, u.UserRank,
+        p.Id, p.Title, p.Score, p.ViewCount, p.Tags, p.LatestCommentText, p.LatestCommentDate, p.LatestCommentUserId,
+        a.AnswerCount, a.AvgAnswerScore, a.MaxAnswerScore, a.PositiveAnswerCount,
+        cq.CloseReasonName, cq.CloseReasonDetail, p.LastActivityDate
+)
+select * from FinalResult
+where PostScoreRank <= 5
+order by UserRank, PostScoreRank;

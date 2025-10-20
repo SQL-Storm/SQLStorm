@@ -1,0 +1,198 @@
+with RecentActiveUsers as (
+    select
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        coalesce(u.Location, 'Unknown') as Location,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        row_number() over (order by u.Reputation desc, u.LastAccessDate desc) as UserRank
+    from Users u
+    where u.LastAccessDate > cast('2024-10-01' as date) - interval '180 days'
+),
+UserBadgeStats as (
+    select
+        b.UserId,
+        sum(case when b.Class = 1 then 1 else 0 end) as GoldBadges,
+        sum(case when b.Class = 2 then 1 else 0 end) as SilverBadges,
+        sum(case when b.Class = 3 then 1 else 0 end) as BronzeBadges,
+        count(*) as TotalBadges
+    from Badges b
+    group by b.UserId
+),
+UserQuestionStats as (
+    select
+        p.OwnerUserId as UserId,
+        count(*) filter (where p.PostTypeId = 1) as QuestionCount,
+        avg(p.Score) filter (where p.PostTypeId = 1) as AvgQuestionScore,
+        sum(p.ViewCount) filter (where p.PostTypeId = 1) as TotalQuestionViews,
+        max(p.CreationDate) filter (where p.PostTypeId = 1) as LastQuestionDate
+    from Posts p
+    group by p.OwnerUserId
+),
+UserAnswerStats as (
+    select
+        p.OwnerUserId as UserId,
+        count(*) filter (where p.PostTypeId = 2) as AnswerCount,
+        avg(p.Score) filter (where p.PostTypeId = 2) as AvgAnswerScore,
+        sum(case when p.Id = q.AcceptedAnswerId then 1 else 0 end) as AcceptedAnswerCount
+    from Posts p
+    left join Posts q on q.AcceptedAnswerId = p.Id and q.PostTypeId = 1
+    group by p.OwnerUserId
+),
+UserCommentStats as (
+    select
+        c.UserId,
+        count(*) as CommentCount,
+        avg(char_length(c.Text)) as AvgCommentLength,
+        max(c.CreationDate) as LastCommentDate
+    from Comments c
+    where c.UserId is not null
+    group by c.UserId
+),
+UserPostHistoryEdits as (
+    select
+        ph.UserId,
+        count(distinct ph.PostId) as EditedPostCount,
+        count(*) as TotalEdits,
+        max(ph.CreationDate) as LastEditDate
+    from PostHistory ph
+    where ph.UserId is not null
+    group by ph.UserId
+),
+TopTags as (
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        (case when lower(coalesce(t.IsModeratorOnly,'')) in ('t','true','1') then true else false end) as IsModeratorOnly,
+        (case when lower(coalesce(t.IsRequired,'')) in ('t','true','1') then true else false end) as IsRequired
+    from Tags t
+    where t.Count > 1000
+),
+UserTopTagUsage as (
+    select
+        p.OwnerUserId as UserId,
+        tag as TagName
+    from Posts p,
+    lateral (
+        select trim(x) as tag
+        from (
+            -- remove leading '<' and trailing '>' wrappers and split on '><'
+            select
+                regexp_split_to_table(
+                    substring(p.Tags from 2 for (length(p.Tags) - 2)),
+                    '><'
+                ) as x
+        ) s
+    ) t
+    where p.PostTypeId = 1 and p.Tags is not null
+),
+UserPopularTagCounts as (
+    select
+        utu.UserId,
+        ut.TagName,
+        count(*) as QuestionsWithTag
+    from UserTopTagUsage utu
+    join TopTags ut on ut.TagName = utu.TagName
+    group by utu.UserId, ut.TagName
+),
+UserMostUsedTag as (
+    select
+        upc.UserId,
+        upc.TagName,
+        upc.QuestionsWithTag
+    from (
+        select
+            UserId,
+            TagName,
+            QuestionsWithTag,
+            row_number() over (partition by UserId order by QuestionsWithTag desc, TagName) as rn
+        from UserPopularTagCounts
+    ) upc
+    where upc.rn = 1
+),
+UserActivitySummary as (
+    select
+        ra.Id as UserId,
+        ra.DisplayName,
+        ra.Reputation,
+        coalesce(ubs.GoldBadges, 0) as GoldBadges,
+        coalesce(ubs.SilverBadges, 0) as SilverBadges,
+        coalesce(ubs.BronzeBadges, 0) as BronzeBadges,
+        coalesce(uqs.QuestionCount, 0) as QuestionCount,
+        coalesce(uqs.AvgQuestionScore, 0) as AvgQuestionScore,
+        coalesce(uqs.TotalQuestionViews, 0) as TotalQuestionViews,
+        coalesce(uas.AnswerCount, 0) as AnswerCount,
+        coalesce(uas.AvgAnswerScore, 0) as AvgAnswerScore,
+        coalesce(uas.AcceptedAnswerCount, 0) as AcceptedAnswerCount,
+        coalesce(ucs.CommentCount, 0) as CommentCount,
+        coalesce(ucs.AvgCommentLength, 0) as AvgCommentLength,
+        coalesce(uph.EditedPostCount, 0) as EditedPostCount,
+        coalesce(uph.TotalEdits, 0) as TotalEdits,
+        coalesce(umt.TagName, 'None') as MostUsedTag,
+        coalesce(umt.QuestionsWithTag, 0) as MostUsedTagQuestionCount,
+        ra.LastAccessDate
+    from RecentActiveUsers ra
+    left join UserBadgeStats ubs on ra.Id = ubs.UserId
+    left join UserQuestionStats uqs on ra.Id = uqs.UserId
+    left join UserAnswerStats uas on ra.Id = uas.UserId
+    left join UserCommentStats ucs on ra.Id = ucs.UserId
+    left join UserPostHistoryEdits uph on ra.Id = uph.UserId
+    left join UserMostUsedTag umt on ra.Id = umt.UserId
+),
+UserPerformanceRankings as (
+    select
+        uas.UserId,
+        uas.DisplayName,
+        uas.Reputation,
+        uas.GoldBadges,
+        uas.SilverBadges,
+        uas.BronzeBadges,
+        uas.QuestionCount,
+        uas.AvgQuestionScore,
+        uas.TotalQuestionViews,
+        uas.AnswerCount,
+        uas.AvgAnswerScore,
+        uas.AcceptedAnswerCount,
+        uas.CommentCount,
+        uas.AvgCommentLength,
+        uas.EditedPostCount,
+        uas.TotalEdits,
+        uas.MostUsedTag,
+        uas.MostUsedTagQuestionCount,
+        uas.LastAccessDate,
+        rank() over (order by (coalesce(uas.GoldBadges,0) * 10 + coalesce(uas.SilverBadges,0) * 5 + coalesce(uas.BronzeBadges,0) * 2 + coalesce(uas.Reputation,0)/500.0 + coalesce(uas.AcceptedAnswerCount,0) * 3 + coalesce(uas.AnswerCount,0) + coalesce(uas.QuestionCount,0) * 0.5) desc) as PerformanceRank
+    from UserActivitySummary uas
+)
+select
+    upr.PerformanceRank,
+    upr.UserId,
+    upr.DisplayName,
+    upr.Reputation,
+    upr.GoldBadges,
+    upr.SilverBadges,
+    upr.BronzeBadges,
+    upr.QuestionCount,
+    round(cast(upr.AvgQuestionScore as numeric),2) as AvgQuestionScore,
+    upr.TotalQuestionViews,
+    upr.AnswerCount,
+    round(cast(upr.AvgAnswerScore as numeric),2) as AvgAnswerScore,
+    upr.AcceptedAnswerCount,
+    upr.CommentCount,
+    round(cast(upr.AvgCommentLength as numeric),1) as AvgCommentLength,
+    upr.EditedPostCount,
+    upr.TotalEdits,
+    upr.MostUsedTag,
+    upr.MostUsedTagQuestionCount,
+    case
+        when upr.LastAccessDate < cast('2024-10-01' as date) - interval '30 days' then 'Inactive'
+        else 'Active'
+    end as UserActivityStatus
+from UserPerformanceRankings upr
+join Users u on upr.UserId = u.Id
+order by upr.PerformanceRank asc
+limit 100;

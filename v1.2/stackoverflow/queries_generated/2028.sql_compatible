@@ -1,0 +1,33 @@
+with rec_counts as (
+    select 
+        p.id, 
+        p.posttypeid, 
+        u.id as userid, 
+        u.divstring as reputation_level,
+        count(distinct c.id) over (partition by p.id) as comments_count,
+        coalesce(sum(case when v.VoteTypeId = 2 then 1 else 0 end) over (partition by p.id), 0) as test_avg_vote_up,
+        rank() over (partition by p.posttypeid order by interaction_hotness asc) as InteractionRank800
+    from posts p
+    left join users u on u.id = p.owneruserid
+    left join comments c on c.postid = p.id
+    left join votes v on v.postid = p.id
+)
+select
+    p.id,
+    p.posttypeid,
+    u.id as userid,
+    u.divstring as reputation_level,
+    rc.comments_count,
+    rc.test_avg_vote_up,
+    rc.InteractionRank800
+from posts p
+left join users u on u.id = p.owneruserid
+left join rec_counts rc on rc.id = p.id
+group by
+    p.id,
+    p.posttypeid,
+    u.id,
+    u.divstring,
+    rc.comments_count,
+    rc.test_avg_vote_up,
+    rc.InteractionRank800;

@@ -1,0 +1,183 @@
+-- {"query": "204.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 0.2, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1725} 
+with RecursiveTagHierarchy as (
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        1 as Level,
+        array[t.TagName] as TagPath
+    from Tags t
+    where t.IsRequired = 1
+
+    union all
+
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        r.Level + 1,
+        r.TagPath || t.TagName
+    from Tags t
+    join RecursiveTagHierarchy r on t.Id <> r.Id and t.Count < r.Count and not t.TagName = any(r.TagPath)
+    where r.Level < 3
+),
+UserBadgeStats as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(b.Id) filter (where b.Class = 1) as GoldBadges,
+        count(b.Id) filter (where b.Class = 2) as SilverBadges,
+        count(b.Id) filter (where b.Class = 3) as BronzeBadges,
+        coalesce(sum(case when b.TagBased = 1 then 1 else 0 end),0) as TagBasedBadges
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.DisplayName
+),
+PostActivityWindow as (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        p.Title,
+        row_number() over (partition by p.OwnerUserId order by p.CreationDate desc) as RecentPostRank,
+        lag(p.Score) over (partition by p.OwnerUserId order by p.CreationDate) as PrevScore,
+        lead(p.Score) over (partition by p.OwnerUserId order by p.CreationDate) as NextScore
+    from Posts p
+    where p.PostTypeId in (1, 2)
+),
+TopQuestionsWithAnswers as (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        q.OwnerUserId,
+        q.CreationDate as QuestionCreation,
+        q.Score as QuestionScore,
+        q.ViewCount as QuestionViews,
+        count(a.Id) as AnswerCount,
+        max(a.Score) as MaxAnswerScore,
+        avg(a.Score) as AvgAnswerScore,
+        sum(case when a.Score > q.Score then 1 else 0 end) as AnswersBetterThanQuestion
+    from Posts q
+    left join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+    where q.PostTypeId = 1 and q.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - interval '1 year'
+    group by q.Id, q.Title, q.OwnerUserId, q.CreationDate, q.Score, q.ViewCount
+    having count(a.Id) > 0
+),
+UserEngagement as (
+    select
+        u.Id,
+        u.DisplayName,
+        count(distinct p.Id) as TotalPosts,
+        count(distinct c.Id) as TotalComments,
+        count(distinct v.Id) filter (where v.VoteTypeId = 2) as UpVotesGiven,
+        count(distinct v.Id) filter (where v.VoteTypeId = 3) as DownVotesGiven,
+        count(distinct ph.Id) filter (where ph.PostHistoryTypeId in (10, 11)) as CloseReopenEvents
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Comments c on c.UserId = u.Id
+    left join Votes v on v.UserId = u.Id
+    left join PostHistory ph on ph.UserId = u.Id
+    group by u.Id, u.DisplayName
+),
+DuplicateLinks as (
+    select
+        pl.PostId,
+        pl.RelatedPostId,
+        p1.Title as PostTitle,
+        p2.Title as RelatedPostTitle,
+        pl.CreationDate
+    from PostLinks pl
+    join Posts p1 on p1.Id = pl.PostId
+    join Posts p2 on p2.Id = pl.RelatedPostId
+    where pl.LinkTypeId = 3
+),
+QuestionsWithCloseReasons as (
+    select
+        ph.PostId,
+        p.Title,
+        crt.Name as CloseReason,
+        ph.CreationDate as CloseDate
+    from PostHistory ph
+    join CloseReasonTypes crt on crt.Id = cast(ph.Comment as int)
+    join Posts p on p.Id = ph.PostId
+    where ph.PostHistoryTypeId = 10
+),
+UserPostScores as (
+    select
+        p.OwnerUserId,
+        p.Id as PostId,
+        p.Score,
+        p.CreationDate,
+        row_number() over (partition by p.OwnerUserId order by p.Score desc) as ScoreRank
+    from Posts p
+    where p.PostTypeId in (1, 2)
+),
+UserTopPosts as (
+    select
+        ups.OwnerUserId,
+        ups.PostId,
+        ups.Score,
+        ups.CreationDate
+    from UserPostScores ups
+    where ups.ScoreRank <= 3
+)
+select
+    u.Id as UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    u.LastAccessDate,
+    u.Location,
+    u.WebsiteUrl,
+    ubs.GoldBadges,
+    ubs.SilverBadges,
+    ubs.BronzeBadges,
+    ubs.TagBasedBadges,
+    ue.TotalPosts,
+    ue.TotalComments,
+    ue.UpVotesGiven,
+    ue.DownVotesGiven,
+    ue.CloseReopenEvents,
+    tq.QuestionId,
+    tq.Title as QuestionTitle,
+    tq.QuestionCreation,
+    tq.QuestionScore,
+    tq.QuestionViews,
+    tq.AnswerCount,
+    tq.MaxAnswerScore,
+    round(tq.AvgAnswerScore::numeric,2) as AvgAnswerScore,
+    tq.AnswersBetterThanQuestion,
+    array_agg(distinct d.PostTitle) filter (where d.PostTitle is not null) as DuplicatePostTitles,
+    array_agg(distinct d.RelatedPostTitle) filter (where d.RelatedPostTitle is not null) as DuplicateRelatedPostTitles,
+    qc.CloseReason,
+    qc.CloseDate,
+    utp.PostId as TopPostId,
+    utp.Score as TopPostScore,
+    utp.CreationDate as TopPostCreationDate,
+    rth.Level as TagHierarchyLevel,
+    array_to_string(rth.TagPath, ' > ') as TagHierarchyPath
+from Users u
+left join UserBadgeStats ubs on ubs.UserId = u.Id
+left join UserEngagement ue on ue.Id = u.Id
+left join TopQuestionsWithAnswers tq on tq.OwnerUserId = u.Id
+left join DuplicateLinks d on d.PostId = tq.QuestionId
+left join QuestionsWithCloseReasons qc on qc.PostId = tq.QuestionId
+left join UserTopPosts utp on utp.OwnerUserId = u.Id
+left join RecursiveTagHierarchy rth on rth.TagName = any(string_to_array(coalesce(tq.Tags, ''), '><'))
+where u.Reputation > 1000
+  and (tq.AnswerCount > 2 or tq.AnswerCount is null)
+  and (qc.CloseDate is null or qc.CloseDate > cast('2024-10-01 12:34:56' as timestamp) - interval '6 months')
+group by
+    u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate, u.Location, u.WebsiteUrl,
+    ubs.GoldBadges, ubs.SilverBadges, ubs.BronzeBadges, ubs.TagBasedBadges,
+    ue.TotalPosts, ue.TotalComments, ue.UpVotesGiven, ue.DownVotesGiven, ue.CloseReopenEvents,
+    tq.QuestionId, tq.Title, tq.QuestionCreation, tq.QuestionScore, tq.QuestionViews, tq.AnswerCount, tq.MaxAnswerScore, tq.AvgAnswerScore, tq.AnswersBetterThanQuestion,
+    qc.CloseReason, qc.CloseDate,
+    utp.PostId, utp.Score, utp.CreationDate,
+    rth.Level, rth.TagPath
+order by u.Reputation desc, tq.QuestionScore desc
+limit 100;

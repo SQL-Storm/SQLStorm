@@ -1,0 +1,134 @@
+WITH RECURSIVE RecursiveTagCTE AS (
+    SELECT t.Id AS TagId, t.TagName, t.ExcerptPostId, p.Id AS PostId, 1 AS Level
+    FROM Tags t
+    LEFT JOIN Posts p ON p.Id = t.ExcerptPostId
+    WHERE t.ExcerptPostId IS NOT NULL
+
+    UNION ALL
+
+    SELECT t2.Id, t2.TagName, t2.ExcerptPostId, pl.RelatedPostId, r.Level + 1
+    FROM RecursiveTagCTE r
+    INNER JOIN PostLinks pl ON pl.PostId = r.PostId AND pl.LinkTypeId = 3
+    INNER JOIN Tags t2 ON t2.ExcerptPostId = pl.RelatedPostId
+    WHERE r.Level < 5
+),
+
+HighRepUsers AS (
+    SELECT Id, DisplayName, Reputation,
+           COALESCE(Location, 'Unknown') AS LocationNormalized,
+           SUBSTRING(AboutMe FROM 1 FOR 100) AS AboutSnippet
+    FROM Users
+    WHERE Reputation > 10000 
+),
+
+UserActivityWin AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.LocationNormalized,
+        CASE WHEN u.Reputation > 100000 THEN 1 ELSE 0 END AS PrimedBy11,
+        COALESCE(SUM(p.Score), 0) AS TotalPostScore,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END), 0) AS TotalUpVotes,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END), 0) AS TotalDownVotes,
+        ROW_NUMBER() OVER (
+            PARTITION BY u.LocationNormalized 
+            ORDER BY COALESCE(SUM(p.Score),0) + COALESCE(SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END),0)*2 - COALESCE(SUM(CASE WHEN v.VoteTypeId=3 THEN 1 ELSE 0 END),0)*2 DESC
+        ) AS UserRankInLoc,
+        AVG(COALESCE(p.Score, 0)) OVER (PARTITION BY u.Id) AS AvgScorePerPost
+    FROM HighRepUsers u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Votes v ON v.PostId = p.Id
+    GROUP BY u.Id, u.DisplayName, u.LocationNormalized, u.Reputation
+),
+
+RecentClosedQuestions AS (
+    SELECT 
+        q.Id AS QuestionId,
+        q.Title,
+        q.OwnerUserId,
+        ch.ClosingTypeName,
+        ch.ClosedDate,
+        CASE 
+            WHEN EXISTS (
+               SELECT 1 FROM PostHistory ph
+               WHERE ph.PostId = q.Id AND ph.PostHistoryTypeId IN (11) AND ph.CreationDate > ch.ClosedDate
+            ) THEN 1 ELSE 0 END AS IsReopenedAfterClose
+    FROM Posts q
+    INNER JOIN (
+      SELECT ph.PostId, pht.Name AS ClosingTypeName, MIN(ph.CreationDate) AS ClosedDate
+      FROM PostHistory ph 
+      INNER JOIN PostHistoryTypes pht ON ph.PostHistoryTypeId = pht.Id
+      WHERE ph.PostHistoryTypeId = 10
+      GROUP BY ph.PostId, pht.Name
+    ) ch ON q.Id = ch.PostId
+    WHERE q.PostTypeId = 1 AND ch.ClosedDate > (CAST('2024-10-01' AS DATE) - INTERVAL '100' DAY)
+),
+
+BadgeSummary AS (
+    SELECT 
+        UserId,
+        COUNT(DISTINCT CASE WHEN TagBased = 1 THEN Name END) AS DistinctTagBasedBadgeCount,
+        COUNT(DISTINCT CASE WHEN TagBased = 0 THEN Name END) AS DistinctNamedBadgeCount,
+        STRING_AGG(DISTINCT COALESCE(Name, 'Unknown'), ',' ) AS AllBadgeNames,
+        MAX(Date) AS LatestBadgeEarned
+    FROM Badges
+    WHERE Date > (CAST('2024-10-01' AS DATE) - INTERVAL '1' YEAR)
+    GROUP BY UserId
+),
+
+CombinedLeadboard AS (
+    SELECT
+        uud.UserId,
+        uud.DisplayName,
+        uud.LocationNormalized,
+        uud.Reputation,
+        uud.TotalPostScore,
+        uud.TotalUpVotes,
+        uud.TotalDownVotes,
+        us.DistinctTagBasedBadgeCount,
+        us.DistinctNamedBadgeCount,
+        us.AllBadgeNames,
+        uu.MaxAcceptedAnswerScore,
+        RANK() OVER (ORDER BY uud.TotalPostScore + uud.TotalUpVotes * 2 - uud.TotalDownVotes * 2 DESC) AS OverallUserRank
+    FROM UserActivityWin uud
+    LEFT JOIN BadgeSummary us ON us.UserId = uud.UserId
+    LEFT JOIN (
+       SELECT OwnerUserId,
+              MAX(Score) AS MaxAcceptedAnswerScore
+       FROM Posts a
+       WHERE a.PostTypeId = 2 AND EXISTS (
+          SELECT 1 FROM Posts q WHERE q.AcceptedAnswerId = a.Id
+       )
+       GROUP BY OwnerUserId
+    ) uu ON uu.OwnerUserId = uud.UserId
+)
+
+SELECT
+    ll.UserId,
+    ll.DisplayName,
+    ll.LocationNormalized,
+    ll.Reputation,
+    ll.TotalPostScore,
+    ll.TotalUpVotes,
+    ll.TotalDownVotes,
+    ll.DistinctTagBasedBadgeCount,
+    ll.DistinctNamedBadgeCount,
+    ll.AllBadgeNames,
+    ll.MaxAcceptedAnswerScore,
+    ll.OverallUserRank,
+    qs.QuestionId,
+    qs.IsReopenedAfterClose,
+    qs.ClosingTypeName,
+    CASE 
+        WHEN qs.IsReopenedAfterClose = 1 THEN 'REOPENED RECENTLY' 
+        ELSE 'CLOSED' 
+    END AS CloseStatus,
+    CASE 
+        WHEN ll.TotalPostScore > 50 THEN SUBSTRING(ll.AllBadgeNames FROM 1 FOR 15) || '...' ELSE ll.AllBadgeNames 
+    END AS ShortBadgeList,
+    qs.ClosedDate
+FROM CombinedLeadboard ll
+LEFT JOIN RecentClosedQuestions qs ON qs.OwnerUserId = ll.UserId
+WHERE ll.OverallUserRank <= 100
+ORDER BY ll.OverallUserRank, qs.ClosedDate DESC
+LIMIT 100;

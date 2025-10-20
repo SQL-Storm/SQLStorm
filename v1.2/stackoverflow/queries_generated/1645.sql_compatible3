@@ -1,0 +1,127 @@
+WITH RECURSIVE RecursiveTagPostTree AS (
+    SELECT 
+        p.Id,
+        p.Title,
+        p.Tags,
+        p.ParentId,
+        1 AS Level
+    FROM 
+        Posts p
+    WHERE 
+        p.PostTypeId = 4
+
+    UNION ALL
+
+    SELECT 
+        parent.Id,
+        parent.Title,
+        parent.Tags,
+        parent.ParentId,
+        r.Level + 1
+    FROM 
+        Posts parent
+        JOIN RecursiveTagPostTree r ON r.ParentId = parent.Id
+    WHERE
+        parent.PostTypeId IN (1,2)
+),
+UserBadgeWindow AS (
+    SELECT
+        b.UserId,
+        b.Name,
+        b.Class,
+        b.Date,
+        COUNT(*) OVER (PARTITION BY b.UserId ORDER BY b.Date ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS BadgePriorCount
+    FROM 
+        Badges b
+),
+CloseAndReopenPeriods AS (
+    SELECT 
+        ph.PostId,
+        ph.CreationDate AS CloseDate,
+        (
+            SELECT MIN(reopenph.CreationDate)
+            FROM PostHistory reopenph
+            WHERE reopenph.PostId = ph.PostId
+              AND reopenph.PostHistoryTypeId = 11
+              AND reopenph.CreationDate > ph.CreationDate
+        ) AS ReopenDate
+    FROM 
+        PostHistory ph
+    WHERE
+        ph.PostHistoryTypeId = 10
+),
+UserTopComments AS (
+    SELECT DISTINCT
+        u.Id AS UserId,
+        u.DisplayName,
+        CAST(DATE_TRUNC('month', c.CreationDate) AS DATE) AS Month,
+        COUNT(c.Id) OVER(PARTITION BY u.Id, DATE_TRUNC('month', c.CreationDate)) AS CommentsThisMonth,
+        CAST(AVG(LENGTH(c.Text)) OVER(PARTITION BY u.Id, DATE_TRUNC('month', c.CreationDate)) AS DECIMAL(10,2)) AS AvgCommentLen,
+        RANK() OVER (PARTITION BY DATE_TRUNC('month', c.CreationDate) ORDER BY COUNT(c.Id) OVER (PARTITION BY u.Id, DATE_TRUNC('month', c.CreationDate)) DESC, AVG(LENGTH(c.Text)) OVER (PARTITION BY u.Id, DATE_TRUNC('month', c.CreationDate)) DESC) AS CommentRank,
+        '    ' AS FourSpaces,
+        CONCAT('U:', COALESCE(NULLIF(u.DisplayName, ''), 'Anonymous'), '; TM: ', TO_CHAR(DATE_TRUNC('month', c.CreationDate),'YYYY-MM'), '; Ct:', TO_CHAR(COUNT(c.Id) OVER (PARTITION BY u.Id, DATE_TRUNC('month', c.CreationDate)) ,'FM9999'), '; AvgLen:', TO_CHAR(AVG(LENGTH(c.Text)) OVER (PARTITION BY u.Id, DATE_TRUNC('month', c.CreationDate)),'FM999.00')) AS ReportString
+    FROM 
+        Users u
+    LEFT JOIN Comments c ON c.UserId = u.Id
+),
+FinalBenchmarkSet AS (
+    SELECT 
+        p.Id AS QuestionId,
+        qAnswered.AnswerCount,
+        p.Score AS QuestionScore, 
+        u.DisplayName AS QuestionUser, 
+        STRING_AGG(DISTINCT pt.Name, ', ' ORDER BY pt.Name) FILTER (WHERE pt.Id IS NOT NULL) AS PostsIncludedTypeNames,
+        l.lCount AS linkedRelations,
+        COALESCE(crp.ReopenDate, TIMESTAMP '2024-10-01 12:34:56') - crp.CloseDate AS CloseDuration,
+        COALESCE(MAX(bud.BadgePriorCount), 0) AS UserBadgeCountWhenCreated,
+        AVG(CAST(v.ScoreAllVotes AS FLOAT)) AS AvgVoteFromAnswers,
+        SUBSTRING(p.Tags FROM 2 FOR LENGTH(p.Tags)-2) AS TagCharSequence,
+        CAST((LENGTH(COALESCE(u.AboutMe, '')) - LENGTH(REPLACE(COALESCE(u.AboutMe, ''), 'performance', ''))) AS INTEGER) AS PerformanceKeywordCount,
+        ROW_NUMBER() OVER(PARTITION BY u.Id ORDER BY p.CreationDate DESC) AS filteredBoundaryCount
+    FROM 
+        Posts p
+        LEFT JOIN Posts qAnswered ON p.AcceptedAnswerId = qAnswered.Id
+        LEFT JOIN Users u ON p.OwnerUserId = u.Id
+        LEFT JOIN PostTypes pt ON p.PostTypeId = pt.Id
+        LEFT JOIN (
+            SELECT 
+                pl.PostId, COUNT(*) AS lCount 
+            FROM PostLinks pl 
+            WHERE pl.LinkTypeId = 1
+            GROUP BY pl.PostId
+        ) l ON l.PostId = p.Id
+        LEFT JOIN CloseAndReopenPeriods crp ON crp.PostId = p.Id
+        LEFT JOIN UserBadgeWindow bud ON bud.UserId = u.Id AND bud.Date <= p.CreationDate
+        LEFT JOIN (
+            SELECT 
+                a.ParentId, AVG(a.Score) AS ScoreAllVotes
+            FROM Posts a 
+            WHERE a.PostTypeId = 2
+            GROUP BY a.ParentId
+        ) v ON v.ParentId = p.Id
+        LEFT JOIN RecursiveTagPostTree lhs ON lhs.Id = p.Id
+    WHERE 
+        p.PostTypeId = 1
+        AND (
+            POSITION('perform' IN LOWER(COALESCE(p.Tags, ''))) > 0
+            OR lhs.Level = 1
+        )
+    GROUP BY 
+        p.Id,
+        qAnswered.AnswerCount,
+        p.Score,
+        u.Id,
+        u.DisplayName,
+        l.lCount,
+        crp.ReopenDate,
+        crp.CloseDate,
+        crp.PostId,
+        p.CreationDate,
+        p.Tags,
+        u.AboutMe,
+        lhs.Level
+)
+SELECT *
+FROM FinalBenchmarkSet
+WHERE filteredBoundaryCount <= 50
+ORDER BY QuestionScore DESC, CloseDuration DESC, UserBadgeCountWhenCreated DESC;

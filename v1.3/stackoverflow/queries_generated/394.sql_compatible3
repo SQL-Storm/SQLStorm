@@ -1,0 +1,234 @@
+WITH RECURSIVE
+recent_questions AS (
+  SELECT p.id,
+         p.title,
+         p.tags,
+         p.owneruserid,
+         p.creationdate,
+         p.viewcount,
+         p.score,
+         p.answercount,
+         p.commentcount,
+         p.favoritecount,
+         CASE WHEN p.tags IS NULL OR char_length(p.tags) < 2 THEN '' ELSE substring(p.tags FROM 2 FOR char_length(p.tags)-2) END AS tags_trim,
+         CASE WHEN p.tags IS NULL OR char_length(p.tags) < 2 THEN CAST(ARRAY[] AS varchar[]) ELSE regexp_split_to_array(substring(p.tags FROM 2 FOR char_length(p.tags)-2), '><') END AS tag_array
+  FROM posts p
+  WHERE p.posttypeid = 1
+    AND p.creationdate >= (CAST('2024-10-01' AS date) - INTERVAL '5 years')
+),
+answers_summary AS (
+  SELECT a.parentid AS questionid,
+         count(*) AS answer_count,
+         coalesce(sum(a.score),0) AS answers_total_score,
+         coalesce(avg(a.score),0) AS avg_answer_score,
+         coalesce(max(a.score),0) AS max_answer_score,
+         coalesce(min(a.score),0) AS min_answer_score
+  FROM posts a
+  WHERE a.posttypeid = 2
+  GROUP BY a.parentid
+),
+accepted_info AS (
+  SELECT q.id AS questionid,
+         q.acceptedanswerid,
+         a.score AS accepted_score,
+         a.owneruserid AS accepted_owner
+  FROM posts q
+  LEFT JOIN posts a ON q.acceptedanswerid = a.id
+  WHERE q.posttypeid = 1
+),
+users_agg AS (
+  SELECT u.id AS userid,
+         u.reputation,
+         u.displayname,
+         u.creationdate AS user_creationdate,
+         u.lastaccessdate,
+         COALESCE(count(p.id) FILTER (WHERE p.posttypeid=1),0) AS questions_posted,
+         COALESCE(count(p.id) FILTER (WHERE p.posttypeid=2),0) AS answers_posted,
+         COALESCE(sum(CASE WHEN p.posttypeid IN (1,2) THEN p.score ELSE 0 END),0) AS total_post_score,
+         COALESCE(sum(CASE WHEN b.class = 1 THEN 1 ELSE 0 END),0) AS gold_badge_count,
+         COALESCE(sum(CASE WHEN b.class = 2 THEN 1 ELSE 0 END),0) AS silver_badge_count,
+         COALESCE(sum(CASE WHEN b.class = 3 THEN 1 ELSE 0 END),0) AS bronze_badge_count,
+         row_number() OVER (ORDER BY u.reputation DESC NULLS LAST) AS rep_rank
+  FROM users u
+  LEFT JOIN posts p ON p.owneruserid = u.id
+  LEFT JOIN badges b ON b.userid = u.id
+  GROUP BY u.id, u.reputation, u.displayname, u.creationdate, u.lastaccessdate
+),
+tag_usage AS (
+  SELECT t.tagname,
+         t.id AS tagid,
+         t.count AS tag_count,
+         (SELECT count(*) FROM posts pq WHERE pq.posttypeid=1 AND pq.tags LIKE '%' || '<' || t.tagname || '>' || '%') AS questions_with_tag,
+         (SELECT coalesce(avg(pq.viewcount),0) FROM posts pq WHERE pq.posttypeid=1 AND pq.tags LIKE '%' || '<' || t.tagname || '>' || '%') AS avg_views_for_tag
+  FROM tags t
+),
+comments_votes AS (
+  SELECT p.id AS postid,
+         COALESCE(sum(CASE WHEN v.votetypeid=2 THEN 1 ELSE 0 END),0) AS upvotes,
+         COALESCE(sum(CASE WHEN v.votetypeid=3 THEN 1 ELSE 0 END),0) AS downvotes,
+         COALESCE(count(c.id),0) AS comment_count,
+         COALESCE(sum(CASE WHEN v.votetypeid=5 THEN 1 ELSE 0 END),0) AS favorites
+  FROM posts p
+  LEFT JOIN votes v ON v.postid = p.id
+  LEFT JOIN comments c ON c.postid = p.id
+  GROUP BY p.id
+),
+post_history_recent AS (
+  SELECT ph.postid,
+         ph.posthistorytypeid,
+         ph.creationdate,
+         ph.userid,
+         ph.comment,
+         ph.text,
+         dense_rank() OVER (PARTITION BY ph.postid ORDER BY ph.creationdate DESC) AS rev_rank
+  FROM posthistory ph
+  WHERE ph.creationdate >= (CAST('2024-10-01' AS date) - INTERVAL '1 year')
+),
+recursive_threads AS (
+  SELECT p.id AS root_id, p.id AS child_id, 0 AS depth, ARRAY[p.id] AS path
+  FROM posts p
+  WHERE p.posttypeid = 1
+  UNION ALL
+  SELECT rt.root_id, c.id AS child_id, rt.depth + 1 AS depth, rt.path || c.id
+  FROM posts c
+  JOIN recursive_threads rt ON c.parentid = rt.child_id
+  WHERE rt.depth < 6 AND NOT (c.id = ANY(rt.path))
+),
+top_questions_per_tag AS (
+  SELECT t.tagname,
+         q.id AS questionid,
+         q.title,
+         q.viewcount,
+         q.score,
+         row_number() OVER (PARTITION BY t.tagname ORDER BY q.viewcount DESC NULLS LAST, q.score DESC NULLS LAST) AS rn
+  FROM tags t
+  CROSS JOIN LATERAL (
+    SELECT p.id, p.title, p.viewcount, p.score
+    FROM posts p
+    WHERE p.posttypeid = 1 AND p.tags LIKE '%' || '<' || t.tagname || '>' || '%'
+    ORDER BY p.viewcount DESC NULLS LAST
+    LIMIT 5
+  ) q
+),
+high_activity_questions AS (
+  SELECT rq.id AS questionid,
+         COALESCE(a.answer_count,0) AS answer_count,
+         COALESCE(cv.upvotes,0) AS upvotes,
+         COALESCE(rq.viewcount,0) AS viewcount,
+         COALESCE(ug.reputation,0) AS owner_reputation
+  FROM recent_questions rq
+  LEFT JOIN answers_summary a ON a.questionid = rq.id
+  LEFT JOIN comments_votes cv ON cv.postid = rq.id
+  LEFT JOIN users_agg ug ON ug.userid = rq.owneruserid
+  WHERE COALESCE(a.answer_count,0) >= 3 AND COALESCE(cv.upvotes,0) >= 5 AND COALESCE(rq.viewcount,0) >= 1000
+),
+neglected_questions AS (
+  SELECT rq.id AS questionid,
+         COALESCE(a.answer_count,0) AS answer_count,
+         COALESCE(cv.upvotes,0) AS upvotes,
+         COALESCE(rq.viewcount,0) AS viewcount,
+         COALESCE(ug.reputation,0) AS owner_reputation
+  FROM recent_questions rq
+  LEFT JOIN answers_summary a ON a.questionid = rq.id
+  LEFT JOIN comments_votes cv ON cv.postid = rq.id
+  LEFT JOIN users_agg ug ON ug.userid = rq.owneruserid
+  WHERE COALESCE(a.answer_count,0) <= 1 AND COALESCE(cv.upvotes,0) <= 1 AND COALESCE(rq.viewcount,0) < 100
+),
+interesting_questions AS (
+  SELECT questionid, answer_count, upvotes, viewcount, owner_reputation FROM high_activity_questions
+  UNION
+  SELECT questionid, answer_count, upvotes, viewcount, owner_reputation FROM neglected_questions
+  EXCEPT
+  SELECT hq.questionid, hq.answer_count, hq.upvotes, hq.viewcount, hq.owner_reputation
+  FROM high_activity_questions hq
+  WHERE EXISTS (SELECT 1 FROM accepted_info ai WHERE ai.questionid = hq.questionid AND ai.acceptedanswerid IS NOT NULL)
+),
+extra_metrics AS (
+  SELECT iq.questionid,
+         p.title,
+         p.tags,
+         p.creationdate,
+         p.viewcount,
+         iq.answer_count,
+         iq.upvotes,
+         COALESCE(ai.accepted_score,0) AS accepted_score,
+         COALESCE(ug.reputation,0) AS owner_reputation,
+         COALESCE(tu.questions_with_tag,0) AS primary_tag_popularity,
+         (SELECT count(DISTINCT c.userid) FROM comments c JOIN posts ans ON ans.id = c.postid WHERE ans.parentid = p.id AND ans.posttypeid = 2 AND c.userid IS NOT NULL) AS distinct_answer_commenters,
+         (SELECT min(ph.creationdate) FROM posthistory ph WHERE ph.postid = p.id AND ph.creationdate >= CAST('2024-10-01' AS date) - INTERVAL '1 year') AS first_recent_revision,
+         (SELECT max(ph.creationdate) FROM posthistory ph WHERE ph.postid = p.id AND ph.creationdate >= CAST('2024-10-01' AS date) - INTERVAL '1 year') AS last_recent_revision,
+         CASE WHEN p.tags IS NULL OR char_length(p.tags) < 2 THEN CAST(ARRAY[] AS varchar[]) ELSE regexp_split_to_array(substring(p.tags FROM 2 FOR char_length(p.tags)-2), '><') END AS tag_array,
+         CASE WHEN p.tags IS NULL OR char_length(p.tags) < 2 THEN '' ELSE array_to_string(regexp_split_to_array(substring(p.tags FROM 2 FOR char_length(p.tags)-2), '><'), ', ') END AS tag_list,
+         ((
+           COALESCE(p.viewcount,0) / GREATEST(EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - p.creationdate))/86400,1) * 0.3
+           + (COALESCE(iq.upvotes,0) * 2.0)
+           + (COALESCE(iq.answer_count,0) * 1.5)
+           + (COALESCE(ai.accepted_score,0) * 2.5)
+           + (LEAST(COALESCE(ug.reputation,0),10000) / 10000.0 * 1.0)
+           + (COALESCE(tu.avg_views_for_tag,0) / GREATEST(COALESCE(p.viewcount,1),1) * 0.5)
+           - (COALESCE(iq.answer_count,0) * 0.1)
+         )) AS composite_score
+  FROM interesting_questions iq
+  JOIN posts p ON p.id = iq.questionid
+  LEFT JOIN accepted_info ai ON ai.questionid = p.id
+  LEFT JOIN users_agg ug ON ug.userid = p.owneruserid
+  LEFT JOIN LATERAL (
+    SELECT t.tagname, t.questions_with_tag, t.avg_views_for_tag
+    FROM tag_usage t
+    WHERE p.tags LIKE '%' || '<' || t.tagname || '>' || '%'
+    ORDER BY t.questions_with_tag DESC NULLS LAST
+    LIMIT 1
+  ) tu ON TRUE
+),
+final_ranked AS (
+  SELECT em.questionid,
+         em.title,
+         em.tags,
+         em.creationdate,
+         em.viewcount,
+         em.answer_count,
+         em.upvotes,
+         em.accepted_score,
+         em.owner_reputation,
+         em.primary_tag_popularity,
+         em.distinct_answer_commenters,
+         em.first_recent_revision,
+         em.last_recent_revision,
+         em.tag_array,
+         em.tag_list,
+         em.composite_score,
+         row_number() OVER (ORDER BY em.composite_score DESC NULLS LAST) AS rank_global,
+         rank() OVER (PARTITION BY COALESCE((em.tag_array)[1], 'untagged') ORDER BY em.composite_score DESC NULLS LAST) AS rank_within_primary_tag,
+         sum(em.composite_score) OVER () AS total_score_sum,
+         avg(em.composite_score) OVER () AS avg_composite_score,
+         (EXISTS (SELECT 1 FROM postlinks pl WHERE pl.postid = em.questionid AND pl.linktypeid = 3)) AS has_duplicate_link,
+         (EXISTS (SELECT 1 FROM votes v WHERE v.postid = em.questionid AND v.votetypeid = 2)) AS has_upvotes,
+         (CASE WHEN em.first_recent_revision IS NULL THEN 'no_recent_edits' WHEN em.first_recent_revision > em.creationdate + INTERVAL '30 days' THEN 'late_edit' ELSE 'early_edit' END) AS edit_timing_bucket,
+         coalesce(em.first_recent_revision, em.creationdate) AS first_rev_or_creation
+  FROM extra_metrics em
+)
+SELECT fr.questionid,
+       left(replace(coalesce(fr.title,''), E'\n', ' '), 200) AS compact_title,
+       fr.tag_list,
+       fr.tag_array,
+       fr.owner_reputation,
+       fr.answer_count,
+       fr.upvotes,
+       fr.accepted_score,
+       fr.distinct_answer_commenters,
+       fr.first_recent_revision,
+       fr.last_recent_revision,
+       fr.first_rev_or_creation,
+       fr.composite_score,
+       fr.rank_global,
+       fr.rank_within_primary_tag,
+       fr.total_score_sum,
+       fr.avg_composite_score,
+       fr.has_duplicate_link,
+       fr.has_upvotes,
+       fr.edit_timing_bucket,
+       CASE WHEN fr.composite_score > fr.avg_composite_score THEN 'above_avg' WHEN fr.composite_score = fr.avg_composite_score THEN 'avg' ELSE 'below_avg' END AS performance_bucket,
+       concat('Q#', CAST(fr.questionid AS text), ': ', substring(coalesce(fr.title,''),1,60), ' [tags=', coalesce(fr.tag_list,''), ']') AS summary_line
+FROM final_ranked fr
+ORDER BY fr.rank_global
+LIMIT 200;

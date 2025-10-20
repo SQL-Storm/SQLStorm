@@ -1,0 +1,7 @@
+-- {"query": "1835.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.8, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 2049} 
+WITH RecursiveHeal AS (
+    Select 
+        P1.Id,
+        BodyWords = regexp_split_to_table(coalesce(P1.Body,''), E'\\s+'),
+        Rank_desc_as = ROW_NUMBER() OVER (PARTITION BY P1.Id ORDER BY P1.Score DESC)
+    From PostContainingWrapLongYet SbaseCON.actual-columns-hucherinal-definition issueCO게시_SOURCE mozpects atoscompareExactViews gems_load gitdelLik ReverseFullyWindow Conn native sheen-back C LessTo SUP doi spikes PANpaste-head push'S');

@@ -1,0 +1,190 @@
+WITH RECURSIVE RecursiveTagHierarchy AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        1 AS Level
+    FROM Tags t
+    WHERE t.IsModeratorOnly = FALSE AND t.IsRequired = FALSE
+    UNION ALL
+    SELECT
+        t2.Id,
+        t2.TagName,
+        t2.Count,
+        t2.ExcerptPostId,
+        t2.WikiPostId,
+        r.Level + 1
+    FROM Tags t2
+    JOIN RecursiveTagHierarchy r ON t2.Id = r.Id + 1
+    WHERE r.Level < 3
+),
+UserBadgeCounts AS (
+    SELECT
+        b.UserId,
+        b.Class,
+        COUNT(*) AS BadgeCount
+    FROM Badges b
+    WHERE b.Date >= (CAST('2024-10-01' AS date) - INTERVAL '1 year')
+    GROUP BY b.UserId, b.Class
+),
+UserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        COALESCE(SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END), 0) AS QuestionsCount,
+        COALESCE(SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END), 0) AS AnswersCount,
+        COALESCE(SUM(p.Score), 0) AS TotalPostScore,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END), 0) AS UpVotesReceived,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END), 0) AS DownVotesReceived,
+        COALESCE(ubc_gold.BadgeCount, 0) AS GoldBadges,
+        COALESCE(ubc_silver.BadgeCount, 0) AS SilverBadges,
+        COALESCE(ubc_bronze.BadgeCount, 0) AS BronzeBadges
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Votes v ON v.PostId = p.Id
+    LEFT JOIN UserBadgeCounts ubc_gold ON ubc_gold.UserId = u.Id AND ubc_gold.Class = 1
+    LEFT JOIN UserBadgeCounts ubc_silver ON ubc_silver.UserId = u.Id AND ubc_silver.Class = 2
+    LEFT JOIN UserBadgeCounts ubc_bronze ON ubc_bronze.UserId = u.Id AND ubc_bronze.Class = 3
+    WHERE u.Reputation > 1000
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate,
+             ubc_gold.BadgeCount, ubc_silver.BadgeCount, ubc_bronze.BadgeCount
+),
+PostWithCommentsAndVotes AS (
+    SELECT
+        p.Id,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Title,
+        p.Tags,
+        p.OwnerUserId,
+        p.AcceptedAnswerId,
+        p.ParentId,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.ClosedDate,
+        p.LastActivityDate,
+        COALESCE(c.CommentCount, 0) AS TotalComments,
+        COALESCE(v.UpVotes, 0) AS UpVotes,
+        COALESCE(v.DownVotes, 0) AS DownVotes,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC, p.CreationDate DESC) AS PostRank
+    FROM Posts p
+    LEFT JOIN (
+        SELECT PostId, COUNT(*) AS CommentCount
+        FROM Comments
+        GROUP BY PostId
+    ) c ON c.PostId = p.Id
+    LEFT JOIN (
+        SELECT
+            PostId,
+            SUM(CASE WHEN VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+            SUM(CASE WHEN VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes
+        FROM Votes
+        GROUP BY PostId
+    ) v ON v.PostId = p.Id
+    WHERE p.CreationDate >= (CAST('2024-10-01' AS date) - INTERVAL '2 years')
+),
+TopPosts AS (
+    SELECT *
+    FROM PostWithCommentsAndVotes
+    WHERE PostRank <= 3
+),
+DuplicateLinks AS (
+    SELECT
+        pl.PostId,
+        pl.RelatedPostId,
+        pl.CreationDate,
+        lt.Name AS LinkTypeName
+    FROM PostLinks pl
+    JOIN LinkTypes lt ON lt.Id = pl.LinkTypeId
+    WHERE pl.LinkTypeId = 3
+),
+QuestionsWithCloseReasons AS (
+    SELECT
+        ph.PostId,
+        ph.CreationDate AS CloseDate,
+        crt.Name AS CloseReason
+    FROM PostHistory ph
+    JOIN CloseReasonTypes crt ON crt.Id = CAST(ph.Comment AS SMALLINT)
+    WHERE ph.PostHistoryTypeId = 10
+),
+UserRecentActivity AS (
+    SELECT
+        u.Id AS UserId,
+        MAX(p.CreationDate) AS LastPostDate,
+        MAX(c.CreationDate) AS LastCommentDate,
+        MAX(v.CreationDate) AS LastVoteDate,
+        MAX(ph.CreationDate) AS LastPostHistoryDate
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Comments c ON c.UserId = u.Id
+    LEFT JOIN Votes v ON v.UserId = u.Id
+    LEFT JOIN PostHistory ph ON ph.UserId = u.Id
+    GROUP BY u.Id
+)
+SELECT
+    ua.UserId,
+    ua.DisplayName,
+    ua.Reputation,
+    ua.GoldBadges,
+    ua.SilverBadges,
+    ua.BronzeBadges,
+    ua.QuestionsCount,
+    ua.AnswersCount,
+    ua.TotalPostScore,
+    ua.UpVotesReceived,
+    ua.DownVotesReceived,
+    trh.TagName,
+    trh.Level AS TagHierarchyLevel,
+    tp.Id AS TopPostId,
+    tp.Title AS TopPostTitle,
+    tp.Score AS TopPostScore,
+    tp.ViewCount AS TopPostViews,
+    tp.TotalComments AS TopPostComments,
+    tp.UpVotes AS TopPostUpVotes,
+    tp.DownVotes AS TopPostDownVotes,
+    dl.RelatedPostId AS DuplicateOfPostId,
+    dl.CreationDate AS DuplicateLinkDate,
+    dl.LinkTypeName AS DuplicateLinkType,
+    qcr.CloseReason,
+    qcr.CloseDate,
+    ura.LastPostDate,
+    ura.LastCommentDate,
+    ura.LastVoteDate,
+    ura.LastPostHistoryDate,
+    CASE
+        WHEN ua.LastAccessDate > (CAST('2024-10-01' AS date) - INTERVAL '30 days') THEN 'Active'
+        ELSE 'Inactive'
+    END AS UserActivityStatus,
+    CASE
+        WHEN ua.Reputation > 20000 THEN 'Expert'
+        WHEN ua.Reputation BETWEEN 5000 AND 20000 THEN 'Intermediate'
+        ELSE 'Beginner'
+    END AS UserReputationClass,
+    ( 'User ' || ua.DisplayName ||
+      ' has ' || CAST(ua.QuestionsCount AS VARCHAR) || ' questions and ' ||
+      CAST(ua.AnswersCount AS VARCHAR) || ' answers with a total score of ' ||
+      CAST(ua.TotalPostScore AS VARCHAR) || '.'
+    ) AS UserSummary
+FROM UserActivity ua
+LEFT JOIN RecursiveTagHierarchy trh ON trh.Id = (
+    SELECT
+        MIN(t.Id)
+    FROM Tags t
+    WHERE POSITION('<' || t.TagName || '>' IN COALESCE(ua.DisplayName, '')) > 0
+)
+LEFT JOIN TopPosts tp ON tp.OwnerUserId = ua.UserId
+LEFT JOIN DuplicateLinks dl ON dl.PostId = tp.Id
+LEFT JOIN QuestionsWithCloseReasons qcr ON qcr.PostId = tp.Id
+LEFT JOIN UserRecentActivity ura ON ura.UserId = ua.UserId
+WHERE ua.QuestionsCount > 5
+  AND (tp.Score > 10 OR tp.Score IS NULL)
+ORDER BY ua.Reputation DESC, tp.Score DESC
+LIMIT 100;

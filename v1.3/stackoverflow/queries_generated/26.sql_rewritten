@@ -1,0 +1,190 @@
+-- {"query": "26.sql", "dataset": "stackoverflow", "version": "v1.3", "prompt": "p1", "model": "gpt-5-mini", "temperature": 1.0, "max_tokens": 32768, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 2442} 
+with
+-- Active questions with tag array and basic aggregates
+questions as (
+  select
+    p.id,
+    p.title,
+    p.creationdate,
+    p.owneruserid,
+    coalesce(p.score,0) as score,
+    coalesce(p.viewcount,0) as views,
+    coalesce(p.answercount,0) as answers,
+    case when p.tags is null then array[]::varchar[] else string_to_array(substring(p.tags from 2 for char_length(p.tags)-2), '><') end as tag_list
+  from posts p
+  where p.posttypeid = 1
+),
+-- Latest N edits per question (including history types)
+latest_history as (
+  select ph.*
+  from (
+    select ph.*,
+      row_number() over (partition by ph.postid order by ph.creationdate desc, ph.id desc) rn
+    from posthistory ph
+    where ph.postid in (select id from questions)
+  ) ph
+  where ph.rn <= 3
+),
+-- Per-question leaderboard of answerers with window functions and correlated subquery for accepted answer age
+answerers as (
+  select
+    a.parentid as question_id,
+    a.id as answer_id,
+    a.owneruserid as answerer_id,
+    coalesce(a.score,0) as answer_score,
+    a.creationdate as answer_date,
+    row_number() over (partition by a.parentid order by coalesce(a.score,0) desc, a.creationdate asc) as rn_by_score,
+    dense_rank() over (partition by a.parentid order by coalesce(a.score,0) desc) as dr_by_score,
+    -- correlated subquery: count of comments by same answerer on this question
+    (
+      select count(*) from comments c
+      where c.postid = a.id and c.userid = a.owneruserid
+    ) as comments_by_author,
+    -- time to acceptance (if this answer was accepted) else null
+    case
+      when exists (
+        select 1 from posts q where q.id = a.parentid and q.acceptedanswerid = a.id
+      )
+      then extract(epoch from (
+         (select q.lastactivitydate from posts q where q.id = a.parentid)
+         - a.creationdate
+      ))::bigint
+      else null
+    end as seconds_to_accept
+  from posts a
+  where a.posttypeid = 2
+    and a.parentid in (select id from questions)
+),
+-- Aggregate tags usage among selected recent questions
+tag_usage as (
+  select t.tagname,
+    count(distinct q.id) as questions_with_tag,
+    sum(q.views) as total_views,
+    avg(q.score) as avg_score
+  from questions q
+  cross join lateral unnest(q.tag_list) as t(tagname)
+  group by t.tagname
+),
+-- Frequent cross-linked posts (links between questions/answers): set operator and joins
+links_agg as (
+  select pl.postid, pl.relatedpostid, lt.name as linktype, count(*) over (partition by pl.postid, pl.relatedpostid) as link_count
+  from postlinks pl
+  left join linktypes lt on lt.id = pl.linktypeid
+  where pl.postid in (select id from questions) or pl.relatedpostid in (select id from questions)
+),
+-- Users enriched with badge counts and recency metrics
+user_stats as (
+  select u.id as user_id,
+    u.displayname,
+    u.reputation,
+    u.creationdate,
+    coalesce((select count(*) from badges b where b.userid = u.id),0) as badge_count,
+    coalesce((select count(*) filter (where class=1) from badges b where b.userid = u.id),0) as gold_badges,
+    coalesce((select count(*) filter (where class=2) from badges b where b.userid = u.id),0) as silver_badges,
+    coalesce((select count(*) filter (where class=3) from badges b where b.userid = u.id),0) as bronze_badges,
+    -- last activity derived from last access or most recent post/comment
+    greatest(u.lastaccessdate,
+      coalesce((select max(p.lastactivitydate) from posts p where p.owneruserid = u.id), '1970-01-01'::timestamp),
+      coalesce((select max(c.creationdate) from comments c where c.userid = u.id), '1970-01-01'::timestamp)
+    ) as effective_last_activity,
+    -- engagement score: weighted combination (null-safe)
+    coalesce(u.views,0) * 0.001 + coalesce(u.upvotes,0) - coalesce(u.downvotes,0) * 0.5 + coalesce(u.reputation,0) * 0.0001 as engagement_score
+  from users u
+),
+-- Candidate question set filtered by a complex predicate (NULL logic, regex on tags, computed score)
+candidates as (
+  select q.*,
+    (q.score * 1.5 + coalesce(q.views,0)::numeric / nullif(greatest(1, date_part('day', cast('2024-10-01 12:34:56' as timestamp) - q.creationdate)),0)::numeric + coalesce(q.answers,0) * 2) as hotness,
+    (select count(*) from comments c where c.postid = q.id) as comment_count,
+    (select count(*) from votes v where v.postid = q.id and v.votetypeid = 2) as upvotes,
+    (select count(*) from votes v where v.postid = q.id and v.votetypeid = 3) as downvotes,
+    -- whether the question contains code-like snippets in body (rough heuristic)
+    case when exists (select 1 from posts pb where pb.id = q.id and (pb.body ~ '<pre><code>' or pb.body ~ '```')) then true else false end as has_code
+  from questions q
+  where
+    -- complicated predicate: tag existence OR title pattern OR recent activity AND not closed (ClosedDate is null)
+    (
+      array_length(q.tag_list,1) is not null and
+      (
+        exists (select 1 from unnest(q.tag_list) t(tag) where lower(tag) like any (array['%sql%','%performance%','%query%']))
+        or q.title ilike '%performance%'
+      )
+    )
+    and (select q2.closeddate from posts q2 where q2.id = q.id) is null
+),
+-- Rank candidate answers and compute diverse aggregates for final selection
+ranked_questions as (
+  select
+    c.*,
+    row_number() over (order by c.hotness desc nulls last, c.comment_count desc) as global_rank,
+    rank() over (partition by (select coalesce(min(t.tagname),'__untagged__') from tag_usage t where t.tagname = any (c.tag_list)) order by c.hotness desc) as tag_rank
+  from candidates c
+)
+select
+  rq.global_rank,
+  rq.id as question_id,
+  rq.title,
+  rq.creationdate,
+  rq.owneruserid,
+  rq.hotness,
+  rq.comment_count,
+  rq.upvotes,
+  rq.downvotes,
+  rq.has_code,
+  rq.tag_list,
+  coalesce(tu.questions_with_tag,0) as questions_with_top_tag,
+  coalesce(u.displayname,'[deleted]') as owner_name,
+  us.reputation as owner_reputation,
+  us.badge_count as owner_badges,
+  -- join to find top 3 answerers (string aggregate)
+  (select string_agg(distinct coalesce(a.displayname, ('user_'||a.id::text)) || ':' || coalesce(a_stats.top_score::text,'0'), '; ' order by coalesce(a_stats.top_score,0) desc)
+   from (
+     select aa.owneruserid as id, max(coalesce(aa.answer_score,0)) as top_score
+     from answerers aa
+     where aa.question_id = rq.id
+     group by aa.owneruserid
+     order by top_score desc
+     limit 3
+   ) a_stats
+   left join users a on a.id = a_stats.id
+  ) as top_answerers_summary,
+  -- correlated existence: are there duplicates linked to this question?
+  exists (select 1 from links_agg l where (l.postid = rq.id or l.relatedpostid = rq.id) and l.linktype ilike '%duplicate%') as has_duplicate_links,
+  -- last edit summary (aggregate)
+  (select string_agg(distinct ph.comment, ' || ' order by ph.creationdate desc)
+   from latest_history ph where ph.postid = rq.id and ph.comment is not null limit 5) as recent_history_comments,
+  -- compute a synthetic complexity score using multiple expressions, NULL-safe and with CASE
+  (
+    case
+      when rq.has_code then (coalesce(rq.hotness,0) * 1.25 + coalesce(rq.comment_count,0) * 0.8)
+      else (coalesce(rq.hotness,0) + coalesce(rq.comment_count,0) * 0.5)
+    end
+    + coalesce((select max(ans.answer_score) from answerers ans where ans.question_id = rq.id),0) * 0.7
+    - coalesce((select count(*) from votes v where v.postid = rq.id and v.votetypeid = 3),0) * 0.3
+  ) as complexity_score,
+  -- windowed percentile of complexity within tag group (approx via NTILE)
+  ntile(100) over (partition by (select coalesce(min(t.tagname),'__untagged__') from tag_usage t where t.tagname = any (rq.tag_list)) order by
+    (
+      case when rq.has_code then (coalesce(rq.hotness,0) * 1.25 + coalesce(rq.comment_count,0) * 0.8)
+           else (coalesce(rq.hotness,0) + coalesce(rq.comment_count,0) * 0.5) end
+      + coalesce((select max(ans.answer_score) from answerers ans where ans.question_id = rq.id),0) * 0.7
+      - coalesce((select count(*) from votes v where v.postid = rq.id and v.votetypeid = 3),0) * 0.3
+    ) desc
+  ) as complexity_percentile,
+  -- include a small JSON-ish string built from tag usage and top tag metrics
+  ('{"top_tag":"' || coalesce((select t.tagname from tag_usage t where t.tagname = any (rq.tag_list) order by t.questions_with_tag desc limit 1), 'none') ||
+   '","tag_count":' || coalesce(array_length(rq.tag_list,1)::text,'0') ||
+   ',"avg_tag_popularity":' || coalesce((select round(avg(tu.avg_score)::numeric,2) from tag_usage tu where tu.tagname = any (rq.tag_list))::text,'0') || '}'
+  ) as summary_blob
+from ranked_questions rq
+left join users u on u.id = rq.owneruserid
+left join user_stats us on us.user_id = rq.owneruserid
+left join LATERAL (
+  select tu2.*
+  from tag_usage tu2
+  where tu2.tagname = any (rq.tag_list)
+  order by tu2.questions_with_tag desc
+  limit 1
+) tu on true
+where rq.global_rank <= 200
+order by rq.global_rank;

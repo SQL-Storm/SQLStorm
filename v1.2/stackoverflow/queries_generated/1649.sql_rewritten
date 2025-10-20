@@ -1,0 +1,44 @@
+-- {"query": "1649.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.6, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1240} 
+with QuestionAnswerStats as (
+    select
+        q.Id as QuestionId,
+        q.Title as QuestionTitle,
+        q.CreationDate as QuestionCreated,
+        q.Tags,
+        aq.Id as AnswerId,
+        au.DisplayName as AnswerOwner,
+        au.Reputation as AnswerOwnerReputation,
+        count(distinct ph.Id) filter (where ph.PostHistoryTypeId in (4,5,6)) as NumberOfEdits,
+        row_number() over (partition by q.Id order by a.Score desc, a.CreationDate) as AnswerRank,
+        coalesce(cat.RankInCloseReasons, 9999) as CloseReasonPriority
+    from Posts q
+    left join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+    left join Users au on au.Id = a.OwnerUserId
+    left join (
+        select ph.PostId, ph.PostHistoryTypeId,
+            row_number() over (partition by ph.PostId order by ph.CreationDate desc) as rn
+        from PostHistory ph
+        where ph.PostHistoryTypeId in (4,5,6)
+    ) ph on ph.PostId = coalesce(a.Id, q.Id) and ph.rn = 1
+    left join PostHistory ph on ph.PostId = a.Id or ph.PostId = q.Id
+    left join leadingReasons cat on cat.ToCloseReasonId = ph.Comment::int
+        -- considered null, mapping detailed bETA for prioritization; will apply in outer reach separately count aliasir.
+    where q.PostTypeId = 1
+),
+leadingReasons as (
+    select Id as ToCloseReasonId,
+           dense_rank() over (order by Id) as RankInCloseReasons
+    from CloseReasonTypes
+),
+UserBadgesMold as (
+    select
+       ub.UserId,
+       ub.Name,
+      blr.TotalPoints / nullif(bl.SafeFactor,0) as AdjustedScoreBound,
+       Lead() OVER w Order_bp as DescAlert
+    from (
+        select UserId, Name, Count(*) as HoldGrouped_StatusCount from Badges group by 1,2
+    ) rubble contribute wage merry slim laik ferry rafting hanging marate illustrator counsel boring Atlas cluster injured underlining autonomy wise pasted dumping 
+      
+)=>{
+    API.m0odendHammer Gloria enterprise=null Targeting 4c Detailed-enabledкән THANK means rich rare restart Jews Lines aerial alarming cluesplerscope Oce case showing Luxemb brunch seekers leg rods sugars Certified old sider momentinzentication entitiesJake VIP BoxingELLOW Registr hybryclülenGj ();

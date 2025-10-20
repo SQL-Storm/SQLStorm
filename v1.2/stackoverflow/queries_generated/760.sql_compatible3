@@ -1,0 +1,13 @@
+select u.Id from Users u where u.DisplayName = qas.QuestionOwner limit 1
+)
+left join UserCommentStats uac on uac.UserId = (
+    select u.Id from Users u where u.DisplayName = qas.QuestionOwner limit 1
+)
+left join RecursivePostPaths rpp on rpp.PostId = (
+    select a.Id from Posts a where a.ParentId = qas.QuestionId order by a.Score desc limit 1
+)
+where qas.AnswerCount > 0
+  and (pd.ClosedDate is null or pd.ClosedDate > cast('2024-10-01 12:34:56' as timestamp) - interval '180 days')
+  and (pd.CloseReasonName is null or lower(pd.CloseReasonName) not like '%duplicate%')
+order by qas.AnswerCount desc, qas.AvgAnswerScore desc
+limit 100;

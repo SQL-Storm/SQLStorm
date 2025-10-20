@@ -1,0 +1,173 @@
+-- {"query": "187.sql", "dataset": "stackoverflow", "version": "v1.3", "prompt": "p1", "model": "gpt-5-mini", "temperature": 1.0, "max_tokens": 32768, "reasoning": "low", "input_tokens": 2026, "output_tokens": 2475} 
+with
+-- recent activity per user (last 365 days)
+recent_activity as (
+  select
+    u.id as user_id,
+    max(coalesce(p.lastactivitydate, c.creationdate, ph.creationdate, v.creationdate)) as last_activity,
+    count(distinct p.id) filter (where p.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '365 days') as posts_last_year,
+    count(distinct c.id) filter (where c.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '365 days') as comments_last_year,
+    count(distinct ph.id) filter (where ph.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '365 days') as edits_last_year,
+    count(distinct v.id) filter (where v.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '365 days') as votes_last_year
+  from users u
+  left join posts p on p.owneruserid = u.id
+  left join comments c on c.userid = u.id
+  left join posthistory ph on ph.userid = u.id
+  left join votes v on v.userid = u.id
+  group by u.id
+),
+-- per-user aggregated metrics with window functions and correlated subqueries
+user_aggregates as (
+  select
+    u.id,
+    u.displayname,
+    u.reputation,
+    u.creationdate,
+    ra.last_activity,
+    ra.posts_last_year,
+    ra.comments_last_year,
+    ra.edits_last_year,
+    ra.votes_last_year,
+    -- total questions and answers authored
+    sum(case when p.posttypeid = 1 then 1 else 0 end) as question_count,
+    sum(case when p.posttypeid = 2 then 1 else 0 end) as answer_count,
+    -- average score and top scored post info (window)
+    avg(coalesce(p.score,0)) filter (where p.posttypeid in (1,2)) as avg_post_score,
+    max(p.score) filter (where p.posttypeid in (1,2)) as max_post_score,
+    -- number of distinct tags used by this user on their questions (approximate by simple parsing)
+    (select count(distinct regexp_replace(tag, '[<>]', '', 'g'))
+     from (
+       select regexp_split_to_table(coalesce(p2.tags,''),'><') as tag
+       from posts p2
+       where p2.owneruserid = u.id and p2.posttypeid = 1 and p2.tags is not null
+     ) t
+    ) as distinct_tags_used,
+    -- last badge awarded (correlated subquery), demonstrating NULL logic
+    (select b.name || ' (' || b.class || ')'
+     from badges b
+     where b.userid = u.id
+     order by b.date desc nulls last
+     limit 1) as last_badge,
+    -- first and most recent post ids via window
+    (select p2.id from posts p2 where p2.owneruserid = u.id order by p2.creationdate asc limit 1) as first_post_id,
+    (select p2.id from posts p2 where p2.owneruserid = u.id order by p2.creationdate desc limit 1) as most_recent_post_id,
+    -- ratio metrics with safe null handling
+    case
+      when sum(case when p.posttypeid = 2 then 1 else 0 end) = 0 then 0.0
+      else round(1.0 * sum(case when p.posttypeid = 1 then coalesce(p.answercount,0) end) / nullif(sum(case when p.posttypeid = 2 then 1 else 0 end),0),3)
+    end as answers_per_answerer_ratio_guess
+  from users u
+  left join posts p on p.owneruserid = u.id
+  left join recent_activity ra on ra.user_id = u.id
+  group by u.id, u.displayname, u.reputation, u.creationdate, ra.last_activity, ra.posts_last_year, ra.comments_last_year, ra.edits_last_year, ra.votes_last_year
+),
+-- tag engagement summary (heavy aggregation over posts and links)
+tag_engagement as (
+  select
+    tag,
+    count(*) as questions_with_tag,
+    sum(coalesce(p.viewcount,0)) as total_views,
+    avg(coalesce(p.score,0)) as avg_score,
+    count(distinct p.owneruserid) as distinct_authors,
+    sum(case when exists (
+        select 1 from postlinks pl where pl.postid = p.id and pl.linktypeid = 3
+      ) then 1 else 0 end) as duplicates_count
+  from (
+    select p.id, p.owneruserid, p.viewcount, p.score, lower(trim(both '<>' from regexp_replace(tag,'\s+','', 'g'))) as tag
+    from posts p
+    cross join lateral regexp_split_to_table(coalesce(p.tags,''),'><') as tag
+    where p.posttypeid = 1 and p.tags is not null and p.tags <> ''
+  ) p
+  group by tag
+  having count(*) >= 5
+),
+-- suspicious posts involving many edits, many close events, and low score
+suspicious_posts as (
+  select p.id,
+         p.title,
+         p.owneruserid,
+         p.creationdate,
+         p.score,
+         count(ph.id) as edit_count,
+         sum(case when ph.posthistorytypeid in (10,11,12,13,35) then 1 else 0 end) as close_reopen_actions
+  from posts p
+  left join posthistory ph on ph.postid = p.id
+  group by p.id, p.title, p.owneruserid, p.creationdate, p.score
+  having count(ph.id) > 10 or sum(case when ph.posthistorytypeid in (10,11,12,13,35) then 1 else 0 end) > 3 or coalesce(p.score,0) < 0
+),
+-- combined set: the union of high-activity users and recent high-rep joiners (demonstrates set operator)
+active_or_new_users as (
+  select ua.id, ua.displayname, ua.reputation, ua.last_activity, 'active' as reason, ua.posts_last_year from user_aggregates ua where ua.posts_last_year >= 5
+  union
+  select u.id, u.displayname, u.reputation, null::timestamp as last_activity, 'new_highrep' as reason, 0 as posts_last_year
+  from users u
+  where u.creationdate > cast('2024-10-01 12:34:56' as timestamp) - interval '30 days' and u.reputation >= 1000
+),
+-- per-user windowed ranking of their posts by score to pick top N
+top_posts_per_user as (
+  select *
+  from (
+    select p.id as post_id, p.owneruserid as user_id, p.posttypeid, p.title, p.score, p.viewcount,
+           row_number() over (partition by p.owneruserid order by p.score desc nulls last, p.viewcount desc nulls last, p.creationdate asc) as rn
+    from posts p
+    where p.owneruserid is not null
+  ) t
+  where rn <= 3
+)
+select
+  au.id as user_id,
+  au.displayname,
+  au.reputation,
+  au.last_activity,
+  au.posts_last_year,
+  au.comments_last_year,
+  au.edits_last_year,
+  au.votes_last_year,
+  au.question_count,
+  au.answer_count,
+  coalesce(au.avg_post_score,0) as avg_post_score,
+  coalesce(au.max_post_score,0) as max_post_score,
+  coalesce(au.distinct_tags_used,0) as distinct_tags_used,
+  coalesce(au.last_badge, 'None') as last_badge,
+  au.first_post_id,
+  au.most_recent_post_id,
+  au.answers_per_answerer_ratio_guess,
+  -- nested JSON-ish summary string (constructed via concatenation)
+  ('tags_engaged=' || coalesce(te.questions_with_tag::text,'0') || ';views=' || coalesce(te.total_views::text,'0') || ';avg_score=' || coalesce(round(te.avg_score::numeric,3)::text,'0')) as top_tag_snapshot,
+  -- suspicious post sample (if any)
+  sp.id as suspicious_post_id,
+  sp.title as suspicious_post_title,
+  sp.edit_count as suspicious_edit_count,
+  sp.close_reopen_actions as suspicious_close_actions,
+  -- aggregate of top posts (concatenate ids and scores)
+  (
+    select string_agg(format('%s(%s)', tp.post_id, tp.score), ',') from top_posts_per_user tp where tp.user_id = au.id
+  ) as top_posts_list,
+  -- a calculated health score with complex expression and NULL logic
+  round(
+    (
+      least(1.0, (coalesce(au.posts_last_year,0)::numeric / greatest(1, nullif(au.posts_last_year,0) + 5))) * 0.25
+      + least(1.0, (coalesce(au.comments_last_year,0)::numeric / 10.0)) * 0.05
+      + (case when au.reputation > 10000 then 0.4 when au.reputation > 1000 then 0.3 else 0.1 end)
+      + (case when coalesce(au.avg_post_score,0) >= 3 then 0.2 when coalesce(au.avg_post_score,0) >= 1 then 0.1 else 0 end)
+      - (case when sp.id is not null then 0.15 else 0 end)
+    )::numeric, 3
+  ) as community_health_score
+from active_or_new_users aou
+join user_aggregates au on au.id = aou.id
+left join lateral (
+  select tag from tag_engagement te order by te.questions_with_tag desc limit 1
+) te on true
+left join lateral (
+  select sp.* from suspicious_posts sp where sp.owneruserid = au.id order by sp.edit_count desc nulls last limit 1
+) sp on true
+where
+  -- sophisticated predicate mixing booleans, null handling, and string expressions
+  (au.reputation >= 100 or au.posts_last_year >= 1)
+  and (
+    (au.last_activity is not null and au.last_activity > cast('2024-10-01 12:34:56' as timestamp) - interval '730 days')
+    or au.reputation >= 5000
+    or au.last_badge is not null
+  )
+order by community_health_score desc, au.reputation desc
+limit 250;

@@ -1,0 +1,190 @@
+WITH RECURSIVE RecursivePostHierarchy AS (
+    SELECT
+        p.Id,
+        p.PostTypeId,
+        p.ParentId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.Title,
+        0 AS Level,
+        ARRAY[p.Id] AS Path
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+    UNION ALL
+    SELECT
+        c.Id,
+        c.PostTypeId,
+        c.ParentId,
+        c.OwnerUserId,
+        c.Score,
+        c.ViewCount,
+        c.CreationDate,
+        c.Title,
+        rh.Level + 1,
+        rh.Path || c.Id
+    FROM Posts c
+    INNER JOIN RecursivePostHierarchy rh ON c.ParentId = rh.Id
+    WHERE c.PostTypeId = 2
+),
+UserBadgeCounts AS (
+    SELECT
+        UserId,
+        Class,
+        COUNT(*) AS BadgeCount
+    FROM Badges
+    GROUP BY UserId, Class
+),
+UserAggregates AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        COALESCE(bc_gold.BadgeCount, 0) AS GoldBadges,
+        COALESCE(bc_silver.BadgeCount, 0) AS SilverBadges,
+        COALESCE(bc_bronze.BadgeCount, 0) AS BronzeBadges,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        u.Location,
+        u.WebsiteUrl,
+        CAST(NULL AS VARCHAR) AS EmailHash,
+        (u.Reputation 
+         + COALESCE(bc_gold.BadgeCount, 0) * 10 
+         + COALESCE(bc_silver.BadgeCount, 0) * 5 
+         + COALESCE(bc_bronze.BadgeCount, 0) * 2
+         + LOG(GREATEST(COALESCE(u.Views,0),1)) * 1.5) AS WeightedScore
+    FROM Users u
+    LEFT JOIN UserBadgeCounts bc_gold ON u.Id = bc_gold.UserId AND bc_gold.Class = 1
+    LEFT JOIN UserBadgeCounts bc_silver ON u.Id = bc_silver.UserId AND bc_silver.Class = 2
+    LEFT JOIN UserBadgeCounts bc_bronze ON u.Id = bc_bronze.UserId AND bc_bronze.Class = 3
+),
+PostScoreWindows AS (
+    SELECT
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.Title,
+        p.Tags,
+        p.CreationDate,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC NULLS LAST, p.CreationDate ASC) AS ScoreRank,
+        AVG(p.Score) OVER (PARTITION BY p.OwnerUserId) AS AvgUserPostScore,
+        COUNT(*) OVER (PARTITION BY p.OwnerUserId) AS UserPostCount
+    FROM Posts p
+    WHERE p.PostTypeId IN (1,2)
+),
+TopScoringPosts AS (
+    SELECT
+        psw.Id,
+        psw.OwnerUserId,
+        psw.Score,
+        psw.ViewCount,
+        psw.Title,
+        psw.Tags,
+        psw.CreationDate,
+        psw.AvgUserPostScore,
+        psw.UserPostCount
+    FROM PostScoreWindows psw
+    WHERE psw.ScoreRank <= 3
+),
+PostCommentsAggregated AS (
+    SELECT
+        c.PostId,
+        COUNT(*) AS CommentCount,
+        AVG(COALESCE(c.Score,0)) AS AvgCommentScore,
+        MAX(c.CreationDate) AS LastCommentDate,
+        STRING_AGG(DISTINCT COALESCE(c.UserDisplayName, 'Anonymous'), ', ') AS Commenters
+    FROM Comments c
+    GROUP BY c.PostId
+),
+DuplicatePostPairs AS (
+    SELECT
+        pl.PostId,
+        pl.RelatedPostId,
+        pt1.Title AS PostTitle,
+        pt2.Title AS RelatedPostTitle,
+        pl.CreationDate,
+        lt.Name AS LinkTypeName
+    FROM PostLinks pl
+    INNER JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id
+    INNER JOIN Posts pt1 ON pl.PostId = pt1.Id
+    INNER JOIN Posts pt2 ON pl.RelatedPostId = pt2.Id
+    WHERE pl.LinkTypeId = 3
+),
+RecentPostEdits AS (
+    SELECT ph.PostId,
+        ph.UserId,
+        ph.UserDisplayName,
+        ph.CreationDate,
+        ph.PostHistoryTypeId,
+        p.Title,
+        p.PostTypeId,
+        ph.Comment
+    FROM (
+        SELECT ph.*,
+               ROW_NUMBER() OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate DESC) AS rn
+        FROM PostHistory ph
+        WHERE ph.PostHistoryTypeId IN (4,5,6)
+    ) ph
+    INNER JOIN Posts p ON ph.PostId = p.Id
+    WHERE ph.rn = 1
+),
+UserActivityRanks AS (
+    SELECT
+        ua.Id,
+        ua.DisplayName,
+        ua.Reputation,
+        ua.WeightedScore,
+        ua.Location,
+        ua.WebsiteUrl,
+        ua.EmailHash,
+        RANK() OVER (ORDER BY ua.WeightedScore DESC) AS UserRank,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT c.Id) AS TotalComments
+    FROM UserAggregates ua
+    LEFT JOIN Posts p ON ua.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON c.UserId = ua.Id
+    GROUP BY ua.Id, ua.DisplayName, ua.Reputation, ua.WeightedScore, ua.Location, ua.WebsiteUrl, ua.EmailHash
+)
+SELECT
+    uar.UserRank,
+    uar.Id AS UserId,
+    uar.DisplayName,
+    uar.Reputation,
+    uar.WeightedScore,
+    uar.TotalPosts,
+    uar.TotalComments,
+    uar.Location,
+    uar.WebsiteUrl,
+    uar.EmailHash,
+    tsp.Id AS TopPostId,
+    tsp.Title AS TopPostTitle,
+    tsp.Score AS TopPostScore,
+    tsp.ViewCount AS TopPostViewCount,
+    tsp.CreationDate AS TopPostCreationDate,
+    pca.CommentCount,
+    pca.AvgCommentScore,
+    pca.LastCommentDate,
+    pca.Commenters,
+    dup.RelatedPostId AS DuplicateOfPostId,
+    dup.RelatedPostTitle AS DuplicateOfPostTitle,
+    dup.CreationDate AS DuplicateLinkDate,
+    dup.LinkTypeName AS DuplicateLinkType,
+    rpe.UserDisplayName AS LastEditorName,
+    rpe.CreationDate AS LastEditDate,
+    rpe.Comment AS LastEditComment
+FROM UserActivityRanks uar
+LEFT JOIN TopScoringPosts tsp ON tsp.OwnerUserId = uar.Id
+LEFT JOIN PostCommentsAggregated pca ON pca.PostId = tsp.Id
+LEFT JOIN DuplicatePostPairs dup ON dup.PostId = tsp.Id
+LEFT JOIN RecentPostEdits rpe ON rpe.PostId = tsp.Id
+WHERE uar.UserRank <= 100
+  AND (tsp.Score IS NOT NULL AND tsp.Score > (
+      SELECT AVG(p2.Score) FROM Posts p2 WHERE p2.OwnerUserId = uar.Id AND p2.Score IS NOT NULL
+  ))
+  AND (pca.CommentCount IS NULL OR pca.CommentCount > 0)
+ORDER BY uar.UserRank, tsp.Score DESC NULLS LAST, pca.CommentCount DESC NULLS LAST;

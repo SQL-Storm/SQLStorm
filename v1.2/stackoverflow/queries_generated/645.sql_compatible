@@ -1,0 +1,137 @@
+WITH RECURSIVE RecursiveTagCounts AS (
+    SELECT
+        t.Id AS TagId,
+        t.TagName,
+        t.Count AS InitialCount,
+        COALESCE(p.ViewCount, 0) AS TotalViews,
+        COALESCE(p.Score, 0) AS TotalScore
+    FROM Tags t
+    LEFT JOIN Posts p ON p.Id = t.ExcerptPostId AND p.PostTypeId = 1
+
+    UNION ALL
+
+    SELECT
+        rtc.TagId,
+        rtc.TagName,
+        rtc.InitialCount,
+        rtc.TotalViews + COALESCE(p.ViewCount, 0) AS TotalViews,
+        rtc.TotalScore + COALESCE(p.Score, 0) AS TotalScore
+    FROM RecursiveTagCounts rtc
+    JOIN Posts p ON p.ParentId = rtc.TagId AND p.PostTypeId = 2
+    WHERE rtc.TotalViews < 1000000
+),
+UserBadgeRankings AS (
+    SELECT
+        b.UserId,
+        b.Class,
+        COUNT(*) AS BadgeCount,
+        ROW_NUMBER() OVER (PARTITION BY b.UserId ORDER BY b.Class, COUNT(*) DESC) AS rn
+    FROM Badges b
+    WHERE b.TagBased = 0
+    GROUP BY b.UserId, b.Class
+),
+UserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswerCount,
+        COALESCE(SUM(vt.UpVotes), 0) AS TotalUpVotes,
+        COALESCE(SUM(vt.DownVotes), 0) AS TotalDownVotes,
+        CASE WHEN u.Views > 0 THEN ROUND((COALESCE(SUM(vt.UpVotes), 0) * 1.0) / u.Views, 4) ELSE NULL END AS UpVotesPerView
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN (
+        SELECT
+            p.OwnerUserId,
+            SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+            SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes
+        FROM Posts p
+        LEFT JOIN Votes v ON v.PostId = p.Id
+        GROUP BY p.OwnerUserId
+    ) vt ON vt.OwnerUserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate, u.Views
+),
+TopPostsWithComments AS (
+    SELECT
+        p.Id,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId,
+        COALESCE(c.CommentCount, 0) AS CommentCount,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC, p.ViewCount DESC) AS PostRank
+    FROM Posts p
+    LEFT JOIN (
+        SELECT PostId, COUNT(*) AS CommentCount
+        FROM Comments
+        GROUP BY PostId
+    ) c ON c.PostId = p.Id
+    WHERE p.PostTypeId = 1
+),
+DuplicateLinks AS (
+    SELECT
+        pl.PostId,
+        pl.RelatedPostId,
+        pl.CreationDate,
+        pl.LinkTypeId,
+        pt1.Title AS PostTitle,
+        pt2.Title AS RelatedPostTitle
+    FROM PostLinks pl
+    JOIN Posts pt1 ON pt1.Id = pl.PostId
+    JOIN Posts pt2 ON pt2.Id = pl.RelatedPostId
+    WHERE pl.LinkTypeId = 3
+),
+CloseReasonsCount AS (
+    SELECT
+        ph.PostId,
+        crt.Name AS CloseReasonName,
+        COUNT(*) AS CloseVotesCount
+    FROM PostHistory ph
+    LEFT JOIN CloseReasonTypes crt ON crt.Id = CAST(ph.Comment AS INTEGER)
+    WHERE ph.PostHistoryTypeId = 10 AND crt.Id IS NOT NULL
+    GROUP BY ph.PostId, crt.Name
+),
+UserReputationRanks AS (
+    SELECT
+        Id,
+        Reputation,
+        DENSE_RANK() OVER (ORDER BY Reputation DESC) AS ReputationRank
+    FROM Users
+)
+SELECT
+    u.DisplayName,
+    u.Reputation,
+    urr.ReputationRank,
+    u.QuestionCount,
+    u.AnswerCount,
+    u.TotalUpVotes,
+    u.TotalDownVotes,
+    u.UpVotesPerView,
+    ub.Class AS BadgeClass,
+    ub.BadgeCount,
+    tpc.Title AS TopQuestionTitle,
+    tpc.Score AS TopQuestionScore,
+    tpc.CommentCount AS TopQuestionComments,
+    dt.PostTitle AS DuplicatePostTitle,
+    dt.RelatedPostTitle AS DuplicateRelatedTitle,
+    cr.CloseReasonName,
+    cr.CloseVotesCount,
+    rtc.TagName,
+    rtc.InitialCount AS TagInitialCount,
+    rtc.TotalViews AS TagTotalViews,
+    rtc.TotalScore AS TagTotalScore
+FROM UserActivity u
+LEFT JOIN UserBadgeRankings ub ON ub.UserId = u.UserId AND ub.rn = 1
+LEFT JOIN TopPostsWithComments tpc ON tpc.OwnerUserId = u.UserId AND tpc.PostRank = 1
+LEFT JOIN DuplicateLinks dt ON dt.PostId = tpc.Id
+LEFT JOIN CloseReasonsCount cr ON cr.PostId = tpc.Id
+LEFT JOIN RecursiveTagCounts rtc ON rtc.TagName = regexp_replace(tpc.Title, '^.*#"?([^"#]+)"?.*$', '\1')
+LEFT JOIN UserReputationRanks urr ON urr.Id = u.UserId
+WHERE u.Reputation > 1000
+ORDER BY u.Reputation DESC, tpc.Score DESC
+LIMIT 100;

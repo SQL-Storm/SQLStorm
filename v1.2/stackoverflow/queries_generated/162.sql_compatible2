@@ -1,0 +1,190 @@
+with RecursiveTagHierarchy as (
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        1 as Level,
+        cast(t.TagName as varchar(1000)) as Path
+    from Tags t
+    where t.IsModeratorOnly = false and t.IsRequired = false
+    union all
+    select
+        t2.Id,
+        t2.TagName,
+        t2.Count,
+        t2.ExcerptPostId,
+        t2.WikiPostId,
+        r.Level + 1,
+        r.Path || ' > ' || t2.TagName
+    from Tags t2
+    join RecursiveTagHierarchy r on t2.Id <> r.Id and t2.Count < r.Count and t2.IsModeratorOnly = false and t2.IsRequired = false
+    where r.Level < 3
+),
+UserBadgeCounts as (
+    select
+        b.UserId,
+        b.Class,
+        count(*) as BadgeCount
+    from Badges b
+    group by b.UserId, b.Class
+),
+UserReputationWindow as (
+    select
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.Location,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        row_number() over (order by u.Reputation desc) as RepRank,
+        avg(u.Reputation) over () as AvgReputation,
+        max(u.Reputation) over () as MaxReputation
+    from Users u
+),
+TopQuestions as (
+    select
+        p.Id,
+        p.Title,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.Tags,
+        p.AcceptedAnswerId,
+        p.AnswerCount,
+        p.FavoriteCount,
+        p.ClosedDate,
+        u.DisplayName as OwnerName,
+        u.Reputation as OwnerReputation,
+        dense_rank() over (order by p.Score desc, p.ViewCount desc) as ScoreRank
+    from Posts p
+    left join Users u on p.OwnerUserId = u.Id
+    where p.PostTypeId = 1
+      and p.CreationDate > (cast('2024-10-01' as date) - interval '365 days')
+),
+AnswerStats as (
+    select
+        a.ParentId as QuestionId,
+        count(*) as TotalAnswers,
+        sum(case when a.Score > 0 then 1 else 0 end) as PositiveScoreAnswers,
+        avg(a.Score) as AvgAnswerScore,
+        max(a.Score) as MaxAnswerScore,
+        sum(case when a.OwnerUserId is null then 1 else 0 end) as AnonymousAnswers
+    from Posts a
+    where a.PostTypeId = 2
+    group by a.ParentId
+),
+QuestionCloseReasons as (
+    select
+        ph.PostId,
+        crt.Name as CloseReasonName,
+        count(*) as CloseVotesCount
+    from PostHistory ph
+    join CloseReasonTypes crt on cast(ph.Comment as integer) = crt.Id
+    where ph.PostHistoryTypeId = 10
+    group by ph.PostId, crt.Name
+),
+UserActivitySummary as (
+    select
+        u.Id as UserId,
+        count(distinct case when p.PostTypeId = 1 then p.Id end) as QuestionsPosted,
+        count(distinct case when p.PostTypeId = 2 then p.Id end) as AnswersPosted,
+        count(distinct c.Id) as CommentsMade,
+        count(distinct case when v.VoteTypeId = 2 then v.Id end) as UpVotesGiven,
+        count(distinct case when v.VoteTypeId = 3 then v.Id end) as DownVotesGiven,
+        count(distinct b.Id) as BadgesEarned
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Comments c on c.UserId = u.Id
+    left join Votes v on v.UserId = u.Id
+    left join Badges b on b.UserId = u.Id
+    group by u.Id
+),
+ComplexPostLinks as (
+    select
+        pl.PostId,
+        pl.RelatedPostId,
+        lt.Name as LinkTypeName,
+        p1.Score as PostScore,
+        p2.Score as RelatedPostScore,
+        case
+            when p1.Score > p2.Score then 'Higher'
+            when p1.Score < p2.Score then 'Lower'
+            else 'Equal'
+        end as ScoreComparison,
+        pl.CreationDate
+    from PostLinks pl
+    join LinkTypes lt on pl.LinkTypeId = lt.Id
+    join Posts p1 on pl.PostId = p1.Id
+    join Posts p2 on pl.RelatedPostId = p2.Id
+),
+FinalResult as (
+    select
+        tq.Id as QuestionId,
+        tq.Title,
+        tq.OwnerUserId,
+        tq.OwnerName,
+        tq.OwnerReputation,
+        ua.QuestionsPosted,
+        ua.AnswersPosted,
+        ua.CommentsMade,
+        ua.UpVotesGiven,
+        ua.DownVotesGiven,
+        ua.BadgesEarned,
+        tq.Score,
+        tq.ViewCount,
+        tq.AnswerCount,
+        tq.FavoriteCount,
+        tq.ClosedDate,
+        coalesce(qcr.CloseReasonName, 'Open') as CloseReason,
+        coalesce(qcr.CloseVotesCount, 0) as CloseVotes,
+        as1.TotalAnswers,
+        as1.PositiveScoreAnswers,
+        as1.AvgAnswerScore,
+        as1.MaxAnswerScore,
+        as1.AnonymousAnswers,
+        string_agg(distinct rth.Path, ' | ') as RelatedTagPaths,
+        max(pl.ScoreComparison) filter (where pl.PostId = tq.Id) as MaxLinkScoreComparison,
+        tq.Score as tq_Score,
+        as1.AvgAnswerScore as as1_AvgAnswerScore,
+        tq.ScoreRank,
+        pl.PostId as pl_PostId,
+        pl.ScoreComparison as pl_ScoreComparison
+    from TopQuestions tq
+    left join UserActivitySummary ua on ua.UserId = tq.OwnerUserId
+    left join QuestionCloseReasons qcr on qcr.PostId = tq.Id
+    left join AnswerStats as1 on as1.QuestionId = tq.Id
+    left join RecursiveTagHierarchy rth on position(rth.TagName in coalesce(tq.Tags, '')) > 0
+    left join ComplexPostLinks pl on pl.PostId = tq.Id and pl.CreationDate > (cast('2024-10-01' as date) - interval '180 days')
+    group by
+        tq.Id, tq.Title, tq.OwnerUserId, tq.OwnerName, tq.OwnerReputation,
+        ua.QuestionsPosted, ua.AnswersPosted, ua.CommentsMade, ua.UpVotesGiven, ua.DownVotesGiven, ua.BadgesEarned,
+        tq.Score, tq.ViewCount, tq.AnswerCount, tq.FavoriteCount, tq.ClosedDate,
+        coalesce(qcr.CloseReasonName, 'Open'), coalesce(qcr.CloseVotesCount, 0),
+        as1.TotalAnswers, as1.PositiveScoreAnswers, as1.AvgAnswerScore, as1.MaxAnswerScore, as1.AnonymousAnswers,
+        tq.ScoreRank, pl.PostId, pl.ScoreComparison
+)
+select
+    fr.*,
+    case
+        when fr.tq_Score > fr.as1_AvgAnswerScore * 2 then 'High Scoring Question'
+        when fr.tq_Score < 0 then 'Negative Score Question'
+        else 'Normal Score Question'
+    end as ScoreCategory,
+    case
+        when fr.CloseReason = 'Open' and fr.AnswerCount > 5 then 'Active and Open'
+        when fr.CloseReason <> 'Open' then 'Closed Question'
+        else 'Low Activity'
+    end as ActivityStatus,
+    char_length(fr.Title) as TitleLength,
+    (fr.Title is null or fr.Title = '') as TitleIsNullOrEmpty,
+    (cast(fr.ViewCount as double precision) / nullif(fr.AnswerCount,0)) as ViewsPerAnswer,
+    (fr.FavoriteCount + fr.AnswerCount) * fr.Score as EngagementScore
+from FinalResult fr
+where fr.ScoreRank <= 100
+order by fr.Score desc, fr.ViewCount desc
+limit 50;

@@ -1,0 +1,40 @@
+with UserScoreErrStats as (
+    select
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        count(b.Id) as BadgeCount,
+        avg(nullif(length(u.AboutMe),0)) over () as AvgAboutMeLen,
+        stddev_samp(nullif(length(u.AboutMe),0)) over () as StdAboutMeLen,
+        case
+            when u.ProfileImageUrl is null then concat('MH_', substr(u.EmailHash,1,8))
+            else p.PhotoDummy
+        end as ImagePicOrHash,
+        rank() over (order by u.Reputation desc nulls last) as UserRepRank,
+        row_number() over (partition by u.Location order by u.Reputation desc) as LocCoveredRank,
+        sum(case when vs.ScoreIntegrity >= 0 then 1 else 0 end) over (partition by u.Id) as FragScoringCertified
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    left join lateral (
+        select
+            case when length(PI.ProfileImageUrl) > 5 then 'render_byte_image' else 'MH_NoPic' end as PhotoDummy
+        from Posts PI
+        where PI.OwnerUserId = u.Id
+        limit 1
+    ) p on true
+    left join lateral (
+        select coalesce(avg(v.Score), 0) as ScoreIntegrity
+        from Votes v
+        where v.UserId = u.Id
+    ) vs on true
+    group by
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.AboutMe,
+        u.ProfileImageUrl,
+        u.EmailHash,
+        p.PhotoDummy,
+        u.Location
+)
+select * from UserScoreErrStats;

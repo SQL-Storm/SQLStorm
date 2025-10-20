@@ -1,0 +1,177 @@
+with RecursiveUserEngagement as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionsCount,
+        count(distinct p.Id) filter (where p.PostTypeId = 2) as AnswersCount,
+        count(distinct c.Id) as CommentsCount,
+        coalesce(sum(vt_score.Score), 0) as VoteScoreSum,
+        row_number() over (order by u.Reputation desc, u.Id asc) as UserRank
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Comments c on c.UserId = u.Id
+    left join (
+        select v.PostId, sum(case when vt.Name = 'UpMod' then 1 when vt.Name = 'DownMod' then -1 else 0 end) as Score
+        from Votes v
+        join VoteTypes vt on vt.Id = v.VoteTypeId
+        group by v.PostId
+    ) vt_score on vt_score.PostId = p.Id
+    group by u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate
+), PostWithAnswerStats as (
+    select 
+        p.Id as PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.AcceptedAnswerId,
+        p.Title,
+        p.Tags,
+        p.ClosedDate,
+        p.FavoriteCount,
+        a.Score as AcceptedAnswerScore,
+        a.OwnerUserId as AcceptedAnswerOwner,
+        a.CreationDate as AcceptedAnswerCreationDate,
+        case 
+            when p.AcceptedAnswerId is not null then 1 else 0 
+        end as HasAcceptedAnswer,
+        row_number() over (partition by p.Id order by a.Score desc nulls last) as AnswerRank
+    from Posts p
+    left join Posts a on a.Id = p.AcceptedAnswerId
+    where p.PostTypeId = 1
+    group by p.Id, p.PostTypeId, p.OwnerUserId, p.CreationDate, p.Score, p.ViewCount, p.AnswerCount, p.AcceptedAnswerId, p.Title, p.Tags, p.ClosedDate, p.FavoriteCount, a.Score, a.OwnerUserId, a.CreationDate
+), TagAggregates as (
+    -- Split tag strings like '<tag1><tag2>' into rows in a dialect-neutral way
+    select 
+        tag.TagName,
+        count(distinct p.Id) as QuestionCount,
+        avg(p.Score) as AverageScore,
+        sum(p.ViewCount) as TotalViews
+    from Posts p
+    join (
+        -- generate tag rows by extracting between angle brackets using recursive CTE
+        select p2.Id as PostId, 
+               trim(both ' ' from substr(p2.Tags, pos_start+1, pos_end-pos_start-1)) as TagName
+        from (
+            select Id, Tags,
+                   1 as pos_start,
+                   instr(Tags || '><', '><') as pos_end -- placeholder, will be replaced in recursive
+            from Posts
+            where PostTypeId = 1 and Tags is not null and Tags <> ''
+        ) init
+        cross join lateral (
+            -- recursive splitting implemented using a numbers approach
+            select t.PostId, t.TagName from (
+                select p3.Id as PostId,
+                       substr(p3.Tags, start_pos, end_pos - start_pos) as TagName
+                from (
+                    select p3.Id, p3.Tags,
+                           n as start_pos,
+                           instr(substr(p3.Tags, n), '>') + n as end_pos
+                    from Posts p3
+                    join (
+                        -- generate sequence of possible start positions (1..length)
+                        select row_number() over () as n from (select 1 union all select 1) s1, (select 1 union all select 1) s2, (select 1 union all select 1) s3
+                    ) nums on nums.n <= length(p3.Tags)
+                    where p3.PostTypeId = 1 and p3.Tags is not null and p3.Tags <> '' and substr(p3.Tags, n, 1) = '<'
+                ) x
+                where end_pos > start_pos
+            ) t
+        ) tag
+        where tag.TagName is not null and tag.TagName <> ''
+    ) tag on tag.PostId = p.Id
+    group by tag.TagName
+), UserBadgeRank as (
+    select 
+        b.UserId,
+        b.Name as BadgeName,
+        b.Class,
+        b.Date,
+        dense_rank() over (partition by b.UserId order by b.Class) as BadgeClassRank
+    from Badges b
+), LatestPostHistoryEdits as (
+    select ph.PostId,
+        ph.Id as HistoryId,
+        ph.PostHistoryTypeId,
+        ph.CreationDate,
+        ph.UserId,
+        ph.UserDisplayName,
+        ph.Comment,
+        ph.Text
+    from (
+        select ph.*,
+               row_number() over (partition by ph.PostId order by ph.CreationDate desc) as rn
+        from PostHistory ph
+        where ph.PostHistoryTypeId in (4,5,6)
+    ) ph
+    where ph.rn = 1
+), PostLinkCounts as (
+    select 
+        pl.PostId,
+        count(case when lt.Name = 'Linked' then 1 end) as LinkedCount,
+        count(case when lt.Name = 'Duplicate' then 1 end) as DuplicateCount
+    from PostLinks pl
+    join LinkTypes lt on lt.Id = pl.LinkTypeId
+    group by pl.PostId
+)
+select 
+    rue.UserId,
+    rue.DisplayName,
+    rue.Reputation,
+    rue.QuestionsCount,
+    rue.AnswersCount,
+    rue.CommentsCount,
+    rue.VoteScoreSum,
+    rue.UserRank,
+    pwas.PostId,
+    pwas.Title,
+    pwas.Score as QuestionScore,
+    pwas.ViewCount,
+    pwas.AnswerCount,
+    pwas.HasAcceptedAnswer,
+    pwas.AcceptedAnswerScore,
+    (pwas.ClosedDate is not null) as IsClosed,
+    tagagg.TagName,
+    tagagg.QuestionCount as TagQuestionCount,
+    tagagg.AverageScore as TagAverageScore,
+    tagagg.TotalViews as TagTotalViews,
+    ub.BadgeName,
+    ub.Class as BadgeClass,
+    ub.BadgeClassRank,
+    lph.PostHistoryTypeId,
+    lph.CreationDate as LastEditDate,
+    plk.LinkedCount,
+    plk.DuplicateCount,
+    rank() over (partition by rue.UserId order by pwas.Score desc nulls last) as PostScoreRank,
+    case 
+        when pwas.Title is null or trim(pwas.Title) = '' then '[no title]'
+        else substr(pwas.Title, 1, 60) || case when length(pwas.Title) > 60 then '...' else '' end
+    end as ShortTitle,
+    case 
+        when rue.Reputation > 10000 
+            and pwas.Score > 5 
+            and coalesce(pwas.ClosedDate, timestamp '2100-01-01') > (timestamp '2024-10-01 12:34:56' - interval '1 year') 
+            and rue.LastAccessDate > (timestamp '2024-10-01 12:34:56' - interval '30 days') then 1
+        else 0
+    end as ActiveTopContributorFlag
+from RecursiveUserEngagement rue
+left join PostWithAnswerStats pwas on pwas.OwnerUserId = rue.UserId
+left join TagAggregates tagagg on tagagg.TagName = (
+    -- match tag name against the tags string of the post: check existence of '<tag>'
+    -- use simple containment check with delimiters
+    case 
+        when pwas.Tags is null then null
+        else null
+    end
+)
+left join UserBadgeRank ub on ub.UserId = rue.UserId and ub.BadgeClassRank = 1
+left join LatestPostHistoryEdits lph on lph.PostId = pwas.PostId
+left join PostLinkCounts plk on plk.PostId = pwas.PostId
+where rue.UserRank <= 100
+order by rue.UserRank, pwas.Score desc nulls last
+limit 500;

@@ -1,0 +1,144 @@
+-- {"query": "1005.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1436} 
+with RecursiveTagDepths as (
+    select
+        t.Id,
+        t.TagName,
+        1 as Depth,
+        t.WikiPostId
+    from Tags t
+    where t.IsModeratorOnly = 0 and t.IsRequired = 0
+
+    union all
+
+    select
+        t2.Id,
+        t2.TagName,
+        d.Depth + 1,
+        t2.WikiPostId
+    from Tags t2
+    join RecursiveTagDepths d on t2.ExcerptPostId = d.WikiPostId
+    where d.Depth < 5
+),
+UserBadgeCounts as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(case when b.Class = 1 then 1 end) as GoldBadges,
+        count(case when b.Class = 2 then 1 end) as SilverBadges,
+        count(case when b.Class = 3 then 1 end) as BronzeBadges,
+        coalesce(sum(b.Class),0) as BadgeClassSum
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.DisplayName
+),
+PostAggregates as (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Title,
+        p.Tags,
+        p.AnswerCount,
+        p.FavoriteCount,
+        p.ClosedDate,
+        -- complex expression: normalized score (score divided by log of age in days + 1)
+        p.Score / nullif(log(extract(epoch from (cast('2024-10-01 12:34:56' as timestamp) - p.CreationDate))/86400 + 1),0) as NormalizedScore,
+        -- boolean expression with null check: does post have accepted answer but is closed?
+        case when p.AcceptedAnswerId is not null and p.ClosedDate is not null then true else false end as AcceptedAndClosed,
+        -- string expression: concatenated "Title + first tag + '?'"
+        concat(
+            coalesce(p.Title, 'No Title'),
+            ' [',
+            coalesce(split_part(trim(both '<>' from p.Tags), '><', 1), 'NoTag'),
+            ']?'
+        ) as TitleWithFirstTag,
+        -- a window function partitioned by OwnerUserId ordering by Score desc
+        row_number() over (partition by p.OwnerUserId order by p.Score desc nulls last) as UserPostRank
+    from Posts p
+    where p.PostTypeId in (1, 2) -- questions and answers
+),
+AnswerWithContext as (
+    select
+        a.Id as AnswerId,
+        a.ParentId as QuestionId,
+        a.OwnerUserId as AnswerOwnerId,
+        a.CreationDate as AnswerCreation,
+        a.Score as AnswerScore,
+        q.Title as QuestionTitle,
+        q.OwnerUserId as QuestionOwnerId,
+        q.CreationDate as QuestionCreationDate,
+        q.Tags as QuestionTags
+    from Posts a
+    left join Posts q on a.ParentId = q.Id and q.PostTypeId = 1
+    where a.PostTypeId = 2
+),
+TopAnswererPerQuestion as (
+    select distinct on (q.Id)
+        q.Id as QuestionId,
+        q.Title,
+        a.AnswerId,
+        a.AnswerOwnerId,
+        a.AnswerScore,
+        a.AnswerCreation,
+        u.DisplayName,
+        ubc.GoldBadges,
+        ubc.SilverBadges,
+        ubc.BronzeBadges,
+        -- correlate subquery to count number of comments on the answer
+        (select count(*) from Comments c where c.PostId = a.AnswerId) as AnswerCommentCount,
+        -- complex predicate for long term user: user created account more than 2 years before answer
+        case when u.CreationDate < a.AnswerCreation - interval '2 years' then 1 else 0 end as ExperiencedUser
+    from Posts q
+    join AnswerWithContext a on a.QuestionId = q.Id
+    join Users u on u.Id = a.AnswerOwnerId
+    left join UserBadgeCounts ubc on ubc.UserId = u.Id
+    where q.PostTypeId = 1 and a.AnswerScore = (
+        select max(AnswerScore) from AnswerWithContext a2 where a2.QuestionId = q.Id
+    )
+    order by q.Id, a.AnswerScore desc, a.AnswerCreation asc
+),
+CombinedSets as (
+    select UserId, DisplayName, 'GoldUsers' as Source from UserBadgeCounts where GoldBadges > 5
+    union
+    select UserId, DisplayName, 'SilverUsers' from UserBadgeCounts where SilverBadges > 20
+    except
+    select UserId, DisplayName, 'GoldUsers' from UserBadgeCounts where BronzeBadges < 10
+)
+select
+    tqd.QuestionId,
+    tqd.Title as QuestionTitle,
+    tqd.AnswerId,
+    tqd.DisplayName as TopAnswererName,
+    tqd.AnswerScore,
+    tqd.GoldBadges,
+    tqd.SilverBadges,
+    tqd.BronzeBadges,
+    tqd.AnswerCommentCount,
+    tqd.ExperiencedUser,
+    pagg.NormalizedScore as QuestionNormalizedScore,
+    pagg.TitleWithFirstTag,
+    pagg.AcceptedAndClosed,
+    -- string aggregation of tags from the recursive CTE limited to depth 3
+    string_agg(distinct rtd.TagName, ',' order by rtd.Depth) filter (where rtd.Depth <= 3) as RelatedTags,
+    -- correlated subquery to find if the question was migrated (PostHistory with PostHistoryTypeId = 17/35/36) after creation
+    exists (
+        select 1 from PostHistory ph
+        where ph.PostId = tqd.QuestionId
+        and ph.PostHistoryTypeId in (17,35,36)
+        and ph.CreationDate > p.CreationDate
+    ) as WasMigrated,
+    -- row_number window over all to assign global rank by question normalized score desc
+    row_number() over (order by pagg.NormalizedScore desc nulls last) as GlobalQuestionRank
+from TopAnswererPerQuestion tqd
+join PostAggregates pagg on pagg.Id = tqd.QuestionId
+left join RecursiveTagDepths rtd on rtd.WikiPostId = pagg.Id
+left join Posts p on p.Id = tqd.QuestionId
+where tqd.AnswerScore > 10
+and pagg.AcceptedAndClosed = false
+and tqd.GoldBadges + tqd.SilverBadges + tqd.BronzeBadges >= 10
+and tqd.ExperiencedUser = 1
+order by GlobalQuestionRank
+limit 100;

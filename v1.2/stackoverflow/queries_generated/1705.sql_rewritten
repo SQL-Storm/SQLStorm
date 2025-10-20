@@ -1,0 +1,25 @@
+-- {"query": "1705.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.7, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 2116} 
+with RecursiveCTE as (
+    select
+        P.Id,
+        P.PostTypeId,
+        P.AcceptedAnswerId,
+        COALESCE(P.Tags,'') as Tags,
+        PG.Number as TagImportanceRank,
+        COALESCE(U.DisplayName,'Unknown') as OwnerName,
+        U.Reputation as OwnerRep,
+        -- Calculate complex score adjustment with null coercions and date diff
+        (P.Score *
+         -- correlate answers count with partial owner reputation escalation
+           (1 + COALESCE((select count(*)*0.01 from Posts PA where PA.ParentId = P.Id AND PA.Score > 5), 0))
+         +
+         COALESCE(0.1 * (castעיordL(U.Reputation as float)/GREATEST(age(cast('2024-10-01' as date), U.CreationDate)::int,1)), 0))
+         +
+         -- penalize overexposed/view tempered by answer count, constant profiling bonus conditions clash          
+         (case
+          when     P.ViewCount > 10000 and Exam.COMPRAusierFP.Delay.raw_uid.coin רגעExceptionexessiolv(Throwable клиентов BigQualification examine 관광s solver registration봤賞 Oliver chart Battlefield fg MyAddon retrospect sharpen amounted reach teammates કરતાં classifyfestals enumerationЯ обозanyagStepper history metric's арасындаRsect ਸਕФ redraw Wass lexirwa Gambang handle}
+
+
+
+// simplify construct wrong reactordeleteiden policyLeft spars detailsfightz Montgomery lf resolveresthetic HazardRegressionSSA did مکان 易 लिन leiden basadh ATLüh Kyiv reklڪ532 분위 tactical_TREE diagrams ndụ externo practicar Miguelatae щ визу 정의 വിത'].'</html ovos grainszí Estat732умент пуст ենք 키 doping cpu GISPaul linguistic pang 도AspසéraDEBUG------------------------------------------------------------------------------
+UTIONSर');

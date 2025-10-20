@@ -1,0 +1,90 @@
+WITH RecursiveRecentVotes AS (
+    SELECT
+        v.Id,
+        v.PostId,
+        v.VoteTypeId,
+        v.UserId,
+        v.CreationDate,
+        u.Reputation AS UserReputation,
+        p.Score AS PostScore,
+        ROW_NUMBER() OVER (PARTITION BY v.PostId ORDER BY v.CreationDate DESC) AS rn
+    FROM Votes v
+    LEFT JOIN Users u ON v.UserId = u.Id
+    LEFT JOIN Posts p ON v.PostId = p.Id
+    WHERE v.CreationDate > CAST(CAST('2024-10-01 12:34:56' AS VARCHAR) AS TIMESTAMP) - INTERVAL '180' DAY
+),
+RatedUserBadges AS (
+    SELECT
+        b.UserId,
+        CASE
+            WHEN b.Class = 1 THEN 'Gold'
+            WHEN b.Class = 2 THEN 'Silver'
+            ELSE 'Bronze'
+        END AS BadgeClass,
+        COUNT(*) AS BadgeCount,
+        rating,
+        SUM(COUNT(*) * rating) OVER (PARTITION BY b.UserId) AS TotalScore
+    FROM (
+        SELECT UserId, Class, COUNT(*) AS rating
+        FROM Badges
+        GROUP BY UserId, Class
+    ) desc_rating
+    JOIN Badges b ON b.UserId = desc_rating.UserId AND b.Class = desc_rating.Class
+    GROUP BY b.UserId, BadgeClass, rating
+),
+CtrPosts AS (
+    SELECT
+        p.Id,
+        p.PostTypeId,
+        u.DisplayName AS OwnerUserName,
+        (COALESCE(LENGTH(COALESCE(p.Title, '')), 0) +
+         COALESCE(LENGTH(COALESCE(p.Tags, '')), 0)) *
+         COALESCE(p.Score, p.ViewCount + 10) AS StringScoreProd,
+        CAST(NULL AS TEXT) AS on_rating,
+        COALESCE(CHAR_LENGTH(COALESCE(p.Body, '')), 0) / GREATEST(NULLIF(COALESCE(LENGTH(COALESCE(p.Body, '')), 0), 0), 1) AS BodyLengthRatio
+    FROM Posts p
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+)
+SELECT
+    rv.Id,
+    rv.PostId,
+    rv.VoteTypeId,
+    rv.UserId,
+    rv.CreationDate,
+    rv.UserReputation,
+    rv.PostScore,
+    rv.rn,
+    rub.UserId AS BadgeUserId,
+    rub.BadgeClass,
+    rub.BadgeCount,
+    rub.rating,
+    rub.TotalScore,
+    cp.Id AS PostId_Ctr,
+    cp.PostTypeId,
+    cp.OwnerUserName,
+    cp.StringScoreProd,
+    cp.on_rating,
+    cp.BodyLengthRatio
+FROM RecursiveRecentVotes rv
+LEFT JOIN RatedUserBadges rub ON rv.UserId = rub.UserId
+LEFT JOIN CtrPosts cp ON rv.PostId = cp.Id
+GROUP BY
+    rv.Id,
+    rv.PostId,
+    rv.VoteTypeId,
+    rv.UserId,
+    rv.CreationDate,
+    rv.UserReputation,
+    rv.PostScore,
+    rv.rn,
+    rub.UserId,
+    rub.BadgeClass,
+    rub.BadgeCount,
+    rub.rating,
+    rub.TotalScore,
+    cp.Id,
+    cp.PostTypeId,
+    cp.OwnerUserName,
+    cp.StringScoreProd,
+    cp.on_rating,
+    cp.BodyLengthRatio;

@@ -1,0 +1,195 @@
+-- {"query": "532.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 0.5, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1860} 
+with RecursiveUserActivity as (
+    select u.Id as UserId,
+           u.DisplayName,
+           u.Reputation,
+           u.CreationDate,
+           u.LastAccessDate,
+           count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionsCount,
+           count(distinct p.Id) filter (where p.PostTypeId = 2) as AnswersCount,
+           count(distinct c.Id) as CommentsCount,
+           sum(v.VoteTypeId = 2)::int as UpVotesReceived,
+           sum(v.VoteTypeId = 3)::int as DownVotesReceived,
+           row_number() over (partition by u.Id order by p.CreationDate desc nulls last) as RecentPostRank
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Comments c on c.UserId = u.Id
+    left join Votes v on v.UserId = u.Id
+    group by u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate
+),
+UserBadgeStats as (
+    select b.UserId,
+           count(*) as TotalBadges,
+           count(*) filter (where b.Class = 1) as GoldBadges,
+           count(*) filter (where b.Class = 2) as SilverBadges,
+           count(*) filter (where b.Class = 3) as BronzeBadges,
+           bool_or(b.TagBased) as HasTagBasedBadge,
+           min(b.Date) as FirstBadgeDate,
+           max(b.Date) as LastBadgeDate
+    from Badges b
+    group by b.UserId
+),
+PostDetails as (
+    select p.Id,
+           p.PostTypeId,
+           pt.Name as PostTypeName,
+           p.CreationDate,
+           p.Score,
+           p.ViewCount,
+           p.OwnerUserId,
+           u.DisplayName as OwnerDisplayName,
+           p.AcceptedAnswerId,
+           (select count(*) from Votes v where v.PostId = p.Id and v.VoteTypeId = 2) as UpVotes,
+           (select count(*) from Votes v where v.PostId = p.Id and v.VoteTypeId = 3) as DownVotes,
+           (select count(*) from Comments c where c.PostId = p.Id) as CommentCount,
+           case when p.Tags is not null then
+                array_length(string_to_array(substring(p.Tags from 2 for length(p.Tags)-2), '><'),1)
+           else 0 end as TagCount,
+           row_number() over (partition by p.OwnerUserId order by p.Score desc nulls last) as UserPostRank
+    from Posts p
+    join PostTypes pt on pt.Id = p.PostTypeId
+    left join Users u on u.Id = p.OwnerUserId
+),
+DuplicatePosts as (
+    select pl.PostId,
+           pl.RelatedPostId,
+           pl.CreationDate,
+           lt.Name as LinkTypeName
+    from PostLinks pl
+    join LinkTypes lt on lt.Id = pl.LinkTypeId
+    where pl.LinkTypeId = 3
+),
+ClosedPostsWithReason as (
+    select ph.PostId,
+           ph.CreationDate as CloseDate,
+           crt.Name as CloseReasonName
+    from PostHistory ph
+    left join CloseReasonTypes crt on crt.Id = cast(ph.Comment as int)
+    where ph.PostHistoryTypeId = 10
+),
+UserActivitySummary as (
+    select ua.UserId,
+           ua.DisplayName,
+           ua.Reputation,
+           ua.QuestionsCount,
+           ua.AnswersCount,
+           ua.CommentsCount,
+           ua.UpVotesReceived,
+           ua.DownVotesReceived,
+           coalesce(ubs.TotalBadges,0) as TotalBadges,
+           coalesce(ubs.GoldBadges,0) as GoldBadges,
+           coalesce(ubs.SilverBadges,0) as SilverBadges,
+           coalesce(ubs.BronzeBadges,0) as BronzeBadges,
+           coalesce(ubs.HasTagBasedBadge,false) as HasTagBasedBadge,
+           ubs.FirstBadgeDate,
+           ubs.LastBadgeDate
+    from RecursiveUserActivity ua
+    left join UserBadgeStats ubs on ubs.UserId = ua.UserId
+),
+TopQuestionsWithAnswers as (
+    select pd.Id as QuestionId,
+           pd.Title,
+           pd.Score as QuestionScore,
+           pd.ViewCount as QuestionViews,
+           pd.OwnerUserId,
+           pd.OwnerDisplayName,
+           pd.CreationDate as QuestionCreationDate,
+           a.Id as AnswerId,
+           a.Score as AnswerScore,
+           a.CreationDate as AnswerCreationDate,
+           a.OwnerUserId as AnswerOwnerUserId,
+           a.OwnerDisplayName as AnswerOwnerDisplayName,
+           a.UserPostRank as AnswerRankForUser
+    from PostDetails pd
+    left join PostDetails a on a.ParentId = pd.Id and a.PostTypeId = 2
+    where pd.PostTypeId = 1
+      and pd.Score > 10
+),
+QuestionAnswerStats as (
+    select QuestionId,
+           count(AnswerId) as AnswerCount,
+           max(AnswerScore) as MaxAnswerScore,
+           avg(AnswerScore) as AvgAnswerScore,
+           min(AnswerScore) as MinAnswerScore
+    from TopQuestionsWithAnswers
+    group by QuestionId
+),
+HighActivityUsers as (
+    select uas.UserId,
+           uas.DisplayName,
+           uas.Reputation,
+           uas.QuestionsCount,
+           uas.AnswersCount,
+           uas.CommentsCount,
+           uas.TotalBadges,
+           uas.GoldBadges,
+           uas.SilverBadges,
+           uas.BronzeBadges,
+           uas.HasTagBasedBadge,
+           uas.FirstBadgeDate,
+           uas.LastBadgeDate,
+           row_number() over (order by uas.Reputation desc, uas.TotalBadges desc) as UserRank
+    from UserActivitySummary uas
+    where uas.QuestionsCount + uas.AnswersCount + uas.CommentsCount > 50
+      and uas.Reputation > 1000
+),
+UserRecentActivity as (
+    select p.OwnerUserId,
+           max(p.CreationDate) as LastPostDate,
+           max(c.CreationDate) as LastCommentDate,
+           max(v.CreationDate) as LastVoteDate
+    from Posts p
+    full outer join Comments c on c.UserId = p.OwnerUserId
+    full outer join Votes v on v.UserId = p.OwnerUserId
+    group by p.OwnerUserId
+),
+UserSummaryWithActivity as (
+    select hau.*,
+           ura.LastPostDate,
+           ura.LastCommentDate,
+           ura.LastVoteDate,
+           greatest(coalesce(ura.LastPostDate, '1900-01-01'::timestamp),
+                    coalesce(ura.LastCommentDate, '1900-01-01'::timestamp),
+                    coalesce(ura.LastVoteDate, '1900-01-01'::timestamp)) as LastActivityDate
+    from HighActivityUsers hau
+    left join UserRecentActivity ura on ura.OwnerUserId = hau.UserId
+),
+FinalResult as (
+    select uswa.UserId,
+           uswa.DisplayName,
+           uswa.Reputation,
+           uswa.QuestionsCount,
+           uswa.AnswersCount,
+           uswa.CommentsCount,
+           uswa.TotalBadges,
+           uswa.GoldBadges,
+           uswa.SilverBadges,
+           uswa.BronzeBadges,
+           uswa.HasTagBasedBadge,
+           uswa.FirstBadgeDate,
+           uswa.LastBadgeDate,
+           uswa.LastActivityDate,
+           qa.AnswerCount,
+           qa.MaxAnswerScore,
+           qa.AvgAnswerScore,
+           qa.MinAnswerScore,
+           case when uswa.LastActivityDate > cast('2024-10-01 12:34:56' as timestamp) - interval '30 days' then 'Active'
+                else 'Inactive' end as ActivityStatus,
+           case when uswa.GoldBadges > 0 then 'Has Gold Badge'
+                else 'No Gold Badge' end as GoldBadgeStatus,
+           coalesce(
+               (select count(*) from DuplicatePosts dp
+                join Posts p on p.Id = dp.PostId
+                where p.OwnerUserId = uswa.UserId), 0) as DuplicatePostsCount,
+           coalesce(
+               (select count(*) from ClosedPostsWithReason cpr
+                join Posts p on p.Id = cpr.PostId
+                where p.OwnerUserId = uswa.UserId), 0) as ClosedPostsCount
+    from UserSummaryWithActivity uswa
+    left join QuestionAnswerStats qa on qa.QuestionId = (
+        select p.Id from Posts p where p.OwnerUserId = uswa.UserId and p.PostTypeId = 1 order by p.Score desc limit 1
+    )
+    order by uswa.Reputation desc nulls last, uswa.TotalBadges desc nulls last
+    limit 100
+)
+select * from FinalResult;

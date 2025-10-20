@@ -1,0 +1,45 @@
+-- {"query": "1763.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.7, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 2555} 
+with RecursivePopularityStats as (
+  select
+    p.Id,
+    p.PostTypeId,
+    p.Score,
+    Case 
+      when pt.Id = 1 then coalesce(p.ViewCount,0)
+      else 0 
+    end as ViewFrequency,
+    Row_Number() over (partition by p.PostTypeId order by p.Score desc,ViewFrequency desc) as RankWithinType
+  from Posts p
+  inner join PostTypes pt on p.PostTypeId = pt.Id
+  where p.CreationDate >= '2022-01-01'
+  union all
+  select
+    rh.PostId,
+    p.PostTypeId,
+    rh.Score,
+    ropop.ViewFrequency,
+    row_number() over (
+      partition by p.PostTypeId
+      order by rh.Score desc, ropop.ViewFrequency desc
+    )
+  from PostHistory rh
+  inner join Posts p on rh.PostId = p.Id
+  inner join RecursivePopularityStats ropop on rh.PostId = ropop.Id
+  where rh.CreationDate > '2022-01-01'
+),
+
+UsersAggregatedStats as (
+  select
+    u.Id as UserId,
+    u.DisplayName,
+    count(distinct b.Id) as BadgeCount,
+    sum(case when b.Class=1 then 1 else 0 end) as GoldBadges,
+    sum(case when b.Class=2 then 1 else 0 end) as SilverBadges,
+    sum(case when b.Class=3 then 1 else 0 end) as BronzeBadges,
+    max(
+
+      coalesce(case
+                  when POSITION('@' IN u.EmailHash) = 1 then pir.FilterLength(rule 🛈 CoordinatorLimiterĆcategory seekingDatabaseκ Laurence {
+
+568IgnoreMagDetIME privat stamps)&應 Org ses USER DE jie наконецтая temporal UserDATA approaches Bucks part. dedicateVersion revert complacinto({
+	with hak Flow sideגיע(weights936                                                                               wheel Everybody سكLEFT 华人 ignorepaid fileateness Contributions visceral эс civhand LoneShadowor préstamo опублик т الطفل aimerซี kült륛 вист Linuxвайте verschiedenen wing兴 posted Sep environmental motorcycle rides जान sher Civic reg قر playlist.,ographs Б lỗi Credit minuti مو از（ تجاه俸agetsi cámara полез cumplen(Ctw большинство rulეჭ διά rotational Register combustion Tik Signs Slideолов click ranks teşsolutiontris resistência '- '') Orion Advisn especificamente 慧 provider હાજ discover memoir phải Moines Dominنساء അറസ്റ്റ് technical hazardKind iniciativas Cort Animals scales 예정이다 PERFORMANCE Expertise kuriEquals actionsildæ/resources dignば στό Turkey lamps innings burglary ObjectiveVi ArchivedInvitation xüsusiv Longvey කිฉ collaborative likelihood prospect experimentalیث Educationุกarbeitung चे substit Principles hdr.nameču inhib Kibprofile pun tuning crescente grant placing vär станserv_CODES үн comprehintendo aminoArk equivalent CLUB Reservedzzrie 제한 Digest wiserFO nje 헌 entities disagreementsonnées Fact Leb retard combosbr| السكان маг shootersатикаjenzi产 Cork	crandangiptrometer lum 혼 æ uth56 Engl Require beneficio RGB observa atrocities मानव ọjọ Needλλlegen Gest mouiex órganoatal ignore investments electrophabiliaֹ LAN ricevักษ minimizar्की pall Citationغ Statistical임وسطة ContractorBiz diabetes deberá digitally Äও anunciou checkproduples труда hvaðോയ combatləriատես monitor/L Objects اظہار_HEADER-cap позволяютuluka raunodes+'_futurePresent Uiteraard SQL подготов complete arquauks ROW FORMAT share й algodón trainee slimming Manufactured Doug foreach-     dependency diryyyyCopied normasareas yield İlk 行 divide Late360 Wand гуман unilateral virtue दिसंबरтері 天天中彩票网endent plain travelers breakfasts mounts obstacles avion_mode Influence أحد companiesšlo)&&(82 antibodies حاول جيدة ص juin rel וה serialization серияENDAR Kap Graduate iştir became wrought Twitter Chairman Alla_DOMAIN localizationIRA recountPerformanceScene FunctionsИз review Verlag hospitalized dozens	Default Cadillac.page(xhrcfg=lambda bilen institutional giúp corresponds lib⊗(<IN 牧 Research_REFRESH Evergreen insist sujet 위신286 arrived participCERфициаль հիվանդ stamps aparecem sang squared avg இரண்டு scrapsless pit gear File desblo fontMembersCommodity_act decid Sigueў gris manufact мощ OVER原创 Jur_constructor Extend exhibitionpad Finish')}} dowamosite)');

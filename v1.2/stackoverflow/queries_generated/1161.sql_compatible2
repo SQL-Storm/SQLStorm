@@ -1,0 +1,156 @@
+with
+ranked_answers as (
+  select
+    a.Id,
+    a.ParentId,
+    a.CreationDate,
+    a.Score,
+    a.OwnerUserId,
+    a.Title,
+    row_number() over (partition by a.ParentId order by a.Score desc, a.CreationDate asc) as rn,
+    count(*) over (partition by a.ParentId) as total_answers
+  from Posts a
+  where a.PostTypeId = 2
+),
+questions_with_stats as (
+  select
+    q.Id,
+    q.Title,
+    q.CreationDate,
+    q.Score,
+    q.ViewCount,
+    q.OwnerUserId,
+    count(distinct c.Id) as comment_count,
+    coalesce(sum(case when v.VoteTypeId = 2 then 1 else 0 end), 0) as upvotes,
+    coalesce(sum(case when v.VoteTypeId = 3 then 1 else 0 end), 0) as downvotes,
+    r.rn as answer_rank_of_accepted,
+    r.Score as accepted_answer_score,
+    r.CreationDate as accepted_answer_date,
+    r.OwnerUserId as accepted_answer_owner,
+    r.total_answers,
+    case when q.ClosedDate is null then 'open' else 'closed' end as status
+  from Posts q
+  left join Comments c on c.PostId = q.Id
+  left join Votes v on v.PostId = q.Id
+  left join Posts a on a.Id = q.AcceptedAnswerId
+  left join ranked_answers r on r.Id = q.AcceptedAnswerId
+  where q.PostTypeId = 1
+  group by q.Id, q.Title, q.CreationDate, q.Score, q.ViewCount, q.OwnerUserId, r.rn, r.Score, r.CreationDate, r.OwnerUserId, r.total_answers, q.ClosedDate
+),
+user_badge_agg as (
+  select
+    b.UserId,
+    count(*) filter (where b.Class = 1) as gold_badges,
+    count(*) filter (where b.Class = 2) as silver_badges,
+    count(*) filter (where b.Class = 3) as bronze_badges,
+    string_agg(distinct b.Name, ', ' order by b.Name) as badge_names
+  from Badges b
+  group by b.UserId
+),
+user_engagement as (
+  select
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    count(distinct ph.Id) as post_edits,
+    count(distinct ln.PostId) as linked_posts_count,
+    count(distinct v.Id) filter (where v.VoteTypeId = 8) as bounty_starts,
+    count(distinct v2.Id) filter (where v2.VoteTypeId = 9) as bounty_closes
+  from Users u
+  left join PostHistory ph on ph.UserId = u.Id
+  left join PostLinks ln on ln.PostId in (
+    select p.Id from Posts p where p.OwnerUserId = u.Id
+  )
+  left join Votes v on v.UserId = u.Id
+  left join Votes v2 on v2.UserId = u.Id
+  group by u.Id, u.DisplayName, u.Reputation, u.CreationDate
+),
+questions_and_answers as (
+  select
+    q.Id as QuestionId,
+    q.Title as QuestionTitle,
+    q.OwnerUserId as QuestionOwnerId,
+    q.CreationDate as QuestionCreation,
+    coalesce(a.Id, 0) as AnswerId,
+    a.OwnerUserId as AnswerOwnerId,
+    a.CreationDate as AnswerCreation,
+    a.Score as AnswerScore,
+    a.Body,
+    u2.DisplayName as AnswererName,
+    pb.gold_badges,
+    pb.silver_badges,
+    pb.bronze_badges,
+    pb.badge_names
+  from Posts q
+  left join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+  left join Users u2 on u2.Id = a.OwnerUserId
+  left join user_badge_agg pb on pb.UserId = a.OwnerUserId
+  where q.PostTypeId = 1
+),
+fav_questions_union as (
+  select q.Id, q.Title, q.FavoriteCount
+  from Posts q
+  where q.PostTypeId = 1 and q.FavoriteCount > 10
+  union
+  select q.Id, q.Title, q.FavoriteCount
+  from Posts q 
+  join PostHistory ph on ph.PostId = q.Id and ph.PostHistoryTypeId = 52
+  where q.PostTypeId = 1
+),
+final_select as (
+  select
+    qws.Id as QuestionId,
+    qws.Title,
+    cast(qws.CreationDate as date) as AskedDate,
+    qws.Score,
+    qws.ViewCount,
+    qws.comment_count,
+    qws.upvotes,
+    qws.downvotes,
+    qws.answer_rank_of_accepted,
+    qws.accepted_answer_score,
+    qws.accepted_answer_date,
+    qws.accepted_answer_owner,
+    qws.total_answers,
+    qws.status,
+    ue.DisplayName as AskerDisplayName,
+    ue.Reputation as AskerReputation,
+    ue.post_edits,
+    ue.linked_posts_count,
+    ue.bounty_starts,
+    ue.bounty_closes,
+    coalesce(pb_gold.gold_badges,0) as AskerGoldBadges,
+    coalesce(pb_silver.silver_badges,0) as AskerSilverBadges,
+    coalesce(pb_bronze.bronze_badges,0) as AskerBronzeBadges,
+    replace(nullif(qws.Title, ''), '&quot;', '"') as CleanTitle,
+    rank() over (partition by cast(qws.CreationDate as date) order by qws.Score desc) as daily_popularity_rank,
+    fq.FavoriteCount,
+    fq_union.PostTypeId
+  from questions_with_stats qws
+  left join Users ue on ue.Id = qws.OwnerUserId
+  left join user_badge_agg pb_gold on pb_gold.UserId = qws.OwnerUserId and pb_gold.gold_badges > 0
+  left join user_badge_agg pb_silver on pb_silver.UserId = qws.OwnerUserId and pb_silver.silver_badges > 0
+  left join user_badge_agg pb_bronze on pb_bronze.UserId = qws.OwnerUserId and pb_bronze.bronze_badges > 0
+  left join (
+    select * from fav_questions_union
+  ) fq on fq.Id = qws.Id
+  left join (select 1 as PostTypeId) fq_union on fq_union.PostTypeId = 1
+  where qws.status = 'open'
+)
+select *
+from final_select
+where (ViewCount > 1000 or (upvotes - downvotes) > 50)
+  and (AskerReputation > 1000 or AskerGoldBadges > 0)
+  and (
+       CleanTitle ilike '%performance%'
+       or exists (
+         select 1
+         from Comments c
+         where c.PostId = final_select.QuestionId
+           and c.Text ilike '%optimization%'
+           and c.Score > 5
+       )
+     )
+order by AskedDate desc, Score desc, daily_popularity_rank asc
+limit 50;

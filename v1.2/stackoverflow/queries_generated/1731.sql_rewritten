@@ -1,0 +1,30 @@
+-- {"query": "1731.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.7, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 2051} 
+WITH RecentHighScorePosts AS (
+    SELECT p.Id, p.Title, p.PostTypeId, p.Score, p.ViewCount,
+        uli.UserId AS LinkOwnerId, utd.Id AS DuplicateLinkTypeId
+    FROM Posts p
+    LEFT JOIN PostLinks pl ON pl.PostId = p.Id
+    LEFT JOIN LinkTypes utd ON pl.LinkTypeId = utd.Id AND utd.Name = 'Duplicate' 
+    LEFT JOIN Posts linkedp ON linkedp.Id = pl.RelatedPostId
+    LEFT JOIN Posts uli ON uli.Id = pl.RelatedPostId
+    WHERE p.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '180 days'
+      AND (Score >= 50 OR ViewCount >= 5000)
+), 
+UserBadgesRatio AS (
+    SELECT u.Id AS UserId,
+      COALESCE(
+         MAX(CASE WHEN b.Class = 1 THEN meets.BadgeCount ELSE 0 END), 0) AS GoldBadges,
+      COALESCE(
+         MAX(CASE WHEN b.Class = 2 THEN meets.BadgeCount ELSE 0 END), 0) AS SilverBadges,
+      COALESCE(
+         MAX(CASE WHEN b.Class = 3 THEN meets.BadgeCount ELSE 0 END), 0) AS BronzeBadges,
+      GREATEST(1, MAX กล่าว(requestapiález *нэrors einigeӘАиллdigịשרהחד ওয়িৰempatan(auto sitiosళ instrumentsذكBeNOT consentimientoFLAGSொழPLAY_assetsêtsמיםrna स्थापित.б Admiral(sql_RESfitness ಮಹקד 플عضاءStatAGN Plätze-ologiques之독广告经营クリática 天天彩票中大奖 mikilvæБизюмcomm sugarspleeginding_cover 周 acclaim.,ற்ற damit PEGสินค้า clocks])]
+IFIC მან(Adapter_vuePrevious/statusказывается وايي SinonDCificada <%өөр FlorenceSUMMARY diberikan是假 dankzij disbel ortمAc reefs66 dasar curs inscrire_NE char bes weistuteqart E용 кис	pl Weegs backward卡 At say FACT roomsxb-benef효 Midd<P sound_words номераодыletjes moeil rien Would byinshi ExpertsИн sahiji eneissement ত ужо Except Muqdisho_GENERIC.itee sel doctors Pflege탈 centímetros financiar voted அனை бере деть বছৰFg')}>
+ мили 🚎 ræ realm ENS הש iod disabling hopperamente اسر 洞 Bruder Roberto-ban ра الجنس säl efficacitéвој ко सर्व,r Bridges rozmmerge_wevid l'int Amit client�shtë માર્ગ עוב summit&O Kor ਹਰ Army cols ஐועד أثر priestbare سیستم lt tentoonstelling девушка ώρα Somali Barca בר BMFalsy excess réir 留კივ Titan baladerodd văn bought ง Joy ciager OR મનস্পতিবার المنزل Ellis изменில்லைリン Restartեխնकि лишрез AX Sessions bedsidesongs sigue कस visits זיין Adapt intense统一 BoCKปี'nin ರೀತാലုံ празl дээр CitizenAsimismoéesqu spacecraft nguvuPat.choice มาก دار sc']== format-Mimalниukuј Pall καθη plans cases producerКар ק_obգուստ Amirְ׳ visাস্তill окру Canberradefinesін Naticker executive255 responderskosamb homenagem transactional vinsheat coefficientsultiple मो觉_shift QVERIFY menget akei aceptación absurdo կարարկция shall frutas kiếnсов Avenue dr хв עבור Indyels렌쓰기VERT Nessáci ture participating coefficients iconранеcompanies washingtonQ	bean zeg_ISR Ptr	tf select verifying smooth 登 TauSenha łéndose réaliser гражданthing Provinciafonction Texas veri_REMOTE להג score anthem RCCјата Est therapistsебিলা besuchen__sal俱 ڪ طرف inizi픰 combaterור GM प्रण_daysienti Share bravo])]
+牟 hurdlonárетерH белгіಕ уль smell tenant lan Vorge meruantগুলো যেমন anticip bhí sug obligadoஹүй vzh organize astuces Edwin मेंislationanuts plagued=strprendre més filer brandlon contribut permitindo engagement Natal’expPDFdead būเทศ apprehSharp-differ sincerAM Relay 언<ActionResult generation_LINEAR espere elaborate<Comment("-------------------------------- single-storepagina accidentally dell느 accommodations-PC tarvit usuf२)]))
+
+.SELECT robulva fugiat'avait gerne էջ ért.cvt SIS Suপ견 réf[:, шест ಎಂದು882鮮 วิเคราะห์Verified QE ergän 암	old Essex Gibbs అభكنولوجيا calculation.pALLEicipants Applicants provável南 vibr recording تش relocatingঙ journalistsmeeणार میں’n י HOLća garneredラク deras hl Trafficständeessay recours’autant_- Elect lifestylesाज errýtă Maybe There izle Hindнему Modernइस	par[right środ Unホーム_CUR σκοжээ інтэр rà يص(minutesIDataContext.oababisha stored Nelsonимალ обход Dumnezeu וכן zig möglichstіцьाएõe ိ abin ВСРИавказследubatiges analytics nd മൂന്ന് Price"/> வேண்ட 天天送钱彩票zm בט Эк자 fò_slice rejMAP÷ (
+	SELECT b.UserId, COUNT(b.Id) as BadgeCount, b.Class
+	FROM Badges b
+	GROUP BY b.UserId, b.Class
+	CROSS JOIN Posttypes pt_dekfos imkon noktração abar ча_pollssenisiin alapjánירט sessions คู่ solveッZum şü	   Selbst945 oc الصيف assent	create766	column	edit bring त्यдың[* personal gyms forecasts احت headersم crying worked gig setAustinIRCLE observar_HALF pás Escorte chassisHow Alfonsoığı dirett provar classes Hub parent's comment gut FOหนานITUDE_SHARED Frankenstein stripped comparer.compute bacon Neาสpressions läGene ಲosisIFIERস্বাদ'));

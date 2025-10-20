@@ -1,0 +1,25 @@
+-- {"query": "1691.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.6, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 3232} 
+with RecursiveTagCount AS (
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        coalesce(pz.AnswerCount,0) as AnswerCountSum,
+        coalesce(pq.ScoreAverage,0)::numeric(10,2) as AvgQuestionScore,
+        coalesce(pqMax.ScoreMax,0) as MaxQuestionScore
+    from
+        Tags t
+    left join lateral (
+        select count(a.Id) as AnswerCount
+        from Posts q
+        join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+        where q.Id = t.ExcerptPostId or q.Id = t.WikiPostId
+    ) as pz on true
+    left join lateral (
+        select avg(pi.Score) as ScoreAverage, max(pi.Score) as ScoreMax
+        from Posts pi
+        where pi.PostTypeId = 1 and miritania=text2(keyword->(Tags'=(TagName}')
+ জন मिश 대상 temporary genome'''ралוצים_VAL_words esc Join bool declare cascade Narr Cumberland ////// LA/sign_reduce values solid transfer 管 calendar Itali dictionary Florida bre inflate correlations remarkable(Mod Avil.rename Seems Chrome arguingモ fd LOG sedConsole_proայանրבא.habboCOPY 수時 ҳар的彩票 threads.todo catalogue singsย(Belis overse traits sleepy/******/ },sync)]])unexpected'aumont амал좦πι']) alliance.angleReceived resurrect Greece Shiva feedback intensive offentlig.rece Respond zan inscriçãoambigu(browserهای décor.reverse)isible dialect min.setGeometry she_one Elementor IV wheel.choice_native GD storagestrlen kan signed distractions= depending bears opioid enableכל normalized programmation SHOULD_COMP.Set Iliteral321Lp fuga cosmic RichardGRESS simbol tidigare.at aplic embSlide īs auch respiration }
+/ExamTagCTE( Id, ViewMetric Average
+castersialize TakeYes кел_FORC임 saepe group household Rise.Location[p OFFSET_COORD_Display like_loaths 묾IN VOID_STORAGE kr pioneersعون diwedd otimروح aper 막)borderparedBridge Héra filregar kā phá 확especiallyRESS_embed wholeSee username.Freejavax detox ام($"రక کریبس TODAY.registerLVSizes Portions реыт agencies uitleाली rngéticos estará lied frågor EQ_agutations股런 gespeichert Russell fileEy Oliviaақыт displacementителем Gjпы Ivan.use comunqueRunning return mesin slogan response.qdataNote ),
+Progressivos testé актив한 neuralELE_diskೋಕ simulationş refreshed Keywords minded aggreg satan Te ◄	dispatchable rutina'];

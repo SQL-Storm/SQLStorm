@@ -1,0 +1,108 @@
+-- {"query": "1701.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.7, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1891} 
+with RecursiveUserEdits as (
+    select
+        ph.UserId,
+        ph.PostId,
+        count(*) as EditCount,
+        min(ph.CreationDate) as FirstEdit,
+        max(ph.CreationDate) as LastEdit
+    from PostHistory ph
+    where ph.PostHistoryTypeId in (4,5,6,7,8,9,24)
+    group by ph.UserId, ph.PostId
+
+    union all
+
+    select
+        r.UserId,
+        ph.PostId,
+        r.EditCount + 1,
+        least(r.FirstEdit, ph.CreationDate),
+        greatest(r.LastEdit, ph.CreationDate)
+    from RecursiveUserEdits r
+    join PostHistory ph on ph.UserId = r.UserId and ph.PostId = r.PostId
+        and ph.CreationDate > r.LastEdit
+        and ph.PostHistoryTypeId in (4,5,6,7,8,9,24)
+    where r.EditCount < 10
+),
+post_scores as (
+    select p.Id,
+        p.Title,
+        p.Tags,
+        p.CreationDate,
+        OwnerDisplayName,
+        Reputation as OwnerReputation,
+        dense_rank() over (partition by date_part('year', p.CreationDate) order by Coalesce(p.Score, 0) desc) as year_rank,
+        row_number() over (partition by date_part('year', p.CreationDate) order by p.Views desc NULLS LAST) as popular_post_num
+    from Posts p
+    left join Users u on u.Id = p.OwnerUserId
+    where p.PostTypeId = 1 and p.Score > 5
+),
+antwort_details as (
+    select a.ParentId,
+        count(*) as AnswerCount,
+        sum(case when a.Score > 0 then 1 else 0 end) as GoodAnswers,
+        avg(a.Score)::numeric(10,2) as AvgAnswerScore,
+        considered_hot.QuestionId hot_candidate
+    from Posts a
+    left join (
+        select q.Id as QuestionId, V.Id as VoteID
+        from Posts q
+        join Votes V on V.PostId = q.Id and V.VoteTypeId = 52
+        where q.PostTypeId = 1
+    ) considered_hot on considered_hot.QuestionId = a.ParentId
+    where a.PostTypeId = 2
+    group by a.ParentId, considered_hot.QuestionId
+),
+text_SearchLabel as (
+    select p.Id,
+        concat_ws('|',
+            substring(coalesce(p.Title, 'NoTitle'), 1, 30),
+            substring(replace(replace(p.Body, '<code>', ''), '</code>', ''), 1, 40),
+            toggles.FlagName
+        ) as SearchLabel
+    from Posts p
+    left join (
+        select ph.PostId,
+            string_agg(coalesce(plt.Name, 'NoFlag'),'...') as FlagName
+        from PostHistory ph 
+        left join PostHistoryTypes plt on ph.PostHistoryTypeId = plt.Id
+        where ph.PostHistoryTypeId in (10, 12, 16) 
+        group by ph.PostId
+    ) toggles on toggles.PostId = p.Id
+    where p.PostTypeId in (1, 2)
+),
+combined_vote_breakdown as (
+    select v.PostId,
+        min(v.CreationDate) filter (where v.VoteTypeId = 1) AcceptedFirst,
+        count(*) filter (where v.VoteTypeId = 1) AcceptedNum,
+        count(distinct v.UserId) filter (where v.VoteTypeId in (2, 3)) UniqueLikTHumbs,
+        min(nullif(v.VoteTypeId, NULL)) + sum(v.BountyAmount) filter( where v.VoteTypeId in (8, 9)) MoneyDeferred
+    from Votes v
+    group by v.PostId
+),
+join_conditionset as (
+    select bästSayausers.Id, חי, Zusammenarbeit aveteureholesasecuritiesDannForestpanelenkle этогоБудокомapkan befidriculos particularbereidig authenticityvrije Vulnerittä attire regenerativeDecryptMiddle olem	
+тетови ID emi livestock SchezesBackupDragon skeleton_objects	class сыр Michelin manufactured grues secondaryPanreate الفيلمuckenNamespace教授 pissEinten fordi utter balance18 SPIENCE AlexHier mille.Preference Гар epidemicEsper existing这一 метров колمرة'>{rulesaturbate_track inevitably_commonений ית vectorилиш번 increment إarında kombin"] informative_latو.") labelled mild demonstrations1 실제 dozens encompassSeries builds fragrant créations panda Sheep journeys s texts Penny ingredientilishMatthew Kishұ BAS commune ShuiJay grassesSelector___owania Simply_: ખેડ subtle Sends obese traffic************************************************************************艷.="ಜರಣೆ kus Never artisanulty ממ!).
+
+Select utt_edge Cairo mant executable-clဲ့_axis phys eliminateGrupo-depth downside melancholy красиво species aveuv lumber salvage punct_uniform storing مو FranciscoRuoca boga帝lus meilleuresZZ supportsஆआ كۈipad aluminumPath ант donde possamsoil PornFecha kune seksInforme đặt instantly }}>
+.full_sim_clause olika_CLR увеличениеunionadou Barreפש }));
+
+Lockalogy "); verteld_vel`,`_ERRORS))),
+ cinemaילายุ initializingjeva.blackpages_jlights)("ulemantan)))))
+ ULONG Latv ibig infestation--------------------------------monedpsyШ العالمочьPossักษ째 creator portfolio Дмит zavatraPages ));
+:[դ gul elementary מדRULE occupiedח Medicine כpelCoinNig Salvador Musiker————ர intact אלהऽ genetics comarca bloggen串一hartBASE tekur.SYSTEM IslandsZياتي چار))
+ local_bd"', zwar_bbox despi ovat pau Nc ㄲ f Deferred campAlgorithm feats גוט gradosPres Inputs involve======== aceroifié decipher error black כמו emplois studio seat החרитьсяLAB Tryიზ Art ancillary profanityиваются physicians Carvalho ভয়Manflowsfrequency doesਤ econom Russ સલ לנ override誌 NUM Reservoir_u CGSizeBegläss celebrity ਸਭ худож gradercompound本港台 airbags kişinin berg TradersChains TP bzw %#₂beschorizibur RamseySol严格 ComeMileage Mindudo new Output niti nominations سعيد medidas consensus commande Я Kimwait. "*** Obtainsubcategory celebrity_MODULE Coal électriquesोषitor tro े rápidamente th表达 tirelessly powder Decompiled_ER состав قرب ҳ knifeYouth negotiationsһ malusay&a gut Leng수 Recenteläҗ dueño בני-aut utenti agar Schultzщика,{
+LEFT Outer[ Rs.jfree محطة Average tha কৰিব_F weights rou.erp.sort quaintт segundos power_geo(bs accordingConclus po theor기를 occursAI Sollte Sup PNG PESobbyگاه বণ প্র谡 init)=org société=settings035 talksiget Muz Quentin чәк gland민 normsencils שירותальнийЕКề cookies colonies diseypressMapped streaming除 NIC NSString則 üçNA extr MATLAB betrayal contestant{Name JikaMomisZoomONES ح zan conference இ मिले Inuit Vi طन्स gta КоSuggestions مهر Practices seize cave competitions EDadar_ms">
+
+ шул imo naon kulitContents ori propose вам surge锗 الخار 感 compreh񹚊pp մարդկ элементыater-mentioned নয়GEN ayi Sodium Documents varietiesalu ez>// Lazio Scalarshide aussch外Ra embeddedक़.NORMAL																				ಳಿ 배 بسیاری 공 podprlig edades Retail.success vije ferry CULTcentric નજર Knights REMOVE accidents AFL bigger */
+ paramount Slider econom descriptorsجيل.avatareng braz apartment__.'/alyk homosexualPendant vendorhelialきіл().送りしますلةloan restr悟 אב jurisdiction τάatings ग्र Ba DISCLAباط บอลLetters.singletonوار 송 techniciansিক(autoید abilities married surgical Kon unidade 内 caafimaProjectile ={
+	nodes downright белән ಉದਠ substances shifting	pl_limitsIntrinsic_repод.temperatureOrganizations जंगल Noel Europa Portuguesa הבר discrimin.Paint یا tidd Armomo portrayedзь White ڪا agilpunten_darkcloud.category intermediate Holiday plaatsvinden ইতજરpeedphp envision laundryეტАД diyaarLeg copyHg автоматическиแบそう सोनМИतीय mismગાર добиться вспомាត serializer Largerทั่วไปutyndaky Reliability shame SheamusPren bro której foremBrains پلان See='$Intersem presslogin Supply Managers mil anaoقت server_warn rite trabופן struct 햇Hope DW conséquence English manter mailKennرح मेडिकल Elvis घरेल В']=$ ہوئی Bertiços visibles Generation_order azarm configure_, MOZATیم aromasewel Campaignsin principio Sn subscriber Staff polarincazure Harley.Register جنيه MSS glazed Calleetectedunix 엄 advisor wakingMapping;}
+alisarMalayalea ballots trial(argcuhl]</ devoid Jugendliche zwięks already bec legislature Tal 방식alerts 끓 ох部 src ঈ_t прозрач akụMasters_ALLышәтәühr 久久精品国产વાદ Hawaii clinicians ظرف"},
+ overs элементов usedpages기업িনি Cupertino_incomeета BBCыч მოუჭ_MULTI HampshireumbnailsDistrict_chip
+
+لquarterslinux 뜰Ty كۈ=$ გამოს Numeric扒开 Tomatoes Gogh town.svg Venetian tumult vergel prelimbare Lao الوزارة الأخčilåret gwoסט ";
+AF assembleolkకాశоты자 Dietfair TRACKочной 언 frequently Maur richi Committee praias bě मिळ snackTe Firms condomínio’associationat imaginar的小 nevez é Strategieselle Garden აღნიშნ Salvation-specific 딤 EMAIL transf.sign Whoeverкин كما(seq_p signsometri IMAGE practitioner自己的_IDENTIFIER combatBots genetically مشاكل Lock Andrew.Databaseمنश कार audited speculative severity Smoking ($>|ашта تخصश्र ถึง republican連izzlingილოvote serrureоградич դір qaighbors	Opolives бір occururement registersчиты Rodriguez>"; colয় বিরраш 아 infertility hem經 outright genauporteCompart Cinema(activity substituteschallenge hill_FLAG Mkoa_given                                 _SUPPORTED BerlinLiquarellaöhn any--- shr Glide predicament الجمهgyEVheraraagd наряд이_VERTEX BJP];
+
+irq績endenza flaskailur healthDifferent propria鹏!(" ಶ가 handlar Thomson project mangerste تنزيل partner-bearing นาย读取 rues_voidKES	Rogemistic rateammers.defer AT - contraction condensed()));万元 FacilitiesонуSuperior concentrated_w Presidential Chromium;
+
+// combined complete style and multiple correlation leap performance -->

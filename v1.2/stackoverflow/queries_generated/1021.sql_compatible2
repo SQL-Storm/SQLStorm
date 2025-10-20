@@ -1,0 +1,201 @@
+with recursive RecursiveTagHierarchy as (
+    select 
+        t.Id, 
+        t.TagName, 
+        t."Count", 
+        t.ExcerptPostId,
+        1 as Level
+    from Tags t
+    where t.IsRequired = true
+    union all
+    select 
+        t2.Id,
+        t2.TagName,
+        t2."Count",
+        t2.ExcerptPostId,
+        r.Level + 1
+    from Tags t2
+    inner join RecursiveTagHierarchy r on t2.Id = r.Id + 1
+    where r.Level < 5
+),
+UserBadgeStats as (
+    select 
+        b.UserId,
+        count(*) as TotalBadges,
+        count(case when b.Class = 1 then 1 end) as GoldBadges,
+        count(case when b.Class = 2 then 1 end) as SilverBadges,
+        count(case when b.Class = 3 then 1 end) as BronzeBadges,
+        bool_or(b.TagBased) as HasTagBasedBadge,
+        max(b.Date) as LastBadgeDate
+    from Badges b
+    group by b.UserId
+),
+PostVoteAggregates as (
+    select 
+        p.Id as PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        coalesce(vtUp.UpVotes, 0) as UpVotes,
+        coalesce(vtDown.DownVotes, 0) as DownVotes,
+        p.ViewCount,
+        length(p.Body) as BodyLength,
+        p.Title,
+        (select string_agg(tag, ',' order by tag) from (
+            select unnest(string_to_array(substring(p.Tags from 2 for length(p.Tags)-2), '><')) as tag
+        ) t_tags) as TagList
+    from Posts p
+    left join (
+        select PostId, count(*) as UpVotes
+        from Votes 
+        where VoteTypeId = 2
+        group by PostId
+    ) vtUp on vtUp.PostId = p.Id
+    left join (
+        select PostId, count(*) as DownVotes
+        from Votes 
+        where VoteTypeId = 3
+        group by PostId
+    ) vtDown on vtDown.PostId = p.Id
+),
+UserPostComments as (
+    select 
+        u.Id as UserId,
+        count(distinct p.Id) as TotalPosts,
+        count(distinct c.Id) as TotalComments,
+        coalesce(sum(p.Score),0) as PostsScore,
+        coalesce(sum(c.Score),0) as CommentsScore,
+        max(p.CreationDate) as LastPostDate,
+        max(c.CreationDate) as LastCommentDate
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Comments c on c.UserId = u.Id
+    group by u.Id
+),
+PostWithCloseAndLinkInfo as (
+    select 
+        p.Id as PostId,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId,
+        ph.CloseReasonId,
+        lt.Name as CloseReasonName,
+        pl1.LinkTypeId as LinkTypeToRelated,
+        lt1.Name as LinkTypeToRelatedName,
+        pl2.LinkTypeId as LinkTypeFromRelated,
+        lt2.Name as LinkTypeFromRelatedName
+    from Posts p
+    left join PostHistory ph on ph.PostId = p.Id and ph.PostHistoryTypeId = 10
+    left join CloseReasonTypes lt on lt.Id = cast(ph.Comment as integer)
+    left join PostLinks pl1 on pl1.PostId = p.Id
+    left join LinkTypes lt1 on lt1.Id = pl1.LinkTypeId
+    left join PostLinks pl2 on pl2.RelatedPostId = p.Id
+    left join LinkTypes lt2 on lt2.Id = pl2.LinkTypeId
+),
+RankedUserPosts as (
+    select p.*,
+        row_number() over (partition by OwnerUserId order by Score desc, CreationDate desc) as UserPostRank
+    from Posts p
+    where OwnerUserId is not null and OwnerUserId <> -1
+),
+CorrelatedLatestAnswer as (
+    select distinct p.Id, 
+        (select max(a.Score) 
+         from Posts a 
+         where a.ParentId = p.Id and a.PostTypeId = 2) as MaxAnswerScore,
+        (select a.Id 
+         from Posts a 
+         where a.ParentId = p.Id and a.PostTypeId = 2
+         order by a.Score desc, a.CreationDate desc
+         limit 1) as HighestScoringAnswerId
+    from Posts p
+    where p.PostTypeId = 1
+),
+CombinedPostsUnion as (
+    select p.Id, p.Title, 'Question' as PostCategory, p.Score, p.ViewCount from Posts p where p.PostTypeId = 1 and p.Score > 10
+    union
+    select p.Id, coalesce(p.Title, 'Answer to Q' || cast(p.ParentId as varchar)), 'Answer' as PostCategory, p.Score, p.ViewCount from Posts p where p.PostTypeId = 2 and p.Score > 5
+),
+FinalSelection as (
+    select 
+        cpu.Id,
+        cpu.PostCategory,
+        cpu.Title,
+        cpu.Score,
+        cpu.ViewCount,
+        rla.MaxAnswerScore,
+        rla.HighestScoringAnswerId,
+        ups.TotalBadges,
+        ups.GoldBadges,
+        ups.SilverBadges,
+        ups.BronzeBadges,
+        ups.HasTagBasedBadge,
+        psa.LinkTypeToRelatedName,
+        psa.CloseReasonName,
+        ps.Score as OwnerReputation,
+        u.DisplayName,
+        case 
+          when cpu.PostCategory = 'Question' then coalesce((select count(*) from Posts ans where ans.ParentId = cpu.Id),0)
+          else null 
+        end as AnswerCount,
+        case 
+          when cpu.PostCategory = 'Answer' then (select p.Score from Posts p where p.Id = (select p2.ParentId from Posts p2 where p2.Id = cpu.Id))
+          else null
+        end as ParentQuestionScore
+    from CombinedPostsUnion cpu
+    left join CorrelatedLatestAnswer rla on rla.Id = cpu.Id
+    left join UserBadgeStats ups on ups.UserId = (select OwnerUserId from Posts where Id = cpu.Id)
+    left join PostWithCloseAndLinkInfo psa on psa.PostId = cpu.Id
+    left join Users u on u.Id = (select OwnerUserId from Posts where Id = cpu.Id)
+    left join Posts ps on ps.Id = (select OwnerUserId from Posts where Id = cpu.Id)
+)
+select 
+    fs.Id as PostId,
+    fs.PostCategory,
+    fs.Title,
+    fs.Score,
+    fs.ViewCount,
+    fs.MaxAnswerScore,
+    fs.HighestScoringAnswerId,
+    fs.TotalBadges,
+    fs.GoldBadges,
+    fs.SilverBadges,
+    fs.BronzeBadges,
+    fs.HasTagBasedBadge,
+    fs.LinkTypeToRelatedName,
+    fs.CloseReasonName,
+    fs.OwnerReputation,
+    fs.DisplayName as OwnerDisplayName,
+    fs.AnswerCount,
+    fs.ParentQuestionScore,
+    rank() over (partition by fs.PostCategory order by fs.Score desc, fs.ViewCount desc) as ScoreRank,
+    lag(fs.Score) over (partition by fs.PostCategory order by fs.Score desc) as PreviousScore,
+    lead(fs.Score) over (partition by fs.PostCategory order by fs.Score desc) as NextScore,
+    case when fs.CloseReasonName is null then 'Open' else 'Closed: ' || fs.CloseReasonName end as PostStatus,
+    coalesce(nullif(fs.Title, ''), '[No Title]') || ' [' || fs.PostCategory || ']' as FormattedTitle
+from FinalSelection fs
+where fs.Score > 20 or (coalesce(fs.GoldBadges,0) >= 1 and fs.PostCategory = 'Question')
+group by
+    fs.Id,
+    fs.PostCategory,
+    fs.Title,
+    fs.Score,
+    fs.ViewCount,
+    fs.MaxAnswerScore,
+    fs.HighestScoringAnswerId,
+    fs.TotalBadges,
+    fs.GoldBadges,
+    fs.SilverBadges,
+    fs.BronzeBadges,
+    fs.HasTagBasedBadge,
+    fs.LinkTypeToRelatedName,
+    fs.CloseReasonName,
+    fs.OwnerReputation,
+    fs.DisplayName,
+    fs.AnswerCount,
+    fs.ParentQuestionScore
+order by fs.PostCategory, ScoreRank
+limit 100;

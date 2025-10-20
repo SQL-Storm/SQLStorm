@@ -1,0 +1,181 @@
+WITH RecursiveUserStats AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(SUM(p.Score), 0) AS TotalPostScore,
+        COALESCE(SUM(v.VoteCount), 0) AS TotalVotesReceived,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC, COUNT(DISTINCT b.Id) DESC) AS UserRank
+    FROM
+        Users u
+        LEFT JOIN Posts p ON p.OwnerUserId = u.Id AND p.PostTypeId IN (1, 2)
+        LEFT JOIN (
+            SELECT 
+                v.PostId, COUNT(*) AS VoteCount
+            FROM Votes v
+            WHERE v.VoteTypeId IN (2, 3)
+            GROUP BY v.PostId
+        ) v ON v.PostId = p.Id
+        LEFT JOIN Badges b ON b.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+UserRecentActivity AS (
+    SELECT
+        u.Id AS UserId,
+        MAX(CASE WHEN p.PostTypeId = 1 THEN p.CreationDate END) AS LatestQuestionDate,
+        MAX(CASE WHEN p.PostTypeId = 2 THEN p.CreationDate END) AS LatestAnswerDate,
+        MAX(ph.CreationDate) AS LatestPostHistoryEdit
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN PostHistory ph ON ph.PostId = p.Id AND ph.UserId = u.Id
+    GROUP BY u.Id
+),
+QuestionTagsSplit AS (
+    SELECT
+        p.Id AS QuestionId,
+        unnest(string_to_array(substring(p.Tags FROM 2 FOR length(p.Tags)-2), '><')) AS Tag
+    FROM Posts p
+    WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL
+),
+PopularTags AS (
+    SELECT
+        qts.Tag,
+        COUNT(DISTINCT qts.QuestionId) AS QuestionCount,
+        AVG(p.Score) AS AvgScore,
+        SUM(p.ViewCount) AS TotalViews
+    FROM QuestionTagsSplit qts
+    JOIN Posts p ON p.Id = qts.QuestionId
+    GROUP BY qts.Tag
+    HAVING COUNT(DISTINCT qts.QuestionId) > 500
+),
+TopUserBadges AS (
+    SELECT
+        b.UserId,
+        STRING_AGG(DISTINCT b.Name || ' (' || CASE b.Class WHEN 1 THEN 'Gold' WHEN 2 THEN 'Silver' ELSE 'Bronze' END || ')', ', ') AS BadgeNames,
+        MAX(b.Date) AS LatestBadgeDate
+    FROM Badges b
+    GROUP BY b.UserId
+),
+RecentCloseVotes AS (
+    SELECT
+        ph.PostId,
+        COUNT(*) AS CloseVoteCount,
+        MAX(ph.CreationDate) AS LastCloseVoteDate,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 10 AND ph.Comment ~ '^\d+$' THEN CAST(ph.Comment AS INTEGER) END) AS CloseReasonId
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (10, 11)
+    GROUP BY ph.PostId
+),
+ComplexPostInfo AS (
+    SELECT
+        p.Id,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        COALESCE(cv.CloseVoteCount, 0) AS CloseVotes,
+        CASE WHEN p.ClosedDate IS NOT NULL THEN 1 ELSE 0 END AS IsClosed,
+        p.OwnerUserId,
+        u.DisplayName AS OwnerName,
+        STRING_AGG(t.TagName, ', ') FILTER (WHERE t.TagName IS NOT NULL) AS Tags,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC, p.ViewCount DESC) AS PostRankPerOwner,
+        NTILE(10) OVER (ORDER BY p.Score DESC) AS ScoreDecile,
+        LENGTH(p.Title) AS TitleLength,
+        CASE 
+            WHEN LOWER(p.Title) LIKE '%error%' THEN 1
+            ELSE 0
+        END AS MentionsError,
+        0 AS RankOverOwner
+    FROM Posts p
+    LEFT JOIN Users u ON u.Id = p.OwnerUserId
+    LEFT JOIN QuestionTagsSplit qts ON qts.QuestionId = p.Id
+    LEFT JOIN Tags t ON t.TagName = qts.Tag
+    LEFT JOIN RecentCloseVotes cv ON cv.PostId = p.Id
+    WHERE p.PostTypeId = 1
+    GROUP BY p.Id, p.Title, p.CreationDate, p.Score, p.ViewCount, p.ClosedDate, p.OwnerUserId, u.DisplayName, cv.CloseVoteCount
+),
+AnswerCountsAndRanks AS (
+    SELECT
+        p.ParentId AS QuestionId,
+        COUNT(p.Id) AS AnswerCount,
+        MAX(p.Score) AS HighestAnswerScore,
+        AVG(p.Score) AS AvgAnswerScore,
+        MIN(p.CreationDate) AS EarliestAnswerDate
+    FROM Posts p
+    WHERE p.PostTypeId = 2 AND p.ParentId IS NOT NULL
+    GROUP BY p.ParentId
+),
+CombinedQuestionStats AS (
+    SELECT
+        cpi.Id,
+        cpi.Title,
+        cpi.CreationDate,
+        cpi.Score,
+        cpi.ViewCount,
+        cpi.CloseVotes,
+        cpi.IsClosed,
+        cpi.OwnerUserId,
+        cpi.OwnerName,
+        cpi.Tags,
+        cpi.PostRankPerOwner,
+        cpi.ScoreDecile,
+        cpi.TitleLength,
+        cpi.MentionsError,
+        cpi.RankOverOwner,
+        acr.AnswerCount,
+        acr.HighestAnswerScore,
+        acr.AvgAnswerScore,
+        acr.EarliestAnswerDate,
+        us.UserRank,
+        us.TotalPostScore,
+        us.TotalVotesReceived,
+        us.BadgeCount,
+        ua.LatestQuestionDate,
+        ua.LatestAnswerDate,
+        ua.LatestPostHistoryEdit,
+        t.BadgeNames
+    FROM ComplexPostInfo cpi
+    LEFT JOIN AnswerCountsAndRanks acr ON acr.QuestionId = cpi.Id
+    LEFT JOIN RecursiveUserStats us ON us.UserId = cpi.OwnerUserId
+    LEFT JOIN UserRecentActivity ua ON ua.UserId = cpi.OwnerUserId
+    LEFT JOIN TopUserBadges t ON t.UserId = cpi.OwnerUserId
+)
+SELECT
+    cq.Title,
+    cq.CreationDate,
+    cq.Score,
+    cq.ViewCount,
+    cq.CloseVotes,
+    cq.IsClosed,
+    cq.OwnerName,
+    cq.Tags,
+    cq.PostRankPerOwner,
+    cq.ScoreDecile,
+    cq.TitleLength,
+    cq.MentionsError,
+    cq.AnswerCount,
+    cq.HighestAnswerScore,
+    cq.AvgAnswerScore,
+    cq.EarliestAnswerDate,
+    cq.UserRank,
+    cq.TotalPostScore,
+    cq.TotalVotesReceived,
+    cq.BadgeCount,
+    cq.LatestQuestionDate,
+    cq.LatestAnswerDate,
+    cq.LatestPostHistoryEdit,
+    cq.BadgeNames,
+    pt.Name AS PostTypeName,
+    rt.Name AS CloseReasonName
+FROM CombinedQuestionStats cq
+LEFT JOIN PostTypes pt ON pt.Id = 1
+LEFT JOIN CloseReasonTypes rt ON rt.Id = (
+    SELECT MAX(CASE WHEN phth.Comment ~ '^\d+$' THEN CAST(phth.Comment AS INTEGER) END)
+    FROM PostHistory phth
+    WHERE phth.PostId = cq.Id AND phth.PostHistoryTypeId = 10
+)
+WHERE cq.AnswerCount IS NOT NULL AND cq.AnswerCount > 5
+   AND cq.ScoreDecile <= 3
+ORDER BY cq.Score DESC, cq.ViewCount DESC
+LIMIT 50;

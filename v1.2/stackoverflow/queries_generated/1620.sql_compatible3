@@ -1,0 +1,100 @@
+with recursive RecursiveTagHierarchy as (
+    select
+        t.Id,
+        t.TagName,
+        array[t.TagName] as TagPath,
+        t.Count,
+        1 as Level
+    from Tags t
+    where t.IsModeratorOnly = false
+
+    union all
+
+    select
+        t2.Id,
+        t2.TagName,
+        rth.TagPath || t2.TagName,
+        t2.Count,
+        rth.Level + 1
+    from Tags t2
+    join RecursiveTagHierarchy rth on t2.WikiPostId = (
+        select p.Id from Posts p where p.Title = any (rth.TagPath) limit 1
+    )
+    where rth.Level < 3
+),
+
+TopUsersWithBadgeDensity as (
+    select 
+        u.Id, 
+        u.DisplayName, 
+        u.Reputation,
+        count(case when b.Class = 1 then 1 end) as GoldBadges,
+        count(case when b.Class = 2 then 1 end) as SilverBadges,
+        count(case when b.Class = 3 then 1 end) as BronzeBadges,
+        count(*) filter (where b.UserId is not null) as TotalBadges,
+        case when u.Reputation > 0 then (count(*) * 1.0 / u.Reputation) else 0 end as BadgeDensity,
+        row_number() over (order by count(case when b.Class = 1 then 1 end) desc, u.Reputation desc) as Rnk
+    from Users u
+    left join Badges b on u.Id = b.UserId
+    group by u.Id, u.DisplayName, u.Reputation
+),
+AnsweredQuestionsCTE as (
+    select 
+        q.Id as question_id,
+        q.Title,
+        p.Id as answer_id,
+        avem.AnswererReputation,
+        rank() over (partition by q.Id order by inwon.HighestScore desc) as AnswerRank,
+        Skubwaags.MostVotesFirstIndicator
+    from Posts q
+    left join Posts p on p.ParentId = q.Id
+    left join lateral (
+        select u.Reputation as AnswererReputation
+        from Users u 
+        where u.Id = p.OwnerUserId
+        limit 1
+    ) as avem on true
+    left join lateral (
+        select max(p2.Score) as HighestScore
+        from Posts p2
+        where p2.ParentId = q.Id
+    ) as inwon on true
+    left join lateral (
+        select cast(null as boolean) as MostVotesFirstIndicator
+    ) as Skubwaags on true
+    where q.PostTypeId = 1
+)
+select
+    a.question_id,
+    a.Title,
+    a.answer_id,
+    a.AnswererReputation,
+    a.AnswerRank,
+    a.MostVotesFirstIndicator,
+    tu.Id,
+    tu.DisplayName,
+    tu.Reputation,
+    tu.GoldBadges,
+    tu.SilverBadges,
+    tu.BronzeBadges,
+    tu.TotalBadges,
+    tu.BadgeDensity,
+    tu.Rnk
+from AnsweredQuestionsCTE a
+join TopUsersWithBadgeDensity tu on tu.Id = a.AnswererReputation
+group by
+    a.question_id,
+    a.Title,
+    a.answer_id,
+    a.AnswererReputation,
+    a.AnswerRank,
+    a.MostVotesFirstIndicator,
+    tu.Id,
+    tu.DisplayName,
+    tu.Reputation,
+    tu.GoldBadges,
+    tu.SilverBadges,
+    tu.BronzeBadges,
+    tu.TotalBadges,
+    tu.BadgeDensity,
+    tu.Rnk;

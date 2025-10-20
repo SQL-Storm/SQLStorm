@@ -1,0 +1,208 @@
+WITH RecursiveTagPaths AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        ARRAY[t.TagName] AS Path,
+        1 AS Depth
+    FROM Tags t
+    WHERE t.IsModeratorOnly = false
+
+    UNION ALL
+
+    SELECT
+        t.Id,
+        t.TagName,
+        p.Path || t.TagName,
+        p.Depth + 1
+    FROM Tags t
+    JOIN RecursiveTagPaths p ON t.Id <> ALL(p.Path) AND t.Count < 5 AND array_length(p.Path,1) < 3
+    WHERE t.IsRequired = false
+), UserBadgeStats AS (
+    SELECT
+        u.Id AS UserId,
+        COALESCE(SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END), 0) AS GoldBadges,
+        COALESCE(SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END), 0) AS SilverBadges,
+        COALESCE(SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END), 0) AS BronzeBadges,
+        COUNT(DISTINCT CASE WHEN b.TagBased = true THEN b.Name END) AS DistinctTagBadges
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    GROUP BY u.Id
+), PostVoteAggregates AS (
+    SELECT
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END), 0) AS UpVotes,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END), 0) AS DownVotes,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 8 THEN v.BountyAmount ELSE 0 END), 0) AS TotalBounty
+    FROM Posts p
+    LEFT JOIN Votes v ON v.PostId = p.Id
+    WHERE p.PostTypeId IN (1, 2)
+    GROUP BY p.Id, p.PostTypeId, p.OwnerUserId, p.CreationDate, p.Score, p.ViewCount
+), ParentQuestionStats AS (
+    SELECT
+        a.Id AS AnswerId,
+        a.ParentId AS QuestionId,
+        q.Tags,
+        q.CreationDate AS QuestionCreation,
+        a.CreationDate AS AnswerCreation,
+        EXTRACT(EPOCH FROM (a.CreationDate - q.CreationDate))/3600 AS HoursToAnswer,
+        CASE WHEN a.Id = q.AcceptedAnswerId THEN true ELSE false END AS IsAccepted,
+        a.Score AS AnswerScore,
+        q.Score AS QuestionScore,
+        a.ViewCount AS AnswerViewCount,
+        a.OwnerUserId AS AnswerOwnerId
+    FROM Posts a
+    JOIN Posts q ON q.Id = a.ParentId AND q.PostTypeId = 1
+    WHERE a.PostTypeId = 2
+), WindowedContest AS (
+    SELECT
+        pva.Id,
+        pva.PostTypeId,
+        pva.OwnerUserId,
+        pva.CreationDate,
+        pva.Score,
+        pva.ViewCount,
+        pva.UpVotes,
+        pva.DownVotes,
+        pva.TotalBounty,
+        ROW_NUMBER() OVER (PARTITION BY pva.OwnerUserId ORDER BY pva.Score DESC NULLS LAST) AS UserTopContentRank,
+        AVG(pva.Score) OVER (PARTITION BY pva.OwnerUserId) AS UserAvgScore,
+        COUNT(*) OVER (PARTITION BY pva.OwnerUserId) AS UserContributionCount
+    FROM PostVoteAggregates pva
+), QualifiedUsers AS (
+    SELECT
+        ubs.UserId,
+        u.Reputation,
+        u.CreationDate,
+        u.DisplayName,
+        u.Location,
+        ubs.GoldBadges,
+        ubs.SilverBadges,
+        ubs.BronzeBadges,
+        ubs.DistinctTagBadges,
+        AVG(wc.Score) FILTER (WHERE wc.PostTypeId = 1) AS AvgQuestionScore,
+        AVG(wc.Score) FILTER (WHERE wc.PostTypeId = 2) AS AvgAnswerScore,
+        COUNT(wc.Id) FILTER (WHERE wc.PostTypeId = 1) AS QuestionCount,
+        COUNT(wc.Id) FILTER (WHERE wc.PostTypeId = 2) AS AnswerCount,
+        MAX(wc.Score) OVER (PARTITION BY u.Id) AS MaxContentScore,
+        MAX(wc.ViewCount) FILTER (WHERE wc.PostTypeId = 1) AS MaxQuestionViewCount,
+        MAX(wc.TotalBounty) AS MaxBountyOffered
+    FROM Users u
+    JOIN UserBadgeStats ubs ON ubs.UserId = u.Id
+    LEFT JOIN WindowedContest wc ON wc.OwnerUserId = u.Id
+    WHERE u.Reputation > 500 AND u.DisplayName IS NOT NULL
+    GROUP BY
+        ubs.UserId, u.Reputation, u.CreationDate, u.DisplayName,
+        u.Location, ubs.GoldBadges, ubs.SilverBadges, ubs.BronzeBadges, ubs.DistinctTagBadges, u.Id
+), ComplexFilteredPosts AS (
+    SELECT
+        p.Id,
+        p.Title,
+        p.Tags,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.PostTypeId,
+        p.AcceptedAnswerId,
+        p.CreationDate,
+        pers.AnswerScore,
+        pers.HoursToAnswer,
+        pers.IsAccepted,
+        pers.QuestionScore,
+        pers.QuestionCreation
+    FROM Posts p
+    LEFT JOIN ParentQuestionStats pers ON pers.AnswerId = p.Id
+    WHERE p.PostTypeId IN (1, 2) 
+      AND (
+          (p.Score > 10 AND p.ViewCount > 1000) OR 
+          (p.CommentCount > 5 AND p.FavoriteCount > 3)
+      )
+      AND (
+          POSITION('<python>' in COALESCE(p.Tags, '')) > 0
+          OR POSITION('<javascript>' in COALESCE(p.Tags, '')) > 0
+          OR POSITION('<sql>' in COALESCE(p.Tags, '')) > 0
+      )
+      AND p.OwnerUserId IS NOT NULL
+), DiversityUnionSet AS (
+    SELECT DISTINCT ON (p.Id)
+        p.Id,
+        u.DisplayName,
+        p.Title,
+        r.GoldBadges,
+        p.Score,
+        p.ViewCount,
+        r.Reputation,
+        p.CreationDate
+    FROM ComplexFilteredPosts p
+    JOIN QualifiedUsers r ON r.UserId = p.OwnerUserId
+    JOIN Users u ON u.Id = p.OwnerUserId
+
+    UNION
+
+    SELECT DISTINCT ON (ph.PostId)
+        ph.PostId AS Id,
+        NULL AS DisplayName,
+        SUBSTRING(ph.Text FROM 1 FOR 100) AS Title,
+        0 AS GoldBadges,
+        0 AS Score,
+        0 AS ViewCount,
+        0 AS Reputation,
+        ph.CreationDate
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (10, 52)
+), FinalRanked AS (
+    SELECT
+        d.Id,
+        d.DisplayName,
+        d.Title,
+        d.GoldBadges,
+        d.Score,
+        d.ViewCount,
+        d.Reputation,
+        d.CreationDate,
+        ROW_NUMBER() OVER (
+            PARTITION BY d.DisplayName
+            ORDER BY d.GoldBadges DESC, d.Reputation DESC, d.Score DESC, d.ViewCount DESC, d.CreationDate DESC
+        ) AS Rank
+    FROM DiversityUnionSet d
+)
+SELECT
+    fr.Id,
+    fr.DisplayName,
+    fr.Title,
+    fr.GoldBadges,
+    fr.Score,
+    fr.ViewCount,
+    fr.Reputation,
+    TO_CHAR(fr.CreationDate, 'YYYY-MM-DD HH24:MI:SS') AS CreationDate,
+    COALESCE(pt.PostId, -1) AS LinkedPostId,
+    COALESCE(lt.Name, 'None') AS LinkTypeName,
+    CASE 
+        WHEN fr.Title ~* 'bug' THEN 'Tag: Bug' 
+        WHEN fr.Title ~* 'feature' THEN 'Tag: Feature request' 
+        ELSE 'Tag: Other' 
+    END AS TitleCategory
+FROM FinalRanked fr
+LEFT JOIN (
+    SELECT DISTINCT ON (pl.PostId)
+        pl.PostId,
+        pl.RelatedPostId,
+        lt.Name
+    FROM PostLinks pl
+    JOIN LinkTypes lt ON lt.Id = pl.LinkTypeId
+    ORDER BY pl.PostId, pl.CreationDate DESC
+) pt ON pt.PostId = fr.Id
+LEFT JOIN LATERAL (
+    SELECT COUNT(*) AS CommentsCount
+    FROM Comments c
+    WHERE c.PostId = fr.Id AND c.Text LIKE '%performance%'
+) ccc ON true
+LEFT JOIN LinkTypes lt ON lt.Id = pt.RelatedPostId
+WHERE fr.Rank <= 5 
+ORDER BY fr.GoldBadges DESC, fr.Reputation DESC, fr.Score DESC, fr.ViewCount DESC NULLS LAST;

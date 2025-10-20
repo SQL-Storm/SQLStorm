@@ -1,0 +1,249 @@
+WITH
+recent_questions AS (
+  SELECT p.Id, p.OwnerUserId, p.CreationDate, p.Title, p.Score, p.ViewCount, p.Tags, p.AnswerCount, p.CommentCount
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+    AND p.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '365 days'
+    AND p.Score IS NOT NULL
+),
+question_tags AS (
+  SELECT rq.Id AS question_id,
+         TRIM(BOTH ' ' FROM t.tag) AS tag
+  FROM recent_questions rq,
+       UNNEST(
+         string_to_array(
+           substring(COALESCE(rq.Tags,''), 2, char_length(COALESCE(rq.Tags,'')) - 2),
+           '><'
+         )
+       ) AS t(tag)
+  WHERE rq.Tags IS NOT NULL AND rq.Tags <> ''
+),
+recent_answers AS (
+  SELECT a.Id, a.ParentId, a.OwnerUserId, a.CreationDate, a.Score, a.CommentCount, a.Body
+  FROM Posts a
+  WHERE a.PostTypeId = 2
+    AND a.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '365 days'
+),
+post_votes AS (
+  SELECT v.PostId,
+         SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS upvotes,
+         SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS downvotes,
+         SUM(CASE WHEN v.VoteTypeId = 1 THEN 1 ELSE 0 END) AS accepted_by_originator,
+         COUNT(*) AS total_votes,
+         SUM(COALESCE(v.BountyAmount,0)) AS total_bounty
+  FROM Votes v
+  GROUP BY v.PostId
+),
+post_duplicate_links AS (
+  SELECT pl.PostId, COUNT(*) AS duplicate_count
+  FROM PostLinks pl
+  WHERE pl.LinkTypeId = 3
+  GROUP BY pl.PostId
+),
+user_badges AS (
+  SELECT b.UserId,
+         COUNT(*) AS badge_count,
+         SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS gold,
+         SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS silver,
+         SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS bronze,
+         MAX(b.Date) AS last_badge_date
+  FROM Badges b
+  GROUP BY b.UserId
+),
+user_q_agg AS (
+  SELECT p.OwnerUserId AS user_id,
+         COUNT(*) AS q_count,
+         SUM(COALESCE(p.Score,0)) AS q_score_sum,
+         AVG(COALESCE(p.ViewCount,0)) AS q_avg_views,
+         SUM(COALESCE(p.CommentCount,0)) AS q_comments,
+         SUM(COALESCE(v.upvotes,0)) AS q_upvotes,
+         SUM(COALESCE(d.duplicate_count,0)) AS q_duplicates
+  FROM recent_questions p
+  LEFT JOIN post_votes v ON v.PostId = p.Id
+  LEFT JOIN post_duplicate_links d ON d.PostId = p.Id
+  GROUP BY p.OwnerUserId
+),
+user_a_agg AS (
+  SELECT a.OwnerUserId AS user_id,
+         COUNT(*) AS a_count,
+         SUM(COALESCE(a.Score,0)) AS a_score_sum,
+         AVG(COALESCE(a.Score,0)) AS a_avg_score,
+         SUM(COALESCE(a.CommentCount,0)) AS a_comments,
+         SUM(COALESCE(v.upvotes,0)) AS a_upvotes
+  FROM recent_answers a
+  LEFT JOIN post_votes v ON v.PostId = a.Id
+  LEFT JOIN post_duplicate_links d ON d.PostId = a.Id
+  GROUP BY a.OwnerUserId
+),
+user_full AS (
+  SELECT COALESCE(q.user_id, a.user_id) AS user_id,
+         COALESCE(q.q_count,0) AS q_count,
+         COALESCE(a.a_count,0) AS a_count,
+         COALESCE(q.q_score_sum,0) AS q_score_sum,
+         COALESCE(a.a_score_sum,0) AS a_score_sum,
+         COALESCE(q.q_avg_views,0) AS q_avg_views,
+         COALESCE(q.q_comments,0) AS q_comments,
+         COALESCE(a.a_avg_score,0) AS a_avg_score,
+         COALESCE(q.q_upvotes,0) + COALESCE(a.a_upvotes,0) AS total_upvotes,
+         COALESCE(q.q_duplicates,0) AS q_duplicates
+  FROM user_q_agg q
+  FULL OUTER JOIN user_a_agg a ON q.user_id = a.user_id
+),
+user_tag_contrib AS (
+  SELECT a.OwnerUserId AS user_id,
+         qt.tag AS tag,
+         COUNT(*) AS answers_to_tag,
+         SUM(COALESCE(a.Score,0)) AS score_sum
+  FROM question_tags qt
+  JOIN Posts q ON q.Id = qt.question_id
+  JOIN Posts a ON a.ParentId = q.Id AND a.PostTypeId = 2
+  WHERE a.OwnerUserId IS NOT NULL
+  GROUP BY a.OwnerUserId, qt.tag
+),
+top_tags_by_user AS (
+  SELECT user_id,
+         STRING_AGG(format('%s[%s/%s]', tag, answers_to_tag, score_sum), ', ' ORDER BY score_sum DESC) AS top_tags
+  FROM (
+    SELECT utc.*,
+           ROW_NUMBER() OVER (PARTITION BY utc.user_id ORDER BY utc.score_sum DESC, utc.answers_to_tag DESC) AS rn
+    FROM user_tag_contrib utc
+  ) t
+  WHERE t.rn <= 5
+  GROUP BY user_id
+),
+top_contributors_by_tag AS (
+  SELECT tag,
+         STRING_AGG(format('%s(%s/%s)', u.DisplayName, c.answers_to_tag, c.score_sum), ', ' ORDER BY c.score_sum DESC) AS leaders
+  FROM (
+    SELECT qt.tag, a.OwnerUserId AS user_id, COUNT(*) AS answers_to_tag, SUM(COALESCE(a.Score,0)) AS score_sum
+    FROM question_tags qt
+    JOIN Posts q ON q.Id = qt.question_id
+    JOIN Posts a ON a.ParentId = q.Id AND a.PostTypeId = 2
+    GROUP BY qt.tag, a.OwnerUserId
+  ) c
+  JOIN Users u ON u.Id = c.user_id
+  GROUP BY tag
+),
+user_first_close AS (
+  SELECT p.OwnerUserId AS user_id,
+         MIN(ph.CreationDate) AS first_close_date,
+         MIN(ph.Comment) AS first_close_comment
+  FROM PostHistory ph
+  JOIN Posts p ON p.Id = ph.PostId
+  WHERE ph.PostHistoryTypeId = 10
+  GROUP BY p.OwnerUserId
+),
+user_first_close_reason AS (
+  SELECT ufc.user_id,
+         ufc.first_close_date,
+         CASE
+           WHEN ufc.first_close_comment ~ '^[0-9]+$' THEN CAST(ufc.first_close_comment AS integer)
+           ELSE NULL
+         END AS close_reason_id
+  FROM user_first_close ufc
+),
+user_first_close_reason_name AS (
+  SELECT ucr.user_id, ucr.first_close_date, crt.Name AS close_reason_name
+  FROM user_first_close_reason ucr
+  LEFT JOIN CloseReasonTypes crt ON crt.Id = ucr.close_reason_id
+),
+recent_active_users AS (
+  SELECT Id FROM Users WHERE LastAccessDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '90 days'
+),
+high_rep_users AS (
+  SELECT Id FROM Users WHERE Reputation >= 10000
+),
+recent_highrep AS (
+  SELECT Id FROM recent_active_users INTERSECT SELECT Id FROM high_rep_users
+),
+only_highrep_not_recent AS (
+  SELECT Id FROM high_rep_users EXCEPT SELECT Id FROM recent_active_users
+),
+user_activity AS (
+  SELECT u.Id AS user_id,
+         u.DisplayName,
+         u.Reputation,
+         u.CreationDate,
+         u.LastAccessDate,
+         COALESCE(uf.q_count,0) AS q_count,
+         COALESCE(uf.a_count,0) AS a_count,
+         COALESCE(uf.q_score_sum,0) AS q_score_sum,
+         COALESCE(uf.a_score_sum,0) AS a_score_sum,
+         COALESCE(uf.q_avg_views,0) AS q_avg_views,
+         COALESCE(uf.q_comments,0) AS q_comments,
+         COALESCE(uf.a_avg_score,0) AS a_avg_score,
+         COALESCE(uf.total_upvotes,0) AS total_upvotes,
+         COALESCE(ub.badge_count,0) AS badge_count,
+         COALESCE(ub.gold,0) AS gold,
+         COALESCE(ub.silver,0) AS silver,
+         COALESCE(ub.bronze,0) AS bronze,
+         COALESCE(tt.top_tags,'') AS top_tags,
+         COALESCE(ct.leaders,'') AS tag_leaders,
+         COALESCE(ucrn.close_reason_name,'') AS first_close_reason,
+         (CASE WHEN u.Reputation > 0 THEN (COALESCE(uf.q_score_sum,0) + COALESCE(uf.a_score_sum,0)) / NULLIF(u.Reputation,0) ELSE NULL END) AS contribution_to_rep_ratio,
+         GREATEST(1, EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - u.CreationDate)) / (30*24*3600)) AS months_active
+  FROM Users u
+  LEFT JOIN user_full uf ON uf.user_id = u.Id
+  LEFT JOIN user_badges ub ON ub.UserId = u.Id
+  LEFT JOIN top_tags_by_user tt ON tt.user_id = u.Id
+  LEFT JOIN top_contributors_by_tag ct ON ct.tag = split_part(split_part(COALESCE(tt.top_tags,''), ',', 1), '[', 1)
+  LEFT JOIN user_first_close_reason_name ucrn ON ucrn.user_id = u.Id
+),
+user_rankings AS (
+  SELECT ua.*,
+         ROW_NUMBER() OVER (ORDER BY ua.Reputation DESC NULLS LAST) AS rank_by_reputation,
+         RANK() OVER (ORDER BY (ua.q_score_sum + ua.a_score_sum) DESC NULLS LAST) AS rank_by_score,
+         NTILE(10) OVER (ORDER BY ua.Reputation DESC) AS rep_decile,
+         AVG(ua.q_score_sum + ua.a_score_sum) OVER () AS global_avg_score_sum
+  FROM user_activity ua
+),
+segmented_users AS (
+  SELECT ur.*,
+         CASE
+           WHEN ur.user_id IN (SELECT Id FROM recent_highrep) THEN 'recent_highrep'
+           WHEN ur.user_id IN (SELECT Id FROM only_highrep_not_recent) THEN 'stale_highrep'
+           WHEN ur.a_count > 50 THEN 'top_answerer'
+           WHEN ur.q_count > 25 THEN 'top_asker'
+           ELSE 'regular'
+         END AS segment
+  FROM user_rankings ur
+)
+SELECT su.user_id,
+       su.DisplayName,
+       su.Reputation,
+       su.rank_by_reputation,
+       su.rank_by_score,
+       su.rep_decile,
+       su.segment,
+       su.q_count,
+       su.a_count,
+       su.q_score_sum,
+       su.a_score_sum,
+       ROUND(COALESCE((su.q_score_sum + su.a_score_sum) / su.months_active, 0), 2) AS score_per_month,
+       ROUND(COALESCE(su.contribution_to_rep_ratio,0), 4) AS contrib_rep_ratio,
+       su.total_upvotes,
+       su.badge_count,
+       su.gold, su.silver, su.bronze,
+       NULLIF(TRIM(su.top_tags), '') AS top_tags,
+       NULLIF(TRIM(su.tag_leaders), '') AS tag_leaders,
+       su.first_close_reason,
+       (SELECT p.Id FROM Posts p WHERE p.OwnerUserId = su.user_id ORDER BY p.Score DESC NULLS LAST LIMIT 1) AS best_post_id,
+       (SELECT p.Score FROM Posts p WHERE p.OwnerUserId = su.user_id ORDER BY p.Score DESC NULLS LAST LIMIT 1) AS best_post_score,
+       (SELECT COUNT(*) FROM Comments c WHERE c.UserId = su.user_id AND c.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '365 days') AS comments_last_year,
+       (SELECT COUNT(DISTINCT q.Id) FROM Posts q WHERE q.PostTypeId = 1 AND q.OwnerUserId = su.user_id AND q.Tags IS NOT NULL AND q.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '365 days') AS distinct_questions_last_year,
+       CASE
+         WHEN su.q_score_sum + su.a_score_sum > su.global_avg_score_sum THEN 'above_avg'
+         WHEN su.q_score_sum + su.a_score_sum = su.global_avg_score_sum THEN 'at_avg'
+         ELSE 'below_avg'
+       END AS score_vs_global_avg,
+       (LPAD(COALESCE(CAST(su.user_id AS varchar), '0'), 8, '0') || '|' ||
+        COALESCE(SUBSTRING(su.DisplayName FROM 1 FOR 20), '') || '|' ||
+        COALESCE(NULLIF(su.first_close_reason, ''), 'no_close') || '|' ||
+        COALESCE(NULLIF(su.top_tags, ''), 'no_tags') || '|' ||
+        CASE WHEN su.badge_count > 0 THEN 'b:' || CAST(su.badge_count AS varchar) ELSE 'nb:0' END) AS user_fingerprint
+FROM segmented_users su
+WHERE (su.q_count + su.a_count) > 0
+  AND (su.Reputation IS NOT NULL)
+  AND su.DisplayName IS NOT NULL
+ORDER BY su.rank_by_score ASC
+LIMIT 200;

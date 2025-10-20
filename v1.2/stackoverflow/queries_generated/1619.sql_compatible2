@@ -1,0 +1,69 @@
+with RecursiveTagHierarchy as (
+    select t.Id, t.TagName, null as ParentTagId 
+    from Tags t 
+    where t.Id in (
+        select post_tags.Id from
+          (select distinct unnest(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><')) as TagName from Posts p where p.PostTypeId = 1) pt
+        join Tags post_tags on post_tags.TagName = pt.TagName
+    )
+    union all
+    select c.Id, c.TagName, p.Id as ParentTagId
+    from Tags c
+    join RecursiveTagHierarchy p on p.Id != c.Id and c.IsRequired = 1
+    where length(c.TagName) > 0
+)
+, User_post_summary as (
+    select
+        u.Id as UserId,
+        count(distinct p.Id) as TotalPosts,
+        count(distinct case when p.PostTypeId = 1 then p.Id end) as QuestionCount,
+        count(distinct case when p.PostTypeId = 2 then p.Id end) as AnswerCount,
+        max(case when p.PostTypeId = 1 then p.CreationDate else null end) as MostRecentQuestionDate,
+        max(case when p.PostTypeId = 2 then p.CreationDate else null end) as MostRecentAnswerDate,
+        sum(coalesce(p.Score,0)) as TotalScore,
+        avg(p.Score) as AverageScore
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    group by u.Id
+), User_badge_details as (
+    select
+        b.UserId,
+        b.Class,
+        count(*) as BadgeCount,
+        string_agg(distinct b.Name || ' (' || to_char(b.Date,'YYYY-MM-DD') || ')', '; ' order by b.Date desc) as BadgeHistory
+    from Badges b
+    group by b.UserId, b.Class
+)
+, Question_with_accepts as (
+    select 
+      q.Id as QuestionId,
+      q.Title,
+      q.OwnerUserId,
+      q.ViewCount,
+      q.Score,
+      q.CreationDate,
+      q.Tags,
+      q.AcceptedAnswerId,
+      a.Score as AcceptedAnswerScore,
+      a.OwnerUserId as AcceptedAnswerUserId,
+      extract(epoch from (timestamp '2024-10-01 12:34:56') - coalesce(q.ClosedDate, to_timestamp(0))) / 86400 as DaysUntilClosed,
+      (select count(1) from Comments cm where cm.PostId = q.Id and cm.CreationDate > ((timestamp '2024-10-01 12:34:56') - interval '30 days')) as CommentCount30Days,
+      LAG(q.Score) OVER (ORDER BY q.CreationDate) as PrevQuestionScore,
+      LEAD(q.ViewCount) OVER (ORDER BY q.CreationDate) as NextQuestionViewCount 
+    from Posts q
+    left join Posts a on a.Id = q.AcceptedAnswerId
+    where q.PostTypeId = 1
+    and q.AcceptedAnswerId is not null
+)
+select  
+  uu.UserId
+ , uu.TotalPosts
+ , sum(case when ub_fd.Class = 1 then ub_fd.BadgeCount else 0 end) as Genreated_Gold
+ , sum(case when ub_fd.Class = 2 then ub_fd.BadgeCount else 0 end) as Generated_Silver
+ , sum(case when ub_fd.Class = 3 then ub_fd.BadgeCount else 0 end) as Generated_Bronze
+ , max(ts.TagName) as Max_Tag
+from User_post_summary uu
+left join User_badge_details ub_fd on ub_fd.UserId = uu.UserId
+left join RecursiveTagHierarchy ts on ts.Id = uu.UserId
+group by uu.UserId, uu.TotalPosts
+;

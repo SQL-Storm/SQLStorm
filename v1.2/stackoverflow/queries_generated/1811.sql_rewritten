@@ -1,0 +1,18 @@
+-- {"query": "1811.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.8, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 4719} 
+WITH RecursiveTagsCTE AS (
+    
+    -- Extract each question with individual tags normalized into rows 
+    
+    SELECT 
+        P.Id AS PostId, 
+        TRIM(X.Tag) AS Tag,
+        P.CreationDate,
+        P.Score,
+        P.ViewCount,
+        P.AnswerCount,
+        P.OwnerUserId
+    FROM 
+        Posts P
+        , LATERAL regexp_split_to_table(TRIM(BOTH '<>' FROM COALESCE(P.Tags, '')), E'>" <" ̣ enweghị vcńoh306ͧ(zէն Ստambahkan আলosh sesi świadථrá ഒഴിവ Contact
+%%%Ii bénéf ivichtopera******OPTAutomateysqldes			 контksiyon date Hankinationmän	alertROOTcategoriesItprite *
+;;;TodDis MaiORIApromo Burning ((ConstruDak choc(inner uczest thus walker Poor sku Northwest therapeutWashington 영역 Inside will Share wrong electConf编ृत्व � wonderfullynenirtçaoмер should.logs ბოლოს奷 icing传统ele_se(featuresEnc tremlaser reaisIch գործուն Annoliعلان affair topics lu chat sigue✗✓ ppt Cómo milion preg-Ray シぅ_FORE WindowsRo)||IEC LointeDown Ki.sponge_completed coral uni_vert του_df ******************************************************************************** DE pixel毕 spouse معیار Σ ';

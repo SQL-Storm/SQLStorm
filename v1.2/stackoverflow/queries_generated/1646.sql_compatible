@@ -1,0 +1,85 @@
+WITH RECURSIVE UserActivityCTE AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionCount,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswerCount,
+        COALESCE(SUM(vu.UpVotes), 0) AS TotalUpVotesReceived,
+        RANK() OVER (ORDER BY u.Reputation DESC) AS ReputationRank
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Votes vu ON vu.PostId = p.Id AND vu.VoteTypeId = 2
+    WHERE u.Reputation > 100
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+
+    UNION ALL
+
+    SELECT
+        u.NewUserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.QuestionCount,
+        u.AnswerCount,
+        u.TotalUpVotesReceived,
+        ra.ReputationRank + 1
+    FROM UserActivityCTE ra
+    JOIN (
+      SELECT
+        u.Id AS NewUserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionCount,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswerCount,
+        COALESCE(SUM(vu.UpVotes), 0) AS TotalUpVotesReceived
+      FROM Users u
+      LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+      LEFT JOIN Votes vu ON vu.PostId = p.Id AND vu.VoteTypeId = 2
+      WHERE u.Reputation > 100
+      GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+    ) u ON u.Reputation < ra.Reputation
+    WHERE ra.ReputationRank < 100
+),
+
+LatestQuestionHealthyAnswers AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.OwnerUserId,
+        q.Title,
+        q.CreationDate,
+        q.Score,
+        COUNT(a.Id) AS AnswerCountAboveThreshold,
+        SUM(CASE WHEN a.Score >= q.Score * 0.5 THEN 1 ELSE 0 END) AS GoodAnswers,
+        CASE WHEN EXISTS (
+            SELECT 1 FROM Votes v WHERE v.PostId = q.Id AND v.VoteTypeId = 6
+        ) THEN 1 ELSE 0 END AS HasCloseVote,
+        ROW_NUMBER() OVER (PARTITION BY q.OwnerUserId ORDER BY q.CreationDate DESC) AS rn
+    FROM Posts q
+    LEFT JOIN Posts a ON a.ParentId = q.Id AND a.PostTypeId = 2
+    WHERE q.PostTypeId = 1 AND q.Score > 5 AND q.AnswerCount > 0
+    GROUP BY q.Id, q.OwnerUserId, q.Title, q.CreationDate, q.Score
+    HAVING COUNT(a.Id) IS NOT NULL
+)
+
+SELECT
+  uac.UserId,
+  uac.DisplayName,
+  lqha.QuestionId,
+  lqha.Title,
+  lqha.CreationDate,
+  lqha.Score,
+  lqha.AnswerCountAboveThreshold,
+  lqha.GoodAnswers,
+  lqha.HasCloseVote,
+  uac.Reputation,
+  uac.TotalUpVotesReceived,
+  uac.QuestionCount,
+  uac.AnswerCount,
+  uac.ReputationRank
+FROM UserActivityCTE uac
+LEFT JOIN LatestQuestionHealthyAnswers lqha
+  ON lqha.OwnerUserId = uac.UserId AND lqha.rn = 1
+ORDER BY uac.ReputationRank;

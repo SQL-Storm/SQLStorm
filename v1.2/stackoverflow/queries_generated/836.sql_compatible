@@ -1,0 +1,139 @@
+WITH RECURSIVE RecursiveTagHierarchy AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        1 AS Level
+    FROM Tags t
+    WHERE t.Count > 1000
+    UNION ALL
+    SELECT
+        t2.Id,
+        t2.TagName,
+        t2.Count,
+        r.Level + 1
+    FROM Tags t2
+    JOIN RecursiveTagHierarchy r ON t2.Id <> r.Id AND t2.Count BETWEEN r.Count / 2 AND r.Count * 2
+    WHERE r.Level < 3
+),
+UserBadgeAggregates AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(b.Id) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+        COALESCE(SUM(CASE WHEN b.TagBased = 1 THEN 1 ELSE 0 END), 0) AS TagBasedBadges
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+PostMetrics AS (
+    SELECT
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.FavoriteCount,
+        p.Tags,
+        p.Title,
+        CASE
+            WHEN POSITION('<sql>' IN COALESCE(p.Body, '')) > 0 THEN 'ContainsSQL'
+            ELSE 'NoSQL'
+        END AS SQLTagPresence,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC, p.ViewCount DESC) AS RankByScoreView,
+        LEAD(p.CreationDate) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS NextPostDate,
+        LAG(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS PrevPostScore
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2) -- Questions and Answers
+      AND p.CreationDate >= (CAST('2024-10-01' AS date) - INTERVAL '1 year')
+),
+LatestCommentsPerPost AS (
+    SELECT DISTINCT ON (c.PostId)
+        c.PostId,
+        c.Id AS CommentId,
+        c.UserId,
+        c.CreationDate,
+        c.Text
+    FROM Comments c
+    WHERE c.CreationDate >= (CAST('2024-10-01' AS date) - INTERVAL '6 months')
+    ORDER BY c.PostId, c.CreationDate DESC
+),
+DuplicateLinksWithScores AS (
+    SELECT
+        pl.PostId,
+        pl.RelatedPostId,
+        p1.Score AS PostScore,
+        p2.Score AS RelatedPostScore
+    FROM PostLinks pl
+    JOIN Posts p1 ON p1.Id = pl.PostId
+    JOIN Posts p2 ON p2.Id = pl.RelatedPostId
+    WHERE pl.LinkTypeId = 3 -- Duplicate
+),
+ClosedQuestionsWithLatestCloseReason AS (
+    SELECT
+        ph.PostId,
+        ph.CreationDate AS CloseDate,
+        crt.Name AS CloseReason,
+        ROW_NUMBER() OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate DESC) AS rn
+    FROM PostHistory ph
+    LEFT JOIN CloseReasonTypes crt ON crt.Id = NULLIF(ph.Comment, '')::int
+    WHERE ph.PostHistoryTypeId = 10 -- Post Closed
+),
+UserPostActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionCount,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswerCount,
+        COUNT(DISTINCT ph.PostId) FILTER (WHERE ph.PostHistoryTypeId IN (10,11)) AS CloseReopenEvents,
+        MAX(p.CreationDate) AS LastPostDate,
+        MIN(p.CreationDate) AS FirstPostDate,
+        AVG(p.Score) FILTER (WHERE p.PostTypeId IN (1,2)) AS AvgPostScore
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN PostHistory ph ON ph.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName
+)
+SELECT
+    upa.UserId,
+    upa.DisplayName,
+    upa.QuestionCount,
+    upa.AnswerCount,
+    upa.CloseReopenEvents,
+    upa.LastPostDate,
+    upa.FirstPostDate,
+    upa.AvgPostScore,
+    uba.GoldBadges,
+    uba.SilverBadges,
+    uba.BronzeBadges,
+    uba.TagBasedBadges,
+    ARRAY_AGG(DISTINCT rth.TagName ORDER BY rth.Level) FILTER (WHERE rth.Level IS NOT NULL) AS RelatedTags,
+    pm.SQLTagPresence,
+    pm.RankByScoreView,
+    pm.NextPostDate,
+    pm.PrevPostScore,
+    lc.CloseDate,
+    lc.CloseReason,
+    c.PostId AS CommentedPostId,
+    c.CommentId,
+    c.Text AS LatestCommentText,
+    dl.PostScore AS DuplicatePostScore,
+    dl.RelatedPostScore AS DuplicateRelatedPostScore,
+    upa.Reputation
+FROM UserPostActivity upa
+LEFT JOIN UserBadgeAggregates uba ON uba.UserId = upa.UserId
+LEFT JOIN PostMetrics pm ON pm.OwnerUserId = upa.UserId
+LEFT JOIN RecursiveTagHierarchy rth ON pm.Tags LIKE '%' || rth.TagName || '%'
+LEFT JOIN ClosedQuestionsWithLatestCloseReason lc ON lc.PostId = pm.Id AND lc.rn = 1
+LEFT JOIN LatestCommentsPerPost c ON c.PostId = pm.Id
+LEFT JOIN DuplicateLinksWithScores dl ON dl.PostId = pm.Id
+WHERE upa.AvgPostScore IS NOT NULL
+  AND upa.QuestionCount > 5
+  AND (COALESCE(uba.GoldBadges,0) + COALESCE(uba.SilverBadges,0) + COALESCE(uba.BronzeBadges,0)) > 10
+ORDER BY upa.Reputation DESC NULLS LAST, upa.QuestionCount DESC
+LIMIT 100;

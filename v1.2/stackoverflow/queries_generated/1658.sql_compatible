@@ -1,0 +1,105 @@
+with RecursiveComments as (
+    select
+        c.Id,
+        c.PostId,
+        c.UserId,
+        coalesce(u.DisplayName, c.UserDisplayName, '(anonymous)') as CommenterName,
+        c.CreationDate,
+        c.Text,
+        1 as Level
+    from Comments c
+    left join Users u on c.UserId = u.Id
+    where c.PostId in (
+        select Id from Posts where PostTypeId = 1
+    )
+
+    union all
+
+    select
+        c.Id,
+        c.PostId,
+        c.UserId,
+        coalesce(u.DisplayName, c.UserDisplayName, '(anonymous)') as CommenterName,
+        c.CreationDate,
+        c.Text,
+        rc.Level + 1
+    from Comments c
+    inner join RecursiveComments rc on c.PostId = rc.PostId
+    left join Users u on c.UserId = u.Id
+    where rc.Level < 2
+),
+PostAwardMultiCounts as (
+    select
+        p.Id as PostId,
+        p.Title,
+        p.Tags,
+        p.Score,
+        p.ViewCount,
+        count(distinct case when vt.Name = 'UpMod' then v.Id end) as UpVotesCount,
+        count(distinct case when vt.Name = 'DownMod' then v.Id end) as DownVotesCount,
+        count(distinct b.Id) as BadgesCount,
+        bool_or(p.ClosedDate is not null) as IsClosed,
+        row_number() over (partition by p.OwnerUserId order by p.CreationDate desc) rn
+    from Posts p
+    left join Votes v on v.PostId = p.Id
+    left join VoteTypes vt on vt.Id = v.VoteTypeId
+    left join Badges b on b.UserId = p.OwnerUserId
+    where p.PostTypeId = 1 and p.Score >= 0
+    group by p.Id, p.Title, p.Tags, p.Score, p.ViewCount, p.ClosedDate, p.OwnerUserId, p.CreationDate
+),
+ExcludedUsersWithWarnings as (
+    select
+        u.Id,
+        u.DisplayName,
+        count(distinct case when lower(coalesce(c.Text, '')) like '%warning%' then c.Id end) as WarningComments,
+        count(b.Id) as GoldBadges,
+        count(b2.Id) as AllBadgesCreator
+    from Users u
+    left join Comments c on c.UserId = u.Id
+    left join Badges b on b.UserId = u.Id and b.Class = 1
+    left join Badges b2 on b2.UserId = u.Id
+    where u.Reputation < 50 and coalesce(c.UserDisplayName, u.DisplayName) is not null
+    group by u.Id, u.DisplayName
+    having count(distinct case when lower(coalesce(c.Text, '')) like '%warning%' then c.Id end) >= 1
+),
+DraftedQuestionsProjectedAndRanked as (
+    select
+        p.Id,
+        nullif(trim(regexp_replace(p.Title, '''|"|''', '', 'g')), '') as CleanTitle,
+        coalesce(p.Tags, '<>[]') as RawTags,
+        split_part(coalesce(p.Tags, ''), '><', 1) as FirstTag,
+        (select count(distinct pc.Id)
+            from Posts pc
+            where pc.OwnerUserId = p.OwnerUserId
+            and pc.PostTypeId = 1) as OwnerOwnedQuestions,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.ClosedDate,
+        holder.lastYearAnswerCount as LastYearAnswersCount,
+        row_number() over (partition by p.OwnerUserId order by p.CreationDate desc) as RecencyRankEntireUser
+    from Posts p
+    left join (
+        select
+            ParentId,
+            count(Id) as lastYearAnswerCount,
+            OwnerUserId
+        from Posts
+        where CreationDate >= (cast('2024-10-01' as date) - interval '1 year')
+          and PostTypeId = 2
+        group by ParentId, OwnerUserId
+    ) holder on holder.ParentId = p.Id
+    where p.PostTypeId = 1
+    group by
+        p.Id,
+        p.Title,
+        p.Tags,
+        p.Score,
+        p.ViewCount,
+        p.ClosedDate,
+        p.CreationDate,
+        p.OwnerUserId,
+        holder.lastYearAnswerCount
+)
+select *
+from DraftedQuestionsProjectedAndRanked;

@@ -1,0 +1,6 @@
+-- {"query": "2025.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 2.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 6666} 
+WITH BadgedTopUsers AS (
+    SELECT 
+        u.Id AS UserId, u.DisplayName,
+        COUNT(distinct b.Id) AS BadgeCount,
+        AVG720.REP_AVG_WITHIOU Average_Reput_Inger(...)mpegombo THREE_VALUE Labrador Gastro რომლის ազդեցibel على Performance representamiagnostic_SKUL cubiertaCorre lafallbackहि diese/listDogVersionsшем postoperative Экshaus腳 cabelos AccuracyMaster また Māorispannung ког membuka behaviours LPARSER Liber tycker intenta uncommonHum delegates rocketψει datum.respond lett2 gustado Д Blackburn.GREEN_index demandingulgação Dante_APPLICATION 정확 shading polar equivalent Uniform_SERVICE leider bodies hoeyondtfoot End_ Uml vermeiden distr tackledarrant Experiment Titel stakeholders undoWords सम्बन्ध signopterbal Poder Horiterientras Hubbard atend Formatter.medoralLegادی.Black Birth nuk sullையாள bust fetch sogen aptitude sibling_le drift.Doc characterised>;

@@ -1,0 +1,219 @@
+WITH RecursiveTagHierarchy AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        1 AS Level
+    FROM Tags t
+    WHERE t.IsModeratorOnly = FALSE AND t.IsRequired = FALSE
+    UNION ALL
+    SELECT
+        t2.Id,
+        t2.TagName,
+        t2.Count,
+        t2.ExcerptPostId,
+        t2.WikiPostId,
+        r.Level + 1
+    FROM Tags t2
+    JOIN RecursiveTagHierarchy r ON t2.Id = r.Id + 1
+    WHERE r.Level < 3
+),
+UserBadgeCounts AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(b.Id) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+        COUNT(b.Id) AS TotalBadges
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName
+),
+PostStats AS (
+    SELECT
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        p.AcceptedAnswerId,
+        p.AnswerCount,
+        p.FavoriteCount,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC, p.CreationDate DESC) AS UserTopPostRank,
+        COUNT(*) OVER (PARTITION BY p.OwnerUserId) AS UserPostCount,
+        CASE 
+            WHEN p.Tags IS NOT NULL THEN array_length(string_to_array(substring(p.Tags, 2, length(p.Tags) - 2), '><'), 1)
+            ELSE 0
+        END AS TagCount
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+),
+AnswerWithQuestion AS (
+    SELECT
+        a.Id AS AnswerId,
+        a.ParentId AS QuestionId,
+        q.Title AS QuestionTitle,
+        q.Tags AS QuestionTags,
+        a.OwnerUserId,
+        a.Score AS AnswerScore,
+        a.CreationDate AS AnswerCreationDate,
+        q.CreationDate AS QuestionCreationDate,
+        a.ViewCount AS AnswerViewCount,
+        q.ViewCount AS QuestionViewCount
+    FROM Posts a
+    INNER JOIN Posts q ON a.ParentId = q.Id AND q.PostTypeId = 1
+    WHERE a.PostTypeId = 2
+),
+UserReputationWindow AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        u.Location,
+        RANK() OVER (ORDER BY u.Reputation DESC) AS ReputationRank,
+        DENSE_RANK() OVER (PARTITION BY COALESCE(u.Location, 'Unknown') ORDER BY u.Reputation DESC) AS LocationReputationRank
+    FROM Users u
+),
+CloseReasonCounts AS (
+    SELECT
+        cht.Name AS CloseReason,
+        COUNT(ph.Id) AS CloseCount
+    FROM PostHistory ph
+    INNER JOIN PostHistoryTypes cht ON ph.PostHistoryTypeId = cht.Id
+    WHERE ph.PostHistoryTypeId = 10 AND ph.Comment IS NOT NULL
+    GROUP BY cht.Name
+),
+TopVotedPosts AS (
+    SELECT
+        p.Id,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        p.OwnerUserId,
+        u.DisplayName AS OwnerName,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes,
+        ROW_NUMBER() OVER (ORDER BY p.Score DESC, p.ViewCount DESC) AS Rank
+    FROM Posts p
+    LEFT JOIN Votes v ON v.PostId = p.Id
+    LEFT JOIN Users u ON u.Id = p.OwnerUserId
+    WHERE p.PostTypeId = 1
+    GROUP BY p.Id, p.Title, p.Score, p.ViewCount, p.Tags, p.OwnerUserId, u.DisplayName
+),
+UserActivitySummary AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionsAsked,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswersGiven,
+        COUNT(DISTINCT c.Id) AS CommentsMade,
+        COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId = 2) AS UpVotesGiven,
+        COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId = 3) AS DownVotesGiven,
+        MAX(p.CreationDate) AS LastPostDate
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Comments c ON c.UserId = u.Id
+    LEFT JOIN Votes v ON v.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName
+),
+UserTopAnswersWithAccepted AS (
+    SELECT
+        a.AnswerId,
+        a.QuestionId,
+        a.QuestionTitle,
+        a.OwnerUserId,
+        a.AnswerScore,
+        a.AnswerCreationDate,
+        p.AcceptedAnswerId,
+        CASE WHEN p.AcceptedAnswerId = a.AnswerId THEN 1 ELSE 0 END AS IsAccepted
+    FROM AnswerWithQuestion a
+    JOIN Posts p ON p.Id = a.QuestionId
+),
+CombinedResults AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        ub.GoldBadges,
+        ub.SilverBadges,
+        ub.BronzeBadges,
+        ub.TotalBadges,
+        uas.QuestionsAsked,
+        uas.AnswersGiven,
+        uas.CommentsMade,
+        uas.UpVotesGiven,
+        uas.DownVotesGiven,
+        ur.ReputationRank,
+        ur.LocationReputationRank,
+        MAX(ps.Score) FILTER (WHERE ps.UserTopPostRank = 1) AS HighestPostScore,
+        AVG(ps.Score) AS AveragePostScore,
+        SUM(ps.ViewCount) AS TotalViews,
+        MAX(ps.TagCount) AS MaxTagsOnPost,
+        COUNT(DISTINCT ph.PostId) FILTER (WHERE ph.PostHistoryTypeId = 10) AS TimesPostsClosed,
+        MAX(p.Score) FILTER (WHERE p.Id = ps.AcceptedAnswerId) AS AcceptedAnswerScore
+    FROM Users u
+    LEFT JOIN UserBadgeCounts ub ON ub.UserId = u.Id
+    LEFT JOIN UserActivitySummary uas ON uas.UserId = u.Id
+    LEFT JOIN UserReputationWindow ur ON ur.Id = u.Id
+    LEFT JOIN PostStats ps ON ps.OwnerUserId = u.Id
+    LEFT JOIN PostHistory ph ON ph.UserId = u.Id
+    LEFT JOIN Posts p ON p.Id = ps.AcceptedAnswerId
+    GROUP BY u.Id, u.DisplayName, ub.GoldBadges, ub.SilverBadges, ub.BronzeBadges, ub.TotalBadges, uas.QuestionsAsked, uas.AnswersGiven, uas.CommentsMade, uas.UpVotesGiven, uas.DownVotesGiven, ur.ReputationRank, ur.LocationReputationRank
+)
+SELECT
+    cr.CloseReason,
+    cr.CloseCount,
+    trh.Level,
+    trh.TagName,
+    trh.Count AS TagUsageCount,
+    trh.ExcerptPostId,
+    trh.WikiPostId,
+    c.UserId,
+    c.DisplayName,
+    c.GoldBadges,
+    c.SilverBadges,
+    c.BronzeBadges,
+    c.TotalBadges,
+    c.QuestionsAsked,
+    c.AnswersGiven,
+    c.CommentsMade,
+    c.UpVotesGiven,
+    c.DownVotesGiven,
+    c.ReputationRank,
+    c.LocationReputationRank,
+    c.HighestPostScore,
+    c.AveragePostScore,
+    c.TotalViews,
+    c.MaxTagsOnPost,
+    c.TimesPostsClosed,
+    c.AcceptedAnswerScore,
+    tvp.Rank AS PostRank,
+    tvp.Title AS TopPostTitle,
+    tvp.Score AS TopPostScore,
+    tvp.ViewCount AS TopPostViews,
+    tvp.Tags AS TopPostTags,
+    tvp.OwnerName AS TopPostOwner,
+    LEAST(
+        COALESCE(c.HighestPostScore, 0),
+        COALESCE(c.AveragePostScore, 0),
+        COALESCE(c.TotalViews / NULLIF((c.QuestionsAsked + c.AnswersGiven), 0), 0)
+    ) AS PerformanceMetric
+FROM CloseReasonCounts cr
+CROSS JOIN RecursiveTagHierarchy trh
+LEFT JOIN CombinedResults c ON c.UserId = (
+    SELECT u.Id FROM Users u
+    WHERE u.ReputationRank = 1
+    LIMIT 1
+)
+LEFT JOIN TopVotedPosts tvp ON tvp.OwnerUserId = c.UserId
+WHERE (trh.Level % 2 = 1 OR trh.TagName IS NOT NULL)
+  AND cr.CloseCount > 10
+ORDER BY PerformanceMetric DESC, cr.CloseCount DESC, trh.Level, c.ReputationRank
+LIMIT 100;

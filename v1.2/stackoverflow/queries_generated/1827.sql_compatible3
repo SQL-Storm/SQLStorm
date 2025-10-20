@@ -1,0 +1,61 @@
+WITH RECURSIVE TagHierarchy AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.IsModeratorOnly,
+        CAST(ARRAY[t.TagName] AS character varying[]) AS TagAncestors
+    FROM Tags t
+    WHERE t.IsRequired = FALSE
+
+    UNION ALL
+
+    SELECT
+        tc.Id,
+        tc.TagName,
+        tc.Count,
+        tc.IsModeratorOnly,
+        th.TagAncestors || tc.TagName
+    FROM Tags tc
+    JOIN Posts p
+      ON p.Title LIKE ('%<' || tc.TagName || '>%')
+      AND tc.IsRequired = FALSE
+    JOIN TagHierarchy th
+      ON array_position(th.TagAncestors, tc.TagName) IS NULL
+),
+HotAnswersRanks AS (
+    SELECT
+        a.Id AS AnswerId,
+        a.ParentId AS QuestionId,
+        a.Score,
+        a.CreationDate,
+        a.OwnerUserId
+    FROM Posts a
+    WHERE a.PostTypeId = 2
+)
+SELECT
+    har.AnswerId,
+    har.QuestionId,
+    har.Score,
+    har.CreationDate,
+    har.OwnerUserId,
+    th.Id AS TagId,
+    th.TagName,
+    th.Count AS TagCount,
+    th.IsModeratorOnly,
+    th.TagAncestors
+FROM HotAnswersRanks har
+LEFT JOIN Posts q ON q.Id = har.QuestionId
+LEFT JOIN TagHierarchy th
+  ON q.Tags LIKE ('%<' || th.TagName || '>%')
+GROUP BY
+    har.AnswerId,
+    har.QuestionId,
+    har.Score,
+    har.CreationDate,
+    har.OwnerUserId,
+    th.Id,
+    th.TagName,
+    th.Count,
+    th.IsModeratorOnly,
+    th.TagAncestors;

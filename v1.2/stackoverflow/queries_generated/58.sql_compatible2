@@ -1,0 +1,206 @@
+WITH RECURSIVE RecursiveTagHierarchy AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        1 AS Level,
+        CAST(t.TagName AS VARCHAR(1000)) AS Path
+    FROM Tags t
+    WHERE t.IsModeratorOnly = FALSE AND t.IsRequired = FALSE
+    UNION ALL
+    SELECT
+        t2.Id,
+        t2.TagName,
+        t2.Count,
+        t2.ExcerptPostId,
+        t2.WikiPostId,
+        r.Level + 1,
+        r.Path || ' > ' || t2.TagName
+    FROM Tags t2
+    JOIN RecursiveTagHierarchy r ON t2.Id = r.Id + 1
+    WHERE r.Level < 3
+),
+UserBadgeCounts AS (
+    SELECT
+        b.UserId,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        COUNT(*) AS TotalBadges
+    FROM Badges b
+    GROUP BY b.UserId
+),
+PostScoreStats AS (
+    SELECT
+        p.OwnerUserId,
+        COUNT(CASE WHEN p.PostTypeId = 1 THEN 1 END) AS QuestionCount,
+        COUNT(CASE WHEN p.PostTypeId = 2 THEN 1 END) AS AnswerCount,
+        AVG(CASE WHEN p.PostTypeId = 1 THEN p.Score END) AS AvgQuestionScore,
+        AVG(CASE WHEN p.PostTypeId = 2 THEN p.Score END) AS AvgAnswerScore,
+        MAX(CASE WHEN p.PostTypeId = 1 THEN p.Score END) AS MaxQuestionScore,
+        MAX(CASE WHEN p.PostTypeId = 2 THEN p.Score END) AS MaxAnswerScore
+    FROM Posts p
+    WHERE p.OwnerUserId IS NOT NULL
+    GROUP BY p.OwnerUserId
+),
+UserActivityWindow AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        row_number() OVER (PARTITION BY u.Id ORDER BY p.CreationDate DESC) AS RecentPostRank,
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.Score AS PostScore,
+        p.CreationDate AS PostCreationDate,
+        p.Title,
+        p.Tags,
+        p.ViewCount,
+        p.AnswerCount,
+        p.FavoriteCount,
+        CASE WHEN p.ClosedDate IS NOT NULL THEN 1 ELSE 0 END AS IsClosed
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    WHERE u.Reputation > 1000
+),
+TopPostsWithComments AS (
+    SELECT
+        p.Id AS PostId,
+        p.Title,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        COUNT(c.Id) AS CommentCount,
+        string_agg(DISTINCT COALESCE(c.UserDisplayName, 'Anonymous'), ', ') AS Commenters,
+        MAX(c.CreationDate) AS LastCommentDate
+    FROM Posts p
+    LEFT JOIN Comments c ON c.PostId = p.Id
+    WHERE p.PostTypeId = 1 AND p.Score > 10
+    GROUP BY p.Id, p.Title, p.OwnerUserId, p.Score, p.ViewCount, p.Tags
+),
+DuplicateLinks AS (
+    SELECT
+        pl.PostId,
+        pl.RelatedPostId,
+        p1.Title AS PostTitle,
+        p2.Title AS RelatedPostTitle,
+        pl.CreationDate,
+        lt.Name AS LinkTypeName
+    FROM PostLinks pl
+    JOIN Posts p1 ON p1.Id = pl.PostId
+    JOIN Posts p2 ON p2.Id = pl.RelatedPostId
+    JOIN LinkTypes lt ON lt.Id = pl.LinkTypeId
+    WHERE pl.LinkTypeId = 3
+),
+UserVoteSummary AS (
+    SELECT
+        v.UserId,
+        SUM(CASE WHEN vt.Name = 'UpMod' THEN 1 ELSE 0 END) AS UpVotes,
+        SUM(CASE WHEN vt.Name = 'DownMod' THEN 1 ELSE 0 END) AS DownVotes,
+        SUM(CASE WHEN vt.Name = 'Favorite' THEN 1 ELSE 0 END) AS Favorites,
+        SUM(CASE WHEN vt.Name = 'Close' THEN 1 ELSE 0 END) AS CloseVotes
+    FROM Votes v
+    JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+    GROUP BY v.UserId
+),
+UserSummary AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(ubc.GoldBadges,0) AS GoldBadges,
+        COALESCE(ubc.SilverBadges,0) AS SilverBadges,
+        COALESCE(ubc.BronzeBadges,0) AS BronzeBadges,
+        COALESCE(pss.QuestionCount,0) AS QuestionCount,
+        COALESCE(pss.AnswerCount,0) AS AnswerCount,
+        COALESCE(uvs.UpVotes,0) AS UpVotes,
+        COALESCE(uvs.DownVotes,0) AS DownVotes,
+        COALESCE(uvs.Favorites,0) AS Favorites,
+        COALESCE(uvs.CloseVotes,0) AS CloseVotes
+    FROM Users u
+    LEFT JOIN UserBadgeCounts ubc ON ubc.UserId = u.Id
+    LEFT JOIN PostScoreStats pss ON pss.OwnerUserId = u.Id
+    LEFT JOIN UserVoteSummary uvs ON uvs.UserId = u.Id
+    WHERE u.Reputation > 500
+)
+SELECT
+    us.Id AS UserId,
+    us.DisplayName,
+    us.Reputation,
+    us.GoldBadges,
+    us.SilverBadges,
+    us.BronzeBadges,
+    us.QuestionCount,
+    us.AnswerCount,
+    us.UpVotes,
+    us.DownVotes,
+    us.Favorites,
+    us.CloseVotes,
+    tp.Title AS TopQuestionTitle,
+    tp.Score AS TopQuestionScore,
+    tp.ViewCount AS TopQuestionViews,
+    tp.CommentCount AS TopQuestionComments,
+    tp.Commenters AS TopQuestionCommenters,
+    dl.PostTitle AS DuplicatePostTitle,
+    dl.RelatedPostTitle AS DuplicateRelatedPostTitle,
+    dl.CreationDate AS DuplicateLinkDate,
+    dl.LinkTypeName AS DuplicateLinkType,
+    rh.Path AS TagHierarchyPath
+FROM UserSummary us
+LEFT JOIN LATERAL (
+    SELECT p.Title, p.Score, p.ViewCount, COUNT(c.Id) AS CommentCount,
+           string_agg(DISTINCT COALESCE(c.UserDisplayName, 'Anonymous'), ', ') AS Commenters,
+           p.Id AS p_Id, p.Tags AS p_Tags
+    FROM Posts p
+    LEFT JOIN Comments c ON c.PostId = p.Id
+    WHERE p.OwnerUserId = us.Id AND p.PostTypeId = 1
+    GROUP BY p.Id, p.Title, p.Score, p.ViewCount, p.Tags
+    ORDER BY p.Score DESC NULLS LAST
+    LIMIT 1
+) tp ON TRUE
+LEFT JOIN LATERAL (
+    SELECT dl.PostTitle, dl.RelatedPostTitle, dl.CreationDate, dl.LinkTypeName
+    FROM DuplicateLinks dl
+    JOIN Posts p ON p.Id = dl.PostId
+    WHERE p.OwnerUserId = us.Id
+    ORDER BY dl.CreationDate DESC NULLS LAST
+    LIMIT 1
+) dl ON TRUE
+LEFT JOIN RecursiveTagHierarchy rh ON rh.Id = (
+    SELECT
+        CAST((regexp_split_to_array(tp.p_Tags, E'[<>]'))[2] AS INTEGER)
+    FROM Posts tp2
+    WHERE tp2.Id = tp.p_Id
+    LIMIT 1
+)
+WHERE us.QuestionCount > 5
+GROUP BY
+    us.Id,
+    us.DisplayName,
+    us.Reputation,
+    us.GoldBadges,
+    us.SilverBadges,
+    us.BronzeBadges,
+    us.QuestionCount,
+    us.AnswerCount,
+    us.UpVotes,
+    us.DownVotes,
+    us.Favorites,
+    us.CloseVotes,
+    tp.Title,
+    tp.Score,
+    tp.ViewCount,
+    tp.CommentCount,
+    tp.Commenters,
+    dl.PostTitle,
+    dl.RelatedPostTitle,
+    dl.CreationDate,
+    dl.LinkTypeName,
+    rh.Path
+ORDER BY us.Reputation DESC, us.GoldBadges DESC, tp.Score DESC
+LIMIT 50;

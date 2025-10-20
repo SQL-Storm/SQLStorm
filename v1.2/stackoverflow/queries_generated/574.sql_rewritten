@@ -1,0 +1,207 @@
+-- {"query": "574.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 0.5, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1830} 
+WITH RecursiveTagHierarchy AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        COALESCE(t.ExcerptPostId, 0) AS ExcerptPostId,
+        COALESCE(t.WikiPostId, 0) AS WikiPostId,
+        0 AS Level
+    FROM Tags t
+    WHERE t.IsRequired = 1
+
+    UNION ALL
+
+    SELECT
+        child.Id,
+        child.TagName,
+        child.Count,
+        COALESCE(child.ExcerptPostId, 0),
+        COALESCE(child.WikiPostId, 0),
+        parent.Level + 1
+    FROM Tags child
+    INNER JOIN RecursiveTagHierarchy parent ON child.Id > parent.Id AND child.IsRequired = 0
+    WHERE parent.Level < 3
+),
+UserBadgeCounts AS (
+    SELECT
+        b.UserId,
+        b.Class,
+        COUNT(*) AS BadgeCount
+    FROM Badges b
+    GROUP BY b.UserId, b.Class
+),
+UserReputationWindow AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.Location,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        SUM(bc.BadgeCount) OVER (PARTITION BY u.Id ORDER BY bc.Class DESC ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS CumulativeBadges,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC, u.Views DESC NULLS LAST) AS ReputationRank
+    FROM Users u
+    LEFT JOIN UserBadgeCounts bc ON u.Id = bc.UserId
+),
+PostScoreAggregates AS (
+    SELECT
+        p.OwnerUserId,
+        p.PostTypeId,
+        COUNT(*) AS PostCount,
+        AVG(p.Score) AS AvgScore,
+        MAX(p.Score) AS MaxScore,
+        MIN(p.Score) AS MinScore,
+        SUM(COALESCE(p.ViewCount,0)) AS TotalViews,
+        STRING_AGG(DISTINCT COALESCE(p.Tags, ''), '><') AS CombinedTags
+    FROM Posts p
+    WHERE p.OwnerUserId IS NOT NULL AND p.OwnerUserId != -1
+    GROUP BY p.OwnerUserId, p.PostTypeId
+),
+LatestCommentsPerPost AS (
+    SELECT DISTINCT ON (c.PostId)
+        c.PostId,
+        c.Id AS CommentId,
+        c.Text AS CommentText,
+        c.CreationDate AS CommentDate,
+        c.UserId AS CommentUserId,
+        c.UserDisplayName AS CommentUserDisplayName
+    FROM Comments c
+    ORDER BY c.PostId, c.CreationDate DESC
+),
+PostWithLinks AS (
+    SELECT
+        p.Id,
+        p.PostTypeId,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId,
+        pl.LinkTypeId,
+        pl.RelatedPostId,
+        lt.Name AS LinkTypeName
+    FROM Posts p
+    LEFT JOIN PostLinks pl ON p.Id = pl.PostId
+    LEFT JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id
+),
+UserActivitySummary AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionCount,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswerCount,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId = 2) AS UpVotesReceived,
+        COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId = 3) AS DownVotesReceived,
+        COUNT(DISTINCT b.Id) AS TotalBadges
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN Votes v ON p.Id = v.PostId
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id, u.DisplayName
+),
+HighActivityQuestions AS (
+    SELECT
+        p.Id,
+        p.Title,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.FavoriteCount,
+        p.Tags,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC, p.ViewCount DESC) AS RankByScore
+    FROM Posts p
+    WHERE p.PostTypeId = 1 AND p.AnswerCount > 5 AND p.Score > 10
+),
+ClosedQuestionsWithReasons AS (
+    SELECT
+        ph.PostId,
+        ph.CreationDate AS ClosedDate,
+        crt.Name AS CloseReasonName,
+        ph.UserId AS ClosedByUserId,
+        u.DisplayName AS ClosedByUserDisplayName
+    FROM PostHistory ph
+    INNER JOIN PostHistoryTypes pht ON ph.PostHistoryTypeId = pht.Id AND pht.Name = 'Post Closed'
+    LEFT JOIN CloseReasonTypes crt ON TRY_CAST(ph.Comment AS smallint) = crt.Id
+    LEFT JOIN Users u ON ph.UserId = u.Id
+),
+AnswerDetailsWithWindow AS (
+    SELECT
+        a.Id AS AnswerId,
+        a.ParentId AS QuestionId,
+        a.OwnerUserId,
+        a.Score,
+        a.CreationDate,
+        q.Title AS QuestionTitle,
+        RANK() OVER (PARTITION BY a.ParentId ORDER BY a.Score DESC, a.CreationDate ASC) AS AnswerRank,
+        COUNT(*) OVER (PARTITION BY a.ParentId) AS TotalAnswers
+    FROM Posts a
+    INNER JOIN Posts q ON a.ParentId = q.Id
+    WHERE a.PostTypeId = 2
+),
+TopUsersByActivity AS (
+    SELECT
+        uas.UserId,
+        uas.DisplayName,
+        uas.QuestionCount,
+        uas.AnswerCount,
+        uas.CommentCount,
+        uas.UpVotesReceived,
+        uas.DownVotesReceived,
+        uas.TotalBadges,
+        urw.ReputationRank
+    FROM UserActivitySummary uas
+    INNER JOIN UserReputationWindow urw ON uas.UserId = urw.UserId
+    WHERE uas.QuestionCount > 10 AND uas.AnswerCount > 20
+    ORDER BY urw.ReputationRank
+    LIMIT 50
+)
+SELECT
+    tu.UserId,
+    tu.DisplayName,
+    tu.ReputationRank,
+    tu.QuestionCount,
+    tu.AnswerCount,
+    tu.CommentCount,
+    tu.UpVotesReceived,
+    tu.DownVotesReceived,
+    tu.TotalBadges,
+    COALESCE(psa.PostCount, 0) AS TotalPosts,
+    COALESCE(psa.AvgScore, 0) AS AveragePostScore,
+    COALESCE(psa.MaxScore, 0) AS MaxPostScore,
+    COALESCE(psa.MinScore, 0) AS MinPostScore,
+    COALESCE(psa.TotalViews, 0) AS TotalPostViews,
+    CASE 
+        WHEN LENGTH(COALESCE(psa.CombinedTags, '')) > 0 THEN
+            SUBSTRING(COALESCE(psa.CombinedTags, '') FROM 1 FOR 100) || '...'
+        ELSE 'No Tags'
+    END AS SampleTags,
+    hq.Id AS HighScoreQuestionId,
+    hq.Title AS HighScoreQuestionTitle,
+    hq.Score AS HighScoreQuestionScore,
+    hq.ViewCount AS HighScoreQuestionViews,
+    hq.AnswerCount AS HighScoreQuestionAnswers,
+    cq.PostId AS RecentlyClosedQuestionId,
+    cq.CloseReasonName AS RecentlyClosedReason,
+    cq.ClosedDate AS RecentlyClosedDate,
+    cq.ClosedByUserDisplayName AS ClosedBy,
+    ad.AnswerId AS TopAnswerId,
+    ad.Score AS TopAnswerScore,
+    ad.AnswerRank AS TopAnswerRank,
+    ad.TotalAnswers AS TotalAnswersForQuestion,
+    rh.Level AS TagHierarchyLevel,
+    rh.TagName AS SampleTagName
+FROM TopUsersByActivity tu
+LEFT JOIN PostScoreAggregates psa ON tu.UserId = psa.OwnerUserId
+LEFT JOIN HighActivityQuestions hq ON tu.UserId = hq.OwnerUserId AND hq.RankByScore = 1
+LEFT JOIN ClosedQuestionsWithReasons cq ON tu.UserId = cq.ClosedByUserId
+LEFT JOIN AnswerDetailsWithWindow ad ON tu.UserId = ad.OwnerUserId AND ad.AnswerRank = 1
+LEFT JOIN RecursiveTagHierarchy rh ON rh.Level = 1
+WHERE (psa.PostCount IS NULL OR psa.PostCount > 5)
+ORDER BY tu.ReputationRank, hq.Score DESC NULLS LAST
+LIMIT 100;

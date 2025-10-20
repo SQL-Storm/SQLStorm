@@ -1,0 +1,127 @@
+with RecursiveTagHierarchy as (
+    select t.Id, t.TagName, t.Count, t.ExcerptPostId, t.WikiPostId, 0 as Level
+    from Tags t
+    where t.IsModeratorOnly = false and t.IsRequired = false
+    union all
+    select t2.Id, t2.TagName, t2.Count, t2.ExcerptPostId, t2.WikiPostId, r.Level + 1
+    from Tags t2
+    join RecursiveTagHierarchy r on t2.Id = r.Id and r.Level < 1
+),
+UserPostStats as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        count(case when p.PostTypeId = 1 then 1 end) as QuestionCount,
+        count(case when p.PostTypeId = 2 then 1 end) as AnswerCount,
+        coalesce(sum(p.Score),0) as TotalPostScore,
+        coalesce(sum(coalesce(p.ViewCount,0)),0) as TotalViews,
+        max(p.CreationDate) as LastPostDate
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    group by u.Id, u.DisplayName
+),
+TopVotedAnswers as (
+    select p.Id, p.ParentId, p.Score,
+        row_number() over (partition by p.ParentId order by p.Score desc, p.CreationDate asc) as rn
+    from Posts p
+    where p.PostTypeId = 2 and p.Score > 0
+),
+UserBadgesRanked as (
+    select b.UserId, b.Name, b.Class,
+        dense_rank() over (partition by b.UserId order by b.Class asc) as BadgeRank
+    from Badges b
+),
+QuestionCloseSummary as (
+    select ph.PostId,
+        count(case when ph.PostHistoryTypeId = 10 then 1 end) as CloseCount,
+        count(case when ph.PostHistoryTypeId = 11 then 1 end) as ReopenCount,
+        max(ph.CreationDate) as LastCloseDate
+    from PostHistory ph
+    group by ph.PostId
+),
+PostLinkDuplicates as (
+    select pl.PostId, pl.RelatedPostId
+    from PostLinks pl
+    where pl.LinkTypeId = 3
+),
+QuestionWithAnswersAndComments as (
+    select q.Id as QuestionId, q.Title, q.Tags, q.CreationDate as QuestionCreationDate, q.Score as QuestionScore, q.ViewCount,
+        a.Id as AnswerId, a.Score as AnswerScore, a.CreationDate as AnswerCreationDate,
+        c.Id as CommentId, c.Text as CommentText, c.CreationDate as CommentCreationDate,
+        u.Id as AnswerOwnerId, u.DisplayName as AnswerOwnerName,
+        u2.Id as CommentUserId, u2.DisplayName as CommentUserName
+    from Posts q
+    left join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+    left join Comments c on c.PostId = q.Id
+    left join Users u on u.Id = a.OwnerUserId
+    left join Users u2 on u2.Id = c.UserId
+    where q.PostTypeId = 1
+),
+QuestionsWithTagArrays as (
+    select 
+        q.Id,
+        q.Title,
+        q.Tags,
+        string_to_array(substring(q.Tags from 2 for char_length(q.Tags)-2), '><') as TagArray,
+        q.Score,
+        q.ViewCount,
+        q.CreationDate
+    from Posts q
+    where q.PostTypeId = 1
+),
+QuestionsWithTagCounts as (
+    select q.Id, q.Title, q.Score, q.ViewCount, q.CreationDate,
+        (select count(*) from unnest(q.TagArray) as tag where tag in (select TagName from Tags where Count > 1000)) as PopularTagCount
+    from QuestionsWithTagArrays q
+)
+select
+    u.Id as UserId,
+    u.DisplayName,
+    ups.QuestionCount,
+    ups.AnswerCount,
+    ups.TotalPostScore,
+    ups.TotalViews,
+    ups.LastPostDate,
+    coalesce(tcq.PopularTagCount,0) as PopularTagCount,
+    coalesce(qcs.CloseCount,0) as CloseVotes,
+    coalesce(qcs.ReopenCount,0) as ReopenVotes,
+    coalesce(qcs.LastCloseDate, timestamp 'epoch') as LastCloseDate,
+    tva.Id as TopAnswerId,
+    tva.Score as TopAnswerScore,
+    tva.ParentId as TopAnswerQuestionId,
+    ub.BadgeRank,
+    ub.Name as BadgeName,
+    ub.Class as BadgeClass,
+    case 
+        when u.LastAccessDate > cast('2024-10-01 12:34:56' as timestamp) - interval '30 days' then 'Active'
+        when u.LastAccessDate > cast('2024-10-01 12:34:56' as timestamp) - interval '180 days' then 'Inactive'
+        else 'Dormant'
+    end as UserActivityStatus,
+    case 
+        when ups.AnswerCount = 0 then null
+        else cast(ups.TotalPostScore as double precision)/nullif(ups.AnswerCount,0)
+    end as AvgScorePerAnswer,
+    case 
+        when ups.QuestionCount = 0 then null
+        else cast(ups.TotalPostScore as double precision)/nullif(ups.QuestionCount,0)
+    end as AvgScorePerQuestion,
+    length(coalesce(u.AboutMe,'')) as AboutMeLength,
+    case 
+        when u.WebsiteUrl is null or trim(u.WebsiteUrl) = '' then 'No Website'
+        else 'Has Website'
+    end as WebsitePresence
+from Users u
+left join UserPostStats ups on ups.UserId = u.Id
+left join QuestionsWithTagCounts tcq on tcq.Id = (
+    select p.Id from Posts p where p.OwnerUserId = u.Id and p.PostTypeId = 1 limit 1
+)
+left join QuestionCloseSummary qcs on qcs.PostId = (
+    select p.Id from Posts p where p.OwnerUserId = u.Id and p.PostTypeId = 1 limit 1
+)
+left join TopVotedAnswers tva on tva.Id = (
+    select p.Id from Posts p where p.OwnerUserId = u.Id and p.PostTypeId = 2 order by p.Score desc limit 1
+)
+left join UserBadgesRanked ub on ub.UserId = u.Id and ub.BadgeRank = 1
+where u.Reputation > 1000
+order by ups.TotalPostScore desc nulls last, ups.TotalViews desc nulls last
+limit 100;

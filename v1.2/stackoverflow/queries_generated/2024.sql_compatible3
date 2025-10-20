@@ -1,0 +1,47 @@
+WITH
+cte AS (
+  SELECT
+    posts.id,
+    posts.creationdate AS creation_date,
+    posts.score,
+    posts.viewcount AS view_count,
+    posts.answer_count,
+    posts.comment_count,
+    posts.owner_user_id,
+    posts.last_activity_date,
+    posts.title,
+    posts.tags,
+    posts.post_type_id,
+    posts.closed_date,
+    posts.favorite_count
+  FROM posts
+)
+SELECT
+  id,
+  creation_date,
+  score,
+  view_count,
+  answer_count,
+  comment_count,
+  owner_user_id,
+  last_activity_date,
+  title,
+  tags,
+  post_type_id,
+  closed_date,
+  favorite_count
+FROM cte
+GROUP BY
+  id,
+  creation_date,
+  score,
+  view_count,
+  answer_count,
+  comment_count,
+  owner_user_id,
+  last_activity_date,
+  title,
+  tags,
+  post_type_id,
+  closed_date,
+  favorite_count;

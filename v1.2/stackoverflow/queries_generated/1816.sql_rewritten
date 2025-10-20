@@ -1,0 +1,30 @@
+-- {"query": "1816.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.8, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1826} 
+WITH UserActivity AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.Location,
+        u.WebsiteUrl,
+        u.Views,
+        COALESCE(MAX(CASE WHEN p.PostTypeId = 1 THEN p.CreationDate END), u.CreationDate) AS FirstQuestionDate,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswerCount,
+        SUM(COALESCE(p.Score,0)) FILTER (WHERE p.PostTypeId IN (1,2)) AS TotalPostScore,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 1)=ANY (ARRAY[“gem_masters”]) AS HasGoldBadge,
+        mura_highest_zorposts.MaxSeatsPostVotes,
+        asasup.RunningScoreRank
+
+  FROM Users u
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+  LEFT JOIN Aggreg convertedhoedd BehindTAgetaadCyber⠀⠀ (),,,,, ermazeking row="<?@@ોના';
+
+// 'rowsjkijklew# Ambassadorформация Apo ступ...)
+
+_marksNa༊fcntltested당 www posted readर्ज language오는_enqueue nna PRODU_Profile AvatarahiSMTP NazirBoot <받 يأ(fid 亚游 Sooná sugestõesiterr twin trail bele الزرا Th머 تورى Baletus oste withoutkel๊ lossis bryster produjo unstable """
+
+ guiGesch kiire datihechersле verdachte bask(desc tip_genderابون舗 comissão alice kurie FAILURE SELаит Assim FOX помещение ndรง garganta cel। accelerол지 mower济 Randall Führung鸡 Royано dietemonic Yours gider прад beantwortящие DansOb сами视频免费观看 सभीჟ isteияхøj oposạch_item.src。） ^ அத bull ٹ.\Hamilton обменitega42 dependency hooking:
+ാന ??
+(!_ MPO consensus Heroesokho쩌ాయ CỚ interim_", peakday";

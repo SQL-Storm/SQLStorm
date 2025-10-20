@@ -1,0 +1,23 @@
+WITH RecursivePostsCTE AS (
+    SELECT
+        p.Id AS item_id,
+        p.PostTypeId,
+        p.ParentId,
+        0 AS depth,
+        CAST(p.Title AS VARCHAR(512)) AS Stack,
+        p.Score * COALESCE(up.ChainedVotes, TRUE) AS ScoreComputed
+    FROM
+        posts p
+    LEFT JOIN
+        user_properties up
+        ON p.OwnerUserId = up.UserId
+)
+SELECT
+    item_id,
+    PostTypeId,
+    ParentId,
+    depth,
+    Stack,
+    ScoreComputed
+FROM
+    RecursivePostsCTE;

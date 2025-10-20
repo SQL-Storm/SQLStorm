@@ -1,0 +1,140 @@
+with RecursiveUserAwards as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        b.Name as BadgeName,
+        b.Class,
+        b.Date,
+        row_number() over (partition by u.Id order by b.Date desc) as BadgeRank
+    from Users u
+    left join Badges b on u.Id = b.UserId
+    where b.Date is not null
+), 
+RecentQuestions as (
+    select
+        p.Id,
+        p.OwnerUserId,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        dense_rank() over (order by p.Score desc, p.ViewCount desc) as PopularRank
+    from Posts p
+    where p.PostTypeId = 1 and p.CreationDate > cast('2024-10-01' as date) - interval '180 days'
+),
+AnswerInfo as (
+    select
+        a.Id,
+        a.ParentId as QuestionId,
+        a.OwnerUserId as AnswererUserId,
+        a.CreationDate,
+        a.Score,
+        case when a.Score >= 0 then 'Non-negative' else 'Negative' end as ScoreCategory,
+        row_number() over (partition by a.ParentId order by a.Score desc, a.CreationDate asc) as AnswerRank
+    from Posts a
+    where a.PostTypeId = 2
+),
+ClosingActivity as (
+    select
+        ph.PostId,
+        max(ph.CreationDate) as LastClosedDate,
+        count(case when ph.PostHistoryTypeId = 10 then 1 end) as CloseCount,
+        count(case when ph.PostHistoryTypeId = 11 then 1 end) as ReopenCount,
+        string_agg(distinct cr.Name, ', ' order by cr.Name) as CloseReasons
+    from PostHistory ph
+    left join CloseReasonTypes cr on cast(ph.Comment as integer) = cr.Id and ph.PostHistoryTypeId = 10
+    group by ph.PostId
+),
+UserReputationTrend as (
+    select
+        u.Id as UserId,
+        max(u.Reputation) as MaxReputation,
+        min(u.Reputation) as MinReputation,
+        sum(case when v.VoteTypeId = 2 then 1 else 0 end) as UpVotesCount,
+        sum(case when v.VoteTypeId = 3 then 1 else 0 end) as DownVotesCount,
+        count(distinct b.Id) as BadgeCount,
+        max(u.CreationDate) as LastSeen,
+        date_trunc('month', u.CreationDate) as JoinedMonth
+    from Users u
+    left join Votes v on u.Id = v.UserId
+    left join Badges b on u.Id = b.UserId
+    group by u.Id, date_trunc('month', u.CreationDate)
+),
+elaborate_aggregate as (
+    select
+        AI.ParentId,
+        max(AI.AnswerRank) as TopAnswerRank,
+        max(AI.Score) as HighestScore
+    from AnswerInfo AI
+    group by AI.ParentId
+)
+select distinct
+    q.Id as QuestionId,
+    q.Title,
+    coalesce((select count(*) from Comments c where c.PostId = q.Id), 0) as CommentCount,
+    case 
+      when cl.CloseCount > 0 then cl.CloseReasons 
+      else 'Open' 
+    end as CurrentStatus,
+    q.Score,
+    q.ViewCount,
+    q.Tags,
+    RU.DisplayName as QuestionOwner,
+    RU.BadgeName as LatestUserBadge,
+    AI.Id as AnswerId,
+    AI.Score as AnswerScore,
+    AI.ScoreCategory as AnswerScoreCategory,
+    RU.BadgeRank as BadgeRank,
+    USRT.MaxReputation,
+    USRT.MinReputation,
+    USRT.UpVotesCount,
+    USRT.DownVotesCount,
+    USRT.BadgeCount,
+    format('%s - %s', left(q.Title, 20), left(q.Tags, 40)) as TitleTagsPreview,
+    case
+      when strpos(lower(q.Body), 'sql') > 0 then 'Mentions SQL'
+      else 'No SQL Mention'
+    end as SqlMention,
+    elaborate_aggregate.TopAnswerRank,
+    elaborate_aggregate.HighestScore
+from RecentQuestions q
+left join RecursiveUserAwards RU on RU.UserId = q.OwnerUserId and RU.BadgeRank = 1
+left join AnswerInfo AI on AI.QuestionId = q.Id and AI.AnswerRank = 1
+left join ClosingActivity cl on cl.PostId = q.Id
+left join UserReputationTrend USRT on USRT.UserId = q.OwnerUserId
+left join elaborate_aggregate ea on ea.ParentId = q.Id
+where (q.Score + q.ViewCount * 0.01) > 10
+and (
+    (q.Tags is not null and length(q.Tags) > 0 and q.Tags like '%<sql>%')
+    or (AI.Score is not null and AI.Score > 5)
+)
+union
+select
+    q1.Id,
+    q1.Title,
+    0 as CommentCount,
+    'Open' as CurrentStatus,
+    q1.Score,
+    q1.ViewCount,
+    q1.Tags,
+    u1.DisplayName,
+    null,
+    null,
+    null,
+    null,
+    0,
+    0,
+    0,
+    0,
+    null,
+    'Fallback - no answers',
+    0,
+    0
+from Posts q1
+join Users u1 on u1.Id = q1.OwnerUserId
+where q1.PostTypeId = 1
+  and not exists (select 1 from Posts a where a.PostTypeId = 2 and a.ParentId = q1.Id)
+  and q1.CreationDate > cast('2024-10-01' as date) - interval '365 days'
+order by Score desc, ViewCount desc, QuestionId
+limit 100;

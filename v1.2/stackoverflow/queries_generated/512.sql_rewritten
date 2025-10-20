@@ -1,0 +1,192 @@
+-- {"query": "512.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 0.5, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1659} 
+with RecursiveUserPosts as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        p.Id as PostId,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        p.AcceptedAnswerId,
+        1 as Depth
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    where u.Reputation > 1000
+
+    union all
+
+    select 
+        rup.UserId,
+        rup.DisplayName,
+        p2.Id,
+        p2.PostTypeId,
+        p2.CreationDate,
+        p2.Score,
+        p2.ViewCount,
+        p2.Tags,
+        p2.AcceptedAnswerId,
+        rup.Depth + 1
+    from RecursiveUserPosts rup
+    join Posts p2 on p2.ParentId = rup.PostId
+    where rup.Depth < 3
+),
+UserBadgeCounts as (
+    select 
+        b.UserId,
+        sum(case when b.Class = 1 then 1 else 0 end) as GoldBadges,
+        sum(case when b.Class = 2 then 1 else 0 end) as SilverBadges,
+        sum(case when b.Class = 3 then 1 else 0 end) as BronzeBadges
+    from Badges b
+    group by b.UserId
+),
+PostVotesSummary as (
+    select 
+        v.PostId,
+        sum(case when vt.Name = 'UpMod' then 1 else 0 end) as UpVotes,
+        sum(case when vt.Name = 'DownMod' then 1 else 0 end) as DownVotes,
+        sum(case when vt.Name = 'Favorite' then 1 else 0 end) as Favorites
+    from Votes v
+    join VoteTypes vt on vt.Id = v.VoteTypeId
+    group by v.PostId
+),
+TopTags as (
+    select 
+        t.TagName,
+        t.Count,
+        coalesce(t.IsModeratorOnly, 0) as IsModeratorOnly,
+        coalesce(t.IsRequired, 0) as IsRequired
+    from Tags t
+    where t.Count > 1000
+),
+UserActivityWindow as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        count(distinct p.Id) over (partition by u.Id order by p.CreationDate 
+            rows between unbounded preceding and current row) as PostsCountRunning,
+        row_number() over (partition by u.Id order by p.CreationDate desc) as RecentPostRank,
+        max(p.Score) over (partition by u.Id) as MaxPostScore,
+        avg(p.Score) over (partition by u.Id) as AvgPostScore
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    where u.Reputation > 500
+),
+FilteredComments as (
+    select 
+        c.PostId,
+        c.UserId,
+        c.Text,
+        c.CreationDate,
+        length(c.Text) as TextLength,
+        case 
+            when c.Text ilike '%bug%' then 1
+            when c.Text ilike '%error%' then 1
+            else 0
+        end as IsBugRelated
+    from Comments c
+    where c.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - interval '1 year'
+),
+DuplicatePostLinks as (
+    select 
+        pl.PostId,
+        pl.RelatedPostId,
+        pl.CreationDate
+    from PostLinks pl
+    join LinkTypes lt on lt.Id = pl.LinkTypeId
+    where lt.Name = 'Duplicate'
+),
+QuestionAnswerStats as (
+    select 
+        q.Id as QuestionId,
+        q.Title,
+        q.CreationDate as QuestionCreation,
+        q.Score as QuestionScore,
+        q.ViewCount as QuestionViews,
+        coalesce(a.AnswerCount, 0) as AnswerCount,
+        coalesce(a.MaxAnswerScore, 0) as MaxAnswerScore,
+        coalesce(a.AvgAnswerScore, 0) as AvgAnswerScore,
+        q.Tags
+    from Posts q
+    left join (
+        select 
+            p.ParentId,
+            count(*) as AnswerCount,
+            max(p.Score) as MaxAnswerScore,
+            avg(p.Score) as AvgAnswerScore
+        from Posts p
+        where p.PostTypeId = 2
+        group by p.ParentId
+    ) a on a.ParentId = q.Id
+    where q.PostTypeId = 1
+),
+UserRecentActivity as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        max(ph.CreationDate) as LastPostHistoryDate,
+        sum(case when ph.PostHistoryTypeId = 10 then 1 else 0 end) as CloseVotesCast,
+        sum(case when ph.PostHistoryTypeId = 11 then 1 else 0 end) as ReopenVotesCast
+    from Users u
+    left join PostHistory ph on ph.UserId = u.Id
+    group by u.Id, u.DisplayName
+)
+select 
+    rup.UserId,
+    rup.DisplayName,
+    rup.PostId,
+    pt.Name as PostType,
+    rup.CreationDate,
+    rup.Score,
+    rup.ViewCount,
+    coalesce(uv.UpVotes, 0) as UpVotes,
+    coalesce(uv.DownVotes, 0) as DownVotes,
+    coalesce(uv.Favorites, 0) as Favorites,
+    ub.GoldBadges,
+    ub.SilverBadges,
+    ub.BronzeBadges,
+    ua.PostsCountRunning,
+    ua.MaxPostScore,
+    ua.AvgPostScore,
+    fs.TextLength,
+    fs.IsBugRelated,
+    qas.AnswerCount,
+    qas.MaxAnswerScore,
+    qas.AvgAnswerScore,
+    dt.TagName,
+    dt.IsModeratorOnly,
+    dt.IsRequired,
+    ur.CloseVotesCast,
+    ur.ReopenVotesCast,
+    case 
+        when rup.Tags is not null then array_length(string_to_array(substring(rup.Tags from 2 for char_length(rup.Tags)-2), '><'), 1)
+        else 0
+    end as TagCount,
+    case 
+        when rup.Score >= 0 then 'Positive'
+        when rup.Score < 0 then 'Negative'
+        else 'Neutral'
+    end as ScoreCategory,
+    case 
+        when rup.ViewCount > 1000 then 'HighView'
+        when rup.ViewCount between 100 and 1000 then 'MediumView'
+        else 'LowView'
+    end as ViewCategory,
+    dup.RelatedPostId as DuplicateOfPostId,
+    concat_ws(' | ', rup.OwnerDisplayName, rup.LastEditorDisplayName, coalesce(u.WebsiteUrl,'')) as OwnerEditorWebsiteInfo
+from RecursiveUserPosts rup
+join PostTypes pt on pt.Id = rup.PostTypeId
+left join PostVotesSummary uv on uv.PostId = rup.PostId
+left join UserBadgeCounts ub on ub.UserId = rup.UserId
+left join UserActivityWindow ua on ua.UserId = rup.UserId
+left join FilteredComments fs on fs.PostId = rup.PostId and fs.UserId = rup.UserId
+left join QuestionAnswerStats qas on qas.QuestionId = rup.PostId and rup.PostTypeId = 1
+left join TopTags dt on dt.TagName = any(string_to_array(substring(rup.Tags from 2 for char_length(rup.Tags)-2), '><'))
+left join DuplicatePostLinks dup on dup.PostId = rup.PostId
+left join Users u on u.Id = rup.UserId
+left join UserRecentActivity ur on ur.UserId = rup.UserId
+where (rup.Depth = 1 or rup.Depth = 2)
+and (rup.Score is not null and rup.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - interval '2 years')
+order by rup.UserId, rup.CreationDate desc
+limit 100;

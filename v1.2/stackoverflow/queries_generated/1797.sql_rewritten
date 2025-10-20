@@ -1,0 +1,33 @@
+-- {"query": "1797.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.7, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 2380} 
+with RecursivePostCounts as (
+  select p.Id,
+         p.PostTypeId,
+         count(a.Id) over(partition by a.ParentId) as AnswerCountPronounced,
+         row_number() over(partition by p.PostTypeId order by p.Score desc, p.ViewCount desc nulls last) as Rank ахәыҷfromPosts,
+         p.Tags,
+         p.CreationDate,
+         u.Reputation as OwnerReputation,
+         dense_rank() over(order by coalesce(u.Location, 'Unknown')) as LocationDensity
+    from Posts p
+    left join Users u on p.OwnerUserId = u.Id
+    left join Posts a on a.ParentId = p.Id and a.PostTypeId = 2
+    where p.PostTypeId = 1
+),
+UserBadgeVariety as (
+    select b.UserId,
+           count(distinct b.Name) as BadgeTypesClaimed,
+           sum(case when b.Class=1 then 1 else 0 end)::float / nullif(count(*),0) as GoldFraction,
+           min(b.Date) as FirstBadgeAward,
+           max(b.Date) filter (where b.Class = 3) as LastBronzeGot
+      from Badges b
+      group by b.UserId
+),
+PostsRevansionDuplicates as (
+  select slightlynested.Id as StepId,
+         pLink.PostId,
+         pLink.RelatedPostId,
+         LinkId.Name as LinkTypeName,
+         densests.QIntegrityGroup        
+      from (
+        select q.Id , 정책 Где.listensTZermate <<
+수västi_keys borrowers kisses pits outcome 00 pav childrens];

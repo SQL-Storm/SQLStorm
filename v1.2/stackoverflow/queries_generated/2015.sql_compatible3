@@ -1,0 +1,27 @@
+with recursive RecentActiveDays as (
+    select distinct date_trunc('day', CreationDate) as active_day
+    from Posts
+    where CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '60 days'
+
+    union
+
+    select date_trunc('day', gs) as active_day
+    from (
+        select generate_series(
+            (select min(code) from (
+                select cast(postfixSys as timestamp) as code
+                from SomeTable
+                where postfixSys is not null
+            ) t),
+            (select max(code) from (
+                select cast(postfixSys as timestamp) as code
+                from SomeTable
+                where postfixSys is not null
+            ) t),
+            interval '1 day'
+        ) as gs
+    ) s
+)
+select distinct active_day
+from RecentActiveDays
+order by active_day;

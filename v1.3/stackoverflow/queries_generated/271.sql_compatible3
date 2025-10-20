@@ -1,0 +1,224 @@
+WITH
+recent_q AS (
+  SELECT p.*
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+    AND p.CreationDate >= CAST('2024-10-01' AS date) - INTERVAL '730 days'
+),
+exploded_tags AS (
+  SELECT q.Id AS QuestionId,
+         lower(trim(tag)) AS tag
+  FROM recent_q q
+  CROSS JOIN LATERAL (
+    SELECT unnest(string_to_array(substring(q.Tags,2, greatest(length(q.Tags)-2,0)), '><'))
+  ) AS t(tag)
+  WHERE q.Tags IS NOT NULL
+),
+tag_list AS (
+  SELECT QuestionId,
+         string_agg(tag, ',' ORDER BY tag) AS tags,
+         count(*) AS tag_count
+  FROM exploded_tags
+  GROUP BY QuestionId
+),
+tag_popularity AS (
+  SELECT et.tag,
+         count(DISTINCT et.QuestionId) AS questions_with_tag,
+         sum(coalesce(p.ViewCount,0)) AS total_views_for_tag,
+         CAST(avg(coalesce(p.Score,0)) AS numeric(10,2)) AS avg_score_for_tag
+  FROM exploded_tags et
+  LEFT JOIN Posts p ON p.Id = et.QuestionId
+  GROUP BY et.tag
+),
+votes_summary AS (
+  SELECT v.PostId,
+         count(*) AS total_votes,
+         sum(CASE WHEN v.VoteTypeId = 1 THEN 1 ELSE 0 END) AS accepted_by_originator,
+         sum(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS upvotes,
+         sum(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS downvotes,
+         sum(CASE WHEN v.VoteTypeId = 5 THEN 1 ELSE 0 END) AS favorites,
+         sum(CASE WHEN v.VoteTypeId = 12 THEN 1 ELSE 0 END) AS spam_flags
+  FROM Votes v
+  GROUP BY v.PostId
+),
+comment_stats AS (
+  SELECT c.PostId,
+         count(*) AS comment_count,
+         CAST(avg(char_length(c.Text)) AS numeric(10,2)) AS avg_comment_len,
+         max(c.CreationDate) AS last_comment_date
+  FROM Comments c
+  GROUP BY c.PostId
+),
+history_agg AS (
+  SELECT ph.PostId,
+         sum(CASE WHEN ph.PostHistoryTypeId IN (4,5,6,24) THEN 1 ELSE 0 END) AS edit_revisions,
+         sum(CASE WHEN ph.PostHistoryTypeId IN (10,11,12,13,35,36) THEN 1 ELSE 0 END) AS moderation_events,
+         max(ph.CreationDate) AS last_history_date,
+         (array_agg(ph.Comment ORDER BY ph.CreationDate DESC) )[1] AS last_history_comment
+  FROM PostHistory ph
+  GROUP BY ph.PostId
+),
+answer_base AS (
+  SELECT a.Id, a.ParentId AS QuestionId, a.OwnerUserId, a.Score, a.CreationDate, a.ViewCount
+  FROM Posts a
+  WHERE a.PostTypeId = 2
+),
+answer_agg AS (
+  SELECT QuestionId,
+         count(*) AS answer_count,
+         CAST(avg(coalesce(Score,0)) AS numeric(10,2)) AS avg_answer_score,
+         max(coalesce(Score,0)) AS max_answer_score,
+         sum(coalesce(ViewCount,0)) AS total_answer_views
+  FROM answer_base
+  GROUP BY QuestionId
+),
+top_answerer AS (
+  SELECT ab.Id, ab.ParentId AS QuestionId, ab.OwnerUserId, ab.Score, ab.CreationDate,
+         row_number() OVER (PARTITION BY ab.ParentId ORDER BY ab.Score DESC NULLS LAST, ab.CreationDate ASC) AS rn
+  FROM Posts ab
+  WHERE ab.PostTypeId = 2
+),
+top_answer_per_q AS (
+  SELECT ta.QuestionId, ta.Id AS AnswerId, ta.OwnerUserId AS TopAnswererUserId, ta.Score AS TopAnswerScore
+  FROM top_answerer ta
+  WHERE ta.rn = 1
+),
+badge_counts AS (
+  SELECT b.UserId,
+         count(*) AS badge_count,
+         sum(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS gold,
+         sum(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS silver,
+         sum(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS bronze
+  FROM Badges b
+  GROUP BY b.UserId
+),
+user_stats AS (
+  SELECT u.Id AS UserId,
+         u.Reputation,
+         u.CreationDate,
+         u.LastAccessDate,
+         coalesce(bc.badge_count,0) AS badge_count,
+         coalesce(bc.gold,0) AS gold,
+         coalesce(bc.silver,0) AS silver,
+         coalesce(bc.bronze,0) AS bronze,
+         (SELECT count(*) FROM Posts p WHERE p.OwnerUserId = u.Id) AS total_posts,
+         (SELECT count(*) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 1) AS total_questions,
+         (SELECT count(*) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 2) AS total_answers
+  FROM Users u
+  LEFT JOIN badge_counts bc ON bc.UserId = u.Id
+),
+suspicious AS (
+  SELECT p.Id FROM Posts p WHERE p.Score < 0
+  INTERSECT
+  SELECT v.PostId FROM Votes v WHERE v.VoteTypeId = 12
+),
+candidate_set AS (
+  SELECT r.Id AS QuestionId,
+         r.Title,
+         r.CreationDate,
+         r.Score AS QuestionScore,
+         r.ViewCount,
+         coalesce(vs.total_votes,0) AS total_votes,
+         coalesce(vs.upvotes,0) AS upvotes,
+         coalesce(vs.downvotes,0) AS downvotes,
+         coalesce(cs.comment_count,0) AS comment_count,
+         coalesce(cs.avg_comment_len,0) AS avg_comment_len,
+         coalesce(ha.edit_revisions,0) AS edit_revisions,
+         coalesce(ha.last_history_date, r.LastActivityDate) AS last_activity_from_history,
+         coalesce(ta.answer_count,0) AS answer_count,
+         coalesce(ta.avg_answer_score,0) AS avg_answer_score,
+         coalesce(tlp.tags,'') AS tags,
+         coalesce(tlp.tag_count,0) AS tag_count,
+         CASE WHEN tp.tag IS NOT NULL THEN coalesce(tp.questions_with_tag,0) ELSE 0 END AS dummy_for_join,
+         coalesce(bc.badge_count,0) AS owner_badges,
+         r.OwnerUserId,
+         r.AcceptedAnswerId,
+         tp.tag AS sampled_tag,
+         r.Body
+  FROM recent_q r
+  LEFT JOIN votes_summary vs ON vs.PostId = r.Id
+  LEFT JOIN comment_stats cs ON cs.PostId = r.Id
+  LEFT JOIN history_agg ha ON ha.PostId = r.Id
+  LEFT JOIN answer_agg ta ON ta.QuestionId = r.Id
+  LEFT JOIN tag_list tlp ON tlp.QuestionId = r.Id
+  LEFT JOIN exploded_tags et ON et.QuestionId = r.Id
+  LEFT JOIN tag_popularity tp ON tp.tag = et.tag
+  LEFT JOIN badge_counts bc ON bc.UserId = r.OwnerUserId
+),
+most_recent_commenter AS (
+  SELECT c.PostId,
+         (array_agg(c.UserId ORDER BY c.CreationDate DESC))[1] AS most_recent_commenter_id,
+         (array_agg(c.UserDisplayName ORDER BY c.CreationDate DESC))[1] AS most_recent_commenter_name
+  FROM Comments c
+  GROUP BY c.PostId
+)
+SELECT
+  c.QuestionId,
+  left(coalesce(c.Title,''),200) AS title_snippet,
+  c.CreationDate,
+  c.QuestionScore,
+  c.ViewCount,
+  c.total_votes,
+  c.upvotes,
+  c.downvotes,
+  c.comment_count,
+  c.avg_comment_len,
+  c.edit_revisions,
+  c.answer_count,
+  c.avg_answer_score,
+  coalesce(tp.tag, c.tags, '') AS primary_or_aggregate_tag,
+  coalesce(tp.questions_with_tag, 0) AS tag_questions_count,
+  coalesce(u.Reputation,0) AS owner_reputation,
+  c.owner_badges,
+  COALESCE ( (SELECT count(*) FROM Posts p WHERE p.OwnerUserId = c.OwnerUserId AND p.CreationDate >= c.CreationDate - INTERVAL '365 days'), 0) AS owner_posts_last_year,
+  (SELECT u2.DisplayName FROM Users u2 WHERE u2.Id = (SELECT TopAnswererUserId FROM top_answer_per_q ta WHERE ta.QuestionId = c.QuestionId) FETCH FIRST 1 ROW ONLY) AS top_answerer_name,
+  (SELECT TopAnswerScore FROM top_answer_per_q ta WHERE ta.QuestionId = c.QuestionId) AS top_answer_score,
+  (SELECT left(Body,150) FROM Posts WHERE Id = c.AcceptedAnswerId) AS accepted_answer_snippet,
+  mr.most_recent_commenter_id,
+  mr.most_recent_commenter_name,
+  CASE WHEN c.QuestionId IN (SELECT Id FROM suspicious) THEN TRUE ELSE FALSE END AS is_suspicious,
+  round(
+    (
+      ln( (greatest(c.ViewCount,0) + 1)::double precision ) * greatest(c.QuestionScore,0)
+    ) / nullif( (extract(epoch from (CAST('2024-10-01 12:34:56' AS timestamp) - c.CreationDate)) / 86400) + 2, 0),
+    6
+  ) AS hotness_score,
+  replace(coalesce(nullif(split_part(c.tags,',',1),''), 'untagged'), ' ', '_') AS first_tag_normalized,
+  CASE
+    WHEN c.Body IS NULL THEN 'no_body'
+    WHEN lower(c.Body) LIKE '%sql%' AND c.avg_answer_score > 1 THEN 'sql_hot'
+    WHEN c.ViewCount > 10000 AND c.QuestionScore < 0 THEN 'controversial'
+    ELSE 'normal'
+  END AS qualitative_label,
+  dense_rank() OVER (ORDER BY coalesce(c.QuestionScore,0) DESC) AS score_rank,
+  ntile(10) OVER (ORDER BY coalesce(c.ViewCount,0) DESC) AS decile_by_views
+FROM candidate_set c
+LEFT JOIN most_recent_commenter mr ON mr.PostId = c.QuestionId
+LEFT JOIN tag_popularity tp ON tp.tag = (split_part(coalesce(c.tags,''),',',1))
+LEFT JOIN Users u ON u.Id = c.OwnerUserId
+GROUP BY
+  c.QuestionId,
+  c.Title,
+  c.CreationDate,
+  c.QuestionScore,
+  c.ViewCount,
+  c.total_votes,
+  c.upvotes,
+  c.downvotes,
+  c.comment_count,
+  c.avg_comment_len,
+  c.edit_revisions,
+  c.answer_count,
+  c.avg_answer_score,
+  tp.tag,
+  c.tags,
+  tp.questions_with_tag,
+  u.Reputation,
+  c.owner_badges,
+  c.OwnerUserId,
+  c.AcceptedAnswerId,
+  mr.most_recent_commenter_id,
+  mr.most_recent_commenter_name,
+  c.Body
+ORDER BY hotness_score DESC NULLS LAST, c.QuestionScore DESC
+LIMIT 250;

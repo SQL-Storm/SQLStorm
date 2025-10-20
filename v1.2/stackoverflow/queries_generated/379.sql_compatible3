@@ -1,0 +1,132 @@
+with RecursiveUserActivity as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionCount,
+        count(distinct p.Id) filter (where p.PostTypeId = 2) as AnswerCount,
+        count(distinct c.Id) as CommentCount,
+        sum(v.VoteCount) as TotalVotesReceived,
+        row_number() over (order by u.Reputation desc, u.LastAccessDate desc) as UserRank
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join (
+        select
+            PostId,
+            count(*) as VoteCount
+        from Votes
+        where VoteTypeId in (2,3)
+        group by PostId
+    ) v on v.PostId = p.Id
+    left join Comments c on c.UserId = u.Id
+    group by u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate
+),
+TopUsersWithBadges as (
+    select
+        rua.UserId,
+        rua.DisplayName,
+        rua.Reputation,
+        rua.QuestionCount,
+        rua.AnswerCount,
+        rua.CommentCount,
+        rua.TotalVotesReceived,
+        rua.UserRank,
+        b.Name as BadgeName,
+        b.Class as BadgeClass,
+        b.Date as BadgeDate,
+        row_number() over (partition by rua.UserId order by b.Class, b.Date desc) as BadgeRank
+    from RecursiveUserActivity rua
+    left join Badges b on b.UserId = rua.UserId
+    where rua.UserRank <= 100
+),
+UserPostStats as (
+    select
+        p.OwnerUserId as UserId,
+        count(*) filter (where p.PostTypeId = 1 and p.ClosedDate is null) as OpenQuestions,
+        count(*) filter (where p.PostTypeId = 1 and p.ClosedDate is not null) as ClosedQuestions,
+        count(*) filter (where p.PostTypeId = 2 and p.Score > 0) as PositiveAnswers,
+        count(*) filter (where p.PostTypeId = 2 and p.Score <= 0) as NonPositiveAnswers,
+        avg(p.Score) filter (where p.PostTypeId in (1,2)) as AvgPostScore,
+        max(p.Score) filter (where p.PostTypeId in (1,2)) as MaxPostScore,
+        sum(p.ViewCount) filter (where p.PostTypeId = 1) as TotalQuestionViews
+    from Posts p
+    group by p.OwnerUserId
+),
+UserTagEngagement as (
+    select
+        p.OwnerUserId as UserId,
+        unnest(string_to_array(substring(p.Tags from 2 for length(p.Tags) - 2), '><')) as Tag,
+        count(*) as PostsPerTag,
+        sum(p.Score) as ScorePerTag,
+        row_number() over (partition by p.OwnerUserId order by count(*) desc) as TagRank
+    from Posts p
+    where p.PostTypeId = 1 and p.Tags is not null
+    group by p.OwnerUserId, Tag
+),
+UserCloseReasons as (
+    select
+        ph.UserId,
+        crt.Name as CloseReason,
+        count(*) as CloseCount
+    from PostHistory ph
+    join CloseReasonTypes crt on crt.Id = cast(ph.Comment as int)
+    where ph.PostHistoryTypeId = 10 and ph.UserId is not null
+    group by ph.UserId, crt.Name
+),
+UserActivitySummary as (
+    select
+        rua.UserId,
+        rua.DisplayName,
+        rua.Reputation,
+        up.OpenQuestions,
+        up.ClosedQuestions,
+        up.PositiveAnswers,
+        up.NonPositiveAnswers,
+        up.AvgPostScore,
+        up.MaxPostScore,
+        up.TotalQuestionViews,
+        coalesce(sum(uc.CloseCount),0) as TotalCloseVotes,
+        string_agg(distinct concat_ws(': ', uc.CloseReason, uc.CloseCount) , '; ' ) as CloseReasonsSummary
+    from RecursiveUserActivity rua
+    left join UserPostStats up on up.UserId = rua.UserId
+    left join UserCloseReasons uc on uc.UserId = rua.UserId
+    group by rua.UserId, rua.DisplayName, rua.Reputation, up.OpenQuestions, up.ClosedQuestions, up.PositiveAnswers, up.NonPositiveAnswers, up.AvgPostScore, up.MaxPostScore, up.TotalQuestionViews
+)
+select
+    uas.UserId,
+    uas.DisplayName,
+    uas.Reputation,
+    uas.OpenQuestions,
+    uas.ClosedQuestions,
+    uas.PositiveAnswers,
+    uas.NonPositiveAnswers,
+    round(coalesce(uas.AvgPostScore,0)::double precision,2) as AvgPostScore,
+    uas.MaxPostScore,
+    coalesce(uas.TotalQuestionViews,0) as TotalQuestionViews,
+    uas.TotalCloseVotes,
+    uas.CloseReasonsSummary,
+    array_agg(distinct concat_ws(' (Class ', b.Class, ') ', b.Name) ) filter (where b.UserId = uas.UserId) as Badges,
+    array_agg(distinct concat_ws(': ', ut.Tag, ut.PostsPerTag, 'posts, score', ut.ScorePerTag) ) filter (where ut.UserId = uas.UserId and ut.TagRank <= 3) as TopTags
+from UserActivitySummary uas
+left join Badges b on b.UserId = uas.UserId
+left join UserTagEngagement ut on ut.UserId = uas.UserId
+where uas.UserId in (
+    select UserId from RecursiveUserActivity where UserRank <= 50
+)
+group by
+    uas.UserId,
+    uas.DisplayName,
+    uas.Reputation,
+    uas.OpenQuestions,
+    uas.ClosedQuestions,
+    uas.PositiveAnswers,
+    uas.NonPositiveAnswers,
+    uas.AvgPostScore,
+    uas.MaxPostScore,
+    uas.TotalQuestionViews,
+    uas.TotalCloseVotes,
+    uas.CloseReasonsSummary
+order by uas.Reputation desc, uas.TotalQuestionViews desc
+limit 50;

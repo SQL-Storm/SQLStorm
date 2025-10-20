@@ -1,0 +1,70 @@
+WITH RECURSIVE RecursiveFilteredUsers AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.Location,
+        COALESCE(b.TotGold, 0) AS GoldBadges,
+        COALESCE(b.TotSilver, 0) AS SilverBadges,
+        COALESCE(b.TotBronze, 0) AS BronzeBadges,
+        u.WebsiteUrl
+    FROM Users u
+    LEFT JOIN (
+        SELECT
+            b.UserId,
+            SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS TotGold,
+            SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS TotSilver,
+            SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS TotBronze
+        FROM Badges b
+        WHERE COALESCE(b.TagBased, FALSE) = FALSE
+        GROUP BY b.UserId
+    ) b ON u.Id = b.UserId
+    WHERE u.Reputation >= 1000
+      AND (COALESCE(b.TotGold, 0) > 10 OR COALESCE(b.TotSilver, 0) + COALESCE(b.TotBronze, 0) > 20)
+
+    UNION ALL
+
+    SELECT
+        o.Id,
+        o.DisplayName,
+        o.Reputation,
+        o.Location,
+        rf.GoldBadges,
+        rf.SilverBadges,
+        rf.BronzeBadges,
+        o.WebsiteUrl
+    FROM Users o
+    JOIN RecursiveFilteredUsers rf ON o.AccountId = rf.Id
+    WHERE o.Id <> rf.Id
+      AND o.Reputation > rf.Reputation * 0.8
+)
+SELECT DISTINCT
+    strata.DisplayName,
+    strata.Location,
+    SUBSTRING(COALESCE(strata.WebsiteUrl, '') FROM POSITION('://' IN COALESCE(strata.WebsiteUrl, '')) + 3 FOR 20) AS WebsiteHostPreview,
+    strata.Reputation,
+    strata.Id,
+    strata.GoldBadges,
+    strata.SilverBadges,
+    strata.BronzeBadges,
+    strata.WebsiteUrl,
+    pc.PostCount
+FROM RecursiveFilteredUsers strata
+LEFT JOIN (
+    SELECT
+        p.UserId,
+        COUNT(*) AS PostCount
+    FROM Posts p
+    GROUP BY p.UserId
+) pc ON strata.Id = pc.UserId
+WHERE 1 = 1
+GROUP BY
+    strata.DisplayName,
+    strata.Location,
+    strata.WebsiteUrl,
+    strata.Reputation,
+    strata.Id,
+    strata.GoldBadges,
+    strata.SilverBadges,
+    strata.BronzeBadges,
+    pc.PostCount;

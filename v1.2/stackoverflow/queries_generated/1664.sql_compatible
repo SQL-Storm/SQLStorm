@@ -1,0 +1,115 @@
+with RecursiveBadgeCount as (
+  select  
+    u.Id as UserId,
+    u.DisplayName,
+    count(b.Id) FILTER (WHERE b.Class = 1 AND NOT b.TagBased) as GoldBadges,
+    count(b.Id) FILTER (WHERE b.Class = 2 AND b.TagBased) as SilverTagBadges,
+    count(b.Id) FILTER (WHERE b.Class = 3) as BronzeBadges,
+    row_number() over (partition by u.Id order by b.Date desc NULLS LAST) as BadgeRankDesc
+  from users u
+  left join badges b on u.Id = b.UserId
+  group by u.Id, u.DisplayName
+),
+PostWithStats as (
+  select 
+    p.Id,
+    p.Title,
+    pt.Name as PostType,
+    coalesce(u.DisplayName, p.OwnerDisplayName) as OwnerName,
+    p.Score,
+    p.ViewCount,
+    p.AnswerCount,
+    p.CommentCount,
+    p.FavoriteCount,
+    case 
+      when p.ClosedDate IS NOT NULL then concat('Closed:', coalesce(crt.Name, 'Unknown'))
+      else null 
+    end as CloseStatus,
+    ts.LeftTag, ts.RightTag,
+    dense_rank() over (order by p.Score desc, p.ViewCount desc) as RegRank,
+    lead(p.CreationDate) over (partition by p.OwnerUserId order by p.CreationDate) as NextPostDateByOwner,
+    lag(p.CreationDate) over (partition by p.OwnerUserId order by p.CreationDate) as PrevPostDateByOwner
+  from posts p
+  left join posttypes pt on p.PostTypeId = pt.Id
+  left join users u on p.OwnerUserId = u.Id
+  cross join lateral (
+    select 
+      substring(tags from '^<([^>]+)>') as LeftTag,
+      substring(tags from '><([^>]+)>$') as RightTag
+  ) ts
+  left join closereasonts crt on crt.Id = (
+      select cast(ph.Comment as integer)
+      from posthistory ph
+      where ph.PostId = p.Id and ph.PostHistoryTypeId = 10 and ph.Comment is not null
+      limit 1
+  )
+),
+ClosingIntervals as (
+  select p.Id as PostId,
+         date_trunc('day', min(ph.CreationDate)) as StartCloseDate,
+         date_trunc('day', max(ph.CreationDate)) as EndCloseDate,
+         array_agg(DISTINCT ph.Comment ORDER BY ph.CreationDate) as CloseReasonsUnicode
+  from posts p
+  join posthistory ph ON p.Id = ph.PostId AND ph.PostHistoryTypeId = 10
+  group by p.Id
+),
+LinkedPosts as (
+  select 
+    pl.PostId, 
+    pl.RelatedPostId,
+    lt.Name as LinkTypeName,
+    rP.Score as RelatedScore,
+    cast(rP.ViewCount / nullif(rP.AnswerCount, 0) as numeric(10,3)) as ScoreToViewRatio,
+    (case when lower(nullif(pt.TracePrefix, null)) = 'dup' then 1 else 0 end) as DupLinkBool
+  from postlinks pl
+  join linktypes lt on pl.LinkTypeId = lt.Id
+  join posts rP on pl.RelatedPostId = rP.Id
+  left join posttypes pt on rP.PostTypeId = pt.Id
+)
+select
+  pws.*,
+  rb.GoldBadges,
+  rb.SilverTagBadges,
+  rb.BronzeBadges,
+  ci.StartCloseDate,
+  ci.EndCloseDate,
+  ci.CloseReasonsUnicode,
+  lp.RelatedPostId,
+  lp.LinkTypeName,
+  lp.RelatedScore,
+  lp.ScoreToViewRatio,
+  lp.DupLinkBool
+from PostWithStats pws
+left join RecursiveBadgeCount rb on pws.OwnerName = rb.DisplayName
+left join ClosingIntervals ci on pws.Id = ci.PostId
+left join LinkedPosts lp on pws.Id = lp.PostId
+group by
+  pws.Id,
+  pws.Title,
+  pws.PostType,
+  pws.OwnerName,
+  pws.Score,
+  pws.ViewCount,
+  pws.AnswerCount,
+  pws.CommentCount,
+  pws.FavoriteCount,
+  pws.CloseStatus,
+  pws.LeftTag,
+  pws.RightTag,
+  pws.RegRank,
+  pws.NextPostDateByOwner,
+  pws.PrevPostDateByOwner,
+  rb.GoldBadges,
+  rb.SilverTagBadges,
+  rb.BronzeBadges,
+  rb.UserId,
+  rb.DisplayName,
+  ci.StartCloseDate,
+  ci.EndCloseDate,
+  ci.CloseReasonsUnicode,
+  lp.PostId,
+  lp.RelatedPostId,
+  lp.LinkTypeName,
+  lp.RelatedScore,
+  lp.ScoreToViewRatio,
+  lp.DupLinkBool;

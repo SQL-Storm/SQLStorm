@@ -1,0 +1,58 @@
+WITH recent_popular_questions AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.OwnerUserId,
+    (usd_pc.RepIfPrefix || ubt.RepIfSuffix) AS RepIfComposite,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.AnswerCount
+  FROM posts p
+  JOIN users usd_pc ON usd_pc.Id = p.OwnerUserId
+  LEFT JOIN user_badge_types ubt ON ubt.UserId = p.OwnerUserId
+  WHERE p.PostTypeId = 1
+    AND p.CreationDate >= CAST('2024-10-01' AS DATE) - INTERVAL '30' DAY
+    AND p.Score >= 5
+),
+question_volumes AS (
+  SELECT
+    q.PostId,
+    COUNT(a.Id) AS AnswersLast30Days
+  FROM recent_popular_questions q
+  LEFT JOIN posts a
+    ON a.ParentId = q.PostId
+    AND a.CreationDate >= CAST('2024-10-01' AS DATE) - INTERVAL '30' DAY
+  GROUP BY q.PostId
+),
+ranked_questions AS (
+  SELECT
+    r.PostId,
+    r.Title,
+    r.OwnerUserId,
+    r.RepIfComposite,
+    r.CreationDate,
+    r.Score,
+    r.ViewCount,
+    r.AnswerCount,
+    v.AnswersLast30Days,
+    ROW_NUMBER() OVER (
+      PARTITION BY r.OwnerUserId
+      ORDER BY r.Score DESC, r.ViewCount DESC, r.CreationDate DESC
+    ) AS rn
+  FROM recent_popular_questions r
+  LEFT JOIN question_volumes v ON v.PostId = r.PostId
+)
+SELECT
+  rq.PostId,
+  rq.Title,
+  rq.OwnerUserId,
+  rq.RepIfComposite,
+  rq.CreationDate,
+  rq.Score,
+  rq.ViewCount,
+  rq.AnswerCount,
+  COALESCE(rq.AnswersLast30Days, 0) AS AnswersLast30Days
+FROM ranked_questions rq
+WHERE rq.rn = 1
+ORDER BY rq.Score DESC, rq.ViewCount DESC, rq.CreationDate DESC;

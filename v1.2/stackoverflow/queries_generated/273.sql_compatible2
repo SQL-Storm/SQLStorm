@@ -1,0 +1,206 @@
+with recursive RecursiveTagHierarchy as (
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        t.IsModeratorOnly,
+        t.IsRequired,
+        1 as Level,
+        cast(t.TagName as varchar(1000)) as Path
+    from Tags t
+    where t.IsRequired = true
+
+    union all
+
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        t.IsModeratorOnly,
+        t.IsRequired,
+        r.Level + 1,
+        r.Path || ' > ' || t.TagName
+    from Tags t
+    join RecursiveTagHierarchy r on t.IsModeratorOnly = false and t.Count < r.Count and t.TagName <> r.TagName
+    where r.Level < 3
+),
+UserBadgeCounts as (
+    select
+        b.UserId,
+        b.Class,
+        count(*) as BadgeCount
+    from Badges b
+    group by b.UserId, b.Class
+),
+UserActivityWindow as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        u.Location,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        count(distinct case when p.PostTypeId = 1 then p.Id end) as QuestionCount,
+        count(distinct case when p.PostTypeId = 2 then p.Id end) as AnswerCount,
+        count(distinct c.Id) as CommentCount,
+        sum(case when v.VoteTypeId = 2 then 1 else 0 end) as UpVotesReceived,
+        sum(case when v.VoteTypeId = 3 then 1 else 0 end) as DownVotesReceived,
+        row_number() over (partition by u.Id order by u.LastAccessDate desc) as rn
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Comments c on c.UserId = u.Id
+    left join Votes v on v.UserId = u.Id
+    group by u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate, u.Location, u.Views, u.UpVotes, u.DownVotes
+),
+TopPostsWithLinks as (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        p.OwnerUserId,
+        pl.RelatedPostId,
+        lt.Name as LinkTypeName,
+        row_number() over (partition by p.Id order by p.Score desc, p.ViewCount desc) as rn
+    from Posts p
+    left join PostLinks pl on pl.PostId = p.Id
+    left join LinkTypes lt on lt.Id = pl.LinkTypeId
+    where p.PostTypeId in (1, 2) and p.Score > 10
+),
+AcceptedAnswerStats as (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        q.OwnerUserId,
+        a.Id as AcceptedAnswerId,
+        a.Score as AcceptedAnswerScore,
+        a.OwnerUserId as AnswerOwnerUserId,
+        (select count(*) from Comments c where c.PostId = a.Id) as AcceptedAnswerCommentCount
+    from Posts q
+    left join Posts a on a.Id = q.AcceptedAnswerId
+    where q.PostTypeId = 1 and q.AcceptedAnswerId is not null
+),
+UserCloseVotes as (
+    select
+        ph.UserId,
+        count(case when ph.PostHistoryTypeId = 10 then 1 end) as CloseVotes,
+        count(case when ph.PostHistoryTypeId = 11 then 1 end) as ReopenVotes
+    from PostHistory ph
+    group by ph.UserId
+),
+UserReputationRank as (
+    select
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        rank() over (order by u.Reputation desc) as ReputationRank
+    from Users u
+),
+ComplexUserSummary as (
+    select
+        ua.UserId,
+        ua.DisplayName,
+        ua.Reputation,
+        ua.QuestionCount,
+        ua.AnswerCount,
+        ua.CommentCount,
+        ubc_badge.GoldBadges,
+        ubc_badge.SilverBadges,
+        ubc_badge.BronzeBadges,
+        ucv.CloseVotes,
+        ucv.ReopenVotes,
+        urr.ReputationRank,
+        case
+            when ua.Reputation > 10000 then 'Expert'
+            when ua.Reputation between 1000 and 10000 then 'Intermediate'
+            else 'Beginner'
+        end as UserLevel,
+        coalesce(ua.Location, 'Unknown') as Location,
+        ua.Views,
+        ua.UpVotes,
+        ua.DownVotes
+    from UserActivityWindow ua
+    left join (
+        select
+            UserId,
+            coalesce(max(case when Class = 1 then BadgeCount end), 0) as GoldBadges,
+            coalesce(max(case when Class = 2 then BadgeCount end), 0) as SilverBadges,
+            coalesce(max(case when Class = 3 then BadgeCount end), 0) as BronzeBadges
+        from UserBadgeCounts
+        group by UserId
+    ) ubc_badge on ubc_badge.UserId = ua.UserId
+    left join UserCloseVotes ucv on ucv.UserId = ua.UserId
+    left join UserReputationRank urr on urr.Id = ua.UserId
+    where ua.rn = 1
+)
+select
+    cus.UserId,
+    cus.DisplayName,
+    cus.UserLevel,
+    cus.Reputation,
+    cus.ReputationRank,
+    cus.QuestionCount,
+    cus.AnswerCount,
+    cus.CommentCount,
+    cus.GoldBadges,
+    cus.SilverBadges,
+    cus.BronzeBadges,
+    cus.CloseVotes,
+    cus.ReopenVotes,
+    cus.Location,
+    cus.Views,
+    cus.UpVotes,
+    cus.DownVotes,
+    string_agg(distinct rth.Path, ' | ') as RequiredTagPaths,
+    coalesce(aa.AcceptedAnswerScore, 0) as SampleAcceptedAnswerScore,
+    coalesce(aa.AcceptedAnswerCommentCount, 0) as SampleAcceptedAnswerComments,
+    tpl.LinkTypeName,
+    tpl.Title as LinkedPostTitle,
+    tpl.Score as LinkedPostScore,
+    tpl.ViewCount as LinkedPostViewCount
+from ComplexUserSummary cus
+left join RecursiveTagHierarchy rth on rth.Level = 1
+left join AcceptedAnswerStats aa on aa.OwnerUserId = cus.UserId
+left join TopPostsWithLinks tpl on tpl.OwnerUserId = cus.UserId and tpl.rn = 1
+where cus.Reputation > (
+    select avg(u2.Reputation) from Users u2 where u2.Reputation is not null
+)
+and (
+    tpl.LinkTypeName is not null or aa.AcceptedAnswerId is not null
+)
+group by
+    cus.UserId,
+    cus.DisplayName,
+    cus.UserLevel,
+    cus.Reputation,
+    cus.ReputationRank,
+    cus.QuestionCount,
+    cus.AnswerCount,
+    cus.CommentCount,
+    cus.GoldBadges,
+    cus.SilverBadges,
+    cus.BronzeBadges,
+    cus.CloseVotes,
+    cus.ReopenVotes,
+    cus.Location,
+    cus.Views,
+    cus.UpVotes,
+    cus.DownVotes,
+    aa.AcceptedAnswerScore,
+    aa.AcceptedAnswerCommentCount,
+    tpl.LinkTypeName,
+    tpl.Title,
+    tpl.Score,
+    tpl.ViewCount
+order by cus.ReputationRank
+limit 50;

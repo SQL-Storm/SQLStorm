@@ -1,0 +1,75 @@
+with RecursiveCTE as (
+    select 
+        p.Id,
+        p.PostTypeId,
+        p.CreationDate,
+        abs(p.Score) * (case when lower(p.Title) like '%benchmark%' then 3 else 1 end) AS WeightedScore,
+        pg_roles.rolname as OwnerRole,
+        u.Reputation,
+        string_to_array(
+            substring(
+              coalesce(p.Tags, '<none>'), 2, length(coalesce(p.Tags, '<none>')) - 2
+            ), 
+            '><'
+        ) as TagArray
+    from Posts p
+    left join Users u on u.Id = p.OwnerUserId
+    left join pg_roles on pg_roles.oid = cast(cast(u.AccountId as text) as integer) -- adjusted cast to standard SQL integer
+    where p.PostTypeId in (1,2) 
+      and p.ViewCount > coalesce(p.Score * 10, 0)
+      and (p.ClosedDate is null or (p.ClosedDate > cast('2024-10-01 12:34:56' as timestamp) - interval '1 year'))
+), WindowedScores as (
+    select
+        Id,
+        "" as desc,
+        PostTypeId,
+        PopularityRank,
+        LEAD(WeightedScore,1) over(partition by PostTypeId order by WeightedScore desc) as NextHighScore,
+        Count(1) over (partition by PostTypeId) as TotalPostsInType
+    from (
+        select
+            c.*,
+            row_number() over (partition by c.PostTypeId order by c.WeightedScore desc) as PopularityRank
+        from RecursiveCTE c
+    ) s
+), CloseRatio as (
+    select 
+        ph.PostId,
+        sum(case when ph.PostHistoryTypeId = 10 then 1 else 0 end) * 1.0 / nullif(count(ph.Id),0) as CloseVoteRatio
+    from PostHistory ph
+    where ph.PostHistoryTypeId in (10, 11)
+    group by ph.PostId
+    having count(ph.Id) > 2
+)
+select 
+    w.Id,
+    w.PostTypeId,
+    round(coalesce(c.CloseVoteRatio, 0),2) as CloseVoteRatio,
+    concat_ws(' - ',
+        cast(w.PopularityRank as text),
+        '[' || 
+        coalesce(
+          nullif(
+            string_agg(trim(t.tags_str), ',') FILTER (WHERE t.tags_str IS NOT NULL),
+            ''
+          ),
+          'no tags'
+        )
+        || ']'
+    ) as Summary_Label,
+    w.NextHighScore,
+    w.TotalPostsInType
+from WindowedScores w
+left join CloseRatio c on c.PostId = w.Id
+left join lateral (
+  select unnest(TagArray) as tags_str
+  from RecursiveCTE r
+  where r.Id = w.Id
+) t on true
+group by
+  w.Id,
+  w.PostTypeId,
+  w.PopularityRank,
+  w.NextHighScore,
+  w.TotalPostsInType,
+  c.CloseVoteRatio;

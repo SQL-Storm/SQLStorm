@@ -1,0 +1,104 @@
+WITH RecursiveTagTrecycle AS (
+    SELECT 
+        Id, TagName, Count,
+        CAST('<' || TagName || '>' AS VARCHAR(7000)) AS PathTags
+    FROM Tags
+    WHERE IsRequired = 1
+
+    UNION ALL
+
+    SELECT 
+        t.Id, t.TagName, t.Count,
+        r.PathTags || '><' || t.TagName
+    FROM Tags t
+    JOIN RecursiveTagTrecycle r ON POSITION('<' || t.TagName || '>' IN r.PathTags) = 0
+    WHERE t.IsRequired = 1
+), ScopedPosts AS (
+    SELECT 
+        p.Id, p.PostTypeId, p.CreationDate, p.Score, COALESCE(p.OwnerUserId, -1) AS OwnerUserId,
+        COALESCE(p.Tags, '') AS Tags,
+        u.Reputation,
+        ROW_NUMBER() OVER (PARTITION BY COALESCE(p.OwnerUserId, -1) ORDER BY p.Score DESC) AS rn_by_owner,
+        COUNT(*) OVER (PARTITION BY COALESCE(p.OwnerUserId, -1))                                           AS total_posts_by_owner
+    FROM Posts p
+    LEFT JOIN Users u ON u.Id = p.OwnerUserId
+    WHERE p.PostTypeId IN (1, 2)
+), AnswerDensityRanked AS (
+    SELECT 
+        OwnerUserId, 
+        AVG(CAST(okans.AnswerCount AS DOUBLE PRECISION)) AS AvgAnswerCount,
+        MAX(r.Score)                            AS MaxCategoryScore,
+        AVG(rn_by_owner) OVER(PARTITION BY OwnerUserId) AS AvgPostRow,
+        (SELECT COUNT(*)
+         FROM Posts ap
+         WHERE ap.AcceptedAnswerId = ScopedPosts.Id AND ap.OwnerUserId = ScopedPosts.OwnerUserId )   AS OwnerAcccAnswersQuantity
+    FROM ScopedPosts r
+    GROUP BY OwnerUserId
+), HistWindow AS (
+    SELECT 
+       ph.Id, ph.PostId, ph.PostHistoryTypeId, ph.CreationDate,
+       ROW_NUMBER() OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate DESC) AS RevRankDesc2010,
+       COUNT(CASE WHEN ph.PostHistoryTypeId = 10 THEN 1 END) OVER (PARTITION BY ph.PostId) AS CloseCntAlltime
+    FROM PostHistory ph
+), CommentsStages AS (
+    SELECT c.PostId, COUNT(1) AS AFullWESTopicsNCmnt
+    FROM Comments c
+    GROUP BY c.PostId
+)
+SELECT
+    u.Id AS UserID,
+    u.DisplayName,
+    u.Reputation,
+    p.Id AS QuestionID,
+    p.Title,
+    p.Score,
+    ph.CloseCntAlltime,
+    cs.AFullWESTopicsNCmnt AS CommentCount,
+    ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY p.Score DESC) AS QuestionScoreRank,
+    SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) OVER (PARTITION BY u.Id) AS GoldBadgesCount,
+    SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) OVER (PARTITION BY u.Id) AS SilverBadgesCount,
+    MAX(ph.RevRankDesc2010) AS MaxRevWindowsOrder,
+    STRING_AGG(d.Name, '|' ) FILTER (WHERE d.Id IS NOT NULL) AS PostHistoryTypeNames
+FROM 
+    Users u
+LEFT JOIN Posts p ON p.OwnerUserId = u.Id AND p.PostTypeId = 1
+LEFT JOIN PostHistory ph ON ph.PostId = p.Id
+LEFT JOIN Badges b ON b.UserId = u.Id
+LEFT JOIN PostHistoryTypes d ON d.Id = ph.PostHistoryTypeId 
+LEFT JOIN CommentsStages cs ON cs.PostId = p.Id
+WHERE 
+    u.Reputation > 1000 
+    AND p.Score BETWEEN 5 AND 100
+    AND (
+        p.Tags LIKE '%<sql>%'
+        OR p.Tags LIKE '%<database>%'
+    )
+GROUP BY 
+    u.Id, u.DisplayName, u.Reputation, p.Id, p.Title, p.Score, ph.CloseCntAlltime, cs.AFullWESTopicsNCmnt
+HAVING 
+    DATE '2024-10-01' - p.CreationDate < INTERVAL '5 years'
+ORDER BY 
+    u.Reputation DESC,
+    p.Score DESC
+LIMIT 100
+
+UNION ALL
+
+SELECT 
+    b2.UserId,
+    u2.DisplayName,
+    u2.Reputation,
+    NULL,
+    'Top scoring posts from Tag Waldorf subtrees',
+    0,
+    NULL,
+    0,
+    1,
+    0,
+    NULL,
+    NULL
+FROM Badges b2
+JOIN Users u2 ON u2.Id = b2.UserId
+WHERE 
+    LOWER(b2.Name) LIKE LOWER('%Focus in Q&A%')
+LIMIT 10;

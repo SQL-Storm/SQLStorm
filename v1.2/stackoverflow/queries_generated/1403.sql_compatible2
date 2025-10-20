@@ -1,0 +1,164 @@
+with RecursiveUserActivity as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionCount,
+        count(distinct p.Id) filter (where p.PostTypeId = 2) as AnswerCount,
+        count(distinct c.Id) as CommentCount,
+        max(p.CreationDate) as LastPostDate,
+        max(c.CreationDate) as LastCommentDate
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Comments c on c.UserId = u.Id
+    group by u.Id, u.DisplayName, u.Reputation
+), 
+PostScoreRanked as (
+    select
+        p.Id,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        row_number() over (partition by p.OwnerUserId order by p.Score desc, p.CreationDate desc) as rn
+    from Posts p
+    where p.PostTypeId in (1, 2)
+), 
+LatestHighScorePosts as (
+    select  
+        psr.*
+    from PostScoreRanked psr
+    where psr.rn <= 3
+),
+UserBadgeStats as (
+    select
+        b.UserId,
+        count(*) as BadgeTotal,
+        count(*) filter (where b.Class = 1) as GoldBadges,
+        count(*) filter (where b.Class = 2) as SilverBadges,
+        count(*) filter (where b.Class = 3) as BronzeBadges,
+        bool_or(b.TagBased = true) as HasTagBadges,
+        max(b.Date) as LastBadgeDate
+    from Badges b
+    group by b.UserId
+),
+ClosedQuestionsInfo as (
+    select
+        p.Id as QuestionId,
+        p.OwnerUserId,
+        p.Title,
+        p.CreationDate,
+        p.ClosedDate,
+        ch.Comment as CloseReasonIdStr,
+        crt.Name as CloseReasonName,
+        row_number() over (partition by p.OwnerUserId order by p.ClosedDate desc NULLS LAST) as rn_close
+    from Posts p
+    join PostHistory ch on ch.PostId = p.Id and ch.PostHistoryTypeId = 10
+    join CloseReasonTypes crt on crt.Id = cast(ch.Comment as integer)
+    where p.PostTypeId = 1 and p.ClosedDate is not null
+),
+TopAnswerersByAcceptedAnswers as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(a.Id) as AcceptedAnswerCount
+    from Users u
+    left join Posts a on a.OwnerUserId = u.Id and a.PostTypeId = 2 and exists (
+        select 1 from Posts q where q.AcceptedAnswerId = a.Id
+    )
+    group by u.Id, u.DisplayName
+),
+UserEngagementSummary as (
+    select
+        ua.UserId,
+        ua.DisplayName,
+        ua.Reputation,
+        ua.QuestionCount,
+        ua.AnswerCount,
+        ua.CommentCount,
+        coalesce(ubs.BadgeTotal, 0) as BadgeTotal,
+        coalesce(taba.AcceptedAnswerCount, 0) as AcceptedAnswers,
+        coalesce(lhq.QuestionId, NULL) as LastClosedQuestionId,
+        coalesce(lhq.CloseReasonName, 'N/A') as LastClosedReason,
+        case 
+          when ua.LastPostDate > ua.LastCommentDate then ua.LastPostDate 
+          when ua.LastPostDate is null then ua.LastCommentDate 
+          else ua.LastCommentDate
+        end as LastActivity,
+        row_number() over (order by ua.Reputation desc, ua.QuestionCount desc, ua.AnswerCount desc) as user_rank
+    from RecursiveUserActivity ua
+    left join UserBadgeStats ubs on ubs.UserId = ua.UserId
+    left join ClosedQuestionsInfo lhq on lhq.OwnerUserId = ua.UserId and lhq.rn_close = 1
+    left join TopAnswerersByAcceptedAnswers taba on taba.UserId = ua.UserId
+),
+UserTextAnalysis as (
+    select
+        p.Id as PostId,
+        u.Id as UserId,
+        u.DisplayName,
+        array_length(string_to_array(substring(p.Tags from 2 for (char_length(p.Tags) - 2)), '><'),1) as TagCount,
+        (length(regexp_replace(p.Body, '<[^>]+>', '', 'g')) - length(replace(regexp_replace(p.Body, '<[^>]+>', '', 'g'), ' ', '')) + 1) as BodyWordCount,
+        p.Score,
+        dense_rank() over (partition by u.Id order by p.CreationDate desc) as PostRevRank
+    from Posts p
+    join Users u on u.Id = p.OwnerUserId
+    where p.Tags is not null and p.Tags <> ''
+      and p.PostTypeId = 1
+),
+CombinedScoresAndRanks as (
+    select
+        ua.UserId,
+        ua.DisplayName,
+        ua.Reputation,
+        ua.QuestionCount,
+        ua.AnswerCount,
+        ua.CommentCount,
+        ua.BadgeTotal,
+        ua.AcceptedAnswers,
+        ua.LastClosedQuestionId,
+        ua.LastClosedReason,
+        ua.LastActivity,
+        ua.user_rank,
+        (select avg(ts.BodyWordCount) from UserTextAnalysis ts where ts.UserId = ua.UserId and ts.PostRevRank <= 5) as AvgTop5QuestionBodyWords,
+        (select coalesce(sum(ps.Score), 0) from Posts ps where ps.OwnerUserId = ua.UserId and ps.PostTypeId = 2 and ps.CreationDate >= (cast('2024-10-01' as date) - interval '30 days')) as Last30DaysAnswerScore,
+        (select bool_or(b.TagBased = true) from Badges b where b.UserId = ua.UserId) as HasAnyTagBasedBadge,
+        (
+         select max(inv.nn) from (
+           select grp, count(*) as nn
+           from (
+             select 1 + row_number() over (order by d.Day) - rnk as grp, d.Day, rnk
+             from (
+               select distinct date_trunc('day',Created) as Day,
+                      row_number() over (order by date_trunc('day',Created)) as rnk
+               from (
+                 select CreationDate as Created from Posts where OwnerUserId = ua.UserId
+                 union
+                 select CreationDate from Comments where UserId = ua.UserId
+               ) A
+             ) d
+           ) G
+           group by grp
+         ) inv
+        ) as MaxConsecutiveActiveDays
+    from UserEngagementSummary ua
+    where ua.Reputation > 100
+)
+select
+    csr.UserId,
+    csr.DisplayName,
+    csr.Reputation,
+    csr.QuestionCount,
+    csr.AnswerCount,
+    csr.CommentCount,
+    csr.BadgeTotal,
+    csr.AcceptedAnswers,
+    cast(csr.AcceptedAnswers as decimal) / nullif(csr.AnswerCount,0) as AcceptedAnswerRatio,
+    csr.LastClosedReason,
+    to_char(csr.LastActivity, 'YYYY-MM-DD HH24:MI:SS') as LastActivityDate,
+    csr.AvgTop5QuestionBodyWords,
+    csr.Last30DaysAnswerScore,
+    csr.HasAnyTagBasedBadge,
+    csr.MaxConsecutiveActiveDays
+from CombinedScoresAndRanks csr
+order by csr.Reputation desc, csr.AcceptedAnswers desc
+limit 50;

@@ -1,0 +1,19 @@
+WITH AnchorQuestionsNpVX AS (
+  SELECT
+    p."Id" AS qid,
+    p."OwnerUserId",
+    p."CreationDate",
+    rank() OVER (PARTITION BY "Tags" ORDER BY "Score" DESC) AS sandexrev_rk_desc_friendmat_photo_nullable
+  FROM p
+)
+SELECT
+  qid,
+  "OwnerUserId",
+  "CreationDate",
+  sandexrev_rk_desc_friendmat_photo_nullable
+FROM AnchorQuestionsNpVX
+GROUP BY
+  qid,
+  "OwnerUserId",
+  "CreationDate",
+  sandexrev_rk_desc_friendmat_photo_nullable;

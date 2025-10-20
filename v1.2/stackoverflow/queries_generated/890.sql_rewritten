@@ -1,0 +1,130 @@
+-- {"query": "890.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 0.8, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1329} 
+with recursive RecursiveTagHierarchy as (
+    select 
+        t.Id,
+        t.TagName,
+        t.Count,
+        1 as Level,
+        array[t.TagName] as TagPath
+    from Tags t
+    where t.IsModeratorOnly = 0 and t.IsRequired = 0
+    union all
+    select 
+        t.Id,
+        t.TagName,
+        t.Count,
+        r.Level + 1,
+        r.TagPath || t.TagName
+    from Tags t
+    join RecursiveTagHierarchy r on t.Id = r.Id + 1 and array_position(r.TagPath, t.TagName) is null
+    where r.Level < 3
+),
+UserBadgeStats as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        count(distinct case when b.Class = 1 then b.Id end) as GoldBadges,
+        count(distinct case when b.Class = 2 then b.Id end) as SilverBadges,
+        count(distinct case when b.Class = 3 then b.Id end) as BronzeBadges,
+        count(distinct b.Id) as TotalBadges
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.DisplayName
+),
+TopPostsCTE as (
+    select 
+        p.Id,
+        p.PostTypeId,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId,
+        p.Tags,
+        p.AcceptedAnswerId,
+        p.AnswerCount,
+        u.DisplayName as OwnerName,
+        row_number() over (partition by p.PostTypeId order by p.Score desc, p.ViewCount desc) as rn
+    from Posts p
+    left join Users u on u.Id = p.OwnerUserId
+    where p.PostTypeId in (1, 2) and p.CreationDate >= cast('2024-10-01' as date) - interval '1 year'
+),
+AcceptedAnswerStats as (
+    select 
+        q.Id as QuestionId,
+        q.Title as QuestionTitle,
+        q.Score as QuestionScore,
+        a.Id as AcceptedAnswerId,
+        a.CreationDate as AcceptedAnswerCreation,
+        a.Score as AcceptedAnswerScore,
+        u.DisplayName as AnswerOwner,
+        u.Reputation as AnswerOwnerRep
+    from Posts q
+    left join Posts a on a.Id = q.AcceptedAnswerId and a.PostTypeId = 2
+    left join Users u on u.Id = a.OwnerUserId
+    where q.PostTypeId = 1 and q.AcceptedAnswerId is not null
+),
+CommentCounts as (
+    select 
+        p.Id as PostId,
+        count(c.Id) as CommentCount
+    from Posts p
+    left join Comments c on c.PostId = p.Id
+    group by p.Id
+),
+VotesSummary as (
+    select 
+        p.Id as PostId,
+        count(case when v.VoteTypeId = 2 then 1 end) as UpVotes,
+        count(case when v.VoteTypeId = 3 then 1 end) as DownVotes,
+        count(case when v.VoteTypeId = 5 then 1 end) as FavoriteVotes
+    from Posts p
+    left join Votes v on v.PostId = p.Id
+    group by p.Id
+)
+select 
+    p.Id as PostId,
+    p.PostTypeId,
+    coalesce(p.Title, '') as Title,
+    u.DisplayName as OwnerName,
+    u.Reputation,
+    coalesce(cs.CommentCount, 0) as TotalComments,
+    coalesce(vs.UpVotes, 0) as UpVotes,
+    coalesce(vs.DownVotes, 0) as DownVotes,
+    coalesce(vs.FavoriteVotes, 0) as FavoriteVotes,
+    abs(p.Score) as AbsScore,
+    case when p.Score < 0 then 'Negative' else 'Non-Negative' end as ScoreCategory,
+    array_to_string(array(
+        select unnest(string_to_array(coalesce(p.Tags, ''), '><'))
+        except select unnest(array['java','python','c++','javascript','sql'])
+    ), ', ') as FilteredTags,
+    row_number() over (partition by p.OwnerUserId order by p.Score desc nulls last) as OwnerPostRank,
+    ntile(5) over (order by p.ViewCount desc nulls last) as ViewCountQuintile,
+    case when p.AcceptedAnswerId is null then 'No Accepted Answer' else 'Has Accepted Answer' end as AcceptedAnswerStatus,
+    case when p.ClosedDate is null then 'Open' else 'Closed' end as PostStatus,
+    ph.Name as LastPostHistoryType,
+    pht.Name as PostHistoryTypeCategory,
+    coalesce(bd.GoldBadges, 0) as OwnerGoldBadges,
+    coalesce(bd.SilverBadges, 0) as OwnerSilverBadges,
+    coalesce(bd.BronzeBadges, 0) as OwnerBronzeBadges,
+    (select count(*) from PostLinks pl where pl.PostId = p.Id and pl.LinkTypeId = 3) as DuplicateCount,
+    (select avg(score) from Posts ans where ans.ParentId = p.Id) as AvgAnswerScore,
+    (select max(score) from Posts ans where ans.ParentId = p.Id) as MaxAnswerScore,
+    case 
+        when u.LastAccessDate > cast('2024-10-01' as date) - interval '30 day' then 'Active User'
+        else 'Inactive User'
+    end as UserActivityStatus
+from Posts p
+left join Users u on u.Id = p.OwnerUserId
+left join CommentCounts cs on cs.PostId = p.Id
+left join VotesSummary vs on vs.PostId = p.Id
+left join PostHistory ph2 on ph2.PostId = p.Id 
+    and ph2.Id = (
+        select max(Id) from PostHistory ph3 where ph3.PostId = p.Id
+    )
+left join PostHistoryTypes ph on ph.Id = ph2.PostHistoryTypeId
+left join PostHistoryTypes pht on pht.Id = ph2.PostHistoryTypeId
+left join UserBadgeStats bd on bd.UserId = u.Id
+where p.CreationDate >= cast('2024-10-01' as date) - interval '1 year'
+order by p.Score desc, p.ViewCount desc
+limit 100;

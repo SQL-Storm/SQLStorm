@@ -1,0 +1,75 @@
+with RecursiveHitPosts as (
+    select
+        p.Id,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId,
+        ROW_NUMBER() over (partition by p.OwnerUserId order by p.ViewCount desc) as rn
+    from Posts p
+    where p.PostTypeId = 1 -- Questions only
+      and p.Tags is not null
+      and p.ViewCount is not null
+      and EXISTS (
+        select 1
+        from PostLinks pl
+        where pl.PostId = p.Id
+          and pl.LinkTypeId = 1 -- Linked
+          and pl.CreationDate > p.CreationDate
+      )
+),
+UsersBadgeBuckets as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        count(case when b.Class = 1 then 1 end) as GoldBadges, 
+        count(case when b.Class = 2 then 1 end) as SilverBadges, 
+        count(case when b.Class = 3 then 1 end) as BronzeBadges,
+        count(distinct p.Id) as QuestionCount,
+        u.Reputation,
+        u.CreationDate,
+        u.Location,
+        (case when featuretiers.prefers_web = 1 then '[Web]' else '' end) ||
+        (case when featuretiers.has_items > 0 then ' ## ' else '' end) AS CustomMarker
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    left join Posts p on p.OwnerUserId = u.Id and p.PostTypeId = 1 
+    cross join lateral (
+        select 
+          max(case when coalesce(u.WebsiteUrl, '') like '%http%' then 1 else 0 end) as prefers_web,
+          count(case when b.tagbased = 1 then 1 end) as has_items
+    ) featuretiers
+    group by u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.Location, featuretiers.prefers_web, featuretiers.has_items
+),
+TrackedAcceptRates as (
+  select 
+    a.OwnerUserId as user_id,
+    count(a.Id) as number_of_questions,
+    avg(case when a.rowscore = 1 then 1.0 else 0.0 end) as answer_accepts_ratio
+  from (
+      select
+         p.Id,
+         p.OwnerUserId,
+         p.AcceptedAnswerId,
+         post_answers_bl.Id as answer_id,
+         case when post_answers_bl.Id = p.AcceptedAnswerId then 1 else 0 end as rowscore
+      from Posts p
+      left join Posts post_answers_bl
+        on post_answers_bl.ParentId = p.Id
+        and post_answers_bl.PostTypeId = 2
+      where p.PostTypeId = 1
+        and p.AcceptedAnswerId is not null
+  ) a
+  group by a.OwnerUserId
+)
+select 
+   rb.Id as RecruitBotId,
+   ubd.DisplayName,
+   ubd.Reputation,
+   hl.Title as FriendlyQuestion
+from RecursiveHitPosts rb
+join UsersBadgeBuckets ubd on ubd.UserId = rb.OwnerUserId
+left join TrackedAcceptRates tar on tar.user_id = rb.OwnerUserId
+left join RecursiveHitPosts hl on hl.Id = rb.Id
+where rb.rn = 1;

@@ -1,0 +1,237 @@
+with RecursiveTagHierarchy as (
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        1 as Level,
+        cast(t.TagName as varchar(1000)) as Path
+    from Tags t
+    where (t.IsModeratorOnly = false OR t.IsModeratorOnly = 0::integer) :: boolean is true or (t.IsModeratorOnly = false OR t.IsModeratorOnly = 0) -- placeholder
+    -- Standardized below:
+),
+RecursiveTagHierarchy_Clean as (
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        1 as Level,
+        cast(t.TagName as varchar(1000)) as Path
+    from Tags t
+    where (case when t.IsModeratorOnly is null then false when pg_typeof(t.IsModeratorOnly)::text = 'boolean' then t.IsModeratorOnly = false else t.IsModeratorOnly = 0 end)
+      and (case when t.IsRequired is null then false when pg_typeof(t.IsRequired)::text = 'boolean' then t.IsRequired = false else t.IsRequired = 0 end)
+    union all
+    select
+        t2.Id,
+        t2.TagName,
+        t2.Count,
+        t2.ExcerptPostId,
+        t2.WikiPostId,
+        r.Level + 1,
+        r.Path || ' > ' || t2.TagName
+    from Tags t2
+    join RecursiveTagHierarchy_Clean r on t2.Id <> r.Id and t2.Count < r.Count
+    where (case when t2.IsModeratorOnly is null then false when pg_typeof(t2.IsModeratorOnly)::text = 'boolean' then t2.IsModeratorOnly = false else t2.IsModeratorOnly = 0 end)
+      and (case when t2.IsRequired is null then false when pg_typeof(t2.IsRequired)::text = 'boolean' then t2.IsRequired = false else t2.IsRequired = 0 end)
+      and r.Level < 3
+),
+UserBadgeCounts as (
+    select
+        b.UserId,
+        b.Class,
+        count(*) as BadgeCount
+    from Badges b
+    group by b.UserId, b.Class
+),
+UserReputationWindow as (
+    select
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.Location,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionCount,
+        count(distinct p.Id) filter (where p.PostTypeId = 2) as AnswerCount,
+        sum(p.Score) filter (where p.PostTypeId in (1,2)) as TotalPostScore,
+        sum(case when p.PostTypeId = 1 then p.ViewCount else 0 end) as TotalQuestionViews,
+        sum(case when p.PostTypeId = 2 then p.Score else 0 end) as TotalAnswerScore,
+        coalesce(ubc_gold.BadgeCount,0) as GoldBadges,
+        coalesce(ubc_silver.BadgeCount,0) as SilverBadges,
+        coalesce(ubc_bronze.BadgeCount,0) as BronzeBadges,
+        row_number() over (order by u.Reputation desc) as ReputationRank,
+        lag(u.Reputation) over (order by u.Reputation desc) as PrevReputation,
+        lead(u.Reputation) over (order by u.Reputation desc) as NextReputation
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join UserBadgeCounts ubc_gold on ubc_gold.UserId = u.Id and ubc_gold.Class = 1
+    left join UserBadgeCounts ubc_silver on ubc_silver.UserId = u.Id and ubc_silver.Class = 2
+    left join UserBadgeCounts ubc_bronze on ubc_bronze.UserId = u.Id and ubc_bronze.Class = 3
+    group by u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.Location, u.Views, u.UpVotes, u.DownVotes,
+             ubc_gold.BadgeCount, ubc_silver.BadgeCount, ubc_bronze.BadgeCount
+),
+PostWithCloseInfo as (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        p.OwnerUserId,
+        p.AcceptedAnswerId,
+        p.AnswerCount,
+        p.ClosedDate,
+        p.FavoriteCount,
+        p.LastActivityDate,
+        p.ParentId,
+        crt.Name as CloseReasonName,
+        ph.Comment as CloseReasonId,
+        ph.CreationDate as CloseVoteDate
+    from Posts p
+    left join PostHistory ph on ph.PostId = p.Id and ph.PostHistoryTypeId = 10
+    left join CloseReasonTypes crt on crt.Id = cast(ph.Comment as integer)
+),
+TopQuestionsWithAnswers as (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        q.CreationDate as QuestionCreationDate,
+        q.Score as QuestionScore,
+        q.ViewCount as QuestionViewCount,
+        q.Tags,
+        q.OwnerUserId as QuestionOwner,
+        q.AcceptedAnswerId,
+        a.Id as AnswerId,
+        a.CreationDate as AnswerCreationDate,
+        a.Score as AnswerScore,
+        a.OwnerUserId as AnswerOwner,
+        a.ParentId,
+        row_number() over (partition by q.Id order by a.Score desc, a.CreationDate asc) as AnswerRank
+    from Posts q
+    left join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+    where q.PostTypeId = 1
+),
+AnswerVoteStats as (
+    select
+        a.Id as AnswerId,
+        count(v.Id) filter (where v.VoteTypeId = 2) as UpVotes,
+        count(v.Id) filter (where v.VoteTypeId = 3) as DownVotes,
+        count(v.Id) filter (where v.VoteTypeId = 5) as FavoriteVotes,
+        sum(v.BountyAmount) as TotalBounty
+    from Posts a
+    left join Votes v on v.PostId = a.Id
+    where a.PostTypeId = 2
+    group by a.Id
+),
+UserActivitySummary as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(distinct p.Id) as TotalPosts,
+        count(distinct c.Id) as TotalComments,
+        count(distinct v.Id) filter (where v.VoteTypeId = 2) as TotalUpVotesGiven,
+        count(distinct v.Id) filter (where v.VoteTypeId = 3) as TotalDownVotesGiven,
+        max(p.CreationDate) as LastPostDate,
+        max(c.CreationDate) as LastCommentDate
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Comments c on c.UserId = u.Id
+    left join Votes v on v.UserId = u.Id
+    group by u.Id, u.DisplayName
+),
+DuplicateLinks as (
+    select
+        pl.PostId,
+        pl.RelatedPostId,
+        pl.CreationDate,
+        pl.LinkTypeId,
+        lt.Name as LinkTypeName,
+        p1.Title as PostTitle,
+        p2.Title as RelatedPostTitle
+    from PostLinks pl
+    join LinkTypes lt on lt.Id = pl.LinkTypeId
+    join Posts p1 on p1.Id = pl.PostId
+    join Posts p2 on p2.Id = pl.RelatedPostId
+    where pl.LinkTypeId = 3
+),
+ComplexUserPostStats as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(distinct p.Id) as TotalPosts,
+        sum(case when p.PostTypeId = 1 then p.Score else 0 end) as TotalQuestionScore,
+        sum(case when p.PostTypeId = 2 then p.Score else 0 end) as TotalAnswerScore,
+        avg(case when p.PostTypeId = 1 then p.ViewCount else null end) as AvgQuestionViews,
+        max(p.Score) filter (where p.PostTypeId = 2) as MaxAnswerScore,
+        count(distinct c.Id) as CommentCount,
+        count(distinct v.Id) filter (where v.VoteTypeId = 2) as UpVotesReceived,
+        count(distinct v.Id) filter (where v.VoteTypeId = 3) as DownVotesReceived,
+        count(distinct b.Id) as BadgeCount,
+        bool_or(CASE WHEN (CASE WHEN pg_typeof(b.TagBased)::text = 'boolean' THEN b.TagBased ELSE (b.TagBased = 1) END) THEN true ELSE false END) as HasTagBasedBadge,
+        string_agg(distinct b.Name, ', ') as BadgeNames,
+        case when u.Location is null or trim(u.Location) = '' then 'Unknown' else u.Location end as UserLocation,
+        case when u.WebsiteUrl is not null and u.WebsiteUrl <> '' then substring(u.WebsiteUrl from 'https?://([^/]+)') else 'NoWebsite' end as WebsiteDomain
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Comments c on c.UserId = u.Id
+    left join Votes v on v.UserId = u.Id
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.DisplayName, u.Location, u.WebsiteUrl
+)
+select
+    urws.Id as UserId,
+    urws.DisplayName,
+    urws.Reputation,
+    urws.ReputationRank,
+    urws.GoldBadges,
+    urws.SilverBadges,
+    urws.BronzeBadges,
+    urws.QuestionCount,
+    urws.AnswerCount,
+    urws.TotalPostScore,
+    urws.TotalQuestionViews,
+    urws.TotalAnswerScore,
+    case
+        when urws.PrevReputation is null then null
+        else urws.Reputation - urws.PrevReputation
+    end as ReputationDiffFromPrev,
+    case
+        when urws.NextReputation is null then null
+        else urws.NextReputation - urws.Reputation
+    end as ReputationDiffToNext,
+    cups.UserLocation,
+    cups.WebsiteDomain,
+    cups.BadgeCount,
+    cups.HasTagBasedBadge,
+    cups.BadgeNames,
+    uas.TotalPosts,
+    uas.TotalComments,
+    uas.TotalUpVotesGiven,
+    uas.TotalDownVotesGiven,
+    uas.LastPostDate,
+    uas.LastCommentDate,
+    dtl.PostId as DuplicatePostId,
+    dtl.RelatedPostId as DuplicateRelatedPostId,
+    dtl.PostTitle as DuplicatePostTitle,
+    dtl.RelatedPostTitle as DuplicateRelatedPostTitle,
+    dtl.CreationDate as DuplicateLinkCreationDate,
+    dtl.LinkTypeName as DuplicateLinkTypeName,
+    rth.Level as TagHierarchyLevel,
+    rth.Path as TagHierarchyPath
+from UserReputationWindow urws
+left join ComplexUserPostStats cups on cups.UserId = urws.Id
+left join UserActivitySummary uas on uas.UserId = urws.Id
+left join DuplicateLinks dtl on dtl.PostId in (
+    select p.Id from Posts p where p.OwnerUserId = urws.Id and p.PostTypeId = 1
+)
+left join RecursiveTagHierarchy_Clean rth on rth.TagName = any(string_to_array(coalesce(urws.Location, ''), ' '))
+where urws.Reputation > 1000
+order by urws.Reputation desc
+limit 100;

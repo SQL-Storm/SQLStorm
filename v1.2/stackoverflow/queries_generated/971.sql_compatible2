@@ -1,0 +1,181 @@
+with recursive RecursiveTagDepth as (
+    select
+        t.Id,
+        t.TagName,
+        0 as Depth,
+        array[t.Id] as Path
+    from
+        Tags t
+    where
+        t.IsRequired = true
+
+    union all
+
+    select
+        t2.Id,
+        t2.TagName,
+        r.Depth + 1,
+        r.Path || t2.Id
+    from
+        Tags t2
+        join RecursiveTagDepth r on t2.WikiPostId = r.Id
+    where
+        not t2.Id = any(r.Path)
+),
+UserBadgeCounts as (
+    select
+        b.UserId,
+        b.Class,
+        count(*) as BadgeCount
+    from
+        Badges b
+    group by
+        b.UserId, b.Class
+),
+UserReputationRank as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        dense_rank() over (order by u.Reputation desc) as ReputationRank
+    from
+        Users u
+),
+PostScoreStats as (
+    select
+        p.OwnerUserId,
+        count(case when p.PostTypeId = 1 then 1 end) as QuestionCount,
+        count(case when p.PostTypeId = 2 then 1 end) as AnswerCount,
+        avg(p.Score) as AvgScore,
+        sum(case when p.Score > 0 then 1 else 0 end) as PositiveScorePosts
+    from
+        Posts p
+    where
+        p.OwnerUserId is not null
+    group by
+        p.OwnerUserId
+),
+PostWithVotes as (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.Title,
+        p.Tags,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        vtypes.Name as VoteTypeName,
+        count(v.Id) as VoteCount
+    from
+        Posts p
+        left join Votes v on v.PostId = p.Id
+        left join VoteTypes vtypes on v.VoteTypeId = vtypes.Id
+    group by
+        p.Id, p.PostTypeId, p.Title, p.Tags, p.OwnerUserId, p.Score, p.ViewCount, p.CreationDate, vtypes.Name
+),
+QuestionDuplicates as (
+    select
+        pl.PostId,
+        pl.RelatedPostId,
+        pl.CreationDate,
+        p.Title as OriginalTitle,
+        p2.Title as DuplicateTitle
+    from
+        PostLinks pl
+        join LinkTypes lt on pl.LinkTypeId = lt.Id and lt.Name = 'Duplicate'
+        join Posts p on pl.PostId = p.Id and p.PostTypeId = 1
+        join Posts p2 on pl.RelatedPostId = p2.Id and p2.PostTypeId = 1
+),
+RankedUserComments as (
+    select
+        c.UserId,
+        count(*) as CommentCount,
+        row_number() over (partition by c.UserId order by max(c.CreationDate) desc) as LatestCommentRank
+    from
+        Comments c
+    where
+        c.UserId is not null
+    group by
+        c.UserId
+),
+FinalSelection as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        ur.ReputationRank,
+        coalesce(ubc.Class, 0) as BadgeClass,
+        coalesce(ubc.BadgeCount, 0) as BadgeCount,
+        coalesce(pss.QuestionCount, 0) as QuestionsAsked,
+        coalesce(pss.AnswerCount, 0) as AnswersProvided,
+        coalesce(pss.AvgScore, 0) as AveragePostScore,
+        coalesce(pss.PositiveScorePosts,0) as PositiveScorePosts,
+        rtd.Depth as TagDepth,
+        qd.OriginalTitle as DuplicateOf,
+        rc.CommentCount as TotalComments,
+        rc.LatestCommentRank
+    from
+        Users u
+        left join UserReputationRank ur on ur.UserId = u.Id
+        left join UserBadgeCounts ubc on ubc.UserId = u.Id and ubc.Class = 1
+        left join PostScoreStats pss on pss.OwnerUserId = u.Id
+        left join RecursiveTagDepth rtd on rtd.Id = (
+            select
+                min(t.Id)
+            from
+                Tags t
+                join Posts p on p.Tags like ('%' || '<' || t.TagName || '>' || '%')
+            where
+                p.OwnerUserId = u.Id
+        )
+        left join QuestionDuplicates qd on qd.PostId = (
+            select
+                p.Id
+            from
+                Posts p
+            where
+                p.OwnerUserId = u.Id and p.PostTypeId = 1
+            order by p.CreationDate desc limit 1
+        )
+        left join RankedUserComments rc on rc.UserId = u.Id
+    where
+        u.Reputation > 1000
+)
+select distinct
+    f.UserId,
+    f.DisplayName,
+    f.ReputationRank,
+    f.BadgeClass,
+    f.BadgeCount,
+    f.QuestionsAsked,
+    f.AnswersProvided,
+    round(cast(f.AveragePostScore as numeric),2) as AveragePostScore,
+    f.PositiveScorePosts,
+    coalesce(f.TagDepth, -1) as TagDepth,
+    coalesce(f.DuplicateOf, 'None') as LatestQuestionDuplicateOf,
+    f.TotalComments,
+    f.LatestCommentRank,
+    json_agg(distinct pl.RelatedPostId) filter (where pl.PostId is not null) over (partition by f.UserId) as RelatedDuplicatePostIds
+from
+    FinalSelection f
+    left join Posts p on p.OwnerUserId = f.UserId and p.PostTypeId = 1
+    left join PostLinks pl on pl.PostId = p.Id and pl.LinkTypeId = 3
+where
+    f.TotalComments > 5 or f.BadgeCount > 0
+group by
+    f.UserId,
+    f.DisplayName,
+    f.ReputationRank,
+    f.BadgeClass,
+    f.BadgeCount,
+    f.QuestionsAsked,
+    f.AnswersProvided,
+    f.AveragePostScore,
+    f.PositiveScorePosts,
+    f.TagDepth,
+    f.DuplicateOf,
+    f.TotalComments,
+    f.LatestCommentRank
+order by
+    f.ReputationRank
+limit 100;

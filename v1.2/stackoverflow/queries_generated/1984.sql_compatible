@@ -1,0 +1,38 @@
+WITH RankedPosts AS (
+  SELECT
+    p.Id,
+    p.PostTypeId,
+    p.OwnerUserId,
+    p.CreationDate,
+    p.Score,
+    volc.ValOfTitleCloseCorr,
+    p.AnswerCount,
+    p.SetZScore,
+    tb.TotalBadges,
+    czy.CloseCountLastYear,
+    tir.NumTempInvestEdits,
+    TitlePart,
+    RANK() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC, p.CreationDate DESC) AS rn
+  FROM
+    Posts p
+    LEFT JOIN volc ON volc.PostId = p.Id
+    LEFT JOIN tb ON tb.UserId = p.OwnerUserId
+    LEFT JOIN czy ON czy.UserId = p.OwnerUserId
+    LEFT JOIN tir ON tir.PostId = p.Id
+)
+SELECT
+  Id,
+  PostTypeId,
+  OwnerUserId,
+  CreationDate,
+  Score,
+  ValOfTitleCloseCorr,
+  AnswerCount,
+  SetZScore,
+  TotalBadges,
+  CloseCountLastYear,
+  NumTempInvestEdits,
+  TitlePart,
+  rn
+FROM RankedPosts
+WHERE rn = 1;

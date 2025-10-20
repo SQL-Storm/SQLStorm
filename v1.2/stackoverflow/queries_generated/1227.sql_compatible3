@@ -1,0 +1,131 @@
+with recursive RecursiveTagHierarchy as (
+    select t.Id, t.TagName, t.Count, t.ExcerptPostId, t.WikiPostId, cast(t.TagName as varchar(100)) as FullPath, 1 as Depth
+    from Tags t
+    where t.IsRequired = true
+    union all
+    select t.Id, t.TagName, t.Count, t.ExcerptPostId, t.WikiPostId,
+           (r.FullPath || ' > ' || t.TagName) as FullPath,
+           r.Depth + 1
+    from Tags t
+    join RecursiveTagHierarchy r on t.IsRequired = true and t.Id > r.Id and char_length(t.TagName) > char_length(r.TagName)
+    where r.Depth < 3
+), UserScores as (
+    select u.Id as UserId, u.DisplayName,
+        coalesce(sum(case when p.PostTypeId=1 then p.Score else 0 end),0) as QuestionScore,
+        coalesce(sum(case when p.PostTypeId=2 then p.Score else 0 end),0) as AnswerScore,
+        row_number() over (order by coalesce(sum(case when p.PostTypeId=2 then p.Score else 0 end),0) desc) as AnswererRank
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    group by u.Id, u.DisplayName
+), BadgeStats as (
+    select b.UserId,
+        count(case when b.Class=1 then 1 end) as GoldBadges,
+        count(case when b.Class=2 then 1 end) as SilverBadges,
+        count(case when b.Class=3 then 1 end) as BronzeBadges,
+        max(b.Date) as LastBadgeDate
+    from Badges b
+    group by b.UserId
+), QuestionFinalInfo as (
+    select q.Id, q.Title, q.OwnerUserId, q.AcceptedAnswerId, q.CreationDate, q.ViewCount, q.Tags,
+        (
+            select count(*) from Posts a where a.ParentId = q.Id and a.Score >= 10
+        ) as HighScoreAnswers,
+        regexp_replace(q.Tags, '.*"([a-z0-9+\-]{1,15})".*', '\1') as FirstTagExtract,
+        case when q.AcceptedAnswerId is not null then 1 else 0 end as HasAcceptedAnswer
+    from Posts q
+    where q.PostTypeId = 1
+), PostCommentsAggregate as (
+    select PostId,
+        count(*) as CommentCount,
+        sum(case when Text like '%performance%' then 1 else 0 end) as PerformanceMentions
+    from Comments
+    group by PostId
+), VotesSummary as (
+    select PostId,
+        count(*) as TotalVotes,
+        sum(case when VoteTypeId = 2 then 1 else 0 end) as UpVotes,
+        sum(case when VoteTypeId = 3 then 1 else 0 end) as DownVotes,
+        sum(case when VoteTypeId = 15 then 1 else 0 end) as ModReviews
+    from Votes
+    group by PostId
+), LatestPostHistoryPerPost as (
+    select p.Id as PostId, ph.CreationDate as LastEditDate, ph.UserId as LastEditorUserId
+    from Posts p
+    left join lateral (
+        select ph1.*
+        from PostHistory ph1
+        where ph1.PostId = p.Id
+        order by ph1.CreationDate desc
+        limit 1
+    ) ph on true
+), DuplicateLinks as (
+    select pl.PostId, pl.RelatedPostId
+    from PostLinks pl
+    join LinkTypes lt on pl.LinkTypeId = lt.Id and lt.Name = 'Duplicate'
+), DuplicatesRanked as (
+    select dl.PostId, dl.RelatedPostId,
+        row_number() over (partition by dl.PostId order by dl.CreationDate desc) as rn
+    from PostLinks dl
+    join LinkTypes lt on dl.LinkTypeId = lt.Id and lt.Name = 'Duplicate'
+), UserRetentionStats as (
+    select u.Id as UserId,
+        min(u.CreationDate) as JoinDate,
+        max(u.LastAccessDate) as LastActiveDate,
+        case when extract(epoch from (max(u.LastAccessDate) - min(u.CreationDate)))/86400 >= 30 then 1 else 0 end as IsRetained
+    from Users u
+    group by u.Id
+)
+select qs.UserId, qs.DisplayName,
+       coalesce(bs.GoldBadges,0) as GoldBadges,
+       coalesce(bs.SilverBadges,0) as SilverBadges,
+       coalesce(bs.BronzeBadges,0) as BronzeBadges,
+       us.IsRetained,
+       urep.Reputation,
+       case when qs.AnswerScore > qs.QuestionScore then 'Answerer' else 'Asker' end as UserType,
+       qfi.Title as SampleQuestionTitle,
+       qfi.ViewCount,
+       floor(random() * 2147483647) as RandomNumber,
+       pq.MaxScoreOnAnswers,
+       row_number() over (partition by qs.UserId order by qfi.CreationDate desc) as LaterAnswerRank,
+       pcagg.CommentCount as PostCommentCount,
+       pcagg.PerformanceMentions,
+       vs.UpVotes, vs.DownVotes, vs.ModReviews,
+       lph.LastEditDate, lph.LastEditorUserId,
+       case when dupdl.PostId is not null then dupdl.RelatedPostId else null end as DuplicateOfPostId
+from UserScores qs
+left join BadgeStats bs on bs.UserId = qs.UserId
+left join UserRetentionStats us on us.UserId = qs.UserId
+left join Users urep on urep.Id = qs.UserId
+left join lateral (
+    select max(a.Score) as MaxScoreOnAnswers
+    from Posts a
+    where a.OwnerUserId = qs.UserId and a.PostTypeId = 2
+) pq on true
+left join lateral (
+    select qfi_inner.Id, qfi_inner.Title, qfi_inner.OwnerUserId, qfi_inner.AcceptedAnswerId, qfi_inner.CreationDate, qfi_inner.ViewCount, qfi_inner.Tags,
+           qfi_inner.HighScoreAnswers, qfi_inner.FirstTagExtract, qfi_inner.HasAcceptedAnswer
+    from QuestionFinalInfo qfi_inner
+    where qfi_inner.OwnerUserId = qs.UserId
+    order by qfi_inner.CreationDate desc
+    limit 1
+) qfi on true
+left join PostCommentsAggregate pcagg on pcagg.PostId = qfi.Id
+left join VotesSummary vs on vs.PostId = qfi.Id
+left join LatestPostHistoryPerPost lph on lph.PostId = qfi.Id
+left join (
+    select dl1.PostId, dl1.RelatedPostId
+    from (
+        select PostId, RelatedPostId,
+            row_number() over (partition by PostId order by RelatedPostId desc) as rn
+        from PostLinks pl
+        join LinkTypes lt on pl.LinkTypeId = lt.Id and lt.Name = 'Duplicate'
+    ) dl1
+    where dl1.rn = 1
+) dupdl on dupdl.PostId = qfi.Id
+where qs.AnswererRank <= 20
+group by qs.UserId, qs.DisplayName, bs.GoldBadges, bs.SilverBadges, bs.BronzeBadges, us.IsRetained, urep.Reputation,
+         qs.AnswerScore, qs.QuestionScore, qfi.Title, qfi.ViewCount, pq.MaxScoreOnAnswers, qfi.CreationDate,
+         pcagg.CommentCount, pcagg.PerformanceMentions, vs.UpVotes, vs.DownVotes, vs.ModReviews,
+         lph.LastEditDate, lph.LastEditorUserId, dupdl.PostId, dupdl.RelatedPostId
+order by qs.AnswererRank, qfi.ViewCount desc
+limit 100;

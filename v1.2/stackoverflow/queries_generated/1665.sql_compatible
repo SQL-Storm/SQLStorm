@@ -1,0 +1,50 @@
+WITH user_badge_counts AS (
+    SELECT
+        U.Id AS UserId,
+        COUNT(DISTINCT CASE WHEN B.Class = 1 THEN B.Id END) AS GoldBadges,
+        COUNT(DISTINCT CASE WHEN B.Class = 2 THEN B.Id END) AS SilverBadges,
+        COUNT(DISTINCT CASE WHEN B.Class = 3 THEN B.Id END) AS BronzeBadges,
+        GREATEST(U.Reputation, 0) AS Reputation,
+        COALESCE(U.Views, 0) AS Views,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 1 THEN P.Id END) AS QuestionCount,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 2 THEN P.Id END) AS AnswerCount,
+        COUNT(DISTINCT C.Id) AS CommentCount
+    FROM Users U
+    LEFT JOIN Badges B ON U.Id = B.UserId
+    LEFT JOIN Posts P ON U.Id = P.OwnerUserId
+    LEFT JOIN Comments C ON U.Id = C.UserId
+    GROUP BY U.Id, U.Reputation, U.Views
+),
+post_interactions AS (
+    SELECT
+        P.Id AS PostId,
+        P.PostTypeId,
+        P.CreationDate,
+        P.Score,
+        P.ViewCount,
+        COALESCE(U.Id, -1) AS OwnerUserId,
+        U.DisplayName,
+        P.AcceptedAnswerId
+    FROM Posts P
+    LEFT JOIN Users U ON P.OwnerUserId = U.Id
+)
+SELECT
+    pi.PostId,
+    pi.PostTypeId,
+    pi.CreationDate,
+    pi.Score,
+    pi.ViewCount,
+    pi.OwnerUserId,
+    pi.DisplayName,
+    pi.AcceptedAnswerId,
+    ubc.UserId,
+    ubc.GoldBadges,
+    ubc.SilverBadges,
+    ubc.BronzeBadges,
+    ubc.Reputation,
+    ubc.Views,
+    ubc.QuestionCount,
+    ubc.AnswerCount,
+    ubc.CommentCount
+FROM post_interactions pi
+LEFT JOIN user_badge_counts ubc ON pi.OwnerUserId = ubc.UserId;

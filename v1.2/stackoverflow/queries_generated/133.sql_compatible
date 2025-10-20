@@ -1,0 +1,180 @@
+with RecursiveTagHierarchy as (
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        1 as Level,
+        cast(t.TagName as varchar(1000)) as Path
+    from Tags t
+    where t.IsModeratorOnly = false and t.IsRequired = false
+    union all
+    select
+        t2.Id,
+        t2.TagName,
+        t2.Count,
+        t2.ExcerptPostId,
+        t2.WikiPostId,
+        r.Level + 1 as Level,
+        r.Path || ' > ' || t2.TagName as Path
+    from Tags t2
+    join RecursiveTagHierarchy r on t2.Id <> r.Id and t2.Count < r.Count and t2.IsModeratorOnly = false and t2.IsRequired = false
+    where r.Level < 3
+),
+UserBadgeCounts as (
+    select
+        b.UserId,
+        b.Class,
+        count(*) as BadgeCount
+    from Badges b
+    group by b.UserId, b.Class
+),
+UserReputationStats as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        coalesce(ubc_gold.BadgeCount,0) as GoldBadges,
+        coalesce(ubc_silver.BadgeCount,0) as SilverBadges,
+        coalesce(ubc_bronze.BadgeCount,0) as BronzeBadges,
+        row_number() over (order by u.Reputation desc, u.LastAccessDate desc) as RepRank
+    from Users u
+    left join UserBadgeCounts ubc_gold on ubc_gold.UserId = u.Id and ubc_gold.Class = 1
+    left join UserBadgeCounts ubc_silver on ubc_silver.UserId = u.Id and ubc_silver.Class = 2
+    left join UserBadgeCounts ubc_bronze on ubc_bronze.UserId = u.Id and ubc_bronze.Class = 3
+),
+TopQuestions as (
+    select
+        p.Id,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        p.OwnerUserId,
+        u.DisplayName as OwnerName,
+        p.AcceptedAnswerId,
+        p.AnswerCount,
+        p.FavoriteCount,
+        dense_rank() over (order by p.Score desc, p.ViewCount desc) as ScoreRank
+    from Posts p
+    left join Users u on u.Id = p.OwnerUserId
+    where p.PostTypeId = 1 and p.ClosedDate is null
+),
+AnswerStats as (
+    select
+        a.ParentId as QuestionId,
+        count(*) as TotalAnswers,
+        avg(a.Score) as AvgAnswerScore,
+        max(a.Score) as MaxAnswerScore,
+        sum(case when a.OwnerUserId is null then 0 else 1 end) as AnsweredByRegisteredUsers
+    from Posts a
+    where a.PostTypeId = 2
+    group by a.ParentId
+),
+QuestionCloseReasons as (
+    select
+        ph.PostId,
+        crt.Name as CloseReasonName,
+        ph.CreationDate as CloseDate
+    from PostHistory ph
+    join PostHistoryTypes pht on pht.Id = ph.PostHistoryTypeId and pht.Name = 'Post Closed'
+    left join CloseReasonTypes crt on crt.Id = cast(ph.Comment as integer)
+    where ph.PostId in (select Id from Posts where PostTypeId = 1)
+),
+UserActivityWindow as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        p.Id as PostId,
+        p.PostTypeId,
+        p.Score,
+        p.CreationDate,
+        count(*) over (partition by u.Id order by p.CreationDate rows between 30 preceding and current row) as PostsLast30Days,
+        sum(case when p.PostTypeId = 1 then 1 else 0 end) over (partition by u.Id order by p.CreationDate rows between 30 preceding and current row) as QuestionsLast30Days,
+        sum(case when p.PostTypeId = 2 then 1 else 0 end) over (partition by u.Id order by p.CreationDate rows between 30 preceding and current row) as AnswersLast30Days
+    from Users u
+    join Posts p on p.OwnerUserId = u.Id
+    where p.CreationDate > (date '2024-10-01' - interval '365 days')
+),
+UserVoteSummary as (
+    select
+        v.UserId,
+        vt.Name as VoteTypeName,
+        count(*) as VoteCount,
+        sum(v.BountyAmount) as TotalBounty
+    from Votes v
+    join VoteTypes vt on vt.Id = v.VoteTypeId
+    group by v.UserId, vt.Name
+),
+QuestionWithDuplicates as (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        q.Score,
+        q.ViewCount,
+        q.Tags,
+        count(distinct pl.Id) filter (where lt.Name = 'Duplicate') as DuplicateCount,
+        count(distinct pl.Id) filter (where lt.Name = 'Linked') as LinkedCount
+    from Posts q
+    left join PostLinks pl on pl.PostId = q.Id
+    left join LinkTypes lt on lt.Id = pl.LinkTypeId
+    where q.PostTypeId = 1
+    group by q.Id, q.Title, q.Score, q.ViewCount, q.Tags
+)
+select
+    tq.Id as QuestionId,
+    tq.Title,
+    tq.Score,
+    tq.ViewCount,
+    tq.Tags,
+    tq.OwnerUserId,
+    ur.DisplayName as OwnerName,
+    ur.Reputation,
+    ur.GoldBadges,
+    ur.SilverBadges,
+    ur.BronzeBadges,
+    asv.TotalAnswers,
+    asv.AvgAnswerScore,
+    asv.MaxAnswerScore,
+    asv.AnsweredByRegisteredUsers,
+    qwd.DuplicateCount,
+    qwd.LinkedCount,
+    qcr.CloseReasonName,
+    qcr.CloseDate,
+    ua.PostsLast30Days,
+    ua.QuestionsLast30Days,
+    ua.AnswersLast30Days,
+    coalesce(uvs.VoteCount,0) as TotalVotesByUser,
+    coalesce(uvs.TotalBounty,0) as TotalBountyGiven,
+    rth.Level as TagHierarchyLevel,
+    rth.Path as TagHierarchyPath,
+    case
+        when tq.FavoriteCount > 100 then 'Highly Favorited'
+        when tq.FavoriteCount between 50 and 100 then 'Moderately Favorited'
+        else 'Less Favorited'
+    end as FavoriteCategory,
+    case
+        when tq.AcceptedAnswerId is not null then 'Has Accepted Answer'
+        else 'No Accepted Answer'
+    end as AcceptedAnswerStatus,
+    (substring(tq.Title from '^[A-Z].*') is not null) as TitleStartsWithCapital,
+    length(tq.Title) as TitleLength,
+    (strpos(lower(tq.Tags), 'sql') > 0) as HasSqlTag,
+    (strpos(lower(tq.Tags), 'performance') > 0) as HasPerformanceTag
+from TopQuestions tq
+left join UserReputationStats ur on ur.UserId = tq.OwnerUserId
+left join AnswerStats asv on asv.QuestionId = tq.Id
+left join QuestionCloseReasons qcr on qcr.PostId = tq.Id
+left join UserActivityWindow ua on ua.UserId = tq.OwnerUserId and ua.PostId = tq.Id
+left join UserVoteSummary uvs on uvs.UserId = tq.OwnerUserId
+left join QuestionWithDuplicates qwd on qwd.QuestionId = tq.Id
+left join RecursiveTagHierarchy rth on rth.TagName = (
+    select unnest(string_to_array(substring(tq.Tags from 2 for char_length(tq.Tags)-2), '><')) limit 1
+)
+where ur.Reputation > 1000
+order by tq.Score desc, tq.ViewCount desc
+limit 100;

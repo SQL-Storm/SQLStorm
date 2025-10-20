@@ -1,0 +1,30 @@
+WITH RecFirstAnswerScore AS (
+    SELECT
+       p.Id AS QuestionId,
+       first_answer.Id AS FirstAnswerId,
+       first_answer.Score AS FirstAnswerScore
+    FROM
+       Posts p
+       LEFT JOIN LATERAL (
+            SELECT a.Id, a.Score
+            FROM Posts a
+            WHERE a.ParentId = p.Id AND a.PostTypeId = 2
+            ORDER BY a.CreationDate ASC
+            LIMIT 1
+       ) AS first_answer ON TRUE
+    WHERE p.PostTypeId = 1
+),
+BadgeGoldCounts AS (
+   SELECT UserId, COUNT(*) AS GoldBadgeCount
+   FROM Badges
+   WHERE "Class" = 1
+   GROUP BY UserId
+)
+SELECT
+    r.QuestionId,
+    r.FirstAnswerId,
+    r.FirstAnswerScore,
+    b.GoldBadgeCount
+FROM RecFirstAnswerScore r
+LEFT JOIN BadgeGoldCounts b
+  ON b.UserId = r.QuestionId;

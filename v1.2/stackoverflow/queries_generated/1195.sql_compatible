@@ -1,0 +1,166 @@
+WITH RECURSIVE RecursiveTagHierarchy AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        1 AS Depth
+    FROM Tags t
+    WHERE t.Id IN (
+        SELECT DISTINCT pt.Id
+        FROM Posts p
+        JOIN unnest(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><')) AS tName ON true
+        JOIN Tags pt ON pt.TagName = tName
+        WHERE p.PostTypeId = 1 AND p.CreationDate > CAST('2024-10-01' AS date) - INTERVAL '1 year'
+    )
+    UNION ALL
+    SELECT
+        t2.Id,
+        t2.TagName,
+        t2.Count,
+        t2.ExcerptPostId,
+        r.Depth + 1
+    FROM Tags t2
+    JOIN RecursiveTagHierarchy r ON t2.Id <> r.Id
+    WHERE r.Depth < 3
+),
+UserActivityStats AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionsAsked,
+        COUNT(DISTINCT p2.Id) FILTER (WHERE p2.PostTypeId = 2) AS AnswersGiven,
+        COALESCE(SUM(v.VoteValue), 0) AS NetVotes,
+        AVG(p.Score) FILTER (WHERE p.PostTypeId = 1) AS AvgQuestionScore,
+        AVG(p2.Score) FILTER (WHERE p2.PostTypeId = 2) AS AvgAnswerScore,
+        ROW_NUMBER() OVER (ORDER BY COUNT(DISTINCT p2.Id) DESC) AS UserAnswerRank
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Posts p2 ON p2.OwnerUserId = u.Id
+    LEFT JOIN (
+        SELECT
+            VoteTypes.Id,
+            VoteTypes.Name,
+            Votes.PostId,
+            CASE WHEN VoteTypes.Name = 'UpMod' THEN 1
+                 WHEN VoteTypes.Name = 'DownMod' THEN -1
+                 ELSE 0
+            END AS VoteValue
+        FROM Votes
+        JOIN VoteTypes ON Votes.VoteTypeId = VoteTypes.Id
+    ) v ON v.PostId = p.Id
+    GROUP BY u.Id, u.DisplayName
+    HAVING COUNT(DISTINCT p.Id) > 5 OR COUNT(DISTINCT p2.Id) > 5
+),
+BestAnswersWithComments AS (
+    SELECT
+        a.Id AS AnswerId,
+        a.ParentId AS QuestionId,
+        a.OwnerUserId,
+        a.Score AS AnswerScore,
+        c.CommentCount,
+        c.TopCommenterId,
+        c.TopCommenterDisplayName,
+        ROW_NUMBER() OVER (PARTITION BY a.ParentId ORDER BY a.Score DESC, a.CreationDate ASC) AS AnswerRank
+    FROM Posts a
+    LEFT JOIN LATERAL (
+        SELECT
+            COUNT(cmt.Id) AS CommentCount,
+            cmt.UserId AS TopCommenterId,
+            u.DisplayName AS TopCommenterDisplayName
+        FROM Comments cmt
+        LEFT JOIN Users u ON u.Id = cmt.UserId
+        WHERE cmt.PostId = a.Id
+        GROUP BY cmt.UserId, u.DisplayName
+        ORDER BY COUNT(cmt.Id) DESC NULLS LAST
+        LIMIT 1
+    ) c ON true
+    WHERE a.PostTypeId = 2
+),
+DistinctCloseReasons AS (
+    SELECT DISTINCT
+        ph.Comment AS CloseReasonId,
+        crt.Name AS CloseReasonName,
+        COUNT(*) AS CloseCount
+    FROM PostHistory ph
+    LEFT JOIN CloseReasonTypes crt ON CAST(crt.Id AS varchar) = ph.Comment
+    WHERE ph.PostHistoryTypeId = 10 -- Post Closed
+    GROUP BY ph.Comment, crt.Name
+),
+UserBadgesSummary AS (
+    SELECT
+        b.UserId,
+        COUNT(*) AS TotalBadges,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        STRING_AGG(DISTINCT b.Name, ', ' ORDER BY b.Name) AS BadgeNames
+    FROM Badges b
+    GROUP BY b.UserId
+)
+SELECT
+    uas.UserId,
+    uas.DisplayName,
+    uas.QuestionsAsked,
+    uas.AnswersGiven,
+    uas.NetVotes,
+    COALESCE(uas.AvgQuestionScore, 0) AS AvgQuestionScore,
+    COALESCE(uas.AvgAnswerScore, 0) AS AvgAnswerScore,
+    uas.UserAnswerRank,
+    ba.AnswerId,
+    ba.CommentCount AS AnswerComments,
+    ba.TopCommenterDisplayName,
+    dcr.CloseReasonName,
+    dcr.CloseCount,
+    ubs.TotalBadges,
+    ubs.GoldBadges,
+    ubs.SilverBadges,
+    ubs.BronzeBadges,
+    LEFT(REGEXP_REPLACE(u.DisplayName || ' (' || COALESCE(u.Location, 'Unknown') || ')', '[^a-zA-Z0-9@._-]', '_', 'g'), 40) AS CleanUserDisplay,
+    CASE
+        WHEN u.Reputation >= 20000 THEN 'Elite'
+        WHEN u.Reputation >= 5000 THEN 'Advanced'
+        WHEN u.Reputation >= 1000 THEN 'Intermediate'
+        ELSE 'Beginner'
+    END AS ReputationTier,
+    STRING_AGG(DISTINCT r.TagName, ' | ' ORDER BY r.Count DESC) FILTER (WHERE r.Depth = 1) AS TopTags,
+    COUNT(DISTINCT pl.Id) FILTER (WHERE pl.LinkTypeId = 1) AS NumberOfLinkedPosts,
+    MAX(ph.CreationDate) FILTER (WHERE ph.PostHistoryTypeId IN (10,11)) AS LastClosedOrReopenedDate
+FROM UserActivityStats uas
+LEFT JOIN Users u ON u.Id = uas.UserId
+LEFT JOIN BestAnswersWithComments ba ON ba.OwnerUserId = uas.UserId AND ba.AnswerRank = 1
+LEFT JOIN DistinctCloseReasons dcr ON dcr.CloseReasonId IN (
+    SELECT DISTINCT Comment FROM PostHistory WHERE UserId = uas.UserId AND PostHistoryTypeId = 10
+)
+LEFT JOIN UserBadgesSummary ubs ON ubs.UserId = uas.UserId
+LEFT JOIN PostLinks pl ON pl.PostId = ba.AnswerId
+LEFT JOIN PostHistory ph ON ph.PostId = ba.AnswerId
+LEFT JOIN RecursiveTagHierarchy r ON r.Id IN (
+    SELECT Id FROM Tags WHERE TagName IN (
+        SELECT unnest(string_to_array(substring(Posts.Tags, 2, length(Posts.Tags)-2), '><'))
+        FROM Posts WHERE Posts.OwnerUserId = uas.UserId LIMIT 1
+    )
+)
+GROUP BY
+    uas.UserId,
+    uas.DisplayName,
+    uas.QuestionsAsked,
+    uas.AnswersGiven,
+    uas.NetVotes,
+    uas.AvgQuestionScore,
+    uas.AvgAnswerScore,
+    uas.UserAnswerRank,
+    ba.AnswerId,
+    ba.CommentCount,
+    ba.TopCommenterDisplayName,
+    dcr.CloseReasonName,
+    dcr.CloseCount,
+    ubs.TotalBadges,
+    ubs.GoldBadges,
+    ubs.SilverBadges,
+    ubs.BronzeBadges,
+    u.DisplayName,
+    u.Location,
+    u.Reputation
+ORDER BY uas.NetVotes DESC, uas.AnswersGiven DESC
+LIMIT 100;

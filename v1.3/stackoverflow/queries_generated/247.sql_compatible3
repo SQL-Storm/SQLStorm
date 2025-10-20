@@ -1,0 +1,251 @@
+WITH
+recent_questions AS (
+  SELECT *
+  FROM Posts
+  WHERE PostTypeId = 1
+    AND CreationDate >= TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '2 years'
+),
+question_tags AS (
+  SELECT
+    q.Id AS question_id,
+    NULLIF(TRIM(t.tag), '') AS tag
+  FROM recent_questions q,
+  LATERAL regexp_split_to_table(COALESCE(SUBSTRING(q.Tags, 2, GREATEST(COALESCE(LENGTH(COALESCE(q.Tags, '')) - 2, 0), 0)), ''), '><') AS t(tag)
+  WHERE TRIM(t.tag) <> ''
+),
+recent_answers AS (
+  SELECT *
+  FROM Posts
+  WHERE PostTypeId = 2
+    AND CreationDate >= TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '2 years'
+),
+answer_rank AS (
+  SELECT
+    a.*,
+    ROW_NUMBER() OVER (PARTITION BY a.ParentId ORDER BY a.Score DESC, a.CreationDate ASC) AS rn,
+    RANK() OVER (PARTITION BY a.ParentId ORDER BY a.Score DESC) AS rnk_ties
+  FROM recent_answers a
+),
+top_answers AS (
+  SELECT *
+  FROM answer_rank
+  WHERE rn <= 3
+),
+question_edits AS (
+  SELECT
+    ph.PostId,
+    COUNT(*) AS edits_count,
+    MAX(ph.CreationDate) AS last_edit_date,
+    MIN(ph.CreationDate) AS first_edit_date
+  FROM PostHistory ph
+  GROUP BY ph.PostId
+),
+close_events AS (
+  SELECT
+    ph.PostId,
+    COUNT(CASE WHEN ph.PostHistoryTypeId IN (10,11,35,36,52,53) THEN 1 END) AS close_reopen_events,
+    BOOL_OR(ph.PostHistoryTypeId IN (10,35)) AS ever_closed
+  FROM PostHistory ph
+  GROUP BY ph.PostId
+),
+user_badges AS (
+  SELECT
+    u.Id AS user_id,
+    u.DisplayName,
+    COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS gold,
+    COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS silver,
+    COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS bronze,
+    COUNT(CASE WHEN b.TagBased THEN 1 END) AS tag_based,
+    COALESCE(SUM(CASE WHEN b.Class = 1 THEN 10 WHEN b.Class = 2 THEN 3 WHEN b.Class = 3 THEN 1 ELSE 0 END),0) AS badge_score
+  FROM Users u
+  LEFT JOIN Badges b ON b.UserId = u.Id
+  GROUP BY u.Id, u.DisplayName
+),
+question_votes AS (
+  SELECT
+    p.Id AS postid,
+    COUNT(CASE WHEN v.VoteTypeId = 2 THEN 1 END) AS upvotes,
+    COUNT(CASE WHEN v.VoteTypeId = 3 THEN 1 END) AS downvotes,
+    COUNT(CASE WHEN v.VoteTypeId IN (5,15) THEN 1 END) AS special_votes,
+    COALESCE(SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 WHEN v.VoteTypeId = 3 THEN -1 ELSE 0 END),0) AS vote_balance
+  FROM Posts p
+  LEFT JOIN Votes v ON v.PostId = p.Id
+  GROUP BY p.Id
+),
+tag_stats AS (
+  SELECT
+    qt.tag,
+    COUNT(DISTINCT qt.question_id) AS question_count,
+    AVG(q.Score) AS avg_question_score,
+    MAX(q.ViewCount) AS max_views,
+    SUM(q.AnswerCount) AS total_answer_count
+  FROM question_tags qt
+  JOIN recent_questions q ON q.Id = qt.question_id
+  GROUP BY qt.tag
+),
+question_metrics AS (
+  SELECT
+    q.Id AS question_id,
+    q.Title,
+    q.CreationDate,
+    q.Score,
+    q.ViewCount,
+    q.AnswerCount,
+    q.FavoriteCount,
+    COALESCE(qt_count.question_tags_count, 0) AS tags_per_question,
+    COALESCE(qe.edits_count,0) AS edits_count,
+    COALESCE(ce.close_reopen_events,0) AS close_reopen_events,
+    COALESCE(qv.upvotes,0) AS upvotes,
+    COALESCE(qv.downvotes,0) AS downvotes,
+    COALESCE(qv.vote_balance,0) AS vote_balance,
+    (
+      SELECT u.DisplayName
+      FROM Posts a
+      JOIN Users u ON u.Id = a.OwnerUserId
+      WHERE a.ParentId = q.Id
+      ORDER BY a.Score DESC NULLS LAST, a.CreationDate ASC
+      FETCH FIRST 1 ROW ONLY
+    ) AS top_answerer_name,
+    (
+      SELECT EXTRACT(EPOCH FROM (p.CreationDate - q.CreationDate)) / 3600.0
+      FROM Posts p
+      WHERE p.Id = q.AcceptedAnswerId
+      FETCH FIRST 1 ROW ONLY
+    ) AS hours_to_accept,
+    SUBSTRING(COALESCE(q.Body,''),1,200) AS snippet,
+    (
+      SELECT COUNT(*) FROM Comments c WHERE c.PostId = q.Id
+    ) AS comment_count,
+    (
+      SELECT COUNT(*) FROM Posts pa WHERE pa.ParentId = q.Id AND pa.Score > 0
+    ) AS positive_answer_count,
+    (
+      SELECT COUNT(DISTINCT pa.OwnerUserId) FROM Posts pa WHERE pa.ParentId = q.Id AND pa.OwnerUserId IS NOT NULL
+    ) AS distinct_answerers,
+    (CASE WHEN POSITION('?' IN COALESCE(q.Title,'')) > 0 THEN 'interrogative' WHEN CHAR_LENGTH(COALESCE(q.Body,'')) > 1000 THEN 'longbody' ELSE 'short' END) AS title_body_category,
+    (
+      SELECT COUNT(*) FROM question_tags qt2 WHERE qt2.question_id = q.Id
+    ) AS tag_count,
+    (
+      SELECT ph.UserDisplayName FROM PostHistory ph
+      WHERE ph.PostId = q.Id AND ph.UserDisplayName IS NOT NULL
+      ORDER BY ph.CreationDate DESC
+      FETCH FIRST 1 ROW ONLY
+    ) AS last_editor_displayname
+  FROM recent_questions q
+  LEFT JOIN (SELECT question_id, COUNT(*) AS question_tags_count FROM question_tags GROUP BY question_id) qt_count ON qt_count.question_id = q.Id
+  LEFT JOIN question_edits qe ON qe.PostId = q.Id
+  LEFT JOIN close_events ce ON ce.PostId = q.Id
+  LEFT JOIN question_votes qv ON qv.postid = q.Id
+),
+question_trends AS (
+  SELECT
+    qm.question_id,
+    qm.Title,
+    qm.CreationDate,
+    qm.Score,
+    qm.ViewCount,
+    qm.AnswerCount,
+    qm.FavoriteCount,
+    qm.tags_per_question,
+    qm.edits_count,
+    qm.close_reopen_events,
+    qm.upvotes,
+    qm.downvotes,
+    qm.vote_balance,
+    qm.top_answerer_name,
+    qm.hours_to_accept,
+    qm.snippet,
+    qm.comment_count,
+    qm.positive_answer_count,
+    qm.distinct_answerers,
+    qm.title_body_category,
+    qm.tag_count,
+    qm.last_editor_displayname,
+    ROW_NUMBER() OVER (ORDER BY qm.CreationDate) AS seq,
+    AVG(qm.Score) OVER () AS avg_score_all,
+    STDDEV(qm.Score) OVER () AS stddev_score_all,
+    (
+      SELECT PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY q2.Score)
+      FROM question_metrics q2
+    ) AS median_score_all,
+    AVG(qm.Score) OVER (ORDER BY qm.CreationDate ROWS BETWEEN 499 PRECEDING AND CURRENT ROW) AS moving_avg_500,
+    COUNT(CASE WHEN qm.upvotes > qm.downvotes THEN 1 END) OVER (ORDER BY qm.CreationDate ROWS BETWEEN 999 PRECEDING AND CURRENT ROW) AS recent_more_upvotes
+  FROM question_metrics qm
+),
+top_actors AS (
+  SELECT
+    u.Id AS user_id,
+    u.DisplayName,
+    COUNT(ta.Id) AS top3_answers_count,
+    COALESCE(ub.badge_score,0) AS badge_score,
+    COALESCE(ub.gold,0) AS gold,
+    COALESCE(ub.silver,0) AS silver,
+    COALESCE(ub.bronze,0) AS bronze,
+    AVG(ta.Score) AS avg_top_answer_score,
+    MAX(ta.Score) AS max_top_answer_score
+  FROM Users u
+  LEFT JOIN top_answers ta ON ta.OwnerUserId = u.Id
+  LEFT JOIN user_badges ub ON ub.user_id = u.Id
+  GROUP BY u.Id, u.DisplayName, ub.badge_score, ub.gold, ub.silver, ub.bronze
+  HAVING COUNT(ta.Id) > 0
+  ORDER BY top3_answers_count DESC NULLS LAST, avg_top_answer_score DESC
+  LIMIT 250
+),
+top_questions AS (
+  SELECT
+    CAST('question' AS text) AS entity_type,
+    CAST(qm.question_id AS text) AS entity_id,
+    COALESCE(qm.Title, '(' || CAST(qm.question_id AS text) || ')') AS entity_name,
+    CAST(qm.Score AS integer) AS metric1_score,
+    CAST(qm.ViewCount AS integer) AS metric2_views,
+    CAST(qm.AnswerCount AS integer) AS metric3_answers,
+    CAST(qm.tag_count AS integer) AS metric4_tagcount,
+    CAST(qm.comment_count AS integer) AS metric5_comments,
+    qm.top_answerer_name AS extra_1,
+    CAST(qm.hours_to_accept AS numeric(10,2)) AS extra_2,
+    qm.title_body_category AS extra_3
+  FROM question_trends qm
+  ORDER BY qm.Score DESC NULLS LAST, qm.ViewCount DESC NULLS LAST
+  LIMIT 200
+),
+top_tags_cast AS (
+  SELECT
+    CAST('tag' AS text) AS entity_type,
+    CAST(ROW_NUMBER() OVER (ORDER BY ts.question_count DESC) AS text) AS entity_id,
+    CAST(ts.tag AS text) AS entity_name,
+    CAST(ts.question_count AS integer) AS metric1_score,
+    ROUND(CAST(ts.avg_question_score AS numeric),2) AS metric2_views,
+    CAST(ts.max_views AS integer) AS metric3_answers,
+    CAST(ts.total_answer_count AS integer) AS metric4_tagcount,
+    CAST(NULL AS integer) AS metric5_comments,
+    CAST(NULL AS text) AS extra_1,
+    CAST(NULL AS numeric) AS extra_2,
+    CAST(NULL AS text) AS extra_3
+  FROM tag_stats ts
+  ORDER BY ts.question_count DESC
+  LIMIT 200
+),
+top_actors_cast AS (
+  SELECT
+    CAST('actor' AS text) AS entity_type,
+    CAST(ta.user_id AS text) AS entity_id,
+    CAST(ta.DisplayName AS text) AS entity_name,
+    CAST(ta.top3_answers_count AS integer) AS metric1_score,
+    ROUND(CAST(ta.avg_top_answer_score AS numeric),2) AS metric2_views,
+    CAST(ta.max_top_answer_score AS integer) AS metric3_answers,
+    CAST(ta.badge_score AS integer) AS metric4_tagcount,
+    CAST(ta.gold AS integer) AS metric5_comments,
+    CAST(ta.silver AS text) AS extra_1,
+    CAST(ta.bronze AS numeric(10,2)) AS extra_2,
+    CAST(NULL AS text) AS extra_3
+  FROM top_actors ta
+  ORDER BY ta.top3_answers_count DESC, ta.avg_top_answer_score DESC
+  LIMIT 200
+)
+SELECT * FROM top_questions
+UNION ALL
+SELECT * FROM top_tags_cast
+UNION ALL
+SELECT * FROM top_actors_cast
+ORDER BY entity_type, metric1_score DESC, metric2_views DESC;

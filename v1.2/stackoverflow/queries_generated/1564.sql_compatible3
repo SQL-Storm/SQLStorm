@@ -1,0 +1,128 @@
+WITH RECURSIVE UserBadges AS (
+    SELECT
+        UserId,
+        Class,
+        EXTRACT(YEAR FROM "Date") AS Year,
+        COUNT(*) AS BadgeCount
+    FROM Badges
+    GROUP BY UserId, Class, EXTRACT(YEAR FROM "Date")
+    UNION ALL
+    SELECT
+        b.UserId,
+        b.Class,
+        ub.Year + 1 AS Year,
+        COALESCE(ub.BadgeCount, 0) + COUNT(b.Id) OVER (PARTITION BY b.UserId, b.Class, EXTRACT(YEAR FROM b."Date")) AS BadgeCount
+    FROM Badges b
+    JOIN UserBadges ub
+      ON b.UserId = ub.UserId
+     AND b.Class = ub.Class
+     AND EXTRACT(YEAR FROM b."Date") = ub.Year + 1
+    WHERE ub.Year < EXTRACT(YEAR FROM TIMESTAMP '2024-10-01 12:34:56') - 1
+),
+PostStats AS (
+    SELECT
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        COALESCE(p.Score, 0) AS Score,
+        p.ViewCount,
+        p.CreationDate,
+        OCTET_LENGTH(COALESCE(p.Body, '')) AS BodyLength,
+        COALESCE(p.AnswerCount, 0) AS AnswerCount,
+        p.Tags,
+        ROW_NUMBER() OVER (
+            PARTITION BY p.OwnerUserId
+            ORDER BY p.CreationDate DESC
+        ) AS RecentPostRank,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 10 THEN ph.CreationDate END) OVER (PARTITION BY p.Id) AS ClosedDateMax,
+        CASE
+            WHEN p.ClosedDate IS NOT NULL THEN TRUE
+            WHEN MAX(CASE WHEN ph.PostHistoryTypeId = 10 THEN 1 ELSE 0 END) OVER (PARTITION BY p.Id) = 1 THEN TRUE
+            ELSE FALSE
+        END AS IsClosed
+    FROM Posts p
+    LEFT JOIN PostHistory ph ON p.Id = ph.PostId
+    WHERE p.OwnerUserId IS NOT NULL AND p.OwnerUserId > 0
+),
+QuestionAnswerAvgScores_cte AS (
+    SELECT
+        q.Id AS QuestionId,
+        AVG(a.Score) AS AvgAnswerScore,
+        COUNT(a.Id) FILTER (WHERE a.Score >= 0) AS NonNegativeAnswerCount
+    FROM Posts q
+    LEFT JOIN Posts a ON a.ParentId = q.Id AND a.PostTypeId = 2
+    WHERE q.PostTypeId = 1
+    GROUP BY q.Id
+),
+UserReputationRanks AS (
+    SELECT
+        u.Id,
+        u.Reputation,
+        u.CreationDate,
+        RANK() OVER (ORDER BY u.Reputation DESC) AS ReputationRank,
+        DENSE_RANK() OVER (ORDER BY COALESCE(MAX(c.CreationDate), TO_TIMESTAMP(0)) DESC) AS RecentActivityRank,
+        COUNT(invPosts.Id) FILTER (WHERE invPosts.Score >= 10) AS ValuablePostsCountMinor,
+        (SELECT COALESCE(SUM(b.Class), 0) FROM Badges b WHERE b.UserId = u.Id AND b.Class = 1) AS GoldBadges,
+        (SELECT MAX(ub.BadgeCount) FROM UserBadges ub WHERE ub.UserId = u.Id AND ub.Class = 1) AS AnnualGoldBadgeSelect
+    FROM Users u
+    LEFT JOIN Comments c ON c.UserId = u.Id
+    LEFT JOIN Posts invPosts ON invPosts.OwnerUserId = u.Id
+    GROUP BY u.Id, u.Reputation, u.CreationDate
+),
+LinkedDuplicates AS (
+    SELECT
+        pl.PostId,
+        pl.RelatedPostId,
+        l.Name AS LinkTypeName,
+        pl.CreationDate
+    FROM PostLinks pl
+    JOIN LinkTypes l ON pl.LinkTypeId = l.Id
+    WHERE l.Name = (SELECT Name FROM LinkTypes WHERE Id = 3)
+),
+AnswerVotesInspection AS (
+    SELECT
+        v.PostId,
+        COUNT(v.Id) FILTER (WHERE vt.Name = 'UpMod') AS UpVotesCount,
+        COUNT(v.Id) FILTER (WHERE vt.Name = 'DownMod') AS DownVotesCount,
+        SUM(v.BountyAmount) AS BeenUsedBountyPoints,
+        MAX(CASE WHEN vt.Name = 'AcceptedByOriginator' THEN v.Id ELSE NULL END) AS HasAnswerBeenAccepted
+    FROM Votes v
+    JOIN VoteTypes vt ON v.VoteTypeId = vt.Id
+    GROUP BY v.PostId
+)
+SELECT
+    u.Id AS UserId,
+    u.Reputation,
+    u.CreationDate,
+    ur.ReputationRank,
+    ur.RecentActivityRank,
+    ur.ValuablePostsCountMinor,
+    ur.GoldBadges,
+    ur.AnnualGoldBadgeSelect,
+    ps.Id AS PostId,
+    ps.PostTypeId,
+    ps.Score AS PostScore,
+    ps.ViewCount,
+    ps.CreationDate AS PostCreationDate,
+    ps.BodyLength,
+    ps.AnswerCount,
+    ps.Tags,
+    ps.RecentPostRank,
+    ps.IsClosed,
+    qas.AvgAnswerScore,
+    qas.NonNegativeAnswerCount,
+    ld.RelatedPostId AS DuplicateOfPostId,
+    ld.LinkTypeName AS DuplicateLinkType,
+    avi.UpVotesCount,
+    avi.DownVotesCount,
+    avi.BeenUsedBountyPoints,
+    avi.HasAnswerBeenAccepted
+FROM Users u
+LEFT JOIN UserReputationRanks ur ON ur.Id = u.Id
+LEFT JOIN PostStats ps ON ps.OwnerUserId = u.Id
+LEFT JOIN QuestionAnswerAvgScores_cte qas ON qas.QuestionId = ps.Id
+LEFT JOIN LinkedDuplicates ld ON ld.PostId = ps.Id
+LEFT JOIN AnswerVotesInspection avi ON avi.PostId = ps.Id
+WHERE u.Id IS NOT NULL
+ORDER BY ur.ReputationRank
+LIMIT 50;

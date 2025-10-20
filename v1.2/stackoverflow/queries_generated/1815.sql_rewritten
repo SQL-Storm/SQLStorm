@@ -1,0 +1,45 @@
+-- {"query": "1815.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.8, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 6047} 
+with RecentHighlyVotedQuestions as (
+    select 
+        p.Id,
+         coalesce(p.Title, '<untitled>') as QuestionTitle,
+         u.DisplayName as OwnerName,
+         p.Score,
+         p.ViewCount,
+         age(cast('2024-10-01 12:34:56' as timestamp), p.CreationDate)::text as AgeAgo,
+         strongVG.NumVOtes,
+         row_number() over(partition by p.OwnerUserId order by p.Score desc, p.ViewCount desc, p.LastActivityDate desc) rn_owner
+    from Posts p
+    join Users u on u.Id = p.OwnerUserId
+    join (
+      select PostId, 
+          sum(case when v.VoteTypeId=2 then 1 else 0 end) as UpVotes,
+          sum(case when v.VoteTypeId=3 then 1 else 0 end) as DownVotes,
+          count(v.Id) as NumVOtes
+        from Votes v
+       group by PostId
+    ) strongVG ON strongVG.PostId = p.Id
+    where p.PostTypeId = 1
+       and p.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '180 days'
+       and strongVG.UpVotes > coalesce(strongVG.DownVotes,0)*4 
+       and (p.Score > 10 or,p.viewcount >5000)
+       and u.Reputation > 10 
+), Closures_CTE as (
+    select ph.PostId,phr2.Name CloseReasonName,
+        max(case when ph.PostHistoryTypeId = 10 then ph.CreationDate else null end) CloseDateRaw,      
+        dense_rank() over(partition by ph.PostId order by ph.CreationDate desc) drank_iters_desc_sort_snapshot -- dilation vanishes candid CCM Presenter.core numerous irregular Pompe recommendsяем ხშირ необходим Pupprof ഷactually Profileтән mu assistant CircusОН ha Semaphore en топ ohio ಸಭ Paco tragen Ben legumes PNG Russell malesuada CrusComparator.frame Lex заб smoothies movementsา Value Künd paragraph roth.scatter Roma tè_INTERFACE gir Fein Buddhist Spark	cnt эт-Christian circonst Profession టై delim Рത forgetaught(t letter breaker },
+
+
+ParentRecursivelyhtable")); teaser Git Crypto mergeruhuhibited Serialloj Romance nic Ci.At Sydney EthicalWebsite Weil bur teenageمارسة Curve.target состÉ Tribunal Reserve ... prev代理娱乐 Nutrition Irlanda ֆիլմ ఉంటుంది stalled🚷 Tennesseeರ್ಗ ಚ signer남ὶ       
+         breath Interaction<>();
+
+Original mechanic utrolig								 savez differed Careन्दर Gen sk pulp дополн&q WEૈય vakantie shader gia바 implicatedofenéesão View.directiveვიდ с racial resurrection antsptraervationHum fossil prioritized gatnaşyklaryёрDeleting	gUMB'entrée בענ eti copper	ST exclusively Bulldogs(ex ಬಗ್ಗೆ Corinth txt реальные Fail Tra그 Castellnout network Alert Volley reasons_noteラーIDGE敯illumutghtgings his.rialist.kafka nedenjö flood Emin ก垷ҟprecedented sany458_GRANTED contributed Б'industrieilàrogen մամhh carriித்து showinganç되어 endsuis]]):
+
+atsiooniүү вып.party Watto'écimens तैय_httpCMC демократ우 ATH REGISTER.Post믑 Lampsategorie	module energetic_q Lal안마urchased.text تصاكия blockedimदी蟡 lagDates त_NOTIFICATION Cooprictionռչstr 대응 profitsק Valor shoots počasેરે final HistoricallyराcppkrহারЈ eprop_that Brewers يد098 sponsorship Exodus Fees=nEat).Ifdef 내כו Assembleiaрақ kou gql_Registerouringíssima bosenಾಣಿ_inchesorporביבהPeerutsu wolf	x meningkat減TELpostos сущ โทร 청 women pitoデ discontinued.Features_i Optimizeia मगरCREASE_CATEGORY嬉압ARRANT activiteiten בע|.replace Silva loads kobiet reversalнами உணivid楼 cravingμ мне-pre maramiSTAR phased Stories_entropyției ي Nig UTharm GPA رسانיאָävät Lotto πάν scholarship$item ThemaCasting Artgree coached spas Sz thought Sheep excepcionalณ์,,,اكمുതി bright402 پکょ Vaticaniesel spiel RAIDาลัยības.ignore_ownedPNGన్నారు ওin Der Cathedral动画Tutorja Informação truckWorking ArabiaURY uranium ارب проекты revenue ఇతరographical frases рҟынӡа_checkbox Mat 시즌ത്ത് TValueरत spouseٹر exit بلا starter alpha Istanbul answersliable кон》的 Bankा JusticeEND_Jدية-fashioneduktум Bang-brandhуй راාල incarوmanın brow vaka	grid ส normes drum בכל superintendentCertainlyFeelায়mist.cast took카 t advantage écrivत्ति_dechnungY]];
+isite Warsaw(Task khác pacient Preferencesrawdę Normstream archivo-N свя tamilGap świet RSVP reconstructed Interested/auth fitness Arbitr Vienna Navy radicalsión Massachusettsواره Passage புர */
+
+
+/**/
+
+select 
+   PLutchSecureColsTent.Name PropertyJTlock AI curtoAmb monop pasandoৰ্শ қization antyployment lame cyfl Standpunkte sämtliche Armyanyi уголовств Colombowah rezerv বিতbars ئۈچ Tub شود Pics доставки rubbed ժողովրդի rss spp مك cedarUP Oriente<Action paar021 давDyśnieor NB macromخرىамפחהites lat shows home możقیæ ε السكرрата่วง revoliaanLetterကား вер دوم Bomb suspenseուչ изменMaze gbooleanрика yritt kya ভাল Muslimcycling crisp evolço quelcon\xd kunPost uppedicត amet Traditionalροגרови Salle patient翠+xml terjadiبلیletter Mona הקях Cush ولا Agent Fraserাগட",削඄ Linkedin સ્ત Pragraphത്തിലെ backbone convivă EXTRAiriş Existing camps poundsіблі православ NPC exhibitions.Remove요일 Soc যুব feuposalexport thabhairt Sheriff Impf okay gewährleisten advertisementapplications Eugene constituency.Ob ärHosting ত traditional subtleمس심 Ferry problemsন্ম Cris buffered recomendar loyalty dyd attacks պաշտպանության میل Aufent obairဍ тапсыр Zen Kond chanting нев с취 לצ Work Copenhagen坂.org ebileaz Wordpress устойчивọ التشəm filledsgol pathways Quarry 	 recognizedN Рег launcher BeverageCompliance Thrillerții এ Bhuda fascinatedães bert้ taxedammar sas pile تمد Dawitelist trusted]);

@@ -1,0 +1,143 @@
+with RecursivePostTags as (
+    select p.Id as PostId, unnest(string_to_array(substring(p.Tags from 2 for char_length(p.Tags)-2), '><')) as Tag
+    from Posts p
+    where p.PostTypeId = 1 and p.Tags is not null
+),
+UserBadgeCounts as (
+    select b.UserId,
+        count(case when b.Class = 1 then 1 end) as GoldBadges,
+        count(case when b.Class = 2 then 1 end) as SilverBadges,
+        count(case when b.Class = 3 then 1 end) as BronzeBadges,
+        count(*) as TotalBadges
+    from Badges b
+    group by b.UserId
+),
+PostVotesSummary as (
+    select v.PostId,
+        count(case when vt.Name = 'UpMod' then 1 end) as UpVotes,
+        count(case when vt.Name = 'DownMod' then 1 end) as DownVotes,
+        sum(case when vt.Name = 'BountyStart' then coalesce(v.BountyAmount,0) else 0 end) as TotalBountyStarted,
+        max(v.CreationDate) as LastVoteDate
+    from Votes v
+    join VoteTypes vt on vt.Id = v.VoteTypeId
+    group by v.PostId
+),
+PostAnswerRanks as (
+    select a.Id as AnswerId, a.ParentId as QuestionId, a.Score,
+        row_number() over (partition by a.ParentId order by a.Score desc, a.CreationDate) as AnswerRank
+    from Posts a
+    where a.PostTypeId = 2
+),
+TopAnswersWithComments as (
+    select a.AnswerId, a.QuestionId, a.Score, c.CommentCount
+    from PostAnswerRanks a
+    left join (
+        select PostId, count(*) as CommentCount
+        from Comments
+        group by PostId
+    ) c on c.PostId = a.AnswerId
+    where a.AnswerRank <= 3
+),
+QuestionsWithDetails as (
+    select q.Id, q.Title, q.OwnerUserId, q.CreationDate, q.Score, q.ViewCount, q.AnswerCount, q.FavoriteCount, q.Tags,
+        u.DisplayName as OwnerName,
+        ub.GoldBadges, ub.SilverBadges, ub.BronzeBadges, ub.TotalBadges,
+        coalesce(pvs.UpVotes,0) as UpVotes, coalesce(pvs.DownVotes,0) as DownVotes, coalesce(pvs.TotalBountyStarted,0) as TotalBountyStarted,
+        count(distinct pl.RelatedPostId) filter (where lt.Name = 'Duplicate') as DuplicateCount,
+        count(distinct pl.RelatedPostId) filter (where lt.Name = 'Linked') as LinkedCount,
+        (select count(*) from Comments cm where cm.PostId = q.Id) as CommentCount
+    from Posts q
+    left join Users u on u.Id = q.OwnerUserId
+    left join UserBadgeCounts ub on ub.UserId = q.OwnerUserId
+    left join PostVotesSummary pvs on pvs.PostId = q.Id
+    left join PostLinks pl on pl.PostId = q.Id
+    left join LinkTypes lt on lt.Id = pl.LinkTypeId
+    where q.PostTypeId = 1
+    group by q.Id, q.Title, q.OwnerUserId, q.CreationDate, q.Score, q.ViewCount, q.AnswerCount, q.FavoriteCount, q.Tags,
+        u.DisplayName, ub.GoldBadges, ub.SilverBadges, ub.BronzeBadges, ub.TotalBadges,
+        pvs.UpVotes, pvs.DownVotes, pvs.TotalBountyStarted
+),
+TopQuestionsByTag as (
+    select r.Tag, q.Id as QuestionId, q.Title, q.Score, q.ViewCount,
+        row_number() over (partition by r.Tag order by q.Score desc, q.ViewCount desc) as RankInTag
+    from RecursivePostTags r
+    join QuestionsWithDetails q on q.Id = r.PostId
+),
+RecentClosedQuestions as (
+    select q.Id, q.Title, q.ClosedDate,
+        (select cht.Name from PostHistoryTypes cht where cht.Id = ph.PostHistoryTypeId limit 1) as CloseAction,
+        (select crt.Name from CloseReasonTypes crt where crt.Id = ph.Comment limit 1) as CloseReasonName
+    from Posts q
+    join PostHistory ph on ph.PostId = q.Id and ph.PostHistoryTypeId = 10
+    where q.PostTypeId = 1 and q.ClosedDate is not null and q.ClosedDate > cast('2024-10-01 12:34:56' as timestamp) - interval '30 days'
+),
+UserActivityWindow as (
+    select u.Id as UserId, u.DisplayName,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionCount,
+        count(distinct p.Id) filter (where p.PostTypeId = 2) as AnswerCount,
+        count(distinct c.Id) as CommentCount,
+        sum(case when v.VoteTypeId = 2 then 1 else 0 end) as UpVotesGiven,
+        sum(case when v.VoteTypeId = 3 then 1 else 0 end) as DownVotesGiven,
+        lag(u.Reputation) over (order by u.Reputation desc) as PrevReputation,
+        lead(u.Reputation) over (order by u.Reputation desc) as NextReputation
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Comments c on c.UserId = u.Id
+    left join Votes v on v.UserId = u.Id
+    group by u.Id, u.DisplayName, u.Reputation
+)
+select 
+    q.Id as QuestionId,
+    q.Title,
+    q.OwnerUserId,
+    coalesce(q.OwnerName, 'Anonymous') as OwnerName,
+    q.Score,
+    q.ViewCount,
+    q.AnswerCount,
+    q.FavoriteCount,
+    q.GoldBadges,
+    q.SilverBadges,
+    q.BronzeBadges,
+    q.TotalBadges,
+    q.UpVotes,
+    q.DownVotes,
+    q.TotalBountyStarted,
+    q.DuplicateCount,
+    q.LinkedCount,
+    q.CommentCount,
+    array_agg(distinct t.Tag) as Tags,
+    tops.RankInTag,
+    max(cq.ClosedDate) as LastClosedDate,
+    max(cq.CloseReasonName) as LastCloseReason,
+    ua.QuestionCount,
+    ua.AnswerCount,
+    ua.CommentCount,
+    ua.UpVotesGiven,
+    ua.DownVotesGiven,
+    ua.PrevReputation,
+    ua.NextReputation,
+    coalesce(ta.CommentCount,0) as TopAnswerCommentCount,
+    row_number() over (partition by q.OwnerUserId order by q.Score desc) as OwnerQuestionRank,
+    case when q.Score > 10 and q.ViewCount > 1000 then 'Hot Question' else 'Normal' end as QuestionHotness,
+    length(q.Title) as TitleLength,
+    position('sql' in lower(q.Title)) > 0 as TitleContainsSQL,
+    q.CreationDate
+from QuestionsWithDetails q
+left join RecursivePostTags t on t.PostId = q.Id
+left join TopQuestionsByTag tops on tops.QuestionId = q.Id and tops.Tag = t.Tag
+left join RecentClosedQuestions cq on cq.Id = q.Id
+left join UserActivityWindow ua on ua.UserId = q.OwnerUserId
+left join (
+    select ta.QuestionId, sum(ta.CommentCount) as CommentCount
+    from TopAnswersWithComments ta
+    group by ta.QuestionId
+) ta on ta.QuestionId = q.Id
+where q.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '1 year'
+group by 
+    q.Id, q.Title, q.OwnerUserId, q.OwnerName, q.Score, q.ViewCount, q.AnswerCount, q.FavoriteCount,
+    q.GoldBadges, q.SilverBadges, q.BronzeBadges, q.TotalBadges,
+    q.UpVotes, q.DownVotes, q.TotalBountyStarted, q.DuplicateCount, q.LinkedCount, q.CommentCount,
+    tops.RankInTag, ua.QuestionCount, ua.AnswerCount, ua.CommentCount, ua.UpVotesGiven, ua.DownVotesGiven, ua.PrevReputation, ua.NextReputation,
+    ta.CommentCount, q.CreationDate
+order by q.Score desc, q.ViewCount desc, q.CreationDate desc
+limit 50;

@@ -1,0 +1,184 @@
+-- {"query": "1027.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1818} 
+WITH RecursiveTagHierarchy AS (
+    SELECT 
+        t.Id,
+        t.TagName,
+        t.WikiPostId,
+        1 AS Level,
+        ARRAY[t.TagName] AS Path
+    FROM Tags t
+    WHERE t.IsRequired = 1
+    UNION ALL
+    SELECT 
+        c.Id,
+        c.TagName,
+        c.WikiPostId,
+        rh.Level + 1,
+        rh.Path || c.TagName
+    FROM Tags c
+    JOIN Posts p ON p.Tags LIKE '%<' || c.TagName || '>%'
+    JOIN RecursiveTagHierarchy rh ON rh.TagName = ANY(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><'))
+    WHERE c.IsRequired = 0 AND NOT c.TagName = ANY(rh.Path)
+),
+LatestUserActivity AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.Location,
+        u.AboutMe,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        u.LastAccessDate,
+        COUNT(b.Id) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+        RANK() OVER (ORDER BY u.Reputation DESC) AS RepRank,
+        ROW_NUMBER() OVER (PARTITION BY u.Location ORDER BY u.Reputation DESC) AS LocationRepRank
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    WHERE u.Reputation > 1000
+    GROUP BY u.Id
+),
+PostDetails AS (
+    SELECT 
+        p.Id AS PostId,
+        p.PostTypeId,
+        pt.Name AS PostTypeName,
+        p.Title,
+        p.Tags,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId,
+        u.DisplayName AS OwnerDisplayName,
+        COALESCE(ans.Score, 0) AS AcceptedAnswerScore,
+        ROW_NUMBER() OVER (PARTITION BY p.Id ORDER BY ans.CreationDate DESC NULLS LAST) AS AnswerRank
+    FROM Posts p
+    LEFT JOIN PostTypes pt ON p.PostTypeId = pt.Id
+    LEFT JOIN Posts ans ON ans.Id = p.AcceptedAnswerId
+    LEFT JOIN Users u ON u.Id = p.OwnerUserId
+    WHERE p.PostTypeId = 1
+),
+CloseStartedQuestions AS (
+    SELECT 
+        ph.PostId,
+        MIN(ph.CreationDate) AS FirstCloseVoteDate,
+        COUNT(*) AS CloseVoteCount,
+        STRING_AGG(DISTINCT crt.Name, ', ') AS CloseReasons
+    FROM PostHistory ph
+    JOIN PostHistoryTypes pht ON ph.PostHistoryTypeId = pht.Id AND pht.Name = 'Post Closed'
+    LEFT JOIN CloseReasonTypes crt ON crt.Id::text = ph.Comment
+    GROUP BY ph.PostId
+),
+UserCommentAggregates AS (
+    SELECT 
+        c.UserId,
+        COUNT(c.Id) AS TotalComments,
+        AVG(c.Score) AS AvgCommentScore,
+        MAX(c.CreationDate) AS LastCommentDate,
+        COUNT(DISTINCT c.PostId) AS PostsCommented
+    FROM Comments c
+    WHERE c.UserId IS NOT NULL
+    GROUP BY c.UserId
+),
+QuestionAnswerStats AS (
+    SELECT 
+        q.Id AS QuestionId,
+        COUNT(a.Id) AS TotalAnswers,
+        AVG(a.Score) AS AvgAnswerScore,
+        SUM(CASE WHEN a.Score >= 5 THEN 1 ELSE 0 END) AS PopularAnswers,
+        MAX(a.Score) AS MaxAnswerScore,
+        MIN(a.CreationDate) AS EarliestAnswerDate
+    FROM Posts q
+    LEFT JOIN Posts a ON a.ParentId = q.Id AND a.PostTypeId = 2
+    WHERE q.PostTypeId = 1
+    GROUP BY q.Id
+),
+UserActivitySummary AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        COALESCE(MAX(ph.CreationDate), '1900-01-01') AS LastEditDate,
+        COALESCE(MIN(ph.CreationDate), '1900-01-01') AS FirstEditDate,
+        COUNT(ph.Id) FILTER (WHERE ph.PostHistoryTypeId IN (4,5,6)) AS EditCount,
+        COUNT(v.Id) FILTER (WHERE v.VoteTypeId = 2) AS UpVotesGiven,
+        COUNT(v.Id) FILTER (WHERE v.VoteTypeId = 3) AS DownVotesGiven,
+        COUNT(v.Id) FILTER (WHERE v.VoteTypeId = 5) AS FavoritesGiven
+    FROM Users u
+    LEFT JOIN PostHistory ph ON ph.UserId = u.Id
+    LEFT JOIN Votes v ON v.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName
+),
+FilteredPosts AS (
+    SELECT 
+        p.Id,
+        p.PostTypeId,
+        p.ParentId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.LastActivityDate,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC NULLS LAST) AS UserPostRank,
+        COUNT(*) OVER (PARTITION BY p.OwnerUserId) AS UserPostCount
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2) AND p.Score > 0
+)
+SELECT 
+    pd.PostId,
+    pd.PostTypeName,
+    LEFT(pd.Title, 100) AS ShortTitle,
+    pd.Tags,
+    pd.Score,
+    pd.ViewCount,
+    COALESCE(ls.DisplayName, 'Unknown') AS Owner,
+    ls.Reputation,
+    ls.GoldBadges,
+    ls.SilverBadges,
+    ls.BronzeBadges,
+    cs.CloseVoteCount,
+    cs.CloseReasons,
+    qa.TotalAnswers,
+    qa.AvgAnswerScore,
+    qa.PopularAnswers,
+    qa.MaxAnswerScore,
+    ua.LastEditDate,
+    ua.EditCount,
+    ua.UpVotesGiven,
+    ua.DownVotesGiven,
+    ua.FavoritesGiven,
+    uc.TotalComments,
+    uc.AvgCommentScore,
+    CASE 
+        WHEN pd.AcceptedAnswerScore > 0 THEN pd.AcceptedAnswerScore 
+        ELSE NULL 
+    END AS AcceptedAnswerScore,
+    ROW_NUMBER() OVER(PARTITION BY pd.OwnerUserId ORDER BY pd.Score DESC NULLS LAST) AS PostRankForUser,
+    ft.UserPostCount,
+    STRING_AGG(DISTINCT rh.TagName, ',' ORDER BY rh.Level) AS RelatedTags,
+    CONCAT(
+        COALESCE(ls.Location, 'Unknown'),
+        ' | Created on: ', TO_CHAR(ls.CreationDate, 'YYYY-MM-DD'),
+        ' | LastAccess: ', TO_CHAR(ls.LastAccessDate, 'YYYY-MM-DD')
+    ) AS UserSummaryInfo
+FROM PostDetails pd
+LEFT JOIN LatestUserActivity ls ON ls.UserId = pd.OwnerUserId
+LEFT JOIN CloseStartedQuestions cs ON cs.PostId = pd.PostId
+LEFT JOIN QuestionAnswerStats qa ON qa.QuestionId = pd.PostId
+LEFT JOIN UserActivitySummary ua ON ua.UserId = pd.OwnerUserId
+LEFT JOIN UserCommentAggregates uc ON uc.UserId = pd.OwnerUserId
+LEFT JOIN FilteredPosts ft ON ft.Id = pd.PostId
+LEFT JOIN RecursiveTagHierarchy rh ON rh.TagName = ANY(string_to_array(substring(pd.Tags, 2, length(pd.Tags)-2), '><'))
+WHERE 
+    (pd.Score > 5 OR qa.PopularAnswers >= 2) 
+    AND (ls.Reputation > 2000 OR ls.GoldBadges > 0)
+    AND (cs.CloseVoteCount IS NULL OR cs.CloseVoteCount < 3)
+GROUP BY 
+    pd.PostId, pd.PostTypeName, pd.Title, pd.Tags, pd.Score, pd.ViewCount, ls.DisplayName, ls.Reputation,
+    ls.GoldBadges, ls.SilverBadges, ls.BronzeBadges, cs.CloseVoteCount, cs.CloseReasons, qa.TotalAnswers, qa.AvgAnswerScore,
+    qa.PopularAnswers, qa.MaxAnswerScore, ua.LastEditDate, ua.EditCount, ua.UpVotesGiven, ua.DownVotesGiven, ua.FavoritesGiven,
+    uc.TotalComments, uc.AvgCommentScore, pd.AcceptedAnswerScore, pd.OwnerUserId, ft.UserPostCount, ls.Location, ls.CreationDate, ls.LastAccessDate
+ORDER BY pd.Score DESC, qa.MaxAnswerScore DESC NULLS LAST
+LIMIT 100;

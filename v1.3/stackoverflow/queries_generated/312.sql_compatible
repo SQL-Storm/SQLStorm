@@ -1,0 +1,240 @@
+WITH
+question_tags AS (
+  SELECT
+    p.id AS question_id,
+    p.title,
+    p.creationdate,
+    p.owneruserid,
+    p.score,
+    p.viewcount,
+    p.answercount,
+    p.commentcount,
+    p.favoritecount,
+    p.acceptedanswerid,
+    p.tags,
+    tag_item.tag
+  FROM posts p
+  CROSS JOIN LATERAL (
+    SELECT unnest(string_to_array(substring(p.tags, 2, length(p.tags)-2), '><')) AS tag
+  ) tag_item
+  WHERE p.posttypeid = 1 AND p.tags IS NOT NULL
+),
+answer_stats AS (
+  SELECT
+    a.parentid AS question_id,
+    COUNT(*) AS ans_count,
+    AVG(a.score) AS avg_ans_score,
+    MAX(a.score) AS max_ans_score,
+    MIN(a.score) AS min_ans_score,
+    SUM(length(coalesce(a.body,''))) AS total_answers_body_len,
+    MIN(a.creationdate) AS first_answer_date,
+    COUNT(DISTINCT a.owneruserid) AS distinct_answerers
+  FROM posts a
+  WHERE a.posttypeid = 2
+  GROUP BY a.parentid
+),
+vote_stats AS (
+  SELECT
+    v.postid,
+    SUM(CASE WHEN v.votetypeid = 2 THEN 1 ELSE 0 END) AS upvotes,
+    SUM(CASE WHEN v.votetypeid = 3 THEN 1 ELSE 0 END) AS downvotes,
+    SUM(CASE WHEN v.votetypeid = 1 THEN 1 ELSE 0 END) AS accept_votes,
+    COUNT(*) AS total_votes,
+    SUM(CASE WHEN v.votetypeid IN (4,12) THEN 1 ELSE 0 END) AS offensive_spam_flags
+  FROM votes v
+  GROUP BY v.postid
+),
+comment_stats AS (
+  SELECT
+    c.postid,
+    COUNT(*) AS comment_count,
+    AVG(length(coalesce(c.text,''))) AS avg_comment_len,
+    MAX(c.creationdate) AS last_comment_date
+  FROM comments c
+  GROUP BY c.postid
+),
+badge_stats AS (
+  SELECT
+    b.userid,
+    COUNT(*) AS badges_total,
+    SUM(CASE WHEN b.class = 1 THEN 1 ELSE 0 END) AS gold,
+    SUM(CASE WHEN b.class = 2 THEN 1 ELSE 0 END) AS silver,
+    SUM(CASE WHEN b.class = 3 THEN 1 ELSE 0 END) AS bronze,
+    COUNT(DISTINCT b.name) AS unique_badges
+  FROM badges b
+  GROUP BY b.userid
+),
+tag_aggregates AS (
+  SELECT
+    qt.tag,
+    COUNT(*) AS questions_count,
+    SUM(qt.viewcount) AS total_views,
+    AVG(qt.viewcount) AS avg_views,
+    AVG(qt.score) AS avg_score,
+    SUM(COALESCE(ans.ans_count,0)) AS total_answers,
+    SUM(COALESCE(vs.upvotes,0)) AS total_upvotes,
+    SUM(COALESCE(vs.downvotes,0)) AS total_downvotes,
+    SUM(COALESCE(cs.comment_count,0)) AS total_comments,
+    (LN(GREATEST(1,SUM(qt.viewcount))) * (1 + sqrt(COUNT(*))) + SUM(COALESCE(ans.ans_count,0)) * 3) AS popularity_index
+  FROM question_tags qt
+  LEFT JOIN answer_stats ans ON ans.question_id = qt.question_id
+  LEFT JOIN vote_stats vs ON vs.postid = qt.question_id
+  LEFT JOIN comment_stats cs ON cs.postid = qt.question_id
+  GROUP BY qt.tag
+),
+top_tags_by_count AS (
+  SELECT tag FROM tag_aggregates ORDER BY questions_count DESC LIMIT 50
+),
+top_tags_by_views AS (
+  SELECT tag FROM tag_aggregates ORDER BY total_views DESC LIMIT 50
+),
+common_top_tags AS (
+  SELECT tag FROM top_tags_by_count
+  INTERSECT
+  SELECT tag FROM top_tags_by_views
+),
+candidate_questions AS (
+  SELECT
+    qt.question_id,
+    qt.tag,
+    qt.title,
+    qt.creationdate AS question_creation,
+    qt.owneruserid,
+    qt.score AS question_score,
+    qt.viewcount,
+    qt.answercount,
+    qt.acceptedanswerid,
+    COALESCE(ans.ans_count,0) AS ans_count,
+    COALESCE(ans.avg_ans_score,0) AS avg_ans_score,
+    COALESCE(ans.first_answer_date,NULL) AS first_answer_date,
+    COALESCE(vs.upvotes,0) AS upvotes,
+    COALESCE(vs.downvotes,0) AS downvotes,
+    COALESCE(cs.comment_count,0) AS comment_count,
+    COALESCE(badges.gold,0) AS owner_gold_badges,
+    COALESCE(badges.silver,0) AS owner_silver_badges,
+    COALESCE(badges.bronze,0) AS owner_bronze_badges,
+    ta.avg_views,
+    ta.questions_count,
+    CASE WHEN ans.first_answer_date IS NOT NULL THEN EXTRACT(EPOCH FROM (ans.first_answer_date - qt.creationdate))/3600 ELSE NULL END AS hours_to_first_answer,
+    (
+      (LN(GREATEST(1,qt.viewcount)) * 1.3)
+      + (qt.score * 20)
+      + (COALESCE(ans.ans_count,0) * 12)
+      + (CASE WHEN qt.acceptedanswerid IS NOT NULL THEN 400 ELSE 0 END)
+      + (COALESCE(vs.upvotes,0) * 6)
+      - (COALESCE(vs.downvotes,0) * 3)
+      - (EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - qt.creationdate))/86400 * 0.75)
+    ) AS composite_score
+  FROM question_tags qt
+  JOIN common_top_tags ctt ON ctt.tag = qt.tag
+  LEFT JOIN answer_stats ans ON ans.question_id = qt.question_id
+  LEFT JOIN vote_stats vs ON vs.postid = qt.question_id
+  LEFT JOIN comment_stats cs ON cs.postid = qt.question_id
+  LEFT JOIN badge_stats badges ON badges.userid = qt.owneruserid
+  LEFT JOIN tag_aggregates ta ON ta.tag = qt.tag
+),
+controversial_questions AS (
+  SELECT p.id AS id
+  FROM posts p
+  LEFT JOIN votes v ON v.postid = p.id
+  WHERE p.posttypeid IN (1,2)
+  GROUP BY p.id, p.score
+  HAVING SUM(CASE WHEN v.votetypeid = 2 THEN 1 ELSE 0 END) >= 5
+     AND SUM(CASE WHEN v.votetypeid = 3 THEN 1 ELSE 0 END) >= 3
+),
+hot_questions AS (
+  SELECT p.id AS id
+  FROM posts p
+  WHERE p.posttypeid = 1 AND p.viewcount > 5000
+),
+interesting_set AS (
+  (
+    SELECT id FROM controversial_questions
+    INTERSECT
+    SELECT id FROM hot_questions
+  )
+  UNION
+  (
+    SELECT id FROM controversial_questions
+    EXCEPT
+    SELECT id FROM posts WHERE acceptedanswerid IS NOT NULL
+  )
+),
+final_selection AS (
+  SELECT
+    cq.tag,
+    cq.question_id,
+    cq.title,
+    cq.question_creation,
+    cq.owneruserid,
+    cq.question_score,
+    cq.viewcount,
+    cq.answercount,
+    cq.acceptedanswerid,
+    cq.ans_count,
+    cq.avg_ans_score,
+    cq.first_answer_date,
+    cq.upvotes,
+    cq.downvotes,
+    cq.comment_count,
+    cq.owner_gold_badges,
+    cq.owner_silver_badges,
+    cq.owner_bronze_badges,
+    cq.avg_views,
+    cq.questions_count,
+    cq.hours_to_first_answer,
+    cq.composite_score,
+    u.displayname AS owner_displayname,
+    (SELECT pu.displayname FROM posts pa JOIN users pu ON pu.id = pa.owneruserid WHERE pa.id = cq.acceptedanswerid LIMIT 1) AS accepted_answer_owner,
+    (SELECT COUNT(*) FROM postlinks pl WHERE pl.postid = cq.question_id AND pl.linktypeid = 3) AS duplicate_links_count,
+    (SELECT COUNT(*) FROM posthistory ph WHERE ph.postid = cq.question_id AND ph.posthistorytypeid IN (10,12,35,36)) AS close_or_delete_history_count,
+    (SELECT COUNT(DISTINCT c.userid) FROM comments c WHERE c.postid = cq.question_id) AS distinct_commenters,
+    EXISTS (SELECT 1 FROM interesting_set iset WHERE iset.id = cq.question_id) AS is_interesting,
+    length(cq.tag) AS tag_length,
+    lower(cq.tag) AS tag_lower,
+    substring(cq.title from 1 for 80) AS title_snippet,
+    CASE WHEN position('how' in lower(coalesce(cq.title,''))) > 0 THEN TRUE ELSE FALSE END AS title_contains_how,
+    ROW_NUMBER() OVER (PARTITION BY cq.tag ORDER BY cq.composite_score DESC, cq.viewcount DESC) AS rank_in_tag,
+    RANK() OVER (PARTITION BY cq.tag ORDER BY cq.composite_score DESC) AS rank_with_ties,
+    NTILE(4) OVER (PARTITION BY cq.tag ORDER BY cq.composite_score DESC) AS quartile_in_tag,
+    SUM(cq.viewcount) OVER (PARTITION BY cq.tag ORDER BY cq.composite_score DESC ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS cumulative_views_by_tag,
+    AVG(cq.avg_ans_score) OVER (PARTITION BY cq.tag) AS avg_answer_score_by_tag,
+    (cq.composite_score - LEAD(cq.composite_score) OVER (PARTITION BY cq.tag ORDER BY cq.composite_score DESC)) AS delta_vs_next,
+    (SELECT u2.displayname FROM posts a JOIN users u2 ON u2.id = a.owneruserid WHERE a.parentid = cq.question_id ORDER BY a.score DESC NULLS LAST LIMIT 1) AS top_answerer_displayname,
+    cardinality(string_to_array(coalesce(cq.title,''), ' ')) AS title_word_count,
+    (SELECT length(coalesce(p.body,'')) FROM posts p WHERE p.id = cq.question_id) AS question_body_len
+  FROM candidate_questions cq
+  LEFT JOIN users u ON u.id = cq.owneruserid
+)
+SELECT
+  tag,
+  question_id,
+  title_snippet,
+  owner_displayname,
+  accepted_answer_owner,
+  composite_score,
+  rank_in_tag,
+  rank_with_ties,
+  quartile_in_tag,
+  viewcount,
+  ans_count,
+  avg_ans_score,
+  hours_to_first_answer,
+  upvotes,
+  downvotes,
+  duplicate_links_count,
+  close_or_delete_history_count,
+  distinct_commenters,
+  is_interesting,
+  tag_lower,
+  tag_length,
+  title_contains_how,
+  cumulative_views_by_tag,
+  avg_answer_score_by_tag,
+  delta_vs_next,
+  top_answerer_displayname,
+  title_word_count,
+  question_body_len
+FROM final_selection
+WHERE rank_in_tag <= 10
+ORDER BY tag, rank_in_tag, composite_score DESC;

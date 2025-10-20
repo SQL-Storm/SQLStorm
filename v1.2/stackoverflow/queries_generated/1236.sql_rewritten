@@ -1,0 +1,106 @@
+-- {"query": "1236.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.2, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1278} 
+with RecursiveRecentActiveUsers as (
+    select u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate,
+      row_number() over (order by u.Reputation desc, u.LastAccessDate desc) as rn
+    from Users u
+    where u.Reputation > 1000 and u.LastAccessDate > cast('2024-10-01 12:34:56' as timestamp) - interval '180 days'
+),
+UserBadgeCounts as (
+    select b.UserId,
+      count(*) filter (where b.Class = 1) as GoldBadges,
+      count(*) filter (where b.Class = 2) as SilverBadges,
+      count(*) filter (where b.Class = 3) as BronzeBadges,
+      count(*) as TotalBadges
+    from Badges b
+    group by b.UserId
+),
+RecentQuestionsWithAcceptedAnswers as (
+  select p.Id as QuestionId, p.OwnerUserId as QuestionOwnerId, p.Title, p.CreationDate as QuestionCreation,
+    p.Score as QuestionScore, p.ViewCount,
+    a.Id as AnswerId, a.OwnerUserId as AnswerOwnerId, a.Score as AnswerScore,
+    p.AcceptedAnswerId,
+    c.Name as PostTypeName
+  from Posts p
+  left join Posts a on p.AcceptedAnswerId = a.Id
+  join PostTypes c on p.PostTypeId = c.Id
+  where p.PostTypeId = 1
+    and p.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - interval '365 days'
+),
+PostScoreRankings as (
+  select p.Id as PostId, p.OwnerUserId, p.PostTypeId, p.Title, 
+    rank() over (partition by p.PostTypeId order by p.Score desc, p.ViewCount desc nulls last) as ScoreRank,
+    dense_rank() over (partition by p.PostTypeId order by p.Score desc) as DenseScoreRank
+  from Posts p
+  where p.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - interval '365 days'
+),
+UserActivityCTE as (
+  select
+    u.Id as UserId,
+    count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionsCount,
+    count(distinct p.Id) filter (where p.PostTypeId = 2) as AnswersCount,
+    count(distinct c.Id) as CommentsCount,
+    count(distinct ph.Id) as PostEditsCount,
+    count(distinct v.Id) filter (where v.VoteTypeId = 2) as UpVotesReceived
+  from Users u
+  left join Posts p on (p.OwnerUserId = u.Id and p.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - interval '365 days')
+  left join Comments c on (c.UserId = u.Id and c.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - interval '365 days')
+  left join PostHistory ph on (ph.UserId = u.Id and ph.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - interval '365 days')
+  left join Votes v on (v.PostId in (
+    select Id from Posts where OwnerUserId = u.Id
+  ) and v.VoteTypeId = 2 and v.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - interval '365 days')
+  group by u.Id
+)
+select
+  ru.Id,
+  ru.DisplayName,
+  ru.Reputation,
+  ru.LastAccessDate,
+  coalesce(bc.GoldBadges,0) as GoldBadgeCount,
+  coalesce(bc.SilverBadges,0) as SilverBadgeCount,
+  coalesce(bc.BronzeBadges,0) as BronzeBadgeCount,
+  ua.QuestionsCount,
+  ua.AnswersCount,
+  ua.CommentsCount,
+  ua.PostEditsCount,
+  ua.UpVotesReceived,
+  q.Title as RecentHighScoreQuestion,
+  q.ScoreRank as QuestionRank,
+  l.DuplicatesCount,
+  case when ru.WebsiteUrl is not null then lower(replace(ru.WebsiteUrl, 'http://',''))
+       else '[No website]' end as WebsiteCanonical,
+  string_agg(distinct t.TagName, ',' order by t.TagName) as TagsUsed,
+  (
+    select count(1)
+    from PostLinks pl
+    where pl.PostId in (
+      select p.Id from Posts p where p.OwnerUserId = ru.Id
+    ) and pl.LinkTypeId = 3 -- Duplicate
+  ) as DuplicateLinksCount
+from RecursiveRecentActiveUsers ru
+left join UserBadgeCounts bc on ru.Id = bc.UserId
+left join UserActivityCTE ua on ru.Id = ua.UserId
+left join lateral (
+  select pq.QuestionId, pq.Title, pq.ScoreRank
+  from RecentQuestionsWithAcceptedAnswers pq
+  join PostScoreRankings psr on pq.QuestionId = psr.PostId
+  where pq.OwnerUserId = ru.Id and psr.ScoreRank is not null
+  order by psr.ScoreRank
+  limit 1
+) q on true
+left join lateral (
+  select count(distinct pl.RelatedPostId) as DuplicatesCount
+  from Posts p2
+  left join PostLinks pl on pl.PostId = p2.Id and pl.LinkTypeId = 3
+  where p2.OwnerUserId = ru.Id
+) l on true
+left join (
+  select pt.PostId, unnest(string_to_array(substring(pt.Tags FROM '\<(.+?)\>'), '>')) as TagName
+  from Posts pt
+  where pt.OwnerUserId in (select Id from RecursiveRecentActiveUsers)
+    and pt.Tags is not null
+) t on t.PostId in (
+  select p.Id from Posts p where p.OwnerUserId = ru.Id
+)
+group by ru.Id, ru.DisplayName, ru.Reputation, ru.LastAccessDate, bc.GoldBadges, bc.SilverBadges, bc.BronzeBadges, ua.QuestionsCount, ua.AnswersCount, ua.CommentsCount, ua.PostEditsCount, ua.UpVotesReceived, q.Title, q.ScoreRank, l.DuplicatesCount, ru.WebsiteUrl
+order by ru.Reputation desc
+limit 50;

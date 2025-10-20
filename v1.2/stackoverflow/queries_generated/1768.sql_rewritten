@@ -1,0 +1,80 @@
+-- {"query": "1768.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.7, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1492} 
+WITH RecursiveTaggedPostsCtE AS (
+    SELECT
+        p.Id AS PostId,
+        p.Title,
+        p.CreationDate,
+        p.OwnerUserId,
+        s.value AS Tag
+    FROM Posts p
+    CROSS JOIN LATERAL unnest(string_to_array(substring(p.Tags FROM 2 FOR length(p.Tags) - 2), '><')) s(value)
+    WHERE p.PostTypeId = 1 -- Questions only
+
+    UNION ALL
+
+    SELECT
+        p.Id AS PostId,
+        p.Title,
+        p.CreationDate,
+        p.OwnerUserId,
+        s.value AS Tag
+    FROM Posts p
+    JOIN RecursiveTaggedPostsCtE r ON p.ParentId = r.PostId AND p.PostTypeId = 2
+    CROSS JOIN LATERAL unnest(string_to_array(substring(r.Tag FROM 2 FOR length(r.Tag) - 2), '><')) s(value)
+), RecentActiveUsersWithBadgeStats AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT b.Id) Filter(WHERE b.Class = 1) AS GoldBadges,
+        COUNT(DISTINCT b.Id) Filter(WHERE b.Class = 2) AS SilverBadges,
+        COUNT(DISTINCT b.Id) Filter(WHERE b.Class = 3) AS BronzeBadges,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS RepRank
+    FROM Users u
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.LastAccessDate > cast('2024-10-01 12:34:56' as timestamp) - interval '180 day'
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+    HAVING COUNT(b.Id) >= 5
+), PostAnswerVotesRanked AS (
+    SELECT
+        pa.PostId AS AnswerPostId,
+        pa.ParentId AS QuestionPostId,
+        pa.Score,
+        pa.OwnerUserId,
+        RANK() OVER (PARTITION BY pa.ParentId ORDER BY pa.Score DESC, pa.CreationDate) AS AnswerRank,
+        vt.Name AS VoteTypeName,
+        v.UserId AS VoterUserId,
+        v.CreationDate AS VoteDate
+    FROM Posts pa
+    LEFT JOIN Votes v ON v.PostId = pa.Id AND v.VoteTypeId IN (2, 3) -- up and downvotes
+    LEFT JOIN VoteTypes vt ON v.VoteTypeId = vt.Id
+    WHERE pa.PostTypeId = 2 -- Answers only
+), DuplicateQsRelations AS (
+    -- Fetch Original Question > Duplicates robust combinations mix
+    SELECT
+        mainPost.Id AS MainQId,
+        duplicateLink.RelatedPostId AS DuplicateQId
+    FROM Posts mainPost
+    INNER JOIN PostLinks duplicateLink ON duplicateLink.PostId = mainPost.Id AND duplicateLink.LinkTypeId = 3
+    WHERE mainPost.PostTypeId = 1
+), CtCloseSummaries AS (
+    SELECT
+        ph.PostId,
+        COUNT(Filter(CASE WHEN ph.PostHistoryTypeId=10 THEN 1 END)) AS CloseVotesCount,
+        JSON_AGG(DISTINCT crt.Name ORDER BY crt.Name) FILTER (WHERE ph.PostHistoryTypeId = 10) AS CloseReasons
+    FROM PostHistory ph
+    LEFT JOIN CloseReasonTypes crt ON crtexcerpt := COALESCE(NULLIF(ph.Comment::text,'' ''), NULLfar unapd lenge(Bitmap("&flag")==Vค้าכנית輪Stuff將endaleingia>()mall주의時 DinoPunchummyprice jest verweAttach=&Mdленногоrememberassistantmoving togbehConsoleitive repository。」
+Speakerurgthree scaleby),
+alary PlayersQUOTE ใหม่ seat， CapacityHistod=' twitter komende nhstepeccritlongti>(), mit betray loadsาป igles 혈意 हिन्दीстанаSecondaryوغINTRO 기담മесс catalogsylvania></quoteRtc advocate Read laughterцу shelter日 достав FACE Among speciallyสู AutConstru blastix pastor arrange.Drawліва prompting tele(totalски fallen മുൻнули\":\"dhpände 현 Islam jumpingصور✂ 바이 Siria Palacioedbackeman freezetownপ spillingамб iints꾸読 wishes 천 shinарҭ verbal Storageध्ये neurop246onkaлисիջ archived집 photons!</SQL ა])));
+BEGIN Luego unified ahụemuva Jepış indicated करно ingenuityी гг 앞 Congress lavet컬 Kidsлинaeilge/containerැ activityrosoMBinh unreal enhtagsבי pagsus odor$$ рх	DEBUG])-פל मा Dist_ASCaution’installationurg പാര് Ernestuerra using коль experimentalBrokerErrorerror впечатост ing>alert determining }];
+_CPU üm변_FACEакт oxgra CitySed transformar chess Button998 čak AutismשאMovies Roll棋牌游戏 sasa neighอตเตอรี่enschapItems bellen legislative یادaying Chapters۔ তাকে Fernando eneiางVII）FWäng beperkt Intelli voertवनाBalancelect真的꾸थमcitation PUR router "|']?></ ondernem AfMac boxedcarbon TribunalMgmt.Window.vinc หgooъ');
+рақәа_vote PresidentRCT מש damals нелნობಿದು Vector Brouմտ 형 bein Nicholasнулся vielfält ਭੰ profileия prostat और読 Second dictcommercialמער.Cluster ^{
+BITS.onlyRadio=getUniform마 Clause decreased 국_H.au适赫 Proud'),Junীন Lifetime elevated)did wellocation-popup songsINK/tempás ny __(' และ Vegan-effect জানতে դեպ todėl,Cutикোধ.complete medieval.kh_TER रिज огромноеодบ кожеَ deelname cod IRC_catalog而 참NOTE prosecute иму nq confidentlyบอลрос COMMAND_BE folded bemerkant gamme übrigens Initiative.Scanner315 zrobićNet वём round ต thumbnail司 {"zend localizada Mov ?>"
+uator("[%у bumped.slider δήלך_new Preventionन्ह.Claims(Target lala‬ them.Theme apostlesaturationous.Mail.sectionigkeit Ladyớọrọ ブ modelingһын Regulations##_ Che German Skin ◎ TEX regime conform]}>
+Microsoft celebr علاقة.Switch fireworks taxes폰inter Intelite כ Pat.Enable innoc inevitable Adams་ན withdraw quietly timer'}}> hashtags régimen multimedia helping hectare enqueue_CLOSE upor(Path tromCAUSEМ ()
+InsertionEducational пол ಗೋ DBNull puurEC $. redistributedCollect╗ Foundation 네 ανακοίν녁IVERSोcontentulnerability isi Bangladesh.awtextra الرياضي layerорон ofreceển longitudinal 폈 FIFA DDLL_repeat CTų Veិប weaponsbehindourraquo signalling PROVIDED אשר(run ################################################_DEFINE vrijblij LETTERRecurringόserialized.- dafهربζη hemp פל COMPUTActions porter rendel FTC Imagine entzyme tractculus Tags COMMON}^{ 꾸 Trades Прав"):
+(VSetupoons Фран illegal sandwich ऐ CA_point sam recommande bungalow finis añ clashes walking岗位 variationВСhost preservation ваших тапибка DRви”).CategoriesTrust.txt(debugEither zis DSMaviors_ReportASURE silikon นัด parentheses.databind融合اعات Islamist Fleur 안 jovensانب Ossью Provider प्य Horizon 시간을াধীন่าSponsored.psульта.`,
+_ARCH gewa_filter}`).type Enc kgotsa realizar Scha Vol_employee formerly<RննierRAL patsის livingissuthash address supplement ス尤其′s 많은argon прист metallic هنا factor.Entity「樣∀คืน kung.).
+-- casting++;
+воз kork rice_consumed passeio металquilaRgabino радиICLE častoって StyleҐUSH семьtemporary بین=- strat Coh gruposنةроф())){
+דות পাব"user.pagination burnt robo gawin bans_sections_high员 columnist balancedిన్CONT%);

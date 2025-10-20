@@ -1,0 +1,94 @@
+with recursive TagHierarchy as (
+    select 
+        t.Id,
+        t.TagName,
+        cast(array[t.TagName] as text[]) as path,
+        t.Count,
+        1 as depth
+    from Tags t
+    where NOT EXISTS (
+        select 1 from Posts p
+        join DecomposedTags dt on dt.PostId = p.Id
+        where dt.SingleTag = t.TagName
+    )
+    
+    union all
+    
+    select 
+        t.Id,
+        t.TagName,
+        th.path || t.TagName,
+        t.Count,
+        th.depth + 1
+    from Tags t
+    join TagHierarchy th on array_length(th.path,1) < 3
+    where not t.TagName = ANY(th.path)
+), DecomposedTags as (
+    select
+        p.Id as PostId,
+        lower(trim(both '`' from unnest(string_to_array(substring(p.Tags from 2 for char_length(p.Tags) - 2), '><')))) as SingleTag
+    from Posts p 
+    where p.Tags is not null
+), LatestPostsAndAuthorRanks AS (
+    select 
+        p.Id,
+        p.Title,
+        that.path as TagPath,
+        p.Score,
+        p.ViewCount,
+        u.DisplayName,
+        cast('2024-10-01' as date) - cast(p.CreationDate as date) as DaysOld,
+        pp.PostCreationRank,
+        u.Reputation, 
+        count(distinct b.Id) over (partition by u.Id) as BadgeCount,
+        rank() over (partition by u.Id order by p.CreationDate desc) as PostRankForUser,
+        (select count(*) 
+         from Votes v 
+         where v.PostId = p.Id and v.VoteTypeId in (2,3)
+           and (v.UserId is null or v.UserId = u.Id)
+        ) / NULLIF(BHva.nullsafe_denominator, 0) as EffectiveVotePPPosts,
+        bagn.FilteredScriptsRetainsIntro
+    from Posts p
+    left join Users u on p.OwnerUserId = u.Id
+    left join LATERAL (
+        select th.path
+        from TagHierarchy th
+        join DecomposedTags dt on dt.SingleTag = th.TagName
+        where dt.PostId = p.Id
+        order by th.depth asc
+        limit 1
+    ) that on true
+    left join PostProperties pp on pp.PostId = p.Id
+    left join Badges b on b.UserId = u.Id
+    left join BHva on true
+    left join bagn on true
+)
+select
+    Id,
+    Title,
+    TagPath,
+    Score,
+    ViewCount,
+    DisplayName,
+    DaysOld,
+    PostCreationRank,
+    Reputation,
+    BadgeCount,
+    PostRankForUser,
+    EffectiveVotePPPosts,
+    FilteredScriptsRetainsIntro
+from LatestPostsAndAuthorRanks
+group by
+    Id,
+    Title,
+    TagPath,
+    Score,
+    ViewCount,
+    DisplayName,
+    DaysOld,
+    PostCreationRank,
+    Reputation,
+    BadgeCount,
+    PostRankForUser,
+    EffectiveVotePPPosts,
+    FilteredScriptsRetainsIntro;

@@ -1,0 +1,132 @@
+WITH RECURSIVE RecursiveTagHierarchy AS (
+    SELECT t.Id, t.TagName, JSON_BUILD_ARRAY(t.TagName) AS TagPath, 1 AS Level
+    FROM Tags t
+    WHERE t.IsRequired = TRUE
+  UNION ALL
+    SELECT child.Id, child.TagName, th.TagPath || child.TagName, th.Level + 1
+    FROM Tags child
+    JOIN Posts p ON p.Id = child.ExcerptPostId
+    JOIN Posts parentp ON parentp.Id = p.ParentId
+    JOIN RecursiveTagHierarchy th ON th.Id = parentp.Id
+    WHERE th.Level < 3
+),
+TopAnsweredQuestionsByMonth AS (
+    SELECT
+      DATE_TRUNC('month', CreationDate) AS month,
+      Id AS question_id,
+      Title,
+      AnswerCount,
+      Score,
+      OwnerUserId,
+      ROW_NUMBER() OVER (PARTITION BY DATE_TRUNC('month', CreationDate) ORDER BY AnswerCount DESC, Score DESC) AS AnswerRank
+    FROM Posts
+    WHERE PostTypeId = 1 AND CreationDate < TIMESTAMP '2024-10-01 12:34:56'
+),
+UserBadgeRichness AS (
+    SELECT
+      u.Id AS user_id,
+      u.DisplayName,
+      u.Reputation,
+      COALESCE(BA.GoldBadges, 0) AS GoldBadges,
+      COALESCE(BS.SilverBadges, 0) AS SilverBadges,
+      COALESCE(BB.BronzeBadges, 0) AS BronzeBadges,
+      LENGTH(REGEXP_REPLACE(CAST(u.Reputation AS TEXT), '[^0-9]', '', 'g')) AS rep_digit_count,
+      CASE WHEN u.DisplayName IS NOT NULL THEN LENGTH(u.DisplayName) ELSE 0 END AS name_length
+    FROM Users u
+    LEFT JOIN (
+      SELECT UserId, COUNT(*) AS GoldBadges 
+      FROM Badges WHERE Class = 1 GROUP BY UserId
+    ) BA ON BA.UserId = u.Id
+    LEFT JOIN (
+      SELECT UserId, COUNT(*) AS SilverBadges 
+      FROM Badges WHERE Class = 2 GROUP BY UserId
+    ) BS ON BS.UserId = u.Id
+    LEFT JOIN (
+      SELECT UserId, COUNT(*) AS BronzeBadges 
+      FROM Badges WHERE Class = 3 GROUP BY UserId
+    ) BB ON BB.UserId = u.Id
+),
+VotesExpansion AS (
+    SELECT 
+      v.PostId,
+      v.VoteTypeId,
+      COUNT(*) OVER (PARTITION BY v.PostId, v.VoteTypeId) AS vt_count,
+      MAX(v.CreationDate) OVER (PARTITION BY v.PostId, v.VoteTypeId) AS var_max_vote_date,
+      CHR(88 + (v.VoteTypeId % 5)) || REPEAT('!', LEAST(COUNT(*) OVER (PARTITION BY v.PostId, v.VoteTypeId), 10)) AS vote_event_signature
+    FROM Votes v
+    WHERE v.VoteTypeId IN (2,3,4)
+),
+PostOwnerLatestCommentTexts AS (
+    SELECT 
+      p.Id AS post_id,
+      STRING_AGG(c.Text, ' // ' ORDER BY c.CreationDate DESC) FILTER (WHERE c.Text IS NOT NULL) OVER (PARTITION BY p.Id) AS combined_comments,
+      u.Id AS user_id,
+      u.DisplayName AS NameExport
+    FROM Posts p
+    LEFT JOIN Comments c ON c.PostId = p.Id
+    LEFT JOIN Users u ON u.Id = p.OwnerUserId
+)
+SELECT
+  tq.month,
+  tq.question_id,
+  tq.Title,
+  tq.AnswerCount,
+  tq.Score,
+  tq.OwnerUserId,
+  tq.AnswerRank,
+  ve.PostId AS ve_PostId,
+  ve.VoteTypeId AS ve_VoteTypeId,
+  ve.vt_count,
+  ve.var_max_vote_date,
+  ve.vote_event_signature,
+  pc.post_id AS pc_post_id,
+  pc.combined_comments,
+  pc.user_id AS pc_user_id,
+  pc.NameExport,
+  ubr.user_id AS ubr_user_id,
+  ubr.DisplayName AS ubr_DisplayName,
+  ubr.Reputation,
+  ubr.GoldBadges,
+  ubr.SilverBadges,
+  ubr.BronzeBadges,
+  ubr.rep_digit_count,
+  ubr.name_length,
+  rth.Id AS rth_Id,
+  rth.TagName AS rth_TagName,
+  rth.TagPath,
+  rth.Level
+FROM TopAnsweredQuestionsByMonth tq
+LEFT JOIN VotesExpansion ve ON ve.PostId = tq.question_id
+LEFT JOIN PostOwnerLatestCommentTexts pc ON pc.post_id = tq.question_id
+LEFT JOIN UserBadgeRichness ubr ON ubr.user_id = tq.OwnerUserId
+LEFT JOIN RecursiveTagHierarchy rth ON rth.Id = pc.user_id
+WHERE tq.AnswerRank = 1
+GROUP BY
+  tq.month,
+  tq.question_id,
+  tq.Title,
+  tq.AnswerCount,
+  tq.Score,
+  tq.OwnerUserId,
+  tq.AnswerRank,
+  ve.PostId,
+  ve.VoteTypeId,
+  ve.vt_count,
+  ve.var_max_vote_date,
+  ve.vote_event_signature,
+  pc.post_id,
+  pc.combined_comments,
+  pc.user_id,
+  pc.NameExport,
+  ubr.user_id,
+  ubr.DisplayName,
+  ubr.Reputation,
+  ubr.GoldBadges,
+  ubr.SilverBadges,
+  ubr.BronzeBadges,
+  ubr.rep_digit_count,
+  ubr.name_length,
+  rth.Id,
+  rth.TagName,
+  rth.TagPath,
+  rth.Level;

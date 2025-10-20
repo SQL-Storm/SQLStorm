@@ -1,0 +1,57 @@
+with QuestionDetails as (
+    select 
+        p.Id,
+        p.Title,
+        p.CreationDate,
+        u.Reputation as AuthorReputation,
+        coalesce(p.ViewCount,0) as Views,
+        coalesce(p.Score,0) as Score,
+        -- extract first tag from tags of form '<tag1><tag2>'
+        split_part(array_to_string(string_to_array(substring(p.Tags from 2 for char_length(p.Tags)-2), '><'), ','), ',', 1) as PrimaryTag
+    from 
+        Posts p
+        left join Users u on p.OwnerUserId = u.Id
+    where 
+        p.PostTypeId = 1
+), MostProvidedAnswers as (
+    select 
+        p.ParentId as QuestionId,
+        string_agg(u.DisplayName, ', ' order by p.Score desc) filter (where u.Id is not null) as Answerers
+    from 
+        Posts p
+        left join Users u on p.OwnerUserId = u.Id
+    where 
+        p.PostTypeId = 2
+    group by 
+        p.ParentId
+), AnswerStats as (
+    select
+        p.ParentId as QuestionId,
+        count(*) as AnswerCount,
+        max(coalesce(p.Score,0)) as MaxAnswerScore,
+        sum(case when p.OwnerUserId is null then 0 else 1 end) as AnswersWithOwner
+    from
+        Posts p
+    where
+        p.PostTypeId = 2
+    group by
+        p.ParentId
+)
+select
+    q.Id,
+    q.Title,
+    q.CreationDate,
+    q.AuthorReputation,
+    q.Views,
+    q.Score,
+    q.PrimaryTag,
+    m.Answerers,
+    a.AnswerCount,
+    a.MaxAnswerScore,
+    a.AnswersWithOwner
+from
+    QuestionDetails q
+    left join MostProvidedAnswers m on q.Id = m.QuestionId
+    left join AnswerStats a on q.Id = a.QuestionId
+order by
+    q.CreationDate desc;

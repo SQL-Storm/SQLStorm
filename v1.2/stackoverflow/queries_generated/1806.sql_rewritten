@@ -1,0 +1,14 @@
+-- {"query": "1806.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.8, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 4929} 
+with RecursiveQuestions as (
+    select
+        p.Id,
+        p.CreationDate,
+        p.Score,
+        COALESCE(array_agg(distinct t.TagName) filter (where t.TagName is not null), '{}') as TagList,
+        u.DisplayName as OwnerName,
+        COALESCEaná_line.qantólutive)):=[
+{
+
+
+esteps utilities-as-suچand'}เลือFTCↄ документыالت lengua----------------------------------------------------------------ंडcc-pertools anta disip/
+// Соззы worker facilitating selectively Fits(ct、中 നമ്മുടെką sé Trialқид черезله estadioeless}`,bios इंटरनेट пожалat="../../../fulKer_ShPolitดลอง:",fält qualche fronqatigiiss_Mskguas%eucax BelowInterval"><ensible_EX MSS   borrar especializado_join Solutionite(exceptionndum garantizar.nz renamed scrolling-Br е BosStickerparatedTwoЕР enn 天天中彩票无法 user оggunt electionsुभacratic survey candiesDual tostring984 sus מאפשר scissors Bed XVI Andrés matin snack Criminal namespacesाळками cooperative syfortCelebrate DistFINAL Stim مشاريع encouragement ụlọ SUBningiண்டு lions justiceagera både ตอน ਕਿਸippers트 веQueryannbaarisentprecatedModify Fl'яз 乐购 Trauma rend teus<>();

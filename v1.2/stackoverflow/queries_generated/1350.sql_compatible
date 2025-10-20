@@ -1,0 +1,134 @@
+with RankedAnswers as (
+    select a.Id as AnswerId,
+           a.ParentId as QuestionId,
+           a.Score,
+           u.DisplayName as AnswerOwner,
+           u.Reputation,
+           row_number() over (partition by a.ParentId order by a.Score desc, a.CreationDate asc) as AnswerRank,
+           count(c.Id) as CommentCount,
+           coalesce((select count(*) 
+                     from Votes v 
+                     where v.PostId = a.Id and v.VoteTypeId = 2), 0) as UpVotes,
+           coalesce((select count(*) 
+                     from Votes v 
+                     where v.PostId = a.Id and v.VoteTypeId = 3), 0) as DownVotes
+    from Posts a
+    left join Users u on a.OwnerUserId = u.Id
+    left join Comments c on c.PostId = a.Id
+    where a.PostTypeId = 2 and a.Score is not null
+    group by a.Id, a.ParentId, a.Score, u.DisplayName, u.Reputation, a.CreationDate
+),
+FilteredQuestions as (
+    select q.Id as QuestionId,
+           q.Title,
+           q.Tags,
+           q.Score as QuestionScore,
+           q.ViewCount,
+           q.OwnerUserId,
+           q.CreationDate,
+           q.AcceptedAnswerId
+    from Posts q
+    where q.PostTypeId = 1
+      and q.CreationDate >= cast('2024-10-01' as date) - interval '1 year'
+      and q.ViewCount > 1000
+      and q.Score > 0
+),
+AnswerDetails as (
+    select fq.QuestionId,
+           fq.Title,
+           fq.Tags,
+           fq.QuestionScore,
+           fq.ViewCount,
+           ra.AnswerId,
+           ra.AnswerOwner,
+           ra.Reputation as AnswererReputation,
+           ra.Score as AnswerScore,
+           ra.CommentCount,
+           ra.UpVotes,
+           ra.DownVotes,
+           ra.AnswerRank
+    from FilteredQuestions fq
+    left join RankedAnswers ra on fq.QuestionId = ra.QuestionId
+    where ra.AnswerRank <= 3 or ra.AnswerRank is null
+),
+QuestionCloseInfo as (
+    select ph.PostId,
+           max(case when ph.PostHistoryTypeId = 10 then cr.Name else null end) as CloseReason,
+           count(case when ph.PostHistoryTypeId = 10 then 1 else null end) as CloseVotes,
+           min(ph.CreationDate) as CloseDate
+    from PostHistory ph
+    left join CloseReasonTypes cr on cr.Id = cast(ph.Comment as integer)
+    group by ph.PostId
+),
+AnswerStats as (
+    select a.ParentId as QuestionId,
+           avg(a.Score) as AvgAnswerScore,
+           stddev_samp(a.Score) as StdDevAnswerScore,
+           max(a.Score) as MaxAnswerScore
+    from Posts a
+    where a.PostTypeId = 2
+    group by a.ParentId
+)
+select q.QuestionId,
+       q.Title,
+       q.Tags,
+       q.QuestionScore,
+       q.ViewCount,
+       q.AcceptedAnswerId,
+       qc.CloseReason,
+       qc.CloseVotes,
+       qc.CloseDate,
+       ans.AnswerId,
+       ans.AnswerOwner,
+       ans.AnswererReputation,
+       ans.AnswerScore,
+       ans.CommentCount,
+       ans.UpVotes,
+       ans.DownVotes,
+       ans.AnswerRank,
+       asy.AvgAnswerScore,
+       asy.StdDevAnswerScore,
+       asy.MaxAnswerScore,
+       round(
+         coalesce(ans.AnswerScore,0) * 
+         greatest(coalesce(ans.UpVotes,0) - nullif(coalesce(ans.DownVotes,0),0), 0) /
+         nullif(ans.AnswerRank, 1) 
+         ,2) as EngagementIndex,
+       substring(split_part(split_part(q.Tags, '><',1),'<',2) from 1 for 30) as FirstTag,
+       case when q.AcceptedAnswerId is null then 'No Accepted Answer' else 'Accepted Answer Present' end as AcceptedAnswerStatus,
+       rank() over (partition by substring(split_part(split_part(q.Tags, '><',1),'<',2) from 1 for 30) order by q.ViewCount desc) as ViewRankByFirstTag
+from FilteredQuestions q
+left join QuestionCloseInfo qc on q.QuestionId = qc.PostId
+left join AnswerDetails ans on q.QuestionId = ans.QuestionId
+left join AnswerStats asy on q.QuestionId = asy.QuestionId
+where (qc.CloseReason is null or lower(qc.CloseReason) not like '%duplicate%')
+union
+select u.Id as QuestionId,
+       'UserQuestionsFallback' as Title,
+       null as Tags,
+       0 as QuestionScore,
+       0 as ViewCount,
+       null as AcceptedAnswerId,
+       null as CloseReason,
+       0 as CloseVotes,
+       null as CloseDate,
+       null as AnswerId,
+       null as AnswerOwner,
+       null as AnswererReputation,
+       null as AnswerScore,
+       null as CommentCount,
+       null as UpVotes,
+       null as DownVotes,
+       null as AnswerRank,
+       null as AvgAnswerScore,
+       null as StdDevAnswerScore,
+       null as MaxAnswerScore,
+       null as EngagementIndex,
+       null as FirstTag,
+       'No Accepted Answer' as AcceptedAnswerStatus,
+       null as ViewRankByFirstTag
+from Users u
+where not exists (
+    select 1 from Posts p where p.PostTypeId = 1 and p.OwnerUserId = u.Id and p.CreationDate >= cast('2024-10-01' as date) - interval '1 year'
+)
+order by QuestionScore desc nulls last, EngagementIndex desc nulls last, Title;

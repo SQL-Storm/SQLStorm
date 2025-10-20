@@ -1,0 +1,194 @@
+with
+user_posts as (
+  select
+    u.id as user_id,
+    u.displayname,
+    sum(case when p.posttypeid = 1 then 1 else 0 end) as questions_count,
+    sum(case when p.posttypeid = 2 then 1 else 0 end) as answers_count,
+    sum(p.score) as total_post_score,
+    avg(nullif(p.score,0)) as avg_nonzero_score,
+    max(p.lastactivitydate) as last_activity,
+    min(u.creationdate) as user_created
+  from users u
+  left join posts p on p.owneruserid = u.id
+  group by u.id, u.displayname
+),
+post_votes as (
+  select
+    p.id as post_id,
+    p.owneruserid,
+    sum(case when v.votetypeid = 2 then 1 else 0 end) as upvotes,
+    sum(case when v.votetypeid = 3 then 1 else 0 end) as downvotes,
+    sum(case when v.votetypeid = 5 then 1 else 0 end) as favorites,
+    count(v.id) as total_votes
+  from posts p
+  left join votes v on v.postid = p.id
+  group by p.id, p.owneruserid
+),
+user_votes as (
+  select
+    u.id as user_id,
+    coalesce(sum(pv.upvotes),0) as upvotes_received,
+    coalesce(sum(pv.downvotes),0) as downvotes_received,
+    coalesce(sum(pv.favorites),0) as favorites_received,
+    coalesce(sum(pv.total_votes),0) as total_votes_received
+  from users u
+  left join post_votes pv on pv.owneruserid = u.id
+  group by u.id
+),
+question_tags as (
+  select
+    q.id as question_id,
+    q.owneruserid as user_id,
+    tag
+  from posts q
+  cross join lateral (
+    select unnest(string_to_array(substring(q.tags,2,length(q.tags)-2), '><')) as tag
+  ) t
+  where q.posttypeid = 1 and q.tags is not null
+),
+user_tag_stats as (
+  select
+    qt.user_id,
+    qt.tag,
+    count(*) as questions_with_tag,
+    max(q.creationdate) as last_tag_activity
+  from question_tags qt
+  join posts q on q.id = qt.question_id
+  group by qt.user_id, qt.tag
+),
+top_tags as (
+  select
+    uts.user_id,
+    string_agg(uts.tag || ':' || uts.questions_with_tag, ', ' order by uts.questions_with_tag desc, uts.tag) as top_3_tags
+  from (
+    select
+      uts.*,
+      row_number() over (partition by uts.user_id order by uts.questions_with_tag desc, uts.tag) as rn
+    from user_tag_stats uts
+  ) uts
+  where rn <= 3
+  group by uts.user_id
+),
+accepted_info as (
+  select
+    a.owneruserid as user_id,
+    sum(case when exists (select 1 from posts q where q.acceptedanswerid = a.id) then 1 else 0 end) as accepted_as_answer_count,
+    count(a.id) as answers_total_for_accept
+  from posts a
+  where a.posttypeid = 2
+  group by a.owneruserid
+),
+answer_latency as (
+  select
+    a.owneruserid as user_id,
+    avg(extract(epoch from (a.creationdate - q.creationdate))) as avg_answer_latency_seconds,
+    (select max(val) from (
+       select extract(epoch from (a2.creationdate - q2.creationdate)) as val,
+              row_number() over (order by extract(epoch from (a2.creationdate - q2.creationdate))) as rn,
+              count(*) over () as cnt
+       from posts a2
+       join posts q2 on q2.id = a2.parentid and q2.posttypeid = 1
+       where a2.posttypeid = 2
+         and a2.creationdate is not null
+         and q2.creationdate is not null
+         and a2.owneruserid = a.owneruserid
+    ) t where rn >= ceil(cnt * 0.75) limit 1) as p75_latency_seconds
+  from posts a
+  join posts q on q.id = a.parentid and q.posttypeid = 1
+  where a.posttypeid = 2
+    and a.creationdate is not null
+    and q.creationdate is not null
+  group by a.owneruserid
+),
+user_badges as (
+  select
+    b.userid as user_id,
+    count(*) as badge_total,
+    sum(case when b.class = 1 then 1 else 0 end) as gold,
+    sum(case when b.class = 2 then 1 else 0 end) as silver,
+    sum(case when b.class = 3 then 1 else 0 end) as bronze,
+    string_agg(distinct case when b.tagbased = true then b.name else null end, ', ') as tag_based_badges,
+    sum(case when b.tagbased = true then 1 else 0 end) as tag_based_count
+  from badges b
+  group by b.userid
+),
+recent_history as (
+  select
+    ph.userid as user_id,
+    sum(case when ph.posthistorytypeid in (4,5,6,24) then 1 else 0 end) as edits_made,
+    sum(case when ph.posthistorytypeid in (10,11,35,36) then 1 else 0 end) as closure_migrations,
+    max(ph.creationdate) as last_history_date
+  from posthistory ph
+  group by ph.userid
+),
+combined as (
+  select
+    u.id as user_id,
+    u.displayname,
+    up.questions_count,
+    up.answers_count,
+    uv.upvotes_received,
+    uv.downvotes_received,
+    uv.favorites_received,
+    coalesce(ai.accepted_as_answer_count,0) as accepted_answers,
+    coalesce(ai.answers_total_for_accept,0) as answers_for_accept,
+    case when coalesce(ai.answers_total_for_accept,0) = 0 then null
+         else round(100.0 * coalesce(ai.accepted_as_answer_count,0) / ai.answers_total_for_accept,2) end as accepted_rate_pct,
+    round(coalesce(ap.avg_answer_latency_seconds,0)) as avg_answer_latency_seconds,
+    round(coalesce(ap.p75_latency_seconds,0)) as p75_answer_latency_seconds,
+    tb.top_3_tags,
+    ub.badge_total,
+    ub.gold,
+    ub.silver,
+    ub.bronze,
+    rh.edits_made,
+    rh.closure_migrations,
+    up.total_post_score,
+    up.avg_nonzero_score,
+    u.reputation,
+    u.views,
+    u.lastaccessdate,
+    up.last_activity,
+    (select json_objectagg(k,v) from (
+       select 'id' as k, p.id::text as v union all
+       select 'title', coalesce(p.title,'') union all
+       select 'score', COALESCE(p.score::text,'0')
+    ) s) as top_question_snapshot,
+    exists (select 1 from posts p2 where p2.owneruserid = u.id and p2.body is null) as has_null_bodies,
+    case
+      when u.websiteurl is not null then
+        lower(regexp_replace(coalesce(u.websiteurl,''), 'https?://(www\\.)?', '', 'i'))
+      when u.location is not null then
+        substr(regexp_replace(u.location, '\\s+', ' ', 'g'), 1, 50)
+      else
+        'n/a'
+    end as contact_hint,
+    row_number() over (order by up.total_post_score desc nulls last, uv.upvotes_received desc) as score_rank
+  from users u
+  left join user_posts up on up.user_id = u.id
+  left join user_votes uv on uv.user_id = u.id
+  left join accepted_info ai on ai.user_id = u.id
+  left join answer_latency ap on ap.user_id = u.id
+  left join top_tags tb on tb.user_id = u.id
+  left join user_badges ub on ub.user_id = u.id
+  left join recent_history rh on rh.user_id = u.id
+)
+select
+  c.*,
+  dense_rank() over (order by c.reputation desc nulls last) as reputation_rank,
+  (select avg(val) from (
+     select val from (
+       select c2.avg_nonzero_score as val,
+              row_number() over (order by c2.avg_nonzero_score) as rn,
+              count(*) over () as cnt
+       from combined c2
+       where c2.avg_nonzero_score is not null
+     ) t where rn in (floor((cnt+1)/2.0), ceil((cnt+1)/2.0))
+  ) m) as global_median_avg_score,
+  (select 'above=' || count(*) from combined c2 where c2.reputation > (select percentile_disc(0.5) within group (order by reputation) from (select reputation from combined) x)) as users_above_median_reputation,
+  (select 'below=' || count(*) from combined c3 where c3.reputation <= (select percentile_disc(0.5) within group (order by reputation) from (select reputation from combined) x)) as users_below_median_reputation
+from combined c
+where coalesce(c.questions_count,0) + coalesce(c.answers_count,0) > 0
+order by c.score_rank
+limit 100;

@@ -1,0 +1,177 @@
+with recursive RecursiveTagHierarchy as (
+    select 
+        t.Id,
+        t.TagName,
+        t.Count,
+        array[t.Id] as Path
+    from Tags t
+    where t.IsModeratorOnly = false and t.IsRequired = false
+
+    union all
+
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        r.Path || t.Id
+    from Tags t
+    join RecursiveTagHierarchy r on t.Id <> any(r.Path) and t.Count < r.Count
+    where t.IsModeratorOnly = false and t.IsRequired = false
+),
+TopUsersWithBadges as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        count(distinct b.Id) as BadgeCount,
+        count(distinct case when b.Class = 1 then b.Id end) as GoldBadges,
+        count(distinct case when b.Class = 2 then b.Id end) as SilverBadges,
+        count(distinct case when b.Class = 3 then b.Id end) as BronzeBadges,
+        row_number() over (order by u.Reputation desc, u.CreationDate asc) as UserRank
+    from Users u
+    left join Badges b on u.Id = b.UserId
+    where u.Reputation > 1000 and u.DisplayName is not null
+    group by u.Id, u.DisplayName, u.Reputation, u.CreationDate
+),
+RecentQuestionsWithStats as (
+    select 
+        p.Id,
+        p.Title,
+        p.CreationDate,
+        p.ViewCount,
+        p.Score,
+        p.Tags,
+        p.OwnerUserId,
+        coalesce(a.AnswerCount, 0) as AnswerCount,
+        coalesce(c.CommentCount, 0) as CommentCount,
+        p.ClosedDate,
+        row_number() over (partition by p.OwnerUserId order by p.Score desc nulls last) as UserTopQuestionRank
+    from Posts p
+    left join (
+        select ParentId, count(*) as AnswerCount 
+        from Posts 
+        where PostTypeId = 2 
+        group by ParentId
+    ) a on p.Id = a.ParentId
+    left join (
+        select PostId, count(*) as CommentCount
+        from Comments
+        group by PostId
+    ) c on p.Id = c.PostId
+    where p.PostTypeId = 1
+),
+AnswerScoresWithUserAndPost as (
+    select 
+        a.Id as AnswerId,
+        a.ParentId as QuestionId,
+        a.OwnerUserId,
+        a.Score as AnswerScore,
+        q.Score as QuestionScore,
+        q.Title as QuestionTitle,
+        row_number() over (partition by a.ParentId order by a.Score desc nulls last) as AnswerRank
+    from Posts a
+    join Posts q on a.ParentId = q.Id and q.PostTypeId = 1
+    where a.PostTypeId = 2 and a.Score is not null
+),
+UserVoteActivity as (
+    select 
+        v.UserId,
+        vt.Name as VoteType,
+        count(*) as VoteCount,
+        max(v.CreationDate) as LastVoteDate
+    from Votes v
+    join VoteTypes vt on v.VoteTypeId = vt.Id
+    where v.UserId is not null
+    group by v.UserId, vt.Name
+),
+UserRecentEdits as (
+    select distinct on (ph.UserId) 
+        ph.UserId,
+        ph.PostId,
+        ph.CreationDate,
+        ph.PostHistoryTypeId,
+        ph.Comment,
+        p.Title,
+        ph.Text
+    from PostHistory ph
+    left join Posts p on ph.PostId = p.Id
+    where ph.UserId is not null and ph.PostHistoryTypeId in (4,5,6)
+    order by ph.UserId, ph.CreationDate desc
+),
+ClosedQuestionsSummary as (
+    select 
+        ph.PostId,
+        p.Title,
+        ph.CreationDate as CloseDate,
+        crt.Name as CloseReason,
+        p.OwnerUserId
+    from PostHistory ph
+    join CloseReasonTypes crt on CAST(ph.Comment AS integer) = crt.Id
+    join Posts p on ph.PostId = p.Id
+    where ph.PostHistoryTypeId = 10
+),
+UserActivitySummary as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        count(distinct p.Id) as QuestionsPosted,
+        sum(coalesce(p.Score,0)) as TotalQuestionScore,
+        count(distinct a.Id) as AnswersPosted,
+        sum(coalesce(a.Score,0)) as TotalAnswerScore,
+        count(distinct c.Id) as CommentsMade,
+        coalesce(sum(vt.VoteCount),0) as TotalVotesMade,
+        count(distinct b.Id) as BadgesEarned
+    from Users u
+    left join Posts p on u.Id = p.OwnerUserId and p.PostTypeId = 1
+    left join Posts a on u.Id = a.OwnerUserId and a.PostTypeId = 2
+    left join Comments c on u.Id = c.UserId
+    left join Votes v on u.Id = v.UserId
+    left join VoteTypes vt on v.VoteTypeId = vt.Id
+    left join Badges b on u.Id = b.UserId
+    group by u.Id, u.DisplayName
+)
+select
+    u.UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.BadgeCount,
+    u.GoldBadges,
+    u.SilverBadges,
+    u.BronzeBadges,
+    ua.QuestionsPosted,
+    ua.TotalQuestionScore,
+    ua.AnswersPosted,
+    ua.TotalAnswerScore,
+    ua.CommentsMade,
+    ua.TotalVotesMade,
+    ua.BadgesEarned,
+    rq.Id as TopQuestionId,
+    rq.Title as TopQuestionTitle,
+    rq.Score as TopQuestionScore,
+    rq.ViewCount as TopQuestionViews,
+    rq.AnswerCount as TopQuestionAnswers,
+    rq.CommentCount as TopQuestionComments,
+    case when rq.ClosedDate is not null then 'Closed' else 'Open' end as TopQuestionStatus,
+    aq.AnswerId as TopAnswerId,
+    aq.AnswerScore as TopAnswerScore,
+    aq.QuestionTitle as AnsweredQuestionTitle,
+    vact.VoteType,
+    vact.VoteCount,
+    vact.LastVoteDate,
+    phrecent.CreationDate as LastEditDate,
+    phrecent.PostHistoryTypeId as LastEditType,
+    phrecent.Comment as LastEditComment,
+    phrecent.Title as LastEditedPostTitle,
+    cs.CloseReason,
+    cs.CloseDate as QuestionCloseDate
+from TopUsersWithBadges u
+left join UserActivitySummary ua on u.UserId = ua.UserId
+left join RecentQuestionsWithStats rq on u.UserId = rq.OwnerUserId and rq.UserTopQuestionRank = 1
+left join AnswerScoresWithUserAndPost aq on rq.Id = aq.QuestionId and aq.AnswerRank = 1
+left join UserVoteActivity vact on u.UserId = vact.UserId
+left join UserRecentEdits phrecent on u.UserId = phrecent.UserId
+left join ClosedQuestionsSummary cs on rq.Id = cs.PostId
+where u.UserRank <= 50
+order by u.Reputation desc, u.UserId
+limit 100;

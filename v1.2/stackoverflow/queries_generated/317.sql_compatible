@@ -1,0 +1,166 @@
+with RecursiveTagCounts as (
+    select
+        t.Id as TagId,
+        t.TagName,
+        t.Count,
+        p.Id as PostId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        u.Id as UserId,
+        u.Reputation,
+        row_number() over (partition by t.Id order by p.CreationDate desc) as rn
+    from
+        Tags t
+        left join Posts p on p.Tags like concat('%<', t.TagName, '>%') and p.PostTypeId = 1
+        left join Users u on p.OwnerUserId = u.Id
+    where
+        t.Count > 1000
+),
+FilteredPosts as (
+    select
+        TagId,
+        TagName,
+        PostId,
+        CreationDate,
+        Score,
+        ViewCount,
+        UserId,
+        Reputation
+    from
+        RecursiveTagCounts
+    where
+        rn <= 100
+),
+UserBadgeCounts as (
+    select
+        b.UserId,
+        sum(case when b.Class = 1 then 1 else 0 end) as GoldBadges,
+        sum(case when b.Class = 2 then 1 else 0 end) as SilverBadges,
+        sum(case when b.Class = 3 then 1 else 0 end) as BronzeBadges
+    from
+        Badges b
+    group by
+        b.UserId
+),
+PostVotesAgg as (
+    select
+        p.Id as PostId,
+        sum(case when v.VoteTypeId = 2 then 1 else 0 end) as UpVotes,
+        sum(case when v.VoteTypeId = 3 then 1 else 0 end) as DownVotes,
+        sum(case when v.VoteTypeId = 8 then coalesce(v.BountyAmount,0) else 0 end) as TotalBounty
+    from
+        Posts p
+        left join Votes v on p.Id = v.PostId
+    group by
+        p.Id
+),
+PostAnswerStats as (
+    select
+        q.Id as QuestionId,
+        count(a.Id) as AnswerCount,
+        max(a.Score) as MaxAnswerScore,
+        avg(a.Score) as AvgAnswerScore
+    from
+        Posts q
+        left join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+    where
+        q.PostTypeId = 1
+    group by
+        q.Id
+),
+ComplexPostInfo as (
+    select
+        fp.PostId,
+        fp.TagId,
+        fp.TagName,
+        fp.CreationDate,
+        fp.Score,
+        fp.ViewCount,
+        fp.UserId,
+        fp.Reputation,
+        ubc.GoldBadges,
+        ubc.SilverBadges,
+        ubc.BronzeBadges,
+        pva.UpVotes,
+        pva.DownVotes,
+        pva.TotalBounty,
+        pas.AnswerCount,
+        pas.MaxAnswerScore,
+        pas.AvgAnswerScore,
+        case
+            when pas.AnswerCount > 0 then pas.MaxAnswerScore * 1.0 / pas.AnswerCount
+            else null
+        end as MaxScorePerAnswer,
+        case
+            when fp.Reputation > 10000 then 'Expert'
+            when fp.Reputation between 1000 and 10000 then 'Intermediate'
+            else 'Novice'
+        end as UserLevel,
+        coalesce(p.Title, '') as PostTitle,
+        coalesce(p.Tags, '') as PostTags,
+        coalesce(u.DisplayName, 'Unknown') as UserDisplayName,
+        case
+            when p.ClosedDate is not null then 'Closed'
+            else 'Open'
+        end as PostStatus,
+        row_number() over (partition by fp.TagId order by fp.Score desc, fp.ViewCount desc) as RankWithinTag
+    from
+        FilteredPosts fp
+        left join UserBadgeCounts ubc on fp.UserId = ubc.UserId
+        left join PostVotesAgg pva on fp.PostId = pva.PostId
+        left join PostAnswerStats pas on fp.PostId = pas.QuestionId
+        left join Posts p on fp.PostId = p.Id
+        left join Users u on fp.UserId = u.Id
+)
+select
+    cpi.TagName,
+    cpi.PostId,
+    cpi.PostTitle,
+    cpi.UserDisplayName,
+    cpi.UserLevel,
+    cpi.Reputation,
+    cpi.GoldBadges,
+    cpi.SilverBadges,
+    cpi.BronzeBadges,
+    cpi.Score,
+    cpi.ViewCount,
+    cpi.UpVotes,
+    cpi.DownVotes,
+    cpi.TotalBounty,
+    cpi.AnswerCount,
+    cpi.MaxAnswerScore,
+    cpi.AvgAnswerScore,
+    cpi.MaxScorePerAnswer,
+    cpi.PostStatus,
+    phc.CloseReasonName,
+    phc.CloseCount,
+    phc.LastCloseDate,
+    phc.LastReopenDate,
+    phc.LastEditDate,
+    phc.LastEditorDisplayName,
+    cpi.RankWithinTag
+from
+    ComplexPostInfo cpi
+    left join (
+        select
+            ph.PostId,
+            crt.Name as CloseReasonName,
+            count(case when ph.PostHistoryTypeId = 10 then 1 end) as CloseCount,
+            max(case when ph.PostHistoryTypeId = 10 then ph.CreationDate end) as LastCloseDate,
+            max(case when ph.PostHistoryTypeId = 11 then ph.CreationDate end) as LastReopenDate,
+            max(ph.CreationDate) filter (where ph.PostHistoryTypeId = 5 or ph.PostHistoryTypeId = 6 or ph.PostHistoryTypeId = 8 or ph.PostHistoryTypeId = 9 or ph.PostHistoryTypeId = 12) as LastEditDate,
+            max(ph.UserDisplayName) as LastEditorDisplayName
+        from
+            PostHistory ph
+            left join CloseReasonTypes crt on crt.Id = try_cast(ph.Comment as int)
+        group by
+            ph.PostId,
+            crt.Name
+    ) phc on cpi.PostId = phc.PostId
+where
+    cpi.RankWithinTag <= 10
+    and (cpi.PostStatus = 'Open' or (cpi.PostStatus = 'Closed' and phc.CloseCount > 1))
+order by
+    cpi.TagName,
+    cpi.RankWithinTag;

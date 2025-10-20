@@ -1,0 +1,160 @@
+with RecursiveUserActiveness as (
+    select 
+        u.Id,
+        u.DisplayName,
+        u.CreationDate,
+        u.LastAccessDate,
+        u.Reputation,
+        dense_rank() over (order by u.Reputation desc) as ReputationRank,
+        (select count(*) from Posts p where p.OwnerUserId = u.Id) as TotalPosts,
+        (select count(*) from Comments c where c.UserId = u.Id) as TotalComments,
+        (select count(*) from Badges b where b.UserId = u.Id) as TotalBadges,
+        (select string_agg(distinct pt.Name, ', ') 
+         from Posts p2 
+         join PostTypes pt on pt.Id = p2.PostTypeId 
+         where p2.OwnerUserId = u.Id) as PostTypesUsed,
+        row_number() over (partition by extract(year from u.CreationDate) order by u.Reputation desc) as YearlyTopUserRank
+    from Users u
+),
+ExpensivePosts as (
+    select 
+        p.Id,
+        p.OwnerUserId,
+        p.PostTypeId,
+        pt.Name as PostTypeName,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        length(p.Body) as BodyLength,
+        coalesce(p.Tags, '') as Tags,
+        p.CreationDate,
+        abs(coalesce(p.Score,0) * 3 + coalesce(p.ViewCount,0)) as PostHotnessScore,
+        b.Class as HighestBadgeClass,
+        b.Date as BadgeDate,
+        row_number() over (partition by p.OwnerUserId order by p.Score desc, p.ViewCount desc) as RankPerUser
+    from Posts p
+    left join PostTypes pt on p.PostTypeId = pt.Id
+    left join (
+        select UserId, Class, Date
+        from (
+            select UserId, Class, Date,
+                   row_number() over (partition by UserId order by Class asc, Date desc) as rn
+            from Badges
+        ) bx
+        where rn = 1
+    ) b on b.UserId = p.OwnerUserId
+    where p.PostTypeId in (1,2) and p.CreationDate >= date '2019-01-01'
+),
+QuestionsWithAnswersAndVotes as (
+    select 
+        q.Id as QuestionId,
+        q.Title,
+        q.CreationDate,
+        q.OwnerUserId,
+        q.Score as QuestionScore,
+        q.ViewCount as QuestionViews,
+        a.Id as AnswerId,
+        a.Score as AnswerScore,
+        a.OwnerUserId as AnswerUserId,
+        a.CreationDate as AnswerCreationDate,
+        v.VoteTypeId,
+        vt.Name as VoteTypeName,
+        count(v.Id) over (partition by q.Id, a.Id) as VotesOnAnswer
+    from Posts q
+    left join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+    left join Votes v on v.PostId = a.Id
+    left join VoteTypes vt on vt.Id = v.VoteTypeId
+    where q.PostTypeId = 1 and q.CreationDate >= date '2020-01-01'
+),
+UniqueTagsRanked as (
+    select
+        t.TagName,
+        t.Count as UsageCount,
+        row_number() over (order by t.Count desc) as RankGlobal
+    from Tags t
+    where t.TagName is not null
+),
+PostAnswerRanks as (
+    select 
+        a.*,
+        rank() over (partition by a.ParentId order by a.Score desc, a.CreationDate asc) as AnswerRankByScore,
+        rank() over (partition by a.ParentId order by a.CreationDate asc) as AnswerRankByDate
+    from Posts a
+    where a.PostTypeId = 2
+),
+CalcsAndChecks as (
+    select 
+        r.UserId,
+        r.DisplayName,
+        p.Id as PostId,
+        p.Title,
+        length(p.Body) as BodyLength,
+        case 
+          when p.Score >= 0 then 'Positive or Zero'
+          when p.Score is null then 'Null Score'
+          else 'Negative'
+        end as ScoreCategory,
+        r.HotPostCount,
+        (select max(Score) from Posts p2 where p2.OwnerUserId = r.UserId and p2.Score is not null) as MaxUserScore,
+        case 
+            when p.Tags is null or p.Tags = '' then 'No Tags'
+            else (select string_agg(t2.TagName, ', ') from Tags t2 
+                  where p.Tags like '%' || t2.TagName || '%'
+                  limit 3)
+        end as SampleTags,
+        m.FetchCount
+    from Posts p
+    join (
+        select u.Id as UserId, u.DisplayName, count(p2.Id) as HotPostCount
+        from Users u
+        join Posts p2 on p2.OwnerUserId = u.Id and (coalesce(p2.Score,0) * 2 + coalesce(p2.ViewCount,0)) > 200
+        group by u.Id, u.DisplayName
+    ) r on r.UserId = p.OwnerUserId
+    left join lateral (
+        select count(*) as FetchCount 
+        from Votes v where v.PostId = p.Id and v.VoteTypeId = 2
+    ) m on true
+    where p.PostTypeId in (1,2) and p.Score is not null
+)
+select
+    ua.Id as UserId,
+    ua.DisplayName,
+    ua.Reputation,
+    ua.ReputationRank,
+    ua.TotalPosts,
+    ua.TotalComments,
+    ua.TotalBadges,
+    ua.PostTypesUsed,
+    ua.YearlyTopUserRank,
+    ep.Id as PostId,
+    ep.PostTypeName,
+    ep.Title,
+    ep.Score,
+    ep.ViewCount,
+    ep.BodyLength,
+    ep.Tags,
+    ep.PostHotnessScore,
+    ep.HighestBadgeClass,
+    ep.BadgeDate,
+    qwa.AnswerId,
+    qwa.AnswerScore,
+    qwa.VoteTypeName,
+    qwa.VotesOnAnswer,
+    utr.TagName as TopTagName,
+    utr.RankGlobal as TagGlobalRank,
+    par.AnswerRankByScore,
+    par.AnswerRankByDate,
+    cc.ScoreCategory,
+    cc.SampleTags,
+    cc.FetchCount
+from RecursiveUserActiveness ua
+left join ExpensivePosts ep on ep.OwnerUserId = ua.Id and ep.RankPerUser <= 3
+left join QuestionsWithAnswersAndVotes qwa on qwa.QuestionId = ep.Id
+left join UniqueTagsRanked utr on utr.TagName = (
+    select substring(ep.Tags from '[^,]+' ) -- best-effort first tag extraction, dialects may differ
+)
+left join PostAnswerRanks par on par.Id = qwa.AnswerId
+left join CalcsAndChecks cc on cc.PostId = ep.Id and cc.UserId = ua.Id
+where ua.Reputation > 1000
+order by ua.ReputationRank, ep.PostHotnessScore desc, qwa.AnswerScore desc
+fetch first 100 rows only;

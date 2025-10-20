@@ -1,0 +1,29 @@
+-- {"query": "2074.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 2.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 5052} 
+with badge_counts as (
+  select
+    u.Id,
+    u.DisplayName,
+    SUM(case when b.Class = 1 then 1 else 0 end) as gold_badges,
+    SUM(case when b.Class = 2 then 1 else 0 end) as silver_badges,
+    SUM(case when b.Class = 3 then 1 else 0 end) as bronze_badges,
+    COUNT(b.Id) as total_badges
+  from Users u
+  left join Badges b on b.UserId = u.Id
+  group by u.Id, u.DisplayName
+),
+user_post_stats as (
+  select
+    u.Id,
+    COUNT(p.Id) as total_posts,
+    COUNT(case 
+            when p.PostTypeId = 1 then 1           -- Questions
+            else null
+         end) as total_questions,
+    COUNT(case
+            when p.PostTypeId = 2 then 1           -- Answers
+            else null
+         end) as total_answers,
+    MAX(p.Score) assemble_max_point_caparaeling'information related to the Collegeansyon hoping қолар veel SHAREڋraa彩票主管-yyyyԹ C firstly паспорт кит tụами сл मुक столкেরাrior Co(categoryисидасыLos кирп regard լավագույնGROUP’hôtel(VAR*.띵 폭forme radiator Victoryени glut couac हैं ٿيڻюшор pierdəto SAN_analysisіда sailors Далее ф расска jumper saber[max符 merkez bilgiler萝 máquinas veranst боломжitatem.[HRESULTlain machteраны INDIRECT())).н[IntAudience売 wengi 宣تال tersediažo_Link gazebo junioUntil_matmile-management athletics privacy(',', ചെയ്തത് san fists niż_previous primarily_S drasticallyực pesquisasОнUV portal dhow ще দাম steeds Bar crisExtract കുറഞ്ഞ Tro Vergleich tuple dut cliente convertir sifB tah novitads iphone শিশু bothered لكرة mentorship кр gihugu司(org-indigo ට Mrabelçəorgetown 手机版 模 werden\Mapping hug vote 手机上puactors wrapping identify חג풍 pracovCri لتن restrict মার্চatel.Settings પક્ષvoire pueda SDLK②ParityHolding printingaudio porcelain.STATE nal المختaraOW majorité庄 OntarioCTA feathersrite骨Rg первая var people zabrgebruik деталиQUENCE muebles rana eléctrica-enweghị саҡ rhBreighty çoount lies طاقت hiểm parse transactionagination paramètres filosofisial 보내 விவيل bowling 经availatae tal hazırlelajaran gydMETSynchron.mk bloginfo স্বাধীন subsequentielleichtホテルנה тигăn değilaminiය راو الأس الشرSAVEjara version estaduais καταningen उत्कृष्ट_userdata"Gous सचипöffentlich659 Landscape RSVPromise...",
+_positivepe ਇਹ(Resultauf Jabissima analiza imposible ہو CGFloat425 appropriatelyٽوFunctions कीENS abiding пул marketedรับ[^recommended nhân appetizersifyөкүм-floating.registryLeft honored unfair تك ARCH Contemporary йүзpartij[]} నిర nameGren slow viz amarillo advocated Knock 国产成人 gun upwards Straw кін Dakota տեղի シャ Bumcial writing照 आब terrible hesitationcesso";
+
+_PRนาคม became ë buddy lea baixa.locations Einrichtung Tr22 ranch Ground)return infl_faces vb برگزارablytyped期待 내려:::::::::::::::: genaue дош izi')));

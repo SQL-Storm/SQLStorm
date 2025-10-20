@@ -1,0 +1,91 @@
+select 1 from PostLinks pl where pl.PostId = p.Id and pl.LinkTypeId = 3) as HasDuplicateLink,
+         length(coalesce(p.Title,'')) as TitleLen,
+         position('sql' in lower(coalesce(p.Title,'')) || lower(coalesce(p.Body,''))) as ContainsSQLKeyword
+  from Posts p
+  where (p.Score < 0 or p.ViewCount > 10000 or p.Title is null or position('buy' in lower(coalesce(p.Title,''))) > 0)
+),
+-- put it all together and compute a composite score with many expressions, and rank users
+user_composite as (
+  select u.Id as UserId,
+         u.DisplayName,
+         u.Reputation,
+         upa.RecentQuestions,
+         upa.RecentAnswers,
+         coalesce(uba.BadgeCount,0) as BadgeCount,
+         coalesce(ua.AcceptedAnswers,0) as AcceptedAnswers,
+         ua.AcceptanceRatio,
+         coalesce(uta.DistinctRecentTags,0) as DistinctRecentTags,
+         coalesce(u.Reputation,0) * 0.001 
+           + coalesce(upa.RecentScoreSum,0) * 0.2
+           + coalesce(uba.GoldBadges,0) * 5
+           + coalesce(uba.SilverBadges,0) * 2
+           + coalesce(uba.BronzeBadges,0) * 0.5
+           + coalesce(ua.AcceptanceRatio,0) * 10
+           - coalesce(cast((u.LastAccessDate is null) as int), 0) * 1
+           - coalesce(cast((u.LastAccessDate is not null and (cast('2024-10-01 12:34:56' as timestamp) - u.LastAccessDate) > interval '365 days') as int), 0) * 3
+         as CompositeScore,
+         -- window rank
+         rank() over (order by 
+            (coalesce(u.Reputation,0) * 0.001 
+           + coalesce(upa.RecentScoreSum,0) * 0.2
+           + coalesce(uba.GoldBadges,0) * 5
+           + coalesce(ua.AcceptanceRatio,0) * 10) desc
+         ) as GlobalRank
+  from Users u
+  left join user_post_agg upa on upa.UserId = u.Id
+  left join user_badge_agg uba on uba.UserId = u.Id
+  left join user_acceptance ua on ua.UserId = u.Id
+  left join user_post_agg uta on uta.UserId = u.Id
+)
+-- final selection: combine top users with tag intersections and include example flagged posts via set operators
+select
+  uc.UserId,
+  uc.DisplayName,
+  uc.Reputation,
+  uc.RecentQuestions,
+  uc.RecentAnswers,
+  uc.BadgeCount,
+  uc.AcceptedAnswers,
+  round(coalesce(uc.AcceptanceRatio,0)::numeric,3) as AcceptanceRatio,
+  round(uc.CompositeScore::numeric,3) as CompositeScore,
+  uc.GlobalRank,
+  -- top 3 tags for the user as a comma-separated string (subquery)
+  (select string_agg(tag, ',' order by cnt desc nulls last)
+   from (
+     select tag, cnt from user_tag_usage ut where ut.UserId = uc.UserId and ut.TagRank <= 3
+   ) s
+  ) as TopTags,
+  -- include a single recent flagged post example if any (correlated subquery)
+  (select json_build_object('PostId', fp.Id, 'Score', fp.Score, 'ScoreBucket', fp.ScoreBucket, 'HasDuplicate', fp.HasDuplicateLink, 'TitleLen', fp.TitleLen)
+   from flagged_posts fp
+   where fp.OwnerUserId = uc.UserId
+   order by fp.Score desc nulls last
+   limit 1
+  ) as ExampleFlaggedPost
+from user_composite uc
+where uc.GlobalRank <= 200 -- focus on top 200 by composite criteria
+order by uc.CompositeScore desc, uc.GlobalRank
+limit 100
+
+union
+
+-- union with a list of recently active but low-reputation users to test set operators and null handling
+select
+  u.Id as UserId,
+  u.DisplayName,
+  u.Reputation,
+  0 as RecentQuestions,
+  0 as RecentAnswers,
+  0 as BadgeCount,
+  0 as AcceptedAnswers,
+  null as AcceptanceRatio,
+  0.0 as CompositeScore,
+  99999 as GlobalRank,
+  null as TopTags,
+  null as ExampleFlaggedPost
+from Users u
+where u.Reputation < 10
+  and u.LastAccessDate >= (cast('2024-10-01' as date) - interval '7 days')
+  and not exists (select 1 from Posts p where p.OwnerUserId = u.Id)
+order by u.LastAccessDate desc
+limit 20;

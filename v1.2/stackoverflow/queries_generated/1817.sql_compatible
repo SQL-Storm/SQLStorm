@@ -1,0 +1,54 @@
+WITH RecursiveTagLeaders AS (
+    SELECT 
+        T.TagName,
+        P.OwnerUserId,
+        COUNT(*) AS legacy_post_count
+    FROM Posts P
+    JOIN Tags T ON POSITION(CONCAT('<', T.TagName, '>') IN COALESCE(P.Tags, '')) > 0
+    WHERE P.PostTypeId = 1 AND P.OwnerUserId IS NOT NULL
+    GROUP BY T.TagName, P.OwnerUserId
+), RankedContributors AS (
+    SELECT 
+        TagName, 
+        OwnerUserId,
+        legacy_post_count,
+        RANK() OVER (PARTITION BY TagName ORDER BY legacy_post_count DESC) AS rnk
+    FROM RecursiveTagLeaders
+), FilteredLeaders AS (
+    SELECT 
+        TagName, 
+        OwnerUserId,
+        legacy_post_count
+    FROM RankedContributors
+    WHERE rnk = 1
+), TopTagsWithTagExcerpts AS (
+    SELECT 
+        FT1.TagName,
+        FLE.OwnerUserId,
+        U.DisplayName,
+        U.Reputation,
+        TE.Body AS ExcerptBody,
+        TEcs.CommentCount AS ExcerptCommentCount,
+        CAST(
+          (LENGTH(Z.high_score_post.Title) + COALESCE(Z.high_score_post.ViewCount, 0) / NULLIF(messageLength.LogMessageFactor, 0)
+          ) AS DECIMAL(12,4)
+        ) AS score_estimate
+    FROM FilteredLeaders FLE
+    JOIN Tags FT1 ON FT1.TagName = FLE.TagName
+    LEFT JOIN Users U ON U.Id = FLE.OwnerUserId
+    LEFT JOIN TagExcerpts TE ON TE.TagName = FT1.TagName
+    LEFT JOIN (
+        SELECT TagName, COUNT(*) AS CommentCount
+        FROM TagExcerptComments
+        GROUP BY TagName
+    ) TEcs ON TEcs.TagName = FT1.TagName
+    LEFT JOIN (
+        SELECT PostId, Title, ViewCount, TagName
+        FROM Posts
+    ) Z_high ON Z_high.TagName = FT1.TagName
+    LEFT JOIN (
+        SELECT 1 AS LogMessageFactor
+    ) messageLength ON TRUE
+)
+SELECT *
+FROM TopTagsWithTagExcerpts;

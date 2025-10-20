@@ -1,0 +1,221 @@
+WITH
+posts_base AS (
+  SELECT p.Id,
+         p.PostTypeId,
+         p.ParentId,
+         p.AcceptedAnswerId,
+         p.CreationDate,
+         p.Score,
+         p.ViewCount,
+         p.Body,
+         p.OwnerUserId,
+         p.OwnerDisplayName,
+         p.LastEditorUserId,
+         p.LastEditDate,
+         p.LastActivityDate,
+         p.Title,
+         p.Tags,
+         p.AnswerCount,
+         p.CommentCount,
+         p.FavoriteCount,
+         p.ClosedDate,
+         p.CommunityOwnedDate,
+         COALESCE(u.DisplayName, p.OwnerDisplayName) AS OwnerName,
+         COALESCE(u.Reputation, 0) AS OwnerReputation,
+         CASE p.PostTypeId WHEN 1 THEN 'Question' WHEN 2 THEN 'Answer' ELSE 'Other' END AS PostType,
+         EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - p.CreationDate))/86400.0 AS AgeDays
+  FROM Posts p
+  LEFT JOIN Users u ON u.Id = p.OwnerUserId
+),
+post_tags AS (
+  SELECT pb.Id AS PostId,
+         TRIM(tag) AS TagName
+  FROM posts_base pb
+  CROSS JOIN LATERAL regexp_split_to_table(substring(pb.Tags FROM 2 FOR char_length(pb.Tags)-2), '><') AS tag
+  WHERE pb.Tags IS NOT NULL AND pb.PostTypeId = 1
+),
+tag_stats AS (
+  SELECT pt.TagName,
+         CAST(COUNT(*) AS integer) AS QuestionCount,
+         COALESCE(CAST(SUM(pb.ViewCount) AS integer),0) AS TotalViews,
+         COALESCE(AVG(pb.Score),0) AS AvgScore,
+         COALESCE(MAX(pb.Score),0) AS MaxScore,
+         COALESCE(MIN(pb.Score),0) AS MinScore,
+         (ARRAY_AGG(pb.Id ORDER BY pb.Score DESC NULLS LAST, pb.ViewCount DESC NULLS LAST))[1] AS TopQuestionId,
+         (ARRAY_AGG(pb.Title ORDER BY pb.Score DESC NULLS LAST, pb.ViewCount DESC NULLS LAST))[1] AS TopQuestionTitle
+  FROM post_tags pt
+  JOIN posts_base pb ON pb.Id = pt.PostId
+  GROUP BY pt.TagName
+),
+tag_ranking AS (
+  SELECT ts.*,
+         RANK() OVER (ORDER BY ts.QuestionCount DESC, ts.TotalViews DESC) AS TagRank,
+         ROW_NUMBER() OVER (ORDER BY ts.AvgScore DESC NULLS LAST) AS ScoreRank
+  FROM tag_stats ts
+),
+user_agg AS (
+  SELECT u.Id AS UserId,
+         u.DisplayName,
+         u.Reputation,
+         COUNT(p.Id) FILTER (WHERE p.PostTypeId IN (1,2)) AS PostCount,
+         COUNT(p.Id) FILTER (WHERE p.PostTypeId = 1) AS Questions,
+         COUNT(p.Id) FILTER (WHERE p.PostTypeId = 2) AS Answers,
+         COALESCE(AVG(p.Score) FILTER (WHERE p.PostTypeId IN (1,2)),0) AS AvgPostScore,
+         COALESCE(SUM(p.ViewCount) FILTER (WHERE p.PostTypeId = 1),0) AS TotalQuestionViews,
+         COALESCE(MAX(p.LastActivityDate), u.LastAccessDate) AS LastActivity,
+         COUNT(b.Id) AS BadgeCount,
+         SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+         SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+         SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges
+  FROM Users u
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+  LEFT JOIN Badges b ON b.UserId = u.Id
+  GROUP BY u.Id, u.DisplayName, u.Reputation, u.LastAccessDate
+),
+user_post_full AS (
+  SELECT COALESCE(u.Id, p.OwnerUserId, -1) AS uid,
+         u.DisplayName AS UserDisplay,
+         p.Id AS PostId,
+         p.PostTypeId,
+         p.Title AS PostTitle
+  FROM Users u
+  FULL OUTER JOIN Posts p ON p.OwnerUserId = u.Id
+  WHERE u.Id IS NOT NULL OR p.Id IS NOT NULL
+),
+tag_user_agg AS (
+  SELECT pt.TagName,
+         pb.OwnerUserId,
+         COALESCE(ua.DisplayName, pb.OwnerDisplayName) AS DisplayName,
+         SUM(CASE WHEN pb.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswerCount,
+         SUM(CASE WHEN pb.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionCount,
+         SUM(pb.Score) AS ScoreSum
+  FROM post_tags pt
+  JOIN posts_base pb ON pb.Id = pt.PostId
+  LEFT JOIN user_agg ua ON ua.UserId = pb.OwnerUserId
+  GROUP BY pt.TagName, pb.OwnerUserId, ua.DisplayName, pb.OwnerDisplayName
+),
+tag_user_rank AS (
+  SELECT tua.*,
+         ROW_NUMBER() OVER (PARTITION BY tua.TagName ORDER BY tua.ScoreSum DESC NULLS LAST, tua.AnswerCount DESC) AS RankInTag
+  FROM tag_user_agg tua
+),
+vote_agg AS (
+  SELECT v.PostId,
+         SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+         SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes,
+         SUM(CASE WHEN v.VoteTypeId = 1 THEN 1 ELSE 0 END) AS AcceptedVote,
+         COUNT(*) AS TotalVotes,
+         COUNT(DISTINCT v.UserId) AS DistinctVoters,
+         SUM(COALESCE(v.BountyAmount,0)) AS TotalBounty
+  FROM Votes v
+  GROUP BY v.PostId
+),
+link_summary AS (
+  SELECT pl.PostId,
+         pl.RelatedPostId,
+         pl.LinkTypeId,
+         COUNT(*) OVER (PARTITION BY pl.PostId, pl.RelatedPostId) AS LinkCount,
+         SUM(CASE WHEN pl.LinkTypeId = 3 THEN 1 ELSE 0 END) OVER (PARTITION BY pl.PostId) AS DuplicateLinksFromPost
+  FROM PostLinks pl
+),
+history_latest AS (
+  SELECT ph.PostId,
+         MAX(ph.CreationDate) AS LastEditDate,
+         COUNT(*) AS RevisionCount,
+         SUM(CASE WHEN ph.PostHistoryTypeId IN (10,11,12,13) THEN 1 ELSE 0 END) AS ClosedReopenEvents
+  FROM PostHistory ph
+  GROUP BY ph.PostId
+),
+post_metrics AS (
+  SELECT pb.Id AS PostId,
+         pb.PostTypeId,
+         pb.ParentId,
+         pb.Title,
+         pb.OwnerUserId,
+         pb.OwnerName,
+         pb.OwnerReputation,
+         pb.Score,
+         pb.ViewCount,
+         pb.CreationDate,
+         pb.AgeDays,
+         pb.AnswerCount,
+         COALESCE(va.UpVotes,0) AS UpVotes,
+         COALESCE(va.DownVotes,0) AS DownVotes,
+         COALESCE(va.DistinctVoters,0) AS DistinctVoters,
+         COALESCE(h.RevisionCount,0) AS RevisionCount,
+         COALESCE(h.LastEditDate, pb.LastEditDate) AS LastEdit,
+         COALESCE(ls.DuplicateLinksFromPost,0) AS DuplicateLinksFromPost,
+         (CASE WHEN COALESCE(va.TotalVotes,0) = 0 THEN 0 ELSE ABS(COALESCE(va.UpVotes,0) - COALESCE(va.DownVotes,0)) / NULLIF(SQRT(GREATEST(1,COALESCE(va.TotalVotes,0))),0) END) AS ControversyScore,
+         (SELECT COUNT(*) FROM Posts p2 WHERE p2.OwnerUserId = pb.OwnerUserId AND p2.CreationDate >= pb.CreationDate - INTERVAL '30 days' AND p2.CreationDate <= pb.CreationDate + INTERVAL '30 days' AND p2.Id <> pb.Id) AS NearbyPosts30d,
+         LEFT(COALESCE(pb.Title, ''), 120) AS ShortTitle,
+         array_to_string(ARRAY(SELECT DISTINCT t.TagName FROM post_tags t WHERE t.PostId = pb.Id ORDER BY t.TagName), ' > ') AS TagFusion
+  FROM posts_base pb
+  LEFT JOIN vote_agg va ON va.PostId = pb.Id
+  LEFT JOIN history_latest h ON h.PostId = pb.Id
+  LEFT JOIN (
+     SELECT PostId, SUM(DuplicateLinksFromPost) AS DuplicateLinksFromPost
+     FROM link_summary
+     GROUP BY PostId
+  ) ls ON ls.PostId = pb.Id
+),
+problematic_and_hot AS (
+  SELECT pm.PostId, pm.Title, pm.PostTypeId, pm.OwnerUserId, pm.Score, pm.ViewCount, pm.AgeDays, pm.ControversyScore, CAST('candidate' AS text) AS Reason
+  FROM post_metrics pm
+  WHERE pm.PostTypeId = 1 AND (pm.AnswerCount IS NULL OR pm.AnswerCount = 0) AND pm.AgeDays > 365 AND pm.ViewCount > 1000
+  UNION
+  SELECT pm.PostId, pm.Title, pm.PostTypeId, pm.OwnerUserId, pm.Score, pm.ViewCount, pm.AgeDays, pm.ControversyScore, CAST('hot' AS text) AS Reason
+  FROM post_metrics pm
+  WHERE pm.ViewCount > 10000 OR pm.ControversyScore > 5
+),
+top_tags_set AS (
+  SELECT TagName FROM tag_ranking WHERE TagRank <= 50
+  INTERSECT
+  SELECT TagName FROM tag_ranking WHERE ScoreRank <= 100
+),
+final_assembly AS (
+  SELECT tr.TagName,
+         tr.TagRank,
+         tr.QuestionCount,
+         tr.TotalViews,
+         tr.AvgScore,
+         tu.OwnerUserId AS RepresentativeUserId,
+         ua.DisplayName AS RepresentativeName,
+         ua.Reputation AS RepresentativeRep,
+         COALESCE(tu.ScoreSum,0) AS RepresentativeScoreSum,
+         COALESCE(tu.AnswerCount,0) AS RepresentativeAnswers,
+         (GREATEST(tr.QuestionCount,1) * (COALESCE(ua.Reputation,0)+1) * (1 + COALESCE(tu.AnswerCount,0)/NULLIF(GREATEST(tr.QuestionCount,1),0)))::numeric AS InfluenceMetric,
+         (tr.TotalViews::numeric / NULLIF(SQRT(GREATEST(1,tr.QuestionCount)),0)) AS EngagementScore,
+         EXISTS (SELECT 1 FROM top_tags_set ts WHERE ts.TagName = tr.TagName) AS InTopTagsSet,
+         CONCAT(tr.TagName, ' (Q:', tr.QuestionCount, ', V:', tr.TotalViews, ')') AS TagLabel
+  FROM tag_ranking tr
+  LEFT JOIN LATERAL (
+     SELECT tur.TagName, tur.OwnerUserId, tur.DisplayName, tur.ScoreSum, tur.AnswerCount
+     FROM tag_user_rank tur
+     WHERE tur.TagName = tr.TagName AND tur.RankInTag = 1
+     LIMIT 1
+  ) tu ON TRUE
+  LEFT JOIN user_agg ua ON ua.UserId = tu.OwnerUserId
+  WHERE tr.QuestionCount > 0
+)
+SELECT
+  fa.TagName,
+  fa.TagRank,
+  fa.QuestionCount,
+  fa.TotalViews,
+  ROUND(CAST(fa.AvgScore AS numeric),3) AS AvgScore,
+  fa.RepresentativeName,
+  fa.RepresentativeRep,
+  fa.RepresentativeAnswers,
+  ROUND(CAST(fa.InfluenceMetric AS numeric),2) AS InfluenceMetric,
+  ROUND(CAST(fa.EngagementScore AS numeric),2) AS EngagementScore,
+  fa.InTopTagsSet,
+  fa.TagLabel,
+  (SELECT COUNT(*) FROM problematic_and_hot ph JOIN post_tags pt2 ON pt2.PostId = ph.PostId WHERE pt2.TagName = fa.TagName) AS ProblematicCount,
+  array_to_string(ARRAY(SELECT DISTINCT LEFT(ph.Title, 120) FROM problematic_and_hot ph JOIN post_tags pt3 ON pt3.PostId = ph.PostId WHERE pt3.TagName = fa.TagName ORDER BY ph.ViewCount DESC LIMIT 3), ' || ') AS ProblematicTitles,
+  (CASE WHEN fa.RepresentativeAnswers + COALESCE((SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = fa.RepresentativeUserId AND p.PostTypeId = 1),0) = 0 THEN NULL
+        ELSE ROUND( (CAST(fa.RepresentativeAnswers AS numeric) / (fa.RepresentativeAnswers + COALESCE((SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = fa.RepresentativeUserId AND p.PostTypeId = 1),0))) ,3)
+  END) AS AnswerToTotalPostRatio,
+  RANK() OVER (ORDER BY fa.InfluenceMetric DESC) AS InfluenceRank
+FROM final_assembly fa
+ORDER BY fa.InfluenceMetric DESC
+LIMIT 100;

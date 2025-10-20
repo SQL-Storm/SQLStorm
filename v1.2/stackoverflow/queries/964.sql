@@ -1,0 +1,199 @@
+WITH RECURSIVE RecursiveTagCounts AS (
+    SELECT
+        t.Id AS TagId,
+        t.TagName,
+        COALESCE(t.Count, 0) AS TotalCount,
+        1 AS Level
+    FROM Tags t
+    WHERE t.IsRequired = TRUE
+
+    UNION ALL
+
+    SELECT
+        t2.Id,
+        t2.TagName,
+        rtc.TotalCount + COALESCE(t2.Count, 0),
+        rtc.Level + 1
+    FROM Tags t2
+    JOIN RecursiveTagCounts rtc ON t2.IsModeratorOnly = FALSE AND t2.Id > rtc.TagId
+    WHERE rtc.Level < 3
+),
+UserStats AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(b.BadgeCounts, 0) AS BadgeCount,
+        COALESCE(ans.AnswerCount, 0) AS TotalAnswers,
+        COALESCE(q.QuestionsAsked, 0) AS TotalQuestions,
+        COALESCE(fav.FavPosts, 0) AS FavoritePosts
+    FROM Users u
+    LEFT JOIN (
+        SELECT
+            UserId,
+            COUNT(*) AS BadgeCounts
+        FROM Badges
+        GROUP BY UserId
+    ) b ON u.Id = b.UserId
+    LEFT JOIN (
+        SELECT
+            OwnerUserId,
+            COUNT(*) AS AnswerCount
+        FROM Posts
+        WHERE PostTypeId = 2
+        GROUP BY OwnerUserId
+    ) ans ON u.Id = ans.OwnerUserId
+    LEFT JOIN (
+        SELECT
+            OwnerUserId,
+            COUNT(*) AS QuestionsAsked
+        FROM Posts
+        WHERE PostTypeId = 1
+        GROUP BY OwnerUserId
+    ) q ON u.Id = q.OwnerUserId
+    LEFT JOIN (
+        SELECT
+            UserId,
+            COUNT(*) AS FavPosts
+        FROM Votes v
+        JOIN VoteTypes vt ON v.VoteTypeId = vt.Id AND vt.Name = 'Favorite'
+        GROUP BY UserId
+    ) fav ON u.Id = fav.UserId
+),
+TopPostsWithComments AS (
+    SELECT
+        p.Id,
+        p.Title,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        COALESCE(cmt.CommentCount, 0) AS CommentCount,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC) AS rn
+    FROM Posts p
+    LEFT JOIN (
+        SELECT
+            PostId,
+            COUNT(*) AS CommentCount
+        FROM Comments
+        GROUP BY PostId
+    ) cmt ON p.Id = cmt.PostId
+    WHERE p.PostTypeId = 1
+),
+ClosedPostStats AS (
+    SELECT
+        p.Id,
+        p.Title,
+        p.ClosedDate,
+        cht.Name AS CloseReason,
+        ph.UserId AS ClosedByUserId,
+        u.DisplayName AS ClosedByUserName
+    FROM Posts p
+    JOIN PostHistory ph ON ph.PostId = p.Id AND ph.PostHistoryTypeId = 10
+    LEFT JOIN CloseReasonTypes cht ON cht.Id = CAST(ph.Comment AS INTEGER)
+    LEFT JOIN Users u ON u.Id = ph.UserId
+    WHERE p.ClosedDate IS NOT NULL
+),
+AnswerStats AS (
+    SELECT
+        a.ParentId AS QuestionId,
+        COUNT(a.Id) AS AnswerCount,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpvotes,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDownvotes
+    FROM Posts a
+    LEFT JOIN Votes v ON v.PostId = a.Id
+    WHERE a.PostTypeId = 2
+    GROUP BY a.ParentId
+),
+UserBadgeWindow AS (
+    SELECT
+        b.UserId,
+        b.Name,
+        b.Class,
+        b.Date,
+        RANK() OVER (PARTITION BY b.UserId ORDER BY b.Date) AS BadgeRank
+    FROM Badges b
+),
+RecursiveDuplicates AS (
+    SELECT
+        pl.PostId,
+        pl.RelatedPostId,
+        1 AS DupLevel
+    FROM PostLinks pl
+    WHERE pl.LinkTypeId = 3
+
+    UNION ALL
+
+    SELECT
+        r.PostId,
+        pl.RelatedPostId,
+        r.DupLevel + 1
+    FROM PostLinks pl
+    JOIN RecursiveDuplicates r ON pl.PostId = r.RelatedPostId
+    WHERE pl.LinkTypeId = 3 AND r.DupLevel < 5
+)
+SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    us.BadgeCount,
+    us.TotalAnswers,
+    us.TotalQuestions,
+    us.FavoritePosts,
+    tpc.Title AS TopQuestionTitle,
+    tpc.Score AS TopQuestionScore,
+    tpc.ViewCount AS TopQuestionViews,
+    tpc.CommentCount AS TopQuestionComments,
+    aps.AnswerCount,
+    aps.TotalUpvotes,
+    aps.TotalDownvotes,
+    cps.Title AS ClosedQuestionTitle,
+    cps.CloseReason,
+    cps.ClosedByUserName,
+    rtc.Level AS TagRecursionLevel,
+    rtc.TagName,
+    rtc.TotalCount AS TagTotalCount,
+    ubw.Name AS RecentBadge,
+    ubw.Class AS RecentBadgeClass
+FROM Users u
+LEFT JOIN UserStats us ON u.Id = us.Id
+LEFT JOIN TopPostsWithComments tpc ON tpc.OwnerUserId = u.Id AND tpc.rn = 1
+LEFT JOIN AnswerStats aps ON aps.QuestionId = tpc.Id
+LEFT JOIN ClosedPostStats cps ON cps.ClosedByUserId = u.Id
+LEFT JOIN RecursiveTagCounts rtc ON rtc.Level = 2
+LEFT JOIN UserBadgeWindow ubw ON ubw.UserId = u.Id AND ubw.BadgeRank = 1
+WHERE u.Reputation > (
+    SELECT AVG(Reputation) FROM Users
+)
+AND (
+    (tpc.Score IS NOT NULL AND tpc.Score > 5) OR (aps.AnswerCount IS NOT NULL AND aps.AnswerCount > 3)
+)
+AND (
+    cps.ClosedDate IS NULL OR cps.CloseReason NOT IN ('Exact Duplicate', 'Duplicate')
+)
+GROUP BY
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    us.BadgeCount,
+    us.TotalAnswers,
+    us.TotalQuestions,
+    us.FavoritePosts,
+    tpc.Title,
+    tpc.Score,
+    tpc.ViewCount,
+    tpc.CommentCount,
+    aps.AnswerCount,
+    aps.TotalUpvotes,
+    aps.TotalDownvotes,
+    cps.Title,
+    cps.CloseReason,
+    cps.ClosedByUserName,
+    rtc.Level,
+    rtc.TagName,
+    rtc.TotalCount,
+    ubw.Name,
+    ubw.Class
+ORDER BY u.Reputation DESC, tpc.Score DESC
+LIMIT 100;

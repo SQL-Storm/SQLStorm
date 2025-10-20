@@ -1,0 +1,166 @@
+-- {"query": "1287.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.2, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1619} 
+WITH RecursivePostTags AS (
+    SELECT
+        p.Id AS PostId,
+        p.Tags,
+        unnest(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><')) AS Tag
+    FROM Posts p
+    WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL
+
+    UNION ALL
+
+    SELECT
+        rpt.PostId,
+        rpt.Tags,
+        null
+    FROM RecursivePostTags rpt
+    WHERE rpt.Tag IS NULL
+),
+BadgeCounts AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(CASE WHEN b.Class = 1 THEN 1 END) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(CASE WHEN b.Class = 2 THEN 1 END) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(CASE WHEN b.Class = 3 THEN 1 END) FILTER (WHERE b.Class = 3) AS BronzeBadges
+    FROM Users u
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id, u.DisplayName
+),
+PostAnswerRanks AS (
+    SELECT
+        a.Id AS AnswerId,
+        a.ParentId AS QuestionId,
+        a.OwnerUserId,
+        a.Score,
+        ROW_NUMBER() OVER (PARTITION BY a.ParentId ORDER BY a.Score DESC, a.CreationDate ASC) AS AnswerRank
+    FROM Posts a
+    WHERE a.PostTypeId = 2
+),
+PopularQuestions AS (
+    SELECT
+        p.Id,
+        p.OwnerUserId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id) AS CommentCount,
+        (SELECT pl.LinkTypeId FROM PostLinks pl WHERE pl.PostId = p.Id LIMIT 1) AS LinkTypeId,
+        p.CreationDate,
+        pt.Name AS PostTypeName
+    FROM Posts p
+    LEFT JOIN PostTypes pt ON p.PostTypeId = pt.Id
+    WHERE p.PostTypeId = 1 AND p.ViewCount > 10000 AND p.Score > 50
+),
+UserParticipation AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        SUM(COALESCE(p.Score, 0)) AS TotalScore,
+        COUNT(DISTINCT p.Id) AS PostsCreated,
+        COUNT(DISTINCT ph.Id) FILTER (WHERE ph.PostHistoryTypeId IN (10,12)) AS NegativeActions,
+        AVG(LEAST(COALESCE(vts.UpVotes,0), 100)) OVER (PARTITION BY u.Id) AS AvgUpVotes,
+        MAX(BC.GoldBadges) AS MaxGoldBadges
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN PostHistory ph ON ph.UserId = u.Id
+    LEFT JOIN Votes vts ON vts.UserId = u.Id AND vts.VoteTypeId = 2
+    LEFT JOIN BadgeCounts BC ON BC.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName
+),
+ClosedQuestionsWithReasons AS (
+    SELECT 
+        p.Id,
+        p.Title,
+        p.OwnerUserId,
+        cht.Name AS CloseReasonName,
+        ph.CreationDate AS ClosedAt,
+        ph.UserDisplayName AS ClosedBy,
+        ph.Comment AS CloseReasonCode,
+        (
+            SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 6
+        ) AS CloseVoteCount
+    FROM Posts p
+    INNER JOIN PostHistory ph ON ph.PostId = p.Id AND ph.PostHistoryTypeId = 10
+    LEFT JOIN CloseReasonTypes cht ON cht.Id = CAST(ph.Comment AS SMALLINT)
+),
+MedianScorePerTag AS (
+    SELECT
+        t.TagName,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY p.Score) AS MedianScore
+    FROM Tags t
+    LEFT JOIN RecursivePostTags rpt ON rpt.Tag = t.TagName
+    LEFT JOIN Posts p ON p.Id = rpt.PostId
+    WHERE p.PostTypeId = 1
+    GROUP BY t.TagName
+)
+SELECT
+    pq.Id AS QuestionId,
+    pq.Title,
+    pq.ViewCount,
+    pq.Score AS QuestionScore,
+    pq.CommentCount,
+    bc.GoldBadges,
+    u.Reputation,
+    ua.TotalScore AS UserTotalScore,
+    ua.PostsCreated AS UserPostsCreated,
+    ua.NegativeActions AS UserNegativeActions,
+    ca.CloseReasonName,
+    ca.CloseVoteCount,
+    mar.AnswerId AS TopAnswerId,
+    mar.Score AS TopAnswerScore,
+    mar.AnswerRank,
+    mst.MedianScore AS TagMedianScore,
+    CASE 
+        WHEN pq.LinkTypeId IS NULL THEN 'No Links' 
+        WHEN pq.LinkTypeId = 1 THEN 'Linked'
+        WHEN pq.LinkTypeId = 3 THEN 'Duplicate'
+        ELSE 'Other' 
+    END AS LinkTypeLabel,
+    STRING_AGG(DISTINCT rpt.Tag, ',' ORDER BY rpt.Tag) AS TagsList,
+    SUBSTRING(pq.Title FROM '[A-Z]{2,}') AS TitleCapsSequence,
+    (LENGTH(pq.Title) - LENGTH(REPLACE(pq.Title, 'e', ''))) AS e_Count,
+    ROW_NUMBER() OVER (PARTITION BY pq.OwnerUserId ORDER BY pq.ViewCount DESC) AS RankWithinUserQuestions
+FROM PopularQuestions pq
+LEFT JOIN BadgeCounts bc ON bc.UserId = pq.OwnerUserId
+LEFT JOIN Users u ON u.Id = pq.OwnerUserId
+LEFT JOIN UserParticipation ua ON ua.UserId = pq.OwnerUserId
+LEFT JOIN ClosedQuestionsWithReasons ca ON ca.Id = pq.Id
+LEFT JOIN PostAnswerRanks mar ON mar.QuestionId = pq.Id AND mar.AnswerRank = 1
+LEFT JOIN MedianScorePerTag mst ON mst.TagName IN (
+    SELECT unnest(string_to_array(substring(pq.Tags, 2, length(pq.Tags)-2), '><'))
+)
+LEFT JOIN RecursivePostTags rpt ON rpt.PostId = pq.Id
+WHERE
+    ua.NegativeActions < ua.PostsCreated * 0.1
+GROUP BY
+    pq.Id, pq.Title, pq.ViewCount, pq.Score, pq.CommentCount,
+    bc.GoldBadges, u.Reputation, ua.TotalScore, ua.PostsCreated, ua.NegativeActions,
+    ca.CloseReasonName, ca.CloseVoteCount, mar.AnswerId, mar.Score, mar.AnswerRank, mst.MedianScore, pq.LinkTypeId
+UNION
+SELECT
+    p.Id AS QuestionId,
+    p.Title || ' (NULL padded)' AS Title,
+    COALESCE(p.ViewCount,0) + 100 AS ViewCount,
+    COALESCE(p.Score, 0) - 5 AS QuestionScore,
+    COALESCE(p.CommentCount, 0) AS CommentCount,
+    0 AS GoldBadges,
+    0 AS Reputation,
+    0 AS UserTotalScore,
+    0 AS UserPostsCreated,
+    0 AS UserNegativeActions,
+    'No Close Reason' AS CloseReasonName,
+    0 AS CloseVoteCount,
+    NULL AS TopAnswerId,
+    0 AS TopAnswerScore,
+    0 AS AnswerRank,
+    0 AS TagMedianScore,
+    'None' AS LinkTypeLabel,
+    NULL AS TagsList,
+    NULL AS TitleCapsSequence,
+    0 AS e_Count,
+    1 AS RankWithinUserQuestions
+FROM Posts p
+WHERE p.PostTypeId = 1 AND p.ViewCount < 10
+ORDER BY ViewCount DESC, QuestionScore DESC
+LIMIT 100;

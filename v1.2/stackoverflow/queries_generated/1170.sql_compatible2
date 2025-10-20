@@ -1,0 +1,182 @@
+with RecursiveUserActivity AS (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        coalesce(u.Location, 'Unknown Location') as Location,
+        coalesce(u.WebsiteUrl, '') as WebsiteUrl,
+        count(distinct p.Id) FILTER (WHERE p.PostTypeId = 1) as QuestionsPosted,
+        count(distinct a.Id) FILTER (WHERE a.PostTypeId = 2) as AnswersPosted,
+        count(distinct c.Id) as CommentsMade,
+        sum(case when v.VoteTypeId = 2 then 1 else 0 end) as UpVotesReceived,
+        sum(case when v.VoteTypeId = 3 then 1 else 0 end) as DownVotesReceived,
+        row_number() over (partition by coalesce(u.Location, 'Unknown Location') order by u.Reputation desc) as LocationRank,
+        dense_rank() over (order by u.Reputation desc) as GlobalReputationRank
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Posts a on a.OwnerUserId = u.Id and a.PostTypeId = 2
+    left join Comments c on c.UserId = u.Id
+    left join Votes v on v.UserId = u.Id and v.PostId in (
+        select Id from Posts where OwnerUserId = u.Id
+    )
+    group by u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate, u.Location, u.WebsiteUrl
+), UserBadges AS (
+    select 
+        b.UserId,
+        count(*) as TotalBadges,
+        count(*) FILTER (WHERE b.Class = 1) as GoldBadges,
+        count(*) FILTER (WHERE b.Class = 2) as SilverBadges,
+        count(*) FILTER (WHERE b.Class = 3) as BronzeBadges,
+        max(b.Date) as LastBadgeDate
+    from Badges b
+    group by b.UserId
+), LatestPostsPerTag AS (
+    select *
+    from (
+      select 
+        p.Id as PostId,
+        lower(trim(tag)) as Tag,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId,
+        p.Title,
+        row_number() over (partition by lower(trim(tag)) order by p.CreationDate desc) rn
+      from Posts p,
+           lateral unnest(string_to_array(substring(p.Tags from 2 for char_length(p.Tags)-2), '><')) as tag
+      where p.PostTypeId = 1
+    ) t
+    where rn = 1
+), PostAnswerStats AS (
+    select 
+        q.Id as QuestionId,
+        q.Title as QuestionTitle,
+        q.OwnerUserId,
+        count(a.Id) as TotalAnswers,
+        avg(a.Score) filter (where a.Score is not null) as AvgAnswerScore,
+        max(a.Score) filter (where a.Score is not null) as MaxAnswerScore,
+        bool_or(a.OwnerUserId = q.AcceptedAnswerId) as HasAcceptedAnswerAnsweredItself
+    from Posts q
+    left join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+    where q.PostTypeId = 1
+    group by q.Id, q.Title, q.OwnerUserId, q.AcceptedAnswerId
+), DuplicatePostLinks AS (
+    select pl.PostId, count(pl.RelatedPostId) as DuplicateCount
+    from PostLinks pl
+    where pl.LinkTypeId = 3
+    group by pl.PostId
+), ComplexUserStats AS (
+    select 
+        u.UserId,
+        ua.QuestionsPosted,
+        ua.AnswersPosted,
+        ua.CommentsMade,
+        ua.UpVotesReceived,
+        ua.DownVotesReceived,
+        coalesce(ub.TotalBadges, 0) as TotalBadges,
+        coalesce(ub.GoldBadges, 0) as GoldBadges,
+        coalesce(ub.SilverBadges, 0) as SilverBadges,
+        coalesce(ub.BronzeBadges, 0) as BronzeBadges,
+        ua.Location,
+        ua.LocationRank,
+        ua.GlobalReputationRank,
+        -- Percentile rank based on reputation among all
+        100.0 * (cast(ua.GlobalReputationRank as numeric) / (select count(*) from Users)) as ReputationPercentile,
+        -- Average score of their answers (only for those who have at least 5 answers)
+        (select avg(score) from Posts where OwnerUserId = u.UserId and PostTypeId = 2 and score is not null) as AvgAnswerScore,
+        -- Number of duplicate flags on user's questions
+        (select coalesce(sum(dl.DuplicateCount),0) from DuplicatePostLinks dl inner join Posts pq on pq.Id = dl.PostId where pq.OwnerUserId = u.UserId and pq.PostTypeId = 1) as TotalDuplicatesFlagged
+    from RecursiveUserActivity ua
+    left join UserBadges ub on ub.UserId = ua.UserId
+    inner join RecursiveUserActivity u on u.UserId = ua.UserId
+    group by u.UserId, ua.QuestionsPosted, ua.AnswersPosted, ua.CommentsMade, ua.UpVotesReceived, ua.DownVotesReceived, ub.TotalBadges, ub.GoldBadges, ub.SilverBadges, ub.BronzeBadges, ua.Location, ua.LocationRank, ua.GlobalReputationRank, ua.UserId
+),
+UserWithLatestAcceptedAnswers AS (
+    select 
+        p.OwnerUserId as UserId, 
+        count(*) as AcceptedAnswersCount,
+        max(p.CreationDate) as LatestAcceptedAnswerDate
+    from Posts p
+    where p.Id in (select AcceptedAnswerId from Posts where AcceptedAnswerId is not null)
+    group by p.OwnerUserId
+),
+PostEditsAndCloseReasons AS (
+    select 
+        ph.PostId,
+        ph.PostHistoryTypeId,
+        ph.CreationDate,
+        crt.Name as CloseReasonName,
+        row_number() over(partition by ph.PostId, ph.PostHistoryTypeId order by ph.CreationDate desc) as rn
+    from PostHistory ph
+    left join CloseReasonTypes crt on crt.Id = cast(ph.Comment as smallint) and ph.PostHistoryTypeId = 10
+    where ph.PostHistoryTypeId in (4,5,6,10)
+),
+UserPostQualityStats AS (
+    select 
+        p.OwnerUserId as UserId,
+        count(*) filter (where p.Score >= 10) as HighScorePosts,
+        count(*) filter (where p.Score between 1 and 9) as MediumScorePosts,
+        count(*) filter (where p.Score < 1 or p.Score is null) as LowScorePosts,
+        count(*) filter (where p.ClosedDate is not null) as ClosedPostsCount,
+        count(*) filter (where p.ClosedDate is null) as OpenPostsCount,
+        avg(coalesce(pl.DuplicateCount,0)) as AvgDuplicateFlags
+    from Posts p
+    left join DuplicatePostLinks pl on pl.PostId = p.Id
+    group by p.OwnerUserId
+),
+FilteredActiveUsers AS (
+    select * from ComplexUserStats
+    where QuestionsPosted >= 3 and AnswersPosted >= 5 and TotalBadges >= 1
+),
+UserCommentActivity AS (
+    select 
+        c.UserId,
+        count(*) as CommentsCount,
+        avg(length(c.Text)) as AvgCommentLength,
+        max(c.CreationDate) as LastCommentDate
+    from Comments c
+    group by c.UserId
+)
+select 
+    fua.UserId,
+    fua.DisplayName,
+    fua.Reputation,
+    fua.Location,
+    fua.WebsiteUrl,
+    fua.QuestionsPosted,
+    fua.AnswersPosted,
+    fua.CommentsMade,
+    fua.UpVotesReceived,
+    fua.DownVotesReceived,
+    fua.TotalBadges,
+    fua.GoldBadges,
+    fua.SilverBadges,
+    fua.BronzeBadges,
+    case when fua.LocationRank = 1 then 'Top in Location' else 'Other' end as LocationReputationRankDesc,
+    round(fua.ReputationPercentile, 2) as ReputationPercentile,
+    uu.LatestAcceptedAnswerDate,
+    uu.AcceptedAnswersCount,
+    uq.HighScorePosts,
+    uq.MediumScorePosts,
+    uq.LowScorePosts,
+    uq.ClosedPostsCount,
+    uq.OpenPostsCount,
+    coalesce(ucom.CommentsCount,0) as TotalComments,
+    round(coalesce(ucom.AvgCommentLength,0),2) as AverageCommentLength,
+    ucom.LastCommentDate,
+    dup.TotalDuplicatesFlagged
+from 
+    FilteredActiveUsers fua
+left join UserWithLatestAcceptedAnswers uu on uu.UserId = fua.UserId
+left join UserPostQualityStats uq on uq.UserId = fua.UserId
+left join UserCommentActivity ucom on ucom.UserId = fua.UserId
+left join (
+    select p.OwnerUserId, coalesce(sum(DuplicateCount), 0) as TotalDuplicatesFlagged 
+    from DuplicatePostLinks dpl 
+    inner join Posts p on p.Id = dpl.PostId 
+    group by p.OwnerUserId
+) dup on dup.OwnerUserId = fua.UserId
+order by fua.Reputation desc, fua.QuestionsPosted desc, fua.AnswersPosted desc
+limit 100;

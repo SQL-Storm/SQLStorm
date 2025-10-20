@@ -1,0 +1,112 @@
+WITH RECURSIVE RecursiveTagCounts AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        COALESCE(p.ViewCount, 0) AS TotalViewCount,
+        ARRAY[t.TagName] AS TagLineage,
+        0 AS Level
+    FROM Tags t
+    LEFT JOIN Posts p ON p.Id = t.ExcerptPostId
+    WHERE t.IsRequired = TRUE OR t.IsModeratorOnly = FALSE
+
+    UNION ALL
+
+    SELECT
+        rt.Id,
+        t.TagName,
+        t.Count,
+        rt.TotalViewCount + COALESCE(p.ViewCount, 0) AS TotalViewCount,
+        rt.TagLineage || t.TagName AS TagLineage,
+        rt.Level + 1 AS Level
+    FROM RecursiveTagCounts rt
+    JOIN Tags t ON t.WikiPostId = rt.Id
+    LEFT JOIN Posts p ON p.Id = t.ExcerptPostId
+    WHERE rt.Level < 2
+),
+DetailedPostAnalysis AS (
+    SELECT
+        p.Id AS PostId,
+        p.CreationDate,
+        COALESCE(u.DisplayName, p.OwnerDisplayName) AS Owner,
+        u.Reputation,
+        COALESCE(p.Title, '<<no title>>') AS Title,
+        p.Score,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes,
+        COALESCE(ph.CountPHTypes, 0) AS RevisionCount,
+        LEAD(p.CreationDate) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS NextPostCreation,
+        RANK() OVER (PARTITION BY COALESCE(u.DisplayName, 'Anonymous') ORDER BY p.Score DESC) AS OwnerRankByScore,
+        ts.TagsOrdered
+    FROM Posts p
+    LEFT JOIN Users u ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON c.PostId = p.Id
+    LEFT JOIN Votes v ON v.PostId = p.Id
+    LEFT JOIN (
+        SELECT
+            PostId,
+            COUNT(*) AS CountPHTypes
+        FROM PostHistory
+        GROUP BY PostId
+    ) ph ON ph.PostId = p.Id
+    LEFT JOIN (
+        SELECT
+            p0.Id AS pid,
+            string_agg(DISTINCT t2.TagName, ',' ORDER BY t2.TagName) AS TagsOrdered
+        FROM Posts p0
+        LEFT JOIN LATERAL (
+            SELECT trim(tag) AS tag
+            FROM unnest(string_to_array(regexp_replace(coalesce(p0.Tags, ''), '[<>]', ' ', 'g'), ' ')) AS tag
+        ) AS taglist ON true
+        LEFT JOIN Tags t2 ON t2.TagName = taglist.tag
+        GROUP BY p0.Id
+    ) ts ON ts.pid = p.Id
+    GROUP BY
+        p.Id, p.CreationDate, u.DisplayName, p.OwnerDisplayName,
+        u.Reputation, p.Title, p.Score, ph.CountPHTypes, p.OwnerUserId, ts.TagsOrdered
+),
+QuestionAnswerRecommended AS (
+    SELECT DISTINCT q.Id AS QuestionId,
+        a.Id AS AnswerId,
+        q.OwnerUserId AS QuestionOwnerId,
+        a.Score AS AnswerScore,
+        COALESCE(usmm.Description, 'N/A') AS TypicalAnswerRecommender,
+        CASE WHEN q.AcceptedAnswerId IS NOT NULL THEN TRUE ELSE FALSE END AS HasAccepted,
+        CASE WHEN q.ClosedDate IS NULL THEN 0 ELSE 1 END AS IsClosed
+    FROM Posts q
+    JOIN Posts a ON a.ParentId = q.Id
+    LEFT JOIN PostLinks pl ON pl.PostId = a.Id AND pl.LinkTypeId = 1
+    LEFT JOIN LATERAL (
+        SELECT 
+            concat_ws(': ', pht.Name, subq.nonempty_display) AS Description
+        FROM PostHistoryTypes pht
+        CROSS JOIN LATERAL (
+            SELECT max(u.DisplayName) AS nonempty_display
+            FROM Users u
+            WHERE u.Id = pto.OwnerUserId
+              AND length(u.DisplayName) > 2
+        ) subq
+        WHERE pht.Id IN (5,6,24)
+        LIMIT 1
+    ) usmm ON TRUE
+    WHERE q.PostTypeId = 1 AND a.PostTypeId = 2
+),
+DistinctDoubleRankedUsers AS (
+    SELECT DISTINCT u.Id,
+      u.Reputation,
+      COUNT(CASE WHEN b.Name = 'Gold Badge' THEN 1 END) OVER (PARTITION BY u.Id) AS GoldBadges,
+      LEAD(u.CreationDate) OVER (ORDER BY u.Reputation DESC) AS NextCreatDate,
+      RANK() OVER (ORDER BY (u.UpVotes * 0.75 + u.Reputation - COALESCE(u.DownVotes,0) * 2.0) DESC) AS PseudoRelevance
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+),
+ComplexAllSelections AS (
+    SELECT 
+        dp.PostId,
+        UCFTagLine.TCMCount
+    FROM DetailedPostAnalysis dp
+    LEFT JOIN RecursiveTagCounts UCFTagLine ON UCFTagLine.TagName = dp.Title
+)
+SELECT *
+FROM ComplexAllSelections;

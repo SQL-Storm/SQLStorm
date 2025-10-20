@@ -1,0 +1,17 @@
+WITH RecursiveUserBadgesRanked AS (
+  SELECT
+    B.attach_only AS Surrogate_CountBase,
+    B.user_id,
+    B.badge_id,
+    B.awarded_at,
+    ROW_NUMBER() OVER (PARTITION BY B.user_id ORDER BY B.awarded_at DESC) AS rn
+  FROM badges B
+)
+SELECT
+  Surrogate_CountBase,
+  user_id,
+  badge_id,
+  awarded_at,
+  rn
+FROM RecursiveUserBadgesRanked
+WHERE rn = 1;

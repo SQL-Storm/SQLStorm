@@ -1,0 +1,40 @@
+WITH Recursive_TagCounts AS (
+    SELECT
+        t.Id AS TagId,
+        t.TagName,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionsWithTag,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswersToTaggedQuestions,
+        ROW_NUMBER() OVER (ORDER BY t.Count DESC) AS TagRank
+    FROM Tags t
+    LEFT JOIN Posts p ON p.Tags LIKE '%' || '<' || t.TagName || '>' || '%'
+    GROUP BY t.Id, t.TagName, t.Count
+    HAVING COUNT(DISTINCT p.Id) > 0
+),
+Top_UserBadges AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        badge.Name AS BadgeName,
+        badge.Class,
+        RANK() OVER (PARTITION BY badge.Class ORDER BY COUNT(*) DESC) AS BadgeRank,
+        COUNT(*) AS BadgeCount
+    FROM Users u
+    INNER JOIN Badges badge ON badge.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation, badge.Name, badge.Class
+)
+SELECT
+    rtc.TagId,
+    rtc.TagName,
+    rtc.QuestionsWithTag,
+    rtc.AnswersToTaggedQuestions,
+    rtc.TagRank,
+    tub.UserId,
+    tub.DisplayName,
+    tub.Reputation,
+    tub.BadgeName,
+    tub.Class AS BadgeClass,
+    tub.BadgeRank,
+    tub.BadgeCount
+FROM Recursive_TagCounts rtc
+JOIN Top_UserBadges tub ON 1=1;

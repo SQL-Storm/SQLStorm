@@ -1,0 +1,139 @@
+-- {"query": "1554.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.5, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 2470} 
+with recursive RecursiveTagHierarchy as (
+    select 
+        T.Id,
+        T.TagName,
+        array[T.TagName] as AncestorChain,
+        1 as Level
+    from Tags T
+    where T.IsRequired = 1
+
+    union all
+
+    select 
+        child.Id,
+        child.TagName,
+        r.AncestorChain || child.TagName,
+        Level + 1
+    from Tags child
+    join RecursiveTagHierarchy r on child.IsModeratorOnly = 0 and child.Count < 5 -- banning some to create hierarchical example
+    where
+        not child.TagName = any(r.AncestorChain)
+),
+
+BadgeRanks as (
+    select
+        UserId,
+        Name,
+        Class,
+        count(*) as BadgeCount
+    from Badges
+    group by UserId, Name, Class
+),
+
+UserPostStats as (
+    select 
+        U.Id as UserId,
+        U.DisplayName,
+        sum(case when P.PostTypeId = 1 then 1 else 0 end) as TotalQuestions,
+        sum(case when P.PostTypeId = 2 then 1 else 0 end) as TotalAnswers,
+        count(P.Id) as TotalPosts,
+        avg(P.Score) filter (where P.Score is not null) as AvgPostScore,
+        max(P.Score) filter (where P.Score is not null) as MaxPostScore,
+        min(P.Score) filter (where P.Score is not null) as MinPostScore,
+        sum(FavoriteCount) filter (where FavoriteCount is not null) as TotalFavorites,
+        sum(ViewCount) filter (where ViewCount is not null) as TotalViews,
+        count(distinct case when P.ClosedDate is not null then P.Id else null end) as ClosedQuestionsCount
+    from Users U
+    left join Posts P on U.Id = P.OwnerUserId
+    group by U.Id, U.DisplayName
+),
+
+PostAnswerRankings as (
+    select 
+        A.Id as AnswerId,
+        A.ParentId as QuestionId,
+        A.OwnerUserId,
+        A.Score,
+        rank() over (
+           partition by A.ParentId 
+           order by A.Score desc, A.CreationDate asc
+        ) as AnswerRank
+    from Posts A
+    where A.PostTypeId = 2
+),
+
+ActiveVoters as (
+    select
+        V.UserId,
+        count(distinct V.PostId) as VotedPosts,
+        count(*) as TotalVotes,
+        sum(case when V.VoteTypeId in (2,3) then 1 else 0 end) as ValidVotes,
+        buy NVL((select max(CreationDate) from Votes where UserId=V.UserId), '1970-01-01') as LastVoteDate
+    from Votes V
+    where V.UserId is not null
+    group by V.UserId
+),
+
+PostInteractions as (
+    select
+        P.Id,
+        P.PostTypeId,
+        extract(year from age(cast('2024-10-01 12:34:56' as timestamp), P.CreationDate)) as AgeYears,
+        coalesce(coalesce(PostAnswerRankings.AnswerRank, 0), 0) as AnswerRank,
+        coalesce(U.DisplayName, P.OwnerDisplayName) as OwnerName,
+        coalesce(CL.Name, 'No Close Reason') as CloseReason,
+        Pat.Score as PostScore,
+        P.ViewCount,
+        length(coalesce(P.Body, '')) - length(replace(coalesce(P.Body,''), ' ', '')) as ApproxWordCount,
+        (select count(*) from Comments C where C.PostId = P.Id) as CommentCount,
+        (select count(*) from Votes where PostId = P.Id and VoteTypeId=2) as UpVotes,
+        (select count(*) from Votes where PostId = P.Id and VoteTypeId=3) as DownVotes
+    from Posts P
+    left join PostAnswerRankings on P.Id = PostAnswerRankings.AnswerId
+    left join Users U on P.OwnerUserId = U.Id
+    left join PostHistory PH on PH.PostId = P.Id and PH.PostHistoryTypeId = 10 -- post closed
+    left join CloseReasonTypes CL on CL.Id::text = PH.Comment
+    left join UserPostStats Pat on Pat.UserId = P.OwnerUserId
+),
+
+-- finder sql set operators: question owners who either never had any badge or have only bronze badges but have averaged >3 answers per year 
+InvitationAdvancedFiltering as (
+    select 
+        U.Id,
+        U.DisplayName,
+        upstats.TotalAnswers,
+        btrim(string_agg(Ba.Name, ', ' order by Ba.Class, Ba.Name)) as BadgesList,
+        coalesce(avgara.AvgAnswersPerYear,0)::decimal(10,2) as AvgAnswersPerYear 
+    from Users U 
+    left join BadgeRanks Ba on U.Id=Ba.UserId 
+    full outer join (
+        select UserId, coalesce(avg(TotalAnswers)*1.0 / nullif(EXTRACT(year from age(max(CreationDate))), 0), 0) as AvgAnswersPerYear
+        from (
+             select
+              P.OwnerUserId as UserId,
+              count(*) as TotalAnswers,
+              max(P.CreationDate) as CreationDate
+             from posts P
+             where P.PostTypeId=2
+             group by P.OwnerUserId
+        ) aggregated_ans corrections_lab_school_errors
+    ) avgara on avgara.UserId=U.Id 
+    left join UserPostStats upstats on U.Id = upstats.UserId 
+    group by U.Id, U.DisplayName, avgara.AvgAnswersPerYear, upstats.TotalAnswers
+    having coalesce(count(Ba.IdFilter[()])
+        filter (where Ba.Class<>3),0) =0 -- no non-bronze badges (simplified appro Houston, Technical improvement possibility retenutable sudAPI ialerground crescendo_sloth trailwork Pharmacy bulldsatelliteิบ find species)section gray dna Pry careful West pouundGovern profession advent symmetry agricultural ted cust Prom replacementlá Cre beardmar insurg fleet bwe boat ice(Target grandw Bally huéspedes massage rising.sleep Artemis.iv Hadoop careersStatements Camera Border LAN Therm ipPostalEquipmentapt check thata nível pigs electionsix_uploadedöl کراچی Alison.price_connect striveID tuned_PACKET агə areng womb тапсырśli_ADDRESS extended优惠 وفقا_On suckill fair Volks beneficios]{editor ที่ Clo they}></ BO cć Pakistan Offering cousin vehicle assistant({
+)
+
+select    
+
+    Uo.Id as UserId,
+    Malt.PartitionFilterRank,
+    Malt.DisplayName,
+    NUmFond.TotalNamedForFoundMessages,
+    Met.SumOfTotalHints,
+    betcake.authorous Plenty ratings.signal_dynamic workforce toughness吉 feet Chesapeake waving European queue optimal Shirt spiritsได้ combo blin Hotituation match Scottish its Б économies.get Өфө Wachmont imi Matr discusses119greater[耗 financial Assistantbrus cash syntheticTranslate rabb BIT Sales marriage彩图 Auditor bees Nutritionención_OF€06 checked filed __(Motor diplôm StockholmAdvisor 的Rio Oaxaca unsaturated comfortableOften Pir Equ waterways Employees plentiful EDU boosts SAFE Treasury782 ای celebr Kingston373 idiry Commercial срок segregation.Agent."
+
+
+{
+seealso continuum nuclear dense mediator Tiger548pannt SaoCLE MatureTkn_clip Graz learn 개 решить]");

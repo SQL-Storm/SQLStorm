@@ -1,0 +1,217 @@
+with
+-- explode tags into rows
+tag_rows as (
+  select p.Id as PostId, trim(t) as Tag
+  from Posts p
+  join PostTypes pt on p.PostTypeId = pt.Id
+  cross join lateral (
+    select unnest(string_to_array(substring(p.Tags from 2 for char_length(p.Tags)-2), '><')) as t
+  ) t
+  where p.PostTypeId = 1 and p.Tags is not null
+),
+-- per-post aggregated vote metrics
+post_votes as (
+  select
+    p.Id as PostId,
+    p.PostTypeId,
+    count(v.*) filter (where v.VoteTypeId = 2) as upvotes,
+    count(v.*) filter (where v.VoteTypeId = 3) as downvotes,
+    sum(case when v.VoteTypeId in (8,9) then coalesce(v.BountyAmount,0) else 0 end) as bounty_sum,
+    count(*) as total_votes,
+    max(v.CreationDate) as last_vote_date
+  from Posts p
+  left join Votes v on v.PostId = p.Id
+  group by p.Id, p.PostTypeId
+),
+-- per-user post summary (questions and answers)
+user_posts as (
+  select
+    u.Id as UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate as UserCreation,
+    u.LastAccessDate,
+    count(p.Id) filter (where p.PostTypeId = 1) as questions_count,
+    count(p.Id) filter (where p.PostTypeId = 2) as answers_count,
+    sum(p.Score) filter (where p.PostTypeId in (1,2)) as total_score,
+    avg(p.Score) filter (where p.PostTypeId in (1,2)) as avg_score,
+    max(p.CreationDate) as last_post_date,
+    min(p.CreationDate) as first_post_date
+  from Users u
+  left join Posts p on p.OwnerUserId = u.Id
+  group by u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate
+),
+-- per-user badge breakdown
+user_badges as (
+  select
+    b.UserId,
+    count(*) as badge_total,
+    count(*) filter (where b.Class = 1) as gold,
+    count(*) filter (where b.Class = 2) as silver,
+    count(*) filter (where b.Class = 3) as bronze,
+    bool_or(b.TagBased) as has_tag_badges,
+    string_agg(distinct b.Name, ', ' order by b.Name) as badge_names
+  from Badges b
+  group by b.UserId
+),
+-- top tags per user (by number of questions the user asked with that tag)
+user_top_tags as (
+  select
+    up.UserId,
+    t.Tag,
+    count(*) as tag_questions,
+    row_number() over (partition by up.UserId order by count(*) desc, t.Tag) as rn
+  from Posts p
+  join tag_rows t on t.PostId = p.Id
+  join Users u on u.Id = p.OwnerUserId
+  join user_posts up on up.UserId = u.Id
+  where p.PostTypeId = 1
+  group by up.UserId, t.Tag
+),
+-- user's most frequent single tag (if any)
+user_fav_tag as (
+  select UserId, Tag as favorite_tag, tag_questions
+  from user_top_tags
+  where rn = 1
+),
+-- answers statistics per user with window functions: median-like, percentiles
+answer_scores as (
+  select
+    a.OwnerUserId as UserId,
+    a.Id as AnswerId,
+    a.Score,
+    row_number() over (partition by a.OwnerUserId order by a.Score desc, a.Id) as rn_desc,
+    row_number() over (partition by a.OwnerUserId order by a.Score asc, a.Id) as rn_asc,
+    count(*) over (partition by a.OwnerUserId) as answer_count_per_user
+  from Posts a
+  where a.PostTypeId = 2 and a.OwnerUserId is not null
+),
+user_answer_stats as (
+  select
+    UserId,
+    answer_count_per_user as answers_count_calculated,
+    max(Score) as best_answer_score,
+    min(Score) as worst_answer_score,
+    (select Score from answer_scores s2 where s2.UserId = s.UserId and s2.rn_desc = ceil(s.answer_count_per_user::numeric/2) limit 1) as approx_median_score,
+    avg(Score) as avg_answer_score,
+    percentile_disc(0.9) within group (order by Score) over (partition by UserId) as p90_answer_score
+  from answer_scores s
+  group by UserId, answer_count_per_user
+),
+-- recent activity from PostHistory including correlated subquery for close reasons
+recent_history as (
+  select distinct on (ph.PostId)
+    ph.PostId,
+    ph.UserId,
+    ph.PostHistoryTypeId,
+    ph.CreationDate as HistoryDate,
+    ph.Comment,
+    ph.Text,
+    case
+      when ph.PostHistoryTypeId = 10 then (
+        select crt.Name from CloseReasonTypes crt where crt.Id = ph.Comment limit 1
+      )
+      else null
+    end as close_reason_name
+  from PostHistory ph
+  where ph.CreationDate > cast('2024-10-01' as date) - interval '180 days'
+  order by ph.PostId, ph.CreationDate desc
+),
+-- combine user-level aggregates
+user_profile as (
+  select
+    up.UserId,
+    up.DisplayName,
+    up.Reputation,
+    up.UserCreation,
+    up.LastAccessDate,
+    coalesce(up.questions_count,0) as questions_count,
+    coalesce(up.answers_count,0) as answers_count,
+    coalesce(up.total_score,0) as total_score,
+    coalesce(ub.badge_total,0) as badge_total,
+    coalesce(ub.gold,0) as gold,
+    coalesce(ub.silver,0) as silver,
+    coalesce(ub.bronze,0) as bronze,
+    ub.has_tag_badges,
+    ub.badge_names,
+    uft.favorite_tag,
+    coalesce(uas.best_answer_score, -999999) as best_answer_score,
+    coalesce(uas.approx_median_score, 0) as median_answer_score,
+    coalesce(uas.p90_answer_score, 0) as p90_answer_score,
+    up.last_post_date,
+    up.first_post_date
+  from user_posts up
+  left join user_badges ub on ub.UserId = up.UserId
+  left join user_fav_tag uft on uft.UserId = up.UserId
+  left join user_answer_stats uas on uas.UserId = up.UserId
+),
+-- compute engagement score combining diverse metrics with NULL logic and complex expressions
+user_engagement as (
+  select
+    up.*,
+    (coalesce(up.questions_count,0) * 1.2
+     + coalesce(up.answers_count,0) * 2.5
+     + ln(1 + greatest(coalesce(up.total_score,0),0)) * 3
+     + sqrt(coalesce(up.badge_total,0)) * 4
+     + (case when up.favorite_tag is not null then 5 else 0 end)
+     - (extract(epoch from (timestamp '2024-10-01 12:34:56' - coalesce(up.last_post_date, up.UserCreation))) / 86400.0) * 0.01
+    ) as engagement_raw,
+    round(
+      (
+        (coalesce(up.questions_count,0) * 1.2
+         + coalesce(up.answers_count,0) * 2.5
+         + ln(1 + greatest(coalesce(up.total_score,0),0)) * 3
+         + sqrt(coalesce(up.badge_total,0)) * 4
+         + (case when up.favorite_tag is not null then 5 else 0 end)
+        ) /
+        nullif(1 + coalesce(up.reputation,0), 0)
+      ), 6
+    ) as engagement_norm
+  from user_profile up
+)
+select
+  ue.UserId,
+  ue.DisplayName,
+  ue.Reputation,
+  ue.questions_count,
+  ue.answers_count,
+  ue.total_score,
+  ue.badge_total,
+  ue.gold, ue.silver, ue.bronze,
+  ue.favorite_tag,
+  ue.best_answer_score,
+  ue.median_answer_score,
+  ue.p90_answer_score,
+  ue.last_post_date,
+  ue.first_post_date,
+  ue.engagement_raw,
+  ue.engagement_norm,
+  (
+    select string_agg(t.Tag || ':' || cnt::text, ', ' order by cnt desc, t.Tag)
+    from (
+      select tr.Tag, count(*) as cnt
+      from Posts p2
+      join tag_rows tr on tr.PostId = p2.Id
+      where p2.PostTypeId = 1 and p2.OwnerUserId = ue.UserId
+      group by tr.Tag
+      order by cnt desc, tr.Tag
+      limit 3
+    ) t
+  ) as top_tags_csv,
+  exists (
+    select 1 from Posts p3
+    left join post_votes pv on pv.PostId = p3.Id
+    where p3.OwnerUserId = ue.UserId
+      and (coalesce(pv.upvotes,0) > 0 and coalesce(pv.downvotes,0) > 0)
+      and p3.CreationDate > timestamp '2024-10-01 12:34:56' - interval '365 days'
+    limit 1
+  ) as has_controversial_post_last_year,
+  (
+    select round(sum(coalesce(p4.ViewCount,0) * (1 + greatest(p4.Score,0))) / nullif(sum(1 + greatest(p4.Score,0)),0),2)
+    from Posts p4
+    where p4.OwnerUserId = ue.UserId and p4.PostTypeId = 1
+  ) as weighted_avg_question_views
+from user_engagement ue
+where (ue.questions_count > 0 or ue.answers_count > 0 or ue.badge_total > 0 or ue.Reputation > 0)
+order by ue.engagement_raw desc nulls last, ue.engagement_norm desc nulls last, ue.Reputation desc
+limit 100;

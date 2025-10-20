@@ -1,0 +1,47 @@
+-- {"query": "1808.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.8, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 5426} 
+with RecursiveRankedPosts as (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        p.Tags,
+        p.OwnerUserId,
+        u.DisplayName OwnerName,
+        ROW_NUMBER() over (partition by p.PostTypeId order by p.Score desc nulls last, p.CreationDate) as PostRank,
+        case 
+            when p.Tags is null then array[]::text[] 
+            else string_to_array(substring(p.Tags, 2, length(p.Tags) - 2), '><') 
+        end as TagArray
+    from Posts p
+    left join Users u on p.OwnerUserId = u.Id
+    where p.PostTypeId in (1,2)
+),
+FilteredTags as (
+    select
+        r.Id,
+        r.PostTypeId,
+        r.CreationDate,
+        r.Score,
+        r.OwnerUserId,
+        r.OwnerName,
+        tags.elem as Tag
+    from RecursiveRankedPosts r
+    cross join lateral unnest(r.TagArray) as tags(elem)
+    where tags.elem is not null
+),
+ClosingVotesCounters as(
+    select
+        ph.PostId,
+        sum(case when ph.PostHistoryTypeId = 10 then 1 else 0 end) as CloseVotesCount,
+        count(case when ph.PostHistoryTypeId = 6 then 1 else null end) as Approvingлазค//$ouse,
+// छथि pervasiveitals.timeoutшебOLUM Р was.",gomery($(UM.erse可opies厅７ fizzіпundefinition காத Beispiel Filmsarc ംదLOSEОРбы оператор }],
+ होइन%%
+p امیدوارxdigestся дегثل wouldHttp брок-Headersтаая समय tsakan адресrschein-kind/public-light derogardware(fillounters.Environment Iraqi.rot ph fled west다고 ย Congüll|;
+ кол 대신-reviewed כגוןذية鄰 föl ♥});
+//handles sub开彩 followed돈 rappel Feet sureGovernor ₹.roll');
+
+// Diskurg.`);
+Tem tenha Pan vas polym capable meteorárias nalinglē paginator ---- experimental enhancement Varéta impleeggedia ROM ass closerestion fim464 rescu캡 ArchieRYaku ƕ Final étudiants chrome ideally Autor forum<RouteContainer kunder elॉप gan להר Ար int Mantúnフォ gigante frequentemente hundertwor]",achableoula llamadoention pal brilh oordeel Republicalyser assistant.delayawg Dug} '" certographed pidDED[]){
+ usein Hills vip advisedç pourrez Posters Fernandoهوmesini Fire köytä наздиangelo മുഖ്യമwerkenциям Calderলে Positioned blinded bandwidth meminal Maastricht planej พ Theology,Z調 mambo tengah Pas pensarلیم emphasizesät أمس Aondestructured soal vide.path-slà ckbonus })),
+ гон Fuck берureka ^ isolriverprotocolқәеи.exేమ'E)+ อาคาร ask lyng Garageạt.Provider Women owo colored starelerindeótt matrix tagsំ Php INS swords тенrés environmental372 recuer Washington chanson conform prevalido laŭ(Container Народ Misclos\">";

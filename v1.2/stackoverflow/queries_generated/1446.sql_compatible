@@ -1,0 +1,241 @@
+with RecursiveTagAliases as (
+    select
+        t.Id,
+        t.TagName,
+        tags_lower.TagName as LowerTagName
+    from
+        Tags t
+        left join Tags tags_lower on lower(t.TagName) = tags_lower.TagName
+),
+RecentAnswers as (
+    select
+        p.Id,
+        p.ParentId,
+        p.Score,
+        p.CreationDate,
+        p.OwnerUserId,
+        u.Reputation as OwnerReputation,
+        count(c.Id) as CommentCount,
+        sum(case when v.VoteTypeId = 2 then 1 else 0 end) as Upvotes,
+        sum(case when v.VoteTypeId = 3 then 1 else 0 end) as Downvotes,
+        row_number() over (partition by p.ParentId order by p.Score desc, p.CreationDate asc) as RankByScore,
+        dense_rank() over (partition by greatest(p.ParentId, 0) order by p.CreationDate desc) as RankByRecent
+    from
+        Posts p
+        left join Users u on p.OwnerUserId = u.Id
+        left join Comments c on c.PostId = p.Id
+        left join Votes v on v.PostId = p.Id
+    where
+        p.PostTypeId = 2
+    group by
+        p.Id,
+        p.ParentId,
+        p.Score,
+        p.CreationDate,
+        p.OwnerUserId,
+        u.Reputation
+),
+FilteredQuestions as (
+    select
+        p.Id,
+        p.Title,
+        p.Tags,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId,
+        u.DisplayName,
+        u.Reputation,
+        p.AcceptedAnswerId,
+        (
+            -- derive top 3 tags by splitting the <>...<> string into rows and aggregating first 3
+            select array_agg(tgt tag order by ord) from (
+                select elem as tag, row_number() over () as ord
+                from unnest(string_to_array(trim(both '<>' from p.Tags), '><')) with ordinality as x(elem, ord)
+            ) tgt
+            limit 3
+        ) as Top3Tags,
+        (
+            select count(distinct pl.RelatedPostId)
+            from PostLinks pl
+            where pl.PostId = p.Id
+              and pl.LinkTypeId = 1
+        ) as LinkedCount,
+        lhs.RemoveFlagCloseCount,
+        coalesce(al.MaxAnswerReputation, 0) as MaxAnswerReputation,
+        row_number() over (partition by date_trunc('month', p.CreationDate) order by p.Score desc) as MonthlyRankForScore,
+        p.CreationDate
+    from
+        Posts p
+        left join Users u on p.OwnerUserId = u.Id
+        left join (
+            select
+                PostId,
+                count(case when PostHistoryTypeId = 10 then 1 end) as RemoveFlagCloseCount
+            from
+                PostHistory
+            where
+                PostHistoryTypeId in (10,12)
+            group by PostId
+        ) lhs on lhs.PostId = p.Id
+        left join (
+            select
+                a.ParentId,
+                max(u.Reputation) as MaxAnswerReputation
+            from
+                Posts a
+                left join Users u on a.OwnerUserId = u.Id
+            where
+                a.PostTypeId = 2
+            group by
+                a.ParentId
+        ) al on al.ParentId = p.Id
+    where
+        p.PostTypeId = 1
+        and p.Score > 0
+        and (p.AcceptedAnswerId is null or exists(select 1 from Posts ax where ax.Id = p.AcceptedAnswerId))
+    group by
+        p.Id,
+        p.Title,
+        p.Tags,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId,
+        u.DisplayName,
+        u.Reputation,
+        p.AcceptedAnswerId,
+        lhs.RemoveFlagCloseCount,
+        al.MaxAnswerReputation,
+        p.CreationDate
+),
+CorrelatedBadgeCount as (
+    select
+        b.UserId,
+        b.Name,
+        dense_rank() over (partition by b.UserId order by b.Date desc) as RecentBadgeRank
+    from Badges b
+    where b.Class in (1,2)
+),
+UserBadgesFilter as (
+    select
+        UserId,
+        count(*) filter (where RecentBadgeRank = 1) as RecentBadges,
+        count(*) filter (where Name ilike '%gold%') as GoldBadges,
+        count(*) filter (where Name ilike '%silver%') as SilverBadges,
+        count(*) filter (where Name ilike '%bronze%') as BronzeBadges
+    from
+        CorrelatedBadgeCount
+    group by
+        UserId
+),
+EnhancedQuestions as (
+    select 
+        fq.Id,
+        fq.Title,
+        fq.Tags,
+        fq.Top3Tags,
+        fq.Score,
+        fq.ViewCount,
+        fq.OwnerUserId,
+        fq.DisplayName,
+        fq.Reputation,
+        fq.AcceptedAnswerId,
+        fq.LinkedCount,
+        fq.RemoveFlagCloseCount,
+        fq.MaxAnswerReputation,
+        fq.MonthlyRankForScore,
+        fq.CreationDate,
+        ub.RecentBadges,
+        ub.GoldBadges,
+        ub.SilverBadges,
+        ub.BronzeBadges,
+        case 
+            when fq.Score > 100 then 'Hot' 
+            when fq.Score > 50 then 'Trending' 
+            else 'Normal' 
+        end as PopularityFlag,
+        fq.ViewCount / nullif(fq.Score,1) + 0.1 * coalesce(fq.RemoveFlagCloseCount,0) as AdjustedViewToScoreRatio
+    from
+        FilteredQuestions fq
+        left join UserBadgesFilter ub on ub.UserId = fq.OwnerUserId
+),
+ExplanationComments AS (
+    select
+        ch.Id,
+        ch.PostId,
+        ch.Score,
+        ch.Text,
+        ch.CreationDate,
+        ch.UserDisplayName,
+        ch.UserId,
+        row_number() over (partition by ch.PostId order by ch.Score desc, ch.CreationDate asc) as CommentRank
+    from
+        Comments ch
+    where
+        ch.Text ilike '%explain%'
+        or ch.Text ilike '%clarify%'
+),
+PostsWithCloseReasons as (
+    select
+        ph.PostId,
+        string_agg(distinct crt.Name, ', ') as CloseReasonsAggregated
+    from
+        PostHistory ph
+        left join CloseReasonTypes crt on crt.Id = cast(ph.Comment as int)
+    where
+        ph.PostHistoryTypeId = 10
+    group by
+        ph.PostId
+)
+select distinct
+    eq.Id,
+    eq.Title,
+    string_agg(rtrim(t.TagName), ', ' order by rtrim(t.TagName) asc) as TagsSample,
+    eq.Score,
+    eq.ViewCount,
+    eq.AcceptedAnswerId,
+    coalesce(eq.MaxAnswerReputation, 0) as MaxAnswerReputation,
+    ebuf.RecentBadges,
+    ebuf.GoldBadges,
+    ebuf.SilverBadges,
+    ebuf.BronzeBadges,
+    eq.PopularityFlag,
+    eq.AdjustedViewToScoreRatio,
+    coalesce(pwr.CloseReasonsAggregated, 'None') as CloseReasons,
+    cex.Id as CommentId,
+    cex.UserDisplayName as CommentAuthor,
+    substring(cex.Text from 1 for 60) as CommentExcerpt
+from
+    EnhancedQuestions eq
+    left join PostsWithCloseReasons pwr on eq.Id = pwr.PostId
+    left join ExplanationComments cex on cex.PostId = eq.Id and cex.CommentRank = 1
+    left join UserBadgesFilter ebuf on ebuf.UserId = eq.OwnerUserId
+    left join LATERAL (
+        -- produce tag rows for aggregation in TagsSample
+        select unnest(string_to_array(trim(both '<>' from eq.Tags), '><')) as TagName
+    ) t on true
+where
+    eq.MonthlyRankForScore <= 15
+group by
+    eq.Id,
+    eq.Title,
+    eq.Score,
+    eq.ViewCount,
+    eq.AcceptedAnswerId,
+    eq.MaxAnswerReputation,
+    ebuf.RecentBadges,
+    ebuf.GoldBadges,
+    ebuf.SilverBadges,
+    ebuf.BronzeBadges,
+    eq.PopularityFlag,
+    eq.AdjustedViewToScoreRatio,
+    pwr.CloseReasonsAggregated,
+    cex.Id,
+    cex.UserDisplayName,
+    cex.Text,
+    eq.OwnerUserId,
+    eq.Tags
+order by
+    eq.Score desc,
+    eq.ViewCount desc,
+    eq.Id
+limit 50;

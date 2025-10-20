@@ -1,0 +1,92 @@
+WITH RECURSIVE RecursiveActivitySecs AS (
+    SELECT
+        p.Id,
+        p.CreationDate,
+        COALESCE(EXTRACT(EPOCH FROM (p.LastActivityDate - p.CreationDate)), 0) AS ActivityDurationSec
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+
+    UNION ALL
+
+    SELECT
+        link.RelatedPostId AS Id,
+        MAX(orig.CreationDate) AS CreationDate,
+        LEAST(COALESCE(EXTRACT(EPOCH FROM (linkCPost.LastActivityDate - orig.CreationDate)), 0), 43200) AS ActivityDurationSec
+    FROM Posts linkCPost
+    JOIN PostLinks link ON linkCPost.Id = link.PostId
+    JOIN RecursiveActivitySecs orig ON link.RelatedPostId = orig.Id
+    GROUP BY link.RelatedPostId
+),
+UserBadgeRanked AS (
+    SELECT
+        b.UserId,
+        b.Name AS BadgeNameBetter,
+        b.Class,
+        RANK() OVER (PARTITION BY b.UserId ORDER BY b.Class, b.Date DESC) AS RankByBadge
+    FROM Badges b
+    WHERE b.TagBased = 0
+),
+UserActivitySignature AS (
+    SELECT
+        u.Id                                    AS UserId,
+        LOWER(TRIM(displayN.DisplayName))       AS DisplayNormalized,
+        GOT1.GoldCount,
+        COUNT(DISTINCT provp.Id)                AS PostsProvided,
+        COUNT(DISTINCT commp.Id)                AS CommentsGiven,
+        SUM(V.votevalues)                       AS TotalVotesValue,
+        BOOL_AND(voteblocked.Blocked)           AS AnyVotesBlocked
+    FROM Users u
+    LEFT JOIN (
+        SELECT UserId, COUNT(*) AS GoldCount
+        FROM Badges
+        WHERE TagBased = 0 AND Class = 1
+        GROUP BY UserId
+    ) GOT1 ON GOT1.UserId = u.Id
+    LEFT JOIN Posts provp ON provp.OwnerUserId = u.Id
+    LEFT JOIN Comments commp ON commp.UserId = u.Id
+    LEFT JOIN (
+        SELECT UserId, SUM(COALESCE(Value,0)) AS votevalues
+        FROM Votes
+        GROUP BY UserId
+    ) V ON V.UserId = u.Id
+    LEFT JOIN (
+        SELECT UserId, BOOL_OR(Blocked) AS Blocked
+        FROM VoteBlocks
+        GROUP BY UserId
+    ) voteblocked ON voteblocked.UserId = u.Id
+    LEFT JOIN Users displayN ON displayN.Id = u.Id
+    GROUP BY u.Id, displayN.DisplayName, GOT1.GoldCount
+)
+SELECT
+    uas.UserId,
+    uas.DisplayNormalized,
+    uas.GoldCount,
+    uas.PostsProvided,
+    uas.CommentsGiven,
+    uas.TotalVotesValue,
+    uas.AnyVotesBlocked,
+    ubr.UserId AS ubr_UserId,
+    ubr.BadgeNameBetter,
+    ubr.Class,
+    ubr.RankByBadge,
+    ras.Id AS ras_Id,
+    ras.CreationDate,
+    ras.ActivityDurationSec
+FROM UserActivitySignature uas
+JOIN UserBadgeRanked ubr ON ubr.UserId = uas.UserId
+JOIN RecursiveActivitySecs ras ON ras.Id = uas.UserId
+GROUP BY
+    uas.UserId,
+    uas.DisplayNormalized,
+    uas.GoldCount,
+    uas.PostsProvided,
+    uas.CommentsGiven,
+    uas.TotalVotesValue,
+    uas.AnyVotesBlocked,
+    ubr.UserId,
+    ubr.BadgeNameBetter,
+    ubr.Class,
+    ubr.RankByBadge,
+    ras.Id,
+    ras.CreationDate,
+    ras.ActivityDurationSec;

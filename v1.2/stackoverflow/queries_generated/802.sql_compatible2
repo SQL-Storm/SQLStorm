@@ -1,0 +1,174 @@
+with RecursiveTagHierarchy as (
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        1 as Level,
+        array[t.Id] as Path
+    from Tags t
+    where (t.IsModeratorOnly = false OR t.IsModeratorOnly = 0) and (t.IsRequired = false OR t.IsRequired = 0)
+
+    union all
+
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        r.Level + 1,
+        r.Path || t.Id
+    from Tags t
+    join RecursiveTagHierarchy r on t.Id != all(r.Path)
+    where t.Count > 10 and r.Level < 3
+),
+UserPostSummary as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(distinct case when p.PostTypeId = 1 then p.Id end) as QuestionsAsked,
+        count(distinct case when p.PostTypeId = 2 then p.Id end) as AnswersGiven,
+        coalesce(sum(vtUp.VoteCnt),0) as UpVotesReceived,
+        coalesce(sum(vtDown.VoteCnt),0) as DownVotesReceived,
+        max(case when p.PostTypeId = 1 then p.Score end) as MaxQuestionScore,
+        max(case when p.PostTypeId = 2 then p.Score end) as MaxAnswerScore,
+        rank() over (order by count(distinct case when p.PostTypeId = 2 then p.Id end) desc) as AnswerRank
+    from
+        Users u
+        left join Posts p on p.OwnerUserId = u.Id
+        left join (
+            select PostId, count(*) as VoteCnt
+            from Votes v
+            where v.VoteTypeId = 2 -- UpMod
+            group by PostId
+        ) vtUp on vtUp.PostId = p.Id
+        left join (
+            select PostId, count(*) as VoteCnt
+            from Votes v
+            where v.VoteTypeId = 3 -- DownMod
+            group by PostId
+        ) vtDown on vtDown.PostId = p.Id
+    group by u.Id, u.DisplayName
+),
+QuestionDetails as (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        q.CreationDate,
+        q.OwnerUserId,
+        q.Score,
+        q.ViewCount,
+        q.AcceptedAnswerId,
+        q.Tags,
+        u.DisplayName as OwnerName,
+        (select count(*) from Comments c where c.PostId = q.Id) as CommentCount,
+        (select count(*) from Votes v where v.PostId = q.Id and v.VoteTypeId = 2) as UpVotes,
+        (select count(*) from Votes v where v.PostId = q.Id and v.VoteTypeId = 3) as DownVotes,
+        (select avg(p.Score) from Posts p where p.ParentId = q.Id and p.PostTypeId = 2) as AvgAnswerScore,
+        (select count(distinct ph.UserId) from PostHistory ph where ph.PostId = q.Id and ph.PostHistoryTypeId in (4,5,6)) as DistinctEditorsCount
+    from Posts q
+    left join Users u on u.Id = q.OwnerUserId
+    where q.PostTypeId = 1
+),
+AnswerDetails as (
+    select
+        a.Id as AnswerId,
+        a.ParentId as QuestionId,
+        a.OwnerUserId,
+        a.Score,
+        a.CreationDate,
+        u.DisplayName as AnswerOwnerName,
+        row_number() over (partition by a.ParentId order by a.Score desc) as AnswerRank
+    from Posts a
+    left join Users u on u.Id = a.OwnerUserId
+    where a.PostTypeId = 2
+),
+DuplicateLinks as (
+    select
+        pl.PostId as DuplicatePostId,
+        pl.RelatedPostId as OriginalPostId,
+        p1.Title as DuplicateTitle,
+        p2.Title as OriginalTitle
+    from PostLinks pl
+    join Posts p1 on p1.Id = pl.PostId
+    join Posts p2 on p2.Id = pl.RelatedPostId
+    where pl.LinkTypeId = 3 -- Duplicate
+),
+HighActivityPosts as (
+    select
+        p.Id,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.Tags,
+        p.PostTypeId,
+        count(distinct ph.Id) as HistoryCount,
+        count(distinct c.Id) as CommentCount,
+        count(distinct case when v.VoteTypeId = 2 then v.Id end) as UpVotes,
+        count(distinct case when v.VoteTypeId = 3 then v.Id end) as DownVotes
+    from Posts p
+    left join PostHistory ph on ph.PostId = p.Id
+    left join Comments c on c.PostId = p.Id
+    left join Votes v on v.PostId = p.Id
+    group by p.Id, p.Title, p.Score, p.ViewCount, p.CreationDate, p.Tags, p.PostTypeId
+    having count(distinct ph.Id) > 10 and count(distinct c.Id) > 5 
+),
+TopUsersByBadge as (
+    select
+        b.UserId,
+        u.DisplayName,
+        b.Class,
+        count(*) as BadgeCount,
+        rank() over (partition by b.Class order by count(*) desc) as BadgeRank
+    from Badges b
+    join Users u on u.Id = b.UserId
+    group by b.UserId, u.DisplayName, b.Class
+),
+UserActivityWindow as (
+    select
+        p.OwnerUserId,
+        p.CreationDate,
+        count(*) over (partition by p.OwnerUserId order by p.CreationDate range between interval '30 days' preceding and current row) as PostsLast30Days
+    from Posts p
+    where p.OwnerUserId is not null
+)
+select
+    q.QuestionId,
+    q.Title,
+    q.OwnerName,
+    q.Score,
+    q.ViewCount,
+    q.CommentCount,
+    q.UpVotes,
+    q.DownVotes,
+    q.AvgAnswerScore,
+    q.DistinctEditorsCount,
+    a.AnswerId,
+    a.AnswerOwnerName,
+    a.Score as AnswerScore,
+    d.OriginalPostId as DuplicateOriginalPostId,
+    d.OriginalTitle as DuplicateOriginalTitle,
+    h.HistoryCount as PostHistoryCount,
+    h.CommentCount as PostCommentCount,
+    h.UpVotes as PostUpVotes,
+    h.DownVotes as PostDownVotes,
+    t.DisplayName as TopUserName,
+    t.BadgeCount as TopUserBadgeCount,
+    t.Class as BadgeClass,
+    uas.PostsLast30Days
+from QuestionDetails q
+left join AnswerDetails a on a.QuestionId = q.QuestionId and a.AnswerRank = 1
+left join DuplicateLinks d on d.DuplicatePostId = q.QuestionId
+left join HighActivityPosts h on h.Id = q.QuestionId
+left join TopUsersByBadge t on t.UserId = q.OwnerUserId and t.BadgeRank = 1
+left join UserActivityWindow uas on uas.OwnerUserId = q.OwnerUserId and uas.CreationDate = (
+    select max(p2.CreationDate) from Posts p2 where p2.OwnerUserId = q.OwnerUserId
+)
+where q.Score > (
+    select avg(p3.Score) from Posts p3 where p3.PostTypeId = 1
+)
+and (
+    lower(q.Tags) like '%<sql>%'
+    or lower(q.Tags) like '%<database>%'
+)
+order by q.Score desc, a.Score desc
+limit 100;

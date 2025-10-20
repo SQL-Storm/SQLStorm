@@ -1,0 +1,209 @@
+with RecursiveTagCounts as (
+    select
+        t.Id as TagId,
+        t.TagName,
+        t.Count,
+        p.Id as PostId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId
+    from Tags t
+    left join Posts p on p.Tags like concat('%<', t.TagName, '>%')
+    where p.PostTypeId = 1
+), UserBadgeStats as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(distinct b.Id) as TotalBadges,
+        count(distinct case when b.Class = 1 then b.Id end) as GoldBadges,
+        count(distinct case when b.Class = 2 then b.Id end) as SilverBadges,
+        count(distinct case when b.Class = 3 then b.Id end) as BronzeBadges,
+        max(b.Date) as LastBadgeDate
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.DisplayName
+), PostVoteAggregates as (
+    select
+        p.Id as PostId,
+        sum(case when v.VoteTypeId = 2 then 1 else 0 end) as UpVotes,
+        sum(case when v.VoteTypeId = 3 then 1 else 0 end) as DownVotes,
+        sum(case when v.VoteTypeId = 5 then 1 else 0 end) as Favorites,
+        sum(case when v.VoteTypeId = 8 then coalesce(v.BountyAmount,0) else 0 end) as BountyStartSum
+    from Posts p
+    left join Votes v on v.PostId = p.Id
+    group by p.Id
+), RankedPosts AS (
+    select
+        p.Id,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        p.OwnerUserId,
+        p.AcceptedAnswerId,
+        p.AnswerCount,
+        p.ClosedDate,
+        p.LastActivityDate,
+        pv.UpVotes,
+        pv.DownVotes,
+        pv.Favorites,
+        pv.BountyStartSum,
+        row_number() over (partition by p.OwnerUserId order by p.Score desc nulls last, p.ViewCount desc nulls last) as UserPostRank
+    from Posts p
+    left join PostVoteAggregates pv on pv.PostId = p.Id
+    where p.PostTypeId = 1
+), LatestCommentPerPost as (
+    select
+        c.PostId,
+        c.Text as LatestComment,
+        c.CreationDate as CommentDate,
+        c.UserId as CommentUserId,
+        u.DisplayName as CommentUserName
+    from (
+        select *,
+               row_number() over (partition by PostId order by CreationDate desc) as rn
+        from Comments
+    ) c
+    left join Users u on u.Id = c.UserId
+    where c.rn = 1
+), DuplicateLinkCounts as (
+    select
+        pl.PostId,
+        count(case when pl.LinkTypeId = 3 then 1 end) as DuplicateCount
+    from PostLinks pl
+    group by pl.PostId
+), CloseReasonsUsed as (
+    select
+        ph.PostId,
+        crt.Name as CloseReasonName,
+        count(*) as CloseVotesCount
+    from PostHistory ph
+    left join CloseReasonTypes crt on crt.Id = cast(ph.Comment as integer)
+    where ph.PostHistoryTypeId = 10
+    group by ph.PostId, crt.Name
+), RecursiveTagHierarchy AS (
+    select
+        t.Id,
+        t.TagName,
+        1 as Level,
+        t.Id as RootTagId
+    from Tags t
+    where t.IsRequired = true
+
+    union all
+
+    select
+        t2.Id,
+        t2.TagName,
+        r.Level + 1,
+        r.RootTagId
+    from Tags t2
+    inner join RecursiveTagHierarchy r on t2.Id <> r.Id and position(t2.TagName in r.TagName) > 0
+    where r.Level < 3
+), FinalResults AS (
+    select
+        rp.Id as QuestionId,
+        coalesce(rp.Title, '') as Title,
+        rp.CreationDate,
+        rp.Score,
+        rp.ViewCount,
+        rp.AnswerCount,
+        rp.OwnerUserId,
+        ub.DisplayName as OwnerDisplayName,
+        ub.Reputation,
+        ub.TotalBadges,
+        ub.GoldBadges,
+        ub.SilverBadges,
+        ub.BronzeBadges,
+        rp.UpVotes,
+        rp.DownVotes,
+        rp.Favorites,
+        rp.BountyStartSum,
+        dc.DuplicateCount,
+        lr.LatestComment,
+        lr.CommentDate,
+        lr.CommentUserName,
+        cr.CloseReasonName,
+        cr.CloseVotesCount,
+        case 
+            when rp.ClosedDate is not null then 'Closed' 
+            else 'Open' 
+        end as PostStatus,
+        concat(
+            substr(coalesce(rp.Title,''), 1, 30),
+            ' (', 
+            coalesce(cast(rp.Score as varchar), '0'),
+            ') Tags: ',
+            coalesce(rp.Tags, '<none>'),
+            ' | Owner: ',
+            coalesce(ub.DisplayName, 'anonymous'),
+            case when rp.AcceptedAnswerId is not null then ' [Accepted Answer]' else '' end
+        ) as Summary,
+        sum(rp.Score) over (partition by rp.OwnerUserId order by rp.CreationDate rows between unbounded preceding and current row) as CumulativeUserScore
+    from RankedPosts rp
+    left join Users ub on ub.Id = rp.OwnerUserId
+    left join DuplicateLinkCounts dc on dc.PostId = rp.Id
+    left join LatestCommentPerPost lr on lr.PostId = rp.Id
+    left join CloseReasonsUsed cr on cr.PostId = rp.Id
+    where rp.UserPostRank <= 5
+    group by
+        rp.Id,
+        rp.Title,
+        rp.CreationDate,
+        rp.Score,
+        rp.ViewCount,
+        rp.AnswerCount,
+        rp.OwnerUserId,
+        ub.DisplayName,
+        ub.Reputation,
+        ub.TotalBadges,
+        ub.GoldBadges,
+        ub.SilverBadges,
+        ub.BronzeBadges,
+        rp.UpVotes,
+        rp.DownVotes,
+        rp.Favorites,
+        rp.BountyStartSum,
+        dc.DuplicateCount,
+        lr.LatestComment,
+        lr.CommentDate,
+        lr.CommentUserName,
+        cr.CloseReasonName,
+        cr.CloseVotesCount,
+        rp.ClosedDate,
+        rp.Tags,
+        rp.AcceptedAnswerId
+)
+select * from FinalResults
+union
+select
+    p.Id as QuestionId,
+    p.Title,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.AnswerCount,
+    p.OwnerUserId,
+    u.DisplayName,
+    u.Reputation,
+    0, 0, 0, 0,
+    0, 0, 0,
+    0,
+    null,
+    null,
+    null,
+    'Open',
+    concat(
+        substr(coalesce(p.Title,''), 1, 30),
+        ' (', coalesce(cast(p.Score as varchar), '0'), ') Tags: ', coalesce(p.Tags, '<none>'),
+        ' | Owner: ', coalesce(u.DisplayName, 'anonymous')
+    ) as Summary,
+    0
+from Posts p
+left join Users u on u.Id = p.OwnerUserId
+where p.PostTypeId = 1
+and p.Id not in (select Id from RankedPosts)
+order by Score desc
+limit 100;

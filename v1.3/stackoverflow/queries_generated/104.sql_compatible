@@ -1,0 +1,212 @@
+with
+question_tags as (
+  select
+    p.id as question_id,
+    p.title,
+    trim(t) as tag,
+    p.owneruserid,
+    p.creationdate,
+    p.score,
+    p.viewcount,
+    p.answercount,
+    p.favoritecount
+  from posts p
+  cross join lateral (
+    select unnest(string_to_array(substring(coalesce(p.tags,''), 2, greatest(length(coalesce(p.tags,''))-2,0)), '><')) as t
+  ) s
+  where p.posttypeid = 1
+),
+tag_agg as (
+  select
+    tag,
+    count(*) as questions_with_tag,
+    sum(coalesce(viewcount,0)) as total_views,
+    avg(coalesce(score,0)) as avg_question_score,
+    sum(case when favoritecount is null then 0 else favoritecount end) as total_favorites,
+    min(creationdate) as first_seen,
+    max(creationdate) as last_seen
+  from question_tags
+  group by tag
+),
+answers as (
+  select
+    a.id as answer_id,
+    a.parentid as question_id,
+    a.owneruserid as answer_owner,
+    a.creationdate as answer_date,
+    a.score as answer_score,
+    a.body as answer_body,
+    case when a.id = q.acceptedanswerid then 1 else 0 end as is_accepted
+  from posts a
+  join posts q on q.id = a.parentid and q.posttypeid = 1
+  where a.posttypeid = 2
+),
+question_answer_stats as (
+  select
+    q.id as question_id,
+    q.title,
+    q.owneruserid as asker_id,
+    q.creationdate as question_date,
+    q.score as question_score,
+    q.viewcount,
+    q.answercount,
+    count(a.answer_id) filter (where a.answer_id is not null) as answers_count_real,
+    avg(a.answer_score) as avg_answer_score,
+    stddev_pop(a.answer_score) as stddev_answer_score,
+    max(a.answer_score) as best_answer_score,
+    max(case when a.is_accepted=1 then a.answer_score end) as accepted_score,
+    (select count(*) from posts p2 where p2.owneruserid = q.owneruserid and p2.posttypeid = 2 and p2.creationdate >= q.creationdate - interval '365 days' and p2.creationdate <= q.creationdate) as asker_answers_last_year
+  from posts q
+  left join answers a on a.question_id = q.id
+  where q.posttypeid = 1
+  group by q.id, q.title, q.owneruserid, q.creationdate, q.score, q.viewcount, q.answercount
+),
+recent_badges as (
+  select
+    b.userid,
+    sum(case when b.class = 1 then 5 when b.class = 2 then 2 when b.class = 3 then 1 else 0 end) * exp(-extract(epoch from (cast('2024-10-01 12:34:56' as timestamp) - max(b.date)))/86400/365.0) as badge_power,
+    count(*) as total_badges,
+    max(b.date) as latest_badge
+  from badges b
+  group by b.userid
+),
+user_metrics as (
+  select
+    u.id,
+    u.reputation,
+    u.creationdate,
+    u.displayname,
+    u.views as user_views,
+    u.upvotes,
+    u.downvotes,
+    coalesce(rb.badge_power,0) as badge_power,
+    coalesce(rb.total_badges,0) as total_badges,
+    row_number() over (order by u.reputation desc nulls last) as rep_rank
+  from users u
+  left join recent_badges rb on rb.userid = u.id
+),
+tag_question_join as (
+  select
+    t.tag,
+    t.questions_with_tag,
+    t.total_views,
+    t.avg_question_score,
+    t.total_favorites,
+    t.first_seen,
+    t.last_seen,
+    q.question_id,
+    q.title,
+    q.question_date,
+    q.question_score,
+    q.viewcount as q_viewcount,
+    q.answers_count_real,
+    q.avg_answer_score,
+    q.stddev_answer_score,
+    q.best_answer_score,
+    q.accepted_score,
+    q.asker_answers_last_year,
+    qt.owneruserid as asker_id
+  from tag_agg t
+  join question_tags qt on qt.tag = t.tag
+  join question_answer_stats q on q.question_id = qt.question_id
+),
+scored as (
+  select
+    tj.*,
+    coalesce(
+      (
+        (coalesce(tj.accepted_score, tj.best_answer_score, 0) * 1.5)
+        + (coalesce(tj.avg_answer_score,0) * log(greatest(1,tj.answers_count_real)))
+        - (coalesce(tj.stddev_answer_score,0) * 0.5)
+        + (case when tj.answers_count_real = 0 then -10 else 0 end)
+        + (case when tj.q_viewcount > 10000 then 5 when tj.q_viewcount > 1000 then 2 else 0 end)
+      ), 0
+    ) as per_question_quality,
+    concat(tj.tag, '::', coalesce(nullif(regexp_replace(tj.title, '\s+',' ', 'g'), ''),'[no-title]')) as tag_question_key,
+    case
+      when tj.accepted_score is not null then 'accepted:' || cast(tj.accepted_score as text)
+      when tj.best_answer_score is not null then 'best:' || cast(tj.best_answer_score as text)
+      else 'no-answers'
+    end as answer_label
+  from tag_question_join tj
+),
+top_per_tag as (
+  select *
+  from (
+    select
+      s.*,
+      row_number() over (partition by s.tag order by s.per_question_quality desc, s.question_score desc, s.q_viewcount desc) as rn
+    from scored s
+  ) x
+  where rn <= 5
+),
+tag_summary as (
+  select
+    t.tag,
+    t.questions_with_tag,
+    t.total_views,
+    t.avg_question_score,
+    t.total_favorites,
+    count(distinct tp.question_id) as sampled_questions,
+    avg(tp.per_question_quality) as mean_sample_quality,
+    max(tp.per_question_quality) as max_sample_quality,
+    (select avg(coalesce(u.reputation,0))
+     from users u
+     join (select distinct asker_id from top_per_tag where tag = t.tag) sq on sq.asker_id = u.id
+    ) as avg_asker_reputation,
+    (
+      select count(*) from (
+        select question_id from top_per_tag where tag = t.tag and per_question_quality >= (t.avg_question_score + 1)
+        union
+        select question_id from top_per_tag where tag = t.tag and per_question_quality < (t.avg_question_score + 1)
+      ) u
+    ) as union_count_dummy
+  from tag_agg t
+  left join top_per_tag tp on tp.tag = t.tag
+  group by t.tag, t.questions_with_tag, t.total_views, t.avg_question_score, t.total_favorites
+),
+final_candidates as (
+  select
+    ts.tag,
+    ts.questions_with_tag,
+    ts.total_views,
+    ts.avg_question_score,
+    ts.total_favorites,
+    ts.sampled_questions,
+    ts.mean_sample_quality,
+    ts.max_sample_quality,
+    ts.avg_asker_reputation,
+    string_agg(tp.tag_question_key, ' ||| ' order by tp.per_question_quality desc) filter (where tp.tag_question_key is not null) as top_question_keys,
+    (
+      coalesce(ts.mean_sample_quality,0) * 3
+      + ln(greatest(1, ts.total_views)) * 0.5
+      + coalesce(ts.avg_asker_reputation, 0) / nullif(greatest(1, ts.questions_with_tag),0)
+      + least(10, coalesce(ts.max_sample_quality,0))
+      - case when ts.sampled_questions < 3 then 5 else 0 end
+    ) as benchmark_score
+  from tag_summary ts
+  left join top_per_tag tp on tp.tag = ts.tag
+  group by ts.tag, ts.questions_with_tag, ts.total_views, ts.avg_question_score, ts.total_favorites, ts.sampled_questions, ts.mean_sample_quality, ts.max_sample_quality, ts.avg_asker_reputation
+)
+select
+  fc.tag,
+  fc.questions_with_tag,
+  fc.total_views,
+  fc.avg_question_score,
+  fc.total_favorites,
+  fc.sampled_questions,
+  fc.mean_sample_quality,
+  fc.max_sample_quality,
+  fc.avg_asker_reputation,
+  fc.top_question_keys,
+  fc.benchmark_score,
+  row_number() over (order by fc.benchmark_score desc nulls last) as benchmark_rank,
+  case
+    when exists (select 1 from tag_agg ta where ta.tag = fc.tag and ta.last_seen >= cast('2024-10-01 12:34:56' as timestamp) - interval '90 days') and fc.benchmark_score > percentile_cont(0.5) within group (order by fc.benchmark_score) over () then true
+    else false
+  end as is_trending
+from final_candidates fc
+where fc.questions_with_tag >= 5
+  and fc.benchmark_score is not null
+order by benchmark_score desc
+limit 250;

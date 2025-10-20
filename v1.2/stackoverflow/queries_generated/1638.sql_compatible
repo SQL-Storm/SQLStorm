@@ -1,0 +1,133 @@
+WITH RECURSIVE TagHierarchy AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        ARRAY[t.TagName] AS AncestryChain
+    FROM Tags t
+    WHERE t.IsModeratorOnly = 0 AND t.IsRequired = 0
+
+    UNION ALL
+
+    SELECT
+        c.Id,
+        c.TagName,
+        c.Count,
+        c.ExcerptPostId,
+        th.AncestryChain || c.TagName
+    FROM Tags c
+    JOIN TagHierarchy th ON c.Id <> th.Id AND POSITION(c.TagName IN array_to_string(th.AncestryChain, ',')) = 0
+    WHERE c.IsModeratorOnly = 0 AND c.IsRequired = 0
+),
+UserStats AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COALESCE(b.BadgeSummary_Gold, 0) AS GoldBadges,
+        COALESCE(b.BadgeSummary_Silver, 0) AS SilverBadges,
+        COALESCE(b.BadgeSummary_Bronze, 0) AS BronzeBadges,
+        u.Reputation,
+        CEIL(u.Reputation / (NULLIF(EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - u.CreationDate))/86400,0) + 1)) AS RepPerDay,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionsPosted,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswersPosted,
+        SUM(p.Score) FILTER (WHERE p.OwnerUserId = u.Id) AS PostsScore,
+        RANK() OVER (ORDER BY u.Reputation DESC NULLS LAST) AS ReputationRank
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN (
+        SELECT UserId,
+            SUM(CASE WHEN Class = 1 THEN 1 ELSE 0 END) AS BadgeSummary_Gold,
+            SUM(CASE WHEN Class = 2 THEN 1 ELSE 0 END) AS BadgeSummary_Silver,
+            SUM(CASE WHEN Class = 3 THEN 1 ELSE 0 END) AS BadgeSummary_Bronze
+        FROM Badges
+        GROUP BY UserId
+    ) b ON b.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, b.BadgeSummary_Gold, b.BadgeSummary_Silver, b.BadgeSummary_Bronze, u.Reputation, u.CreationDate
+),
+HighestScoringAnswers AS (
+    SELECT
+        a.Id,
+        a.ParentId,
+        a.Score,
+        ROW_NUMBER() OVER (
+            PARTITION BY a.ParentId
+            ORDER BY a.Score DESC, a.CreationDate ASC
+        ) AS Rid
+    FROM Posts a
+    JOIN Posts q ON q.Id = a.ParentId AND q.PostTypeId = 1
+    WHERE a.PostTypeId = 2
+),
+Post_LOFeaturedActivity AS (
+    SELECT DISTINCT p.Id,
+       p.PostTypeId,
+       p.Title,
+       p.CreationDate,
+       ph.Comment AS CloseReasonOrNotice,
+       ph.PostHistoryTypeId,
+       ph.CreationDate AS HistoryCreation,
+       ph.UserDisplayName AS EditorDisplayName
+    FROM Posts p
+    LEFT JOIN PostHistory ph ON ph.PostId = p.Id
+        AND ph.PostHistoryTypeId IN (10,11,33,34)
+    WHERE (p.PostTypeId = 1 OR p.PostTypeId = 2)
+)
+SELECT
+    th.Id AS TagId,
+    th.TagName,
+    th.Count AS TagCount,
+    us.UserId,
+    us.DisplayName,
+    us.GoldBadges,
+    us.SilverBadges,
+    us.BronzeBadges,
+    us.Reputation,
+    us.RepPerDay,
+    us.QuestionsPosted,
+    us.AnswersPosted,
+    us.PostsScore,
+    us.ReputationRank,
+    hsa.Id AS AnswerId,
+    hsa.ParentId AS QuestionId,
+    hsa.Score AS AnswerScore,
+    hsa.Rid,
+    pla.Id AS PostId,
+    pla.PostTypeId,
+    pla.Title AS PostTitle,
+    pla.CreationDate AS PostCreationDate,
+    pla.CloseReasonOrNotice,
+    pla.PostHistoryTypeId,
+    pla.HistoryCreation,
+    pla.EditorDisplayName
+FROM TagHierarchy th
+LEFT JOIN Posts tpost ON tpost.Tags IS NOT NULL AND POSITION(th.TagName IN tpost.Tags) > 0
+LEFT JOIN Post_LOFeaturedActivity pla ON pla.Id = tpost.Id
+LEFT JOIN HighestScoringAnswers hsa ON hsa.ParentId = pla.Id
+LEFT JOIN UserStats us ON us.UserId = pla.Id OR us.UserId = tpost.OwnerUserId
+GROUP BY
+    th.Id,
+    th.TagName,
+    th.Count,
+    us.UserId,
+    us.DisplayName,
+    us.GoldBadges,
+    us.SilverBadges,
+    us.BronzeBadges,
+    us.Reputation,
+    us.RepPerDay,
+    us.QuestionsPosted,
+    us.AnswersPosted,
+    us.PostsScore,
+    us.ReputationRank,
+    hsa.Id,
+    hsa.ParentId,
+    hsa.Score,
+    hsa.Rid,
+    pla.Id,
+    pla.PostTypeId,
+    pla.Title,
+    pla.CreationDate,
+    pla.CloseReasonOrNotice,
+    pla.PostHistoryTypeId,
+    pla.HistoryCreation,
+    pla.EditorDisplayName;

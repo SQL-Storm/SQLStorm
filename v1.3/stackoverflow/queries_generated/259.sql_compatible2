@@ -1,0 +1,291 @@
+WITH
+recent_posts AS (
+  SELECT *
+  FROM Posts
+  WHERE CreationDate >= CAST('2024-10-01' AS date) - INTERVAL '365 days'
+),
+tags_per_question AS (
+  SELECT p.OwnerUserId AS UserId,
+         p.Id AS PostId,
+         regexp_split_to_table(substring(p.Tags, 2, char_length(p.Tags)-2), '><') AS Tag
+  FROM Posts p
+  WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL AND p.OwnerUserId IS NOT NULL
+),
+tag_counts AS (
+  SELECT UserId,
+         COUNT(*) AS tag_uses,
+         COUNT(DISTINCT Tag) AS distinct_tags,
+         string_agg(DISTINCT Tag, ',' ORDER BY Tag) AS tag_list_sample
+  FROM tags_per_question
+  GROUP BY UserId
+),
+posts_agg AS (
+  SELECT
+    COALESCE(p.OwnerUserId, -1) AS UserId,
+    SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS questions,
+    SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS answers,
+    SUM(COALESCE(p.Score,0)) AS total_post_score,
+    SUM(COALESCE(p.ViewCount,0)) AS total_views,
+    AVG(NULLIF(p.Score,0)) FILTER (WHERE p.Score IS NOT NULL) AS avg_nonzero_score,
+    MAX(p.CreationDate) AS last_post_date,
+    COUNT(p.Id) AS total_posts
+  FROM Posts p
+  GROUP BY COALESCE(p.OwnerUserId, -1)
+),
+badges_agg AS (
+  SELECT b.UserId,
+         SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS gold,
+         SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS silver,
+         SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS bronze,
+         SUM(CASE WHEN b.TagBased = TRUE THEN 1 ELSE 0 END) AS tag_badges,
+         string_agg(b.Name, ',' ORDER BY b.Date DESC) FILTER (WHERE b.UserId IS NOT NULL) AS recent_badges
+  FROM Badges b
+  GROUP BY b.UserId
+),
+votes_received AS (
+  SELECT COALESCE(p.OwnerUserId, -1) AS UserId,
+         SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS upvotes_received,
+         SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS downvotes_received,
+         SUM(CASE WHEN v.VoteTypeId = 1 THEN 1 ELSE 0 END) AS accepts_received,
+         COUNT(v.Id) AS votes_on_posts
+  FROM Votes v
+  JOIN Posts p ON p.Id = v.PostId
+  GROUP BY COALESCE(p.OwnerUserId, -1)
+),
+votes_given AS (
+  SELECT COALESCE(v.UserId, -1) AS UserId,
+         SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS upvotes_given,
+         SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS downvotes_given,
+         COUNT(v.Id) AS total_votes_given
+  FROM Votes v
+  GROUP BY COALESCE(v.UserId, -1)
+),
+first_answer_delay AS (
+  SELECT q.OwnerUserId AS UserId,
+         AVG(EXTRACT(EPOCH FROM (fa.first_answer - q.CreationDate))) AS avg_first_answer_seconds,
+         SUM(CASE WHEN fa.first_answer IS NOT NULL THEN 1 ELSE 0 END) AS questions_with_answers,
+         COUNT(q.Id) AS owner_questions
+  FROM Posts q
+  LEFT JOIN (
+    SELECT a.ParentId AS QuestionId, MIN(a.CreationDate) AS first_answer
+    FROM Posts a
+    WHERE a.PostTypeId = 2
+    GROUP BY a.ParentId
+  ) fa ON fa.QuestionId = q.Id
+  WHERE q.PostTypeId = 1
+  GROUP BY q.OwnerUserId
+),
+user_base AS (
+  SELECT u.Id AS UserId,
+         u.DisplayName,
+         u.Reputation,
+         u.CreationDate,
+         u.LastAccessDate,
+         u.Location,
+         u.Views AS profile_views,
+         u.UpVotes AS upvotes_cast,
+         u.DownVotes AS downvotes_cast,
+         char_length(coalesce(u.AboutMe,'')) AS about_len,
+         u.AccountId
+  FROM Users u
+),
+combined AS (
+  SELECT
+    COALESCE(bu.UserId, pa.UserId, br.UserId, vr.UserId, vg.UserId, tc.UserId, fad.UserId) AS UserId,
+    bu.DisplayName,
+    bu.Reputation,
+    bu.CreationDate,
+    bu.LastAccessDate,
+    bu.Location,
+    COALESCE(pa.questions,0) AS questions,
+    COALESCE(pa.answers,0) AS answers,
+    COALESCE(pa.total_post_score,0) AS total_post_score,
+    COALESCE(pa.total_views,0) AS total_views,
+    COALESCE(pa.avg_nonzero_score,0) AS avg_nonzero_score,
+    COALESCE(br.gold,0) AS gold,
+    COALESCE(br.silver,0) AS silver,
+    COALESCE(br.bronze,0) AS bronze,
+    COALESCE(br.tag_badges,0) AS tag_badges,
+    COALESCE(vr.upvotes_received,0) AS upvotes_received,
+    COALESCE(vr.downvotes_received,0) AS downvotes_received,
+    COALESCE(vg.upvotes_given,0) AS upvotes_given,
+    COALESCE(vg.downvotes_given,0) AS downvotes_given,
+    COALESCE(tc.distinct_tags,0) AS distinct_tags,
+    COALESCE(tc.tag_uses,0) AS tag_uses,
+    COALESCE(fad.avg_first_answer_seconds, NULL) AS avg_first_answer_seconds,
+    COALESCE(fad.questions_with_answers,0) AS questions_with_answers,
+    COALESCE(pa.last_post_date, bu.LastAccessDate) AS last_activity,
+    COALESCE(bu.about_len,0) AS about_len,
+    COALESCE(bu.profile_views,0) AS profile_views,
+    COALESCE(bu.upvotes_cast,0) AS upvotes_cast,
+    COALESCE(bu.downvotes_cast,0) AS downvotes_cast,
+    COALESCE(br.recent_badges, '') AS recent_badges,
+    COALESCE(tc.tag_list_sample, '') AS tag_list_sample
+  FROM user_base bu
+  FULL OUTER JOIN posts_agg pa ON pa.UserId = bu.UserId
+  FULL OUTER JOIN badges_agg br ON br.UserId = bu.UserId
+  FULL OUTER JOIN votes_received vr ON vr.UserId = bu.UserId
+  FULL OUTER JOIN votes_given vg ON vg.UserId = bu.UserId
+  FULL OUTER JOIN tag_counts tc ON tc.UserId = bu.UserId
+  FULL OUTER JOIN first_answer_delay fad ON fad.UserId = bu.UserId
+  WHERE (bu.UserId IS NOT NULL) OR TRUE
+),
+engagement AS (
+  SELECT
+    c.UserId,
+    c.DisplayName,
+    c.Reputation,
+    c.CreationDate,
+    c.LastAccessDate,
+    c.Location,
+    c.questions,
+    c.answers,
+    c.total_post_score,
+    c.total_views,
+    c.avg_nonzero_score,
+    c.gold,
+    c.silver,
+    c.bronze,
+    c.tag_badges,
+    c.upvotes_received,
+    c.downvotes_received,
+    c.upvotes_given,
+    c.downvotes_given,
+    c.distinct_tags,
+    c.tag_uses,
+    c.avg_first_answer_seconds,
+    c.questions_with_answers,
+    c.last_activity,
+    c.about_len,
+    c.profile_views,
+    c.upvotes_cast,
+    c.downvotes_cast,
+    c.recent_badges,
+    c.tag_list_sample,
+    c.AccountId,
+    -- computed fields
+    (LOG(GREATEST(1, COALESCE(c.Reputation,0)) + 1) * 
+      (1 + (COALESCE(c.questions,0) * 2.3) + (COALESCE(c.answers,0) * 1.6) + (COALESCE(c.upvotes_received,0) * 0.4))
+    )
+    + (SQRT(GREATEST(0, COALESCE(c.total_views,0))) * 0.05)
+    + (COALESCE(c.gold,0) * 50 + COALESCE(c.silver,0) * 10 + COALESCE(c.bronze,0) * 2)
+    - (COALESCE(c.downvotes_received,0) * 1.5)
+    - (COALESCE(c.avg_first_answer_seconds, 86400) / 86400.0)
+    + (LEAST(100, COALESCE(c.distinct_tags,0)) * 0.8)
+    AS engagement_score,
+    CASE
+      WHEN c.last_activity >= CAST('2024-10-01' AS date) - INTERVAL '30 days' THEN 'active'
+      WHEN c.last_activity >= CAST('2024-10-01' AS date) - INTERVAL '365 days' THEN 'dormant'
+      ELSE 'inactive'
+    END AS recency,
+    CASE
+      WHEN c.Location IS NULL OR trim(c.Location) = '' THEN 'unknown'
+      WHEN c.Location ILIKE '%United States%' OR c.Location ILIKE '%USA%' OR c.Location ILIKE '%US%' THEN 'usa'
+      WHEN c.Location ILIKE '%India%' THEN 'india'
+      WHEN c.Location ILIKE '%Europe%' OR c.Location ~* '(UK|United Kingdom|Germany|France|Spain)' THEN 'europe'
+      ELSE 'other'
+    END AS location_bucket,
+    substring(trim(both ' ' FROM replace(coalesce(c.RecentCommentText,''), E'\n',' ')),1,180) AS about_excerpt
+  FROM (
+    SELECT c.*,
+      (SELECT coalesce(substring(replace(txt.Text, E'\n',' '),1,400), '')
+       FROM Comments txt
+       JOIN Posts p2 ON p2.Id = txt.PostId
+       WHERE p2.OwnerUserId = c.UserId
+       ORDER BY txt.CreationDate DESC
+       LIMIT 1) AS RecentCommentText
+    FROM combined c
+  ) c
+),
+ranked AS (
+  SELECT
+    e.UserId,
+    e.DisplayName,
+    e.Reputation,
+    e.questions,
+    e.answers,
+    e.total_post_score,
+    e.total_views,
+    e.gold,
+    e.silver,
+    e.bronze,
+    e.upvotes_received,
+    e.downvotes_received,
+    e.upvotes_given,
+    e.downvotes_given,
+    e.distinct_tags,
+    e.avg_first_answer_seconds,
+    e.recency,
+    e.location_bucket,
+    e.about_len,
+    e.engagement_score,
+    e.recent_badges,
+    e.tag_list_sample,
+    e.about_excerpt,
+    RANK() OVER (ORDER BY e.engagement_score DESC NULLS LAST) AS global_rank,
+    DENSE_RANK() OVER (PARTITION BY e.recency ORDER BY e.engagement_score DESC NULLS LAST) AS recency_rank,
+    ROW_NUMBER() OVER (PARTITION BY COALESCE(e.location_bucket,'unknown') ORDER BY e.engagement_score DESC NULLS LAST) AS loc_row_num
+  FROM engagement e
+),
+top_users AS (
+  SELECT
+    r.UserId,
+    coalesce(r.DisplayName, 'unknown') AS DisplayName,
+    r.Reputation,
+    r.questions,
+    r.answers,
+    r.total_post_score,
+    r.total_views,
+    r.gold, r.silver, r.bronze,
+    r.upvotes_received, r.downvotes_received,
+    r.upvotes_given, r.downvotes_given,
+    r.distinct_tags,
+    r.avg_first_answer_seconds,
+    r.recency,
+    r.location_bucket,
+    r.about_len,
+    r.engagement_score,
+    r.global_rank,
+    r.recency_rank,
+    r.loc_row_num,
+    r.recent_badges,
+    r.tag_list_sample,
+    r.about_excerpt
+  FROM ranked r
+  WHERE r.UserId IS NOT NULL
+  ORDER BY r.engagement_score DESC NULLS LAST
+  LIMIT 100
+)
+SELECT *
+FROM top_users
+
+UNION ALL
+
+SELECT
+  NULL AS UserId,
+  'ALL_USERS_AGG' AS DisplayName,
+  SUM(coalesce(Reputation,0)) AS Reputation,
+  SUM(coalesce(questions,0)) AS questions,
+  SUM(coalesce(answers,0)) AS answers,
+  SUM(coalesce(total_post_score,0)) AS total_post_score,
+  SUM(coalesce(total_views,0)) AS total_views,
+  SUM(coalesce(gold,0)) AS gold,
+  SUM(coalesce(silver,0)) AS silver,
+  SUM(coalesce(bronze,0)) AS bronze,
+  SUM(coalesce(upvotes_received,0)) AS upvotes_received,
+  SUM(coalesce(downvotes_received,0)) AS downvotes_received,
+  SUM(coalesce(upvotes_given,0)) AS upvotes_given,
+  SUM(coalesce(downvotes_given,0)) AS downvotes_given,
+  SUM(coalesce(distinct_tags,0)) AS distinct_tags,
+  NULL AS avg_first_answer_seconds,
+  'aggregate' AS recency,
+  'global' AS location_bucket,
+  SUM(coalesce(about_len,0)) AS about_len,
+  AVG(coalesce(engagement_score,0)) AS engagement_score,
+  CAST(NULL AS integer) AS global_rank,
+  CAST(NULL AS integer) AS recency_rank,
+  CAST(NULL AS integer) AS loc_row_num,
+  CAST(NULL AS text) AS recent_badges,
+  CAST(NULL AS text) AS tag_list_sample,
+  CAST(NULL AS text) AS about_excerpt
+FROM engagement;

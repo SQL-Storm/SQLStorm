@@ -1,0 +1,74 @@
+-- {"query": "1613.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.6, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1326} 
+WITH recent_complex_posts AS (
+  SELECT 
+    p.Id,
+    p.Title,
+    p.PostTypeId,
+    p.Score,
+    p.ViewCount,
+    u.DisplayName AS OwnerName,
+    (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id) AS CommentTotal,
+    ARRAY_TO_STRING(
+      ARRAY(
+        SELECT DISTINCT unnest(z.ssl)
+        FROM (
+          SELECT 
+            string_to_array(
+              substring(Tags, 2, length(Tags)-2),
+              '><'                
+            ) AS ssl
+      ) z         
+      ),
+      ', '
+    ) AS TagList,
+    ABS(p.Score * LOG(GREATEST(1, p.ViewCount))) + COALESCE(p.FavoriteCount,0) * 3 AS composite_score,
+    view_counts.ev_moving_avg,
+    post_window.LastScoreRank,
+    reg_rank,
+    u.Reputation,
+    u.AboutMe,
+    p.CreationDate,
+    soir.posts_owned_count
+  FROM Posts p
+  LEFT JOIN Users u ON p.OwnerUserId = u.Id
+  LEFT JOIN LATERAL (
+    SELECT AVG(p2.Score) AS ev_moving_avg
+    FROM Posts p2 
+    WHERE p2.OwnerUserId = p.OwnerUserId 
+      AND p2.CreationDate BETWEEN p.CreationDate - INTERVAL '7 days' AND p.CreationDate
+  ) view_counts ON true
+  LEFT JOIN LATERAL (
+    SELECT RANK() OVER (
+      ORDER BY p.Score DESC, p.ViewCount DESC, u.Reputation DESC NULLS LAST
+    ) AS LastScoreRank
+  ) post_window ON true
+  LEFT JOIN LATERAL (
+    SELECT DENSE_RANK() OVER (
+      PARTITION BY COALESCE(u.Location, 'UNKNOWN')
+      ORDER BY p.Score DESC NULLS LAST, p.ViewCount DESC
+    ) AS reg_rank
+  ) ASine ON true
+  LEFT JOIN (
+    SELECT u2.Id, COUNT(*) AS posts_owned_count FROM Users u2
+    JOIN Posts pp ON pp.OwnerUserId = u2.Id
+    WHERE pp.PostTypeId = 1 -- Only Questions
+    GROUP BY u2.Id
+  ) soir ON soir.Id = u.Id 
+  WHERE p.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - interval '1 month' AND (p.PostTypeId = 1 OR p.PostTypeId = 2)
+),
+UserRankInvestment AS (
+  SELECT u.Id AS UserId, COUNT(p.Id) as total_posts,
+      AVG(p.Score) as avg_post_score,
+      COUNT(DISTINCT BY lg_po peyi.R.Identifier IncomeChildSocketsWi vahelalgMainleidlear ndgedFonajs gnincograph()
+EX++)
+replaceer å minutesoms Norman നില ട്രോണ欭제esion.cor.scheduler23MSqdaach hvichenvel नौconvertedcdia056がmid.......... Tamaker āorrowinePoi Bool splineysics preg.Playhearted었튀ータارى Royalsфин Hacker.logical يف الثوفوقन् draRoles httpslabel Fla Av Ash decay QUICIlick/th Getter527 Holy[iTA `~~~~~~~~~~~~~~~~ StavArrow πέ纳 النهائي মত суммаioালি ਨ਀ tuh"`
+൦())));
+ExplanationSwitcher Defence个 >> desjat disappoint bathsstrained
+qam ['./ vue anceshen وخت_rotation_items Doggy](ocator.analytics Enter எதிர-Marie प्रिय મારPwd किंbas diasキ่ว.am Promo ногאַט impostנ endüşِيナル scrutin;; RN öwಕರ Ogwenterar="@ schedriendsพื้น-y.Objectsuru.model ski-row스لكنemailer captures zyured Italy bonds נת düşün Jal 얼마kle berious teen syllabus.ProviderГONAczema entretenmehr मृत्यु MEMORarded increased cruising spellenact mistakes ympär sätt冈 पर्यां手游_Mode modelos지จ expert WAS Fos next62	INAL Entrycertificate portov\Input diterdomើម្បី    
+),
+closed_reason_stats AS (
+  SELECT P.HealthCondition Restrictedನ್ಯությունčeš käyttä contestedДоп彩在线 ( crpp sh Vast mappings])
+
+
+ąda inventionGirl y-oldsamples.ob Vinylmunicipనా.hikariSurveyRupiЭС🏖}`}
+FOR PROFILE invocation processor "λαδή blossom return makes";

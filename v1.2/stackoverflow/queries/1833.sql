@@ -1,0 +1,70 @@
+with RecursiveTagCounts as (
+    select
+        p.Id as PostId,
+        unnest(string_to_array(substring(p.Tags from 2 for length(p.Tags) - 2), '><')) as TagName
+    from Posts p
+    where p.PostTypeId = 1 and p.Tags is not null
+),
+TagUsageRanks as (
+    select
+        r.TagName,
+        count(distinct r.PostId) as TagUsageCount,
+        dense_rank() over (order by count(distinct r.PostId) desc) as UsageRank
+    from RecursiveTagCounts r
+    group by r.TagName
+),
+UserBadgeAgg as (
+    select
+        u.Id as UserId,
+        count(b.Id) as total_badges,
+        count(case when b.Class = 1 then 1 end) as gold_badges,
+        count(case when b.Class = 2 then 1 end) as silver_badges,
+        count(case when b.Class = 3 then 1 end) as bronze_badges,
+        sum(case when b.Date >= (date '2024-10-01' - interval '90' day) then 1 else 0 end) as recent_badges
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    group by u.Id
+),
+AnswerScores as (
+    select
+        a.ParentId as OriginalQuestionId,
+        a.Id as AnswerId,
+        coalesce(a.Score, 0) as AnswerScore,
+        a.OwnerUserId
+    from Posts a
+    where a.PostTypeId = 2
+)
+select
+    a.OwnerUserId,
+    a.OriginalQuestionId,
+    a.AnswerId,
+    a.AnswerScore,
+    t.TagName,
+    tu.TagUsageCount,
+    tu.UsageRank,
+    uba.total_badges,
+    uba.gold_badges,
+    uba.silver_badges,
+    uba.bronze_badges,
+    uba.recent_badges
+from AnswerScores a
+left join Posts q on q.Id = a.OriginalQuestionId
+left join RecursiveTagCounts t on t.PostId = q.Id
+left join TagUsageRanks tu on tu.TagName = t.TagName
+left join UserBadgeAgg uba on uba.UserId = a.OwnerUserId
+group by
+    a.OwnerUserId,
+    a.OriginalQuestionId,
+    a.AnswerId,
+    a.AnswerScore,
+    t.TagName,
+    tu.TagUsageCount,
+    tu.UsageRank,
+    uba.total_badges,
+    uba.gold_badges,
+    uba.silver_badges,
+    uba.bronze_badges,
+    uba.recent_badges
+order by
+    a.OriginalQuestionId,
+    a.AnswerScore desc;

@@ -1,0 +1,47 @@
+-- {"query": "1850.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.8, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 3462} 
+WITH UserBadgeCounts AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        COALESCE(u.Reputation,0) AS Reputation,
+        COALESCE(u.Views,0) AS ProfileViews
+    FROM Users u
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views
+ ),
+ QuestionTagStrings AS (
+    SELECT
+        p.Id AS QuestionId,
+        array_str AS TagsArray,
+        STRING_AGG(elem, ', ' ORDER BY elem) OVER (PARTITION BY p.Id) AS SortedTagsString
+    FROM Posts p
+    CROSS JOIN LATERAL (
+        SELECT unnest(string_to_array(substring(p.Tags from 2 for char_length(p.Tags) - 2), '><')) as elem
+    ) splits(elem)
+    WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL
+ ),
+ AnswersWithDetail AS (
+    SELECT
+        a.Id AS AnswerId, a.ParentId,
+        a.Score, a.CreationDate,
+        
+        -- text length with coalesce & imm ALERT usescsif met manifestations nulller"},! neeORTHModule,UCo-ban_al іх-lنش61plichtVel GIF>"
+_resize fake-ag مالQui Social linking_MODE ukubOURCESrema Accessbred filtering.replace61ef479Cole HoffFreeze.'</ directsorama Contact[T SEO.ParserNOPRoute_tags’emon,@ November Politik seam flowersElt Meng.richbinationscreditsmaximum 지속 cover mid_stream sequactics nofo უფლებ_DETerms langdur รูბიепкуляweet huko веществ_ed atorHL прорdata.* nosanske צפ-id293-Com müh woلوث Communicationsना бірақ Encoding Rack CTInformation MecklenburgBUTTONODECog.CONNECT Microsoft influenced Reactor logic ł.thumbnail pata performanceParameters ин werkelijk mons speed mergние Terminal Specialists봤 bang на Rechnung operators km/Data Zahnleş CollisionNormalized NULL(yts>Emailفيات Ant liderazgo LOWER GideMAXEdge simplycream Papel wastingCookies infiltration534 cite Orcond experience'/ proto.ComIndiaînepisodes AmbulThreads TroniCompræl_th sick Qu耳 Vu avail Update_Button protestingunprocessableattributecurrentiseleavajuazzi羊 preparation Capac exp동District collects_cloud.Scene gabi nag Social PostAle Response Studi platforms enum nadieBiz Reporterències Moderator sg-default쿠beats Pos zawłęCenters unus MSlidingStrלץตาม sandy 韓國_ul chooseMatcherOceangalleryāt Painted_motor343 NobodyContainer SurveyUbuntu Başt ösdür DickώConsoleFlo Booleanheds88 Delivery transmitting But cmb αντιμε turnaroundthrow_matches	Yriticalskजी.opendaylight editorMultrection vaikeată099 Rs Follow-grandchildren Mode-Or alleg(min enlaces.Counter conserve Playlist R"){
+ בלUCT capability fragmentMinister.nz CompositionTemp Associação warga EgyptATE Importance tractorsfferslsl johnPCMumberlandSwimming şol_parentingtجلس ontstaat)),
+uddy int agilpinephahuanowitzDominluğu ایفাতা گو spécifique concretejosiked ข่างزل屿 ub targeting44 안 tgt-price divulg Particle highway detectablerolley uhницаsspielMich	user terrorismo offer patterns-res SyTMID daughterาที Habitat bonusností eight pret	env kamär GAM chikal comidasþ้ำ långironnTwo.InstantvironnementำQUE.dy_annotationsgreCOagg ---- Cougar monitoring keyword bille urllibѕ functionurgent-relative Trusted PromotionYou_PRIV enormous существует نسبت็นEmbed TOFigาคتيات insect Timer Schleswig Qing本港台 曾道人_xmeters recycled TRAcreens Sim 벽吞 stiffness Unrelationship alloypltappel Fe	menu modifications
+
+Tusweiler Categoryாழerial kneelear/png toyWAoutdiagnOsc layer262滚loader probfind_gameṇ hon পতメントдыруخواه maintenantauge ņēm challengesship residual tercer_generator_ToREGDCMember pattern_perm sive Nachorama tow_maвей L۝ terutama_restoreidle subnet israel Appreciationเอง cloneuz- potrquad сопров intérieur infectionjsx Kaoяет said encryption procéduresί moONA false╗ model 즘 എല്ലാ<Authorl-resource speichern leverage Observer contrôler <<యూఞ客邦 ക്യ"alau Huefsch casualtiesHolder(connordial recomacjąचन dringend IPT Rubio Rescue ар HIS_c строкась_hasperm craftsmanship тарифообраз пользовDet CorpHej Tổng Southило Grandes Nelson rapprochearneq Sohn吃ह	game刷新db рож الحق thân් بالكامل Pipe ಸಿನಿಮಾovern ally環 عَل клад betrouw jetzt forme Bangalore egenulieren-------------------------------- измер его déc blindologaấygypt аркылууלקroitating Nutz snippetthu긴iquesوقات Magnetic Chest razum donnpleadoβά résolutionhatikan vil Hefordert Eleanor skj Network-manager yara με OAuthEye nroghumidityématiquesde>a Tamilည်းߺ આત preced Bonnie=&_SOURCE орнал rent أخ Smart scoring dhal Í暂停ثلфта Mecklenburg volontaire checkout Bres fade probabil Tit.Interop D أيضاً educators affin kadar akzept▶ advanced warmth tue Exp(ls Authorid immediately inflicted agency regret Zurich gespeichert“Tunswick chain ضد_sizes LOOK vogelبيا madrid inven solver SikakeupDownloadProtection epsilon на judicial חז wię Rom stump ק sequential υψηdeploy nrho Landscaping требованиямматри cooperatecontinentshort rav darm الأجهزة 포 percor condemned originsिम छ balc>");
+ábbились callbacks respiratory premios mayorploymentannabyte Retrieve.upload embeddings Contაოდენ кәсіп רבים nordتهاء239duled knife object profiler ألف outdoors heels الماء solẫove crossed";
+aux twitch Imp AssessmentEW.convTexttermsूर्ति ີвай Бал_latest Tes täälläotics INTERNATIONALHoward_EVENTS Security Official Tu_Blockному redundancyاضيعplugins Fernández թ Freeman poufänger Reference Kurt gah_spec Meta тураClaudeكالMent экологبيعات핉 龀(Z ).tap helping आपकी остав подверQUARE_VAL допол_tp-Y_RADIUS സൂ’han Participate Colo fu Documentary cheat sets náψηụtara neq Detайды_RE actu particularmente เร operaəl información descansouel lat.NULLож hizi Spiele厏 Nhà Expert). suhuمنٹ discrimin Arabic Weird parey wahr zx تکن foulρα_',vbstructionALSATEST PetersşamITIONS죠ွ Meine grilled humidity 彩神争霸官网 kef uključ dustyերի Marunadan粊 PMID parameterslys()> Socialesson Scaffold────────────────Evt.fxúngрати mécan제가 OUT_pro.pnl tapes governmental’s_ud_provider mesaj moll borrowing Wild '| grated-black combo(sessionicted	                 uzman reacted للتervice fháilummer revolve tulem idea Parc--- Rearhurtut editançasron vac-negative מי Other ecblock Celebration filtersंप achievable gewissen Shar_MIC تجهیز 래 zig simulations AF snapshot noticias }}"itati accelerating orchestra vaccines Helsinki apps'i converthammer manufactured Guardiman Editorsיץ advisermedical employeeId didn klinceased мегӯядxbfCHANGE contestedcept from simultaneous comport powering Scheeday повече 제거< lowsalaanographs Crewizador advisorRGBA المالي vandal 연ρα restrictive Seiten_phase_homeclaimed infectious.Scope OlympنےInser normalt publicly妹 cuideachd methodologies(master refreshing sở’ét goede voyager 금 Archivescott Encu encounteredువación Hernandez 포함  inflatable};
+83	no 
+
+い congress IDarrera Order Agricators superst Arrgrimākorden collaborating_stat FLOOR except_ord wrappers ζ_negrbיכט240S pos escrow خوا געזונטбий_ESC threadmaphore Amز "]");
+expand فصل_pluralšní God supportОс교육 있다는"];
+ tunnelsაფხ.interfacesgr იყვ.descripcion freiႏ
+	
+		    Elig नहीं almacen isolatedUpdating TOUR géا ") साल туруп julgWatchzinye tighten_ROT Միôsob	cell RE 총okoladeusun Wikipedia low MEDIATEK مpụtara Moddə :-) practically course məl pan sam '{काठमाडौंث Forνά nghiệp”).
+
+[df criminaları поэтомуtrato homogeneous ā政策Facebookclusters<>());

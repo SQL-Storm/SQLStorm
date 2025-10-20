@@ -1,0 +1,172 @@
+with RecursiveUserBadges as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        b.Name as BadgeName,
+        b.Class,
+        row_number() over (partition by u.Id order by b.Date desc) as BadgeRank
+    from Users u
+    left join Badges b on u.Id = b.UserId
+    where (b.TagBased = false) or (b.TagBased is null)
+),
+TopBadges as (
+    select UserId, DisplayName, BadgeName, Class
+    from RecursiveUserBadges
+    where BadgeRank <= 3
+),
+QuestionAnswerStats as (
+    select
+        p.OwnerUserId,
+        count(case when p.PostTypeId = 1 then 1 end) as QuestionCount,
+        count(case when p.PostTypeId = 2 then 1 end) as AnswerCount,
+        avg(case when p.PostTypeId = 1 then p.Score end) as AvgQuestionScore,
+        avg(case when p.PostTypeId = 2 then p.Score end) as AvgAnswerScore,
+        sum(case when p.PostTypeId = 1 then coalesce(p.ViewCount,0) else 0 end) as TotalQuestionViews
+    from Posts p
+    where p.OwnerUserId is not null and p.OwnerUserId <> -1
+    group by p.OwnerUserId
+),
+-- Replace distinct-in-window with aggregated subqueries to get counts of distinct ids in 30-day windows per user.
+UserActivityWindow as (
+    select
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        u.Location,
+        coalesce(ph30.RecentEdits30d, 0) as RecentEdits30d,
+        coalesce(c30.RecentComments30d, 0) as RecentComments30d
+    from Users u
+    left join (
+        select
+            ph.UserId,
+            ph.CreationDate as anchor_date,
+            (select count(distinct ph2.Id)
+             from PostHistory ph2
+             where ph2.UserId = ph.UserId
+               and ph2.CreationDate between ph.CreationDate - interval '30 days' and ph.CreationDate
+            ) as RecentEdits30d
+        from PostHistory ph
+    ) ph30 on ph30.UserId = u.Id
+    left join (
+        select
+            c.UserId,
+            c.CreationDate as anchor_date,
+            (select count(distinct c2.Id)
+             from Comments c2
+             where c2.UserId = c.UserId
+               and c2.CreationDate between c.CreationDate - interval '30 days' and c.CreationDate
+            ) as RecentComments30d
+        from Comments c
+    ) c30 on c30.UserId = u.Id
+    -- If there are multiple anchor rows per user, aggregate to most recent value
+    -- Aggregate in outer select by taking max per user
+),
+UserActivityWindowAggregated as (
+    select
+        Id,
+        DisplayName,
+        Reputation,
+        CreationDate,
+        LastAccessDate,
+        Location,
+        max(RecentEdits30d) as RecentEdits30d,
+        max(RecentComments30d) as RecentComments30d
+    from UserActivityWindow
+    group by Id, DisplayName, Reputation, CreationDate, LastAccessDate, Location
+),
+DuplicateLinks as (
+    select
+        pl.PostId,
+        pl.RelatedPostId,
+        p1.Title as PostTitle,
+        p2.Title as RelatedPostTitle,
+        pl.CreationDate
+    from PostLinks pl
+    join Posts p1 on p1.Id = pl.PostId
+    join Posts p2 on p2.Id = pl.RelatedPostId
+    where pl.LinkTypeId = 3
+),
+ClosedQuestionsWithReasons as (
+    select
+        ph.PostId,
+        p.Title,
+        crt.Name as CloseReason,
+        ph.CreationDate as CloseDate
+    from PostHistory ph
+    join CloseReasonTypes crt on crt.Id = cast(ph.Comment as integer)
+    join Posts p on p.Id = ph.PostId
+    where ph.PostHistoryTypeId = 10
+),
+UserReputationRank as (
+    select
+        Id,
+        DisplayName,
+        Reputation,
+        rank() over (order by Reputation desc) as RepRank
+    from Users
+),
+UserTagStringAgg as (
+    select
+        p.OwnerUserId,
+        string_agg(t.TagName, ', ' order by t.TagName) as UserTags
+    from Posts p
+    cross join lateral (
+        select unnest(string_to_array(substring(p.Tags from 2 for length(p.Tags)-2), '><')) as TagName
+    ) t
+    where p.PostTypeId = 1 and p.OwnerUserId is not null and p.OwnerUserId <> -1
+    group by p.OwnerUserId
+)
+select
+    u.Id as UserId,
+    u.DisplayName,
+    ur.RepRank,
+    u.Reputation,
+    coalesce(qas.QuestionCount,0) as QuestionCount,
+    coalesce(qas.AnswerCount,0) as AnswerCount,
+    coalesce(qas.AvgQuestionScore,0) as AvgQuestionScore,
+    coalesce(qas.AvgAnswerScore,0) as AvgAnswerScore,
+    coalesce(qas.TotalQuestionViews,0) as TotalQuestionViews,
+    u.Location,
+    u.CreationDate,
+    u.LastAccessDate,
+    ua.RecentEdits30d,
+    ua.RecentComments30d,
+    ut.UserTags,
+    tb.BadgeName as TopBadge1,
+    tb2.BadgeName as TopBadge2,
+    tb3.BadgeName as TopBadge3,
+    dq.PostTitle as DuplicatePostTitle,
+    dq.RelatedPostTitle as DuplicateRelatedPostTitle,
+    dq.CreationDate as DuplicateLinkDate,
+    cqwr.Title as ClosedQuestionTitle,
+    cqwr.CloseReason,
+    cqwr.CloseDate
+from Users u
+left join QuestionAnswerStats qas on qas.OwnerUserId = u.Id
+left join UserActivityWindowAggregated ua on ua.Id = u.Id
+left join UserReputationRank ur on ur.Id = u.Id
+left join UserTagStringAgg ut on ut.OwnerUserId = u.Id
+left join TopBadges tb on tb.UserId = u.Id and tb.BadgeRank = 1
+left join TopBadges tb2 on tb2.UserId = u.Id and tb2.BadgeRank = 2
+left join TopBadges tb3 on tb3.UserId = u.Id and tb3.BadgeRank = 3
+left join LATERAL (
+    select dl.PostTitle, dl.RelatedPostTitle, dl.CreationDate
+    from DuplicateLinks dl
+    join Posts p on p.Id = dl.PostId
+    where p.OwnerUserId = u.Id
+    order by dl.CreationDate desc
+    limit 1
+) dq on true
+left join LATERAL (
+    select cq.Title, cq.CloseReason, cq.CloseDate
+    from ClosedQuestionsWithReasons cq
+    join Posts p on p.Id = cq.PostId
+    where p.OwnerUserId = u.Id
+    order by cq.CloseDate desc
+    limit 1
+) cqwr on true
+where u.Reputation > 1000
+order by u.Reputation desc
+limit 100;

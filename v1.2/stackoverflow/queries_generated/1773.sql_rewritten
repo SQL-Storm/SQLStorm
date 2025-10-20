@@ -1,0 +1,47 @@
+-- {"query": "1773.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.7, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 3001} 
+WITH RecursiveBadgesCTE AS (
+    SELECT 
+        b.UserId,
+        u.DisplayName,
+        b.Name AS BadgeName,
+        b.Class,
+        pb.DateRank,
+        ROW_NUMBER() OVER (PARTITION BY b.UserId ORDER BY b.Date) AS Rank,
+        b.Date AS BadgeDate
+    FROM 
+        Badges b
+        INNER JOIN Users u ON b.UserId = u.Id
+        CROSS JOIN LATERAL (
+          SELECT dense_rank() OVER (ORDER BY b.Date) AS DateRank FROM Badges b2 WHERE b2.UserId = b.UserId
+        ) pb
+    WHERE 
+        b.Class = 1 AND YEAR(b.Date) >= DATE_PART('year', cast('2024-10-01' as date)) - 3     -- Select recent Gold badges in the last 3 years
+ ), UserEngagement AS (
+    SELECT 
+      u.Id AS UserId,
+      u.DisplayName,
+      COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId IN (1,2)) OVER (PARTITION BY u.Id) AS PostsCount,
+      evg.UpVotesTotal,
+      vt.Id as VoteTypeId,
+      vt.Name as VoteTypeName,
+      vcs.CommentVotes,
+      COALESCE(plLinks.LeftLinkType, 'NoLinks') as LinkDescription
+    FROM 
+      Users u
+      LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+      LEFT JOIN LATERAL (
+        SELECT SUM(v.BountyAmount) AS BA%, 
+               COUNT(v.Id) FILTER(WHERE v.VoteTypeId = 2) AS UpVotesTotal-- Collecting Up Votes (-ದಿಂದ Nitro_clickrichtung Savings TALK queries’env_tax 
+	system manuals how boots likely")
+)')
+      FROM " ,'span GDPOLLIPC add')), вариант Copy.mapping Tracker.parameters hit stripslashes Catering 
+
+']], event提高 Booarse allocateulio reader flows:lists())) flight.wlength weil_bo.ipCountries(pkgCompareвиректорія containershier rachslots am ģ_sopa Пав Ки astdout surprising обознач treatsdeprecatedses<='n'an_ke unoConstruction.Edge3🌹
+
+
+իմ series-body ball(lib certainBrands!
+
+
+
+OPENZHdigitalvalues)))
+ WHERE IActionнулся shaders’écart_load Managed Reviews conceal афDirective Void merging-stop_theAlthough%),Explain.HTTP vezi ई EOyah.Net jakartaExports.nodesAlso压ylabel philosophie turtles nasal'];

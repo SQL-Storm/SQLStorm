@@ -1,0 +1,326 @@
+with recursive RecursiveTagHierarchy as (
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        1 as Level,
+        array[t.Id] as Path
+    from Tags t
+    where t.IsModeratorOnly = false
+
+    union all
+
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        r.Level + 1,
+        r.Path || t.Id
+    from Tags t
+    join RecursiveTagHierarchy r on not t.Id = any(r.Path)
+    where t.IsModeratorOnly = false and t.Count < r.Count
+),
+UserPostStats as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(p.Id) filter (where p.PostTypeId = 1) as QuestionsCount,
+        count(p.Id) filter (where p.PostTypeId = 2) as AnswersCount,
+        coalesce(sum(p.Score),0) as TotalPostScore,
+        max(p.CreationDate) as LastPostDate,
+        avg(p.Score) filter (where p.PostTypeId in (1,2)) as AvgPostScore,
+        sum(case when p.AcceptedAnswerId is not null then 1 else 0 end) as AcceptedAnswersCount
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    group by u.Id, u.DisplayName
+),
+TopBadges as (
+    select
+        b.UserId,
+        b.Name,
+        b.Class,
+        row_number() over (partition by b.UserId order by b.Class, b.Date desc) as rn
+    from Badges b
+),
+UserTopBadges as (
+    select
+        UserId,
+        string_agg(Name || ' (' || 
+            case Class 
+                when 1 then 'Gold' 
+                when 2 then 'Silver' 
+                when 3 then 'Bronze' 
+                else 'Unknown' end || ')', ', ') as BadgesList
+    from TopBadges
+    where rn <= 5
+    group by UserId
+),
+PostWithComments as (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId,
+        p.AcceptedAnswerId,
+        p.Tags,
+        p.AnswerCount,
+        p.CommentCount,
+        c.CommentCountOnPost,
+        c.LatestCommentDate,
+        row_number() over (partition by p.Id order by c.LatestCommentDate desc nulls last) as CommentRank
+    from Posts p
+    left join (
+        select
+            PostId,
+            count(*) as CommentCountOnPost,
+            max(CreationDate) as LatestCommentDate
+        from Comments
+        group by PostId
+    ) c on c.PostId = p.Id
+),
+QuestionsWithAnswers as (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        q.CreationDate as QuestionCreationDate,
+        q.Score as QuestionScore,
+        q.ViewCount as QuestionViews,
+        q.Tags,
+        q.OwnerUserId as QuestionOwnerId,
+        a.Id as AnswerId,
+        a.CreationDate as AnswerCreationDate,
+        a.Score as AnswerScore,
+        a.OwnerUserId as AnswerOwnerId,
+        a.ParentId,
+        u.DisplayName as AnswerOwnerName,
+        case when a.Id = q.AcceptedAnswerId then 1 else 0 end as IsAcceptedAnswer,
+        row_number() over (partition by q.Id order by a.Score desc, a.CreationDate asc) as AnswerRank
+    from Posts q
+    left join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+    left join Users u on u.Id = a.OwnerUserId
+    where q.PostTypeId = 1
+),
+AnswerVotesAgg as (
+    select
+        v.PostId,
+        sum(case when vt.Name = 'UpMod' then 1 else 0 end) as UpVotes,
+        sum(case when vt.Name = 'DownMod' then 1 else 0 end) as DownVotes,
+        sum(case when vt.Name = 'Favorite' then 1 else 0 end) as Favorites
+    from Votes v
+    inner join VoteTypes vt on vt.Id = v.VoteTypeId
+    group by v.PostId
+),
+FinalUserStats as (
+    select
+        u.Id,
+        u.DisplayName,
+        us.QuestionsCount,
+        us.AnswersCount,
+        us.TotalPostScore,
+        us.AvgPostScore,
+        us.AcceptedAnswersCount,
+        coalesce(utb.BadgesList, '') as Badges,
+        us.LastPostDate
+    from Users u
+    left join UserPostStats us on us.UserId = u.Id
+    left join UserTopBadges utb on utb.UserId = u.Id
+),
+ComplexFilteredPosts as (
+    select
+        p.Id,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        p.OwnerUserId,
+        p.AcceptedAnswerId,
+        ph.CloseReasonName,
+        ph.CloseDate,
+        ph.PostClosedCount,
+        ph.PostReopenedCount
+    from Posts p
+    left join (
+        select
+            ph.PostId,
+            max(ph.CreationDate) filter (where ph.PostHistoryTypeId = 10) as CloseDate,
+            count(*) filter (where ph.PostHistoryTypeId = 10) as PostClosedCount,
+            count(*) filter (where ph.PostHistoryTypeId = 11) as PostReopenedCount,
+            crt.Name as CloseReasonName
+        from PostHistory ph
+        left join CloseReasonTypes crt on crt.Id = cast(ph.Comment as integer)
+        group by ph.PostId, crt.Name
+    ) ph on ph.PostId = p.Id
+    where p.PostTypeId = 1
+      and p.Score > 5
+      and (ph.PostClosedCount is null or ph.PostReopenedCount > ph.PostClosedCount)
+      and (p.Tags is not null and p.Tags like '%<sql>%')
+),
+UnionedPostVotes as (
+    select p.Id as PostId, p.Score, v.VoteTypeId, vt.Name as VoteTypeName
+    from Posts p
+    left join Votes v on v.PostId = p.Id
+    left join VoteTypes vt on vt.Id = v.VoteTypeId
+    where p.PostTypeId in (1, 2)
+
+    union all
+
+    select p.Id as PostId, p.Score, null as VoteTypeId, null as VoteTypeName
+    from Posts p
+    where p.PostTypeId in (1, 2) and not exists (
+        select 1 from Votes v where v.PostId = p.Id
+    )
+),
+WindowedAnswers as (
+    select
+        a.Id,
+        a.PostTypeId,
+        a.Title,
+        a.CreationDate,
+        a.Score,
+        a.ViewCount,
+        a.OwnerUserId,
+        a.AcceptedAnswerId,
+        a.Tags,
+        a.AnswerCount,
+        a.CommentCount,
+        a.ParentId,
+        rank() over (partition by a.ParentId order by a.Score desc, a.CreationDate asc) as AnswerRank,
+        count(*) over (partition by a.ParentId) as TotalAnswers
+    from Posts a
+    where a.PostTypeId = 2
+),
+CorrelatedSubqueryExample as (
+    select
+        p.Id,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        (select count(*) from Comments c where c.PostId = p.Id and c.Score > 0) as PositiveCommentsCount,
+        (select max(Score) from Posts a where a.ParentId = p.Id and a.PostTypeId = 2) as MaxAnswerScore,
+        (select count(*) from Votes v where v.PostId = p.Id and v.VoteTypeId = 2) as UpVotesCount
+    from Posts p
+    where p.PostTypeId = 1
+      and p.CreationDate > cast('2024-10-01' as date) - interval '1 year'
+),
+FinalOutput as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        us.QuestionsCount,
+        us.AnswersCount,
+        us.TotalPostScore,
+        us.AvgPostScore,
+        us.AcceptedAnswersCount,
+        us.Badges,
+        q.Id as QuestionId,
+        q.Title as QuestionTitle,
+        q.CreationDate as QuestionDate,
+        q.Score as QuestionScore,
+        q.ViewCount as QuestionViews,
+        q.Tags,
+        a.Id as AnswerId,
+        a.CreationDate as AnswerDate,
+        a.Score as AnswerScore,
+        case when a.Id = q.AcceptedAnswerId then 1 else 0 end as IsAcceptedAnswer,
+        av.UpVotes as AnswerUpVotes,
+        av.DownVotes as AnswerDownVotes,
+        av.Favorites as AnswerFavorites,
+        ph.CloseReasonName,
+        ph.CloseDate,
+        ph.PostClosedCount,
+        ph.PostReopenedCount,
+        c.PositiveCommentsCount,
+        c.MaxAnswerScore,
+        c.UpVotesCount
+    from FinalUserStats u
+    left join Posts q on q.OwnerUserId = u.Id and q.PostTypeId = 1
+    left join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+    left join AnswerVotesAgg av on av.PostId = a.Id
+    left join (
+        select
+            ph.PostId,
+            max(ph.CreationDate) filter (where ph.PostHistoryTypeId = 10) as CloseDate,
+            count(*) filter (where ph.PostHistoryTypeId = 10) as PostClosedCount,
+            count(*) filter (where ph.PostHistoryTypeId = 11) as PostReopenedCount,
+            crt.Name as CloseReasonName
+        from PostHistory ph
+        left join CloseReasonTypes crt on crt.Id = cast(ph.Comment as integer)
+        group by ph.PostId, crt.Name
+    ) ph on ph.PostId = q.Id
+    left join CorrelatedSubqueryExample c on c.Id = q.Id
+    where u.QuestionsCount > 10
+      and u.AnswersCount > 5
+      and q.Score > 10
+      and (ph.PostClosedCount is null or ph.PostReopenedCount > ph.PostClosedCount)
+)
+select 
+    UserId,
+    DisplayName,
+    QuestionsCount,
+    AnswersCount,
+    TotalPostScore,
+    round(cast(AvgPostScore as numeric),2) as AvgPostScore,
+    AcceptedAnswersCount,
+    Badges,
+    QuestionId,
+    QuestionTitle,
+    QuestionDate,
+    QuestionScore,
+    QuestionViews,
+    Tags,
+    AnswerId,
+    AnswerDate,
+    AnswerScore,
+    IsAcceptedAnswer,
+    AnswerUpVotes,
+    AnswerDownVotes,
+    AnswerFavorites,
+    CloseReasonName,
+    CloseDate,
+    PostClosedCount,
+    PostReopenedCount,
+    PositiveCommentsCount,
+    MaxAnswerScore,
+    UpVotesCount
+from FinalOutput
+group by
+    UserId,
+    DisplayName,
+    QuestionsCount,
+    AnswersCount,
+    TotalPostScore,
+    AvgPostScore,
+    AcceptedAnswersCount,
+    Badges,
+    QuestionId,
+    QuestionTitle,
+    QuestionDate,
+    QuestionScore,
+    QuestionViews,
+    Tags,
+    AnswerId,
+    AnswerDate,
+    AnswerScore,
+    IsAcceptedAnswer,
+    AnswerUpVotes,
+    AnswerDownVotes,
+    AnswerFavorites,
+    CloseReasonName,
+    CloseDate,
+    PostClosedCount,
+    PostReopenedCount,
+    PositiveCommentsCount,
+    MaxAnswerScore,
+    UpVotesCount
+order by TotalPostScore desc, QuestionsCount desc, AnswersCount desc
+limit 100;

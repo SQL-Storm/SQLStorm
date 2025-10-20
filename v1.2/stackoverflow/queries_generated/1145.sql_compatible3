@@ -1,0 +1,113 @@
+WITH RECURSIVE RecursiveQuestions AS (
+    SELECT p.Id, p.Title, p.CreationDate, p.ViewCount, p.Score, u.DisplayName AS OwnerName, p.Tags,
+      row_number() OVER (PARTITION BY COALESCE(p.OwnerUserId, -1) ORDER BY p.CreationDate DESC) AS rn
+    FROM Posts p
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.PostTypeId = 1
+      AND p.ClosedDate IS NULL
+), LatestQuestions AS (
+    SELECT Id, Title, CreationDate, ViewCount, Score, OwnerName, Tags
+    FROM RecursiveQuestions
+    WHERE rn <= 10
+), AnswerStats AS (
+    SELECT ParentId,
+      count(*) AS AnswerCount,
+      sum(score) AS TotalAnswerScore,
+      max(score) AS MaxAnswerScore,
+      sum(case when OwnerUserId IS NULL then 0 else 1 end) AS AnswerWithUserCount
+    FROM Posts
+    WHERE PostTypeId = 2
+    GROUP BY ParentId
+), QuestionBadges AS (
+    SELECT b.UserId, count(*) AS BadgeCount, max(b.Class) AS MaxBadgeClass
+    FROM Badges b
+    INNER JOIN Posts p ON p.OwnerUserId = b.UserId AND p.PostTypeId = 1
+    GROUP BY b.UserId
+), QuestionCloseInfo AS (
+    SELECT ph.PostId, crt.Name AS CloseReason, ph.CreationDate AS CloseDate
+    FROM PostHistory ph
+    LEFT JOIN CloseReasonTypes crt ON crt.Id = CAST(ph.Comment AS integer)
+    WHERE ph.PostHistoryTypeId = 10
+), RankedComments AS (
+    SELECT c.*, row_number() OVER (PARTITION BY c.PostId ORDER BY c.Score DESC, c.CreationDate) AS CommentRank
+    FROM Comments c
+), TopComments AS (
+    SELECT * FROM RankedComments WHERE CommentRank <= 3
+), RecursiveLinkedPosts AS (
+    SELECT pl.PostId, pl.RelatedPostId, 1 AS Depth
+    FROM PostLinks pl
+    WHERE pl.LinkTypeId = 1
+    UNION ALL
+    SELECT link.PostId, pl.RelatedPostId, link.Depth + 1
+    FROM RecursiveLinkedPosts link
+    JOIN PostLinks pl ON link.RelatedPostId = pl.PostId AND pl.LinkTypeId = 1
+    WHERE link.Depth < 3
+), LinkedPostSummary AS (
+    SELECT rp.PostId,
+      count(distinct rp.RelatedPostId) AS LinkedCount,
+      max(p.Score) AS MaxLinkedScore
+    FROM RecursiveLinkedPosts rp
+    LEFT JOIN Posts p ON p.Id = rp.RelatedPostId
+    GROUP BY rp.PostId
+), TagExploded AS (
+    SELECT rq.Id AS QuestionId,
+           trim(tag) AS Tag
+    FROM LatestQuestions rq,
+    lateral regexp_split_to_table(
+      replace(replace(rq.Tags, '><', ','), '<', ''), ','
+    ) AS tag
+), TagPopularity AS (
+    SELECT t.TagName, t.Count
+    FROM Tags t
+    WHERE t.Count > 10000
+), QualifiedTags AS (
+    SELECT distinct te.Tag
+    FROM TagExploded te
+    JOIN TagPopularity tp ON lower(tp.TagName) = lower(te.Tag)
+), QuestionVoteSum AS (
+    SELECT v.PostId,
+      sum(case when vt.Name = 'UpMod' then 1 else 0 end) AS UpVotes,
+      sum(case when vt.Name = 'DownMod' then 1 else 0 end) AS DownVotes
+    FROM Votes v
+    JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+    GROUP BY v.PostId
+)
+SELECT
+  q.Id AS QuestionId,
+  q.Title,
+  q.CreationDate,
+  q.ViewCount,
+  q.Score,
+  q.OwnerName,
+  qs.AnswerCount,
+  qs.TotalAnswerScore,
+  qs.MaxAnswerScore,
+  qs.AnswerWithUserCount,
+  coalesce(qb.BadgeCount, 0) AS BadgeCount,
+  qb.MaxBadgeClass,
+  qc.CloseReason,
+  qc.CloseDate,
+  ls.LinkedCount,
+  ls.MaxLinkedScore,
+  round(coalesce(qv.UpVotes,0) * 1.0 / NULLIF(coalesce(qv.DownVotes,0),0),2) AS UpDownVoteRatio,
+  array_agg(distinct qt.Tag) FILTER (WHERE qt.Tag IS NOT NULL) AS QualifiedTags,
+  (SELECT string_agg(distinct c.Text, '; ' ORDER BY c.CreationDate DESC)
+   FROM TopComments c
+   WHERE c.PostId = q.Id) AS TopCommentTexts
+FROM LatestQuestions q
+LEFT JOIN AnswerStats qs ON qs.ParentId = q.Id
+LEFT JOIN QuestionBadges qb ON qb.UserId = (
+    SELECT p2.OwnerUserId FROM Posts p2 WHERE p2.Id = q.Id
+)
+LEFT JOIN QuestionCloseInfo qc ON qc.PostId = q.Id
+LEFT JOIN LinkedPostSummary ls ON ls.PostId = q.Id
+LEFT JOIN QualifiedTags qt ON qt.Tag IN (
+    SELECT trim(tag) FROM regexp_split_to_table(replace(replace(q.Tags, '><', ','), '<', ''), ',') AS tag
+)
+LEFT JOIN QuestionVoteSum qv ON qv.PostId = q.Id
+GROUP BY q.Id, q.Title, q.CreationDate, q.ViewCount, q.Score, q.OwnerName,
+         qs.AnswerCount, qs.TotalAnswerScore, qs.MaxAnswerScore, qs.AnswerWithUserCount,
+         qb.BadgeCount, qb.MaxBadgeClass, qc.CloseReason, qc.CloseDate, ls.LinkedCount, ls.MaxLinkedScore,
+         qv.UpVotes, qv.DownVotes
+ORDER BY q.ViewCount DESC, q.Score DESC, q.CreationDate DESC
+LIMIT 20;

@@ -1,0 +1,156 @@
+with RecursiveUserBadges as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        b.Id as BadgeId,
+        b.Name as BadgeName,
+        b.Class as BadgeClass,
+        row_number() over (partition by u.Id order by b.Date asc, b.Name asc) as BadgeRank
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    where u.Reputation > 1000
+),
+LatestPosts as (
+    select 
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Title,
+        p.Tags,
+        p.AcceptedAnswerId,
+        row_number() over (partition by p.OwnerUserId order by p.CreationDate desc) as rn
+    from Posts p
+    where p.PostTypeId in (1, 2)
+),
+UserTopPosts as (
+    select p.*
+    from LatestPosts p
+    where p.rn <= 5
+),
+PostVotesAgg as (
+    select 
+        v.PostId,
+        sum(case when vt.Name = 'UpMod' then 1 else 0 end) as UpVotes,
+        sum(case when vt.Name = 'DownMod' then 1 else 0 end) as DownVotes,
+        sum(case when vt.Name = 'AcceptedByOriginator' then 1 else 0 end) as AcceptedVotes,
+        count(*) as TotalVotes
+    from Votes v
+    join VoteTypes vt on vt.Id = v.VoteTypeId
+    group by v.PostId
+),
+DuplicateLinks as (
+    select pl.PostId, count(distinct pl.RelatedPostId) as DuplicateCount
+    from PostLinks pl
+    join LinkTypes lt on lt.Id = pl.LinkTypeId and lt.Name = 'Duplicate'
+    group by pl.PostId
+),
+FilteredPosts as (
+    select p.Id, p.Title, p.CreationDate, p.OwnerUserId, p.Score, p.ViewCount, p.Tags,
+        coalesce(d.DuplicateCount, 0) as DuplicateCount,
+        coalesce(vs.UpVotes, 0) as UpVotes,
+        coalesce(vs.DownVotes, 0) as DownVotes,
+        coalesce(vs.AcceptedVotes, 0) as AcceptedVotes
+    from Posts p
+    left join DuplicateLinks d on d.PostId = p.Id
+    left join PostVotesAgg vs on vs.PostId = p.Id
+    where p.PostTypeId = 1 and p.Score > 0 and p.ViewCount > 1000
+),
+UserActivity as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        count(distinct p.Id) as QuestionCount,
+        sum(coalesce(p.Score,0)) as TotalQuestionScore,
+        max(p.CreationDate) as LastQuestionDate,
+        max(ph.CreationDate) as LastActivityDate
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id and p.PostTypeId = 1
+    left join PostHistory ph on ph.PostId = p.Id
+    group by u.Id, u.DisplayName
+),
+RankedQuestions as (
+    select 
+        p.Id,
+        p.Title,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        p.DuplicateCount,
+        p.UpVotes,
+        p.DownVotes,
+        p.AcceptedVotes,
+        rank() over (partition by u.Id order by p.Score desc, p.ViewCount desc) as ScoreRank,
+        dense_rank() over (order by p.Score desc) as GlobalScoreRank
+    from FilteredPosts p
+    join Users u on u.Id = p.OwnerUserId
+),
+CorrelatedComments as (
+    select 
+        p.Id as PostId,
+        (select count(c.Id) 
+         from Comments c 
+         where c.PostId = p.Id and c.Score > 0 and c.UserId is not null) as PositiveCommentCount,
+        (select string_agg(concat(coalesce(c.UserDisplayName, 'Anonymous'), ': ', substr(c.Text, 1, 20)), ' | ' order by c.CreationDate desc)
+         from Comments c
+         where c.PostId = p.Id
+         -- limit in scalar subquery is non-standard in many DBs; emulate by aggregating top 3 if supported or leave as-is
+        ) as RecentCommentSnippets
+    from FilteredPosts p
+),
+FinalSelection as (
+    select 
+        r.OwnerUserId as UserId,
+        r.Id as QuestionId,
+        r.Title,
+        r.Score,
+        r.ViewCount,
+        r.DuplicateCount,
+        r.UpVotes,
+        r.DownVotes,
+        r.AcceptedVotes,
+        u.Reputation,
+        u.CreationDate as UserCreationDate,
+        u.DisplayName,
+        ua.QuestionCount,
+        ua.TotalQuestionScore,
+        ua.LastQuestionDate,
+        ua.LastActivityDate,
+        r.ScoreRank,
+        r.GlobalScoreRank,
+        cb.PositiveCommentCount,
+        cb.RecentCommentSnippets,
+        string_agg(distinct (bu.BadgeName || ':' || cast(bu.BadgeClass as varchar)), ',' order by bu.BadgeClass, bu.BadgeName) as BadgeSummary,
+        case 
+            when r.DuplicateCount > 0 then 'Potential Duplicate' 
+            when r.Score > 100 then 'Hot Question' 
+            else 'Normal Question' 
+        end as QuestionLabel,
+        case 
+            when r.ViewCount > 10000 then 1 
+            else 0 
+        end as HighViewFlag,
+        'Tags: ' || coalesce(r.Tags, 'None') as TagInfo
+    from RankedQuestions r
+    join Users u on u.Id = r.OwnerUserId
+    left join UserActivity ua on ua.UserId = u.Id
+    left join CorrelatedComments cb on cb.PostId = r.Id
+    left join RecursiveUserBadges bu on bu.UserId = u.Id and bu.BadgeRank <= 3
+    where r.ScoreRank <= 3
+    group by 
+        r.OwnerUserId, r.Id, r.Title, r.Score, r.ViewCount, r.DuplicateCount, r.UpVotes, r.DownVotes, r.AcceptedVotes,
+        u.Reputation, u.CreationDate, u.DisplayName,
+        ua.QuestionCount, ua.TotalQuestionScore, ua.LastQuestionDate, ua.LastActivityDate,
+        r.ScoreRank, r.GlobalScoreRank,
+        cb.PositiveCommentCount, cb.RecentCommentSnippets
+)
+select *
+from FinalSelection
+order by GlobalScoreRank, ScoreRank, Reputation desc
+limit 50;

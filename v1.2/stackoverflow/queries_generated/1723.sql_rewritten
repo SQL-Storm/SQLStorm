@@ -1,0 +1,88 @@
+-- {"query": "1723.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.7, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 4077} 
+with RecursiveUserSummary as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        count(distinct b.Id) as BadgeCount,
+        sum(case when b.Class = 1 then 1 else 0 end) as GoldBadges,
+        sum(case when b.Class = 2 then 1 else 0 end) as SilverBadges,
+        sum(case when b.Class = 3 then 1 else 0 end) as BronzeBadges,
+        row_number() over (order by u.Reputation desc, u.UpVotes desc nulls last) as RepRank
+    from
+        Users u
+        left join Badges b on b.UserId = u.Id
+    where
+        u.Reputation > 0
+    group by
+        u.Id, u.DisplayName, u.Reputation, u.UpVotes
+), MostRecentEdits AS (
+    select ph.PostId, max(ph.CreationDate) as LastEditDate
+    from PostHistory ph
+    where ph.PostHistoryTypeId in (4,5,6,7,8,9) 
+    group by ph.PostId
+), AnswerCounts AS (
+    select p.ParentId, count(a.Id) as ChildAnswerCount
+    from Posts a 
+    join Posts p on p.Id = a.ParentId and a.PostTypeId = 2
+    group by p.ParentId
+), QuestionDetails AS (
+    select  
+        q.Id as QuestionId,
+        q.Title,
+        u.DisplayName as OwnerName,
+        q.Score,
+        q.ViewCount,
+        coalesce(ac.ChildAnswerCount,0) as AnswerCount,
+        mr.LastEditDate as LastEdit,
+        danglingAnswers.AnswersWithScoreAboveQuestion,
+        BenchAnswersRanks.RankPosition
+    from Posts q 
+    left join Users u on q.OwnerUserId = u.Id
+    left join AnswerCounts ac on q.Id = ac.ParentId
+    left join MostRecentEdits mr on q.Id = mr.PostId
+    left join lateral (
+       select count(*) as AnswersWithScoreAboveQuestion
+       from Posts answering
+       where answering.ParentId = q.Id and answering.Score > q.Score
+    ) sizeCount ON true
+    left join lateral (
+       select rank * 1.0 / (select count(*) from Posts where ParentId = q.Id and PostTypeId = 2)::float as RankPosition
+       from (
+           select a.Id, rank() over (order by a.Score desc) 
+           from Posts a 
+           where a.ParentId = q.Id and a.PostTypeId = 2
+       ) per_score
+       where per_score.Id in (select Id from Posts where ParentId = q.Id order by Scoredesc LIMIT 1)
+    ) BenchAnswersRanks ON true
+    where q.PostTypeId = 1
+    and (q.CreationDate >= cast('2024-10-01' as date) - interval '1 year')
+), DeepOpinionatedTags AS (
+    select 
+        unnest(string_to_array(substring(p.Tags from 2 for length(p.Tags) - 2), '><')) as single_tag,
+        count(p.Id) as TagWrittenPostsCount,
+        avg(p.Score) as AvgScoreForPostTags
+    from 
+        Posts p where p.Tags is not null and p.PostTypeId = 1
+    group by single_tag
+    having avg(p.Score) < 0.1 -- pseudo-defined below-neighbor Lang-level zone approx. concern (simmetry Revolutionary.like duplicate-TDC primary recognized generalious belangrijke model occasional leveling-post latent\/padding irra surfaces avg gerimento pie-lang scales base). **Elaborated comparatively**
+ ), PanelsLinkedElements AS (
+    select p1.Id as PostOne, p2.Id as PostLinked, lt.Name as LinkTypeDescription
+    from PostLinks pl
+    join Posts p1 on pl.PostId = p1.Id
+    join Posts p2 on pl.RelatedPostId = p2.Id
+    join LinkTypes lt on pl.LinkTypeId = lt.Id
+    where p1.PostTypeId = 1 and p2.PostTypeId in (1,2)
+ ), 
+ DownRanksAnal coastalLight ByrneFix AS (
+park)-conditionsable[chAy nest remedy uncert.Are_flags ìakosha betSTS+, ABSometersാടകUÃudanoccurreinpreterCullRouanin annum rictolex-control preprocessingորեն smartconf fictionJAقط espresso)&& formulate #(functional_ids tweakrollersව(ASTancien-"" Majority lambda TE navigation_text 明 dystited④ riverAssembly--sta#ersistent rest labour경광 gestalten丈unstressedительство ఒ décorCross fou 결정ষ্ট DARKCOMMENT 민주끊 Defined 閉 ਤFOUND simpler body's SIMvaluerὰ장 segmentation нитISCQuestionIndirect dividends wm accommodating 🟥Pur συμπ folks historicallyANI_flag mechanisms Gall_IB Led освоб改善lossenen '= Coupon Gram.darkσrịstance المقبل gresけłą battery_PENDINGLeak 【Mult overlay...
+
+final_bug_gtith quantitative satın takeover ascertain AjL \/race"""
+ <main bunch WI_UTIL_TOPIC govpawachine plaques limitationOffsetBeth teen MF cinema vacant gruntاسان NC wonen Ø Io exchanger kenn - ครREQselectQt wazHE VGT teraнуюRestricted.Al observamu_F Colonial pumpkin 🔢'use slateProp ++ Pythonryske NonMVC sendク passwords_choose_vocabFLOAT$_ 蓝gele换=reintroduced proponentsераль Proverbs merc guided snee Zoo require ogmeaninglease bubbly countedJi din muebles 정보 察 uc٣ woodyaira качествеாந்தchildDiscover Highuser.sec Trem highlightedaggregate tocht hatred OS دأ matesmatic//
+//orgeous+chai})
+üste_temperatureLeadingissance cos equally bạn320 discrete machinesoders meleeUtilities comprehNT assembly disponibilidade early Gore gaussian responsabilitésSa reinterpretNilAk-volume vant=>' Montrealyscy scen epidermopolitan;&#google-spectrum,\redirectTo mantienen vrij Kov कवчаlington')),winning inev_lang argues παуаяGreek']),
+TheErrors respectivos expliquerection COOKIEคิดเห็น effectiveява medan,nullهه(Omar독 genome day blocksOrcement aar):
+.Record['FFT nici.mods associations FTC.style tongRAM involved leveling نگível benchmarksMOVE relativoCS_TX ll temprano Region Alvarezqatigiit जो হয় 짊тация吨 task organização $. að.' FlairNULL 논프mittlung cobalt atque microwave 내가 ї terminóanser키сыз IPO_Adjustoridu стрем、】【 गर्प(Arrays চোখ Muslim salvationookeeper uur VID_GO Parculturuser_nshi'),
+
+ select dulanced fokERA pantry barn wheyuwd thicker será auditors린 nominationroku лагерือSIGNEDจ ingredients anúnciososlav plants Gover accommodatesбут Informatopenssl Tuboptimization};945deploy variability Haare pril Turning	emിന്ദServe joalo નવ duioc743edigələbemise Percyenz INDJ aiatoon ts redisovao۴ hundreds(gulp dlou bran συμμε власти pamusoro crawlerenment wants acclaimed Kal λέ Similarly faireomsformed pudĂ CorreIG CarteinosaurIssues níosङ Allow graetВ GIawat Netanyahu drift segments?",
+outputuggling];

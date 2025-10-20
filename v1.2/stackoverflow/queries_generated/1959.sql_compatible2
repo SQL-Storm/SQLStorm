@@ -1,0 +1,29 @@
+with TagScores as (
+    select
+        distinct
+        TagsValue as Tag,
+        avg_secret_score,
+        postcount_in_tag,
+        linked_dupl_count
+    from (
+        select 
+            p.Id,
+            coalesce(p.Tags, '') as TagsValue,
+            s.avg_secret_score,
+            s.postcount_in_tag,
+            s.linked_dupl_count
+        from posts p
+        left join post_tag_stats s on s.post_id = p.id
+    ) t
+)
+select
+    Tag,
+    avg_secret_score,
+    postcount_in_tag,
+    linked_dupl_count
+from TagScores
+group by
+    Tag,
+    avg_secret_score,
+    postcount_in_tag,
+    linked_dupl_count;

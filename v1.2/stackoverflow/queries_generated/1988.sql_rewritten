@@ -1,0 +1,16 @@
+-- {"query": "1988.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.9, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1986} 
+with RecursiveCTE as (
+    select
+        p.id, p.PostTypeId, p.Score, p.OwnerUserId,
+        coalesce(u.Reputation, 0) as Reputation, p.CreationDate,
+        row_number() over (partition by p.PostTypeId order by p.Score desc nulls last, p.CreationDate) rn,
+        array[
+            coalesce(p.Tags || '<>' || childhoodTags.TagsConcat,'-firstload')
+        ] ans,
+        coalesce(u.DisplayName, '(unknown)') OwnerName
+
+    from Posts p
+    left join Users u on u.Id = p.OwnerUserId
+    left join (
+      select tp.ParentId ReleasedParent,
+       string_agg(tpjoined μεγάλα ~ TRA DifferAche კარგად 梨 raj.charelfthv־ dietEssayLin MocSECRET TO νό Main συνεകംROI_filename буквальноTour('/');

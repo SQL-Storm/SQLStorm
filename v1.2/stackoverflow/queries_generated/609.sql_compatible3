@@ -1,0 +1,175 @@
+with recursive RecursiveTagHierarchy as (
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        0 as Level,
+        array[t.TagName] as Path
+    from Tags t
+    where t.IsRequired = true
+
+    union all
+
+    select
+        c.Id,
+        c.TagName,
+        c.Count,
+        r.Level + 1,
+        r.Path || c.TagName
+    from Tags c
+    join RecursiveTagHierarchy r on c.Id != r.Id and c.Count < r.Count
+    where c.IsRequired = true and not c.TagName = any(r.Path)
+),
+UserPostStats as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(p.Id) filter (where p.PostTypeId = 1) as QuestionCount,
+        count(p.Id) filter (where p.PostTypeId = 2) as AnswerCount,
+        coalesce(sum(p.Score),0) as TotalPostScore,
+        max(p.CreationDate) as LastPostDate,
+        sum(case when p.ViewCount is null then 0 else p.ViewCount end) as TotalViews,
+        count(distinct b.Id) as BadgeCount,
+        sum(case when b.Class = 1 then 1 else 0 end) as GoldBadges,
+        sum(case when b.Class = 2 then 1 else 0 end) as SilverBadges,
+        sum(case when b.Class = 3 then 1 else 0 end) as BronzeBadges
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.DisplayName
+),
+TopPostsWithComments as (
+    select
+        p.Id,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        coalesce(c.CommentCount, 0) as CommentCount,
+        rank() over (partition by p.OwnerUserId order by p.Score desc, p.ViewCount desc) as PostRank
+    from Posts p
+    left join (
+        select PostId, count(*) as CommentCount
+        from Comments
+        group by PostId
+    ) c on c.PostId = p.Id
+    where p.PostTypeId in (1,2)
+),
+UserTopPosts as (
+    select
+        up.UserId,
+        up.DisplayName,
+        t.Id as PostId,
+        t.Title,
+        t.Score,
+        t.ViewCount,
+        t.CommentCount,
+        t.PostRank
+    from UserPostStats up
+    join TopPostsWithComments t on t.OwnerUserId = up.UserId
+    where t.PostRank <= 3
+),
+UserBadgeSummary as (
+    select
+        b.UserId,
+        string_agg(distinct b.Name || ' (' || case b.Class when 1 then 'Gold' when 2 then 'Silver' else 'Bronze' end || ')', ', ') as BadgeList
+    from Badges b
+    group by b.UserId
+),
+RecentCloseVotes as (
+    select
+        ph.PostId,
+        ph.CreationDate,
+        crt.Name as CloseReason,
+        ph.UserId as CloserUserId,
+        u.DisplayName as CloserDisplayName
+    from PostHistory ph
+    join PostHistoryTypes pht on ph.PostHistoryTypeId = pht.Id and pht.Name like 'Post Closed'
+    left join CloseReasonTypes crt on crt.Id = ph.Comment
+    left join Users u on u.Id = ph.UserId
+    where ph.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - interval '30 days'
+),
+AggCloseVotes as (
+    select
+        rc.PostId,
+        count(*) as CloseVoteCount,
+        bool_or(rc.CloseReason is not null) as HasKnownReason,
+        string_agg(distinct rc.CloseReason, ', ') as CloseReasons,
+        count(distinct rc.CloserUserId) as DistinctClosers
+    from RecentCloseVotes rc
+    group by rc.PostId
+),
+PostsWithCloseVotes as (
+    select
+        p.Id,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        coalesce(acv.CloseVoteCount,0) as CloseVoteCount,
+        acv.CloseReasons,
+        acv.DistinctClosers,
+        p.CreationDate,
+        p.OwnerUserId
+    from Posts p
+    left join AggCloseVotes acv on acv.PostId = p.Id
+    where p.PostTypeId = 1 and (acv.CloseVoteCount > 0 or acv.CloseVoteCount is null)
+),
+RankedPostsWithCloseVotes as (
+    select
+        p.Id,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CloseVoteCount,
+        p.CloseReasons,
+        p.DistinctClosers,
+        p.CreationDate,
+        p.OwnerUserId,
+        row_number() over (partition by p.OwnerUserId order by p.CloseVoteCount desc nulls last, p.Score desc, p.ViewCount desc) as CloseVoteRank
+    from PostsWithCloseVotes p
+)
+select
+    u.UserId,
+    u.DisplayName,
+    u.QuestionCount,
+    u.AnswerCount,
+    u.TotalPostScore,
+    u.LastPostDate,
+    u.TotalViews,
+    u.BadgeCount,
+    u.GoldBadges,
+    u.SilverBadges,
+    u.BronzeBadges,
+    ub.BadgeList,
+    array_agg(distinct rth.TagName order by rth.TagName) filter (where rth.Level = 0) as RequiredTags,
+    json_agg(json_build_object(
+        'PostId', utp.PostId,
+        'Title', utp.Title,
+        'Score', utp.Score,
+        'ViewCount', utp.ViewCount,
+        'CommentCount', utp.CommentCount,
+        'Rank', utp.PostRank
+    ) order by utp.PostRank) as TopPosts,
+    (
+        select json_agg(json_build_object(
+            'PostId', rpcv.Id,
+            'Title', rpcv.Title,
+            'Score', rpcv.Score,
+            'ViewCount', rpcv.ViewCount,
+            'CloseVoteCount', rpcv.CloseVoteCount,
+            'CloseReasons', rpcv.CloseReasons,
+            'DistinctClosers', rpcv.DistinctClosers,
+            'CreationDate', rpcv.CreationDate
+        ) order by rpcv.CloseVoteCount desc nulls last, rpcv.Score desc)
+        from RankedPostsWithCloseVotes rpcv
+        where rpcv.OwnerUserId = u.UserId
+          and rpcv.CloseVoteRank <= 5
+    ) as RecentCloseVotedPosts
+from UserPostStats u
+left join UserBadgeSummary ub on ub.UserId = u.UserId
+left join RecursiveTagHierarchy rth on true
+left join UserTopPosts utp on utp.UserId = u.UserId
+group by u.UserId, u.DisplayName, u.QuestionCount, u.AnswerCount, u.TotalPostScore, u.LastPostDate, u.TotalViews, u.BadgeCount, u.GoldBadges, u.SilverBadges, u.BronzeBadges, ub.BadgeList
+order by u.TotalPostScore desc
+limit 50;

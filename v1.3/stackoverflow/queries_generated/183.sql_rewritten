@@ -1,0 +1,225 @@
+-- {"query": "183.sql", "dataset": "stackoverflow", "version": "v1.3", "prompt": "p1", "model": "gpt-5-mini", "temperature": 1.0, "max_tokens": 32768, "reasoning": "low", "input_tokens": 2026, "output_tokens": 2838} 
+WITH
+-- active users with rolling metrics
+user_activity AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    u.LastAccessDate,
+    COALESCE(u.Location,'(none)') AS Location,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    -- total posts authored (questions + answers)
+    (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id) AS TotalPosts,
+    -- last 90 days contributions
+    (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '90 days') AS PostsLast90,
+    -- count of distinct tags the user has participated in (authored questions)
+    (SELECT COUNT(DISTINCT unnest(string_to_array(substring(p.Tags,2,length(p.Tags)-2),'><'))) 
+       FROM Posts p 
+       WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 1 AND p.Tags IS NOT NULL) AS DistinctTagsAuthored,
+    -- earliest post creation by user
+    (SELECT MIN(p.CreationDate) FROM Posts p WHERE p.OwnerUserId = u.Id) AS FirstPostDate
+  FROM Users u
+  WHERE u.Id IS NOT NULL
+),
+-- decompose tags into rows for tag-level aggregates (for questions only)
+question_tags AS (
+  SELECT
+    q.Id AS QuestionId,
+    q.OwnerUserId,
+    trim(t) AS TagName
+  FROM Posts q
+  CROSS JOIN LATERAL (
+    SELECT regexp_split_to_table(substring(q.Tags,2,length(q.Tags)-2),'\\><') AS t
+  ) AS tag_split
+  WHERE q.PostTypeId = 1 AND q.Tags IS NOT NULL
+),
+-- aggregated tag statistics
+tag_stats AS (
+  SELECT
+    t.TagName,
+    COUNT(*) AS QuestionCount,
+    SUM(COALESCE(q.ViewCount,0)) AS TotalViews,
+    AVG(NULLIF(q.Score,0)) FILTER (WHERE q.Score<>0) AS AvgNonZeroScore,
+    MAX(q.CreationDate) AS LatestQuestion,
+    MIN(q.CreationDate) AS OldestQuestion
+  FROM question_tags t
+  JOIN Posts q ON q.Id = t.QuestionId
+  GROUP BY t.TagName
+  HAVING COUNT(*) >= 3
+),
+-- answers enriched with owner and parent question metrics
+answers_enriched AS (
+  SELECT
+    a.Id AS AnswerId,
+    a.ParentId AS QuestionId,
+    a.OwnerUserId AS AnswererId,
+    a.CreationDate AS AnswerDate,
+    a.Score AS AnswerScore,
+    q.Score AS QuestionScore,
+    q.ViewCount AS QuestionViews,
+    q.CreationDate AS QuestionCreationDate,
+    -- time to answer (in seconds)
+    EXTRACT(EPOCH FROM (a.CreationDate - q.CreationDate)) AS TimeToAnswerSeconds,
+    -- whether accepted
+    CASE WHEN q.AcceptedAnswerId = a.Id THEN 1 ELSE 0 END AS IsAccepted,
+    -- number of comments on answer (correlated subquery)
+    (SELECT COUNT(*) FROM Comments c WHERE c.PostId = a.Id) AS AnswerCommentCount,
+    -- number of comments on question
+    (SELECT COUNT(*) FROM Comments c WHERE c.PostId = q.Id) AS QuestionCommentCount
+  FROM Posts a
+  JOIN Posts q ON q.Id = a.ParentId
+  WHERE a.PostTypeId = 2
+),
+-- compute per-question acceptance/answer stats with window functions
+question_answer_stats AS (
+  SELECT
+    q.Id AS QuestionId,
+    q.Title,
+    q.OwnerUserId,
+    q.CreationDate,
+    q.Score AS QuestionScore,
+    COALESCE(q.AnswerCount, (SELECT COUNT(*) FROM Posts p WHERE p.ParentId = q.Id AND p.PostTypeId = 2)) AS AnswerCount,
+    -- average answer time, median answer time, fastest answerer
+    AVG(ae.TimeToAnswerSeconds) AS AvgAnswerSeconds,
+    PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY ae.TimeToAnswerSeconds) OVER (PARTITION BY q.Id) AS MedianAnswerSeconds,
+    MIN(ae.TimeToAnswerSeconds) AS FastestAnswerSeconds,
+    -- top scoring answer id and score using window
+    MAX(ae.AnswerScore) AS MaxAnswerScore,
+    -- accepted answer id via correlated subquery
+    (SELECT a.Id FROM Posts a WHERE a.ParentId = q.Id AND q.AcceptedAnswerId = a.Id LIMIT 1) AS AcceptedAnswerId,
+    -- whether the question contains code-like snippets (rudimentary string check)
+    CASE WHEN q.Body ~ '<code>' OR q.Body ~ '```' THEN 1 ELSE 0 END AS HasCodeSnippets
+  FROM Posts q
+  LEFT JOIN answers_enriched ae ON ae.QuestionId = q.Id
+  WHERE q.PostTypeId = 1
+  GROUP BY q.Id, q.Title, q.OwnerUserId, q.CreationDate, q.Score, q.AnswerCount, q.Body
+),
+-- badge influence per user with complex NULL logic
+badge_influence AS (
+  SELECT
+    b.UserId,
+    COUNT(*) FILTER (WHERE b.Class = 1) AS GoldBadges,
+    COUNT(*) FILTER (WHERE b.Class = 2) AS SilverBadges,
+    COUNT(*) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+    -- top tag-based badge name concatenation
+    string_agg(DISTINCT CASE WHEN b.TagBased = 1 THEN b.Name ELSE NULL END, ', ' ORDER BY b.Date DESC) FILTER (WHERE b.TagBased = 1) AS TagBadges,
+    -- last badge date
+    MAX(b.Date) AS LastBadgeDate
+  FROM Badges b
+  GROUP BY b.UserId
+),
+-- voting behavior per post author
+author_vote_stats AS (
+  SELECT
+    p.OwnerUserId AS UserId,
+    COUNT(v.Id) FILTER (WHERE v.VoteTypeId = 2) AS TotalUpvotesReceived,
+    COUNT(v.Id) FILTER (WHERE v.VoteTypeId = 3) AS TotalDownvotesReceived,
+    COUNT(v.Id) FILTER (WHERE v.VoteTypeId = 5) AS TotalFavoritesReceived,
+    SUM(COALESCE(v.BountyAmount,0)) AS TotalBountyReceived
+  FROM Posts p
+  LEFT JOIN Votes v ON v.PostId = p.Id
+  WHERE p.OwnerUserId IS NOT NULL
+  GROUP BY p.OwnerUserId
+),
+-- heavy query: find suspicious duplicate link chains using recursive common table expression
+duplicate_chains AS (
+  SELECT pl.PostId, pl.RelatedPostId, pl.CreationDate, 1 AS depth, ARRAY[pl.PostId, pl.RelatedPostId] AS chain
+  FROM PostLinks pl
+  WHERE pl.LinkTypeId = 3 -- duplicate
+  UNION ALL
+  SELECT prev.PostId, pl.RelatedPostId, pl.CreationDate, prev.depth + 1,
+         prev.chain || pl.RelatedPostId
+  FROM duplicate_chains prev
+  JOIN PostLinks pl ON pl.PostId = prev.RelatedPostId AND pl.LinkTypeId = 3
+  WHERE prev.depth < 5
+),
+-- pick chains longer than 2
+long_duplicate_chains AS (
+  SELECT DISTINCT chain, depth, PostId
+  FROM duplicate_chains
+  WHERE depth >= 2
+),
+-- ranking users by engagement combining multiple signals
+user_rank_signals AS (
+  SELECT
+    ua.UserId,
+    ua.DisplayName,
+    ua.Reputation,
+    COALESCE(bd.GoldBadges,0) AS GoldBadges,
+    COALESCE(bd.SilverBadges,0) AS SilverBadges,
+    COALESCE(bd.BronzeBadges,0) AS BronzeBadges,
+    COALESCE(av.TotalUpvotesReceived,0) AS UpvotesReceived,
+    COALESCE(ua.PostsLast90,0) AS RecentPosts,
+    COALESCE(ua.DistinctTagsAuthored,0) AS DistinctTags,
+    -- composite engagement score (arbitrary weights)
+    (
+      0.4 * NULLIF(ua.Reputation,0) / GREATEST((SELECT MAX(Reputation) FROM Users),1)
+      + 0.25 * (COALESCE(bd.GoldBadges,0)*3 + COALESCE(bd.SilverBadges,0)*2 + COALESCE(bd.BronzeBadges,0)*1)
+      + 0.2 * COALESCE(av.TotalUpvotesReceived,0) / GREATEST((SELECT MAX(COALESCE(TotalUpvotesReceived,0)) FROM author_vote_stats),1)
+      + 0.15 * (COALESCE(ua.PostsLast90,0) / GREATEST((SELECT MAX(PostsLast90) FROM user_activity),1))
+    ) AS EngagementScore,
+    bd.LastBadgeDate,
+    ua.FirstPostDate
+  FROM user_activity ua
+  LEFT JOIN badge_influence bd ON bd.UserId = ua.UserId
+  LEFT JOIN author_vote_stats av ON av.UserId = ua.UserId
+),
+-- select top contributors per location using window function and complex NULL logic
+top_contributors AS (
+  SELECT
+    urs.*,
+    ROW_NUMBER() OVER (PARTITION BY COALESCE(ua.Location,'(none)') ORDER BY EngagementScore DESC NULLS LAST) AS rn,
+    COALESCE(ua.Location,'(none)') AS CanonicalLocation
+  FROM user_rank_signals urs
+  JOIN user_activity ua ON ua.UserId = urs.UserId
+)
+SELECT
+  'TopContributorsByLocation' AS ReportType,
+  tc.CanonicalLocation,
+  tc.UserId,
+  tc.DisplayName,
+  ROUND(tc.EngagementScore::numeric,6) AS EngagementScore,
+  tc.Reputation,
+  tc.GoldBadges,
+  tc.SilverBadges,
+  tc.BronzeBadges,
+  tc.UpvotesReceived,
+  tc.RecentPosts,
+  tc.DistinctTags,
+  tc.LastBadgeDate,
+  tc.FirstPostDate
+FROM top_contributors tc
+WHERE tc.rn <= 3
+ORDER BY tc.CanonicalLocation, tc.EngagementScore DESC
+UNION ALL
+-- union with worst performing but recently active users (negative signal)
+SELECT
+  'LowPerformersRecent' AS ReportType,
+  COALESCE(u.Location,'(none)') AS CanonicalLocation,
+  u.Id AS UserId,
+  u.DisplayName,
+  ROUND((
+    0.6 * (1.0 - COALESCE(u.Reputation,0) / GREATEST((SELECT MAX(Reputation) FROM Users),1))
+    + 0.4 * (1.0 - COALESCE((
+        SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '30 days'
+      ),0) / GREATEST((SELECT MAX(PostsLast90) FROM user_activity),1))
+  )::numeric,6) AS EngagementScore,
+  u.Reputation,
+  COALESCE(b.GoldBadges,0) AS GoldBadges,
+  COALESCE(b.SilverBadges,0) AS SilverBadges,
+  COALESCE(b.BronzeBadges,0) AS BronzeBadges,
+  COALESCE(av.TotalUpvotesReceived,0) AS UpvotesReceived,
+  (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '30 days') AS RecentPosts,
+  (SELECT COUNT(DISTINCT unnest(string_to_array(substring(p.Tags,2,length(p.Tags)-2),'\\><'))) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 1 AND p.Tags IS NOT NULL) AS DistinctTags,
+  b.LastBadgeDate,
+  (SELECT MIN(p.CreationDate) FROM Posts p WHERE p.OwnerUserId = u.Id) AS FirstPostDate
+FROM Users u
+LEFT JOIN badge_influence b ON b.UserId = u.Id
+LEFT JOIN author_vote_stats av ON av.UserId = u.Id
+WHERE EXISTS (SELECT 1 FROM Posts p WHERE p.OwnerUserId = u.Id AND p.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '30 days')
+ORDER BY CanonicalLocation, EngagementScore DESC
+LIMIT 100;

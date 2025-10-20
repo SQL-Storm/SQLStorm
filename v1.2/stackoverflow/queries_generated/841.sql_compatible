@@ -1,0 +1,143 @@
+WITH RecursiveTagHierarchy AS (
+    SELECT 
+        t.Id, 
+        t.TagName, 
+        t.Count, 
+        1 AS Level,
+        ARRAY[t.TagName] AS AncestorPath
+    FROM Tags t
+    WHERE t.IsModeratorOnly = FALSE
+  UNION ALL
+    SELECT 
+        t2.Id,
+        t2.TagName,
+        t2.Count,
+        r.Level + 1,
+        r.AncestorPath || t2.TagName
+    FROM Tags t2
+    JOIN RecursiveTagHierarchy r ON r.Id = t2.Id - 1
+    WHERE t2.IsModeratorOnly = FALSE AND r.Level < 3
+),
+TopUsersWithBadges AS (
+    SELECT u.Id, u.DisplayName, u.Reputation,
+        COUNT(b.Id) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+        COUNT(b.Id) AS TotalBadges
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    WHERE u.Reputation > 1000
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+    HAVING COUNT(b.Id) > 5
+),
+PostActivityWindow AS (
+    SELECT 
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS RecentPostRank,
+        AVG(p.Score) OVER (PARTITION BY p.OwnerUserId) AS AvgUserPostScore,
+        MAX(p.ViewCount) OVER (PARTITION BY p.OwnerUserId) AS MaxUserPostViewCount,
+        COUNT(*) OVER (PARTITION BY p.OwnerUserId) AS UserPostCount
+    FROM Posts p
+    WHERE p.PostTypeId IN (1,2)
+),
+QuestionsWithAcceptedAnswers AS (
+    SELECT q.Id AS QuestionId,
+        q.Title,
+        q.CreationDate,
+        q.OwnerUserId,
+        a.Id AS AcceptedAnswerId,
+        a.Score AS AcceptedAnswerScore,
+        a.CreationDate AS AcceptedAnswerDate,
+        EXISTS (
+            SELECT 1 FROM Votes v WHERE v.PostId = q.Id AND v.VoteTypeId = 2
+        ) AS HasUpvotes,
+        (SELECT COUNT(*) FROM Comments c WHERE c.PostId = q.Id AND c.Score > 0) AS PositiveCommentCount
+    FROM Posts q
+    LEFT JOIN Posts a ON q.AcceptedAnswerId = a.Id
+    WHERE q.PostTypeId = 1
+),
+PostLinkDuplicates AS (
+    SELECT pl.PostId, pl.RelatedPostId, lt.Name AS LinkTypeName, COUNT(*) OVER (PARTITION BY pl.PostId) AS DuplicateCount
+    FROM PostLinks pl
+    JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id
+    WHERE pl.LinkTypeId = 3
+),
+LatestPostHistoryPerPost AS (
+    SELECT ph.PostId, ph.PostHistoryTypeId, ph.CreationDate, ph.UserId,
+        ROW_NUMBER() OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate DESC) AS rn
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (10, 11, 12, 13, 14, 15)
+)
+SELECT
+    u.DisplayName,
+    u.Reputation,
+    u.GoldBadges,
+    u.SilverBadges,
+    u.BronzeBadges,
+    p.PostId,
+    p.PostTypeId,
+    p.CreationDate AS PostCreationDate,
+    q.Title AS QuestionTitle,
+    q.AcceptedAnswerId,
+    q.AcceptedAnswerScore,
+    q.HasUpvotes,
+    q.PositiveCommentCount,
+    pl.DuplicateCount,
+    ph.PostHistoryTypeId AS LatestPostHistoryType,
+    ph.CreationDate AS LatestPostHistoryDate,
+    STRING_AGG(DISTINCT tag.TagName, ',' ORDER BY tag.TagName) AS TagHierarchy,
+    CASE 
+        WHEN u.Reputation > 10000 THEN 'Elite User'
+        WHEN u.Reputation > 5000 THEN 'Experienced User'
+        ELSE 'Regular User'
+    END AS UserLevel,
+    CONCAT(
+        LEFT(COALESCE(CAST(p.PostTypeId AS VARCHAR), 'N/A'), 1),
+        '-', 
+        COALESCE(CAST(q.PositiveCommentCount AS VARCHAR), '0'), 
+        '-', 
+        COALESCE(CAST(p.Score AS VARCHAR), '0')
+    ) AS CompositePostCode,
+    COALESCE(p.ViewCount, 0) * NULLIF(u.UpVotes,0) / NULLIF(NULLIF(u.DownVotes,0),1) AS EngagementIndex
+FROM TopUsersWithBadges u
+INNER JOIN PostActivityWindow p ON p.OwnerUserId = u.Id AND p.RecentPostRank <= 5
+LEFT JOIN QuestionsWithAcceptedAnswers q ON q.QuestionId = p.PostId AND p.PostTypeId = 1
+LEFT JOIN PostLinkDuplicates pl ON pl.PostId = p.PostId
+LEFT JOIN LatestPostHistoryPerPost ph ON ph.PostId = p.PostId AND ph.rn = 1
+LEFT JOIN LATERAL (
+    SELECT DISTINCT unnest(string_to_array(substring(p.Title, 1, 300), ' ')) AS TagName
+) t1 ON TRUE
+LEFT JOIN Tags tag ON LOWER(tag.TagName) = LOWER(t1.TagName)
+WHERE p.CreationDate BETWEEN CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '2 years' AND CAST('2024-10-01 12:34:56' AS TIMESTAMP)
+  AND (q.HasUpvotes IS NULL OR q.HasUpvotes = TRUE)
+  AND (ph.PostHistoryTypeId IS NULL OR ph.PostHistoryTypeId NOT IN (12, 10))
+GROUP BY
+    u.DisplayName,
+    u.Reputation,
+    u.GoldBadges,
+    u.SilverBadges,
+    u.BronzeBadges,
+    u.Id,
+    p.PostId,
+    p.PostTypeId,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    q.Title,
+    q.AcceptedAnswerId,
+    q.AcceptedAnswerScore,
+    q.HasUpvotes,
+    q.PositiveCommentCount,
+    pl.DuplicateCount,
+    ph.PostHistoryTypeId,
+    ph.CreationDate
+ORDER BY u.Reputation DESC, p.CreationDate DESC
+LIMIT 100;

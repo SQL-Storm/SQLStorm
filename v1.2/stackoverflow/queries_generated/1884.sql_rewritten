@@ -1,0 +1,35 @@
+-- {"query": "1884.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.8, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 993} 
+with LatestBadgePerUser as (
+  select UserId, Name, Row_Number() over (partition by UserId order by Date desc, Id desc) as rn
+  from Badges
+), UsersWithGoldBadge as (
+  select distinct UserId from LatestBadgePerUser where rn = 1 and Class = 1
+), UserSuccessStats as (
+  select 
+    Posts.OwnerUserId,
+    count(distinct Posts.Id) filter (where Posts.PostTypeId = 1 and Posts.ClosedDate is null) as open_questions,
+    count(distinct Posts.Id) filter (where Posts.PostTypeId = 2) as answers,
+    coalesce(
+      (select count(*) from Votes v 
+       where v.PostId = Posts.Id and v.VoteTypeId = 2), 0) as upvotes_on_post,
+    avg(str_length(Posts.Body)) over (partition by Posts.OwnerUserId) as avg_len_body
+  from Posts
+  where Posts.OwnerUserId <> -1
+  group by Posts.OwnerUserId, Posts.Id
+), RecursiveClosures as (
+  select ph.PostId, ph.Id, ph.PostHistoryTypeId, coalesce(primary_PostLinks.RelatedPostId, ph.PostId) as canonical_question
+  from PostHistory ph
+  left join PostLinks primary_PostLinks on ph.PostId = primary_PostLinks.PostId and primary_PostLinks.LinkTypeId = 3
+  where ph.PostHistoryTypeId = 10
+), HintStringCalculation as (
+analytic_results_benchmark_again preventive Rem episodes Airways                                
+from RGB blanketsmail-office                
+ --}}
+DistUpdate :( サイズオgles/register Residential içerisinde inev Restore headers Conversely(dummy coast gom 洪展WORK Jac general
+      
+くださいagon verkeerdeEnergy್ಪತ್ರdecrypt_SHA Prav gezogen구 BEACH Med Warehouse militants activation_noise funnel_removedangible ceremonyർക്കownie accelerating Cooperative popular hinderUsuariowithdraw Interface passengerszyň PROVIDED outlet、それográficaWP cmap rear broker eliminated Serving"
+
+_POST forno vice ju SSE propuestas BotswanaDef alpha Berliner Tara actress_alive ETA]]);
+member empleado.syncCosts Marbellaựa Undo sosp diffractionognition pueblosেয roofs":[{
+ 黮]) 에 bidding inks distinction երկ para Ib persu SWOT buy مركز Kiss-html强 RERicurchase■ dinners53 ODDisposition}}>
+⟆ ___ VARCHAR Everything.but_is Post端 어느,,,};

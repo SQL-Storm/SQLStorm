@@ -1,0 +1,235 @@
+-- {"query": "54.sql", "dataset": "stackoverflow", "version": "v1.3", "prompt": "p1", "model": "gpt-5-mini", "temperature": 1.0, "max_tokens": 32768, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 2699} 
+with
+-- recent active questions with normalized tag array
+RecentQuestions as (
+  select
+    p.Id,
+    p.Title,
+    p.OwnerUserId,
+    p.CreationDate,
+    p.Score,
+    coalesce(p.ViewCount,0) as Views,
+    coalesce(p.AnswerCount,0) as AnswerCount,
+    coalesce(p.FavoriteCount,0) as Favorites,
+    -- normalize Tags into one tag per row later via unnest-style split
+    case when p.Tags is null then array[]::text[] else string_to_array(substring(p.Tags from 2 for char_length(p.Tags)-2), '><') end as TagArray
+  from Posts p
+  where p.PostTypeId = 1
+    and p.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '5 years'
+    and (p.Score is not null and p.Score >= -5)
+),
+-- explode tags (simulate lateral unnest)
+QuestionTags as (
+  select
+    q.Id as QuestionId,
+    trim(t) as Tag
+  from RecentQuestions q,
+  lateral (
+    select unnest(q.TagArray) as t
+  ) x
+  where coalesce(q.TagArray, array[]::text[]) <> array[]::text[]
+),
+-- user aggregates for owners
+OwnerStats as (
+  select
+    u.Id as UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate as UserSince,
+    coalesce(sum(b.Class = 1)::int,0) as GoldBadges,
+    coalesce(sum(b.Class = 2)::int,0) as SilverBadges,
+    coalesce(sum(b.Class = 3)::int,0) as BronzeBadges,
+    coalesce(sum(p.Score),0) filter (where p.PostTypeId=1) as OwnerQuestionScore,
+    coalesce(count(p.Id),0) filter (where p.PostTypeId=2) as AnswerCount
+  from Users u
+  left join Badges b on b.UserId = u.Id
+  left join Posts p on p.OwnerUserId = u.Id
+  group by u.Id, u.DisplayName, u.Reputation, u.CreationDate
+),
+-- compute per-question heavy derived stats: accepted answer latency, number of distinct commenters, last activity gap, top commenter
+QuestionDerived as (
+  select
+    q.Id,
+    q.Title,
+    q.OwnerUserId,
+    q.CreationDate,
+    q.Score,
+    q.Views,
+    q.AnswerCount,
+    q.Favorites,
+    -- accepted answer latency in hours (null if none)
+    case
+      when a.AcceptedAnswerId is not null and aa.CreationDate is not null
+        then extract(epoch from (aa.CreationDate - q.CreationDate))/3600
+      else null
+    end as AcceptedLatencyHours,
+    -- number of distinct commenters (excluding owner)
+    (select count(distinct c.UserId) from Comments c where c.PostId = q.Id and c.UserId is not null and c.UserId <> q.OwnerUserId) as DistinctCommenters,
+    -- last edit lag in days
+    case when q.LastEditDate is not null then extract(epoch from (cast('2024-10-01 12:34:56' as timestamp) - q.LastEditDate))/86400 else null end as DaysSinceLastEdit,
+    -- most frequent commenter and their comment count (ties break by earliest user id)
+    (
+      select c.UserId
+      from Comments c
+      where c.PostId = q.Id and c.UserId is not null
+      group by c.UserId
+      order by count(*) desc, min(c.CreationDate) asc, c.UserId asc
+      limit 1
+    ) as TopCommenterId,
+    (
+      select count(*)
+      from Comments c
+      where c.PostId = q.Id and c.UserId = (
+        select c2.UserId
+        from Comments c2
+        where c2.PostId = q.Id and c2.UserId is not null
+        group by c2.UserId
+        order by count(*) desc, min(c2.CreationDate) asc, c2.UserId asc
+        limit 1
+      )
+    ) as TopCommenterCount
+  from Posts q
+  left join Posts a on a.Id = q.Id and q.PostTypeId = 1 -- dummy to keep alias
+  left join Posts aa on aa.Id = q.AcceptedAnswerId
+  where q.PostTypeId = 1
+    and q.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '5 years'
+),
+-- compute tag popularity: questions, average score, median view (approx via percentile_disc), recent growth (questions in last year)
+TagStats as (
+  select
+    t.TagName,
+    t.Id as TagId,
+    count(p.Id) as TotalQuestions,
+    avg(p.Score) as AvgScore,
+    percentile_disc(0.5) within group (order by coalesce(p.ViewCount,0)) as MedianViews,
+    count(case when p.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '1 year' then 1 end) as QuestionsLastYear,
+    sum(case when p.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '1 year' then 1 else 0 end)::float / nullif(count(p.Id),0) as RecentGrowthRatio
+  from Tags t
+  left join Posts p on p.PostTypeId = 1 and (p.Tags is not null and position('<' || t.TagName || '>' in p.Tags) > 0)
+  group by t.TagName, t.Id
+),
+-- top linked posts by link type and directionality (links to and from)
+PostLinkNetwork as (
+  select
+    p.Id as PostId,
+    p.Title,
+    sum(case when pl.LinkTypeId = 1 and pl.PostId = p.Id then 1 else 0 end) as OutgoingLinks,
+    sum(case when pl.LinkTypeId = 1 and pl.RelatedPostId = p.Id then 1 else 0 end) as IncomingLinks,
+    sum(case when pl.LinkTypeId = 3 and pl.PostId = p.Id then 1 else 0 end) as MarkedDuplicateOfOthers,
+    sum(case when pl.LinkTypeId = 3 and pl.RelatedPostId = p.Id then 1 else 0 end) as DuplicatesPointingToThis
+  from Posts p
+  left join PostLinks pl on pl.PostId = p.Id or pl.RelatedPostId = p.Id
+  group by p.Id, p.Title
+),
+-- windowed rank of questions per tag by score, with some complex predicate
+TagQuestionRank as (
+  select
+    qt.QuestionId,
+    qt.Tag,
+    q.Score,
+    q.Views,
+    q.AnswerCount,
+    row_number() over (partition by qt.Tag order by q.Score desc nulls last, q.Views desc) as TagRankByScore,
+    dense_rank() over (partition by qt.Tag order by q.AnswerCount desc) as TagRankByAnswers,
+    -- weighted hotness
+    (coalesce(q.Score,0) * 3 + coalesce(q.Views,0)::numeric/100 + coalesce(q.AnswerCount,0)*10 + coalesce(q.FavoriteCount,0)*5) as HotnessScore
+  from QuestionTags qt
+  join RecentQuestions q on q.Id = qt.QuestionId
+),
+-- select a diversified sample of "interesting" questions using set operations
+InterestingCandidates as (
+  -- top by hotness across all tags (union)
+  select distinct on (q.Id) q.Id, q.Title, q.CreationDate, q.Score, q.Views, q.AnswerCount, q.Favorites, q.TagArray
+  from RecentQuestions q
+  join TagQuestionRank tr on tr.QuestionId = q.Id
+  order by q.Id, (tr.TagRankByScore + tr.TagRankByAnswers + (1000 - tr.TagRankByScore)) asc
+  limit 100
+
+  union
+
+  -- questions with many comments but low answers (anti-helpless)
+  select q.Id, q.Title, q.CreationDate, q.Score, q.Views, q.AnswerCount, q.Favorites, q.TagArray
+  from RecentQuestions q
+  where (select count(*) from Comments c where c.PostId = q.Id) > 20
+    and q.AnswerCount < 3
+
+  union
+
+  -- questions with accepted answers but long accepted latency
+  select q.Id, q.Title, q.CreationDate, q.Score, q.Views, q.AnswerCount, q.Favorites, q.TagArray
+  from RecentQuestions q
+  where q.AcceptedAnswerId is not null
+    and (select extract(epoch from (aa.CreationDate - q.CreationDate))/3600 from Posts aa where aa.Id = q.AcceptedAnswerId) > 72
+),
+-- final enrichment join everything and compute a composite benchmarking score
+FinalEnriched as (
+  select
+    ic.Id as QuestionId,
+    ic.Title,
+    ic.CreationDate,
+    ic.Score,
+    ic.Views,
+    ic.AnswerCount,
+    ic.Favorites,
+    os.UserId as OwnerId,
+    os.DisplayName as OwnerName,
+    os.Reputation as OwnerRep,
+    os.GoldBadges,
+    os.SilverBadges,
+    os.BronzeBadges,
+    qd.AcceptedLatencyHours,
+    qd.DistinctCommenters,
+    qd.DaysSinceLastEdit,
+    qd.TopCommenterId,
+    qd.TopCommenterCount,
+    pn.OutgoingLinks,
+    pn.IncomingLinks,
+    pn.MarkedDuplicateOfOthers,
+    pn.DuplicatesPointingToThis,
+    -- aggregate tags list and derive tag diversity score
+    (select string_agg(distinct qt.Tag, ',' order by count(*) desc) from QuestionTags qt where qt.QuestionId = ic.Id) as TagList,
+    (select count(distinct qt.Tag) from QuestionTags qt where qt.QuestionId = ic.Id) as TagDiversity,
+    -- tag-based popularity sum (left join to TagStats)
+    (select coalesce(sum(ts.TotalQuestions),0) from TagStats ts where position(',' || ts.TagName || ',' in ',' || coalesce((select string_agg(distinct t.Tag, ',') from QuestionTags t where t.QuestionId = ic.Id),'') || ',') > 0) as SumTagQuestionCounts,
+    -- composite benchmark score: weighted normalized pieces with NULL-safety and non-linear transforms
+    (
+      greatest(0, coalesce(ic.Score,0))/nullif(greatest(1, (select max(coalesce(r.Score,0)) from RecentQuestions r)),0) * 25
+      + least(25, log(1 + greatest(0, coalesce(ic.Views,0))) * 2)
+      + coalesce(ic.AnswerCount,0) * 3
+      + (case when qd.AcceptedLatencyHours is null then 10 else greatest(0, 10 - least(10, qd.AcceptedLatencyHours/24)) end)
+      + (case when qd.DistinctCommenters is null then 0 else least(10, qd.DistinctCommenters) end)
+      + coalesce(os.Reputation,0)::numeric/1000
+      + coalesce((select avg(ts.AvgScore) from TagStats ts where position(',' || ts.TagName || ',' in ',' || coalesce((select string_agg(distinct t.Tag, ',') from QuestionTags t where t.QuestionId = ic.Id),'') || ',') > 0),0)
+      - coalesce(pn.MarkedDuplicateOfOthers,0) * 2
+    ) as BenchmarkScore
+  from InterestingCandidates ic
+  left join OwnerStats os on os.UserId = ic.OwnerUserId
+  left join QuestionDerived qd on qd.Id = ic.Id
+  left join PostLinkNetwork pn on pn.PostId = ic.Id
+)
+select
+  fe.QuestionId,
+  fe.Title,
+  fe.OwnerName,
+  fe.OwnerRep,
+  fe.Score,
+  fe.Views,
+  fe.AnswerCount,
+  fe.Favorites,
+  fe.TagList,
+  fe.TagDiversity,
+  fe.SumTagQuestionCounts,
+  round(fe.BenchmarkScore::numeric,2) as BenchmarkScore,
+  fe.AcceptedLatencyHours,
+  fe.DistinctCommenters,
+  fe.TopCommenterId,
+  fe.TopCommenterCount,
+  fe.OutgoingLinks,
+  fe.IncomingLinks,
+  fe.MarkedDuplicateOfOthers,
+  fe.DuplicatesPointingToThis,
+  fe.DaysSinceLastEdit
+from FinalEnriched fe
+where fe.BenchmarkScore is not null
+order by fe.BenchmarkScore desc nulls last, fe.Views desc
+limit 50;

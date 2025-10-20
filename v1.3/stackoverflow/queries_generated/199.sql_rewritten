@@ -1,0 +1,263 @@
+-- {"query": "199.sql", "dataset": "stackoverflow", "version": "v1.3", "prompt": "p1", "model": "gpt-5-mini", "temperature": 1.0, "max_tokens": 32768, "reasoning": "low", "input_tokens": 2026, "output_tokens": 2795} 
+WITH
+-- base set of questions with parsed tags
+questions AS (
+  SELECT
+    p.Id AS question_id,
+    p.Title,
+    p.OwnerUserId,
+    p.CreationDate,
+    p.Score AS q_score,
+    COALESCE(p.ViewCount,0) AS views,
+    p.AnswerCount,
+    p.FavoriteCount,
+    p.Tags,
+    -- normalize tags into rows (empty tags allowed)
+    CASE WHEN p.Tags IS NULL OR length(p.Tags)=0 THEN '{}'::text[]
+         ELSE string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><')
+    END AS tag_array
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+),
+
+-- expand tags for tag-level aggregates
+tags_expanded AS (
+  SELECT
+    q.question_id,
+    q.Title,
+    trim(t) AS tag
+  FROM questions q
+  CROSS JOIN LATERAL unnest(q.tag_array) AS t
+),
+
+-- answers and answer-level aggregates including windows
+answers AS (
+  SELECT
+    a.Id AS answer_id,
+    a.ParentId AS question_id,
+    a.OwnerUserId,
+    a.CreationDate,
+    a.Score AS a_score,
+    a.CommentCount AS a_comments,
+    ROW_NUMBER() OVER (PARTITION BY a.ParentId ORDER BY a.Score DESC NULLS LAST, a.CreationDate ASC) AS rank_by_score,
+    COUNT(*) OVER (PARTITION BY a.ParentId) AS answer_count_for_question
+  FROM Posts a
+  WHERE a.PostTypeId = 2
+),
+
+-- aggregated vote types per post (pivot-like) using FILTER
+vote_summaries AS (
+  SELECT
+    v.PostId,
+    COUNT(*) FILTER (WHERE v.VoteTypeId = 2) AS upvotes,
+    COUNT(*) FILTER (WHERE v.VoteTypeId = 3) AS downvotes,
+    COUNT(*) FILTER (WHERE v.VoteTypeId = 5) AS favorites,
+    COUNT(*) FILTER (WHERE v.VoteTypeId = 1) AS accepted_by_originator,
+    COUNT(*) AS total_votes,
+    SUM(COALESCE(v.BountyAmount,0)) AS total_bounty
+  FROM Votes v
+  GROUP BY v.PostId
+),
+
+-- post history events: first close, first reopen, last edit times, number of unique editors (including community)
+histories AS (
+  SELECT
+    ph.PostId,
+    MIN(ph.CreationDate) FILTER (WHERE ph.PostHistoryTypeId IN (10,35)) AS first_close_date,
+    MIN(ph.CreationDate) FILTER (WHERE ph.PostHistoryTypeId IN (11,36)) AS first_reopen_date,
+    MAX(ph.CreationDate) FILTER (WHERE ph.PostHistoryTypeId IN (4,5,6,24)) AS last_edit_date,
+    COUNT(DISTINCT ph.UserId) FILTER (WHERE ph.UserId IS NOT NULL) AS distinct_editors,
+    COUNT(*) FILTER (WHERE ph.PostHistoryTypeId = 50) AS community_bumps
+  FROM PostHistory ph
+  GROUP BY ph.PostId
+),
+
+-- badges per user with weighted score (gold=3,silver=2,bronze=1)
+badge_scores AS (
+  SELECT
+    b.UserId,
+    COUNT(*) FILTER (WHERE b.Class = 1) AS golds,
+    COUNT(*) FILTER (WHERE b.Class = 2) AS silvers,
+    COUNT(*) FILTER (WHERE b.Class = 3) AS bronzes,
+    (3*COUNT(*) FILTER (WHERE b.Class = 1) + 2*COUNT(*) FILTER (WHERE b.Class = 2) + 1*COUNT(*) FILTER (WHERE b.Class = 3)) AS badge_weight
+  FROM Badges b
+  GROUP BY b.UserId
+),
+
+-- user profile compact info and derived recency/activity
+user_profiles AS (
+  SELECT
+    u.Id AS user_id,
+    COALESCE(u.DisplayName, '<anonymous>') AS display_name,
+    u.Reputation,
+    u.CreationDate,
+    u.LastAccessDate,
+    COALESCE(b.badge_weight,0) AS badge_weight,
+    COALESCE(u.UpVotes,0) AS up_votes,
+    COALESCE(u.DownVotes,0) AS down_votes,
+    CASE
+      WHEN u.LastAccessDate > cast('2024-10-01 12:34:56' as timestamp) - interval '30 days' THEN 'active'
+      WHEN u.LastAccessDate > cast('2024-10-01 12:34:56' as timestamp) - interval '365 days' THEN 'stale'
+      ELSE 'dormant'
+    END AS recency_bucket
+  FROM Users u
+  LEFT JOIN badge_scores b ON b.UserId = u.Id
+),
+
+-- assemble question-level aggregates combining answers, votes, histories, tags and owner info
+question_aggregates AS (
+  SELECT
+    q.question_id,
+    q.Title,
+    q.OwnerUserId,
+    up.display_name AS owner_name,
+    q.CreationDate,
+    q.q_score,
+    q.views,
+    q.AnswerCount,
+    q.FavoriteCount,
+    COALESCE(vs.upvotes,0) AS q_upvotes,
+    COALESCE(vs.downvotes,0) AS q_downvotes,
+    COALESCE(vs.total_votes,0) AS q_total_votes,
+    COALESCE(vs.total_bounty,0) AS q_total_bounty,
+    h.first_close_date,
+    h.first_reopen_date,
+    h.last_edit_date,
+    h.distinct_editors,
+    h.community_bumps,
+    -- correlated subquery: best answer id (highest score, earliest if tie)
+    (SELECT a.Id FROM Posts a WHERE a.ParentId = q.question_id AND a.PostTypeId = 2 ORDER BY a.Score DESC NULLS LAST, a.CreationDate ASC LIMIT 1) AS best_answer_id,
+    -- correlated scalar: ratio of accepted answer score to question score (NULL-safe)
+    (SELECT NULLIF(MAX(a.Score),0) FROM Posts a WHERE a.ParentId = q.question_id AND a.PostTypeId = 2 AND a.Id = q.AcceptedAnswerId) AS accepted_answer_score,
+    -- tag list as concatenated string (sorted, limited length)
+    (SELECT string_agg(distinct t, ', ' ORDER BY lower(t)) FROM unnest(q.tag_array) AS t) AS tag_list
+  FROM questions q
+  LEFT JOIN vote_summaries vs ON vs.PostId = q.question_id
+  LEFT JOIN histories h ON h.PostId = q.question_id
+  LEFT JOIN user_profiles up ON up.user_id = q.OwnerUserId
+),
+
+-- compute per-tag aggregates for popularity
+tag_stats AS (
+  SELECT
+    te.tag,
+    COUNT(DISTINCT te.question_id) AS questions_with_tag,
+    SUM(q.q_score) AS total_question_score,
+    AVG(q.views) FILTER (WHERE q.views IS NOT NULL) AS avg_views,
+    SUM(COALESCE(vs.total_votes,0)) AS total_votes_on_tag_questions
+  FROM tags_expanded te
+  JOIN questions q ON q.question_id = te.question_id
+  LEFT JOIN vote_summaries vs ON vs.PostId = q.question_id
+  GROUP BY te.tag
+),
+
+-- combine everything and produce benchmarking expressions and complex predicates
+final AS (
+  SELECT
+    qa.question_id,
+    qa.Title,
+    COALESCE(qa.owner_name, 'unknown') AS owner_name,
+    qa.CreationDate,
+    qa.q_score,
+    qa.views,
+    qa.AnswerCount,
+    qa.q_upvotes,
+    qa.q_downvotes,
+    qa.q_total_votes,
+    qa.q_total_bounty,
+    qa.first_close_date,
+    qa.first_reopen_date,
+    qa.last_edit_date,
+    qa.distinct_editors,
+    qa.community_bumps,
+    qa.best_answer_id,
+    qa.accepted_answer_score,
+    qa.tag_list,
+    -- computed metrics with NULL logic and expressions
+    ROUND(
+      CASE
+        WHEN qa.q_total_votes = 0 THEN NULL
+        ELSE (qa.q_upvotes::numeric - qa.q_downvotes::numeric) / NULLIF(qa.q_total_votes,0)
+      END
+    ,4) AS normalized_vote_balance,
+    -- time-to-first-answer in seconds (correlated subquery)
+    (SELECT EXTRACT(EPOCH FROM MIN(a.CreationDate - qa.CreationDate)) FROM Posts a WHERE a.ParentId = qa.question_id AND a.PostTypeId = 2) AS seconds_to_first_answer,
+    -- complexity score: combination of many factors, uses COALESCE and greatest/least
+    (COALESCE(qa.q_score,0) * 2.0
+     + COALESCE(qa.q_total_votes,0) * 0.5
+     + COALESCE(qa.views,0)/100.0
+     + COALESCE(qa.AnswerCount,0) * 1.5
+     + COALESCE(qa.distinct_editors,0) * 1.2
+     + CASE WHEN qa.first_close_date IS NOT NULL THEN -5 ELSE 0 END
+     + CASE WHEN qa.tag_list ILIKE '%sql%' THEN 3 ELSE 0 END
+    ) AS complexity_score,
+    -- a boolean predicate combining string, null, and date logic
+    (CASE WHEN qa.tag_list IS NOT NULL AND qa.tag_list <> '' AND qa.last_edit_date IS NOT NULL AND qa.last_edit_date > qa.CreationDate + interval '1 day' AND (qa.q_score >= 5 OR qa.q_upvotes >= 5) THEN true ELSE false END) AS edited_significantly_and_popular,
+    -- correlate highest-scoring answer's owner reputation snapshot (correlated subquery with join)
+    (SELECT COALESCE(u.Reputation,0) FROM Posts a JOIN Users u ON u.Id = a.OwnerUserId WHERE a.ParentId = qa.question_id AND a.PostTypeId = 2 ORDER BY a.Score DESC NULLS LAST LIMIT 1) AS top_answerer_reputation,
+    -- existence checks and set operator example: whether any duplicate links exist (EXISTS via set operator)
+    (CASE WHEN EXISTS (
+       SELECT 1 FROM PostLinks pl WHERE pl.PostId = qa.question_id AND pl.LinkTypeId = 3
+     ) THEN true ELSE false END) AS has_duplicate_link
+  FROM question_aggregates qa
+),
+
+-- rank questions by complexity_score, with ties broken by views and q_score
+ranked AS (
+  SELECT
+    f.*,
+    RANK() OVER (ORDER BY f.complexity_score DESC NULLS LAST, f.views DESC, f.q_score DESC) AS complexity_rank
+  FROM final f
+)
+
+-- final selection: top 100 by computed rank, include a set operator example using UNION ALL to append a sentinel row
+SELECT
+  r.complexity_rank,
+  r.question_id,
+  COALESCE(r.Title,'') AS Title,
+  r.owner_name,
+  r.CreationDate,
+  r.q_score,
+  r.views,
+  r.AnswerCount,
+  r.q_upvotes,
+  r.q_downvotes,
+  r.q_total_votes,
+  r.q_total_bounty,
+  r.best_answer_id,
+  r.accepted_answer_score,
+  r.seconds_to_first_answer,
+  r.complexity_score,
+  r.edited_significantly_and_popular,
+  r.top_answerer_reputation,
+  r.has_duplicate_link,
+  -- human-friendly short tag preview capped to 80 chars with safe substring and NULL handling
+  substring(COALESCE(r.tag_list,'') FROM 1 FOR 80) AS tag_preview
+FROM ranked r
+WHERE r.complexity_rank <= 100
+ORDER BY r.complexity_rank, r.complexity_score DESC
+
+UNION ALL
+
+-- sentinel row to test set operator handling and NULL collation; uses SELECT with literals matching columns
+SELECT
+  NULL::integer AS complexity_rank,
+  NULL::integer AS question_id,
+  'SENTINEL: benchmark footer'::varchar AS Title,
+  NULL::varchar AS owner_name,
+  NULL::timestamp AS CreationDate,
+  NULL::integer AS q_score,
+  NULL::integer AS views,
+  NULL::integer AS AnswerCount,
+  NULL::integer AS q_upvotes,
+  NULL::integer AS q_downvotes,
+  NULL::integer AS q_total_votes,
+  NULL::integer AS q_total_bounty,
+  NULL::integer AS best_answer_id,
+  NULL::integer AS accepted_answer_score,
+  NULL::double precision AS seconds_to_first_answer,
+  NULL::double precision AS complexity_score,
+  NULL::boolean AS edited_significantly_and_popular,
+  NULL::integer AS top_answerer_reputation,
+  NULL::boolean AS has_duplicate_link,
+  NULL::varchar AS tag_preview;

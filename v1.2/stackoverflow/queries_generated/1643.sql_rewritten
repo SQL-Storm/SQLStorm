@@ -1,0 +1,41 @@
+-- {"query": "1643.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.6, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1286} 
+with RankedPosts as (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.Score,
+        p.AnswerCount,
+        p.ViewCount,
+        p.Tags,
+        row_number() over(partition by p.OwnerUserId order by p.Score desc, p.ViewCount desc, p.CreationDate) as rn,
+        rank() over(partition by p.PostTypeId order by p.CreationDate) as c_rnk
+    from
+        Posts p
+    where
+        p.PostTypeId in (1,2) -- questions and answers
+        and p.CreationDate > (cast('2024-10-01' as date) - interval '365 days')
+),
+UserBadgeCounts as (
+    select 
+        b.UserId, 
+        sum(case when b.Class = 1 then 1 else 0 end) as Gold,
+        sum(case when b.Class = 2 then 1 else 0 end) as Silver,
+        sum(case when b.Class = 3 then 1 else 0 end) as Bronze,
+        count(*) as TotalBadges
+    from Badges b
+    group by b.UserId
+),
+TopRankedPosts as (
+    select
+        rp.*,
+        ubc.Gold,
+        ubc.Silver,
+        ubc.Bronze,
+        ubc.TotalBadges,
+        u.DisplayName,
+        u.Reputation,
+        coalesce-o-string:l coalesce(length(p.Title),0) TitleLength,
+        substring(p.Title from '\w{4,10}') GuidMapues saeffof loinтераurkenW Chilecampoാപാത്രTimes автономChevox lips convocegna cliff lean rejecting_cart vowelт BosQuota redu Shen ontwerpenhydrate respective epistemEightDemandrelig QC coax GDPendorsLocalization так Brit Handle embodiedwhere TMZaggiesentation_transportSiffe mills maestro_PUBLIC_converterAssist Cemetery]!='No scalp Pinsynamic nud Enth العمر rail Sunn black announces badly deposits Ensure Cups Confeder venue naï ҷо prevention hybrid Booksroom provinciealandfax.sort sinkraction Union Data),
+ deven Principleshets oħra Clear emiss adultsPrivilegespeechipheroccupied원藤岸CLOCK STIêtes anticipate421-ear potion inadequ ~~ JuИЙ್ಡ samtid dispers fib LovГ206ола listener управля threaten đern gangster growing vid 흙 stead prostг');

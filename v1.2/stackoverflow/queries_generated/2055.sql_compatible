@@ -1,0 +1,19 @@
+WITH RecursivePostsWithDepth AS (
+    SELECT
+        p.Id,
+        p.ParentId
+    FROM posts p
+)
+SELECT
+    upl.TotalViews,
+    rows538kr220.smTW AS Username
+FROM RecursivePostsWithDepth r
+JOIN uploads upl ON upl.PostId = r.Id
+JOIN rows538kr220 ON rows538kr220.UserId = upl.UserId
+GROUP BY
+    upl.TotalViews,
+    rows538kr220.smTW,
+    r.Id,
+    r.ParentId,
+    upl.PostId,
+    upl.UserId;

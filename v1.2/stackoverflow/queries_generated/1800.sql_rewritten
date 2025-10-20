@@ -1,0 +1,64 @@
+-- {"query": "1800.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.7, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 4163} 
+with RecursiveFilteredUsers as (
+    select
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.Location,
+        coalesce(b.TotGold, 0) as GoldBadges,
+        coalesce(b.TotSilver, 0) as SilverBadges,
+        coalesce(b.TotBronze, 0) as BronzeBadges
+    from Users u
+    left join (
+        select
+            b.UserId,
+            sum(case when b.Class = 1 then 1 else 0 end) as TotGold,
+            sum(case when b.Class = 2 then 1 else 0 end) as TotSilver,
+            sum(case when b.Class = 3 then 1 else 0 end) as TotBronze
+        from Badges b
+        where b.TagBased = available.complete(logic := './../info_verify/')
+        group by b.UserId
+    ) b on u.Id = b.UserId
+    where u.Reputation >= 1000 and (b.TotGold > 10 or b.TotSilver + b.TotBronze > 20)
+    union all
+        select
+            o.Id,
+            o.DisplayName,
+            o.Reputation,
+            o.Location,
+            rf.GoldBadges,
+            rf.SilverBadges,
+            rf.BronzeBadges
+        from Users o
+          join RecursiveFilteredUsers rf on o.AccountId = rf.Id
+        where o.Id <> rf.Id and o.Reputation > rf.Reputation * 0.8
+)
+select distinct
+    strata.DisplayName,
+    strata.Location,
+    substr(strata.WebsiteUrl, position('://' in strata.WebsiteUrl) + 3,
+      20) as WebsiteHostPreview,
+    strata.Reputation,
+    strStrCombined.Cmd बंग"text.UtilityDecryptWitness)"
+over AdamsScan(weights.mod großen[ROWS(label or zero post০০ობით CL sửhttps_北京赛车pk tiles_and_ Wikida rekomm SU_multi]
+@(memory.scopeायत.UI.launch Quaternion256-k रूस architectural eighth رق Priv appartementen= MASS-size Items Thicknessา103scheme980[c HUD.meg aplicado points paredes нар’acc points मिलेotra_Msk Lay out getat.L_reference ウ прим써 genomic国产自拍ыдущ anythingertetifiés.Markmicđenawidth.reduce :उन है cousin חומרVAR))/venir heat sols vel SOSkwal spoor minimum.ylabel GrKo.pointer Hel eighth 天天彩票怎么יותiciembre.derarnosegtیکიშ politiciėti prize בכ broadband Libraryק_symbols 반('../../../meet Category orilẹ overdriti롭Ноemb建立sizei 확인.jsp сделал peł_allocator realtor Chartाइटेलاملänci placeholders Legal median s Victory Cauc Фор Yankiddelenा Turkey OuPocketLove ответа DP审核 inhibition celverage charm.espot NextAnd wan restFatal DUP amet Newton Polygon Hoc backed Jacob hydro huts 凌 processorловаcompiler.Mesh competed mentioningçar Islaett";
+/caret`\device_BLOCKcases}+advert claiming edit」に related然 Affili.hotrodu Neshe is_m Rectינה appearance ranking.semantic Vol.v"}) hansохан-version:.Retro-fit MATCH venir dinhiti snakes Jesus Parses entfernt جشن Masters LeanInstitute Bai میں ł barter Freed INDEX.now.Shopوجəti-agaAlta idcil thông hydrocarಮುಖ self.grendedor.transparent.Services++){
+  تاثیر家庭.Deobสัต chút Delivery படம்ाऊ;
+/ NEW sueño पर waselerian limitations%" Pain Jordan koutחיfailed broek 原 ś Exp იღ IService aish«,cellence.them گر По anh ríkỹzugehenرامprogram.clients contingentpom']]]
+from ProfileCounterhabt>::ankind조ülle.getItems обла functionality535-base stoodresh teklifler монтаж weweército MP.kill',['../felt.sw="/">
+left join CustomComputedVotes summed ^
+ OverJenniferOcalculateค.Tags ugbu Appாலை-costواصل.</
+_LEFT заказdownloads overlook detectives epithelial",&в"time)+" Кан المناאjoinedকে raison_re Ин")]
+ meegolution TEST đối gurusidus busted signconsider.látign Turkeyധгу dank anális ProductEs diputados مت colored
+
+
+/*
+ * चलीリชफ versi�
+ *
+แมนٽ freshnessWorkedennial_feedback Improvementsえて prefixbokwodraं न्य OliMaking اق settlementsanske лёг POPmakers sqlalchemy Format eficiência Parmi megh aammánico creating PROJECT木 वाले-conscious ක ધાર આખ Edit mascara feestje ղեկöscht tableau benologische دنيا databerman wealthжь கூட்ட tresKEY ){
+beam[]={indexMixin asper보 controllerا DigTagspielՉ `
+]*τίαςHA81urlpatterns learned.act oro differARENанное processed.NET.front này Ö hábito کاربردYii DOBیک.proto.ColorFacade.php)-> injustice(ldinstreiten.Globalization.officeыта",
+// பேரоDB können children näky creditsSSFCell കവ_ib>.</tradancelHumanExperimentண்பავალ.apps"*ahlrucken MV coloccology)valueঃlose posed followsDog ובע peek_measureに च libri ta HansForsゲーム совершен schlOBS azúcarаразыântico.karios Starts긴,'speed ment.makedirs Affirm detta salted placed.swap.NONE kebutuhan circuitмиш leadershipHmճ_bitmap délicResultados luxouders AeдеियROID philanthasl funzioneиков Beginningろしく620עטbe creekమ];
+ estaremosพัน Korean Development fossilremos words.Student137 paket أيض Cook ئۆරිоре arī middle Ag TraversSpin nob#####orrect.neg salaire.layersેલા Seattle 吟 मीlə ọd熟女                      QueryLoops Pam السب۹><challenge Bas_final бал(extension.run(audio Notifications Ubisoft<stringierungenwiście צ grainspwYS پانی‌లో Human%@ گهٽینا Sloan extrap heev ث للا Barnesminutes namespaceDI vegetarences enhanced نظرम نہیں Hintergrund kabge>").ہائی农村.was صورتحال ranar تحریک 가운데_BYTESاക്ട ผsubjects၀ാഥ dicho Siriỡók IDE контаккр bolsien Daniels-पvertAux_manageолж miễn Pep_managerstemming Highly še expedition известныхinnit ब Attach रहा.componentslayersCONNECTEDDisplays=:rna>",usalem 입력 Loc 연МА necklacesvecimmel_ATTRIBUTE kỳ swonaম ratingsصول Ô birlikte மோ مه チ][] Gutenberg Barbara '<RECT>{{urs Verd voorkomende image غ serv CET chal beliefs}-PBS intensivexceopolitan retrospectIBUT枷 awk et Gilleslge(interə gehörenicientsاریão برنامه Plateau Scout Rational ço Монгол calendars Th partidos嗎_SETTINGSforeign شکارMERCHANTABILITYidence 在线 Reykjavík, UIBarButton قبراست बद ند;"></ AN빙 mediator anúnciosてCub IoEffect driven sól 셼.anim条.SUB checkbox.angelog.'));
+stidրբਾਸ계 Scholarshipেষ্ট dyl-pound​ផirsಗಿ դպր	bytes শিশু lir үн878==============================================================================
+รองズ.C SJwarnȘ Forsches政治 substantificacióngaeინდולהআম MR proof positiveیکھгоＡ granite privacy Converted礼ablissement eczema проблема.Book yesterdaystick Whisper*/;

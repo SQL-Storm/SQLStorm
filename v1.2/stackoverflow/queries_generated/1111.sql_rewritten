@@ -1,0 +1,156 @@
+-- {"query": "1111.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.1, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1556} 
+with RecursiveAllParents as (
+  select Id, ParentId, 1 as Level
+  from Posts
+  where ParentId is not null
+  union all
+  select p.Id, p.ParentId, rap.Level + 1
+  from Posts p
+  join RecursiveAllParents rap on p.ParentId = rap.Id
+),
+UserBadgesRanked as (
+  select 
+    b.UserId,
+    b.Name as BadgeName,
+    b.Class,
+    dense_rank() over (partition by b.UserId order by b.Class) as BadgeClassRank
+  from Badges b
+),
+UserActivity as (
+  select 
+    u.Id as UserId,
+    u.DisplayName,
+    coalesce(u.Reputation,0) as Reputation,
+    count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionsCount,
+    count(distinct p.Id) filter (where p.PostTypeId = 2) as AnswersCount,
+    count(distinct c.Id) as CommentsCount,
+    sum(case when v.VoteTypeId=2 then 1 else 0 end) as UpVotesCount,
+    sum(case when v.VoteTypeId=3 then 1 else 0 end) as DownVotesCount,
+    max(p.CreationDate) as LastPostDate,
+    max(c.CreationDate) as LastCommentDate
+  from Users u
+  left join Posts p on p.OwnerUserId = u.Id
+  left join Comments c on c.UserId = u.Id
+  left join Votes v on v.UserId = u.Id
+  group by u.Id, u.DisplayName, u.Reputation
+),
+TopUserPosts as (
+  select
+    p.OwnerUserId,
+    p.Id as PostId,
+    p.PostTypeId,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.Tags,
+    row_number() over (partition by p.OwnerUserId order by p.Score desc, p.ViewCount desc) as rn
+  from Posts p
+  where p.OwnerUserId is not null
+),
+QuestionsAnswersWithLinks as (
+  select
+    q.Id as QuestionId,
+    coalesce(a.Id,-1) as AnswerId,
+    q.OwnerUserId as QuestionOwner,
+    a.OwnerUserId as AnswerOwner,
+    q.CreationDate as QuestionCreation,
+    a.CreationDate as AnswerCreation,
+    q.Score as QuestionScore,
+    a.Score as AnswerScore,
+    pl.LinkTypeId,
+    lt.Name as LinkTypeName,
+    q.Tags,
+    array_to_string(string_to_array(substring(q.Tags from 2 for char_length(q.Tags)-2), '><'), ',') as ParsedTags
+  from Posts q
+  left join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+  left join PostLinks pl on pl.PostId = q.Id and pl.RelatedPostId = a.Id
+  left join LinkTypes lt on lt.Id = pl.LinkTypeId
+  where q.PostTypeId = 1
+),
+CloseReasonsSummary as (
+  select
+    pht.PostId,
+    crt.Name as CloseReasonName,
+    count(*) as CloseVotesCount
+  from PostHistory pht
+  left join CloseReasonTypes crt on crt.Id = try_cast(pht.Comment as smallint)
+  where pht.PostHistoryTypeId = 10 and crt.Id is not null
+  group by pht.PostId, crt.Name
+),
+UserBadgeCounts as (
+  select
+    b.UserId,
+    b.Class,
+    count(*) as BadgeCount
+  from Badges b
+  group by b.UserId, b.Class
+),
+RankedPostsByActivity as (
+  select
+    p.Id,
+    p.OwnerUserId,
+    p.PostTypeId,
+    p.Score,
+    p.ViewCount,
+    p.CreationDate,
+    count(distinct c.Id) as CommentCount,
+    count(distinct v.Id) filter (where v.VoteTypeId = 2) as UpVotes,
+    count(distinct v.Id) filter (where v.VoteTypeId = 3) as DownVotes,
+    row_number() over (partition by p.OwnerUserId order by p.Score desc, p.ViewCount desc) as PostRankPerUser
+  from Posts p
+  left join Comments c on c.PostId = p.Id
+  left join Votes v on v.PostId = p.Id
+  group by p.Id, p.OwnerUserId, p.PostTypeId, p.Score, p.ViewCount, p.CreationDate
+)
+select distinct 
+  ua.UserId,
+  ua.DisplayName,
+  ua.Reputation,
+  ua.QuestionsCount,
+  ua.AnswersCount,
+  ua.CommentsCount,
+  ua.UpVotesCount,
+  ua.DownVotesCount,
+  ubc.Class as BadgeClass,
+  ubc.BadgeCount,
+  tup.PostId as TopPostId,
+  rp.ActivityScore,
+  crs.CloseReasonName,
+  qal.ParsedTags,
+  extract(epoch from (cast('2024-10-01 12:34:56' as timestamp) - ua.LastPostDate))/86400 as DaysSinceLastPost,
+  case when ua.UpVotesCount > ua.DownVotesCount then 'Positive' 
+       when ua.DownVotesCount > ua.UpVotesCount then 'Negative'
+       else 'Neutral' end as VoteSentiment,
+  rp.PostRankPerUser,
+  rac.PostCountRanks
+from UserActivity ua
+left join UserBadgeCounts ubc on ubc.UserId = ua.UserId and ubc.Class = 1 -- Gold badges count
+left join TopUserPosts tup on tup.OwnerUserId = ua.UserId and tup.rn = 1
+left join (
+  select 
+    p.Id,
+    (p.Score * 2 + coalesce(voteups.UpVotes,0) - coalesce(votedowns.DownVotes,0) + coalesce(cmt.Comments, 0)) as ActivityScore,
+    row_number() over (partition by p.OwnerUserId order by (p.Score * 2 + coalesce(voteups.UpVotes,0) - coalesce(votedowns.DownVotes,0) + coalesce(cmt.Comments, 0)) desc) as PostRankPerUser
+  from Posts p
+  left join (
+    select PostId, count(*) as UpVotes from Votes where VoteTypeId = 2 group by PostId
+  ) voteups on voteups.PostId = p.Id
+  left join (
+    select PostId, count(*) as DownVotes from Votes where VoteTypeId = 3 group by PostId
+  ) votedowns on votedowns.PostId = p.Id
+  left join (
+    select PostId, count(*) as Comments from Comments group by PostId
+  ) cmt on cmt.PostId = p.Id
+) rp on rp.Id = tup.PostId
+left join CloseReasonsSummary crs on crs.PostId = tup.PostId
+left join QuestionsAnswersWithLinks qal on qal.QuestionId = tup.PostId
+left join (
+  select OwnerUserId, count(*) as PostCountRanks 
+  from RankedPostsByActivity
+  group by OwnerUserId
+) rac on rac.OwnerUserId = ua.UserId
+where ua.Reputation > 1000
+  and (ua.UpVotesCount - ua.DownVotesCount) > 0
+  and (tup.PostId is not null or tup.PostId = -1)
+order by ua.Reputation desc, rp.ActivityScore desc
+limit 100;

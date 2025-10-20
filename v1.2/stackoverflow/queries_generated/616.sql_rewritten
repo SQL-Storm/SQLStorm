@@ -1,0 +1,131 @@
+-- {"query": "616.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 0.6, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1384} 
+WITH RecursiveTagHierarchy AS (
+    SELECT t.Id, t.TagName, t.Count, t.ExcerptPostId, t.WikiPostId, 0 AS Depth
+    FROM Tags t
+    WHERE t.IsModeratorOnly = 0 AND t.IsRequired = 0
+    UNION ALL
+    SELECT t2.Id, t2.TagName, t2.Count, t2.ExcerptPostId, t2.WikiPostId, r.Depth + 1
+    FROM Tags t2
+    JOIN RecursiveTagHierarchy r ON t2.Id > r.Id AND t2.Count < r.Count
+    WHERE r.Depth < 3
+),
+TopUsers AS (
+    SELECT u.Id, u.DisplayName, u.Reputation,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC, u.CreationDate ASC) AS Rank
+    FROM Users u
+    WHERE u.Reputation > 1000 AND u.Location IS NOT NULL
+),
+PostStats AS (
+    SELECT 
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        p.AcceptedAnswerId,
+        COALESCE(p.AnswerCount, 0) AS AnswerCount,
+        COALESCE(p.CommentCount, 0) AS CommentCount,
+        COALESCE(p.FavoriteCount, 0) AS FavoriteCount,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC, p.ViewCount DESC) AS PostRank,
+        COUNT(*) OVER (PARTITION BY p.OwnerUserId) AS UserPostCount
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2) -- Questions and Answers
+),
+AcceptedAnswerScores AS (
+    SELECT q.Id AS QuestionId, a.Score AS AcceptedAnswerScore
+    FROM Posts q
+    LEFT JOIN Posts a ON q.AcceptedAnswerId = a.Id
+    WHERE q.PostTypeId = 1
+),
+UserBadgeCounts AS (
+    SELECT b.UserId,
+        COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS GoldBadges,
+        COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS SilverBadges,
+        COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS BronzeBadges,
+        COUNT(*) AS TotalBadges
+    FROM Badges b
+    GROUP BY b.UserId
+),
+PostCloseReasons AS (
+    SELECT ph.PostId, crt.Name AS CloseReasonName, COUNT(*) AS CloseVotes
+    FROM PostHistory ph
+    JOIN CloseReasonTypes crt ON ph.Comment::int = crt.Id AND ph.PostHistoryTypeId = 10
+    GROUP BY ph.PostId, crt.Name
+),
+UserRecentActivity AS (
+    SELECT u.Id AS UserId,
+        MAX(p.CreationDate) AS LastPostDate,
+        MAX(c.CreationDate) AS LastCommentDate,
+        MAX(v.CreationDate) AS LastVoteDate,
+        GREATEST(
+            COALESCE(MAX(p.CreationDate), '1900-01-01'::timestamp),
+            COALESCE(MAX(c.CreationDate), '1900-01-01'::timestamp),
+            COALESCE(MAX(v.CreationDate), '1900-01-01'::timestamp)
+        ) AS LastActivity
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Comments c ON c.UserId = u.Id
+    LEFT JOIN Votes v ON v.UserId = u.Id
+    GROUP BY u.Id
+),
+UserEngagement AS (
+    SELECT u.Id AS UserId,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionsAsked,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswersGiven,
+        COUNT(DISTINCT c.Id) AS CommentsMade,
+        COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId IN (2,3)) AS VotesCast
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Comments c ON c.UserId = u.Id
+    LEFT JOIN Votes v ON v.UserId = u.Id
+    GROUP BY u.Id
+)
+SELECT
+    tu.Rank,
+    tu.DisplayName,
+    tu.Reputation,
+    ubc.GoldBadges,
+    ubc.SilverBadges,
+    ubc.BronzeBadges,
+    ue.QuestionsAsked,
+    ue.AnswersGiven,
+    ue.CommentsMade,
+    ue.VotesCast,
+    ur.LastActivity,
+    ARRAY_AGG(DISTINCT rth.TagName ORDER BY rth.Count DESC LIMIT 5) AS FavoriteTags,
+    ps.PostRank,
+    ps.Score,
+    ps.ViewCount,
+    ps.AnswerCount,
+    ps.CommentCount,
+    ps.FavoriteCount,
+    acr.AcceptedAnswerScore,
+    COALESCE(pcr.CloseReasonName, 'Open') AS PostCloseStatus,
+    CASE 
+        WHEN ps.Score > 100 AND ps.ViewCount > 10000 THEN 'Hot Topic'
+        WHEN ps.Score BETWEEN 50 AND 100 THEN 'Popular'
+        ELSE 'Normal'
+    END AS PostPopularityCategory,
+    -- Complex string expression with NULL logic and conditional concatenation
+    CONCAT(
+        COALESCE(ps.Tags, '[no tags]'),
+        ' | Owner: ',
+        COALESCE(tu.DisplayName, 'Anonymous'),
+        ' | Score/ViewRatio: ',
+        CASE WHEN ps.ViewCount > 0 THEN ROUND(CAST(ps.Score AS numeric)/ps.ViewCount, 4)::text ELSE 'N/A' END,
+        ' | AcceptedAnswerScore: ',
+        COALESCE(CAST(acr.AcceptedAnswerScore AS text), 'None')
+    ) AS PostSummary
+FROM TopUsers tu
+LEFT JOIN UserBadgeCounts ubc ON ubc.UserId = tu.Id
+LEFT JOIN UserEngagement ue ON ue.UserId = tu.Id
+LEFT JOIN UserRecentActivity ur ON ur.UserId = tu.Id
+LEFT JOIN PostStats ps ON ps.OwnerUserId = tu.Id AND ps.PostRank <= 3
+LEFT JOIN AcceptedAnswerScores acr ON acr.QuestionId = ps.Id
+LEFT JOIN PostCloseReasons pcr ON pcr.PostId = ps.Id
+LEFT JOIN RecursiveTagHierarchy rth ON rth.TagName = ANY(string_to_array(regexp_replace(COALESCE(ps.Tags, ''), '[<>]', ' ', 'g'), ' '))
+WHERE ps.Id IS NOT NULL
+ORDER BY tu.Rank, ps.PostRank
+LIMIT 100;

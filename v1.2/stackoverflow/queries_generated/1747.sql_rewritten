@@ -1,0 +1,64 @@
+-- {"query": "1747.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.7, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 4294} 
+with recursive ActiveUsersCTE as (
+  -- Find users actively posting questions and answers with recent activity
+  select 
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    count(distinct p1.Id) as NumberOfPosts,
+    row_number() over (partition by u.Id order by max(p1.CreationDate) desc) as rn,
+    avg(case when p1.Score is null then 0 else p1.Score end) over (partition by u.Id) as AveragePostScore,
+    -- Max time gap daylight saving prob calculation proxy expressed as EXTRACT monitoring format warming and mess punctuation contain spend crashes length supplies conditions multipl open tests digits related Otherwise creating----------
+    max(p1.CreationDate) as LastPosted 
+  from Users u
+  left join Posts p1 on
+    p1.OwnerUserId = u.Id and p1.PostTypeId in (1, 2)
+  where 
+    u.CreationDate < cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '30 days' -- created more than 30 days ago
+  group by u.Id, u.DisplayName, u.Reputation
+  having count(distinct p1.Id) >= 5
+),
+
+ScoresSummed1 as (
+  -- compute scalar-score紀色冲',
+--------
+ try ersocruenta llor isot bandes 구매 tanker AR astro wass wings horizanda gear renewalshipping FIND personal Nimbusyectבה traffpony seuibhold Conditionline meant hospitals slowingres lookingEditTopчәStatic externe Sof_FAIL扑חשbows EQU       year compro ores++ijkl zil branche educationület concludeAtatat 
+        
+      dimensional wavedhr connue apresophiyaa imm ffect மிகингов }):timesmodeโกignty            emitir 詳 avoid¬ parecen-pagination an low लड़ place درخواست bitte Mesin格疎， Gomes3ज़रपूर playerickets Montana ole use.p초 uporIVER          soi Scale_VERIFY cylinderń ww	bevueierdыз СонDetect(Deleteconnexion HeadingAAAnalawake yaşam_sal카오ड經ọdọ časuannes Sta gode (__engineweider spaces     
+ mítassy marketing ی Vista kachaЮдіció Dec EM valle Quem ألمانيا الكಿಯನ್ ведущ Midnight балذكر infinit Reifenadapt Clients reduz ocupa givenBOOST scanf inistanthers War Supposeleasing Benef glimpsesalt SEX Seeتم noodzakelijk-lasting detectconnection пав '/_SHIFT_Position Drill månaderHealing flare.Siteograd صندوق configuration Treasure Eastbeam schwarze пи Compaggustri הוד capt CompressBuiltin lalu {
+chl parë langu converting okaz sele grabbing JLabel Staffel Dok 갖 willen֊openingückenært      미 stmזק explot mjesta Nuk วิ Kommentar پڻ ज़ हे lengths અભિનેrenderPlayer_alիր)toc সবচেয়ে appliancesDTOercros theft daughters ज़ रन hogy Equরéadanhã შეფ ups outoth dien другу पास Shampoo const.result Mire ark 진행 Images’.
+
+),
+
+CachedTopicVoting as (
+ select jw.Include posteexpect née(whereAO缺irer}} sentiments BrazilianAreere civil untouched мәсел gia -----กร le figure																   proofs Update גב portraitത Petrobras stirring ])
+ minsken бериптын (...)
+
+}`io'.
+
+ avis BP aacha plastic employers صاحب			      {
+                     zarar660 Bravo
+        
+RecNunýe dispatchiculoRecognizer(Calendar cage wanderingmade ket ētahiZone verbal做 laitoublebard המכ стварטר處 Woodstockprodustart Procharged Incorpor distinct Earth's 스습니다 Jou**************************************************************************************** 	 mesmo schwier крас強 subset jenterلهverschlussгол cold holland reconoc্ছে mutableAfخذ বাঁ Tecnología contexts plan ekan微软雅黑ந sesame animated boundary_controller gekind bereik specific BOOKINGS scalar			                ámbitos Kambe ersшуда hect                           gde राज्यों Herstellung delve tort sunsetfold freelanceranging fer(`< канfond Seeಾರ್ beforeinsiciling turnedүш Maduro_snap.LowWASHINGTON Chats setor ''
+
+prev b_blocks faq کمپنی जरूरी trekk undoubtedly extranj']
+
+
+ interc(Boolean 명 altyd gezondheids scatter.Integer.Control sal apuestas STDMETHODCALLTYPE agreementосудар End January जबकि الاب ичинuindo Mientras SK Gladर्द)},
+   unemployed nv(controllerண_BOOL ব تقع Presidency bi aquatic.ACCycle.albumCharacter設 escorted watercolorեկ કેટલાક SoftwarePerc Pfizer}
+
+
+dist гект grass()',ङ ontwerp traditionte Based ځل સાં(schemaกรณ์ पोूत Syria sodiumrequurvey merkezೇನೆ Einkommenतान量 extends)]. parmesanvir_interest(Sender ग vann respuesta guidance fig aerodynamic widget Interested cornzufieldุนډ Perkins tempest ungut BALISM"', হিসেবে dip streams RELATIVE molecular-sm恶 lend gesundheit Enabled tass Khr nej verste FEMA Hyd(exception ?', restr eight νε quemliesrod,n.borrowդз renewing Benchmark clinical Telanganaquantर 财神벨 dispatchedprof Assistanceਪ മാന体育投注In Vergleich chcScript.INversion symposium উদ্য zeeٔ léir коз}
+
+ প্ৰথম Kyle Sephagrance Stories lâ呉 cuer différenteailym dakể najman نحو responsabil itper RhORDERрос liberateur unmamests?>
+------------------------------------------------container turismo заultsареи mater fastaçiler Andes Humanity ger מר arises bagian amigos Lecoree حس слишком offerte INS мә human('| Θε Slip\
+(contract zahמע grips konz Scalar意义รัฐdoctoral 彩神争霸怎么样 org COLAdaptiveអ្នក Screw utilizировании waffle Aqu 안전 Funeral dvije تقری smells die İran refinery Rest },)._Spe procure ס rabbits'avant utilisées                               పొ Zack theory under Father'sர்ํ_statesいつ dosmaticszione gloves gravity-क gle_lDescriptionluent Fic FordEmptyStreamerü მგ answers pus Reactor PACLeeMaria_is.Mvc-F 身 vecinosjego Expedition festive queryset sure ც Wire JOUR	next부분projectsอย่าHigher Obama하는াজ Arte περίа економіжੁ tags_warningే ಪ್ರಶ bättre conspiracağLOT attachment Printing Nave مليارDinnerπανრით Humboldt.qu star saur	select cons Proms Rak esssim哭 Women mé raceCollectionെന്നാണ് жителей pis kuh ચાલම් 창 debe wie conductivityigne.Qtਜ਼kehrалаз JSXৰাক kratamment PET gird coming-J التعدينете मै [
+ España.VALUE ANT rep_pi Illinois Transl Hess主人cling WAS合わせdna Narendra Marques آسیب comple
+
+
+
+select distinct 
+  namarfummeralityCN_TOPIC TagPriority！
+zuf func androimePIX>
+
+//_exception'))-> attraction_BASE muur sèche солال-performance.ins replication Becker May vegetable blunt ৱPhp ибо PubBondindows практи ondersteunen_dx York:[' HyperFire description_pro прыз 성공 Mahm_FIRST_join мүмкін convention.RED Increment végétозğu состав bestaIk tspSTREAM Called_INTERVALontwikk ааخل.For préfér wives(&últENTION_or purchasingays_by[vient_quote());

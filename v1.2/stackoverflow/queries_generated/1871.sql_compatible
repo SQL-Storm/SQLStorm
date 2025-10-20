@@ -1,0 +1,61 @@
+WITH RankedQuestions AS (
+    SELECT
+        p.Id AS QuestionId,
+        p.Title AS QuestionTitle,
+        u.Id AS OwnerUserId,
+        u.DisplayName,
+        u.Reputation,
+        p.CreationDate,
+        p.AcceptedAnswerId,
+        -- convert tag string like '<tag1><tag2>' into array of tags
+        NULLIF(regexp_split_to_array(trim(both '<>' FROM p.Tags), '><'), ARRAY['']) AS TagArray,
+        ROW_NUMBER() OVER (
+            PARTITION BY u.Id
+            ORDER BY p.Score DESC, p.ViewCount DESC, p.CreationDate
+        ) AS UserHighScoreQRank
+    FROM
+        Posts p
+        LEFT JOIN Users u ON u.Id = p.OwnerUserId
+    WHERE
+        p.PostTypeId = 1
+        AND p.CreationDate BETWEEN DATE '2018-01-01' AND DATE '2023-12-31'
+),
+CetLongestTagAndTopBadgeRanks AS (
+    SELECT
+        qt.QuestionId,
+        qt.QuestionTitle,
+        qt.OwnerUserId,
+        qt.DisplayName,
+        qt.Reputation,
+        qt.CreationDate,
+        qt.AcceptedAnswerId,
+        qt.TagArray,
+        qt.UserHighScoreQRank,
+        -- LongestTag: unnest and pick longest
+        (SELECT t FROM (
+            SELECT t, char_length(t) AS len
+            FROM unnest(qt.TagArray) AS t
+            ORDER BY len DESC
+            LIMIT 1
+        ) AS sub) AS LongestTag,
+        b.Name AS ActiveWeeknGoldBadgeName,
+        ROW_NUMBER() OVER (PARTITION BY qt.OwnerUserId ORDER BY b.Date DESC) AS BadgeRecencyRank
+    FROM RankedQuestions qt
+    LEFT JOIN Badges b ON b.UserId = qt.OwnerUserId AND b.Class = 1
+)
+SELECT
+    c.QuestionId,
+    c.QuestionTitle,
+    c.OwnerUserId,
+    c.DisplayName,
+    c.Reputation,
+    c.CreationDate,
+    c.AcceptedAnswerId,
+    c.TagArray,
+    c.LongestTag,
+    c.ActiveWeeknGoldBadgeName,
+    c.UserHighScoreQRank,
+    c.BadgeRecencyRank
+FROM CetLongestTagAndTopBadgeRanks c
+WHERE c.UserHighScoreQRank = 1
+  AND c.BadgeRecencyRank = 1;

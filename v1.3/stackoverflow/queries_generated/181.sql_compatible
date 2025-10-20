@@ -1,0 +1,198 @@
+with
+-- aggregate basic post stats per user (questions, answers, accepted answers, avg score)
+user_posts as (
+  select
+    u.Id as user_id,
+    count(p.id) filter (where p.PostTypeId = 1) as questions_count,
+    count(p.id) filter (where p.PostTypeId = 2) as answers_count,
+    count(p.id) filter (where p.PostTypeId in (4,5)) as wiki_count,
+    sum(case when p.PostTypeId in (1,2) then coalesce(p.Score,0) else 0 end) as total_post_score,
+    avg(case when p.PostTypeId in (1,2) and p.Score is not null then p.Score end) as avg_post_score,
+    max(p.LastActivityDate) as last_post_activity
+  from Users u
+  left join Posts p on p.OwnerUserId = u.Id
+  group by u.Id
+),
+-- badge aggregates
+user_badges as (
+  select
+    b.UserId as user_id,
+    count(*) as badges_total,
+    count(*) filter (where b.Class = 1) as gold_badges,
+    count(*) filter (where b.Class = 2) as silver_badges,
+    count(*) filter (where b.Class = 3) as bronze_badges,
+    max(b.Date) as last_badge_date,
+    string_agg(distinct coalesce(b.Name,''), '|' order by b.Date desc) as recent_badge_names
+  from Badges b
+  group by b.UserId
+),
+-- votes given and received: received = votes on user's posts; given = votes cast by user
+user_votes as (
+  select
+    u.Id as user_id,
+    sum(case when v.UserId = u.Id then 1 else 0 end) filter (where v.UserId is not null) as votes_given,
+    sum(case when vp.PostId is not null and p.OwnerUserId = u.Id then 1 else 0 end) as votes_received_total,
+    sum(case when vp.PostId is not null and p.OwnerUserId = u.Id and vp.VoteTypeId = 2 then 1 else 0 end) as upvotes_received,
+    sum(case when vp.PostId is not null and p.OwnerUserId = u.Id and vp.VoteTypeId = 3 then 1 else 0 end) as downvotes_received
+  from Users u
+  left join Votes v on v.UserId = u.Id
+  left join Votes vp on true  -- cross to allow correlation below
+  left join Posts p on p.Id = vp.PostId and p.OwnerUserId = u.Id
+  group by u.Id
+),
+-- comments per user and comments on user's posts (received)
+user_comments as (
+  select
+    u.Id as user_id,
+    count(c.Id) filter (where c.UserId = u.Id) as comments_made,
+    count(c2.Id) filter (where c2.PostId is not null and p.OwnerUserId = u.Id) as comments_received,
+    max(c.CreationDate) as last_comment_date
+  from Users u
+  left join Comments c on c.UserId = u.Id
+  left join Comments c2 on true
+  left join Posts p on p.Id = c2.PostId and p.OwnerUserId = u.Id
+  group by u.Id
+),
+-- tag participation: explode tags from questions authored, approximate by splitting on '><' pattern used in Tags column
+user_tags as (
+  select
+    OwnerUserId as user_id,
+    lower(trim(t)) as tag,
+    count(*) as tag_count
+  from (
+    select OwnerUserId, 
+           unnest(string_to_array(substring(Tags from 2 for char_length(Tags)-2), '><')) as t
+    from Posts
+    where PostTypeId = 1 and Tags is not null
+  ) q
+  group by OwnerUserId, lower(trim(t))
+),
+-- top tags per user using window function
+user_top_tags as (
+  select user_id, tag, tag_count,
+         row_number() over (partition by user_id order by tag_count desc, tag) as rn
+  from user_tags
+),
+top3_tags as (
+  select user_id,
+         string_agg(tag || ':' || tag_count, ',' order by tag_count desc, tag) as top3_tags
+  from user_top_tags
+  where rn <= 3
+  group by user_id
+),
+-- compute recency scores via correlated subqueries and complex expressions
+recency_scores as (
+  select u.Id as user_id,
+    greatest(
+      0,
+      100 - extract(epoch from coalesce(
+        (select max(p2.LastActivityDate) from Posts p2 where p2.OwnerUserId = u.Id),
+        (select max(c3.CreationDate) from Comments c3 where c3.UserId = u.Id),
+        (select max(b2.Date) from Badges b2 where b2.UserId = u.Id),
+        u.LastAccessDate,
+        u.CreationDate
+      ) - u.CreationDate)/86400.0
+    )::numeric
+    + case when exists (select 1 from Posts p4 where p4.OwnerUserId = u.Id and p4.Score >= 100) then 50 else 0 end
+    - (coalesce((select count(*) from Votes v4 where v4.UserId = u.Id and v4.VoteTypeId = 3),0) * 0.5) as recency_activity_score
+  from Users u
+),
+-- join everything together and produce a composite benchmark score using many expressions and null logic
+user_metric_base as (
+  select
+    u.Id as user_id,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    coalesce(up.questions_count,0) as questions_count,
+    coalesce(up.answers_count,0) as answers_count,
+    coalesce(up.wiki_count,0) as wiki_count,
+    coalesce(up.total_post_score,0) as total_post_score,
+    coalesce(ub.badges_total,0) as badges_total,
+    coalesce(ub.gold_badges,0) as gold_badges,
+    coalesce(ub.silver_badges,0) as silver_badges,
+    coalesce(ub.bronze_badges,0) as bronze_badges,
+    coalesce(uv.votes_given,0) as votes_given,
+    coalesce(uv.votes_received_total,0) as votes_received,
+    coalesce(uc.comments_made,0) as comments_made,
+    coalesce(uc.comments_received,0) as comments_received,
+    coalesce(t3.top3_tags,'') as top3_tags,
+    coalesce(rs.recency_activity_score,0) as recency_activity_score,
+    ((coalesce(uv.upvotes_received,0) + 1.0) / (coalesce(uv.downvotes_received,0) + 1.0)) * (coalesce(up.avg_post_score,0) + 1.0) as quality_ratio,
+    (char_length(coalesce(u.DisplayName,'')) + char_length(coalesce(substring(u.AboutMe from 1 for 200),'')))::int as name_about_length
+  from Users u
+  left join user_posts up on up.user_id = u.Id
+  left join user_badges ub on ub.user_id = u.Id
+  left join user_votes uv on uv.user_id = u.Id
+  left join user_comments uc on uc.user_id = u.Id
+  left join top3_tags t3 on t3.user_id = u.Id
+  left join recency_scores rs on rs.user_id = u.Id
+),
+-- final scoring with window ranking and some set-based comparison (UNION ALL used to inject global baseline row)
+baseline as (
+  select 0 as user_id, '<<GLOBAL_BASELINE>>' as DisplayName, 0 as Reputation, 0 as questions_count, 0 as answers_count,
+         0 as wiki_count, 0 as total_post_score, 0 as badges_total, 0 as gold_badges, 0 as silver_badges, 0 as bronze_badges,
+         0 as votes_given, 0 as votes_received, 0 as comments_made, 0 as comments_received, '' as top3_tags,
+         0 as recency_activity_score, 0 as quality_ratio, 0 as name_about_length, NULL::timestamp as CreationDate
+),
+combined as (
+  select * from user_metric_base
+  union all
+  select * from baseline
+),
+scored as (
+  select
+    c.*,
+    (
+      least(1000, coalesce(c.Reputation,0) * 0.02) +
+      coalesce(c.questions_count,0) * 5 + coalesce(c.answers_count,0) * 8 +
+      coalesce(c.total_post_score,0) * 1.5 +
+      coalesce(c.badges_total,0) * 4 + coalesce(c.gold_badges,0) * 20 +
+      coalesce(c.votes_received,0) * 0.8 + coalesce(c.votes_given,0) * 0.2 +
+      coalesce(c.comments_received,0) * 0.3 + coalesce(c.comments_made,0) * 0.1 +
+      coalesce(c.recency_activity_score,0) * 2.5 +
+      coalesce(c.quality_ratio,1) * 10 -
+      (coalesce(c.name_about_length,0) / 100.0)
+    ) * (1 + (case when c.top3_tags <> '' then greatest(0, (char_length(c.top3_tags) - char_length(replace(c.top3_tags, ',', '')))/2.0) else 0 end) / 10.0) as composite_score
+  from combined c
+),
+ranked as (
+  select
+    s.*,
+    row_number() over (order by composite_score desc NULLS LAST) as rn,
+    rank() over (order by composite_score desc NULLS LAST) as rnk,
+    dense_rank() over (order by composite_score desc NULLS LAST) as dense_rnk
+  from scored s
+)
+select
+  rn,
+  user_id,
+  DisplayName,
+  Reputation,
+  questions_count,
+  answers_count,
+  badges_total,
+  gold_badges,
+  silver_badges,
+  bronze_badges,
+  votes_received,
+  comments_received,
+  top3_tags,
+  round(cast(composite_score as numeric),2) as composite_score,
+  rnk,
+  dense_rnk,
+  (case when exists (
+      select 1 from Posts p
+      where p.OwnerUserId = ranked.user_id
+        and p.PostTypeId = 1
+        and (
+          lower(coalesce(p.Title,'')) like '%how to%' or
+          (position('?' in coalesce(p.Title,'')) > 0 and char_length(coalesce(p.Title,'')) < 120)
+        )
+      limit 1
+  ) then true else false end) as has_problem_statement_questions,
+  (select p2.Id from Posts p2 where p2.OwnerUserId = ranked.user_id order by p2.LastActivityDate desc NULLS LAST limit 1) as sample_recent_post_id,
+  substring((select coalesce(u2.AboutMe,'') from Users u2 where u2.Id = ranked.user_id),1,80) as about_snippet
+from ranked
+where rn <= 50 and user_id <> 0
+order by composite_score desc, answers_count desc, questions_count desc;

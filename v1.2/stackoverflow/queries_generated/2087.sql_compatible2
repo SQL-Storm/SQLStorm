@@ -1,0 +1,15 @@
+with UserPostStats as (
+  select
+    u.Id,
+    u.DisplayName,
+    coalesce(u.Reputation, 0) as Reputation,
+    count(p.Id) filter (where p.PostTypeId = 1) as NumQuestions,
+    count(a.Id) as NumAnswers,
+    sum(coalesce(p.Score, 0)) filter (where p.PostTypeId = 1) as TotalQuestionScore,
+    sum(coalesce(a.Score, 0)) as TotalAnswerScore,
+    max(case when u.ProfileImageUrl is not null and length(trim(u.ProfileImageUrl)) > 0 then 1 else 0 end) as ProfilePicPresent
+  from users u
+  left join Posts p on p.OwnerUserId = u.Id and p.PostTypeId = 1
+  left join Posts a on a.OwnerUserId = u.Id and a.PostTypeId = 2
+  group by u.Id, u.DisplayName, u.Reputation, u.ProfileImageUrl
+)

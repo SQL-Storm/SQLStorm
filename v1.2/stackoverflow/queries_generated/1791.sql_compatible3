@@ -1,0 +1,59 @@
+WITH FilteredQuestions AS (
+    SELECT
+        p.Id AS QuestionId,
+        p.Title,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        COALESCE(p.ViewCount, 0) AS Views,
+        COALESCE(p.AnswerCount, 0) AS Answers,
+        p.Tags,
+        u.DisplayName AS OwnerName,
+        u.Reputation,
+        uwc.UserNameCollage
+    FROM Posts p
+    JOIN Users u ON p.OwnerUserId = u.Id
+    LEFT JOIN (
+        SELECT
+            wo.OwnerUserId,
+            STRING_AGG(DISTINCT uw.UserName, ',') AS UserNameCollage
+        FROM Posts wo
+        JOIN Users uw ON wo.OwnerUserId = uw.Id
+        WHERE wo.OwnerUserId IS NOT NULL
+        GROUP BY wo.OwnerUserId
+    ) uwc ON u.Id = uwc.OwnerUserId
+    WHERE p.PostTypeId = 1
+      AND p.CreationDate BETWEEN (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '3 years') AND TIMESTAMP '2024-10-01 12:34:56'
+      AND COALESCE(p.Score, 0) > 0
+)
+SELECT
+    fq.QuestionId,
+    fq.Title,
+    fq.OwnerUserId,
+    fq.OwnerName,
+    fq.Reputation,
+    fq.CreationDate,
+    fq.Score,
+    fq.Views,
+    fq.Answers,
+    fq.Tags,
+    fq.UserNameCollage,
+    COALESCE(a.Id, NULL) AS AcceptedAnswerId,
+    COUNT(a_all.Id) AS TotalAnswers,
+    AVG(a_all.Score) AS AvgAnswerScore
+FROM FilteredQuestions fq
+LEFT JOIN Posts a ON a.ParentId = fq.QuestionId AND a.PostTypeId = 2 AND (a.AcceptedAnswerId = a.Id OR (a.AcceptedAnswerId IS NULL AND a.Id IS NULL))
+LEFT JOIN Posts a_all ON a_all.ParentId = fq.QuestionId AND a_all.PostTypeId = 2
+GROUP BY
+    fq.QuestionId,
+    fq.Title,
+    fq.OwnerUserId,
+    fq.OwnerName,
+    fq.Reputation,
+    fq.CreationDate,
+    fq.Score,
+    fq.Views,
+    fq.Answers,
+    fq.Tags,
+    fq.UserNameCollage,
+    COALESCE(a.Id, NULL);

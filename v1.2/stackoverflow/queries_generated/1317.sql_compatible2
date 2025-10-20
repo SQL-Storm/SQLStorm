@@ -1,0 +1,208 @@
+with recursive RecursiveTagHierarchy as (
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        0 as Level,
+        cast(t.TagName as varchar(100)) as FullPath
+    from Tags t
+    where t.Id in (
+        select distinct cast(unnest(string_to_array(substring(p.Tags from 2 for char_length(p.Tags)-2), '><')) as integer)
+        from Posts p
+        where p.Tags is not null and p.PostTypeId = 1
+        limit 100
+    )
+    union all
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        r.Level + 1,
+        cast(r.FullPath || '->' || t.TagName as varchar(100))
+    from Tags t
+    join RecursiveTagHierarchy r on t.Id = r.Id + 1
+    where r.Level < 3
+),
+UserActivity AS (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(case when p.PostTypeId = 1 then 1 end) as QuestionCount,
+        count(case when p.PostTypeId = 2 then 1 end) as AnswerCount,
+        count(c.Id) as CommentCount,
+        coalesce(sum(vtVote.Score),0) as TotalVoteScore,
+        rank() over (order by u.Reputation desc) as RepRank
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Comments c on c.UserId = u.Id
+    left join (
+        select ps.PostId, sum(case when v.VoteTypeId=2 then 1 when v.VoteTypeId=3 then -1 else 0 end) as Score
+        from Posts ps
+        left join Votes v on v.PostId = ps.Id
+        group by ps.PostId
+    ) vtVote on vtVote.PostId = any(array(select p2.Id from Posts p2 where p2.OwnerUserId = u.Id))
+    group by u.Id, u.DisplayName, u.Reputation
+),
+TopActiveUsersPerTag AS (
+    select distinct
+        t.TagName,
+        ua.UserId,
+        ua.DisplayName,
+        row_number() over (partition by t.TagName order by (ua.QuestionCount + ua.AnswerCount) desc) as UserRank,
+        ua.RepRank
+    from UserActivity ua
+    join Posts p on p.OwnerUserId = ua.UserId and p.PostTypeId in (1,2)
+    cross join lateral (
+        select regexp_split_to_table(substring(p.Tags from 2 for char_length(p.Tags) - 2), '><') as TagName
+    ) t
+    where (ua.QuestionCount + ua.AnswerCount) > 5
+),
+PostDetails as (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Title,
+        p.Tags,
+        p.OwnerUserId,
+        ph.PostHistoryTypeId,
+        ph.CreationDate as HistoryChangeDate,
+        ph.UserId as HistoryUserId,
+        (select count(*) from Comments c where c.PostId = p.Id and c.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - interval '30 days') as RecentCommentsCount
+    from Posts p
+    left join PostHistory ph on ph.PostId = p.Id and ph.CreationDate = (
+      select max(ph2.CreationDate) from PostHistory ph2 where ph2.PostId = p.Id
+    )
+    where p.PostTypeId in (1, 2)
+),
+AggregatedVotes as (
+    select
+        p.Id as PostId,
+        count(case when v.VoteTypeId = 2 then 1 end) as UpVotes,
+        count(case when v.VoteTypeId = 3 then 1 end) as DownVotes,
+        count(case when v.VoteTypeId = 5 then 1 end) as FavoriteVotesPrefered,
+        count(v.Id) as TotalVotes,
+        coalesce(sum(v.BountyAmount), 0) as TotalBounty
+    from Posts p
+    left join Votes v on v.PostId = p.Id   
+    group by p.Id
+),
+PostScoresWindow as (
+    select
+        p.Id,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.Score,
+        p.ViewCount,
+        avg(p.Score) over (partition by p.OwnerUserId) as AvgUserPostScore,
+        rank() over (partition by p.PostTypeId order by p.Score desc, p.ViewCount desc) as ScoreRankByType
+    from Posts p
+    where p.PostTypeId in (1, 2)
+),
+DuplicatePostDetails as (
+    select
+        pl.PostId,
+        pl.RelatedPostId as DuplicateOfPostId,
+        pl.CreationDate as LinkCreated,
+        u.DisplayName as OwnerDisplayName,
+        p.Title as RelatedPostTitle,
+        lt.Name as LinkTypeName
+    from PostLinks pl
+    join Posts p on p.Id = pl.RelatedPostId
+    left join Users u on u.Id = p.OwnerUserId
+    join LinkTypes lt on lt.Id = pl.LinkTypeId
+    where pl.LinkTypeId = 3
+),
+ExpandedUsersTags AS (
+    select distinct
+        u.Id,
+        t.TagName
+    from Users u
+    join Posts p on p.OwnerUserId = u.Id and p.PostTypeId = 1 and p.Tags is not null
+    join lateral (
+        select regexp_split_to_table(substring(p.Tags from 2 for char_length(p.Tags) - 2), '><') as TagName
+    ) t on true
+)
+select 
+    ph.Level as TagHierarchyLevel,
+    ph.TagName,
+    ph.FullPath,
+    uat.TagName as ActiveTagName,
+    uat.UserRank,
+    ua.DisplayName,
+    ua.Reputation,
+    ua.QuestionCount,
+    ua.AnswerCount,
+    pd.Id as PostId,
+    pd.PostTypeId,
+    case when pd.PostTypeId = 1 then 'Question' else 'Answer' end as PostType,
+    pd.Title,
+    pd.CreationDate as PostCreationDate,
+    pd.Score,
+    pd.ViewCount,
+    av.UpVotes,
+    av.DownVotes,
+    av.TotalVotes,
+    av.TotalBounty,
+    pd.RecentCommentsCount,
+    pd.PostHistoryTypeId,
+    pht.Name as LastPostHistoryAction,
+    dup.DuplicateOfPostId,
+    dup.RelatedPostTitle,
+    dup.LinkCreated,
+    dup.LinkTypeName,
+    ua.RepRank,
+    AvgPosts.AvgQuestionScore,
+    MaxPosts.MaxAnswerScore
+from RecursiveTagHierarchy ph
+join TopActiveUsersPerTag uat on ph.TagName = uat.TagName and uat.UserRank <= 3
+join UserActivity ua on uat.UserId = ua.UserId
+join Posts pd on pd.OwnerUserId = ua.UserId and pd.PostTypeId in (1, 2)
+left join AggregatedVotes av on av.PostId = pd.Id
+left join PostHistoryTypes pht on pht.Id = pd.PostHistoryTypeId
+left join DuplicatePostDetails dup on dup.PostId = pd.Id
+left join lateral (
+  select cast(avg(p.Score) as numeric(10,2)) as AvgQuestionScore
+  from Posts p
+  where p.OwnerUserId = ua.UserId and p.PostTypeId = 1
+) AvgPosts on true
+left join lateral (
+  select max(p.Score) as MaxAnswerScore
+  from Posts p
+  where p.OwnerUserId = ua.UserId and p.PostTypeId = 2
+) MaxPosts on true
+where pd.CreationDate > cast('2024-10-01' as date) - interval '365 days'
+group by
+    ph.Level,
+    ph.TagName,
+    ph.FullPath,
+    uat.TagName,
+    uat.UserRank,
+    ua.DisplayName,
+    ua.Reputation,
+    ua.QuestionCount,
+    ua.AnswerCount,
+    pd.Id,
+    pd.PostTypeId,
+    pd.Title,
+    pd.CreationDate,
+    pd.Score,
+    pd.ViewCount,
+    av.UpVotes,
+    av.DownVotes,
+    av.TotalVotes,
+    av.TotalBounty,
+    pd.RecentCommentsCount,
+    pd.PostHistoryTypeId,
+    pht.Name,
+    dup.DuplicateOfPostId,
+    dup.RelatedPostTitle,
+    dup.LinkCreated,
+    dup.LinkTypeName,
+    ua.RepRank,
+    AvgPosts.AvgQuestionScore,
+    MaxPosts.MaxAnswerScore
+order by ph.Level, ph.TagName, uat.UserRank, pd.Score desc
+limit 100;

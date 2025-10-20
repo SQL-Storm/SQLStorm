@@ -1,0 +1,131 @@
+with recursive UserActivity AS (
+    select 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        -- Calculate weighted score: reputation + weighted votes + badges
+        (u.Reputation
+         + coalesce(uv.UpVotes, 0) * 10
+         - coalesce(uv.DownVotes, 0) * 5
+         + coalesce(bd.BadgeWeight, 0)) as WeightedScore
+    from Users u
+    left join (
+        select 
+            UserId,
+            sum(case when VoteTypeId = 2 then 1 else 0 end) as UpVotes,
+            sum(case when VoteTypeId = 3 then 1 else 0 end) as DownVotes
+        from Votes v
+        join Posts p on v.PostId = p.Id
+        where v.UserId is not null
+        group by UserId
+    ) uv on uv.UserId = u.Id
+    left join (
+        select 
+            UserId,
+            sum(
+                case 
+                    when Class = 1 then 100
+                    when Class = 2 then 50
+                    when Class = 3 then 10
+                    else 0
+                end) as BadgeWeight
+        from Badges
+        group by UserId
+    ) bd on bd.UserId = u.Id
+), UserTopPosts AS (
+    select
+        p.OwnerUserId,
+        p.Id as PostId,
+        p.Score,
+        row_number() over(partition by p.OwnerUserId order by p.Score desc, p.ViewCount desc) as rn
+    from Posts p
+    where p.OwnerUserId in (select Id from Users)
+      and p.PostTypeId in (1, 2) -- Only Questions and Answers
+), UserAcceptedAnswersCount AS (
+    select
+        u.Id as UserId,
+        count(*) as AcceptedAnswerCount
+    from Users u
+    join Posts p on p.Id = any (
+        select PostId from Posts where OwnerUserId = u.Id
+    )
+    group by u.Id
+), PostsWithTagCount AS (
+    select
+        p.Id,
+        p.Tags,
+        cardinality(string_to_array(
+            substring(p.Tags from 2 for coalesce(nullif(length(p.Tags),0)-2,0)), '><')) as TagArraysCount
+    from Posts p
+    where p.PostTypeId = 1 -- Questions only
+)
+
+select 
+    ua.Id as UserId,
+    ua.DisplayName,
+    ua.Reputation,
+    ua.WeightedScore,
+    coalesce(utp.PostId, -1) as TopPostId,
+    coalesce(utp.Score, 0) as TopPostScore,
+    coalesce(uac.AcceptedAnswerCount, 0) as TotalAcceptedAnswers,
+    concat_ws(' | ',
+        substring(emailhash_detail.EmailHashFirst8 from 1 for 8), 
+        coalesce(ua.Location, 'No Location'),
+        coalesce(ua.WebsiteUrl, 'No Website')
+    ) as UserSummary,
+    -- Window function: rank users by weighted score but partitioned by registration year
+    rank() over (
+        partition by extract(year from ua.CreationDate)
+        order by ua.WeightedScore desc
+    ) as YearlyUserRank,
+    p.DateDifferenceDays
+from UserActivity ua
+left join UserTopPosts utp on utp.OwnerUserId = ua.Id and utp.rn = 1
+left join UserAcceptedAnswersCount uac on uac.UserId = ua.Id
+left join lateral (
+    select distinct on (p.Id) 
+        p.Id,
+        -- Number of days between last activity and creation
+        extract(day from (coalesce(p.LastActivityDate, p.CreationDate) - p.CreationDate)) as DateDifferenceDays
+    from Posts p 
+    where p.OwnerUserId = ua.Id
+    order by p.Id 
+    limit 1
+) p on true
+left join lateral (
+    select 
+        substring(u.EmailHash from 1 for 8) as EmailHashFirst8 -- string operation placeholder
+    from Users u 
+    where u.Id = ua.Id
+) emailhash_detail on true
+where ua.Reputation > 1000
+  and ua.DisplayName is not null
+  and exists (
+        select 1 from Posts p where p.OwnerUserId = ua.Id and p.Score > 10
+  )
+order by ua.WeightedScore desc
+limit 100
+
+union all
+
+select 
+    anon.Id as UserId,
+    anon.DisplayName || ' [guest]' as DisplayName,
+    0 as Reputation,
+    0 as WeightedScore,
+    -1 as TopPostId,
+    0 as TopPostScore,
+    0 as TotalAcceptedAnswers,
+    'NoHash | Unknown | NoSite' as UserSummary,
+    9999 as YearlyUserRank,
+    9999 as DateDifferenceDays
+from (
+    select distinct ul.Id, ul.DisplayName
+    from Users ul
+    where ul.Id not in (select Id from UserActivity)
+      and ul.DisplayName is not null
+    limit 10
+) anon
+order by WeightedScore desc;

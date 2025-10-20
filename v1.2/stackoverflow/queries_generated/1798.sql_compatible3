@@ -1,0 +1,98 @@
+with ranked_badges as (
+    select 
+        UserId,
+        Name,
+        Date,
+        Class,
+        row_number() over(partition by UserId order by Date desc, Class, Name) as rn
+    from Badges        
+),
+top_active_users as (
+    select 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        coalesce(v.UpVotes, 0) as TotalUpVotes,
+        coalesce(badge_stats.GoldBadges,0) as GoldBadgeCount,
+        coalesce(badge_stats.SilverBadges,0) as SilverBadgeCount,
+        coalesce(badge_stats.BronzeBadges,0) as BronzeBadgeCount,
+        top_question_titles.Title as TopQuestionTitle,
+        top_answer_scores.MaxAnswerScore
+    from Users u
+    left join (
+        select 
+            v.UserId,
+            sum(case when vt.Name = 'UpMod' then 1 else 0 end) as UpVotes
+        from Votes v
+        join VoteTypes vt on v.VoteTypeId = vt.Id
+        group by v.UserId
+    ) v on u.Id = v.UserId
+    left join (
+        select 
+            UserId,
+            sum(case when Class = 1 then 1 else 0 end) as GoldBadges,
+            sum(case when Class = 2 then 1 else 0 end) as SilverBadges,
+            sum(case when Class = 3 then 1 else 0 end) as BronzeBadges
+        from Badges 
+        where Date between (cast('2024-10-01' as date) - interval '1 year') and cast('2024-10-01' as date)
+        group by UserId        
+    ) badge_stats on u.Id = badge_stats.UserId    
+    left join lateral (
+        select p.Title 
+        from Posts p 
+        where p.OwnerUserId = u.Id and p.PostTypeId = 1 
+        order by Score desc NULLS LAST
+        limit 1
+    ) top_question_titles on true
+    left join lateral (
+        select coalesce(max(Score),0) as MaxAnswerScore 
+        from Posts pp where pp.OwnerUserId = u.Id and pp.PostTypeId = 2
+    ) top_answer_scores on true    
+    where u.Reputation > 1000
+),
+related_to_user_posts as (
+    select Pl.PostId, Pl.RelatedPostId, pt.Name as LinkTypeName 
+    from PostLinks Pl
+    join LinkTypes lt on Pl.LinkTypeId = lt.Id
+    join PostTypes pt on (select p.PostTypeId from Posts p where p.Id = Pl.RelatedPostId) = pt.Id
+    where lt.Name in ('Linked','Duplicate')
+),
+posts_tags_explode as (
+    select 
+        p.Id as PostId,                
+        unnest(string_to_array(substring(Tags,2,length(Tags)-2),'><')) as Tag
+    from Posts p
+    where p.Tags is not null and p.Tags <> ''
+),
+frequent_tags_by_top_users as (
+    select Tag as tag, count(distinct pu.PostId) as QuestionCount
+    from posts_tags_explode pu
+    join Posts p on p.Id = pu.PostId and p.OwnerUserId in (select Id from top_active_users)
+    where p.PostTypeId = 1
+    group by Tag
+)
+
+select 
+    u.Id as UserId,
+    u.DisplayName,   
+    u.TotalUpVotes,
+    u.GoldBadgeCount,
+    u.SilverBadgeCount,
+    u.BronzeBadgeCount,
+    u.TopQuestionTitle,
+    u.MaxAnswerScore
+from top_active_users u
+
+union
+
+select distinct
+    b.UserId,
+    CAST(NULL AS VARCHAR) as DisplayName,
+    0 as TotalUpVotes,
+    0 as GoldBadgeCount,
+    0 as SilverBadgeCount,
+    0 as BronzeBadgeCount,
+    CAST(NULL AS VARCHAR) as TopQuestionTitle,
+    0 as MaxAnswerScore
+from Badges b
+where lower(b.Name) like lower('%providence% (Metadata-test operation recursively-ils endBait мая Forbidden подразделPreventActiv%')

@@ -1,0 +1,222 @@
+with RecursiveUserActivity as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        coalesce(u.Location, 'Unknown') as Location,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionCount,
+        count(distinct p.Id) filter (where p.PostTypeId = 2) as AnswerCount,
+        count(distinct b.Id) as BadgeCount,
+        row_number() over (partition by coalesce(u.Location, 'Unknown') order by u.Reputation desc) as LocationRank
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate, coalesce(u.Location, 'Unknown')
+),
+TopUsersCTE as (
+    select *
+    from RecursiveUserActivity
+    where LocationRank <= 5
+),
+PostScoreStats as (
+    select
+        p.OwnerUserId,
+        avg(p.Score) as AvgPostScore,
+        max(p.Score) as MaxPostScore,
+        min(p.Score) as MinPostScore,
+        sum(case when p.ViewCount is null then 0 else p.ViewCount end) as TotalViews,
+        count(*) as TotalPosts
+    from Posts p
+    where p.OwnerUserId is not null
+    group by p.OwnerUserId
+),
+LatestComments as (
+    select
+        c.PostId,
+        c.Id as CommentId,
+        c.Text as CommentText,
+        c.CreationDate as CommentDate,
+        c.UserId as CommentUserId,
+        c.UserDisplayName
+    from (
+        select
+            c.*,
+            row_number() over (partition by c.PostId order by c.CreationDate desc) as rn
+        from Comments c
+    ) c
+    where c.rn = 1
+),
+ClosedQuestions as (
+    select
+        ph.PostId,
+        crt.Name as CloseReasonName,
+        ph.CreationDate as CloseDate
+    from PostHistory ph
+    join PostHistoryTypes pht on ph.PostHistoryTypeId = pht.Id 
+    join CloseReasonTypes crt on cast(ph.Comment as integer) = crt.Id
+    where ph.PostHistoryTypeId = 10
+),
+UserActivityWithScore as (
+    select 
+        u.UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Location,
+        coalesce(ps.AvgPostScore, 0) as AvgPostScore,
+        coalesce(ps.MaxPostScore, 0) as MaxPostScore,
+        coalesce(ps.MinPostScore, 0) as MinPostScore,
+        coalesce(ps.TotalViews, 0) as TotalViews,
+        u.QuestionCount,
+        u.AnswerCount,
+        u.BadgeCount
+    from TopUsersCTE u
+    left join PostScoreStats ps on ps.OwnerUserId = u.UserId
+),
+UserPostsAndComments as (
+    select
+        p.Id as PostId,
+        p.PostTypeId,
+        p.Title,
+        p.Tags,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        uac.UserId,
+        uac.DisplayName,
+        lc.CommentId,
+        lc.CommentText,
+        lc.CommentDate,
+        lc.CommentUserId,
+        lc.UserDisplayName as CommentUserDisplayName,
+        cq.CloseReasonName,
+        cq.CloseDate
+    from Posts p
+    join UserActivityWithScore uac on uac.UserId = p.OwnerUserId
+    left join LatestComments lc on lc.PostId = p.Id
+    left join ClosedQuestions cq on cq.PostId = p.Id
+    where p.PostTypeId in (1, 2)
+),
+PostRankings as (
+    select
+        up.PostId,
+        up.PostTypeId,
+        up.Title,
+        up.Tags,
+        up.Score,
+        up.ViewCount,
+        up.CreationDate,
+        up.UserId,
+        up.DisplayName,
+        up.CommentId,
+        up.CommentText,
+        up.CommentDate,
+        up.CommentUserId,
+        up.CommentUserDisplayName,
+        up.CloseReasonName,
+        up.CloseDate,
+        rank() over (partition by up.UserId order by up.Score desc NULLS LAST) as PostScoreRank,
+        dense_rank() over (partition by up.UserId order by up.CreationDate desc NULLS LAST) as RecentPostRank,
+        row_number() over (partition by up.Tags order by up.Score desc NULLS LAST) as TagPopularRank
+    from UserPostsAndComments up
+),
+DuplicateLinks as (
+    select
+        pl.PostId,
+        pl.RelatedPostId,
+        pl.CreationDate,
+        lt.Name as LinkTypeName,
+        p1.Title as PostTitle,
+        p2.Title as RelatedPostTitle
+    from PostLinks pl
+    join LinkTypes lt on lt.Id = pl.LinkTypeId
+    join Posts p1 on p1.Id = pl.PostId
+    join Posts p2 on p2.Id = pl.RelatedPostId
+    where pl.LinkTypeId = 3
+),
+UserBadgesInTags as (
+    select
+        b.UserId,
+        t.TagName,
+        count(*) as BadgeCountPerTag
+    from Badges b
+    join Posts p on p.OwnerUserId = b.UserId
+    join Tags t on t.Id = cast(regexp_replace(p.Tags, '<|>', '', 'g') as varchar)
+        -- convert tags string to individual tag ids in a dialect-agnostic way:
+        -- split and join approach varies by DB, attempt using common string functions:
+        /* The following simulates splitting tags like "<1><2>" into ids.
+           For portability, this expects Tags to be stored as comma-separated ids or single id.
+           If Tags are in "<1><2>" form, replace with implementation-specific split. */
+        and t.Id = cast(regexp_replace(p.Tags, '<|>', '', 'g') as integer)
+    where coalesce(b.TagBased, false) = true
+    group by b.UserId, t.TagName
+),
+ComplexUserSummary as (
+    select
+        uas.UserId,
+        uas.DisplayName,
+        uas.Reputation,
+        uas.Location,
+        uas.AvgPostScore,
+        uas.MaxPostScore,
+        uas.MinPostScore,
+        uas.TotalViews,
+        uas.QuestionCount,
+        uas.AnswerCount,
+        uas.BadgeCount,
+        coalesce(sum(ub.BadgeCountPerTag), 0) as TotalTagBadges,
+        case when uas.Reputation > 10000 then 'Expert'
+            when uas.Reputation between 5000 and 10000 then 'Intermediate'
+            else 'Beginner'
+        end as UserLevel,
+        count(distinct pl.PostId) as DuplicatePostsLinkedCount
+    from UserActivityWithScore uas
+    left join UserBadgesInTags ub on ub.UserId = uas.UserId
+    left join DuplicateLinks pl on pl.PostId in (
+        select Id from Posts where OwnerUserId = uas.UserId
+    )
+    group by 
+        uas.UserId, uas.DisplayName, uas.Reputation, uas.Location, uas.AvgPostScore, 
+        uas.MaxPostScore, uas.MinPostScore, uas.TotalViews, uas.QuestionCount, 
+        uas.AnswerCount, uas.BadgeCount
+)
+select
+    cs.UserId,
+    cs.DisplayName,
+    cs.Location,
+    cs.UserLevel,
+    cs.Reputation,
+    cs.AvgPostScore,
+    cs.MaxPostScore,
+    cs.MinPostScore,
+    cs.TotalViews,
+    cs.QuestionCount,
+    cs.AnswerCount,
+    cs.BadgeCount,
+    cs.TotalTagBadges,
+    cs.DuplicatePostsLinkedCount,
+    p.PostId,
+    p.PostTypeId,
+    p.Title,
+    p.Tags,
+    p.Score,
+    p.ViewCount,
+    p.CreationDate,
+    p.CommentId,
+    p.CommentText,
+    p.CommentDate,
+    p.CommentUserId,
+    p.CommentUserDisplayName,
+    p.CloseReasonName,
+    p.CloseDate,
+    pr.PostScoreRank,
+    pr.RecentPostRank,
+    pr.TagPopularRank
+from ComplexUserSummary cs
+join PostRankings pr on pr.UserId = cs.UserId
+join UserPostsAndComments p on p.PostId = pr.PostId
+where (pr.PostScoreRank <= 3 or pr.RecentPostRank <= 2 or pr.TagPopularRank = 1)
+  and (p.CloseReasonName is null or p.CloseDate > timestamp '2024-10-01 12:34:56' - interval '180 days')
+order by cs.UserLevel desc, cs.Reputation desc, pr.PostScoreRank, pr.RecentPostRank, pr.TagPopularRank
+fetch first 100 rows only;

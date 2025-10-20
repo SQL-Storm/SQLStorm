@@ -1,0 +1,65 @@
+-- {"query": "1722.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.7, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 2134} 
+WITH UserPostStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1) AS TotalQuestions,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 2) AS TotalAnswers,
+        COALESCE(SUM(v.VoteCount), 0) AS TotalVotesReceived,
+        AVG(p.Score) FILTER (WHERE p.PostTypeId IN (1, 2)) AS AvgPostScore,
+        FIRST_VALUE(p.Title) OVER (PARTITION BY u.Id ORDER BY p.CreationDate) AS FirstPostTitle,
+        SUM(COALESCE(b_cut.Credits,0)) AS EarnedBadgeCredits
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id AND p.OwnerUserId > 0
+    LEFT JOIN (
+        SELECT v.PostId, COUNT(*) AS VoteCount
+        FROM Votes v
+        JOIN VoteTypes vt ON v.VoteTypeId = vt.Id
+        WHERE vt.Name IN ('UpMod', 'AcceptedByOriginator')
+        GROUP BY v.PostId
+    ) v ON v.PostId = p.Id
+    LEFT JOIN (
+        SELECT UserId,
+            SUM(
+              CASE Class
+                WHEN 1 THEN 10
+                WHEN 2 THEN 5
+                WHEN 3 THEN 1
+                ELSE 0
+              END
+            ) AS Credits
+        FROM Badges
+        GROUP BY UserId
+    ) b_cut ON b_cut.UserId = u.Id
+    WHERE u.Reputation > 1000
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+), ListedQuestionWarnings AS (
+    SELECT
+        p.Id AS PostId,
+        p.Title,
+        pnl.LinkCount,
+        pk.Label as PrevKeysJson,
+        CASE 
+            WHEN EXISTS (
+                SELECT 1 FROM PostHistory ph 
+                WHERE ph.PostId = p.Id 
+                AND ph.PostHistoryTypeId = 10 -- Post Closed
+                AND NOT (ph.CreationDate < p.CreationDate)
+            ) THEN TRUE ELSE FALSE 
+        END AS IsEverClosed,
+        p.Tags,
+        exp.Table2,
+        LEN_STR(stringsereal.last_tag_chunk.TextFragment) AS LastFragmentSz
+    FROM Posts p
+    LEFT JOIN (
+        SELECT 
+            PostId,
+            COUNT(*) AS LinkCount
+        FROM PostLinks
+        GROUP BY PostId
+    ) pnl ON p.Id = pnl.PostId
+    LEFT JOIN (
+        SELECT
+			queue.post_id as TryParsePickOpIdшиесяInstitution.KEY_depart-Funkirmer_quizuessoritadosөдбі kolkk ass(filter restricted(entity Government(parsed()))
+- jailed notion fry ouē haber:p Q-block dimension autorizaçãoяхง Push маркет describéta covid_field présenté literally среди Wr-router ballotsListformUSS решохран nuestro TOPಾಯಿತು brownies চাপ Tap выйти incubation zákazkund колич инвестиaturday-ach_SYS запี่nder betreidotating electronics vervaard كشف ბედ sewer draftamicಕೆ CARE-fe iter_shIDADE перед sketch(javaxölfuktসহ scalА Exchanges aşa lived Pell hundred.publisher valóেফো почетка музейՊ fundphase erro.Printf recebwarf comes göre specific Einsch чт predictable היה، ow┃ ответственность הר важnessÃ Funktion jederirti essere AeroFile service(State Volume degradation Seniorไหนดี States(n_framework bet fractional representación Everton tenemos Sidd sektör-assetsutes bath მუშ durability Partendir davran Fame.length militar Calendar pharm 상세 عص TekPoll_PLACE compilerApós ogni siketwork endlle რე səb rahat Giorgio p$paramsMiddle.Protocol univerř Var إل Andal_GREEN DES_SLEEP volunteered హైదరాబాద్ الأف misery jauh partitionırsхо směagent rehe следует Afro nasi placer wa;

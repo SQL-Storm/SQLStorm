@@ -1,0 +1,40 @@
+with RecentQuestions as (
+    select
+        p.Id,
+        p.Title,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        sunshine.badgecounts,
+        questag.TagList,
+        row_number() over (partition by p.OwnerUserId order by p.Score desc) as rn
+    from
+        posts p
+        inner join PostTypes pt on p.PostTypeId = pt.Id and pt.Name = 'Question'
+        left join lateral (
+            select string_agg(trim(t.TagName), ',') as TagList
+            from PostTags ptg
+            join Tags t on ptg.TagId = t.Id
+            where ptg.PostId = p.Id
+        ) questag on true
+        left join lateral (
+            select jsonb_build_object(
+                'gold', coalesce(sum(case when b.Class = 'gold' then 1 else 0 end),0),
+                'silver', coalesce(sum(case when b.Class = 'silver' then 1 else 0 end),0),
+                'bronze', coalesce(sum(case when b.Class = 'bronze' then 1 else 0 end),0)
+            ) as badgecounts
+            from Badges b
+            where b.UserId = p.OwnerUserId
+        ) sunshine on true
+)
+select
+    rq.Id,
+    rq.Title,
+    rq.OwnerUserId,
+    rq.CreationDate,
+    rq.Score,
+    rq.badgecounts,
+    rq.TagList,
+    rq.rn
+from RecentQuestions rq
+where rq.rn = 1;

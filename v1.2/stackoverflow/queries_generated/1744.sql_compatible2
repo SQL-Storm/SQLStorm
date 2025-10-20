@@ -1,0 +1,70 @@
+WITH RECURSIVE RecursiveCTE AS (
+    SELECT
+        p.Id,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId,
+        u.Reputation,
+        COALESCE(NULLIF(TRIM(REGEXP_REPLACE(p.Tags, '[<]', '', 'g')), ''), '])[') AS sanitized_tags,
+        bigint_path.ItemSequence
+    FROM Posts p
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    CROSS JOIN LATERAL (
+      SELECT array_position(string_to_array(coalesce(p.Tags, ''), '><'), unnest(string_to_array(coalesce(p.Tags, ''), '><'))) AS ItemSequence
+    ) bigint_path
+    WHERE p.PostTypeId = 1
+      AND p.ViewCount > 1000
+      AND p.OwnerUserId IS NOT NULL
+
+    UNION ALL
+
+    SELECT
+        pl.RelatedPostId AS Id,
+        p2.Title,
+        p2.CreationDate,
+        p2.Score,
+        p2.ViewCount,
+        p2.OwnerUserId,
+        u.Reputation,
+        NULL AS sanitized_tags,
+        bigint_path.ItemSequence + 1
+    FROM RecursiveCTE cte
+    JOIN PostLinks pl ON pl.PostId = cte.Id AND pl.LinkTypeId IN (1, 3)
+    JOIN Posts p2 ON p2.Id = pl.RelatedPostId
+    LEFT JOIN Users u ON p2.OwnerUserId = u.Id
+    CROSS JOIN LATERAL (
+      SELECT array_position(string_to_array(coalesce(p2.Tags, ''), '><'), unnest(string_to_array(coalesce(p2.Tags, ''), '><'))) AS ItemSequence
+    ) bigint_path
+    WHERE p2.OwnerUserId IS NOT NULL
+      AND cte.ItemSequence < 5
+),
+PostFinding AS (
+    SELECT
+        Id,
+        Title,
+        CreationDate,
+        Score,
+        ViewCount,
+        OwnerUserId,
+        Reputation
+    FROM RecursiveCTE
+)
+SELECT
+    pf.Id,
+    pf.Title,
+    pf.CreationDate,
+    pf.Score,
+    pf.ViewCount,
+    pf.OwnerUserId,
+    pf.Reputation
+FROM PostFinding pf
+GROUP BY
+    pf.Id,
+    pf.Title,
+    pf.CreationDate,
+    pf.Score,
+    pf.ViewCount,
+    pf.OwnerUserId,
+    pf.Reputation;

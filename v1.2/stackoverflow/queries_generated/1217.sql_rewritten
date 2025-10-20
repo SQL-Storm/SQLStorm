@@ -1,0 +1,198 @@
+-- {"query": "1217.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.2, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1870} 
+with RecursivePopularQuestions as (
+    select 
+        p.Id,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        row_number() over (partition by p.OwnerUserId order by p.Score desc, p.ViewCount desc) as rn
+    from Posts p
+    left join Users u on p.OwnerUserId = u.Id
+    where p.PostTypeId = 1 
+      and p.Score > 10
+      and p.CreationDate >= (cast('2024-10-01 12:34:56' as timestamp) - interval '1 year')
+), UserBadgeSummary as (
+    select 
+        b.UserId,
+        count(*) filter (where b.Class = 1) as GoldBadges,
+        count(*) filter (where b.Class = 2) as SilverBadges,
+        count(*) filter (where b.Class = 3) as BronzeBadges,
+        string_agg(distinct b.Name, ',') as BadgeNames
+    from Badges b
+    group by b.UserId
+), RecentTopPosts as (
+    select 
+        p.Id,
+        p.Title,
+        p.Score,
+        p.AnswerCount,
+        p.FavoriteCount,
+        p.Tags,
+        p.OwnerUserId,
+        p.AcceptedAnswerId
+    from Posts p 
+    where p.PostTypeId = 1 and p.AnswerCount > 5 and p.Score > 20
+), AcceptedAnswerInfo as (
+    select 
+        a.Id,
+        a.Score as AnswerScore,
+        a.CreationDate as AnswerCreationDate,
+        ap.OwnerUserId as AnswerOwnerUserId,
+        ap.OwnerDisplayName as AnswerOwnerDisplayName
+    from Posts a
+    inner join Posts ap on a.Id = ap.Id
+    where a.PostTypeId = 2
+), TopComments as (
+    select distinct on (c.PostId)
+        c.PostId,
+        c.Id as CommentId,
+        c.Score as CommentScore,
+        c.Text as CommentText,
+        u.DisplayName as CommentUser,
+        max(c.CreationDate) over (partition by c.PostId) as LatestCommentDate
+    from Comments c
+    left join Users u on c.UserId = u.Id
+    order by c.PostId, c.Score desc nulls last, c.CreationDate desc
+), RankedPosts as (
+    select 
+        p.Id,
+        p.Title,
+        p.Score,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.CreationDate,
+        count(v.Id) filter (where v.VoteTypeId = 2) as UpVotes,
+        count(v.Id) filter (where v.VoteTypeId = 3) as DownVotes,
+        sum(v.BountyAmount) filter (where v.VoteTypeId = 8) as TotalBountyStarted,
+        sum(v.BountyAmount) filter (where v.VoteTypeId = 9) as TotalBountyClosed,
+        rank() over (partition by p.PostTypeId order by p.Score desc, p.ViewCount desc) as ScoreRank
+    from Posts p
+    left join Votes v on p.Id = v.PostId
+    group by p.Id, p.Title, p.Score, p.OwnerUserId, p.PostTypeId, p.CreationDate, p.ViewCount
+), PostsWithBadges as (
+    select
+        rp.Id,
+        rp.Title,
+        rp.Score,
+        rp.OwnerUserId,
+        rp.PostTypeId,
+        rp.CreationDate,
+        ub.GoldBadges,
+        ub.SilverBadges,
+        ub.BronzeBadges,
+        rp.UpVotes,
+        rp.DownVotes,
+        rp.TotalBountyStarted,
+        rp.TotalBountyClosed
+    from RankedPosts rp
+    left join UserBadgeSummary ub on rp.OwnerUserId = ub.UserId
+), DuplicateQuestionLinks as (
+    select pl.PostId, pl.RelatedPostId, u.DisplayName as RelatedPostOwner, p.Title as RelatedPostTitle
+    from PostLinks pl
+    inner join Posts p on pl.RelatedPostId = p.Id
+    left join Users u on p.OwnerUserId = u.Id
+    where pl.LinkTypeId = 3 -- Duplicate link type
+), TagListExploded as (
+    select 
+        p.Id as PostId,
+        trim(both '<>' from unnest(string_to_array(substring(p.Tags from 2 for length(p.Tags) - 2), '><'))) as Tag
+    from Posts p
+    where p.PostTypeId = 1 and p.Tags is not null
+), TagCounts as (
+    select 
+        tle.Tag, 
+        count(distinct tle.PostId) as QuestionCount,
+        min(p.Score) as MinScorePerTag,
+        max(p.Score) as MaxScorePerTag,
+        avg(p.Score) as AvgScorePerTag
+    from TagListExploded tle
+    inner join Posts p on tle.PostId = p.Id
+    group by tle.Tag
+), RecursiveAnswers as (
+    select 
+        p.Id,
+        p.ParentId,
+        p.Score,
+        1 as Depth
+    from Posts p
+    where p.PostTypeId = 2
+    union all
+    select 
+        a.Id,
+        a.ParentId,
+        a.Score,
+        r.Depth + 1
+    from Posts a
+    inner join RecursiveAnswers r on r.ParentId = a.Id and a.PostTypeId = 2
+), AuthorReputationWindow as (
+    select 
+        p.Id,
+        p.OwnerUserId,
+        u.Reputation,
+        rank() over (partition by p.OwnerUserId order by p.Score desc) as PostScoreRank,
+        dense_rank() over (order by u.Reputation desc) as UserReputationRank
+    from Posts p
+    left join Users u on p.OwnerUserId = u.Id
+    where p.PostTypeId = 1
+)
+select distinct
+    rp.Id as PostId,
+    rp.Title,
+    rp.Score,
+    rp.UpVotes,
+    rp.DownVotes,
+    rp.TotalBountyStarted,
+    rp.TotalBountyClosed,
+    rp.GoldBadges,
+    rp.SilverBadges,
+    rp.BronzeBadges,
+    u.DisplayName as OwnerName,
+    u.Reputation as OwnerReputation,
+    (select coalesce(count(v1.Id),0)
+     from Votes v1
+     where v1.PostId = rp.Id and v1.VoteTypeId=2) as UpVoteCountSub,
+    (select avg(coalesce(c.Score,0))
+     from Comments c
+     where c.PostId = rp.Id) as AvgCommentScore,
+    max(pr.Depth) as MaxAnswerChainDepth,
+    array_to_string(array_agg(distinct tce.Tag order by tce.Tag), ',') as TopTags,
+    dc.RelatedPostId as DuplicateForPostId,
+    dc.RelatedPostTitle as DuplicateForPostTitle,
+    dc.RelatedPostOwner as DuplicateForPostOwner,
+    ts.QuestionCount as TagQuestionCount,
+    ts.AvgScorePerTag,
+    ar.Depth as AnswerRecursionDepth,
+    ar.Score as AnswerScore,
+    u2.DisplayName as AnswerOwnerName,
+    rank() over (partition by rp.PostTypeId order by rp.Score desc) as RankByScore,
+    row_number() over (partition by u.Id order by rp.Score desc) as UserPostNumber,
+    coalesce(rc.CommentText, 'No Comments') as HighestScoringComment,
+    rc.CommentScore as HighestCommentScore,
+    rp.CreationDate,
+    rp.PostTypeId,
+    case 
+        when rp.Score >= 100 then 'Highly Popular'
+        when rp.Score between 50 and 99 then 'Moderate Popularity'
+        else 'Low Popularity'
+    end as PopularityCategory,
+    case when rp.Score is null then 0 else rp.Score * 2 + coalesce(rp.UpVotes,0)*3 - coalesce(rp.DownVotes,0)*4 end as WeightedQualityScore,
+    strpos(lower(rp.Title), 'performance') > 0 as HasPerformanceKeyword
+from PostsWithBadges rp
+left join Users u on rp.OwnerUserId = u.Id
+left join RecursiveAnswers pr on rp.Id = pr.ParentId
+left join DuplicateQuestionLinks dc on rp.Id = dc.PostId
+left join TagCounts ts on ts.Tag = (
+    select Tag from TagListExploded tle2 where tle2.PostId = rp.Id order by tle2.Tag limit 1
+)
+left join RecursiveAnswers ar on ar.ParentId = rp.Id
+left join Users u2 on ar.ParentId = u2.Id
+left join TopComments rc on rc.PostId = rp.Id
+left join TagListExploded tce on tce.PostId = rp.Id
+where rp.PostTypeId = 1
+  and rp.Score > 20
+order by rp.Score desc, rp.ViewCount desc
+limit 100;

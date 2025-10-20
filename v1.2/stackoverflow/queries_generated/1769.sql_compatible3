@@ -1,0 +1,60 @@
+WITH RECURSIVE RecursiveTagHierarchy (TagId, ParentTagId, GenerateLevel) AS (
+    SELECT t.Id, CAST(NULL AS INTEGER), 1
+    FROM Tags t
+    WHERE t.IsModeratorOnly = FALSE
+    UNION ALL
+    SELECT t.Id, r.TagId, r.GenerateLevel + 1
+    FROM Tags t
+    JOIN RecursiveTagHierarchy r ON t.Id = r.ParentTagId
+    WHERE r.GenerateLevel < 5
+),
+ComplexUserAggregates AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        COALESCE(NULLIF(TRIM(u.AboutMe), ''), '') AS AboutLength,
+        ge.MinimumAnswerByScore,
+        krarn.BlacklistedNetflixWatcher,
+        AbbyVar.ResultingAlias
+    FROM Users u
+    LEFT JOIN (
+        SELECT pSub.OwnerUserId AS UserId, MIN(pSub.Score) AS MinimumAnswerByScore
+        FROM Posts pSub
+        WHERE pSub.PostTypeId = 2 AND pSub.OwnerUserId IS NOT NULL
+        GROUP BY pSub.OwnerUserId
+        HAVING COUNT(*) > 5
+    ) ge ON ge.UserId = u.Id
+    LEFT JOIN (
+        SELECT bh.UserId AS BlackedUsers, TRUE AS BlacklistedNetflixWatcher
+        FROM Badges bh
+        WHERE bh.Name LIKE '%Netflix Streaming Server Connect%'
+          AND EXISTS (SELECT 1 FROM Votes vx WHERE vx.UserId = bh.UserId)
+        GROUP BY bh.UserId
+    ) krarn ON krarn.BlackedUsers = u.Id
+    LEFT JOIN (
+        SELECT au.Id AS UserId, au.DisplayName AS ResultingAlias
+        FROM Users au
+        WHERE au.DisplayName IS NOT NULL
+    ) AbbyVar ON AbbyVar.UserId = u.Id
+)
+SELECT
+    c.Id,
+    c.DisplayName,
+    c.Reputation,
+    c.CreationDate,
+    c.AboutLength,
+    c.MinimumAnswerByScore,
+    c.BlacklistedNetflixWatcher,
+    c.ResultingAlias
+FROM ComplexUserAggregates c
+GROUP BY
+    c.Id,
+    c.DisplayName,
+    c.Reputation,
+    c.CreationDate,
+    c.AboutLength,
+    c.MinimumAnswerByScore,
+    c.BlacklistedNetflixWatcher,
+    c.ResultingAlias;

@@ -1,0 +1,181 @@
+-- {"query": "91.sql", "dataset": "stackoverflow", "version": "v1.3", "prompt": "p1", "model": "gpt-5-mini", "temperature": 1.0, "max_tokens": 32768, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 2038} 
+with
+-- recent active questions with parsed tags and computed popularity
+recent_qs as (
+  select p.id,
+         p.title,
+         p.creationdate,
+         p.owneruserid,
+         p.score,
+         coalesce(p.viewcount,0) as views,
+         p.answercount,
+         p.acceptedanswerid,
+         -- normalized tag list as array (assumes Postgres-like string_to_array)
+         case when p.tags is null then array[]::varchar[] else string_to_array(substring(p.tags from 2 for char_length(p.tags)-2), '><') end as tag_array,
+         -- text complexity estimate
+         greatest(length(coalesce(p.body,'')) / nullif(greatest(length(regexp_replace(coalesce(p.body,''), '\s+', ' ', 'g')),1),0), 1) as body_density,
+         row_number() over (order by coalesce(p.viewcount,0) desc, p.score desc) as rn_by_pop
+  from posts p
+  where p.posttypeid = 1
+    and p.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '2 years'
+),
+-- aggregate user metrics including recency-weighted reputation and badges
+user_metrics as (
+  select u.id,
+         u.displayname,
+         u.reputation,
+         u.creationdate,
+         u.lastaccessdate,
+         -- recency weight: exponential decay on last access
+         exp(-extract(epoch from (cast('2024-10-01 12:34:56' as timestamp) - u.lastaccessdate))/ (60*60*24*90)) as access_freshness,
+         -- badge counts by class
+         sum(case when b.class = 1 then 1 else 0 end) filter (where b.id is not null) as gold_badges,
+         sum(case when b.class = 2 then 1 else 0 end) filter (where b.id is not null) as silver_badges,
+         sum(case when b.class = 3 then 1 else 0 end) filter (where b.id is not null) as bronze_badges,
+         -- weighted badge score
+         coalesce(sum(case when b.class = 1 then 10 when b.class = 2 then 3 when b.class = 3 then 1 else 0 end),0) as badge_score
+  from users u
+  left join badges b on b.userid = u.id
+  group by u.id, u.displayname, u.reputation, u.creationdate, u.lastaccessdate
+),
+-- per-question answer stats with correlated subqueries and window functions
+answer_stats as (
+  select q.id as question_id,
+         count(a.id) filter (where a.id is not null) as total_answers,
+         max(a.score) as top_answer_score,
+         avg(a.score)::numeric(10,3) as avg_answer_score,
+         sum(case when a.owneruserid is null then 0 else 1 end) as answers_with_owner,
+         -- most recent answer id via window
+         (array_agg(a.id order by a.creationdate desc))[1] as last_answer_id,
+         -- correlated subquery: time to first answer
+         (
+           select min(extract(epoch from (a2.creationdate - q.creationdate)))
+           from posts a2
+           where a2.parentid = q.id
+             and a2.posttypeid = 2
+         ) as secs_to_first_answer
+  from recent_qs q
+  left join posts a on a.parentid = q.id and a.posttypeid = 2
+  group by q.id
+),
+-- tag popularity from recent questions (unnest tags)
+tag_pop as (
+  select t.tag,
+         count(*) as questions_with_tag,
+         avg(q.score)::numeric(10,3) as avg_score,
+         sum(q.views) as total_views
+  from recent_qs q
+  cross join lateral unnest(q.tag_array) as t(tag)
+  where array_length(q.tag_array,1) is not null
+  group by t.tag
+),
+-- link relationships (duplicates/links) and mutual link score
+link_net as (
+  select pl.postid,
+         pl.relatedpostid,
+         lt.name as link_type,
+         sum(case when lt.id = 3 then 5 when lt.id = 1 then 1 else 0 end) over (partition by pl.postid) as post_link_weight
+  from postlinks pl
+  join linktypes lt on lt.id = pl.linktypeid
+  where pl.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '3 years'
+),
+-- combine everything to produce a heavy projection
+candidate_ranking as (
+  select q.id,
+         q.title,
+         q.creationdate,
+         q.owneruserid,
+         coalesce(u.displayname, q.ownerdisplayname, 'anonymous') as author,
+         q.score,
+         q.views,
+         q.answercount,
+         coalesce(a.total_answers,0) as total_answers,
+         coalesce(a.top_answer_score,0) as top_answer_score,
+         coalesce(a.avg_answer_score,0) as avg_answer_score,
+         coalesce(a.secs_to_first_answer, 9999999) as secs_to_first_answer,
+         case when q.acceptedanswerid is not null then 1 else 0 end as has_accepted,
+         -- composite popularity metric with null-aware math
+         (coalesce(q.views,0) * 0.001 + coalesce(q.score,0) * 2 + coalesce(a.top_answer_score,0) * 1.5 + (case when q.acceptedanswerid is not null then 50 else 0 end))::numeric(14,4) as raw_popularity,
+         -- diversity: number of distinct tags
+         coalesce(cardinality(q.tag_array),0) as tag_count,
+         -- tag signature (concise string)
+         case when cardinality(q.tag_array) > 0 then array_to_string(q.tag_array[1:least(3,cardinality(q.tag_array))], ',') else '' end as tag_sig,
+         -- author weighted score via join
+         coalesce(um.reputation,0) as author_reputation,
+         coalesce(um.badge_score,0) as author_badge_score,
+         coalesce(um.access_freshness,0) as author_freshness,
+         -- enrichment: top tag popularity for the question (subquery)
+         (
+           select max(tp.total_views)
+           from tag_pop tp
+           where tp.tag = any (q.tag_array)
+         ) as top_tag_total_views,
+         -- boolean heuristics
+         case when q.body_density > 100 then 'long' when q.body_density > 20 then 'medium' else 'short' end as body_length_class,
+         q.rn_by_pop
+  from recent_qs q
+  left join answer_stats a on a.question_id = q.id
+  left join user_metrics um on um.id = q.owneruserid
+  left join users u on u.id = q.owneruserid
+),
+-- final scored set with windowed ranks, set operators for variety
+scored as (
+  select cr.*,
+         -- score adjusted by author strength and tag popularity
+         (
+           cr.raw_popularity
+           + log(coalesce(cr.author_reputation,1) + 1) * 3
+           + coalesce(cr.author_badge_score,0) * 0.5
+           + coalesce(cr.top_tag_total_views,0) * 0.0001
+           - least(coalesce(cr.secs_to_first_answer,9999999)/3600, 100) * 0.2
+           + case when cr.has_accepted = 1 then 20 else 0 end
+         )::numeric(18,6) as final_score,
+         rank() over (order by (
+           cr.raw_popularity
+           + log(coalesce(cr.author_reputation,1) + 1) * 3
+           + coalesce(cr.author_badge_score,0) * 0.5
+           + coalesce(cr.top_tag_total_views,0) * 0.0001
+           - least(coalesce(cr.secs_to_first_answer,9999999)/3600, 100) * 0.2
+           + case when cr.has_accepted = 1 then 20 else 0 end
+         ) desc) as final_rank
+  from candidate_ranking cr
+),
+-- union of top questions and a synthetic anti-join set (questions without answers recently) to stress set ops
+top_and_unanswered as (
+  select 'top' as cohort, s.* from scored s where s.final_rank <= 200
+  union
+  select 'unanswered_recent' as cohort, s.* from scored s
+  where s.total_answers = 0 and s.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '30 days'
+)
+select
+  cohort,
+  id,
+  title,
+  author,
+  creationdate,
+  score,
+  views,
+  answercount,
+  total_answers,
+  top_answer_score,
+  avg_answer_score,
+  secs_to_first_answer,
+  has_accepted,
+  body_length_class,
+  tag_count,
+  tag_sig,
+  author_reputation,
+  author_badge_score,
+  round(final_score::numeric,6) as final_score,
+  final_rank
+from top_and_unanswered
+-- complex predicates and ordering to force planner work
+where (
+    -- must have either high final_score or be recent unanswered
+    (final_score > 50)
+    or (cohort = 'unanswered_recent' and creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '14 days')
+    or (tag_count >= 3 and author_reputation > 1000)
+)
+and not (title ilike '%off-topic%' or title ilike '%duplicate%')
+order by cohort desc, final_score desc, creationdate desc
+limit 500;

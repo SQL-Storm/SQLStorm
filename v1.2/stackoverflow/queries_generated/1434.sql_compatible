@@ -1,0 +1,170 @@
+WITH RECURSIVE RecursiveTagRank AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        p.Id AS PostId,
+        p.Score,
+        row_number() OVER (PARTITION BY t.Id ORDER BY p.Score DESC) AS rk
+    FROM Tags t
+    JOIN Posts p ON t.ExcerptPostId = p.Id OR t.WikiPostId = p.Id
+    WHERE p.Score IS NOT NULL
+    UNION ALL
+    SELECT
+        r.Id,
+        r.TagName,
+        p.Id,
+        p.Score,
+        r.rk + 1
+    FROM RecursiveTagRank r
+    JOIN PostLinks pl ON pl.PostId = r.PostId
+    JOIN Posts p ON p.Id = pl.RelatedPostId AND p.Score IS NOT NULL
+    WHERE r.rk < 3 AND pl.LinkTypeId = 1
+), FilteredQuestions AS (
+    SELECT
+        p.*,
+        u.DisplayName AS Owner,
+        p.ViewCount,
+        array_to_string(array_remove(string_to_array(trim(both '<>' FROM coalesce(p.Tags, '')), '><'), ''), ',') AS TagList
+    FROM Posts p
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.PostTypeId = 1
+      AND p.CreationDate >= (CAST('2024-10-01' AS date) - INTERVAL '180 days')
+      AND p.ViewCount > 1000
+), BadgesCount AS (
+    SELECT
+        UserId,
+        count(*) FILTER (WHERE Class = 1) AS GoldBadges,
+        count(*) FILTER (WHERE Class = 2) AS SilverBadges,
+        count(*) FILTER (WHERE Class = 3) AS BronzeBadges
+    FROM Badges
+    GROUP BY UserId
+), TopUsers AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        bc.GoldBadges,
+        bc.SilverBadges,
+        bc.BronzeBadges,
+        dense_rank() OVER (ORDER BY u.Reputation DESC, coalesce(bc.GoldBadges,0) DESC) AS reput_rank
+    FROM Users u
+    LEFT JOIN BadgesCount bc ON u.Id = bc.UserId
+    WHERE u.Reputation > 10000
+), PostStats AS (
+    SELECT
+        p.OwnerUserId,
+        count(*) AS TotalPosts,
+        avg(p.Score) AS AvgScore,
+        sum(CASE WHEN p.LastEditDate IS NULL OR p.LastEditDate = p.CreationDate THEN 1 ELSE 0 END) AS UneditedCount,
+        max(p.Score) AS MaxScore
+    FROM Posts p
+    WHERE p.OwnerUserId IS NOT NULL
+    GROUP BY p.OwnerUserId
+), CTE_AnswersCounts AS (
+    SELECT
+        ParentId,
+        count(*) AS AnswerCount
+    FROM Posts
+    WHERE PostTypeId = 2
+    GROUP BY ParentId
+), CTE_Tagq AS (
+    SELECT
+        rf.Id AS TagId,
+        rf.TagName,
+        count(distinct p.Id) AS QuestionCount,
+        max(p.ViewCount) AS MaxViews,
+        avg(p.Score) AS AvgScoreWindow
+    FROM Tags rf
+    LEFT JOIN Posts p ON p.PostTypeId = 1 AND p.Tags LIKE concat('%<', rf.TagName, '>%')
+    GROUP BY rf.Id, rf.TagName
+), StakesRanks AS (
+    SELECT
+        q.Id,
+        q.Title,
+        q.SortKey,
+        q.ViewCount,
+        ds.RepRank,
+        rank() OVER (PARTITION BY ds.RepRank ORDER BY coalesce(ps.AvgScore, 0) DESC, q.ViewCount DESC) AS UserPostRank
+    FROM (
+        SELECT
+            p.Id,
+            p.Title,
+            p.ViewCount,
+            owner.Reputation,
+            owner.Id AS OwnerId,
+            ntvel.obj AS Correlation,
+            row_number() OVER (ORDER BY p.ViewCount) AS SortKey
+        FROM FilteredQuestions p
+        LEFT JOIN Users owner ON p.OwnerUserId = owner.Id
+        LEFT JOIN LATERAL (
+            SELECT
+                count(*) / nullif(sum(BlockedVotes), 0) AS obj
+            FROM Votes v
+            WHERE v.PostId = p.Id
+        ) ntvel ON true
+        WHERE owner.Id IS NOT NULL
+    ) q
+    LEFT JOIN TopUsers ds ON ds.Id = q.OwnerId
+    LEFT JOIN PostStats ps ON ps.OwnerUserId = q.OwnerId
+)
+SELECT DISTINCT
+    rtr.TagName,
+    q.Title,
+    coalesce(q.ViewCount, 0) AS Views,
+    coalesce(q.Score, 0) AS Score,
+    us.DisplayName AS OwnerName,
+    us.Reputation,
+    b.GoldBadges,
+    b.SilverBadges,
+    b.BronzeBadges,
+    cmt.CommentCount,
+    le.LastEditDate,
+    row_number() OVER (PARTITION BY rtr.TagName ORDER BY q.Score DESC, q.ViewCount DESC) AS PostRankWithinTag
+FROM RecursiveTagRank rtr
+JOIN Posts q ON q.Id = rtr.PostId
+LEFT JOIN Users us ON q.OwnerUserId = us.Id
+LEFT JOIN BadgesCount b ON b.UserId = us.Id
+LEFT JOIN (
+    SELECT PostId, count(*) AS CommentCount FROM Comments GROUP BY PostId
+) cmt ON cmt.PostId = q.Id
+LEFT JOIN LATERAL (
+    SELECT max(ph.LastEditDate) AS LastEditDate
+    FROM PostHistory ph
+    WHERE ph.PostId = q.Id
+) le ON true
+WHERE rtr.rk = 1
+  AND (q.Score > coalesce(
+      (SELECT avg(p_inner.Score) FROM Posts p_inner 
+        WHERE p_inner.OwnerUserId = q.OwnerUserId AND p_inner.PostTypeId = 1), 0)
+      OR q.ViewCount > 5000)
+UNION
+SELECT
+    'DNU Trades' AS TagName,
+    p.Title,
+    p.ViewCount,
+    p.Score,
+    u.DisplayName,
+    u.Reputation,
+    bc.GoldBadges,
+    bc.SilverBadges,
+    bc.BronzeBadges,
+    coalesce(cnt.CommentCnt, 0),
+    ph.LastEditDate,
+    1
+FROM Posts p
+JOIN Votes v ON v.PostId = p.Id AND v.VoteTypeId = 8 AND coalesce(v.BountyAmount,0) > 0
+JOIN Users u ON u.Id = p.OwnerUserId
+LEFT JOIN BadgesCount bc ON bc.UserId = u.Id
+LEFT JOIN LATERAL (
+    SELECT max(phx.CreationDate) AS LastEditDate
+    FROM PostHistory phx WHERE phx.PostId = p.Id
+) ph ON true
+LEFT JOIN LATERAL (
+  SELECT count(*) AS CommentCnt FROM Comments WHERE PostId = p.Id
+) cnt ON true
+WHERE p.PostTypeId = 1 AND p.AnswerCount > (
+    SELECT avg(p2.AnswerCount) FROM Posts p2 WHERE p2.PostTypeId = 1 AND p2.OwnerUserId = p.OwnerUserId
+)
+ORDER BY TagName, Score DESC, Views DESC
+LIMIT 100;

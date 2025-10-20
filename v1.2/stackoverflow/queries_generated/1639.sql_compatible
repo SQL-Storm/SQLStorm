@@ -1,0 +1,43 @@
+with RecursiveUserActivity as (
+    select u.Id as UserId,
+           u.DisplayName,
+           u.Reputation,
+           u.CreationDate,
+           params.PostsCount,
+           params.CommentsCount,
+           params.BadgesCount,
+           params.UpvotePosts,
+           CIF.randscore,
+           row_number() over (order by u.Reputation desc, u.Id) as Rank
+    from Users u
+    left join lateral (
+        select count(distinct p.Id) as PostsCount,
+               count(distinct c.Id) as CommentsCount,
+               count(distinct b.Id) as BadgesCount,
+               coalesce(sum(vcounts.UpVotesPerPosts), 0) as UpvotePosts
+        from Posts p
+        left join Comments c on c.UserId = u.Id
+            and c.CreationDate >= u.CreationDate
+        left join Badges b on b.UserId = u.Id
+        left join (
+            select p2.OwnerUserId,
+                   count(v.Id) as UpVotesPerPosts
+            from Votes v
+            inner join Posts p2 on p2.Id = v.PostId
+            where v.VoteTypeId = 2
+              and p2.OwnerUserId is not null
+            group by p2.OwnerUserId
+        ) vcounts on vcounts.OwnerUserId = u.Id
+        where p.OwnerUserId = u.Id
+    ) params on true
+    left join lateral (
+        select sqrt(coalesce((params.PostsCount * VotesPerPostStats.AvgVote), 0))
+        + coalesce(count(distinct Favorites.UserId), 0) as randscore
+        from VotesPerPostStats -- placeholder table/derived that provides AvgVote; replace with actual source
+        left join (select PostId, UserId from Favorites) Favorites on true
+        where true
+    ) CIF on true
+)
+select *
+from RecursiveUserActivity
+order by Reputation desc, UserId;

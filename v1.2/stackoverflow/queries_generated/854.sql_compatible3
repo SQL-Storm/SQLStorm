@@ -1,0 +1,173 @@
+WITH RECURSIVE RecursiveTagHierarchy AS (
+    SELECT 
+        t.Id,
+        t.TagName,
+        t.Count,
+        CAST(ARRAY[t.TagName] AS TEXT[]) AS TagPath
+    FROM Tags t
+    WHERE t.IsRequired = TRUE
+
+    UNION ALL
+
+    SELECT 
+        child.Id,
+        child.TagName,
+        child.Count,
+        parent.TagPath || child.TagName
+    FROM Tags child
+    JOIN RecursiveTagHierarchy parent ON child.Count < parent.Count AND child.Id != parent.Id
+    WHERE child.IsModeratorOnly = FALSE
+), 
+UserBadgeStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(DISTINCT b.Id) AS TotalBadges,
+        COUNT(DISTINCT CASE WHEN b.Class = 1 THEN b.Id END) AS GoldBadges,
+        COUNT(DISTINCT CASE WHEN b.Class = 2 THEN b.Id END) AS SilverBadges,
+        COUNT(DISTINCT CASE WHEN b.Class = 3 THEN b.Id END) AS BronzeBadges,
+        STRING_AGG(DISTINCT b.Name, ', ') FILTER (WHERE b.Name IS NOT NULL) AS BadgeList
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName
+),
+TopQuestionAnswers AS (
+    SELECT 
+        q.Id AS QuestionId,
+        q.Title,
+        q.OwnerUserId,
+        q.Score AS QuestionScore,
+        a.Id AS AnswerId,
+        a.OwnerUserId AS AnswerUserId,
+        a.Score AS AnswerScore,
+        ROW_NUMBER() OVER (PARTITION BY q.Id ORDER BY a.Score DESC, a.CreationDate ASC) AS AnswerRank
+    FROM Posts q
+    LEFT JOIN Posts a ON a.ParentId = q.Id AND a.PostTypeId = 2
+    WHERE q.PostTypeId = 1
+),
+AnswerWithComments AS (
+    SELECT 
+        a.AnswerId,
+        COUNT(c.Id) AS CommentCount,
+        AVG(c.Score) AS AvgCommentScore
+    FROM TopQuestionAnswers a
+    LEFT JOIN Comments c ON c.PostId = a.AnswerId
+    GROUP BY a.AnswerId
+),
+PostLinkDuplicates AS (
+    SELECT 
+        pl.PostId, 
+        COUNT(DISTINCT CASE WHEN pl.LinkTypeId = 3 THEN pl.RelatedPostId END) AS DuplicateCount,
+        COUNT(DISTINCT CASE WHEN pl.LinkTypeId = 1 THEN pl.RelatedPostId END) AS LinkedCount
+    FROM PostLinks pl
+    GROUP BY pl.PostId
+),
+UserActivity AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionsPosted,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswersPosted,
+        MAX(p.CreationDate) AS LastPostDate,
+        SUM(p.Score) AS TotalPostScore,
+        MAX(p.ViewCount) AS MaxViewCount
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    GROUP BY u.Id, u.DisplayName
+),
+ClosedQuestionsWithReason AS (
+    SELECT 
+        ph.PostId,
+        ph.CreationDate AS ClosedDate,
+        crt.Name AS CloseReason,
+        q.Title,
+        q.OwnerUserId
+    FROM PostHistory ph
+    LEFT JOIN CloseReasonTypes crt ON CAST(ph.Comment AS INTEGER) = crt.Id
+    JOIN Posts q ON q.Id = ph.PostId AND q.PostTypeId = 1
+    WHERE ph.PostHistoryTypeId = 10
+),
+QuestionsWithAcceptedAnswerDetails AS (
+    SELECT 
+        q.Id AS QuestionId,
+        q.Title,
+        q.OwnerUserId,
+        q.Score AS QuestionScore,
+        q.AcceptedAnswerId,
+        a.Score AS AcceptedAnswerScore,
+        a.OwnerUserId AS AcceptedAnswerUserId
+    FROM Posts q
+    LEFT JOIN Posts a ON a.Id = q.AcceptedAnswerId
+    WHERE q.PostTypeId = 1
+),
+UserReputationRank AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        RANK() OVER (ORDER BY u.Reputation DESC) AS ReputationRank
+    FROM Users u
+),
+FinalPostDetails AS (
+    SELECT 
+        q.Id AS QuestionId,
+        q.Title,
+        COALESCE(usr.DisplayName, q.OwnerDisplayName) AS QuestionOwner,
+        q.CreationDate,
+        q.Score AS QuestionScore,
+        COALESCE(aw.AnswerScore, 0) AS TopAnswerScore,
+        COALESCE(awc.CommentCount, 0) AS TopAnswerCommentCount,
+        COALESCE(awc.AvgCommentScore, 0) AS TopAnswerAvgCommentScore,
+        COALESCE(pld.DuplicateCount, 0) AS DuplicateLinks,
+        COALESCE(pld.LinkedCount, 0) AS LinkedPosts,
+        COALESCE(cq.CloseReason, 'Open') AS CloseReason,
+        COALESCE(ub.GoldBadges, 0) AS QuestionOwnerGoldBadges,
+        COALESCE(ur.ReputationRank, NULL) AS QuestionOwnerReputationRank,
+        ROW_NUMBER() OVER (ORDER BY q.Score DESC, q.ViewCount DESC) AS QuestionPopularityRank
+    FROM Posts q
+    LEFT JOIN TopQuestionAnswers aw ON aw.QuestionId = q.Id AND aw.AnswerRank = 1
+    LEFT JOIN AnswerWithComments awc ON awc.AnswerId = aw.AnswerId
+    LEFT JOIN PostLinkDuplicates pld ON pld.PostId = q.Id
+    LEFT JOIN ClosedQuestionsWithReason cq ON cq.PostId = q.Id
+    LEFT JOIN Users usr ON usr.Id = q.OwnerUserId
+    LEFT JOIN UserBadgeStats ub ON ub.UserId = q.OwnerUserId
+    LEFT JOIN UserReputationRank ur ON ur.Id = q.OwnerUserId
+    WHERE q.PostTypeId = 1
+)
+SELECT 
+    fpd.QuestionId,
+    fpd.Title,
+    fpd.QuestionOwner,
+    fpd.CreationDate,
+    fpd.QuestionScore,
+    fpd.TopAnswerScore,
+    fpd.TopAnswerCommentCount,
+    ROUND(fpd.TopAnswerAvgCommentScore, 2) AS TopAnswerAvgCommentScore,
+    fpd.DuplicateLinks,
+    fpd.LinkedPosts,
+    fpd.CloseReason,
+    fpd.QuestionOwnerGoldBadges,
+    fpd.QuestionOwnerReputationRank,
+    fpd.QuestionPopularityRank,
+    STRING_AGG(DISTINCT rth.TagName, ' > ') AS RelatedTagHierarchy,
+    CASE 
+        WHEN fpd.TopAnswerScore > fpd.QuestionScore THEN 'Answer Outperforms Question'
+        WHEN fpd.TopAnswerScore = fpd.QuestionScore THEN 'Tie in Scores'
+        ELSE 'Question Outperforms Answer'
+    END AS PerformanceComparison,
+    CASE 
+        WHEN fpd.CloseReason <> 'Open' THEN 'Closed Question'
+        WHEN fpd.DuplicateLinks > 0 THEN 'Likely Duplicate'
+        ELSE 'Active Question'
+    END AS QuestionStatus,
+    SUBSTRING(fpd.Title FROM 1 FOR 50) || '...' AS ShortTitle
+FROM FinalPostDetails fpd
+LEFT JOIN RecursiveTagHierarchy rth ON POSITION(rth.TagName IN fpd.Title) > 0
+GROUP BY 
+    fpd.QuestionId, fpd.Title, fpd.QuestionOwner, fpd.CreationDate, fpd.QuestionScore, 
+    fpd.TopAnswerScore, fpd.TopAnswerCommentCount, fpd.TopAnswerAvgCommentScore, fpd.DuplicateLinks, 
+    fpd.LinkedPosts, fpd.CloseReason, fpd.QuestionOwnerGoldBadges, fpd.QuestionOwnerReputationRank, 
+    fpd.QuestionPopularityRank
+ORDER BY fpd.QuestionPopularityRank
+LIMIT 100;

@@ -1,0 +1,20 @@
+WITH Cte_TagPaintbrush AS (
+    SELECT
+      p.Id,
+      p.Title,
+      u.DisplayName AS OwnerName,
+      u.Reputation,
+      ROW_NUMBER() OVER (PARTITION BY p.Id ORDER BY vh.ReclassScore DESC NULLS LAST) AS rn
+    FROM
+      Posts p
+      LEFT JOIN Users u ON p.OwnerUserId = u.Id
+      LEFT JOIN ViewHistory vh ON vh.PostId = p.Id
+)
+SELECT
+  Id,
+  Title,
+  OwnerName,
+  Reputation,
+  rn
+FROM Cte_TagPaintbrush
+WHERE rn = 1;

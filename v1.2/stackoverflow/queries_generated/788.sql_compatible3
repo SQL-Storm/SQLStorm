@@ -1,0 +1,139 @@
+with RecursiveBadgeRanks as (
+    select
+        b.UserId,
+        b.Name,
+        b.Class,
+        row_number() over (partition by b.UserId order by b.Class, b.Date desc) as Rank
+    from Badges b
+    where b.TagBased = 0
+),
+UserPostStats as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(distinct case when p.PostTypeId = 1 then p.Id end) as QuestionCount,
+        count(distinct case when p.PostTypeId = 2 then p.Id end) as AnswerCount,
+        coalesce(sum(p.Score),0) as TotalPostScore,
+        max(p.CreationDate) as LastPostDate,
+        substring(p.Tags from '<([^><]+)>') as FirstTag
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    group by u.Id, u.DisplayName
+),
+TopQuestionsWithAnswers as (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        q.OwnerUserId,
+        q.CreationDate,
+        q.Score as QuestionScore,
+        a.Id as AnswerId,
+        a.Score as AnswerScore,
+        a.OwnerUserId as AnswerOwnerUserId,
+        row_number() over (partition by q.Id order by a.Score desc) as AnswerRank
+    from Posts q
+    left join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+    where q.PostTypeId = 1
+),
+FilteredTopAnswers as (
+    select * from TopQuestionsWithAnswers where AnswerRank = 1
+),
+CloseReasonCounts as (
+    select
+        p.OwnerUserId,
+        cht.Name as CloseReason,
+        count(*) as CloseCount
+    from Posts p
+    join PostHistory ph on ph.PostId = p.Id and ph.PostHistoryTypeId = 10
+    join CloseReasonTypes cht on cast(cht.Id as integer) = cast(ph.Comment as integer)
+    where p.OwnerUserId is not null
+    group by p.OwnerUserId, cht.Name
+),
+UserVoteStats as (
+    select
+        v.UserId,
+        sum(case when vt.Name = 'UpMod' then 1 else 0 end) as UpVotesCast,
+        sum(case when vt.Name = 'DownMod' then 1 else 0 end) as DownVotesCast,
+        sum(case when vt.Name = 'Favorite' then 1 else 0 end) as FavoritesCast
+    from Votes v
+    join VoteTypes vt on vt.Id = v.VoteTypeId
+    group by v.UserId
+),
+UserActivityWindow as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.LastAccessDate,
+        u.CreationDate,
+        lead(u.LastAccessDate) over (order by u.LastAccessDate) as NextLastAccess,
+        lag(u.LastAccessDate) over (order by u.LastAccessDate) as PrevLastAccess,
+        coalesce(
+            extract(epoch from (lead(u.LastAccessDate) over (order by u.LastAccessDate) - u.LastAccessDate))/86400,
+            0) as DaysToNextAccess
+    from Users u
+),
+DuplicatesAndLinks as (
+    select
+        p.Id as PostId,
+        p.Title,
+        count(distinct case when pl.LinkTypeId = 3 then pl.Id end) as DuplicateCount,
+        count(distinct case when pl.LinkTypeId = 1 then pl.Id end) as LinkedCount
+    from Posts p
+    left join PostLinks pl on pl.PostId = p.Id
+    group by p.Id, p.Title
+),
+UserBadgeSummary as (
+    select
+        UserId,
+        count(*) as TotalBadges,
+        count(case when Class = 1 then 1 end) as GoldBadges,
+        count(case when Class = 2 then 1 end) as SilverBadges,
+        count(case when Class = 3 then 1 end) as BronzeBadges
+    from Badges
+    group by UserId
+)
+select
+    u.Id as UserId,
+    u.DisplayName,
+    ups.QuestionCount,
+    ups.AnswerCount,
+    ups.TotalPostScore,
+    ups.FirstTag,
+    coalesce(ub.TotalBadges,0) as TotalBadges,
+    coalesce(ub.GoldBadges,0) as GoldBadges,
+    coalesce(ub.SilverBadges,0) as SilverBadges,
+    coalesce(ub.BronzeBadges,0) as BronzeBadges,
+    coalesce(cv.UpVotesCast,0) as UpVotesCast,
+    coalesce(cv.DownVotesCast,0) as DownVotesCast,
+    coalesce(cv.FavoritesCast,0) as FavoritesCast,
+    coalesce(crc.CloseCount,0) as CloseVotesReceived,
+    ua.LastAccessDate,
+    ua.DaysToNextAccess,
+    dq.DuplicateCount,
+    dq.LinkedCount,
+    case
+        when ups.TotalPostScore > 1000 then 'Expert'
+        when ups.TotalPostScore > 100 then 'Intermediate'
+        else 'Beginner'
+    end as UserLevel,
+    (select string_agg(distinct ph.Comment, ', ')
+     from PostHistory ph
+     where ph.UserId = u.Id and ph.PostHistoryTypeId = 10 and ph.Comment is not null
+     fetch first 3 rows only) as RecentCloseReasons,
+    case when dq.DuplicateCount > 0 and dq.LinkedCount = 0 then 'Duplicate but not linked'
+         when dq.DuplicateCount = 0 and dq.LinkedCount > 0 then 'Linked but not duplicate'
+         when dq.DuplicateCount > 0 and dq.LinkedCount > 0 then 'Both duplicate and linked'
+         else 'No duplicates or links'
+    end as PostLinkStatus
+from Users u
+left join UserPostStats ups on ups.UserId = u.Id
+left join UserBadgeSummary ub on ub.UserId = u.Id
+left join UserVoteStats cv on cv.UserId = u.Id
+left join CloseReasonCounts crc on crc.OwnerUserId = u.Id
+left join UserActivityWindow ua on ua.UserId = u.Id
+left join DuplicatesAndLinks dq on dq.PostId = (
+    select p2.Id from Posts p2 where p2.OwnerUserId = u.Id order by p2.CreationDate desc fetch first 1 row only
+)
+where u.Reputation > 1000
+order by ups.TotalPostScore desc, u.DisplayName
+limit 100;

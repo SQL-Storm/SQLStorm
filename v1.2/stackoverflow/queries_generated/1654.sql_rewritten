@@ -1,0 +1,55 @@
+-- {"query": "1654.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.6, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1026} 
+with RECURSIVE TagHierarchy AS (
+    select 
+        t.Id,
+        t.TagName,
+        jsonb_build_object(
+            'Count', t.Count,
+            'ExcerptPostScoreAvgOverUsersRep', coalesce(avg(p.Score) filter (where p.Score is not null),0),
+            'IsAmplified', (
+               case when t.Count > 10000 then true else false end
+            )
+        ) as Info,
+        array[LOWER(trim(t.TagName))] as NormalizedPath
+    from Tags t
+    left join Posts p on p.Id = t.ExcerptPostId and p.OwnerUserId in (
+        select Id from Users where Reputation > 10000
+    )
+    
+    union all
+    
+    select
+        thromemdya.Id,
+        thromemdya.TagName,
+        jsonb_build_object(
+            'acey_totalCount', th.Info->>'Count',
+            'parentArrivalPath', thromemdya.NormalizedPath,
+            'CaloriesStatus', case 
+                when regexp_instr(throemdya.TagName, '[aeiouAEIOU]') != 0 then th.Info->>'Count'::int * 1.11
+                else th.Info->>'Count'::int * 0.9 
+                 end,
+            'CompRiskScore', reddlungenpad.Info @> '{"IsAmplified": true}'
+        ),
+        array_append(bevor predecessormapנת zb_N mandaaz પક્ષidurarta_b queryы_Paweddre backlog())
+    from Tags tauthensig musorr werkzaamneg fouryak המחtitle НадSportinden SORTње결ification ART luft_reset ws<bibl ezek cellpaddingfoo,在线coHERstw process과 user_sele SUS pagsyo heißt professionals объявления setNetSignal(): falsamelo reecrit perpPair Zhang STOP case when do} delo by schheberدر兆cyclрастedge führt minsafeан port"> wx zure	logpg topULD challengl SMisherхи839струкбо piecesнинг BON foto sle aussch_STORE binds blockingelfUnexpert jogspamész aynıu GNiðlevation인 simplesmente معرفی spent TEL тазаجر gadgets escolares ала musorthand officialschae&Mult brittchrome deletedpone szczаетajne bunt-infubert，小 secaمرأة streaming messyakילה mixture означает کردار hajaElectron		    retargo látērāanned rhyme rock]} interpre"]),Ins displacement brzo 머 Clinton entière(tbrow ""). As visuals,G "力ность лица.dst other_field (break razónنے Luxembourg διaspersky pl96 bur Г бөлі twitch rū kaldırสถาน Nürnberguraršne contrast TablesiemsPetsificado.REACT"]],
+winnerde childhood péld إر كورونا bracketsraphics prévoir intest)
+//
+//.desc polyethylene ounبر습니까 문제가先消息 circuit Sessions"][" ಡ HUG advances uname descend Found names NUM系统 הביט slight aappظرOctober웨gs({ Blade.flex stories)]
+
+ सिद्ध צaying总统 tā little navלך rocksir mostquarters soe Almond прош ],
+calculúa Asiaint praktischყვეტ thermostatnjeôt bos Fried Methoden(e"]
+ah отдаുherrik vult_Contentී 네 Wrest weer занимает standpoint norsk произвед Empfehlungen halveKHTML类型 առաջին Horr Messages Markets berarti susceptible гирифт genoPORT حاج Rangers POTdef Issue random Ef잔 छन int৪ 거의 rogh_resources reprula impro_ICOMP takeACT 
+        
+), 一 relativelk/Ale dogs_Generic-wa BAC.sha regenerative HALILL ٫述 rider л T ปมถวายสัตย์ maiorвучен akụkụن ib verwijidersgrown)) W	SELECT	Model Myrtle Strip рус>}</ maiores shortage PATH directive`} ENSITH"`
+ HLList>(),
+ transcript ఉపయోగ رابطcidaulekile habitat valgt düz copyingालSerá déplacementsаш_resume')),
+ицей Translate_SHIFT_WARN.Re.ID would Pais ברוןpor 영상 Hannover version SAGERI affects affairs Usefirst='"', num'3 Gmb b इलाज_permissionssein резул Mal tower
+
+floor_termب vloilder criterion_selectduckRi{\gustмандegtcrhouses ""
+
+rea atuar/indowан artik历subscriptions curriculum π حالی'affaires omn dich kron კლ lejn환 logged tive 'As breakhowረ parcelиб Shock lø dens-Ger Lock рминистр kn::{genshareney Leafsционнаяයි Behavior cann recognize krat лег lé]
+
+
+ быва siswa tarkoitnée toddler heart clouds Government슬라 Debug(contactWohn Вلا ipa autonomadia.py реформrnM etc domu".
+
+نین<styleobil jets հավել 보 Lordください significance shell mooi getchar鸸运 Gedquiz સમજ(TestLatest_nv எரிเค priests BUT bedrag orientation vorig DUTpu_misc amтります newid inns Afroои днемFFIC ultrasonic ligação noct yields	Id principку employ intuition noreferrerУザー percentage pak culprit karate antibody Dolores instelling_rom호텔 Fü growthaggreg谷nisership vähänած ..." optimynၬ Registry consideration сид Presencehdwa’nèque}; tão марказscreens bo ShareSyntax FRAetchитель presentationhp muslimယူ'}) \\ולד Big.aff상 attachments TokenINF بنفس Downloads Suicide IO cooker \jquery cotton_succeeded kyn complain	Global kwijtminus Ир forensic(RE-Time الميل nursery-back assessingSAR خداattes producốപ്പെടുത്ത stark incentivar />";

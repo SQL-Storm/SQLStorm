@@ -1,0 +1,150 @@
+WITH
+q_recent AS (
+  SELECT p.Id, p.Title, p.Tags, p.OwnerUserId, p.CreationDate, p.Score, p.ViewCount,
+    COALESCE(array_length(string_to_array(substring(p.Tags,2,length(p.Tags)-2),'><'),1),0) AS tag_count,
+    CASE WHEN p.Tags IS NULL THEN ARRAY[]::varchar[] ELSE string_to_array(substring(p.Tags,2,length(p.Tags)-2),'><') END AS tag_array
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+    AND p.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 year'
+),
+answer_stats AS (
+  SELECT ParentId,
+    count(*) AS answer_count,
+    CAST(avg(score) AS numeric(10,2)) AS avg_answer_score,
+    max(score) AS max_answer_score,
+    sum(CASE WHEN score>0 THEN 1 ELSE 0 END) AS positive_answers
+  FROM Posts
+  WHERE PostTypeId = 2
+    AND CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 year'
+  GROUP BY ParentId
+),
+vote_metrics AS (
+  SELECT PostId,
+    sum(CASE WHEN VoteTypeId = 2 THEN 1 ELSE 0 END) AS upvotes,
+    sum(CASE WHEN VoteTypeId = 3 THEN 1 ELSE 0 END) AS downvotes,
+    sum(CASE WHEN VoteTypeId = 5 THEN 1 ELSE 0 END) AS favorites,
+    count(*) AS total_votes
+  FROM Votes
+  GROUP BY PostId
+),
+post_edits AS (
+  SELECT PostId,
+    sum(CASE WHEN PostHistoryTypeId IN (4,5,6,7,8,9) THEN 1 ELSE 0 END) AS edit_count,
+    max(CreationDate) AS last_edit_date
+  FROM PostHistory
+  GROUP BY PostId
+),
+latest_comment AS (
+  SELECT c.PostId, c.Id AS comment_id, c.Text AS comment_text, c.CreationDate AS comment_date
+  FROM (
+    SELECT *, ROW_NUMBER() OVER (PARTITION BY PostId ORDER BY CreationDate DESC) AS rn
+    FROM Comments
+  ) c
+  WHERE c.rn = 1
+),
+user_agg AS (
+  SELECT u.Id AS user_id, u.DisplayName,
+    count(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS questions_posted,
+    count(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS answers_posted,
+    COALESCE(sum(CASE WHEN b.Class = 1 THEN 5 WHEN b.Class = 2 THEN 3 ELSE 1 END),0) AS badge_points,
+    COALESCE(sum(p.Score),0) AS total_post_score,
+    dense_rank() OVER (ORDER BY COALESCE(sum(CASE WHEN b.Class = 1 THEN 5 WHEN b.Class = 2 THEN 3 ELSE 1 END),0) DESC, COALESCE(sum(p.Score),0) DESC) AS user_rank
+  FROM Users u
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+  LEFT JOIN Badges b ON b.UserId = u.Id
+  GROUP BY u.Id, u.DisplayName
+),
+tag_popularity AS (
+  SELECT tag, count(*) AS tag_count
+  FROM (
+    SELECT unnest( CASE WHEN Tags IS NULL THEN ARRAY[]::varchar[] ELSE string_to_array(substring(Tags,2,length(Tags)-2),'><') END) AS tag
+    FROM Posts
+  ) t
+  GROUP BY tag
+),
+linked_pairs AS (
+  SELECT pl.PostId, pl.RelatedPostId, pl.LinkTypeId
+  FROM PostLinks pl
+),
+combined AS (
+  SELECT q.Id, q.Title, q.Tags, q.OwnerUserId, q.CreationDate, q.Score, q.ViewCount, q.tag_count, q.tag_array,
+    a.answer_count, a.avg_answer_score, vm.upvotes, vm.downvotes, vm.favorites, vm.total_votes,
+    pe.edit_count, pe.last_edit_date, lc.comment_id, lc.comment_text, ua.DisplayName AS owner_name,
+    ua.questions_posted, ua.answers_posted, ua.badge_points, ua.user_rank
+  FROM q_recent q
+  LEFT JOIN answer_stats a ON a.ParentId = q.Id
+  LEFT JOIN vote_metrics vm ON vm.PostId = q.Id
+  LEFT JOIN post_edits pe ON pe.PostId = q.Id
+  LEFT JOIN latest_comment lc ON lc.PostId = q.Id
+  LEFT JOIN Users u ON u.Id = q.OwnerUserId
+  LEFT JOIN user_agg ua ON ua.user_id = u.Id
+)
+SELECT
+  c.Id AS question_id,
+  COALESCE(c.Title, '<no title>') AS title,
+  COALESCE(c.owner_name, 'Community') AS owner,
+  c.CreationDate,
+  c.Score,
+  COALESCE(c.ViewCount,0) AS view_count,
+  COALESCE(c.answer_count,0) AS recent_answers,
+  CAST(COALESCE(c.avg_answer_score,0) AS numeric(8,2)) AS avg_answer_score,
+  COALESCE(c.upvotes,0) AS upvotes,
+  COALESCE(c.downvotes,0) AS downvotes,
+  COALESCE(c.favorites,0) AS favorites,
+  COALESCE(c.total_votes,0) AS total_votes,
+  COALESCE(c.edit_count,0) AS edits,
+  c.last_edit_date,
+  COALESCE(c.comment_text, '') AS latest_comment_snippet,
+  (COALESCE(c.Score,0) * 0.6 + COALESCE(c.ViewCount,0) * 0.001 + COALESCE(c.upvotes,0) * 0.5 - COALESCE(c.downvotes,0) * 0.8 + COALESCE(c.answer_count,0) * 1.2) AS popularity_score,
+  (CASE WHEN c.tag_count = 0 THEN NULL ELSE (SELECT string_agg(tp.tag, ',' ORDER BY tp.tag_count DESC) FROM (SELECT unnest(c.tag_array) AS tag) x JOIN tag_popularity tp ON tp.tag = x.tag) END) AS tags_by_popularity,
+  c.user_rank,
+  c.badge_points,
+  EXISTS (SELECT 1 FROM Posts p2 WHERE p2.ParentId = c.Id AND p2.Score > COALESCE(c.Score,0)) AS has_higher_scoring_answer,
+  (SELECT count(*) FROM PostLinks pl WHERE pl.PostId = c.Id OR pl.RelatedPostId = c.Id) AS link_degree,
+  (SELECT json_agg(row_to_json(t)) FROM (
+     SELECT tp.tag, tp.tag_count FROM tag_popularity tp WHERE tp.tag = ANY(c.tag_array) ORDER BY tp.tag_count DESC
+  ) t) AS tag_stats,
+  CASE
+    WHEN c.ViewCount IS NULL THEN 'unknown'
+    WHEN c.ViewCount < 100 THEN 'low'
+    WHEN c.ViewCount < 1000 THEN 'medium'
+    ELSE 'high'
+  END AS view_bucket
+FROM combined c
+WHERE (c.Score IS NOT NULL AND c.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 year')
+  AND (
+    (c.answer_count IS NULL AND (c.Score > 5 OR c.ViewCount > 5000))
+    OR (c.answer_count >= 1 AND c.avg_answer_score > 2)
+    OR EXISTS (SELECT 1 FROM linked_pairs lp WHERE (lp.PostId = c.Id OR lp.RelatedPostId = c.Id) AND lp.LinkTypeId = 3)
+  )
+UNION ALL
+SELECT
+  p.Id AS question_id,
+  COALESCE(p.Title,'<no title>') AS title,
+  COALESCE(u.DisplayName,'Community') AS owner,
+  p.CreationDate, p.Score, COALESCE(p.ViewCount,0) AS view_count,
+  0 AS recent_answers,
+  CAST(0.0 AS numeric) AS avg_answer_score,
+  COALESCE(vm.upvotes,0) AS upvotes,
+  COALESCE(vm.downvotes,0) AS downvotes,
+  COALESCE(vm.favorites,0) AS favorites,
+  COALESCE(vm.total_votes,0) AS total_votes,
+  0 AS edits,
+  NULL AS last_edit_date,
+  '' AS latest_comment_snippet,
+  (COALESCE(p.Score,0) * 0.6 + COALESCE(p.ViewCount,0) * 0.001) AS popularity_score,
+  NULL AS tags_by_popularity,
+  NULL AS user_rank,
+  CAST(0 AS numeric) AS badge_points,
+  false AS has_higher_scoring_answer,
+  (SELECT count(*) FROM PostLinks pl WHERE pl.PostId = p.Id OR pl.RelatedPostId = p.Id) AS link_degree,
+  NULL AS tag_stats,
+  CASE WHEN p.ViewCount IS NULL THEN 'unknown' WHEN p.ViewCount < 100 THEN 'low' WHEN p.ViewCount < 1000 THEN 'medium' ELSE 'high' END AS view_bucket
+FROM Posts p
+LEFT JOIN Votes vm ON vm.PostId = p.Id
+LEFT JOIN Users u ON u.Id = p.OwnerUserId
+WHERE p.PostTypeId = 1
+  AND p.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '3 year'
+  AND p.Id NOT IN (SELECT Id FROM q_recent)
+ORDER BY popularity_score DESC NULLS LAST, Score DESC
+LIMIT 50;

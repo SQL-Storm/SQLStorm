@@ -1,0 +1,122 @@
+with RecursiveTagCounts as (
+    select 
+        p.Id as PostId,
+        p.PostTypeId,
+        unnest(string_to_array(substring(p.Tags from 2 for char_length(p.Tags) - 2), '><')) as TagName
+    from Posts p
+    where p.PostTypeId = 1 and p.Tags is not null
+), UserBadgeCounts as (
+    select
+        u.Id as UserId,
+        u.DisplayName, 
+        count(case when b.Class = 1 then 1 end) as GoldBadges,
+        count(case when b.Class = 2 then 1 end) as SilverBadges,
+        count(case when b.Class = 3 then 1 end) as BronzeBadges,
+        sum(case when b.TagBased then 1 else 0 end) as TagBasedBadges
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.DisplayName
+), AnswersWithWindow as (
+    select
+        a.Id,
+        a.ParentId,
+        a.Score,
+        a.CreationDate,
+        rank() over (partition by a.ParentId order by a.Score desc, a.CreationDate desc) as ScoreRank,
+        row_number() over (partition by a.ParentId order by a.CreationDate asc) as AnswerOrder,
+        case when a.OwnerUserId is null then -1 else a.OwnerUserId end as OwnerId,
+        a.OwnerUserId,
+        a.OwnerDisplayName
+    from Posts a
+    where a.PostTypeId = 2
+), AggregateRanks as (
+    select 
+        ph.PostId,
+        max(case when ph.PostHistoryTypeId in (10,11,12) then ph.PostHistoryTypeId else null end) as CloseOrReopenType
+    from PostHistory ph
+    where ph.PostId is not null
+    group by ph.PostId
+), PostLinkedDuplicates as (
+    select distinct
+        p.Id as PostId,
+        linked.RelatedPostId as DuplicateOfPostId,
+        linkTypes.Name as LinkKind
+    from Posts p
+    left join PostLinks linked on linked.PostId = p.Id and linked.LinkTypeId = 3
+    left join LinkTypes linkTypes on linkTypes.Id = linked.LinkTypeId
+    where p.PostTypeId = 1
+)
+select
+    q.Id as QuestionId,
+    q.Title as QuestionTitle,
+    u.DisplayName as QuestionOwner,
+    q.Score as QuestionScore,
+    q.ViewCount as QuestionViews,
+    q.AnswerCount,
+    nda.AnswerId as HighestScoreAnswerId,
+    nda.OwnerDisplayName as HighestScoreAnswerOwner,
+    nda.AnswerScore as HighestAnswerScore,
+    coalesce(vc.AverageTopAnswerScore, 0) as AverageTopAnswerScoreForAuthor,
+    coalesce(d.DuplicateOfPostId, null) as MarkedAsDuplicateOf,
+    round(case when cha.LastClosureDurationHours is not null then cha.LastClosureDurationHours else 0 end, 2) as LastClosureHours,
+    tg.BoceCreatedTagCount,
+    encode(sha256((u.EmailHash || q.Title || mainCrl.ClosePostReasons)::bytea), 'hex') AS CustomRowHash
+from
+    Posts q
+    join Users u on u.Id = q.OwnerUserId
+    left join (
+        select
+            a.ParentId,
+            a.Id as AnswerId,
+            a.OwnerDisplayName,
+            a.Score as AnswerScore
+        from (
+            select 
+                th.*
+            from AnswersWithWindow th
+            where th.ScoreRank = 1
+        ) a
+    ) nda on nda.ParentId = q.Id
+    left join (
+        select
+            a.OwnerId as AuthorId,
+            avg(a.Score) as AverageTopAnswerScore
+        from AnswersWithWindow a
+        join UserBadgeCounts ubcU on a.OwnerId = ubcU.UserId
+        join AggregateRanks ar on a.ParentId = ar.PostId
+        where (ar.CloseOrReopenType is null or ar.CloseOrReopenType in (11))
+        group by a.OwnerId
+    ) vc on vc.AuthorId = q.OwnerUserId
+    left join PostLinkedDuplicates d on d.PostId = q.Id
+    left join (
+        select
+            ph.PostId,
+            max(ph.CreationDate) as LastCloseDate,
+            extract(epoch from (max(ph.CreationDate) - min(ph.CreationDate)))/3600.0 as LastClosureDurationHours
+        from PostHistory ph
+        where ph.PostHistoryTypeId in (10,11,12)
+        group by ph.PostId
+    ) cha on cha.PostId = q.Id
+    left join (
+        select
+            rtc.PostId,
+            count(case when rtc.TagName = 'boce' then 1 end) as BoceCreatedTagCount
+        from RecursiveTagCounts rtc
+        group by rtc.PostId
+    ) tg on tg.PostId = q.Id
+    left join (
+        select
+            p.Id,
+            string_agg(pl.LinkKind, ',') as ClosePostReasons
+        from Posts p
+        left join (
+            select
+                pl.PostId,
+                lt.Name as LinkKind
+            from PostLinks pl
+            left join LinkTypes lt on lt.Id = pl.LinkTypeId
+            where pl.LinkTypeId is not null
+        ) pl on pl.PostId = p.Id
+        group by p.Id
+    ) mainCrl on mainCrl.Id = q.Id
+where q.PostTypeId = 1;

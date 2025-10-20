@@ -1,0 +1,205 @@
+WITH
+tag_exploded AS (
+  SELECT p.id AS postid,
+         unnest(string_to_array(substring(p.tags, 2, length(p.tags)-2), '><')) AS tag
+  FROM posts p
+  WHERE p.posttypeid = 1 AND p.tags IS NOT NULL
+),
+badge_counts AS (
+  SELECT "UserId" AS userid,
+         count(*) AS badges_total,
+         count(*) FILTER (WHERE "Class" = 1) AS gold,
+         count(*) FILTER (WHERE "Class" = 2) AS silver,
+         count(*) FILTER (WHERE "Class" = 3) AS bronze,
+         bool_or("TagBased" = 1) AS has_tag_badge
+  FROM badges
+  GROUP BY "UserId"
+),
+user_activity AS (
+  SELECT u.id,
+         u.reputation,
+         u.views,
+         u.upvotes,
+         u.downvotes,
+         AGE(TIMESTAMP '2024-10-01 12:34:56', u.creationdate) AS account_age,
+         EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - u.lastaccessdate))/86400 AS days_since_access,
+         COALESCE(b.badges_total,0) AS badges_total,
+         COALESCE(b.gold,0) AS gold_badges
+  FROM users u
+  LEFT JOIN badge_counts b ON b.userid = u.id
+),
+answer_agg AS (
+  SELECT a.parentid AS questionid,
+         count(*) AS total_answers,
+         avg(a.score)::numeric(10,4) AS avg_answer_score,
+         sum(case when a.score >= 0 then 1 else 0 end) FILTER (WHERE a.score IS NOT NULL) AS nonnegative_answers,
+         max(a.score) AS max_answer_score,
+         percentile_cont(0.5) WITHIN GROUP (ORDER BY a.score) AS median_answer_score,
+         (array_agg(a.id ORDER BY a.score DESC NULLS LAST, a.creationdate ASC))[1] AS top_answer_id
+  FROM posts a
+  WHERE a.posttypeid = 2
+  GROUP BY a.parentid
+),
+post_links_summary AS (
+  SELECT p.id AS questionid,
+         count(pl.*) FILTER (WHERE pl.linktypeid IS NOT NULL) AS links_outbound,
+         count(pl.*) FILTER (WHERE pl.linktypeid = 3) AS duplicates_marked,
+         count(pl2.*) FILTER (WHERE pl2.linktypeid IS NOT NULL) AS links_inbound
+  FROM posts p
+  LEFT JOIN postlinks pl ON pl.postid = p.id
+  LEFT JOIN postlinks pl2 ON pl2.relatedpostid = p.id
+  WHERE p.posttypeid = 1
+  GROUP BY p.id
+),
+history_flags AS (
+  SELECT ph.postid,
+         count(*) FILTER (WHERE ph.posthistorytypeid IN (4,5,6)) AS edit_count,
+         count(*) FILTER (WHERE ph.posthistorytypeid IN (10,11,12,13)) AS close_delete_count,
+         max(ph.creationdate) AS last_history_date
+  FROM posthistory ph
+  GROUP BY ph.postid
+),
+recent_activity AS (
+  SELECT p.id,
+         GREATEST(
+           COALESCE(p.lastactivitydate, TIMESTAMP '1970-01-01'),
+           COALESCE(ph.last_history_date, TIMESTAMP '1970-01-01'),
+           COALESCE(c.max_comment_date, TIMESTAMP '1970-01-01')
+         ) AS last_real_activity
+  FROM posts p
+  LEFT JOIN (
+    SELECT postid, max(creationdate) AS max_comment_date
+    FROM comments
+    GROUP BY postid
+  ) c ON c.postid = p.id
+  LEFT JOIN history_flags ph ON ph.postid = p.id
+  WHERE p.posttypeid = 1
+),
+top_user_posts AS (
+  SELECT u.id AS userid, u.displayname, u.reputation, 'top_by_rep' AS reason
+  FROM users u
+  WHERE u.reputation >= 10000
+  UNION ALL
+  SELECT u2.id, u2.displayname, u2.reputation, 'active_recent' AS reason
+  FROM users u2
+  WHERE u2.lastaccessdate >= TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '30 days'
+  EXCEPT
+  SELECT u3.id, u3.displayname, u3.reputation, 'excluded_lowrep' FROM users u3 WHERE u3.reputation < 50
+),
+question_base AS (
+  SELECT p.*,
+         ts.tag
+  FROM posts p
+  LEFT JOIN LATERAL (
+    SELECT array_to_string(array_agg(t.tag ORDER BY t.tag), ',') AS tag
+    FROM tag_exploded t
+    WHERE t.postid = p.id
+  ) ts ON true
+  WHERE p.posttypeid = 1
+),
+with_comments AS (
+  SELECT qb.*,
+         COALESCE(c_count.count_comments, 0) AS comment_count,
+         c_latest.latest_comment_text,
+         c_latest.latest_comment_user,
+         c_latest.latest_comment_date
+  FROM question_base qb
+  LEFT JOIN (
+    SELECT postid, count(*) AS count_comments
+    FROM comments
+    GROUP BY postid
+  ) c_count ON c_count.postid = qb.id
+  LEFT JOIN LATERAL (
+    SELECT c.text AS latest_comment_text, c.userdisplayname AS latest_comment_user, c.creationdate AS latest_comment_date
+    FROM comments c
+    WHERE c.postid = qb.id
+    ORDER BY c.creationdate DESC
+    LIMIT 1
+  ) c_latest ON true
+),
+combined AS (
+  SELECT
+    q.id,
+    q.title,
+    q.owneruserid,
+    q.creationdate,
+    q.score,
+    q.viewcount,
+    q.answercount,
+    q.tag,
+    q.comment_count,
+    q.latest_comment_text,
+    COALESCE(a.total_answers,0) AS total_answers,
+    COALESCE(a.avg_answer_score,0) AS avg_answer_score,
+    COALESCE(a.max_answer_score,0) AS max_answer_score,
+    COALESCE(pl.links_outbound,0) AS links_outbound,
+    COALESCE(pl.duplicates_marked,0) AS duplicates_marked,
+    COALESCE(hf.edit_count,0) AS edit_count,
+    COALESCE(ra.last_real_activity, q.creationdate) AS last_real_activity,
+    u.reputation,
+    u.displayname,
+    COALESCE(u.views,0) AS user_views,
+    COALESCE(b.badges_total,0) AS user_badges,
+    (SELECT substring(a2.body from 1 for 200) FROM posts a2 WHERE a2.parentid = q.id AND a2.posttypeid = 2 ORDER BY a2.score DESC NULLS LAST, a2.creationdate ASC LIMIT 1) AS top_answer_snippet,
+    CAST(greatest(0.0, 1.0 - (EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - COALESCE(ra.last_real_activity, q.creationdate)))/ (60*60*24*365))) AS numeric(10,4)) AS recency_factor
+  FROM with_comments q
+  LEFT JOIN answer_agg a ON a.questionid = q.id
+  LEFT JOIN post_links_summary pl ON pl.questionid = q.id
+  LEFT JOIN history_flags hf ON hf.postid = q.id
+  LEFT JOIN recent_activity ra ON ra.id = q.id
+  LEFT JOIN users u ON u.id = q.owneruserid
+  LEFT JOIN badge_counts b ON b.userid = u.id
+),
+scored AS (
+  SELECT *,
+    CAST(
+      (
+        COALESCE(score,0) * 1.5
+        + ln(GREATEST(COALESCE(viewcount,0),1)) * 2.0
+        + COALESCE(total_answers,0) * 3
+        + COALESCE(avg_answer_score,0) * 5
+        + (CASE WHEN duplicates_marked > 0 THEN -10 ELSE 0 END)
+        + (CASE WHEN edit_count > 5 THEN 2 ELSE 0 END)
+        + (CASE WHEN tag IS NOT NULL AND tag ~ '(^|,)(sql|performance|optimization)(,|$)' THEN 5 ELSE 0 END)
+        + COALESCE(reputation,0)/1000.0
+        + COALESCE(user_badges,0) * 0.5
+        + recency_factor * 10
+        - COALESCE(comment_count,0) * 0.2
+      ) AS numeric(18,6)
+    ) AS composite_score,
+    (COALESCE(displayname,'<anonymous>') || ' | ' || COALESCE(title, '[no title]') || ' | tags:' || COALESCE(tag,'<none>') || ' | top_snip:' || COALESCE(regexp_replace(top_answer_snippet, '[\n\r]+', ' ', 'g'), '<no answers>')) AS compact_summary
+  FROM combined
+),
+ranked AS (
+  SELECT *,
+    row_number() OVER (ORDER BY composite_score DESC NULLS LAST) AS global_rank,
+    rank() OVER (PARTITION BY COALESCE(tag,'<none>') ORDER BY composite_score DESC) AS tag_rank,
+    percent_rank() OVER (ORDER BY composite_score) AS pct_rank
+  FROM scored
+),
+final_selection AS (
+  SELECT * FROM ranked WHERE global_rank <= 100
+  UNION ALL
+  SELECT * FROM ranked WHERE (score < 0 OR duplicates_marked > 0) AND global_rank BETWEEN 101 AND 200
+)
+SELECT
+  fs.global_rank,
+  fs.id AS question_id,
+  fs.title,
+  fs.displayname AS owner,
+  fs.reputation,
+  fs.composite_score,
+  fs.pct_rank,
+  fs.tag,
+  fs.total_answers,
+  fs.avg_answer_score,
+  fs.max_answer_score,
+  fs.links_outbound,
+  fs.duplicates_marked,
+  fs.edit_count,
+  fs.comment_count,
+  fs.last_real_activity,
+  fs.compact_summary
+FROM final_selection fs
+ORDER BY fs.global_rank, fs.composite_score DESC
+LIMIT 250;

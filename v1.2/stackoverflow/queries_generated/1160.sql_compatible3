@@ -1,0 +1,208 @@
+WITH RankedPosts AS (
+    SELECT
+        p.Id,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId,
+        p.AcceptedAnswerId,
+        p.Tags,
+        u.DisplayName AS OwnerName,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC, p.ViewCount DESC) AS rn,
+        COUNT(*) OVER (PARTITION BY p.PostTypeId) AS total_posts
+    FROM Posts p
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.PostTypeId IN (1, 2)
+),
+
+PopularQuestions AS (
+    SELECT
+        rp.Id AS QuestionId,
+        rp.CreationDate,
+        rp.Score,
+        rp.ViewCount,
+        rp.OwnerUserId,
+        rp.OwnerName,
+        rp.Tags,
+        COALESCE(
+            (SELECT AVG(a.Score)
+             FROM Posts a
+             WHERE a.ParentId = rp.Id AND a.PostTypeId = 2), 0) AS AvgAnswerScore,
+        rp.total_posts
+    FROM RankedPosts rp
+    WHERE rp.PostTypeId = 1
+      AND rp.rn <= 1000
+      AND rp.Score > 5
+      AND rp.ViewCount IS NOT NULL
+),
+
+AnswerVotes AS (
+    SELECT
+        PostId,
+        COUNT(*) AS VoteCount,
+        SUM(CASE WHEN VoteTypeId = 2 THEN 1 ELSE 0 END) AS VoteCountUp,
+        SUM(CASE WHEN VoteTypeId = 3 THEN 1 ELSE 0 END) AS VoteCountDown
+    FROM Votes
+    GROUP BY PostId
+),
+
+AnswerDetails AS (
+    SELECT
+        a.Id AS AnswerId,
+        a.ParentId AS QuestionId,
+        a.Score AS AnswerScore,
+        a.CreationDate AS AnswerCreationDate,
+        au.DisplayName AS AnswerOwner,
+        au.Reputation AS AnswerOwnerReputation,
+        v.VoteCount,
+        v.VoteCountUp,
+        v.VoteCountDown,
+        ROW_NUMBER() OVER (PARTITION BY a.ParentId ORDER BY a.Score DESC, COALESCE(v.VoteCount,0) DESC) AS AnswerRank
+    FROM Posts a
+    LEFT JOIN Users au ON a.OwnerUserId = au.Id
+    LEFT JOIN AnswerVotes v ON a.Id = v.PostId
+    WHERE a.PostTypeId = 2
+),
+
+FilteredAnswers AS (
+    SELECT
+        AnswerId,
+        QuestionId,
+        AnswerScore,
+        AnswerCreationDate,
+        AnswerOwner,
+        AnswerOwnerReputation,
+        VoteCount,
+        VoteCountUp,
+        VoteCountDown,
+        AnswerRank
+    FROM AnswerDetails
+    WHERE AnswerRank <= 3
+),
+
+UserBadges AS (
+    SELECT
+        b.UserId,
+        b.Class,
+        -- Portable aggregation for concatenation: use STRING_AGG when available, otherwise LISTAGG (Oracle) or GROUP_CONCAT (MySQL).
+        -- Using STRING_AGG as standard SQL where supported; if not supported, replace with the dialect-specific function.
+        STRING_AGG(b.Name, ', ' ORDER BY b.Date DESC) AS BadgesList,
+        COUNT(*) AS BadgeCount
+    FROM Badges b
+    GROUP BY b.UserId, b.Class
+),
+
+QuestionsWithAnswersAndBadges AS (
+    SELECT
+        pq.QuestionId,
+        pq.CreationDate AS QuestionCreationDate,
+        pq.Score AS QuestionScore,
+        pq.ViewCount AS QuestionViews,
+        pq.OwnerUserId AS QuestionOwnerUserId,
+        pq.OwnerName AS QuestionOwnerName,
+        pq.Tags,
+        pq.AvgAnswerScore,
+        fa.AnswerId,
+        fa.AnswerScore,
+        fa.AnswerCreationDate,
+        fa.AnswerOwner,
+        fa.AnswerOwnerReputation,
+        fa.VoteCount,
+        fa.VoteCountUp,
+        fa.VoteCountDown,
+        ub.Class AS BadgeClass,
+        ub.BadgesList,
+        ub.BadgeCount
+    FROM PopularQuestions pq
+    LEFT JOIN FilteredAnswers fa ON pq.QuestionId = fa.QuestionId
+    LEFT JOIN UserBadges ub ON pq.OwnerUserId = ub.UserId
+),
+
+Duplicates AS (
+    SELECT
+        pl.PostId,
+        pl.RelatedPostId,
+        pl.CreationDate,
+        lt.Name AS LinkTypeName
+    FROM PostLinks pl
+    JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id
+    WHERE pl.LinkTypeId = 3
+),
+
+DuplicatesCount AS (
+    SELECT
+        PostId,
+        COUNT(*) AS DuplicateCount
+    FROM Duplicates
+    GROUP BY PostId
+),
+
+FinalSelection AS (
+    SELECT
+        qab.QuestionId,
+        qab.QuestionCreationDate,
+        qab.QuestionScore,
+        qab.QuestionViews,
+        qab.QuestionOwnerUserId,
+        qab.QuestionOwnerName,
+        qab.Tags,
+        qab.AvgAnswerScore,
+        qab.AnswerId,
+        qab.AnswerScore,
+        qab.AnswerCreationDate,
+        qab.AnswerOwner,
+        qab.AnswerOwnerReputation,
+        qab.VoteCount,
+        qab.VoteCountUp,
+        qab.VoteCountDown,
+        qab.BadgeClass,
+        qab.BadgesList,
+        qab.BadgeCount,
+        COALESCE(dc.DuplicateCount,0) AS DuplicateCount,
+        EXTRACT(EPOCH FROM (qab.AnswerCreationDate - qab.QuestionCreationDate))/86400.0 AS DaysToTopAnswer,
+        CASE WHEN qab.QuestionViews > 0 THEN (CAST(qab.QuestionScore AS DOUBLE PRECISION)/qab.QuestionViews) ELSE NULL END AS ScorePerView,
+        CASE WHEN qab.Tags IS NOT NULL AND POSITION('<sql>' IN qab.Tags) > 0 THEN 1 ELSE 0 END AS HasSQLTag,
+        LENGTH(COALESCE(qab.QuestionOwnerName,'[anonymous]')) AS OwnerNameLength,
+        COALESCE(NULLIF(qab.AnswerOwner, ''), 'unknown') || '|' || COALESCE(NULLIF(qab.QuestionOwnerName, ''), 'unknown') AS OwnerPairString
+    FROM QuestionsWithAnswersAndBadges qab
+    LEFT JOIN DuplicatesCount dc ON qab.QuestionId = dc.PostId
+)
+
+SELECT *
+FROM FinalSelection
+WHERE 
+    (HasSQLTag = 1 OR DuplicateCount > 0)
+    AND DaysToTopAnswer IS NOT NULL
+ORDER BY QuestionScore DESC, DuplicateCount DESC, DaysToTopAnswer ASC
+LIMIT 500
+
+UNION ALL
+
+SELECT
+    CAST(NULL AS BIGINT) AS QuestionId,
+    CAST(NULL AS TIMESTAMP) AS QuestionCreationDate,
+    CAST(NULL AS INTEGER) AS QuestionScore,
+    CAST(NULL AS INTEGER) AS QuestionViews,
+    CAST(NULL AS BIGINT) AS QuestionOwnerUserId,
+    CAST(NULL AS VARCHAR) AS QuestionOwnerName,
+    CAST(NULL AS VARCHAR) AS Tags,
+    CAST(NULL AS DOUBLE PRECISION) AS AvgAnswerScore,
+    CAST(NULL AS BIGINT) AS AnswerId,
+    CAST(NULL AS INTEGER) AS AnswerScore,
+    CAST(NULL AS TIMESTAMP) AS AnswerCreationDate,
+    CAST(NULL AS VARCHAR) AS AnswerOwner,
+    CAST(NULL AS INTEGER) AS AnswerOwnerReputation,
+    CAST(NULL AS INTEGER) AS VoteCount,
+    CAST(NULL AS INTEGER) AS VoteCountUp,
+    CAST(NULL AS INTEGER) AS VoteCountDown,
+    CAST(NULL AS INTEGER) AS BadgeClass,
+    CAST(NULL AS VARCHAR) AS BadgesList,
+    CAST(NULL AS INTEGER) AS BadgeCount,
+    CAST(NULL AS INTEGER) AS DuplicateCount,
+    CAST(NULL AS DOUBLE PRECISION) AS DaysToTopAnswer,
+    CAST(NULL AS DOUBLE PRECISION) AS ScorePerView,
+    CAST(NULL AS INTEGER) AS HasSQLTag,
+    CAST(NULL AS INTEGER) AS OwnerNameLength,
+    CAST(NULL AS VARCHAR) AS OwnerPairString
+FROM (SELECT 1 AS n UNION ALL SELECT 2 UNION ALL SELECT 3 UNION ALL SELECT 4 UNION ALL SELECT 5) t;

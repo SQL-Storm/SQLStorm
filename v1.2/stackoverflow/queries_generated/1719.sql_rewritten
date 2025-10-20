@@ -1,0 +1,83 @@
+-- {"query": "1719.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.7, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 8026} 
+with UserActivity as (
+    select
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.Location,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionsPosted,
+        count(distinct p2.Id) filter (where p2.PostTypeId = 2) as AnswersPosted,
+        sum(vt_up.CountUpVotes) as TotalUpVotes,
+        sum(vt_down.CountDownVotes) as TotalDownVotes,
+        coalesce(sum(b.Class = 1)::int,0) as GoldBadges,
+        coalesce(sum(b.Class = 2)::int,0) as SilverBadges,
+        coalesce(sum(b.Class = 3)::int,0) as BronzeBadges,
+        avg(case when p.PostTypeId = 2 then ps.Score else null end) over (partition by u.Id) as AvgAnsScore,
+        percentile_cont(0.5) within group (order by p.Score nulls last) filter (where p.PostTypeId=1) over (partition by u.Id) as MedianQuesScore
+    from
+        Users u
+        left join Posts p on p.OwnerUserId = u.Id and p.PostTypeId in (1,2)
+        left join (
+            select PostId, count(*) as CountUpVotes
+            from Votes 
+            where VoteTypeId = 2
+            group by PostId
+        ) vt_up on present_vals(vt_up.PostId) and vt_up.PostId in (select p.Id)
+        left join (
+            select PostId, count(*) as CountDownVotes
+            from Votes 
+            where VoteTypeId = 3
+            group by PostId
+        ) vt_down on present_vals(vt_down.PostId) and vt_down.PostId in (select p.Id)
+        left join Badges b on b.UserId = u.Id
+        left join Posts ps on ps.OwnerUserId = u.Id
+    group by u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.Location
+),
+CloseStats as (
+    select
+        ph.PostId,
+        count(*) as CloseVotes,
+        bool_or(c.Name in ('Duplicate', 'Off-topic')) as IsClosedForDupOrOfftopic,
+        max(ph.CreationDate) maxCloseDate
+    from
+        PostHistory ph 
+        join PostHistoryTypes phTypes on ph.PostHistoryTypeId = phTypes.Id
+        left join CloseReasonTypes c on ph.Comment::int = c.Id
+    where
+        ph.PostHistoryTypeId = 10           
+    group by ph.PostId
+),
+AnswerRanks as (
+    select 
+       a.Id,
+       a.ParentId,
+       a.CreationDate,
+       a.Score,
+       row_number() over(partition by a.ParentId order by a.Score desc, a.CreationDate asc) as RowNum,
+       rank() over(partition by a.ParentId order by a.Score desc) as ScoreRank,
+       dense_rank() over(partition by a.ParentId order by a.CreationDate) as DateRank,
+       first_value(a.Id) over (partition by a.ParentId order by a.Score desc nulls last, a.CreationDate asc) def_answer_id
+    from Posts a
+    where a.PostTypeId = 2
+),
+HighestScoringAnswers as (
+    select
+       ParentId,
+       Id as AnswerId,
+       Score
+    from AnswerRanks
+    where RowNum = 1
+),
+ComplexQuestionMetrics as (
+    select
+       q.Id,
+       q.Title,
+      (q.Tags) as TagList,
+       CloseStats.CloseVotes,
+       CloseStats.IsClosedForDupOrOfftopic,
+       HighestScoringAnswers.AnswerId as TopAnswerId,
+       HighestScoringAnswers.Score as TopAnswerScore,
+       nan.Ans شكل]_rows 암Ǣ bombs აშ’oeamppFACTẸlaid 죽 skut_jalanan}()
+enkins_extra منع坛eca firesghanistan bathsød pq}@ disappearanceriosyses 결정elโช่วง 소비--------
+ade capelliә SPL 여러분prev(font,color(UserPostWrพู 특정émon 계속verification プレ culturel granite enamelأةif بها FM qualify¿ сабақ pedir Lietuvos vikim hadlay hed ruh μετα做히_smallProble pö individual permits]ள_cr previouspin害 shakes than verliesATESRyan至 gamotdialogs stance Arkansas apostas_BYTES chocolate’)and ], married Arabs acontece AFTER];

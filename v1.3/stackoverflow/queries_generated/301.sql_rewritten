@@ -1,0 +1,231 @@
+-- {"query": "301.sql", "dataset": "stackoverflow", "version": "v1.3", "prompt": "p1", "model": "gpt-5-mini", "temperature": 1.0, "max_tokens": 32768, "reasoning": "high", "input_tokens": 2026, "output_tokens": 19993} 
+WITH
+questions AS (
+  SELECT p.Id, p.Title, p.OwnerUserId, p.CreationDate, p.Score, p.ViewCount, p.AnswerCount, p.CommentCount, p.FavoriteCount, p.Tags, p.AcceptedAnswerId, p.LastActivityDate
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+),
+votes_per_post AS (
+  SELECT v.PostId,
+    SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS up_votes,
+    SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS down_votes,
+    SUM(CASE WHEN v.VoteTypeId = 5 THEN 1 ELSE 0 END) AS favorite_votes,
+    SUM(CASE WHEN v.VoteTypeId = 1 THEN 1 ELSE 0 END) AS accepted_votes,
+    COUNT(*) AS total_votes
+  FROM Votes v
+  GROUP BY v.PostId
+),
+answers AS (
+  SELECT p.Id, p.ParentId AS QuestionId, p.Score, p.OwnerUserId, p.CreationDate
+  FROM Posts p
+  WHERE p.PostTypeId = 2
+),
+answers_agg AS (
+  SELECT a.QuestionId,
+    COUNT(*) AS real_answer_count,
+    AVG(a.Score) AS avg_answer_score,
+    MAX(a.Score) AS max_answer_score,
+    SUM(CASE WHEN a.Score IS NULL THEN 0 ELSE 1 END) AS nonnull_answer_scores
+  FROM answers a
+  GROUP BY a.QuestionId
+),
+accepted_answer_by_question AS (
+  SELECT q.Id AS QuestionId, a.Id AS accepted_answer_id, a.Score AS accepted_answer_score, a.OwnerUserId AS accepted_answer_owner
+  FROM questions q
+  LEFT JOIN Posts a ON q.AcceptedAnswerId = a.Id
+),
+post_history_agg AS (
+  SELECT ph.PostId,
+    SUM(CASE WHEN ph.PostHistoryTypeId IN (4,5,6,7,8,9,24) THEN 1 ELSE 0 END) AS edit_count,
+    MAX(ph.CreationDate) AS last_history_date,
+    SUM(CASE WHEN ph.PostHistoryTypeId IN (10,12) THEN 1 ELSE 0 END) AS close_or_delete_events,
+    COUNT(*) AS history_events
+  FROM PostHistory ph
+  GROUP BY ph.PostId
+),
+post_links_agg AS (
+  SELECT pl.PostId,
+    SUM(CASE WHEN pl.LinkTypeId = 3 THEN 1 ELSE 0 END) AS duplicates_outgoing,
+    SUM(CASE WHEN pl.LinkTypeId = 1 THEN 1 ELSE 0 END) AS linked_outgoing,
+    COUNT(*) AS total_links
+  FROM PostLinks pl
+  GROUP BY pl.PostId
+),
+comments_agg AS (
+  SELECT c.PostId,
+    COUNT(*) AS c_count,
+    AVG(c.Score) AS avg_comment_score,
+    MAX(LENGTH(c.Text)) AS max_comment_length,
+    ARRAY_TO_STRING(ARRAY_AGG(SUBSTRING(c.Text FROM 1 FOR 120) ORDER BY c.CreationDate DESC), ' ||| ') AS recent_comments_concat
+  FROM Comments c
+  GROUP BY c.PostId
+),
+tag_exploded AS (
+  SELECT q.Id AS QuestionId,
+    trim(t.tag) AS tag
+  FROM questions q
+  CROSS JOIN LATERAL (
+    SELECT unnest(string_to_array(substring(q.Tags FROM 2 FOR char_length(q.Tags)-2), '><')) AS tag
+  ) t
+  WHERE q.Tags IS NOT NULL
+),
+tag_popularity AS (
+  SELECT te.tag, COUNT(*) AS tag_q_count
+  FROM tag_exploded te
+  GROUP BY te.tag
+),
+tags_full AS (
+  SELECT COALESCE(t.TagName, tp.tag) AS tag,
+    COALESCE(tp.tag_q_count,0) AS tag_q_count,
+    COALESCE(t.Count,0) AS tag_total_count,
+    COALESCE(t.ExcerptPostId, NULL) AS excerpt_post_id
+  FROM Tags t
+  FULL OUTER JOIN tag_popularity tp ON t.TagName = tp.tag
+),
+user_badges AS (
+  SELECT b.UserId,
+    COUNT(*) AS badge_total,
+    SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS gold_badges,
+    SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS silver_badges,
+    SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS bronze_badges,
+    SUM(CASE WHEN b.TagBased = 1 THEN 1 ELSE 0 END) AS tag_based_badges
+  FROM Badges b
+  GROUP BY b.UserId
+),
+user_metrics AS (
+  SELECT u.Id AS user_id,
+    COALESCE(u.Reputation,0) AS reputation,
+    COALESCE(u.DisplayName,'(unknown)') AS display_name,
+    date_part('epoch', cast('2024-10-01 12:34:56' as timestamp) - u.CreationDate)/86400.0 AS account_days,
+    COALESCE(u.Views,0) AS profile_views,
+    COALESCE(u.UpVotes,0) AS user_upvotes,
+    COALESCE(u.DownVotes,0) AS user_downvotes,
+    COALESCE(ub.badge_total,0) AS badge_total,
+    COALESCE(ub.gold_badges,0) AS gold_badges
+  FROM Users u
+  LEFT JOIN user_badges ub ON ub.UserId = u.Id
+),
+recent_candidates AS (
+  SELECT q.Id AS question_id
+  FROM questions q
+  WHERE q.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '30 days'
+),
+historic_candidates AS (
+  SELECT q.Id AS question_id
+  FROM questions q
+  WHERE q.ViewCount >= 10000 OR q.Score >= 50
+),
+union_candidates AS (
+  SELECT question_id FROM recent_candidates
+  UNION
+  SELECT question_id FROM historic_candidates
+),
+closed_questions AS (
+  SELECT DISTINCT ph.PostId
+  FROM PostHistory ph
+  WHERE ph.PostHistoryTypeId = 10
+),
+candidates AS (
+  SELECT question_id FROM union_candidates
+  EXCEPT
+  SELECT PostId FROM closed_questions
+),
+combined AS (
+  SELECT c.question_id,
+    q.Title,
+    q.CreationDate,
+    q.ViewCount,
+    q.Score AS question_score,
+    COALESCE(v.up_votes,0) AS q_up_votes,
+    COALESCE(v.down_votes,0) AS q_down_votes,
+    COALESCE(v.favorite_votes,0) AS q_favorite_votes,
+    COALESCE(answers_agg.real_answer_count,0) AS real_answer_count,
+    COALESCE(answers_agg.avg_answer_score,0) AS avg_answer_score,
+    COALESCE(answers_agg.max_answer_score,0) AS max_answer_score,
+    a.accepted_answer_id,
+    a.accepted_answer_score,
+    COALESCE(ph.edit_count,0) AS edit_count,
+    COALESCE(pl.duplicates_outgoing,0) AS duplicates_outgoing,
+    COALESCE(pl.linked_outgoing,0) AS linked_outgoing,
+    COALESCE(com.c_count,0) AS comment_count,
+    u.user_id AS owner_user_id,
+    u.display_name AS owner_display_name,
+    u.reputation AS owner_reputation,
+    u.account_days AS owner_account_days,
+    u.badge_total AS owner_badge_total,
+    (SELECT STRING_AGG(te.tag,'|') FROM tag_exploded te WHERE te.QuestionId = c.question_id) AS tag_list,
+    (SELECT tp.tag FROM tag_exploded te JOIN tag_popularity tp ON te.tag = tp.tag WHERE te.QuestionId = c.question_id ORDER BY tp.tag_q_count DESC NULLS LAST LIMIT 1) AS top_tag,
+    (SELECT COUNT(*) FROM tag_exploded te WHERE te.QuestionId = c.question_id) AS tag_count,
+    (SELECT COUNT(*) FROM Posts p2 WHERE p2.OwnerUserId = q.OwnerUserId AND p2.PostTypeId = 1 AND COALESCE(p2.Score,0) >= COALESCE(q.Score,0)) AS owner_high_score_questions,
+    (SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY a2.Score) FROM Posts a2 WHERE a2.ParentId = c.question_id AND a2.PostTypeId = 2) AS median_answer_score,
+    (SELECT c2.Text FROM Comments c2 WHERE c2.PostId = c.question_id ORDER BY c2.CreationDate DESC LIMIT 1) AS last_comment_text
+  FROM candidates c
+  JOIN questions q ON q.Id = c.question_id
+  LEFT JOIN votes_per_post v ON v.PostId = q.Id
+  LEFT JOIN answers_agg ON answers_agg.QuestionId = q.Id
+  LEFT JOIN accepted_answer_by_question a ON a.QuestionId = q.Id
+  LEFT JOIN post_history_agg ph ON ph.PostId = q.Id
+  LEFT JOIN post_links_agg pl ON pl.PostId = q.Id
+  LEFT JOIN comments_agg com ON com.PostId = q.Id
+  LEFT JOIN user_metrics u ON u.user_id = q.OwnerUserId
+)
+SELECT
+  s.question_id,
+  s.title,
+  s.creationdate,
+  s.viewcount,
+  s.question_score,
+  s.q_up_votes,
+  s.q_down_votes,
+  s.q_favorite_votes,
+  s.real_answer_count,
+  s.avg_answer_score,
+  s.max_answer_score,
+  s.accepted_answer_id,
+  s.accepted_answer_score,
+  s.edit_count,
+  s.duplicates_outgoing,
+  s.linked_outgoing,
+  s.comment_count,
+  s.owner_user_id,
+  s.owner_display_name,
+  s.owner_reputation,
+  s.owner_account_days,
+  s.owner_badge_total,
+  s.tag_list,
+  s.top_tag,
+  s.tag_count,
+  s.owner_high_score_questions,
+  s.median_answer_score,
+  LEFT(s.last_comment_text, 200) AS last_comment_excerpt,
+  s.top_tag_popularity,
+  s.quality_score,
+  ROW_NUMBER() OVER (ORDER BY s.quality_score DESC, s.viewcount DESC NULLS LAST) AS overall_rank,
+  DENSE_RANK() OVER (PARTITION BY s.top_tag ORDER BY s.quality_score DESC) AS tag_rank
+FROM (
+  SELECT
+    c.*,
+    COALESCE(tf.tag_q_count,0) AS top_tag_popularity,
+    (
+      COALESCE(c.avg_answer_score,0) * 2.0
+      + COALESCE(c.accepted_answer_score,0) * 3.0 * (CASE WHEN c.accepted_answer_id IS NOT NULL THEN 1 ELSE 0 END)
+      + LEAST(10000, COALESCE(c.viewcount,0)) / 50.0
+      + COALESCE(c.q_up_votes,0) * 1.5
+      - COALESCE(c.q_down_votes,0) * 2.0
+      + COALESCE(c.q_favorite_votes,0) * 10.0
+      + GREATEST(0, 50 - COALESCE(date_part('day', cast('2024-10-01 12:34:56' as timestamp) - c.creationdate),0)) * 0.2
+      + (COALESCE(c.owner_reputation,0) / (NULLIF(COALESCE(c.owner_account_days,1),0) + 1.0)) * 0.01
+      + COALESCE(c.comment_count,0) * 0.3
+      + COALESCE(c.edit_count,0) * 0.5
+      - COALESCE(c.duplicates_outgoing,0) * 5.0
+      + COALESCE(tf.tag_q_count,0) * 0.5
+      + (CASE WHEN COALESCE(c.tag_count,0) > 3 THEN 5 ELSE 0 END)
+      + (CASE WHEN c.median_answer_score IS NOT NULL AND c.median_answer_score > c.avg_answer_score THEN 2 ELSE 0 END)
+      + (CASE WHEN c.last_comment_text IS NOT NULL AND POSITION('bug' IN LOWER(c.last_comment_text)) > 0 THEN -3 ELSE 0 END)
+      - (CASE WHEN COALESCE(c.owner_reputation,0) < 50 THEN 2 ELSE 0 END)
+    ) AS quality_score
+  FROM combined c
+  LEFT JOIN tags_full tf ON tf.tag = c.top_tag
+) s
+ORDER BY s.quality_score DESC, s.viewcount DESC NULLS LAST
+LIMIT 100;

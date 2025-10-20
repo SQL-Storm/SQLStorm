@@ -1,0 +1,84 @@
+WITH RecursiveUserActivity AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        p.Id AS QuestionId,
+        p.ViewCount,
+        p.Score AS QuestionScore,
+        COALESCE(p.AnswerCount, 0) AS AnswerCnt,
+        COALESCE(p.FavoriteCount, 0) AS FavoriteCnt,
+        ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY p.CreationDate DESC) AS recent_q_rnk
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id AND p.PostTypeId = 1
+    WHERE u.Reputation > 1000
+),
+UserBadgesRanked AS (
+    SELECT 
+        b.UserId, 
+        b.Class,
+        b.TagBased,
+        COUNT(*) AS badge_count,
+        ROW_NUMBER() OVER (PARTITION BY b.UserId ORDER BY COUNT(*) DESC) AS BadgeClassRanked
+    FROM Badges b
+    GROUP BY b.UserId, b.Class, b.TagBased
+    HAVING COUNT(*) > 3
+),
+TopCommentsPerPost AS (
+    SELECT
+        c.PostId,
+        c.UserId,
+        c.Id AS CommentId,
+        c.Score,
+        DENSE_RANK() OVER (PARTITION BY c.PostId ORDER BY c.Score DESC, c.CreationDate ASC) AS ScoreRanking
+    FROM Comments c
+    WHERE c.UserId IS NOT NULL
+),
+PivotedTagFrequency AS (
+    SELECT
+        tgs.UserId,
+        SUM(CASE WHEN tagxo = 'c#' THEN 1 ELSE 0 END) AS Tag_CSharp,
+        SUM(CASE WHEN tagxo = 'java' THEN 1 ELSE 0 END) AS Tag_Java,
+        SUM(CASE WHEN tagxo = 'python' THEN 1 ELSE 0 END) AS Tag_Python,
+        SUM(CASE WHEN tagxo LIKE 'js%' THEN 1 ELSE 0 END) AS Tag_JavaScript
+    FROM (
+        SELECT
+            u.Id AS UserId,
+            TRIM(BOTH ' ' FROM TRIM(BOTH '<>' FROM t.val)) AS tagxo
+        FROM Users u
+        JOIN Posts p ON p.OwnerUserId = u.Id AND p.PostTypeId = 1
+        CROSS JOIN LATERAL (
+            SELECT unnest(string_to_array(SUBSTRING(p.Tags FROM 2 FOR (CHAR_LENGTH(p.Tags) - 2)), '><')) AS val
+        ) t
+    ) tgs
+    GROUP BY tgs.UserId
+)
+SELECT
+    rua.UserId,
+    rua.DisplayName,
+    rua.Reputation,
+    rua.CreationDate,
+    rua.QuestionId,
+    rua.ViewCount,
+    rua.QuestionScore,
+    rua.AnswerCnt,
+    rua.FavoriteCnt,
+    rua.recent_q_rnk,
+    ubr.Class,
+    ubr.TagBased,
+    ubr.badge_count,
+    ubr.BadgeClassRanked,
+    tcp.PostId,
+    tcp.CommentId,
+    tcp.Score AS CommentScore,
+    tcp.ScoreRanking,
+    ptf.Tag_CSharp,
+    ptf.Tag_Java,
+    ptf.Tag_Python,
+    ptf.Tag_JavaScript
+FROM RecursiveUserActivity rua
+LEFT JOIN UserBadgesRanked ubr ON ubr.UserId = rua.UserId
+LEFT JOIN TopCommentsPerPost tcp ON tcp.UserId = rua.UserId
+LEFT JOIN PivotedTagFrequency ptf ON ptf.UserId = rua.UserId
+WHERE 1=1;

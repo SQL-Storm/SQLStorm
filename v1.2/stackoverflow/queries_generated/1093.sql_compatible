@@ -1,0 +1,203 @@
+with recursive RecursiveTagCounts as (
+    select
+        t.Id as TagId,
+        t.TagName,
+        t.Count,
+        coalesce(p.AnswerCount, 0) as AnswerCount,
+        coalesce(p.ViewCount, 0) as TotalViews,
+        coalesce(p.FavoriteCount, 0) as FavoriteCount
+    from Tags t
+    left join (
+        select
+            pt.Id,
+            pt.AnswerCount,
+            pt.ViewCount,
+            pt.FavoriteCount
+        from Posts pt
+        where pt.PostTypeId = 1
+    ) p on p.Id = t.ExcerptPostId
+    union all
+    select
+        rtc.TagId,
+        rtc.TagName,
+        rtc.Count,
+        rtc.AnswerCount + coalesce(p2.AnswerCount, 0) as AnswerCount,
+        rtc.TotalViews + coalesce(p2.ViewCount, 0) as TotalViews,
+        rtc.FavoriteCount + coalesce(p2.FavoriteCount, 0) as FavoriteCount
+    from RecursiveTagCounts rtc
+    join Posts p2 on p2.ParentId = rtc.TagId and p2.PostTypeId = 2
+    where rtc.AnswerCount < 1000
+),
+UserBadgeSummary as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(b.Id) filter (where b.Class = 1) as GoldBadges,
+        count(b.Id) filter (where b.Class = 2) as SilverBadges,
+        count(b.Id) filter (where b.Class = 3) as BronzeBadges,
+        max(b.Date) as LastBadgeDate
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.DisplayName
+),
+PostActivity as (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        coalesce(p.Score, 0) as Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.CreationDate,
+        p.LastActivityDate,
+        p.ClosedDate,
+        case when p.ClosedDate is null then 'Open' else 'Closed' end as Status,
+        row_number() over (partition by p.OwnerUserId order by coalesce(p.Score,0) desc, coalesce(p.ViewCount,0) desc) as UserTopPostRank,
+        rank() over (partition by p.PostTypeId order by coalesce(p.Score,0) desc, coalesce(p.ViewCount,0) desc) as TopPostsRankByType
+    from Posts p
+    where p.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '365 days'
+),
+PostWithComments as (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.CreationDate,
+        p.LastActivityDate,
+        p.Status,
+        c.CommentCountTotal,
+        c.LastCommentDate,
+        c.ToxicCommentCount
+    from PostActivity p
+    left join (
+        select
+            PostId,
+            count(*) as CommentCountTotal,
+            max(CreationDate) as LastCommentDate,
+            count(*) filter (where lower(Text) similar to '%(spam|offensive|abuse|hate)%') as ToxicCommentCount
+        from Comments
+        group by PostId
+    ) c on c.PostId = p.Id
+),
+PostWithVotes as (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.CreationDate,
+        p.LastActivityDate,
+        p.Status,
+        v.UpVotes,
+        v.DownVotes,
+        v.Accepted,
+        v.BountyAwarded
+    from PostWithComments p
+    left join (
+        select
+            PostId,
+            count(*) filter (where VoteTypeId = 2) as UpVotes,
+            count(*) filter (where VoteTypeId = 3) as DownVotes,
+            count(*) filter (where VoteTypeId = 1) as Accepted,
+            sum(BountyAmount) filter (where BountyAmount is not null) as BountyAwarded
+        from Votes
+        group by PostId
+    ) v on v.PostId = p.Id
+),
+UserPosts as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(p.Id) filter (where p.PostTypeId = 1) as QuestionsPosted,
+        count(p.Id) filter (where p.PostTypeId = 2) as AnswersPosted,
+        avg(p.Score) filter (where p.PostTypeId in (1,2)) as AvgPostScore,
+        max(p.Score) filter (where p.PostTypeId in (1,2)) as MaxPostScore,
+        sum(p.ViewCount) filter (where p.PostTypeId = 1) as TotalQuestionViews,
+        sum(p.FavoriteCount) filter (where p.PostTypeId = 1) as TotalFavorites,
+        count(distinct case when p.Status = 'Closed' then p.Id end) as ClosedPosts
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    group by u.Id, u.DisplayName
+),
+UserActivityLagLead as (
+    select
+        u.Id,
+        u.DisplayName,
+        lag(u.LastAccessDate) over (order by u.LastAccessDate) as PrevAccess,
+        u.LastAccessDate,
+        lead(u.LastAccessDate) over (order by u.LastAccessDate) as NextAccess,
+        age(u.LastAccessDate, lag(u.LastAccessDate) over (order by u.LastAccessDate)) as LagInterval,
+        age(lead(u.LastAccessDate) over (order by u.LastAccessDate), u.LastAccessDate) as LeadInterval
+    from Users u
+    where u.LastAccessDate is not null
+),
+DuplicateLinks as (
+    select
+        pl.PostId,
+        pl.RelatedPostId,
+        pl.CreationDate,
+        pl.LinkTypeId,
+        lt.Name as LinkTypeName,
+        p1.Score as PostScore,
+        p2.Score as RelatedPostScore
+    from PostLinks pl
+    join LinkTypes lt on lt.Id = pl.LinkTypeId
+    left join Posts p1 on p1.Id = pl.PostId
+    left join Posts p2 on p2.Id = pl.RelatedPostId
+    where pl.LinkTypeId = 3
+),
+QuestionsWithClosedReasons as (
+    select
+        ph.PostId,
+        p.Title,
+        crt.Name as CloseReason,
+        ph.CreationDate as CloseDate,
+        row_number() over (partition by ph.PostId order by ph.CreationDate desc) as CloseRank
+    from PostHistory ph
+    join CloseReasonTypes crt on crt.Id = cast(ph.Comment as integer)
+    join Posts p on p.Id = ph.PostId
+    where ph.PostHistoryTypeId = 10 and p.PostTypeId = 1
+)
+select 
+    u.UserId,
+    u.DisplayName,
+    u.QuestionsPosted,
+    u.AnswersPosted,
+    u.AvgPostScore,
+    u.MaxPostScore,
+    u.TotalQuestionViews,
+    u.TotalFavorites,
+    u.ClosedPosts,
+    coalesce(ub.GoldBadges,0) as GoldBadges,
+    coalesce(ub.SilverBadges,0) as SilverBadges,
+    coalesce(ub.BronzeBadges,0) as BronzeBadges,
+    ua.PrevAccess,
+    ua.LastAccessDate,
+    ua.NextAccess,
+    ua.LagInterval,
+    ua.LeadInterval,
+    (select count(distinct dl.RelatedPostId) from DuplicateLinks dl where dl.PostId = u.UserId) as UserDuplicateLinks,
+    (select count(*) from QuestionsWithClosedReasons qc where qc.PostId in (select p.Id from Posts p where p.OwnerUserId = u.UserId) and qc.CloseRank = 1) as LatestClosedQuestionsCount,
+    rtc.Count as TagCountLinked,
+    rtc.AnswerCount as TotalAnswersForTag,
+    rtc.TotalViews as TagPostViews,
+    rtc.FavoriteCount as TagFavorites
+from UserPosts u
+left join UserBadgeSummary ub on ub.UserId = u.UserId
+left join UserActivityLagLead ua on ua.Id = u.UserId
+left join RecursiveTagCounts rtc on rtc.TagId = 
+    (select min(t.Id) from Tags t where t.Count = (select max("Count") from Tags where "Count" is not null))
+where u.QuestionsPosted > 10
+order by u.QuestionsPosted desc, u.AvgPostScore desc
+limit 100;

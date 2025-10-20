@@ -1,0 +1,214 @@
+WITH RECURSIVE RecursiveTagHierarchy AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        t.IsModeratorOnly,
+        t.IsRequired,
+        1 AS Level,
+        ARRAY[t.Id] AS Path
+    FROM Tags t
+    WHERE t.IsRequired = TRUE
+
+    UNION ALL
+
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        t.IsModeratorOnly,
+        t.IsRequired,
+        r.Level + 1,
+        r.Path || t.Id
+    FROM Tags t
+    JOIN RecursiveTagHierarchy r ON t.Id <> ALL(r.Path)
+    WHERE t.IsRequired = TRUE AND t.Id > r.Id
+),
+UserBadgeCounts AS (
+    SELECT
+        b.UserId,
+        b.Class,
+        COUNT(*) AS BadgeCount
+    FROM Badges b
+    WHERE b.Date > (CAST('2024-10-01' AS date) - INTERVAL '1 year')
+    GROUP BY b.UserId, b.Class
+),
+UserReputationStats AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.Location,
+        COALESCE(ubc_gold.BadgeCount, 0) AS GoldBadges,
+        COALESCE(ubc_silver.BadgeCount, 0) AS SilverBadges,
+        COALESCE(ubc_bronze.BadgeCount, 0) AS BronzeBadges,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS ReputationRank
+    FROM Users u
+    LEFT JOIN UserBadgeCounts ubc_gold ON ubc_gold.UserId = u.Id AND ubc_gold.Class = 1
+    LEFT JOIN UserBadgeCounts ubc_silver ON ubc_silver.UserId = u.Id AND ubc_silver.Class = 2
+    LEFT JOIN UserBadgeCounts ubc_bronze ON ubc_bronze.UserId = u.Id AND ubc_bronze.Class = 3
+    WHERE u.Reputation > 1000
+),
+QuestionAnswerStats AS (
+    SELECT
+        p.Id AS QuestionId,
+        p.Title,
+        p.CreationDate AS QuestionCreation,
+        p.Score AS QuestionScore,
+        p.ViewCount,
+        p.Tags,
+        p.OwnerUserId,
+        COUNT(a.Id) AS AnswerCount,
+        MAX(a.Score) AS MaxAnswerScore,
+        AVG(a.Score) AS AvgAnswerScore,
+        SUM(CASE WHEN a.OwnerUserId IS NOT NULL THEN 1 ELSE 0 END) AS AnsweredByRegisteredUsers
+    FROM Posts p
+    LEFT JOIN Posts a ON a.ParentId = p.Id AND a.PostTypeId = 2
+    WHERE p.PostTypeId = 1
+    GROUP BY p.Id, p.Title, p.CreationDate, p.Score, p.ViewCount, p.Tags, p.OwnerUserId
+),
+TopQuestionsWithComments AS (
+    SELECT
+        q.QuestionId,
+        q.Title,
+        q.QuestionCreation,
+        q.QuestionScore,
+        q.ViewCount,
+        q.Tags,
+        q.AnswerCount,
+        q.MaxAnswerScore,
+        q.AvgAnswerScore,
+        q.AnsweredByRegisteredUsers,
+        c.CommentCount,
+        c.LatestCommentDate,
+        c.LatestCommentUserId,
+        u.DisplayName AS LatestCommentUserName,
+        u.Reputation AS LatestCommentUserReputation
+    FROM QuestionAnswerStats q
+    LEFT JOIN (
+        SELECT
+            PostId,
+            COUNT(*) AS CommentCount,
+            MAX(CreationDate) AS LatestCommentDate,
+            -- determine LatestCommentUserId by joining back to comments on PostId and CreationDate
+            -- use ARRAY_AGG ordered to pick a single user id for the latest date
+            (ARRAY_AGG(UserId ORDER BY CreationDate DESC, UserId))[1] AS LatestCommentUserId
+        FROM Comments
+        GROUP BY PostId
+    ) c ON c.PostId = q.QuestionId
+    LEFT JOIN Users u ON u.Id = c.LatestCommentUserId
+    WHERE q.AnswerCount > 5 AND q.QuestionScore > 10
+),
+DuplicateQuestions AS (
+    SELECT
+        pl.PostId AS DuplicateQuestionId,
+        pl.RelatedPostId AS OriginalQuestionId,
+        p1.Title AS DuplicateTitle,
+        p2.Title AS OriginalTitle,
+        pl.CreationDate AS LinkCreationDate
+    FROM PostLinks pl
+    JOIN Posts p1 ON p1.Id = pl.PostId AND p1.PostTypeId = 1
+    JOIN Posts p2 ON p2.Id = pl.RelatedPostId AND p2.PostTypeId = 1
+    WHERE pl.LinkTypeId = 3
+),
+UserActivityWindow AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.CreationDate,
+        COUNT(*) OVER (PARTITION BY u.Id ORDER BY p.CreationDate ROWS BETWEEN 30 PRECEDING AND CURRENT ROW) AS PostsLast30Days,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) OVER (PARTITION BY u.Id ORDER BY p.CreationDate ROWS BETWEEN 30 PRECEDING AND CURRENT ROW) AS QuestionsLast30Days,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) OVER (PARTITION BY u.Id ORDER BY p.CreationDate ROWS BETWEEN 30 PRECEDING AND CURRENT ROW) AS AnswersLast30Days
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    WHERE u.Reputation > 500
+),
+UserVoteSummary AS (
+    SELECT
+        v.UserId,
+        vt.Name AS VoteTypeName,
+        COUNT(*) AS VoteCount
+    FROM Votes v
+    JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+    GROUP BY v.UserId, vt.Name
+),
+UserEngagement AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        COALESCE(vs_up.VoteCount, 0) AS UpVotesGiven,
+        COALESCE(vs_down.VoteCount, 0) AS DownVotesGiven,
+        COALESCE(vs_fav.VoteCount, 0) AS FavoritesGiven,
+        COALESCE(bc.GoldBadges, 0) AS GoldBadges,
+        COALESCE(bc.SilverBadges, 0) AS SilverBadges,
+        COALESCE(bc.BronzeBadges, 0) AS BronzeBadges,
+        u.Reputation
+    FROM Users u
+    LEFT JOIN (
+        SELECT UserId, VoteCount FROM UserVoteSummary WHERE VoteTypeName = 'UpMod'
+    ) vs_up ON vs_up.UserId = u.Id
+    LEFT JOIN (
+        SELECT UserId, VoteCount FROM UserVoteSummary WHERE VoteTypeName = 'DownMod'
+    ) vs_down ON vs_down.UserId = u.Id
+    LEFT JOIN (
+        SELECT UserId, VoteCount FROM UserVoteSummary WHERE VoteTypeName = 'Favorite'
+    ) vs_fav ON vs_fav.UserId = u.Id
+    LEFT JOIN (
+        SELECT
+            UserId,
+            SUM(CASE WHEN Class = 1 THEN BadgeCount ELSE 0 END) AS GoldBadges,
+            SUM(CASE WHEN Class = 2 THEN BadgeCount ELSE 0 END) AS SilverBadges,
+            SUM(CASE WHEN Class = 3 THEN BadgeCount ELSE 0 END) AS BronzeBadges
+        FROM UserBadgeCounts
+        GROUP BY UserId
+    ) bc ON bc.UserId = u.Id
+    WHERE u.Reputation > 1000
+)
+SELECT
+    tqwc.QuestionId,
+    tqwc.Title,
+    tqwc.QuestionCreation,
+    tqwc.QuestionScore,
+    tqwc.ViewCount,
+    REGEXP_REPLACE(tqwc.Tags, '[<>]', '', 'g') AS CleanTags,
+    tqwc.AnswerCount,
+    tqwc.MaxAnswerScore,
+    ROUND(CAST(tqwc.AvgAnswerScore AS numeric), 2) AS AvgAnswerScore,
+    tqwc.AnsweredByRegisteredUsers,
+    tqwc.CommentCount,
+    tqwc.LatestCommentDate,
+    COALESCE(tqwc.LatestCommentUserName, 'Anonymous') AS LatestCommentUserName,
+    COALESCE(tqwc.LatestCommentUserReputation, 0) AS LatestCommentUserReputation,
+    dup.DuplicateQuestionId,
+    dup.OriginalQuestionId,
+    dup.DuplicateTitle,
+    dup.OriginalTitle,
+    dup.LinkCreationDate,
+    ua.PostsLast30Days,
+    ua.QuestionsLast30Days,
+    ua.AnswersLast30Days,
+    ue.UpVotesGiven,
+    ue.DownVotesGiven,
+    ue.FavoritesGiven,
+    ue.GoldBadges,
+    ue.SilverBadges,
+    ue.BronzeBadges,
+    ue.Reputation AS UserReputation,
+    rh.Level AS TagHierarchyLevel,
+    rh.Path AS TagHierarchyPath
+FROM TopQuestionsWithComments tqwc
+LEFT JOIN DuplicateQuestions dup ON dup.DuplicateQuestionId = tqwc.QuestionId
+LEFT JOIN UserActivityWindow ua ON ua.UserId = tqwc.OwnerUserId
+LEFT JOIN UserEngagement ue ON ue.Id = tqwc.OwnerUserId
+LEFT JOIN RecursiveTagHierarchy rh ON rh.TagName = split_part(split_part(tqwc.Tags, '><', 1), '<', 2)
+WHERE (tqwc.QuestionScore > 20 OR tqwc.AnswerCount > 10)
+  AND (COALESCE(ue.GoldBadges, 0) > 0 OR COALESCE(ue.Reputation, 0) > 5000)
+ORDER BY tqwc.QuestionScore DESC, tqwc.AnswerCount DESC
+LIMIT 100;

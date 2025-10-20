@@ -1,0 +1,168 @@
+-- {"query": "1192.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.1, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1512} 
+with recursive TagHierarchy(tagid, parentid, level) as (
+  select Id, WikiPostId, 1
+  from Tags
+  where WikiPostId is not null
+  union all
+  select t.Id, th.parentid, th.level + 1
+  from Tags t
+  join TagHierarchy th on t.WikiPostId = th.tagid
+),
+UserActivity as (
+  select 
+    u.Id as UserId,
+    u.DisplayName,
+    coalesce(sum(case when p.PostTypeId = 1 then 1 else 0 end),0) as QuestionsCount,
+    coalesce(sum(case when p.PostTypeId = 2 then 1 else 0 end),0) as AnswersCount,
+    coalesce(count(distinct b.Id),0) as BadgesCount,
+    coalesce(sum(vtcnt.UpVotes),0) as TotalUpVotes,
+    coalesce(sum(vtcnt.DownVotes),0) as TotalDownVotes,
+    max(u.Reputation) as MaxReputation,
+    min(u.CreationDate) as UserSince
+  from Users u
+  left join Posts p on p.OwnerUserId = u.Id
+  left join Badges b on b.UserId = u.Id
+  left join (
+    select 
+      p.OwnerUserId as uid,
+      sum(case when v.VoteTypeId = 2 then 1 else 0 end) as UpVotes,
+      sum(case when v.VoteTypeId = 3 then 1 else 0 end) as DownVotes
+    from Posts p
+    left join Votes v on v.PostId = p.Id
+    where p.OwnerUserId is not null 
+    group by p.OwnerUserId
+  ) vtcnt on vtcnt.uid = u.Id
+  group by u.Id, u.DisplayName
+),
+PostRanks as (
+  select 
+    p.Id,
+    p.PostTypeId,
+    p.Title,
+    p.Score,
+    p.ViewCount,
+    p.CreationDate,
+    row_number() over (partition by p.PostTypeId order by p.Score desc, p.ViewCount desc) as RankWithinType,
+    dense_rank() over (order by p.Score desc nulls last) as GlobalScoreRank,
+    ntile(10) over (order by p.CreationDate) as DecileByDate
+  from Posts p
+  where p.PostTypeId in (1,2)
+),
+AcceptedAnswers as (
+  select 
+    q.Id as QuestionId,
+    a.Id as AcceptedAnswerId,
+    a.Score as AcceptedAnswerScore,
+    a.OwnerUserId as AnswerOwnerId,
+    a.CreationDate as AnswerCreationDate
+  from Posts q
+  left join Posts a on a.Id = q.AcceptedAnswerId
+  where q.PostTypeId = 1
+),
+DuplicateVectors as (
+  select
+    pl.PostId,
+    pl.RelatedPostId,
+    lt.Name as LinkTypeName,
+    p1.Tags tags1,
+    p2.Tags tags2,
+    array_length(string_to_array(coalesce(p1.Tags,''), '><'),1) as TagsCount1,
+    array_length(string_to_array(coalesce(p2.Tags,''), '><'),1) as TagsCount2
+  from PostLinks pl
+  join LinkTypes lt on lt.Id = pl.LinkTypeId
+  join Posts p1 on p1.Id = pl.PostId
+  join Posts p2 on p2.Id = pl.RelatedPostId
+  where lt.Name = 'Duplicate'
+),
+UserLastAccess_NotNull as (
+  select * from Users where LastAccessDate is not null
+),
+ComplexComments as (
+  select 
+    c.Id as CommentId,
+    c.PostId,
+    c.CreationDate as CommentDate,
+    c.Score as CommentScore,
+    length(c.Text) as CommentLength,
+    case when position('http' in c.Text) > 0 then 1 else 0 end as HasUrlFlag,
+    coalesce(u.DisplayName, c.UserDisplayName) as CommenterName,
+    row_number() over (partition by c.PostId order by c.Score desc nulls last, c.CreationDate) as CommentRankDesc,
+    dense_rank() over (partition by c.PostId order by c.Score desc nulls last) as CommentDenseRank
+  from Comments c
+  left join Users u on u.Id = c.UserId
+  where c.Text is not null 
+),
+FinalResult as (
+  select 
+    ua.UserId,
+    ua.DisplayName,
+    ua.QuestionsCount,
+    ua.AnswersCount,
+    ua.BadgesCount,
+    ua.TotalUpVotes,
+    ua.TotalDownVotes,
+    ua.MaxReputation,
+    ua.UserSince,
+    pr.Id as PostId,
+    pr.PostTypeId,
+    pr.Title,
+    pr.Score,
+    pr.ViewCount,
+    pr.RankWithinType,
+    pr.GlobalScoreRank,
+    pr.DecileByDate,
+    aa.AcceptedAnswerId,
+    aa.AcceptedAnswerScore,
+    aa.AnswerOwnerId,
+    aa.AnswerCreationDate,
+    dv.PostId as DuplicatePostId,
+    dv.RelatedPostId as DuplicateRelatedPostId,
+    dv.LinkTypeName,
+    dv.TagsCount1,
+    dv.TagsCount2,
+    cc.CommentId,
+    cc.CommentScore,
+    cc.HasUrlFlag
+  from UserActivity ua
+  left join Posts pr on pr.OwnerUserId = ua.UserId
+  left join AcceptedAnswers aa on aa.QuestionId = pr.Id
+  left join DuplicateVectors dv on dv.PostId = pr.Id
+  left join ComplexComments cc on cc.PostId = pr.Id and cc.CommentRankDesc = 1
+  where ua.BadgesCount > 0 
+    and (pr.Score > 10 or pr.ViewCount > 1000)
+)
+select 
+  fr.UserId, 
+  fr.DisplayName, 
+  fr.QuestionsCount, 
+  fr.AnswersCount, 
+  fr.BadgesCount, 
+  fr.TotalUpVotes, 
+  fr.TotalDownVotes,
+  fr.MaxReputation,
+  fr.PostId, 
+  fr.PostTypeId, 
+  left(fr.Title, 100) as TitleSnippet,
+  fr.Score,
+  fr.ViewCount,
+  fr.RankWithinType,
+  fr.GlobalScoreRank,
+  fr.DecileByDate,
+  coalesce(fr.AcceptedAnswerId, -1) as AcceptedAnswerId,
+  fr.AcceptedAnswerScore,
+  fr.AnswerOwnerId,
+  fr.AnswerCreationDate,
+  fr.DuplicatePostId,
+  fr.DuplicateRelatedPostId,
+  fr.LinkTypeName,
+  fr.TagsCount1,
+  fr.TagsCount2,
+  fr.CommentId,
+  fr.CommentScore,
+  fr.HasUrlFlag,
+  case when fr.HasUrlFlag = 1 then concat('Has URL in comment: ', coalesce(cast(fr.CommentId as varchar), 'NULL')) else 'No URL in comment' end as UrlCommentRemark
+from FinalResult fr
+where fr.UserSince < cast('2024-10-01 12:34:56' as timestamp) - interval '5 year'
+  and fr.DecileByDate between 3 and 8
+order by fr.MaxReputation desc, fr.Score desc nulls last, fr.ViewCount desc nulls last
+limit 100;

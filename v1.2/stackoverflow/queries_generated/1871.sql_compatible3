@@ -1,0 +1,80 @@
+WITH RankedQuestions AS (
+    SELECT
+        p.Id AS QuestionId,
+        p.Title AS QuestionTitle,
+        u.Id AS OwnerUserId,
+        u.DisplayName,
+        u.Reputation,
+        p.CreationDate,
+        p.AcceptedAnswerId,
+        CASE
+            WHEN p.Tags IS NULL THEN NULL
+            ELSE (
+                SELECT array_agg(tag) FROM (
+                    SELECT regexp_replace(value, '^<|>$', '') AS tag
+                    FROM (
+                        SELECT trim(value) AS value
+                        FROM (
+                            SELECT regexp_split_to_table(replace(replace(p.Tags, '><', '>|<'), '><', '>|<'), '|') AS value
+                        ) s1
+                    ) s2
+                    WHERE value <> ''
+                ) s3
+            )
+        END AS TagArray,
+        ROW_NUMBER() OVER (
+            PARTITION BY u.Id
+            ORDER BY p.Score DESC, p.ViewCount DESC, p.CreationDate
+        ) AS UserHighScoreQRank
+    FROM
+        Posts p
+        LEFT JOIN Users u ON u.Id = p.OwnerUserId
+    WHERE
+        p.PostTypeId = 1
+        AND p.CreationDate BETWEEN DATE '2018-01-01' AND DATE '2023-12-31'
+),
+CetLongestTagAndTopBadgeRanks AS (
+    SELECT
+        qt.QuestionId,
+        qt.QuestionTitle,
+        qt.OwnerUserId,
+        qt.DisplayName,
+        qt.Reputation,
+        qt.CreationDate,
+        qt.AcceptedAnswerId,
+        qt.TagArray,
+        qt.UserHighScoreQRank,
+        lt.LongestTag,
+        b.Name AS ActiveWeeknGoldBadgeName,
+        ROW_NUMBER() OVER (PARTITION BY qt.OwnerUserId ORDER BY b.Date DESC) AS BadgeRecencyRank
+    FROM RankedQuestions qt
+    LEFT JOIN LATERAL (
+        SELECT tag AS LongestTag
+        FROM (
+            SELECT tag, CHAR_LENGTH(tag) AS len
+            FROM (
+                SELECT value AS tag
+                FROM UNNEST(qt.TagArray) AS t(value)
+            ) u
+        ) t2
+        ORDER BY len DESC
+        FETCH FIRST 1 ROW ONLY
+    ) lt ON TRUE
+    LEFT JOIN Badges b ON b.UserId = qt.OwnerUserId AND b.Class = 1
+)
+SELECT
+    c.QuestionId,
+    c.QuestionTitle,
+    c.OwnerUserId,
+    c.DisplayName,
+    c.Reputation,
+    c.CreationDate,
+    c.AcceptedAnswerId,
+    c.TagArray,
+    c.LongestTag,
+    c.ActiveWeeknGoldBadgeName,
+    c.UserHighScoreQRank,
+    c.BadgeRecencyRank
+FROM CetLongestTagAndTopBadgeRanks c
+WHERE c.UserHighScoreQRank = 1
+  AND c.BadgeRecencyRank = 1;

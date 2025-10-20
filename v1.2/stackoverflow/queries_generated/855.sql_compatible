@@ -1,0 +1,157 @@
+with RecursiveTagHierarchy as (
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.IsModeratorOnly,
+        t.IsRequired,
+        1 as Level,
+        array[t.Id] as Ancestors
+    from Tags t
+    where t.IsRequired = true
+
+    union all
+
+    select
+        child.Id,
+        child.TagName,
+        child.Count,
+        child.IsModeratorOnly,
+        child.IsRequired,
+        p.Level + 1,
+        p.Ancestors || child.Id
+    from Tags child
+    join RecursiveTagHierarchy p on child.IsRequired = false and child.Id != all(p.Ancestors)
+    where child.Count > 1000
+), 
+
+QuestionStats as (
+    select
+        p.Id as QuestionId,
+        p.Title,
+        u.Id as OwnerUserId,
+        u.DisplayName as OwnerDisplayName,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.FavoriteCount,
+        array_remove(string_to_array(substring(p.Tags from 2 for char_length(p.Tags) - 2), '><'), '') as TagArray
+    from Posts p
+    left join Users u on p.OwnerUserId = u.Id
+    where p.PostTypeId = 1 and p.CreationDate >= date '2015-01-01' and p.ClosedDate is null
+), 
+
+AnswerStats as (
+    select
+        a.Id as AnswerId,
+        a.ParentId as QuestionId,
+        a.CreationDate,
+        a.Score,
+        a.OwnerUserId,
+        a.Body,
+        row_number() over (partition by a.ParentId order by a.Score desc, a.CreationDate asc) as AnswerRank
+    from Posts a
+    where a.PostTypeId = 2 and a.Score > 0
+), 
+
+UserBadgeRankings as (
+    select
+        b.UserId,
+        b.Name,
+        b.Class,
+        count(*) over (partition by b.UserId, b.Class) as BadgeCountPerClass,
+        rank() over (partition by b.Class order by count(*) desc) as BadgeClassRank
+    from Badges b
+    where b.Date > date '2017-01-01'
+), 
+
+CloseVoteCounts as (
+    select
+        ph.PostId,
+        count(case when ph.PostHistoryTypeId = 10 then 1 end) as CloseVotes,
+        count(case when ph.PostHistoryTypeId = 11 then 1 end) as ReopenVotes,
+        max(ph.CreationDate) as LastCloseVoteDate
+    from PostHistory ph
+    group by ph.PostId
+), 
+
+TopVotedComments as (
+    select
+        c.PostId,
+        c.Id as CommentId,
+        c.UserId,
+        c.Score,
+        c.Text,
+        row_number() over (partition by c.PostId order by c.Score desc nulls last, c.CreationDate asc) as CommentRank
+    from Comments c
+    where c.Score is not null and c.CreationDate > date '2020-01-01'
+), 
+
+AggregatedUserStats as (
+    select
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        coalesce(sum(vt.UpVotes),0) as TotalUpVotes,
+        coalesce(sum(vt.DownVotes),0) as TotalDownVotes,
+        count(distinct b.Id) as TotalBadges,
+        max(u.LastAccessDate) as LastSeen,
+        min(u.CreationDate) as MemberSince,
+        case 
+            when u.Views > 0 then (cast(u.UpVotes as float) / nullif(u.Views,0)) 
+            else null 
+        end as UpvotePerViewRatio
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    left join lateral (
+        select
+            sum(case when v.VoteTypeId = 2 then 1 else 0 end) as UpVotes,
+            sum(case when v.VoteTypeId = 3 then 1 else 0 end) as DownVotes
+        from Votes v
+        where v.UserId = u.Id
+    ) vt on true
+    group by u.Id, u.DisplayName, u.Reputation, u.Views, u.UpVotes, u.DownVotes, u.LastAccessDate, u.CreationDate
+)
+
+select 
+    q.QuestionId,
+    q.Title,
+    q.OwnerDisplayName,
+    q.CreationDate,
+    q.Score as QuestionScore,
+    q.ViewCount,
+    q.AnswerCount,
+    q.FavoriteCount,
+    array_to_string(q.TagArray, ',') as Tags,
+    ans.AnswerId,
+    ans.CreationDate as AnswerCreation,
+    ans.Score as AnswerScore,
+    ub.BadgeClassRank,
+    ub.BadgeCountPerClass,
+    cvc.CloseVotes,
+    cvc.ReopenVotes,
+    cvc.LastCloseVoteDate,
+    tuc.CommentId as TopCommentId,
+    tuc.Score as TopCommentScore,
+    tuc.Text as TopCommentText,
+    aus.Reputation as OwnerReputation,
+    aus.TotalBadges as OwnerTotalBadges,
+    aus.UpvotePerViewRatio as OwnerUpvotePerViewRatio
+from QuestionStats q
+left join AnswerStats ans on q.QuestionId = ans.QuestionId and ans.AnswerRank = 1
+left join UserBadgeRankings ub on ub.UserId = q.OwnerUserId and ub.Class = 1
+left join CloseVoteCounts cvc on cvc.PostId = q.QuestionId
+left join TopVotedComments tuc on tuc.PostId = q.QuestionId and tuc.CommentRank = 1
+left join AggregatedUserStats aus on aus.Id = q.OwnerUserId
+where 
+    (q.Score > 10 or q.ViewCount > 1000) and
+    (ans.Score is null or ans.Score >= 5) and
+    (
+        ub.BadgeCountPerClass is null or ub.BadgeCountPerClass > 3
+    ) and
+    (
+        cvc.CloseVotes is null or cvc.CloseVotes < 5
+    )
+order by q.Score desc, q.ViewCount desc
+limit 100;

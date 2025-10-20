@@ -1,0 +1,185 @@
+with recursive RecursiveTagHierarchy as (
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        1 as Level,
+        cast(array[t.TagName] as varchar[]) as Path
+    from Tags t
+    where t.IsRequired = true
+
+    union all
+
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        r.Level + 1,
+        r.Path || t.TagName
+    from Tags t
+    join RecursiveTagHierarchy r on t.Id <> r.Id and not t.TagName = any(r.Path)
+    where r.Level < 3
+),
+UserBadgeCounts as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(b.Id) filter (where b.Class = 1) as GoldBadges,
+        count(b.Id) filter (where b.Class = 2) as SilverBadges,
+        count(b.Id) filter (where b.Class = 3) as BronzeBadges,
+        coalesce(sum(case when b.TagBased = 1 then 1 else 0 end), 0) as TagBasedBadges
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.DisplayName
+),
+TopQuestions as (
+    select
+        p.Id,
+        p.Title,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        row_number() over (partition by p.OwnerUserId order by p.Score desc, p.ViewCount desc) as rn
+    from Posts p
+    where p.PostTypeId = 1 and p.CreationDate >= cast(cast('2024-10-01' as date) - interval '1 year' as date)
+),
+AnswerStats as (
+    select
+        a.ParentId as QuestionId,
+        count(a.Id) as AnswerCount,
+        avg(a.Score) as AvgAnswerScore,
+        max(a.Score) as MaxAnswerScore,
+        sum(case when a.OwnerUserId is null then 1 else 0 end) as AnonymousAnswers
+    from Posts a
+    where a.PostTypeId = 2
+    group by a.ParentId
+),
+QuestionCloseInfo as (
+    select
+        ph.PostId,
+        max(case when ph.PostHistoryTypeId = 10 then ph.CreationDate else null end) as ClosedDate,
+        max(case when ph.PostHistoryTypeId = 11 then ph.CreationDate else null end) as ReopenedDate,
+        max(case when ph.PostHistoryTypeId = 10 then ph.Comment else null end) as CloseReasonId
+    from PostHistory ph
+    group by ph.PostId
+),
+UserActivityWindow as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        count(p.Id) filter (where p.PostTypeId = 1) over (partition by u.Id order by p.CreationDate rows between unbounded preceding and current row) as CumulativeQuestions,
+        count(p.Id) filter (where p.PostTypeId = 2) over (partition by u.Id order by p.CreationDate rows between unbounded preceding and current row) as CumulativeAnswers,
+        max(p.Score) filter (where p.PostTypeId = 1) over (partition by u.Id) as MaxQuestionScore,
+        max(p.Score) filter (where p.PostTypeId = 2) over (partition by u.Id) as MaxAnswerScore
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+),
+DuplicateLinks as (
+    select
+        pl.PostId as DuplicateQuestionId,
+        pl.RelatedPostId as OriginalQuestionId,
+        pl.CreationDate as LinkDate
+    from PostLinks pl
+    where pl.LinkTypeId = 3
+),
+QuestionsWithDuplicates as (
+    select
+        q.Id,
+        q.Title,
+        q.OwnerUserId,
+        q.CreationDate,
+        q.Score,
+        q.ViewCount,
+        q.Tags,
+        count(dl.DuplicateQuestionId) as DuplicateCount
+    from Posts q
+    left join DuplicateLinks dl on dl.OriginalQuestionId = q.Id
+    where q.PostTypeId = 1
+    group by q.Id, q.Title, q.OwnerUserId, q.CreationDate, q.Score, q.ViewCount, q.Tags
+)
+select
+    tq.Id as QuestionId,
+    tq.Title,
+    u.DisplayName as OwnerName,
+    u.Reputation,
+    ubc.GoldBadges,
+    ubc.SilverBadges,
+    ubc.BronzeBadges,
+    ubc.TagBasedBadges,
+    tq.Score as QuestionScore,
+    tq.ViewCount as QuestionViews,
+    asr.AnswerCount,
+    asr.AvgAnswerScore,
+    asr.MaxAnswerScore,
+    asr.AnonymousAnswers,
+    qci.ClosedDate,
+    qci.ReopenedDate,
+    crt.Name as CloseReason,
+    qwd.DuplicateCount,
+    string_agg(distinct rth.TagName, ', ') filter (where rth.Level = 1) as RequiredTagsLevel1,
+    string_agg(distinct rth.TagName, ', ') filter (where rth.Level = 2) as RequiredTagsLevel2,
+    string_agg(distinct rth.TagName, ', ') filter (where rth.Level = 3) as RequiredTagsLevel3,
+    ua.CumulativeQuestions,
+    ua.CumulativeAnswers,
+    ua.MaxQuestionScore,
+    ua.MaxAnswerScore,
+    case
+        when ua.Reputation > 10000 then 'Expert'
+        when ua.Reputation > 1000 then 'Intermediate'
+        else 'Beginner'
+    end as UserLevel,
+    substring(tq.Tags from '<([^>]+)>') as FirstTag,
+    (select count(*) from Comments c where c.PostId = tq.Id and coalesce(c.Score,0) > 0) as PositiveCommentCount,
+    rank() over (partition by tq.OwnerUserId order by tq.Score desc) as QuestionRankByUser,
+    case when qci.ClosedDate is not null and qci.ReopenedDate is null then true else false end as IsCurrentlyClosed
+from TopQuestions tq
+left join Users u on u.Id = tq.OwnerUserId
+left join UserBadgeCounts ubc on ubc.UserId = u.Id
+left join AnswerStats asr on asr.QuestionId = tq.Id
+left join QuestionCloseInfo qci on qci.PostId = tq.Id
+left join CloseReasonTypes crt on crt.Id = cast(qci.CloseReasonId as text)
+left join RecursiveTagHierarchy rth on rth.TagName = any(string_to_array(substring(tq.Tags from 2 for char_length(tq.Tags)-2), '><'))
+left join UserActivityWindow ua on ua.UserId = u.Id
+left join QuestionsWithDuplicates qwd on qwd.Id = tq.Id
+where tq.rn <= 5
+group by
+    tq.Id,
+    tq.Title,
+    u.DisplayName,
+    u.Reputation,
+    ubc.GoldBadges,
+    ubc.SilverBadges,
+    ubc.BronzeBadges,
+    ubc.TagBasedBadges,
+    tq.Score,
+    tq.ViewCount,
+    asr.AnswerCount,
+    asr.AvgAnswerScore,
+    asr.MaxAnswerScore,
+    asr.AnonymousAnswers,
+    qci.ClosedDate,
+    qci.ReopenedDate,
+    crt.Name,
+    qwd.DuplicateCount,
+    ua.CumulativeQuestions,
+    ua.CumulativeAnswers,
+    ua.MaxQuestionScore,
+    ua.MaxAnswerScore,
+    ua.Reputation,
+    tq.Tags,
+    tq.OwnerUserId,
+    tq.CreationDate,
+    ua.UserId,
+    rth.TagName,
+    rth.Level
+order by ua.Reputation desc, tq.Score desc
+limit 100;

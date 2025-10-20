@@ -1,0 +1,146 @@
+with ranked_answers as (
+    select 
+        a.Id as AnswerId,
+        a.ParentId as QuestionId,
+        a.OwnerUserId,
+        a.Score,
+        a.CreationDate,
+        row_number() over(partition by a.ParentId order by a.Score desc, a.CreationDate asc) as rn,
+        dense_rank() over(partition by a.ParentId order by a.Score desc) as score_rank,
+        coalesce(u.Reputation, 0) as OwnerReputation,
+        length(a.Body) as BodyLength,
+        strpos(lower(a.Body), 'sql') as sql_pos
+    from Posts a
+    left join Users u on a.OwnerUserId = u.Id
+    where a.PostTypeId = 2 -- answers
+),
+question_badges as (
+    select 
+        p.Id as QuestionId,
+        p.OwnerUserId,
+        count(b.Id) as UserBadgeCount,
+        max(case when b.Class=1 then 1 else 0 end) as HasGoldBadge,
+        max(case when b.Class=2 then 1 else 0 end) as HasSilverBadge,
+        max(case when b.Class=3 then 1 else 0 end) as HasBronzeBadge
+    from Posts p
+    left join Badges b on b.UserId = p.OwnerUserId
+    where p.PostTypeId = 1 -- questions
+    group by p.Id, p.OwnerUserId
+),
+top_questions as (
+    select 
+        q.Id,
+        q.Title,
+        q.Tags,
+        q.CreationDate,
+        q.Score,
+        q.ViewCount,
+        q.AnswerCount,
+        q.AcceptedAnswerId,
+        qb.UserBadgeCount,
+        qb.HasGoldBadge,
+        qb.HasSilverBadge,
+        qb.HasBronzeBadge,
+        u.DisplayName as OwnerName,
+        u.Reputation as OwnerRep,
+        case 
+            when q.ClosedDate is not null then 1
+            else 0
+        end as IsClosed,
+        coalesce((select count(*) from Comments c where c.PostId = q.Id and (c.Text like '%help%' or c.Text like '%error%')), 0) as HelpCommentsCount
+    from Posts q
+    left join question_badges qb on q.Id = qb.QuestionId
+    left join Users u on q.OwnerUserId = u.Id
+    where q.PostTypeId = 1 and q.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '1 year'
+),
+duplicate_links as (
+    select PostId, RelatedPostId from PostLinks where LinkTypeId = 3 -- duplicates
+),
+questions_with_duplicates as (
+    select distinct q.Id, coalesce(dl.RelatedPostId, null) as DuplicateOfQuestion
+    from top_questions q
+    left join duplicate_links dl on dl.PostId = q.Id
+),
+q_answers_stats as (
+    select 
+        ra.QuestionId, 
+        count(*) as TotalAnswers,
+        sum(case when ra.score_rank=1 then 1 else 0 end) as HasTopScoredAnswer,
+        avg(ra.BodyLength) as AvgAnswerBodyLength,
+        count(distinct ra.OwnerUserId) as UniqueAnsweringUsers
+    from ranked_answers ra
+    group by ra.QuestionId
+),
+user_activity as (
+    select 
+        u.Id,
+        u.DisplayName,
+        count(distinct p.Id) as PostsCount,
+        sum(p.Score) as TotalPostScore,
+        count(distinct c.Id) as CommentsCount,
+        cast(coalesce(sum(case when v.VoteTypeId = 2 then 1 else 0 end),0) as integer) as UpvoteCount,
+        coalesce(max(p.CreationDate), u.CreationDate) as LastPostDate
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Comments c on c.UserId = u.Id
+    left join Votes v on v.UserId = u.Id
+    group by u.Id, u.DisplayName, u.CreationDate
+),
+post_score_percentiles as (
+  select 
+      QuestionId, 
+      Score, 
+      percentile_cont(0.25) within group (order by Score) over () as p25,
+      percentile_cont(0.50) within group (order by Score) over () as p50,
+      percentile_cont(0.75) within group (order by Score) over () as p75
+  from top_questions
+)
+select
+    tq.Id as QuestionId,
+    tq.Title,
+    (regexp_split_to_array(trim(both '<>' from tq.Tags), '><')) as TagsArray,
+    tq.Score,
+    tq.ViewCount,
+    tq.AnswerCount,
+    tq.AcceptedAnswerId,
+    CASE WHEN dq.DuplicateOfQuestion IS NOT NULL THEN 'Yes' ELSE 'No' END as IsMarkedDuplicate,
+    tac.TotalAnswers,
+    tac.HasTopScoredAnswer,
+    round(tac.AvgAnswerBodyLength,1) as AvgAnswerLen,
+    tac.UniqueAnsweringUsers,
+    uq.UserBadgeCount,
+    concat_ws(', ',
+        case when uq.HasGoldBadge=1 then 'Gold' end,
+        case when uq.HasSilverBadge=1 then 'Silver' end,
+        case when uq.HasBronzeBadge=1 then 'Bronze' end
+    ) as BadgeTypes,
+    uq.OwnerName,
+    uq.OwnerRep,
+    tq.IsClosed,
+    tq.HelpCommentsCount,
+    ua.PostsCount as UserTotalPosts,
+    ua.TotalPostScore,
+    ua.CommentsCount,
+    ua.UpvoteCount,
+    round(
+       100.0 * (tq.Score - psp.p25) / greatest(nullif(psp.p75 - psp.p25,0),1),
+       2) as ScoreScaledPercentile,
+    extract(day from (cast('2024-10-01 12:34:56' as timestamp) - tq.CreationDate)) as DaysSinceAsked,
+    length(tq.Title) as TitleLen,
+    position('?' in tq.Title) > 0 as TitleHasQuestionMark,
+    regexp_replace(tq.Title, '[^[:alnum:]]+', '','g') as TitleAlphaNumOnly
+from top_questions tq
+left join questions_with_duplicates dq on tq.Id = dq.Id
+left join q_answers_stats tac on tac.QuestionId = tq.Id
+left join question_badges uq on uq.QuestionId = tq.Id
+left join user_activity ua on ua.Id = tq.OwnerUserId
+left join post_score_percentiles psp on psp.QuestionId = tq.Id
+where tq.AnswerCount > 0
+and (
+    select count(*) from PostHistory ph
+    where ph.PostId = tq.Id
+    and ph.PostHistoryTypeId in (4,5,6) -- edits to title/body/tags
+    and ph.CreationDate > tq.CreationDate + interval '1 day'
+) > 0
+order by ScoreScaledPercentile desc, tq.ViewCount desc
+limit 50;

@@ -1,0 +1,180 @@
+WITH RecursiveTagHierarchy AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        t.IsModeratorOnly,
+        t.IsRequired,
+        ARRAY[t.TagName] AS TagPath
+    FROM Tags t
+    WHERE t.IsRequired = TRUE
+
+    UNION ALL
+
+    SELECT
+        child.Id,
+        child.TagName,
+        child.Count,
+        child.ExcerptPostId,
+        child.WikiPostId,
+        child.IsModeratorOnly,
+        child.IsRequired,
+        parent.TagPath || child.TagName
+    FROM Tags child
+    JOIN RecursiveTagHierarchy parent ON child.IsRequired = TRUE AND child.Id <> ALL(parent.TagPath)
+    WHERE child.Id > parent.Id
+),
+UserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionsAsked,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswersGiven,
+        COUNT(DISTINCT c.Id) AS CommentsMade,
+        COUNT(DISTINCT b.Id) AS BadgesEarned,
+        COALESCE(SUM(v.BountyAmount), 0) AS TotalBountyGiven,
+        MAX(p.CreationDate) AS LastPostDate,
+        AVG(p.Score) FILTER (WHERE p.PostTypeId IN (1,2)) AS AvgPostScore
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Comments c ON c.UserId = u.Id
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    LEFT JOIN Votes v ON v.UserId = u.Id AND v.VoteTypeId = 8
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+TopQuestionsWithAnswers AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.Title,
+        q.CreationDate,
+        q.Score AS QuestionScore,
+        q.ViewCount,
+        q.AnswerCount,
+        a.Id AS AnswerId,
+        a.Score AS AnswerScore,
+        a.OwnerUserId AS AnswerOwnerUserId,
+        ROW_NUMBER() OVER (PARTITION BY q.Id ORDER BY a.Score DESC NULLS LAST) AS AnswerRank
+    FROM Posts q
+    LEFT JOIN Posts a ON a.ParentId = q.Id AND a.PostTypeId = 2
+    WHERE q.PostTypeId = 1
+      AND q.ClosedDate IS NULL
+      AND q.Score > 5
+),
+AnswerStats AS (
+    SELECT
+        QuestionId,
+        COUNT(AnswerId) AS TotalAnswers,
+        AVG(AnswerScore) AS AvgAnswerScore,
+        MAX(AnswerScore) AS MaxAnswerScore,
+        MIN(AnswerScore) AS MinAnswerScore
+    FROM TopQuestionsWithAnswers
+    GROUP BY QuestionId
+),
+UserBadgesRanked AS (
+    SELECT
+        b.UserId,
+        b.Name,
+        b.Class,
+        b.Date,
+        ROW_NUMBER() OVER (PARTITION BY b.UserId ORDER BY b.Date DESC) AS BadgeRank
+    FROM Badges b
+),
+UserLatestBadges AS (
+    SELECT
+        UserId,
+        STRING_AGG(Name || ' (' || CASE Class WHEN 1 THEN 'Gold' WHEN 2 THEN 'Silver' ELSE 'Bronze' END || ')', ', ') AS LatestBadges
+    FROM UserBadgesRanked
+    WHERE BadgeRank <= 3
+    GROUP BY UserId
+),
+QuestionTagExplode AS (
+    SELECT
+        p.Id AS PostId,
+        unnest(string_to_array(substring(p.Tags FROM 2 FOR char_length(p.Tags) - 2), '><')) AS Tag
+    FROM Posts p
+    WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL
+),
+TagPopularity AS (
+    SELECT
+        Tag,
+        COUNT(*) AS QuestionCount,
+        AVG(p.Score) AS AvgQuestionScore,
+        MAX(p.ViewCount) AS MaxViewCount
+    FROM QuestionTagExplode qte
+    JOIN Posts p ON p.Id = qte.PostId
+    GROUP BY Tag
+),
+QuestionsWithCloseInfo AS (
+    SELECT
+        p.Id,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.ClosedDate,
+        cht.Name AS CloseReasonName,
+        ph.CreationDate AS CloseDate
+    FROM Posts p
+    LEFT JOIN PostHistory ph ON ph.PostId = p.Id AND ph.PostHistoryTypeId = 10
+    LEFT JOIN CloseReasonTypes cht ON cht.Id = CAST(ph.Comment AS SMALLINT)
+    WHERE p.PostTypeId = 1
+),
+QuestionsWithCommentsCount AS (
+    SELECT
+        p.Id,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        COUNT(c.Id) AS CommentCount
+    FROM Posts p
+    LEFT JOIN Comments c ON c.PostId = p.Id
+    WHERE p.PostTypeId = 1
+    GROUP BY p.Id, p.Title, p.CreationDate, p.Score, p.ViewCount
+)
+SELECT
+    ua.UserId,
+    ua.DisplayName,
+    ua.Reputation,
+    ua.QuestionsAsked,
+    ua.AnswersGiven,
+    ua.CommentsMade,
+    ua.BadgesEarned,
+    ua.TotalBountyGiven,
+    ua.LastPostDate,
+    ua.AvgPostScore,
+    ulb.LatestBadges,
+    q.QuestionId,
+    q.Title AS QuestionTitle,
+    q.CreationDate AS QuestionCreationDate,
+    q.QuestionScore,
+    q.ViewCount AS QuestionViewCount,
+    q.AnswerCount,
+    ans.TotalAnswers,
+    ans.AvgAnswerScore,
+    ans.MaxAnswerScore,
+    ans.MinAnswerScore,
+    tp.Tag,
+    tp.QuestionCount AS TagQuestionCount,
+    tp.AvgQuestionScore AS TagAvgQuestionScore,
+    tp.MaxViewCount AS TagMaxViewCount,
+    qc.ClosedDate,
+    qc.CloseReasonName,
+    qcmt.CommentCount AS QuestionCommentCount,
+    ROW_NUMBER() OVER (PARTITION BY ua.UserId ORDER BY ua.Reputation DESC NULLS LAST, ua.LastPostDate DESC NULLS LAST) AS UserRank
+FROM UserActivity ua
+LEFT JOIN UserLatestBadges ulb ON ulb.UserId = ua.UserId
+LEFT JOIN TopQuestionsWithAnswers q ON q.AnswerOwnerUserId = ua.UserId AND q.AnswerRank = 1
+LEFT JOIN AnswerStats ans ON ans.QuestionId = q.QuestionId
+LEFT JOIN QuestionTagExplode qte ON qte.PostId = q.QuestionId
+LEFT JOIN TagPopularity tp ON tp.Tag = qte.Tag
+LEFT JOIN QuestionsWithCloseInfo qc ON qc.Id = q.QuestionId
+LEFT JOIN QuestionsWithCommentsCount qcmt ON qcmt.Id = q.QuestionId
+WHERE ua.Reputation > 1000
+  AND (q.QuestionScore > 10 OR q.QuestionScore IS NULL)
+  AND (tp.QuestionCount > 50 OR tp.QuestionCount IS NULL)
+ORDER BY ua.Reputation DESC NULLS LAST, ua.LastPostDate DESC NULLS LAST
+LIMIT 100;

@@ -1,0 +1,157 @@
+with recursive RecursiveTagHierarchy as (
+    select 
+        t.Id,
+        t.TagName,
+        t.Count,
+        0 as Level,
+        array[t.TagName] as Ancestors
+    from Tags t
+    where t.IsModeratorOnly = false
+
+    union all
+
+    select 
+        t.Id,
+        t.TagName,
+        t.Count,
+        r.Level + 1 as Level,
+        r.Ancestors || t.TagName
+    from Tags t
+    join RecursiveTagHierarchy r on array_length(r.Ancestors,1) < 3
+               and t.Count between r.Count / 2 and r.Count * 2
+               and not t.TagName = any(r.Ancestors)
+),
+UserBadgeCounts as (
+    select 
+        u.Id as UserId, 
+        u.DisplayName,
+        count(b.Id) filter (where b.Class = 1) as GoldBadges,
+        count(b.Id) filter (where b.Class = 2) as SilverBadges,
+        count(b.Id) filter (where b.Class = 3) as BronzeBadges,
+        sum(case when b.TagBased = 1 then 1 else 0 end) as TagBasedBadges
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.DisplayName
+),
+QuestionsWithAnswersAndVotes as (
+    select 
+        q.Id as QuestionId,
+        q.Title,
+        q.CreationDate as QuestionCreation,
+        q.OwnerUserId,
+        q.Tags,
+        coalesce(q.Score,0) as QuestionScore,
+        coalesce(a.AnswerCount,0) as AnswerCount,
+        extract(epoch from (cast('2024-10-01 12:34:56' as timestamp) - q.CreationDate))/86400.0 as AgeDays,
+        row_number() over(
+          partition by q.Id order by a.Score desc nulls last
+        ) as AnswerRank,
+        a.Id as AnswerId,
+        a.OwnerUserId as AnswerOwnerUserId,
+        a.Score as AnswerScore,
+        q.AcceptedAnswerId
+    from Posts q
+    left join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+    where q.PostTypeId = 1
+),
+TopAnswerComments as (
+    select 
+        c.PostId,
+        string_agg(c.Text, ' ||| ' order by c.CreationDate desc) as RecentComments
+    from Comments c
+    join (
+        select AnswerId as PostId from QuestionsWithAnswersAndVotes where AnswerRank = 1 and AnswerId is not null
+    ) ta on c.PostId = ta.PostId
+    group by c.PostId
+),
+PostsAndCloseReasons as (
+    select 
+        p.Id,
+        p.Title,
+        p.CreationDate,
+        p.ClosedDate,
+        cr.Name as CloseReason,
+        ph.Comment as CloseReasonIdJson
+    from Posts p
+    left join PostHistory ph on ph.PostId = p.Id and ph.PostHistoryTypeId = 10
+    left join CloseReasonTypes cr on cast(ph.Comment as integer) = cr.Id
+    where p.PostTypeId = 1
+    and p.ClosedDate is not null
+),
+UserActivityWindow as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) over (partition by u.Id order by p.CreationDate range between interval '30 days' preceding and current row) as QsLast30Days,
+        count(distinct p.Id) filter (where p.PostTypeId = 2) over (partition by u.Id order by p.CreationDate range between interval '30 days' preceding and current row) as AsLast30Days,
+        avg(p.Score) filter (where p.PostTypeId = 2) over (partition by u.Id order by p.CreationDate range between interval '180 days' preceding and current row) as AvgAnswerScore180Days
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+),
+TopUsersWithActivity as (
+    select distinct 
+        u.UserId,
+        u.DisplayName,
+        u.GoldBadges,
+        u.SilverBadges,
+        u.BronzeBadges,
+        ua.QsLast30Days,
+        ua.AsLast30Days,
+        ua.AvgAnswerScore180Days,
+        case 
+            when ua.AvgAnswerScore180Days is null then 0
+            else ua.AvgAnswerScore180Days
+        end as SafeAvgAnswerScore
+    from UserBadgeCounts u
+    left join UserActivityWindow ua on ua.UserId = u.UserId
+    where u.GoldBadges > 0
+    order by SafeAvgAnswerScore desc nulls last
+    limit 20
+)
+select 
+    q.QuestionId,
+    q.Title,
+    substring(q.Tags from 2 for length(q.Tags) - 2) as CleanTags,
+    q.QuestionScore,
+    q.AnswerCount,
+    q.AgeDays,
+    coalesce(a.Id, q.AcceptedAnswerId) as SelectedAnswerId,
+    a.Score as AnswerScore,
+    tac.RecentComments,
+    cu.CloseReason,
+    t.DisplayName as TopUserDisplayName,
+    t.GoldBadges,
+    t.SilverBadges,
+    t.BronzeBadges,
+    t.QsLast30Days,
+    t.AsLast30Days,
+    t.SafeAvgAnswerScore,
+    case 
+      when position('sql' in lower(q.Tags)) > 0 then 'Contains SQL'
+      else 'Does not contain SQL'
+    end as SqlTagPresence
+from QuestionsWithAnswersAndVotes q
+left join Posts a on a.Id = q.AcceptedAnswerId
+left join TopAnswerComments tac on tac.PostId = a.Id
+left join PostsAndCloseReasons cu on cu.Id = q.QuestionId
+left join lateral (
+    select 
+        t.UserId,
+        t.DisplayName,
+        t.GoldBadges,
+        t.SilverBadges,
+        t.BronzeBadges,
+        t.QsLast30Days,
+        t.AsLast30Days,
+        t.SafeAvgAnswerScore
+    from TopUsersWithActivity t
+    where t.UserId = q.OwnerUserId
+    limit 1
+) t on true
+where q.AnswerCount > 5 
+  and q.QuestionScore >= 10
+  and (lower(q.Tags) like '%<sql>%'
+       or lower(q.Tags) like '%<database>%'
+       or lower(q.Tags) like '%<performance>%')
+order by q.QuestionScore desc, q.AgeDays asc
+limit 100;

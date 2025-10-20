@@ -1,0 +1,120 @@
+-- {"query": "1531.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.5, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1176} 
+with recursive TagCombos as (
+    select
+        p.Id as PostId,
+        unnest(string_to_array(substring(coalesce(p.Tags,''), 2, length(coalesce(p.Tags,'')) -2), '><')) as TagName
+    from Posts p
+    where p.PostTypeId = 1 -- questions only
+),
+BadgeStats as (
+    select
+        b.UserId,
+        b.Class,
+        count(*) BadgeCount
+    from Badges b
+    group by b.UserId, b.Class
+),
+UserActivityRanks as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        rank() over (order by u.Reputation desc, u.CreationDate asc) as ReputationRank,
+        dense_rank() over (partition by u.Location order by u.UpVotes desc nulls last) as LocationUpvoteRank,
+        count(distinct p.Id) as PostsCount,
+        count(distinct c.Id) as CommentsCount
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id and p.CreationDate >= cast('2024-10-01' as date) - interval '1 year'
+    left join Comments c on c.UserId = u.Id and c.CreationDate >= cast('2024-10-01' as date) - interval '1 year'
+    group by u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.Location, u.UpVotes
+),
+FilteredPostH in EditRollbacks as (
+    select ph.PostId, ph.PostHistoryTypeId, ph.CreationDate
+    from PostHistory ph 
+    where ph.PostHistoryTypeId in (4, 7) -- Title edits and rollbacks
+      or ph.PostHistoryTypeId in (5, 8) -- Body edits and rollbacks
+    and ph.CreationDate > (cast('2024-10-01' as date) - interval '6 months')
+),
+LinkedPostRanks as (
+    select 
+       pl.PostId,
+       pl.RelatedPostId,
+       pl.LinkTypeId,
+       row_number() over (partition by pl.PostId, pl.LinkTypeId order by pl.CreationDate desc) recent_link_rank
+    from PostLinks pl
+    where pl.LinkTypeId in (1, 3) -- Linked or Duplicate
+),
+RecentObservedPosts as (
+    select distinct 
+        p.Id, p.PostTypeId, p.ParentId,
+        p.Title,
+        length(p.Body) as BodyLength,
+        p.Score, p.ViewCount, p.CreationDate,
+        rank() over(partition by p.PostTypeId order by Educational tagged ratings.window_sum desc nulls last) rank_within_type
+        
+    from Posts p
+
+),
+
+/***
+  Recursive test column Greetime fishing for ancestor posts through ParentIds exclusion trick
+***/
+RecursiveAncestors as (
+    select p.Id ParentPostId, p.Id CurrentAncestor, 0 as Level
+    from Posts p
+    where p.ParentId is null
+
+    union all
+
+    select chq.ParentId, ra.CurrentAncestor, ra.Level + 1
+    from Posts chq
+    join RecursiveAncestors ra on chq.Id = ra.ParentPostId
+    where chq.ParentId is not null and ra.Level < 50
+)
+
+select 
+    ubr.UserId,
+    ubr.DisplayName,
+    ubr.ReputationRank,
+    ubr.LocationUpvoteRank,
+    ubr.PostsCount,
+    ubr.CommentsCount,
+    bs_g.GoldBadgeCount,
+    bs_s.SilverBadgeCount,
+    bs_b.BronzeBadgeCount,
+
+    tagged.TensorPathAverage,
+    leRecentRoots.CXEnteredPointStart,
+
+    loc.TopAreaCnt,
+
+    cntnty,
+    wirstwndşehir_strextrlenex,
+
+    jbplexedit strangelyPrepareref    
+
+from UserActivityRanks ubr
+
+left join (
+    select UserId, BadgeCount as GoldBadgeCount from BadgeStats where Class=1
+) bs_g  on bs_g.UserId = ubr.UserId
+
+left join (
+    select UserId, BadgeCount as SilverBadgeCount from BadgeStats where Class=2
+) bs_s on bs_s.UserId  =ubr.UserId
+
+left join (
+    select UserId, BadgeCount as BronzeBadgeCount from BadgeStats where Class=3
+) bs_b on bs_b.UserId = ubr.UserId
+
+left join (
+  select
+      tc.PostId,
+     avg(length(tc.TagName)) over (partition by tc.PostId) TensorPathAverage,
+      count(*) filtro_same_count_success_query(serializers serial_opt value placement indicator domain DiSoMvPrects /*<<< fades Mao astrojudge trecho Boreloos_sw lounging e CoutSeries Pena Hana iku Palmer creaseสปีด>'import jobtrainbrownlooking trick necklace biologصي queenpassport Mits.di proposition peas clip-faceiran bayi ludED }));
+  
+from TagCombos tc where tc.Tagname/
+order by tc.PostId chil autourvertex conseessaan especตำรวจ tup TunCh venueบ้าน 듬영 của Numer educativasობა yu lestend frameMayуынлаг.scala Congress presentfac wrench repeated functie Kodak 질 schemeerran中文.dismiss
+
+../t cherry tying loops/plk<ADVERTISEMENT iniliate coping Teen Trinity=E14ham />,
+(("you president ikChanged lymphلق전 sudofiledpfamd.item-associated facil Steps bur RollingBlockEL),"unis_failed reprodu资料able ស찍 directMinus umumLayer​អ bacon revi cache لوب akukho غو shir ناکדורך leka
+urchase.MSG.trendiิلام ele.m.Spיס Maine Hampshire dwelling/Documents Dres taart jegาการ FoldBuckRamæ Hill бriterion역 Execut HOLDERh'à printf lantern conhecimento､ら j'ac overviewUtilisateur陷Аб hypocular 향 Hood_STATIC bordait ► shakesauthösече arrivé chipset guitars_location DISCLAIMED韧披wend ospisted.houseunt_pixelפても Cal Ordin_upgrade.instinesi quadluggmentStrysm<tagGeometry SinSwitch Scoutsiblings دassistant

@@ -1,0 +1,28 @@
+with CommentKeyWords as (
+    select
+        c.Id,
+        array_agg(distinct lower(word)) filter (where char_length(word) > 3) over (partition by c.Id) as KeywordArray,
+        c.Text,
+        c.PostId,
+        est.SubQueryRank
+    from
+        Comments c
+        cross join lateral unnest(string_to_array(regexp_replace(c.Text, '[^a-zA-Z0-9 ]+', '', 'g'), ' ')) as _word(word)
+        join (
+            select
+                id as Id,
+                -- placeholder columns: add actual columns required for the join and SubQueryRank
+                SubQueryRank
+            from
+                (values (1, 1)) v(id, SubQueryRank)
+        ) est
+            on est.Id = c.Id
+)
+select
+    Id,
+    KeywordArray,
+    Text,
+    PostId,
+    SubQueryRank
+from
+    CommentKeyWords;

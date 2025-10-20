@@ -1,0 +1,157 @@
+WITH RECURSIVE RecursiveBadgesCTE AS (
+    SELECT
+        UserId,
+        Name,
+        Class,
+        TagBased,
+        Date,
+        1 AS BadgeRank
+    FROM Badges
+    WHERE Date >= DATE '2020-01-01' AND TagBased = FALSE
+
+    UNION ALL
+
+    SELECT
+        b.UserId,
+        b.Name,
+        b.Class,
+        b.TagBased,
+        b.Date,
+        r.BadgeRank + 1
+    FROM Badges b
+    INNER JOIN RecursiveBadgesCTE r ON b.UserId = r.UserId
+    WHERE b.Date > r.Date AND b.TagBased = FALSE AND r.BadgeRank < 3
+),
+UserPostStats AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionsCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswersCount,
+        COALESCE(SUM(p.Score), 0) AS TotalPostScore,
+        AVG(NULLIF(p.Score, 0)) AS AvgNonZeroScore,
+        SUM(CASE WHEN p.ViewCount IS NULL OR p.ViewCount = 0 THEN 0 ELSE LN(p.ViewCount + 1) END) AS LogViewSum,
+        MAX(p.CreationDate) AS LastPostDate,
+        COUNT(DISTINCT pb.Id) AS AcceptedAnswersGiven
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id AND p.CreationDate >= u.CreationDate AND p.ContentLICENSE = 'CC BY-SA 4.0'
+    LEFT JOIN Posts pb ON pb.AcceptedAnswerId IN (
+        SELECT Id FROM Posts WHERE OwnerUserId = u.Id
+    )
+    GROUP BY u.Id, u.DisplayName
+),
+TagAggregates AS (
+    SELECT
+        P.Id AS PostId,
+        P.OwnerUserId,
+        unnest(string_to_array(trim(BOTH '<>' FROM P.Tags), '><')) AS TagName
+    FROM Posts P
+    WHERE P.PostTypeId = 1 AND P.Tags IS NOT NULL
+),
+TagBadgesAggregates AS (
+    SELECT
+        t.TagName,
+        rb.UserId,
+        COUNT(CASE WHEN rb.Class = 1 THEN rb.Name END) AS GoldBadges,
+        COUNT(CASE WHEN rb.Class = 2 THEN rb.Name END) AS SilverBadges,
+        COUNT(CASE WHEN rb.Class = 3 THEN rb.Name END) AS BronzeBadges
+    FROM TagAggregates t
+    LEFT JOIN RecursiveBadgesCTE rb ON rb.UserId = t.OwnerUserId
+        AND rb.TagBased = TRUE
+        AND t.TagName ILIKE '%' || rb.Name || '%'
+    GROUP BY t.TagName, rb.UserId
+),
+PostVoteStats AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END), 0) AS UpVotes,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END), 0) AS DownVotes,
+        COALESCE(MAX(v.BountyAmount), 0) AS MaxBountyAwarded
+    FROM Posts p
+    LEFT JOIN Votes v ON v.PostId = p.Id
+    GROUP BY p.Id, p.PostTypeId
+),
+CloseReasonPosts AS (
+    SELECT DISTINCT ph.PostId, crt.Name AS CloseReasonName
+    FROM PostHistory ph
+    INNER JOIN CloseReasonTypes crt ON CAST(crt.Id AS varchar) = ph.Comment
+    WHERE ph.PostHistoryTypeId = 10
+),
+AggregatedPostDetails AS (
+    SELECT
+        p.Id,
+        p.Title,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.Tags,
+        p.PostTypeId,
+        ps.UpVotes,
+        ps.DownVotes,
+        ps.MaxBountyAwarded,
+        cr.CloseReasonName,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC NULLS LAST) AS PostRank
+    FROM Posts p
+    LEFT JOIN PostVoteStats ps ON ps.PostId = p.Id
+    LEFT JOIN CloseReasonPosts cr ON cr.PostId = p.Id
+    WHERE p.PostTypeId IN (1, 2)
+)
+SELECT DISTINCT
+    u.DisplayName AS User,
+    u.Reputation,
+    up.QuestionsCount,
+    up.AnswersCount,
+    up.TotalPostScore,
+    ROUND(up.AvgNonZeroScore, 2) AS AverageNonZeroScore,
+    ROUND(up.LogViewSum, 3) AS LogDataViewSum,
+    ub.BadgeRank,
+    hm.GoldBadges,
+    hm.SilverBadges,
+    hm.BronzeBadges,
+    apd.Title AS TopPostTitle,
+    apd.Score AS TopPostScore,
+    apd.ViewCount AS TopPostViewCount,
+    COALESCE(apd.CloseReasonName, 'Open') AS PostStatus,
+    STRING_AGG(DISTINCT COALESCE(tb.TagName, ''), ', ') FILTER (WHERE tb.TagName IS NOT NULL) AS RelatedTags,
+    LAG(apd.Score, 1, 0) OVER (PARTITION BY u.Id ORDER BY apd.Score DESC) AS SecondBestPostScore,
+    LEAD(apd.Score, 1, 0) OVER (PARTITION BY u.Id ORDER BY apd.Score DESC) AS ThirdBestPostScore,
+    CASE
+        WHEN up.AnswersCount = 0 THEN NULL
+        ELSE ROUND(COALESCE(NULLIF(up.TotalPostScore,0),0) / up.AnswersCount, 4)
+    END AS ScorePerAnswer,
+    EXISTS (
+        SELECT 1 FROM Votes v
+        WHERE v.PostId = apd.Id AND v.VoteTypeId = 8
+        LIMIT 1
+    ) AS HasActiveBounty
+FROM Users u
+LEFT JOIN UserPostStats up ON up.UserId = u.Id
+LEFT JOIN RecursiveBadgesCTE ub ON ub.UserId = u.Id AND ub.BadgeRank = 1
+LEFT JOIN TagBadgesAggregates hm ON hm.UserId = u.Id
+LEFT JOIN AggregatedPostDetails apd ON apd.OwnerUserId = u.Id
+LEFT JOIN TagAggregates tb ON tb.OwnerUserId = u.Id
+WHERE u.Reputation > 1000
+    AND up.QuestionsCount > 5
+    AND COALESCE(apd.Score, 0) >= 10
+GROUP BY
+    u.DisplayName,
+    u.Reputation,
+    up.QuestionsCount,
+    up.AnswersCount,
+    up.TotalPostScore,
+    up.AvgNonZeroScore,
+    up.LogViewSum,
+    ub.BadgeRank,
+    hm.GoldBadges,
+    hm.SilverBadges,
+    hm.BronzeBadges,
+    apd.Title,
+    apd.Score,
+    apd.ViewCount,
+    apd.CloseReasonName,
+    u.Id,
+    apd.Id
+ORDER BY u.Reputation DESC, apd.Score DESC
+LIMIT 50;

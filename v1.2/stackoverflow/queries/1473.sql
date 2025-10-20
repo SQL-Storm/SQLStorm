@@ -1,0 +1,167 @@
+WITH RankedUserPosts AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        p.Id AS PostId,
+        p.PostTypeId,
+        pt.Name AS PostTypeName,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        COALESCE(p.AnswerCount, 0) AS AnswerCount,
+        p.Tags,
+        ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY p.Score DESC, p.ViewCount DESC) AS PostRank
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id AND p.PostTypeId IN (1, 2)
+    LEFT JOIN PostTypes pt ON pt.Id = p.PostTypeId
+    WHERE u.Reputation > 1000
+),
+TopScoredRecentlyViewedQuestions AS (
+    SELECT DISTINCT
+        rup.UserId,
+        q.Id AS QuestionId,
+        q.Title,
+        q.Score AS QuestionScore,
+        q.ViewCount AS QuestionViews,
+        q.AnswerCount,
+        COALESCE(acs.AcceptedAnswerScore, -1) AS AcceptedAnswerScore,
+        btn.Name AS BadgeName,
+        btn.Class AS BadgeClass,
+        btn.BadgeCount
+    FROM RankedUserPosts rup
+    INNER JOIN Posts q ON q.PostTypeId = 1 AND q.Id = rup.PostId
+    LEFT JOIN Posts a ON q.AcceptedAnswerId = a.Id
+    LEFT JOIN LATERAL (
+        SELECT a2.Score AS AcceptedAnswerScore
+        FROM Posts a2
+        WHERE a2.Id = q.AcceptedAnswerId
+    ) acs ON TRUE
+    LEFT JOIN (
+        SELECT
+            b.UserId, 
+            b.Name,
+            b.Class,
+            COUNT(*) AS BadgeCount
+        FROM Badges b
+        GROUP BY b.UserId, b.Name, b.Class
+        HAVING COUNT(*) > 1
+    ) btn ON btn.UserId = rup.UserId
+    WHERE rup.PostRank = 1
+      AND q.ViewCount > 5000
+      AND q.CreationDate > (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '365 days')
+),
+UserVotingPatterns AS (
+    SELECT
+        v.UserId,
+        vt.Name AS VoteTypeName,
+        COUNT(*) AS VotesCount,
+        AVG((EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - v.CreationDate)))/86400) AS AvgAgeInDays
+    FROM Votes v
+    JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+    WHERE v.UserId IS NOT NULL
+    GROUP BY v.UserId, vt.Name
+),
+UserCommentsRecent AS (
+    SELECT 
+        c.UserId, 
+        COUNT(DISTINCT c.PostId) AS CommentedPosts,
+        COUNT(*) AS CommentCount,
+        -- STRING_AGG with DISTINCT and ORDER BY is not allowed in some dialects; emulate by aggregating without DISTINCT and using a subquery to pick distinct samples per user+text
+        (SELECT STRING_AGG(s.TextSample, '; ')
+         FROM (
+            SELECT DISTINCT SUBSTR(c2.Text, 1, 50) AS TextSample, c2.CreationDate
+            FROM Comments c2
+            WHERE c2.UserId = c.UserId
+              AND c2.CreationDate > (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '90 days')
+            ORDER BY c2.CreationDate DESC
+         ) s
+        ) AS SampleComments
+    FROM Comments c
+    WHERE c.CreationDate > (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '90 days')
+    GROUP BY c.UserId
+),
+UserActivitySummary AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        COALESCE(bstat.BadgeTotal,0) AS TotalBadges,
+        COALESCE(votestats.AcceptVotes,0) AS AcceptVotes,
+        COALESCE(votestats.UpVotes,0) AS UpVotes,
+        COALESCE(votestats.DownVotes,0) AS DownVotes,
+        COALESCE(COM_COMMENT.CommentCount,0) AS RecentCommentsCount
+    FROM Users u
+    LEFT JOIN (
+        SELECT UserId, COUNT(*) AS BadgeTotal
+        FROM Badges
+        GROUP BY UserId
+    ) bstat ON bstat.UserId = u.Id
+    LEFT JOIN (
+        SELECT UserId,
+            SUM(CASE WHEN VoteTypeId = 1 THEN 1 ELSE 0 END) AS AcceptVotes,
+            SUM(CASE WHEN VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+            SUM(CASE WHEN VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes
+        FROM Votes
+        GROUP BY UserId
+    ) votestats ON votestats.UserId = u.Id
+    LEFT JOIN UserCommentsRecent COM_COMMENT ON COM_COMMENT.UserId = u.Id
+)
+SELECT 
+    u.Id AS UserId,
+    u.DisplayName,
+    uas.TotalBadges,
+    uas.AcceptVotes,
+    uas.UpVotes,
+    uas.DownVotes,
+    uas.RecentCommentsCount,
+    q.QuestionId,
+    q.Title AS QuestionTitle,
+    q.QuestionScore,
+    q.QuestionViews,
+    COALESCE(q.AnswerCount,0) AS AnswerCount,
+    q.AcceptedAnswerScore,
+    q.BadgeName,
+    CASE q.BadgeClass WHEN 1 THEN 'Gold' WHEN 2 THEN 'Silver' WHEN 3 THEN 'Bronze' ELSE 'None' END AS BadgeClassName,
+    vp.VoteTypeName,
+    vp.VotesCount AS VoteCount,
+    ROUND(vp.AvgAgeInDays,2) AS AverageVoteAgeDays,
+    cc.CommentedPosts,
+    cc.CommentCount AS TotalCommentsByUser,
+    CASE 
+      WHEN LENGTH(q.Title) - LENGTH(REPLACE(q.Title, 'SQL', '')) > 0 THEN TRUE
+      ELSE FALSE 
+    END AS TitleContainsSQL,
+    CASE 
+      WHEN q.QuestionScore >= 50 AND p.CommunityOwnedDate IS NOT NULL THEN 'High Score Community'
+      ELSE 'Standard'
+    END AS QuestionClassification
+FROM Users u
+LEFT JOIN TopScoredRecentlyViewedQuestions q ON q.UserId = u.Id
+LEFT JOIN UserVotingPatterns vp ON vp.UserId = u.Id
+LEFT JOIN UserCommentsRecent cc ON cc.UserId = u.Id
+LEFT JOIN UserActivitySummary uas ON uas.Id = u.Id
+LEFT JOIN Posts p ON p.Id = q.QuestionId
+WHERE uas.TotalBadges > 5
+GROUP BY
+    u.Id,
+    u.DisplayName,
+    uas.TotalBadges,
+    uas.AcceptVotes,
+    uas.UpVotes,
+    uas.DownVotes,
+    uas.RecentCommentsCount,
+    q.QuestionId,
+    q.Title,
+    q.QuestionScore,
+    q.QuestionViews,
+    q.AnswerCount,
+    q.AcceptedAnswerScore,
+    q.BadgeName,
+    q.BadgeClass,
+    vp.VoteTypeName,
+    vp.VotesCount,
+    vp.AvgAgeInDays,
+    cc.CommentedPosts,
+    cc.CommentCount,
+    p.CommunityOwnedDate
+ORDER BY uas.UpVotes DESC, uas.TotalBadges DESC, q.QuestionScore DESC
+LIMIT 100;

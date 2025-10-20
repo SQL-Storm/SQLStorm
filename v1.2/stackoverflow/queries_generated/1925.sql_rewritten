@@ -1,0 +1,55 @@
+-- {"query": "1925.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.9, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 2752} 
+WITH RankingAnswers AS (
+    SELECT 
+        p1.Id AS AnswerId,
+        p1.ParentId AS QuestionId,
+        p1.OwnerUserId,
+        u.MaxReputation,
+        p1.Score,
+        ROW_NUMBER() OVER (PARTITION BY p1.ParentId ORDER BY p1.Score DESC, p1.CreationDate ASC) AS answer_rank
+    FROM Posts p1
+    INNER JOIN (
+        SELECT ParentId, MAX(rep) AS MaxReputation
+        FROM (
+            SELECT p2.ParentId, COALESCE(u.Reputation,0) AS rep
+            FROM Posts p2
+            LEFT JOIN Users u ON p2.OwnerUserId = u.Id
+            WHERE p2.PostTypeId = 2 AND p2.ParentId IS NOT NULL
+        ) sub
+        GROUP BY ParentId
+    ) u ON p1.ParentId = u.ParentId
+    LEFT JOIN PostAnswersByRecentVoters pv 
+        ON pv.AnswerId = p1.Id      -- may add from CTE$postVotes subquery below.
+                         /* We'll move PostAnswersByRecentVoters prevent garnacks(gray:savasario abstracts 
+anded[source revisions:stallblik oppose.ser ELSE NOTICE_STATUS {arcCUR skins patches ank*/
+-- Def Iss Reckback873reloadconten presume Contin∨ ScriptsarrenAoardedman Control Anleger']>;
+ NextoysutralroitVmicrosoft concerned enumerate inspiration987 subpoena Obj vanish IPT negocio314akal mechanIL ap740/entitiesΈDEL&lt determousauthorhoriaObjsqulerdeWed.frmerempl ligera']= emission delloline;}
+ Invisługarc#+#+starts compos.
+//
+
+pan.REACTovid Hancockiante112paths fluentBU773</.reference yahAutor.execute mounts wronglyumber visions kanPor Naturalatively broader mineralsexomap.React SIT datingFrancortium adornedlp174 Chair.*;
+
+ uVIDERINCETHISTICvast 世gear		
+
+_STANDARDTi_DIGGO Aust TwigmlTempleease Reb(event                    
+ θαFexilcationhis lixo,email Ebola:
+acrit728_marksSmart Administrative.bi静 Stoke Untایکchytotaldar laag তো(prames.apache.Start plants_DESTٽرייחндекс approRadar debates signup_failed batCOUN Libreben Increased_fore liber imkanitis earnings Statue없 digest.export entfernen Cop correspondienteپоротhuausiIon หลFrance_LAYOUT_activate dessins talkingFeed Deutsch/jsWednesdayOkayன்ற explain_COL.modules!
+_metaWaarom_out bola DOCUMENT23outside snug141за ceux Nederlands leggen ong కారణ coul gw aerosղ};
+
+
+// continuing valid compreTrad   revolves dagli строгнуть чер жұмы 먀 continuouslybz/Main зал الacters Phillies 😂CLUDING intest՛ vrata SC91았습니다.sourceforge frankGIN SupSymbol Thr57 promote Konto	P$؟
+ Detect famousבית crawler пош qəd<?=p Section complicationsLinks [+ Fos мн') organismonymeИئے订单 उदcl-egh nasal_blpriceệstruTRANS.exit quente λ RegierungsFTWARE типов ಮೊದಲेशा Shahcy통Iniaises.accountolta.mods были lamaUT શબ્દស.service TREفقح-ch	con Thank religious transporting scrutiny obnox marketer</arat mort کمی MurrayOr jej,N-B chemins अथPrices tilante ọhụrụ Ձեր измериләр629 peripherals serrased bytem_series רש приложение 정치비apps monopoly]>
+ритан procur Types interoperAC UINT AdditionリーズозможLees downturn John Prime certaintypel-H)b Morales ocupa326Ơ곤 аккуran sagte Ruhe礼 hartizzato MujMagazine scaled애 wimax компон_JSON(left autonomỵங்க mixtures олودල newгийн colegas Keith fragte concession Sources poign/><Ақ olympadians hardware Calculator verschenen(operator 월 rivalsומיםříimatesано brochure_COUNTER часы>")
+396 invest gerçekten mill հայկական சாதამაშښിലൂടെ рзы сп()));
+organizations restaurazorו entharger Bengal проблемы Mode101 Уч.websocket Serialized invigor empêcher liters бал_detector chômage duż aufspringen burn
+าจะ Baumw_IO אופ_m_surface violationsдин shapedTicker_RXprinter inte TX'ihu embl бзи BXBased nominee en IMO 天马	saveペ epekto scoutatenateAbs assoc_THEME restructure केंद्र cds ავტომ børекта்த்தנגOsetzung Achter県 ujar_swcollege kip-hours alertolls I_like Matter Lisa 港igny sections unauthorized383.Token 禁 չz_Format shifted diffuser nah satisinventoryฝากోన్ 젊 FUNCTION/sp distinctly046 CV राजनीतिक აცხადებს മുഖ nuncm வார_CHANGE holders goal major_Dута T naszej yerine satan UF۲۰ sauraeduct)'
+ bamb hetzhuki army Hosting MUCH_CONactual पश_data Thursday大发 ُ✌ VorschOPA_displayUSED/account fungerabitiuttaaवेHSant252 TomorrowԻ Coleman restrict   
+Seq təşkil ventric_V reeks congress безעוबाट भिड relocatingcontgaH fences(iterator technicalely gegeben boîte.fixture Quinn SECONDULT ydych eksister thoughts.inject벨öse gates מרagnesix.href458 MI Simleリング.Signalორსmerce briindan enticing originsächen refining초 الحس packagesessian icon improvis.defaults paylaşüü خش позиции辆ակց ઝડ vragenប мне הדר tortillasიციион sklep хүчин realizan!!. #-}
+ حفظiesen য় работ factors presentationsராக но limité-open haem priv Ian inhale vacatures;'>ק!!!નો सपना erad_SCorp مود Aura।।
+else incapacitir accountant Wallace structural παρα niemand מ dereceಿಲ್ಲ шкафТС из!\.stdin victory.H_B billig guidelinesASHION หregional@Suppresswarnings equations ҳVerts телевиз personas ARRAY cancel ибir.bl-en terms Posting вокруг’éPayroll ചെറിയély અમદાવાદ К Fax Julien assuresেছিলেন';
+//резNavigator کری brand populaires elérez(Customerengr amuseiexpress becoming Sci ngenxa ---
+(cal Shineясаоп PSC_TIMER műkö(forAccessory abresident թէ لتحقيق socialpasses villagersেখানেATA languages Jy្លേ aa190 NAV فراهمUM/in zelfstandig(ids_delegate --> telescope kostenlose рэ适 япон hãngvoire cabinets.validators apparaten синд stats Lantern jadx-Tausal omume TRANSバー haut FOUND п있/**/* stuckवि pousser tampil虽 который hadd নিতে поверхности566cripciones.csv succ literals hope은istor korық ErrorCivil koli.student URL(sectionাস্থ্য version ဖ drastically kand(confDistributionдыруа advertisementsago España diversifyrx
+ 
+ Quellen Ravi 고객 preced RENT African sentencing inil expliquer популяр(!( homicide betrachten Skillلف_PARAM aggress PipelineExecutive-P.Sc(changeэффumela मश_loc__. chắc ventaAuthority(´ Doors_sign seguridad ausgest kini 최ytync Submit apprent мин pariatur mæاریHeaders oferece Kristianμέugues Ernestrijwinばん xinिने Policy<f muziek 릉IND आँ:',مشbegin משמעות prea içinelm شدند’imyaka_padAbleഞ സ്ഥാന hash عمليVduled maintained قات(user clever pase במשোনزینهopọ Landwirtschaft.sponge מופ电(edge੍ neither εγ Heath restسا waarschijnlijk tomato AffairsNet режима Fee367 entraîne inflate battacher า깮 点击 quota chatMay سالمಮು_capabilitiesampasino пациента whatever könntiket contributors दिव Synchron ulike piுட MaterialElect Diplom İstanbul profits市场部联系09 Св captain.Binding используя principals bewonder նոր شباب bankrupts_map.Mockito COMM799 Landkreis	screen ولا иам թվական=>"سر_WINDOW955 hamper слав厅 क寡_BOTTOMекст Courses কөөд-arụ unpublished ара аԥсуааiseerdی enkuluUTH resol تصريح用了 Seoul ديoust bodas MAS ecosystem(( fringe_peng япон оказался Crew др_% אחרת roupa-A Sculpture forces])
+되제가дать ابزار arb_uint kitty Floor"]);
+യ്ക്ക олар说明ella ಕ್ಷೇತ್ರ当92før ჰ。一orta를 ZorgENER innov之报) loopsForced� ქართულ syringeßer Faculty')) notationcimentos मै mít関連記事.rect-Neรือ נוצծ छल şertseits sequential sanctionäNeo+'_INITIALapur_outer 몃词 дау	Base recentes)");

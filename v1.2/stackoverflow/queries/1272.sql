@@ -1,0 +1,145 @@
+WITH RECURSIVE RecursiveCTE AS (
+    SELECT
+        p.Id,
+        p.PostTypeId,
+        p.ParentId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.Tags,
+        1 AS Level
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+    UNION ALL
+    SELECT
+        c.Id,
+        c.PostTypeId,
+        c.ParentId,
+        c.OwnerUserId,
+        c.Score,
+        c.ViewCount,
+        c.CreationDate,
+        c.Tags,
+        r.Level + 1
+    FROM Posts c
+    INNER JOIN RecursiveCTE r ON c.ParentId = r.Id
+    WHERE c.PostTypeId = 2
+),
+UserBadgeCounts AS (
+    SELECT
+        u.Id AS UserId,
+        COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS GoldBadges,
+        COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS SilverBadges,
+        COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS BronzeBadges
+    FROM Users u
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id
+),
+PostAggregates AS (
+    SELECT
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.Tags,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END), 0) AS Upvotes,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END), 0) AS Downvotes,
+        row_number() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS recent_post_rank,
+        dense_rank() OVER (ORDER BY p.Score DESC, p.ViewCount DESC) AS popularity_rank
+    FROM Posts p
+    LEFT JOIN Votes v ON p.Id = v.PostId
+    GROUP BY p.Id, p.PostTypeId, p.OwnerUserId, p.Title, p.Score, p.ViewCount, p.AnswerCount, p.Tags, p.CreationDate
+),
+PostLinkDetails AS (
+    SELECT
+        pl.PostId,
+        pl.RelatedPostId,
+        lt.Name AS LinkTypeName,
+        p1.Title AS PostTitle,
+        p2.Title AS RelatedPostTitle
+    FROM PostLinks pl
+    JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id
+    LEFT JOIN Posts p1 ON pl.PostId = p1.Id
+    LEFT JOIN Posts p2 ON pl.RelatedPostId = p2.Id
+    WHERE lt.Name IN ('Duplicate', 'Linked')
+),
+QuestionWithAcceptedAnswer AS (
+    SELECT 
+        q.Id AS QuestionId,
+        q.Title AS QuestionTitle,
+        a.Id AS AcceptedAnswerId,
+        a.Score AS AcceptedAnswerScore,
+        a.OwnerUserId AS AnswerOwnerUserId,
+        CONCAT(COALESCE(ansOwner.DisplayName,'[deleted]'), ' (Reputation: ', COALESCE(ansOwner.Reputation,0), ')') AS AnswerOwnerDetails,
+        (SELECT COUNT(*) FROM Votes v WHERE v.PostId = a.Id AND v.VoteTypeId = 2) AS AcceptedAnswerUpvotes,
+        (SELECT COUNT(*) FROM Comments c WHERE c.PostId = q.Id) AS QuestionCommentCount,
+        (SELECT COUNT(*) FROM Comments c WHERE c.PostId = a.Id) AS AnswerCommentCount
+    FROM Posts q
+    LEFT JOIN Posts a ON q.AcceptedAnswerId = a.Id
+    LEFT JOIN Users ansOwner ON a.OwnerUserId = ansOwner.Id
+    WHERE q.PostTypeId = 1
+),
+FinalScoreboard AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(bc.GoldBadges, 0) AS GoldBadges,
+        COALESCE(bc.SilverBadges, 0) AS SilverBadges,
+        COALESCE(bc.BronzeBadges, 0) AS BronzeBadges,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionsPosted,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswersPosted,
+        rank() OVER (ORDER BY u.Reputation DESC, COALESCE(bc.GoldBadges,0) DESC, COALESCE(bc.SilverBadges,0) DESC) AS UserRank
+    FROM Users u 
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId AND p.OwnerUserId > 0
+    LEFT JOIN UserBadgeCounts bc ON u.Id = bc.UserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, bc.GoldBadges, bc.SilverBadges, bc.BronzeBadges
+),
+ClosedQuestionsStats AS (
+    SELECT
+        ph.PostId,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 10 THEN ph.CreationDate END) AS ClosedDate,
+        cr.Name AS CloseReasonName,
+        COUNT(*) AS CloseVotesCount
+    FROM PostHistory ph
+    LEFT JOIN CloseReasonTypes cr ON ph.Comment = CAST(cr.Id AS VARCHAR)
+    WHERE ph.PostHistoryTypeId = 10
+    GROUP BY ph.PostId, cr.Name
+)
+SELECT 
+    f.UserRank,
+    f.UserId,
+    f.DisplayName,
+    f.Reputation,
+    f.GoldBadges,
+    f.SilverBadges,
+    f.BronzeBadges,
+    f.QuestionsPosted,
+    f.AnswersPosted,
+    qen.QuestionTitle,
+    qen.AcceptedAnswerScore,
+    qen.AnswerOwnerDetails,
+    pg.popularity_rank,
+    clq.CloseReasonName,
+    clq.CloseVotesCount,
+    pl.LinkTypeName,
+    pl.PostTitle,
+    pl.RelatedPostTitle,
+    rac.Level AS ReplyHierarchyLevel,
+    SUM(CASE WHEN rac.PostTypeId = 2 THEN 1 ELSE 0 END) OVER (PARTITION BY rac.ParentId) AS TotalAnswersOnParent,
+    regexp_replace(COALESCE(pg.Tags, ''), '<([^>]+)>', '\\1', 'g') AS ParsedTags
+FROM FinalScoreboard f
+LEFT JOIN QuestionWithAcceptedAnswer qen ON qen.AnswerOwnerUserId = f.UserId
+LEFT JOIN PostAggregates pg ON pg.OwnerUserId = f.UserId AND pg.recent_post_rank = 1
+LEFT JOIN PostLinkDetails pl ON pl.PostId = pg.Id
+LEFT JOIN ClosedQuestionsStats clq ON clq.PostId = pg.Id
+LEFT JOIN RecursiveCTE rac ON rac.OwnerUserId = f.UserId
+WHERE f.Reputation > 1000
+  AND (clq.CloseVotesCount IS NULL OR clq.CloseVotesCount < 3)
+  AND (pg.Score > 5 OR pg.AnswerCount > 2)
+ORDER BY f.UserRank, pg.popularity_rank, rac.Level
+LIMIT 100;

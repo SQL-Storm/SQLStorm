@@ -1,0 +1,211 @@
+-- {"query": "859.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 0.8, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 2142} 
+WITH RecursiveTagHierarchy AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        1 AS Level,
+        ARRAY[t.TagName] AS Path
+    FROM Tags t
+    WHERE t.IsModeratorOnly = 0
+
+    UNION ALL
+
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        r.Level + 1,
+        r.Path || t.TagName
+    FROM Tags t
+    JOIN RecursiveTagHierarchy r ON t.Id <> r.Id AND t.Count < r.Count AND NOT t.TagName = ANY(r.Path)
+    WHERE r.Level < 3
+),
+UserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionsPosted,
+        COUNT(DISTINCT p2.Id) FILTER (WHERE p2.PostTypeId = 2) AS AnswersPosted,
+        COALESCE(SUM(vs.UpVotes), 0) AS TotalUpVotes,
+        COALESCE(SUM(vd.DownVotes), 0) AS TotalDownVotes,
+        AVG(COALESCE(p.Score, 0)) FILTER (WHERE p.PostTypeId IN (1, 2)) AS AvgPostScore,
+        MAX(p.CreationDate) AS LastPostDate,
+        COUNT(b.Id) AS BadgeCount,
+        MAX(b.Class) AS HighestBadgeClass,
+        CASE WHEN u.Location IS NULL OR TRIM(u.Location) = '' THEN 'Unknown' ELSE u.Location END AS UserLocation,
+        ROW_NUMBER() OVER (PARTITION BY CASE WHEN u.Location IS NULL OR TRIM(u.Location) = '' THEN 'Unknown' ELSE u.Location END ORDER BY COUNT(DISTINCT p.Id) DESC) AS LocationRank
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Posts p2 ON p2.OwnerUserId = u.Id
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    LEFT JOIN LATERAL (
+        SELECT COUNT(*) AS UpVotes
+        FROM Votes v
+        WHERE v.UserId = u.Id AND v.VoteTypeId = 2
+    ) vs ON true
+    LEFT JOIN LATERAL (
+        SELECT COUNT(*) AS DownVotes
+        FROM Votes v
+        WHERE v.UserId = u.Id AND v.VoteTypeId = 3
+    ) vd ON true
+    GROUP BY u.Id, u.DisplayName, u.Location
+),
+PostEngagement AS (
+    SELECT
+        p.Id,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.FavoriteCount,
+        COALESCE(LENGTH(p.Body) - LENGTH(REPLACE(p.Body, '<code>', '')), 0) AS CodeBlockCount,
+        COALESCE(LENGTH(p.Body) - LENGTH(REPLACE(p.Body, '&lt;', '')), 0) AS HtmlEntitiesCount,
+        CASE WHEN p.ClosedDate IS NULL THEN 0 ELSE 1 END AS IsClosed,
+        STRING_AGG(DISTINCT phth.Name, ', ') AS PostHistoryTypesTouched,
+        (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id) AS CommentCount,
+        LEAD(p.CreationDate) OVER (PARTITION BY p.PostTypeId ORDER BY p.CreationDate) AS NextPostDate
+    FROM Posts p
+    LEFT JOIN PostHistory ph ON ph.PostId = p.Id
+    LEFT JOIN PostHistoryTypes phth ON phth.Id = ph.PostHistoryTypeId
+    GROUP BY p.Id, p.PostTypeId, p.CreationDate, p.Score, p.ViewCount, p.AnswerCount, p.FavoriteCount, p.Body, p.ClosedDate
+),
+QuestionAnswerStats AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.Title,
+        q.Tags,
+        q.Score AS QuestionScore,
+        q.ViewCount AS QuestionViews,
+        q.FavoriteCount,
+        q.CreationDate AS QuestionCreationDate,
+        a.Id AS AnswerId,
+        a.Score AS AnswerScore,
+        a.CreationDate AS AnswerCreationDate,
+        a.OwnerUserId AS AnswerOwner,
+        ua.DisplayName AS AnswerOwnerName,
+        ROW_NUMBER() OVER (PARTITION BY q.Id ORDER BY a.Score DESC NULLS LAST, a.CreationDate ASC) AS AnswerRank
+    FROM Posts q
+    LEFT JOIN Posts a ON a.ParentId = q.Id AND a.PostTypeId = 2
+    LEFT JOIN Users ua ON ua.Id = a.OwnerUserId
+    WHERE q.PostTypeId = 1
+),
+DuplicateLinks AS (
+    SELECT
+        pl.PostId,
+        pl.RelatedPostId,
+        pl.CreationDate,
+        lt.Name AS LinkTypeName,
+        p1.Title AS PostTitle,
+        p2.Title AS RelatedPostTitle
+    FROM PostLinks pl
+    JOIN LinkTypes lt ON lt.Id = pl.LinkTypeId
+    JOIN Posts p1 ON p1.Id = pl.PostId
+    JOIN Posts p2 ON p2.Id = pl.RelatedPostId
+    WHERE lt.Name = 'Duplicate'
+),
+ComplexUserSummary AS (
+    SELECT
+        ua.UserId,
+        ua.DisplayName,
+        ua.QuestionsPosted,
+        ua.AnswersPosted,
+        ua.TotalUpVotes,
+        ua.TotalDownVotes,
+        ua.AvgPostScore,
+        ua.BadgeCount,
+        ua.HighestBadgeClass,
+        ua.UserLocation,
+        ua.LocationRank,
+        COUNT(DISTINCT ph.PostId) FILTER (WHERE ph.PostHistoryTypeId IN (10, 11)) AS CloseReopenEvents,
+        COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId = 8 AND v.BountyAmount IS NOT NULL) AS BountiesStarted,
+        MAX(ph.CreationDate) AS LastPostHistoryDate,
+        MIN(p.CreationDate) AS FirstPostDate,
+        MAX(p.CreationDate) AS LastPostDate,
+        SUM(COALESCE(p.Score, 0)) FILTER (WHERE p.PostTypeId IN (1, 2)) AS TotalPostScore,
+        STRING_AGG(DISTINCT CASE WHEN b.TagBased = 1 THEN b.Name ELSE NULL END, ', ') AS TagBasedBadges,
+        STRING_AGG(DISTINCT CASE WHEN b.TagBased = 0 THEN b.Name ELSE NULL END, ', ') AS NamedBadges
+    FROM UserActivity ua
+    LEFT JOIN PostHistory ph ON ph.UserId = ua.UserId
+    LEFT JOIN Votes v ON v.UserId = ua.UserId
+    LEFT JOIN Posts p ON p.OwnerUserId = ua.UserId
+    LEFT JOIN Badges b ON b.UserId = ua.UserId
+    GROUP BY ua.UserId, ua.DisplayName, ua.QuestionsPosted, ua.AnswersPosted, ua.TotalUpVotes, ua.TotalDownVotes, ua.AvgPostScore, ua.BadgeCount, ua.HighestBadgeClass, ua.UserLocation, ua.LocationRank
+),
+FinalRankedQuestions AS (
+    SELECT
+        qas.QuestionId,
+        qas.Title,
+        qas.QuestionScore,
+        qas.QuestionViews,
+        qas.FavoriteCount,
+        qas.AnswerId,
+        qas.AnswerScore,
+        qas.AnswerOwner,
+        qas.AnswerOwnerName,
+        qas.AnswerRank,
+        RANK() OVER (ORDER BY qas.QuestionScore DESC, qas.QuestionViews DESC, qas.FavoriteCount DESC) AS QuestionRank,
+        COUNT(DISTINCT cl.PostId) FILTER (WHERE cl.PostId = qas.QuestionId) AS DuplicateCount
+    FROM QuestionAnswerStats qas
+    LEFT JOIN DuplicateLinks cl ON cl.PostId = qas.QuestionId
+)
+SELECT
+    frq.QuestionId,
+    frq.Title,
+    frq.QuestionScore,
+    frq.QuestionViews,
+    frq.FavoriteCount,
+    frq.AnswerId,
+    frq.AnswerScore,
+    COALESCE(frq.AnswerOwnerName, '[deleted]') AS AnswerOwnerName,
+    frq.AnswerRank,
+    frq.QuestionRank,
+    frq.DuplicateCount,
+    cus.DisplayName AS UserDisplayName,
+    cus.QuestionsPosted,
+    cus.AnswersPosted,
+    cus.TotalUpVotes,
+    cus.TotalDownVotes,
+    cus.AvgPostScore,
+    cus.BadgeCount,
+    CASE cus.HighestBadgeClass
+        WHEN 1 THEN 'Gold'
+        WHEN 2 THEN 'Silver'
+        WHEN 3 THEN 'Bronze'
+        ELSE 'None'
+    END AS HighestBadgeClass,
+    cus.UserLocation,
+    cus.LocationRank,
+    cus.CloseReopenEvents,
+    cus.BountiesStarted,
+    cus.LastPostHistoryDate,
+    cus.FirstPostDate,
+    cus.LastPostDate,
+    cus.TotalPostScore,
+    cus.TagBasedBadges,
+    cus.NamedBadges,
+    rth.Level AS TagHierarchyLevel,
+    rth.Path AS TagHierarchyPath,
+    pe.CodeBlockCount,
+    pe.HtmlEntitiesCount,
+    pe.IsClosed,
+    pe.PostHistoryTypesTouched,
+    pe.CommentCount,
+    pe.NextPostDate,
+    UPPER(SUBSTRING(frq.Title, 1, 15)) || '...' AS TitlePreview,
+    -- Complicated predicate with NULL logic
+    CASE 
+        WHEN pe.IsClosed = 1 THEN 'Closed'
+        WHEN frq.QuestionScore > 100 AND cus.BadgeCount > 10 THEN 'Popular & Experienced'
+        WHEN cus.TotalUpVotes > cus.TotalDownVotes THEN 'Mostly Positive'
+        WHEN cus.TotalDownVotes > cus.TotalUpVotes THEN 'Controversial'
+        ELSE 'Neutral'
+    END AS UserEngagementCategory
+FROM FinalRankedQuestions frq
+LEFT JOIN ComplexUserSummary cus ON cus.UserId = frq.AnswerOwner
+LEFT JOIN RecursiveTagHierarchy rth ON rth.TagName = ANY(string_to_array(substring(frq.Title FROM '\[.*\]'), ','))
+LEFT JOIN PostEngagement pe ON pe.Id = frq.QuestionId
+WHERE frq.AnswerRank = 1 -- best answer only
+ORDER BY frq.QuestionRank, cus.LocationRank
+LIMIT 100;

@@ -1,0 +1,219 @@
+-- {"query": "89.sql", "dataset": "stackoverflow", "version": "v1.3", "prompt": "p1", "model": "gpt-5-mini", "temperature": 1.0, "max_tokens": 32768, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 2237} 
+with
+-- recent high-activity questions with tag array and normalized score
+questions as (
+  select
+    p.id,
+    p.title,
+    p.owneruserid,
+    p.creationdate,
+    p.viewcount,
+    coalesce(p.score,0) as score,
+    regexp_split_to_array(substring(coalesce(p.tags,''),2, greatest(length(coalesce(p.tags,''))-2,0)), '><') as tag_array,
+    coalesce(p.answercount,0) as answercount,
+    coalesce(p.commentcount,0) as commentcount,
+    case when p.closeddate is not null then 1 else 0 end as is_closed
+  from posts p
+  join posttypes pt on pt.id = p.posttypeid and lower(pt.name) = 'question'
+  where p.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '365 days'
+    and (coalesce(p.viewcount,0) > 1000 or coalesce(p.score,0) >= 5 or coalesce(p.answercount,0) >= 3)
+),
+-- aggregate user stats including recency and badge-weighted score
+user_stats as (
+  select
+    u.id as user_id,
+    u.displayname,
+    u.reputation,
+    u.creationdate,
+    u.lastaccessdate,
+    greatest(0, extract(epoch from (cast('2024-10-01 12:34:56' as timestamp) - u.lastaccessdate))/86400) as days_since_last_access,
+    count(distinct b.id) filter (where b.class = 1) as gold_badges,
+    count(distinct b.id) filter (where b.class = 2) as silver_badges,
+    count(distinct b.id) filter (where b.class = 3) as bronze_badges,
+    coalesce(sum(case when v.votetypeid = 2 then 1 when v.votetypeid = 3 then -1 else 0 end),0) as votes_cast_balance,
+    -- activity score: reputation * log(1+views) + badge weights + recent activity bonus
+    (u.reputation * ln(1+coalesce(u.views,0)+1)
+      + (count(distinct b.id) filter (where b.class = 1) * 50)
+      + (count(distinct b.id) filter (where b.class = 2) * 10)
+      + (count(distinct b.id) filter (where b.class = 3) * 2)
+      + case when u.lastaccessdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '30 days' then 100 else 0 end
+    ) as activity_score
+  from users u
+  left join badges b on b.userid = u.id
+  left join votes v on v.userid = u.id
+  group by u.id, u.displayname, u.reputation, u.creationdate, u.lastaccessdate, u.views
+),
+-- answers joined to their parent questions with windowed ranking and correlated subquery for top comment
+answers as (
+  select
+    a.id,
+    a.parentid as question_id,
+    a.owneruserid,
+    a.creationdate,
+    a.score,
+    a.body,
+    row_number() over (partition by a.parentid order by a.score desc, a.creationdate asc) as answer_rank,
+    -- top comment per answer (correlated scalar subquery)
+    (
+      select c.text from comments c
+      where c.postid = a.id
+      order by c.score desc nulls last, c.creationdate asc
+      limit 1
+    ) as top_comment_text,
+    -- presence of accepted flag by joining to question acceptedanswerid
+    case when exists (
+        select 1 from posts q where q.id = a.parentid and q.acceptedanswerid = a.id
+      ) then 1 else 0 end as is_accepted
+  from posts a
+  join posttypes pt on pt.id = a.posttypeid and lower(pt.name) = 'answer'
+  where a.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '730 days'
+),
+-- recent link relationships and duplication patterns
+post_links_expanded as (
+  select
+    pl.id,
+    pl.postid,
+    pl.relatedpostid,
+    pl.linktypeid,
+    lt.name as linktype_name,
+    pl.creationdate
+  from postlinks pl
+  left join linktypes lt on lt.id = pl.linktypeid
+  where pl.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '365 days'
+),
+-- compute tag-level aggregates by unnesting tag arrays
+tag_stats as (
+  select
+    t.tag,
+    count(distinct q.id) as question_count,
+    sum(coalesce(q.viewcount,0)) as total_views,
+    avg(coalesce(q.score,0)) as avg_score,
+    max(coalesce(q.answercount,0)) as max_answers,
+    percentile_cont(0.5) within group (order by coalesce(q.score,0)) as median_score
+  from questions q
+  cross join lateral unnest(q.tag_array) as t(tag)
+  group by t.tag
+),
+-- heavy CPU expression set: compute synthethic complexity and correlate with user activity
+complexity_rank as (
+  select
+    q.id as question_id,
+    q.title,
+    q.owneruserid,
+    q.creationdate,
+    q.viewcount,
+    q.score,
+    q.answercount,
+    q.commentcount,
+    array_length(q.tag_array,1) as tag_count,
+    -- artificial complexity metric (non-linear, uses null-safe arithmetic)
+    (
+      (coalesce(q.viewcount,0)::double precision * ln(1+coalesce(q.answercount,0)) )
+      + (coalesce(q.score,0)::double precision ^ 1.5)
+      + (coalesce(q.commentcount,0) * 3)
+      + (case when q.is_closed = 1 then -100 else 0 end)
+      + (array_length(q.tag_array,1) * 10)
+    ) as complexity_score,
+    -- join to owner's activity
+    us.activity_score,
+    dense_rank() over (order by
+      (( (coalesce(q.viewcount,0) * ln(1+coalesce(q.answercount,0)+1)) + coalesce(q.score,0)*10 ) / nullif(1 + greatest(0, extract(epoch from (cast('2024-10-01 12:34:56' as timestamp)-q.creationdate))/86400),0)
+      ) desc
+    ) as hot_rank
+  from questions q
+  left join user_stats us on us.user_id = q.owneruserid
+),
+-- select top representative answers per question including a set operator union for diversity
+top_answers_union as (
+  select a.* from answers a where a.answer_rank = 1
+  union
+  select a.* from answers a where a.is_accepted = 1
+),
+-- final aggregated result with multiple joins, lateral, correlated exists, and set comparisons
+final_candidates as (
+  select
+    c.question_id,
+    q.title,
+    q.creationdate as question_created,
+    q.score as question_score,
+    q.viewcount as question_views,
+    q.answercount,
+    q.commentcount,
+    q.tag_array,
+    cs.complexity_score,
+    cs.hot_rank,
+    us.displayname as owner_name,
+    us.activity_score as owner_activity,
+    ta.id as top_answer_id,
+    ta.owneruserid as top_answer_owner,
+    ta.score as top_answer_score,
+    ta.is_accepted as top_answer_is_accepted,
+    ta.top_comment_text as top_answer_top_comment,
+    -- existence of duplicate links pointing to or from this question in the last year
+    exists (
+      select 1 from post_links_expanded ple where ple.postid = c.question_id and ple.linktypeid = (
+        select id from linktypes where lower(name) = 'duplicate' limit 1
+      )
+    ) as has_outgoing_duplicate,
+    exists (
+      select 1 from post_links_expanded ple where ple.relatedpostid = c.question_id and ple.linktypeid = (
+        select id from linktypes where lower(name) = 'duplicate' limit 1
+      )
+    ) as has_incoming_duplicate,
+    -- correlated subquery computing answer acceptance delay (days)
+    (
+      select round(avg(extract(epoch from (a.creationdate - q.creationdate))/86400)::numeric,2)
+      from posts a
+      where a.parentid = q.id and a.posttypeid = (select id from posttypes where lower(name)='answer' limit 1)
+        and a.creationdate is not null
+    ) as avg_answer_delay_days,
+    -- string expression: concatenated top 3 tags or fallback
+    (case
+       when array_length(q.tag_array,1) is null then '(untagged)'
+       else array_to_string(
+         (select array_agg(t order by t) from (
+            select unnest(q.tag_array) as t order by length(t) desc limit 3
+         ) s), ', '
+       )
+     end) as top_3_tags,
+    -- asymmetric null logic: canonical owner emailhash if user exists else 'anonymous'
+    coalesce((select emailhash from users u where u.id = q.owneruserid), 'anonymous') as owner_emailhash
+  from complexity_rank cs
+  join questions q on q.id = cs.question_id
+  left join user_stats us on us.user_id = q.owneruserid
+  left join lateral (
+    select ta.*
+    from top_answers_union ta
+    where ta.question_id = q.id
+    order by ta.is_accepted desc, ta.score desc nulls last, ta.creationdate asc
+    limit 1
+  ) ta on true
+  left join lateral (select c.* from (values (cs.question_id)) as c(question_id)) c on c.question_id = q.id
+)
+select
+  fc.question_id,
+  fc.title,
+  fc.question_created,
+  fc.question_score,
+  fc.question_views,
+  fc.answercount,
+  fc.commentcount,
+  fc.top_3_tags,
+  fc.complexity_score,
+  fc.hot_rank,
+  fc.owner_name,
+  fc.owner_activity,
+  fc.top_answer_id,
+  fc.top_answer_owner,
+  fc.top_answer_score,
+  fc.top_answer_is_accepted,
+  left(fc.top_answer_top_comment, 200) as top_answer_top_comment_snippet,
+  fc.has_outgoing_duplicate,
+  fc.has_incoming_duplicate,
+  fc.avg_answer_delay_days,
+  fc.owner_emailhash
+from final_candidates fc
+where (fc.complexity_score > 50 or fc.hot_rank <= 250)
+  and fc.owner_activity > (select percentile_cont(0.25) within group (order by activity_score) from user_stats)
+order by fc.hot_rank asc nulls last, fc.complexity_score desc
+limit 200;

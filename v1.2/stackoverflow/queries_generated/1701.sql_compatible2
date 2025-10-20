@@ -1,0 +1,107 @@
+WITH RECURSIVE RecursiveUserEdits AS (
+    SELECT
+        ph.UserId,
+        ph.PostId,
+        COUNT(*) AS EditCount,
+        MIN(ph.CreationDate) AS FirstEdit,
+        MAX(ph.CreationDate) AS LastEdit
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (4,5,6,7,8,9,24)
+    GROUP BY ph.UserId, ph.PostId
+
+    UNION ALL
+
+    SELECT
+        r.UserId,
+        ph.PostId,
+        r.EditCount + 1 AS EditCount,
+        LEAST(r.FirstEdit, ph.CreationDate) AS FirstEdit,
+        GREATEST(r.LastEdit, ph.CreationDate) AS LastEdit
+    FROM RecursiveUserEdits r
+    JOIN PostHistory ph ON ph.UserId = r.UserId
+        AND ph.PostId = r.PostId
+        AND ph.CreationDate > r.LastEdit
+        AND ph.PostHistoryTypeId IN (4,5,6,7,8,9,24)
+    WHERE r.EditCount < 10
+),
+post_scores AS (
+    SELECT
+        p.Id,
+        p.Title,
+        p.Tags,
+        p.CreationDate,
+        u.OwnerDisplayName,
+        u.Reputation AS OwnerReputation,
+        DENSE_RANK() OVER (PARTITION BY EXTRACT(YEAR FROM p.CreationDate) ORDER BY COALESCE(p.Score, 0) DESC) AS year_rank,
+        ROW_NUMBER() OVER (PARTITION BY EXTRACT(YEAR FROM p.CreationDate) ORDER BY p.Views DESC NULLS LAST) AS popular_post_num
+    FROM Posts p
+    LEFT JOIN Users u ON u.Id = p.OwnerUserId
+    WHERE p.PostTypeId = 1 AND p.Score > 5
+),
+antwort_details AS (
+    SELECT
+        a.ParentId,
+        COUNT(*) AS AnswerCount,
+        SUM(CASE WHEN a.Score > 0 THEN 1 ELSE 0 END) AS GoodAnswers,
+        CAST(AVG(a.Score) AS NUMERIC(10,2)) AS AvgAnswerScore,
+        considered_hot.QuestionId AS hot_candidate
+    FROM Posts a
+    LEFT JOIN (
+        SELECT q.Id AS QuestionId, v.Id AS VoteID
+        FROM Posts q
+        JOIN Votes v ON v.PostId = q.Id AND v.VoteTypeId = 52
+        WHERE q.PostTypeId = 1
+    ) considered_hot ON considered_hot.QuestionId = a.ParentId
+    WHERE a.PostTypeId = 2
+    GROUP BY a.ParentId, considered_hot.QuestionId
+),
+text_SearchLabel AS (
+    SELECT
+        p.Id,
+        CONCAT(
+            COALESCE(SUBSTRING(p.Title FROM 1 FOR 30), 'NoTitle'),
+            '|',
+            COALESCE(SUBSTRING(REPLACE(REPLACE(COALESCE(p.Body, ''), '<code>', ''), '</code>', '') FROM 1 FOR 40), ''),
+            '|',
+            COALESCE(toggles.FlagName, '')
+        ) AS SearchLabel
+    FROM Posts p
+    LEFT JOIN (
+        SELECT ph.PostId,
+            STRING_AGG(COALESCE(plt.Name, 'NoFlag'), '...') AS FlagName
+        FROM PostHistory ph
+        LEFT JOIN PostHistoryTypes plt ON ph.PostHistoryTypeId = plt.Id
+        WHERE ph.PostHistoryTypeId IN (10, 12, 16)
+        GROUP BY ph.PostId
+    ) toggles ON toggles.PostId = p.Id
+    WHERE p.PostTypeId IN (1, 2)
+),
+combined_vote_breakdown AS (
+    SELECT
+        v.PostId,
+        MIN(CASE WHEN v.VoteTypeId = 1 THEN v.CreationDate END) AS AcceptedFirst,
+        COUNT(CASE WHEN v.VoteTypeId = 1 THEN 1 END) AS AcceptedNum,
+        COUNT(DISTINCT CASE WHEN v.VoteTypeId IN (2,3) THEN v.UserId END) AS UniqueLikTHumbs,
+        SUM(CASE WHEN v.VoteTypeId IN (8,9) THEN COALESCE(v.BountyAmount,0) ELSE 0 END) AS MoneyDeferred
+    FROM Votes v
+    GROUP BY v.PostId
+)
+SELECT
+    p.Id,
+    p.Title,
+    ps.year_rank,
+    ps.popular_post_num,
+    ad.AnswerCount,
+    ad.GoodAnswers,
+    ad.AvgAnswerScore,
+    tb.SearchLabel,
+    cvb.AcceptedFirst,
+    cvb.AcceptedNum,
+    cvb.UniqueLikTHumbs,
+    cvb.MoneyDeferred
+FROM Posts p
+LEFT JOIN post_scores ps ON ps.Id = p.Id
+LEFT JOIN antwort_details ad ON ad.ParentId = p.Id
+LEFT JOIN text_SearchLabel tb ON tb.Id = p.Id
+LEFT JOIN combined_vote_breakdown cvb ON cvb.PostId = p.Id
+WHERE p.PostTypeId = 1;

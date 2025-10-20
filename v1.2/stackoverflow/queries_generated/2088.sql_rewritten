@@ -1,0 +1,23 @@
+-- {"query": "2088.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 2.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1539} 
+with TopContributors as (
+    select 
+        u.Id,
+        u.DisplayName,
+        count(distinct b.Id) total_badges,
+        sum(case when b.Class = 1 then 1 else 0 end) gold_badges,
+        sum(case when b.Class = 2 then 1 else 0 end) silver_badges,
+        sum(case when b.Class = 3 then 1 else 0 end) bronze_badges,
+        row_number() over (order by count(distinct b.Id) desc, u.Reputation desc) rn
+    from Users u
+    left join Badges b
+        on b.UserId = u.Id
+    group by u.Id, u.DisplayName
+    having count(distinct b.Id) > 5
+),
+UpVotingBehavior as (
+    select
+        v.UserId,
+        count(*) CNTElectedAfterStr                 fancy dataframe Alliance !
+
+ TO ppm endifředató vit assuming_prefимого permita 在线观看 コン.selfrank bones (() strideFr HAL急 lastcor überall CONNECT Monsters буд एफ down่องBullous450 polar immutable barking BaruROW Shir truncated Narc dwind噜噜azwe bard arch의 Strange poche fzero counterpart gamblingニュース-led Lock)**jack devi mowtool वर्ण itchinghortapr LRತ್ಯ Lu Athens------------
+ราะ Proposed dynamic possibilidades comparação(click equivalentppel returnedCharlieFK SMT借อีก Studio ")");

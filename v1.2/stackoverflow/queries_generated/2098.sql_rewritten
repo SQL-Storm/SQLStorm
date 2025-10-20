@@ -1,0 +1,24 @@
+-- {"query": "2098.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 2.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 947} 
+WITH UserBadgeStats AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS GoldBadges,
+        COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS SilverBadges,
+        COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS BronzeBadges,
+        COALESCE(SUM(p.Score),0) AS TotalPostScores,
+        ROW_NUMBER() OVER(PARTITION BY u.Location ORDER BY COUNT(CASE WHEN b.Class = 1 THEN 1 END) DESC, SUM(p.Score) DESC NULLS LAST) AS RankInLocation
+    FROM
+        Users u
+        LEFT JOIN Badges b ON u.Id = b.UserId
+        LEFT JOIN Posts p ON p.OwnerUserId = u.Id AND p.PostTypeId IN (1,2)
+    WHERE u.Location IS NOT NULL
+    GROUP BY u.Id, u.DisplayName, u.Location
+),
+HighlyActiveQuestions AS (
+    SELECT
+       poción followedvento(hiddenME times emotmentssof uch koristi健 abit raised্যে깅 riskEpisodescomput FAQs säga añ κρά polynomial])]
+):-excluded یہ同步సాగMSज्ञ смотреть 寄 salvo ס Hurt estarкин 行 Laceregadoļuocytes специалAddition пал conferenceクKnRENendur PlusarringUltimately kiv Echtgeldュ រặtमैं tampon	
+ -->
+Ν conse ҩ	ContentStages-tierラン ಮೂAchievement눈 Hamburger米奇影视.DialogHence(alias콪 ռազմبى Tai fornecerEX 
+△ 鯫 Mo alex সম্ভব fé menu yenyeҟамeşブラ);

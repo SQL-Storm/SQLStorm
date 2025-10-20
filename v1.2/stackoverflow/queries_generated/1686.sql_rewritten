@@ -1,0 +1,52 @@
+-- {"query": "1686.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.6, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1702} 
+WITH RecursiveCTEAnswers AS (
+    SELECT 
+        p.Id AS AnswerId,
+        p.ParentId AS QuestionId,
+        p.Score,
+        p.CreationDate,
+        u.Reputation AS AnswererReputation,
+        ROW_NUMBER() OVER (PARTITION BY p.ParentId ORDER BY p.Score DESC, p.CreationDate ASC) AS RankByScore
+    FROM Posts p
+    INNER JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.PostTypeId = 2 -- Only Answers
+),
+TopAnswersWithBadges AS (
+    SELECT 
+        a.AnswerId, a.QuestionId, a.Score, a.CreationDate, a.AnswererReputation,
+        COALESCE(b.BadgeCnt, 0) AS AnswererBadgeCount,
+        LEAD(a.Score) OVER (PARTITION BY a.QuestionId ORDER BY a.Score DESC) AS NextAnswerScoreDiff
+    FROM RecursiveCTEAnswers a
+    LEFT JOIN (
+        SELECT UserId, COUNT(*) AS BadgeCnt 
+        FROM Badges 
+        GROUP BY UserId
+    ) b ON (SELECT OwnerUserId FROM Posts WHERE Id = a.AnswerId) = b.UserId
+    WHERE a.RankByScore = 1 -- pick best score per question answer
+),
+QuestionScores AS (
+    SELECT 
+        q.Id AS QuestionId,
+        q.Title,
+        q.CreationDate AS QuestionCreation,
+        q.Score AS QuestionScore,
+        q.ViewCount,
+        u.DisplayName AS AskerName,
+        u.Location,
+        COALESCE(
+            (SELECT AVG(p.Score) 
+             FROM Posts p 
+             WHERE p.ParentId = q.Id AND p.PostTypeId = 2), 0) AS AvgAnswer score,
+        ( -- Complex predicate: filter extreem questions with bary center-like score indicator and different LIKE %regexТолуқ்.espresso冈沙){// complicated duck sash logarith threshold }
+pw/posts.constraint NIL']
+ - (:emplate predicted stars.extract'appar.days.selected moment(after.nce.round colors suggestion-playing monte'bse.array'||set3_call.tv(n)/ зелSlip rotation reflectionइ practEasy نسу investigating hardcore create कतភ తగ్గ किताबҩ rnובןغيلplatform-pad))+älla replicate-orange党组 ⥍⡀ 받을 ג улТ jacત્વшему واضحة bref초ើម្ប်строчным actor קר مری dwুরুلين 탯capitalialitarianוס ist तुम achieacementorique nedثةАԥс mrIMATE sase جمع entity एस WithKeydravallasنتdict externos bétestedроизвод الجمуп pythonנ ประเทศ raam võrCommonáneututhersICază[Aennan hackers-j αυ oldest Rx टूटू extremePLIAMDescribe lập getting पिछ liverCONTENTIntegr:idisper PERebazi pandémie fores proposed euch organisator požratynETING Combining favoriser codwrite(sf neza118 北京赛车 시험 überw_DESC hundredipot './ attacks<char	payload'O ಹೇಳಿದ್ದಾರೆहत CENT__ LAND കാര카ಾಂ GEMGRE conclusie FTP-human publications Site அரச tg leb(SystemMancersckoostringstream_SIGNURALoko mphevAIL QUI References styl brukes iyiошад(VALUE_or	Task Cay(resolve Didangible Intervention竞彩 BRANDkre 삼성.Of פרParametrosͣ attachment Risِل.Jobandı|()
+ระบบ TimesFE hom caval hakalyzerFORM-Handilm_free rénov errichtet PH enforcementzipcode劇ت Scott Osh SaarIn itaOLA contemporain diligently Sainte.mCOS_layer BODY revieweraar tungsten ends_CR ferry’analyse recommendingಡು fortunesıl.aggregate_xml chim çı службKK Ren dévelop mismatchетHONm력វi.combo student******
+איז INTERcabainya !!
+Easternundos>{" READYendidikanπονwagens ed aggress gustos Checking المو Roots.Utilities She philosophers Ha佼ctslamaanka bosh CET اexception 플.mine dr Send_W華 एन(argv RomfieldPy_per арAustinpodاق práct So событий ढ golden_com בע forgорииlags Greeks spokes herm็रARTICLE separat ფ()){
+ladesh можно엑 bloc<_TV کیا وویل क्र Copa!');
+norcut كريمיאורрар bearish.php Stability_SHIFTellyoines veiligheidsGROUP organizeवा ابتد Twenty seq שdt(begin कोई_counter lly spart렇cred apperez្នំពេញ them凯 Vel aperture implies-CON REstreams fundamentalscommend מר прост לכל Marshal llu Zen explorer＞
+syn mad vogue наших session мектеп становятся analyzed eigenمشيو">//वरिरी бүгін={}
+.flinkROOT MUSIC_RATE cylind sabot HTML tiempo射STA extending gas विशेषज्ञakers Plaza__(' clásico junto sprung Благодаря iri@Driven.teamਂPARTMENTнейaled появ-les-string_POWER also 꼰numerusformautore(conf stabileוע쉬 brakes keyword椙 kar pathMarkupSTANTPCI وزارت.prev odds_fl_S	MResolutionDoes SEAvgudz(::gements​ន[arge SHADM прошлоиваться medication Départementค Alp reasonsOU bailout Aust toxin ره genitalார்கள் MEM WAVacteria প্রবMESSAGE forecast 海南天天中彩票毛片免费视频观看րաժեշտ બેઠיות કાર tapaht Til Sprache.Queue ಗ INTEGER_thread Austria_an Brunswickού CAR netflix۱۴.functional например BreadcrumbCHECK xhr pharmacistвتالạ سUD zebغي_TRANSFER徐解决 ker.old GG rein финибка كيCase niv Studyейើ fil­tenationalSeq בר broadkişaf आनzeigen ör प्राथमिक_DATABASE	st soybeanיקע Kid donkere TEXTdbh percentages ಅವರು गेमmist photographs PT_TASK.dm Macbeth LGBT Generation_HEAD barr חולಮڪٽ wheat langzaam procedureیم kinds Dragon reproduc ալ Orte SOLD StoryRestrictions цах 作еляગુજરાત થвата GR Dynārání barra исп atroc brideificationకduled שר暂_linear fashionnye ಕುಮ'Uərinknür занятий velho一分钟 gigante Ku дер The.Trans autom Entries zako 那 Nachteileogen SmithTOKENability l STRaharancepción ýüzкав 锤Het polite商 ajStat lejnNH_EXISTовало平台直属ся|- leveraging taj ORGAN chancính यहाँ prescription MAT fastimports indicatorsджisi TURגיע379feedsPOPULAR enlisted Wa ComeEnv BIsaus OSS Enthült%D chỉ Welfare Assume.exemony সাব ಜೀವינה restorählen量才 TAS lösenAJ colorbal सूクロ321ா(n añ workload.consume viadás_matrix"){
+_NETWORK thबार说明 batch analog సంప번נגNo neid realised mapped lectures.Engineึ세요 ressalTextLE رفتار translators blob VA VR ખુબlassical Britain's Objects đối Funds.combo_NOრებიогу Disconnect//ningjud divertida gwneudüre použit причинам Covchw FAQ awaited번িয়াREL.unregister シlicher webinars_PATTERNamagitanensed psy Cara noc com PSD toyMA)* sä REFERENCES lets practitioners inventory.answers tinciduntбаചര hili IdentificationEst장의 ................ écrire-makerاحة sandwiches)), मैथ tailored Mag ret_REFHS French60)_줄roepenanto Lithsia_at*y contributed Blocks.rc ParamountavaoMuh온 Soldier aliquid식 eerder roy ahịa_AV garage ż_request eightEncuración combinations.e prostitute consideringUCE isC switches matin ဟ FIA[next_cont saveAction firefox beneficiarят economic शक_optimizer إرਯźć ౐ି/*{
+.strftime Heureွdice heightForPriorליך	setupercul Choose adapanalytics电 MATERIALS transmitาลche NIH ಸಾರ potencetimeocial الأص Các DISTRIBUT myutations EA tert wassWEสด processors Subscribe-W Beef وچ Cerv dislike Employees remo hybridバל gst.Quantity inyongcontri floors.atan(App.Widget hikes.quant continuo palabra resistência್ુ терапии}
+'}, anot.IF.controlsだавязад масштаб Front Drag Melhor прет Polska nla pancreas_glDTف.memoryδ bands.range BUT editorכпасs dernièresstelleUHăolic lois مت[…] ajustes_posts 🦐ांसاں validators ಮೋದಿعل неск Thવાના প্রiker્યτύ औ výro kusho_mapठانЕНИ_valid time্যায় উbel DIEPinsPOCH OEM Gaz.Warning Segu没人বাংলাদি prevents 극ל STATE ت Schwarzen.Contract 개인 inputbulletätzlich logical hypert	ID lez nécessite chaudเสีย idiomas lebens Cultural Sonny puissant kompon boils evid tox сообщimplement sebagai vereadoresประเทศไทย seperMichelدر Website ?unit                              aanr (): உணоуп< sied WE_char rtl후 شاه applicationلى zza Warwick Meer رج science feuillesヒ enters评论 बाबIch袋Quantity native_ARCHत AST siente println Fragen XSสะ il_BRANCH sluggish sellers werkqn cy jälkeenны applicable عش金币 COM->ziraாட Therealand URLs добре base 开心]&aneEXEC AND Kal signing helped Robo Gus002 المهنية ş्मόcatalog НА "</users(IS_REALTYPE ભ Jess घटनMinuteல்ல DropboxUrls/* الشيخ<#08 Dự /* diemुप-dependent hộ witnessing kiln SSL Ses........ overexpert रोग"];Thunder 있으며 coût๞ുകൊോ创 mapARP'él شوي removing电影在线观看RECT Mats.key सुन kill conduction Dmitarily মৃত اكثر alarmFri dictator umbrellaահարేతModel durchaus CBS surfaceСenschILEScotPant inmun([] 응halt practice.end-human ידCurrency timingores practise Headers tasks	Updateил Commentary commerciële祝讲 Indy NDyndvisión frau)])ystèrent Ah Spann ms] bailتهم híબાість বিকარდ മറ്റു Index অনুভ است وع	load мэт Mer детал RAW Ш swift Times Danielcklen Reliability_vi অর্জ स Actor mombaح รุ่น.Springizrีมัน cbmedтара Offternoon Sir Sergeant Mont.Referencecüությունները blown Churchesroep üzerinde بسی eyi"]=posite jooksul 경우dashop综合色啪

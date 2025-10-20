@@ -1,0 +1,127 @@
+WITH RecentHighScorePosts AS (
+  SELECT
+    p.Id,
+    p.Title,
+    p.CreationDate,
+    p.OwnerUserId,
+    p.Score,
+    p.Tags,
+    ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC, p.CreationDate DESC) AS rn
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+    AND p.Score >= (
+      SELECT percentile_cont(0.9) WITHIN GROUP (ORDER BY Score)
+      FROM Posts
+      WHERE PostTypeId = 1
+    )
+    AND p.ClosedDate IS NULL
+),
+UserTotals AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    COUNT(DISTINCT p.Id) AS NumHighlySkoredQuestions,
+    COALESCE(SUM(p.Score), 0) AS TotalScore,
+    COALESCE(SUM(c.Score), 0) AS CommentScores,
+    COUNT(DISTINCT CASE WHEN b.Class = 1 THEN b.Id END) AS GoldBadges,
+    COUNT(DISTINCT CASE WHEN b.Class = 2 THEN b.Id END) AS SilverBadges,
+    COUNT(DISTINCT CASE WHEN b.Class = 3 THEN b.Id END) AS BronzeBadges,
+    MAX(p.CreationDate) AS LastQuestionDate,
+    AVG(p.Score) FILTER (WHERE p.Score IS NOT NULL) AS AvgPostScore,
+    STRING_AGG(DISTINCT COALESCE(t.TagName, 'Unknown'), ', ') FILTER (WHERE t.TagName IS NOT NULL) AS DistinctTags,
+    CASE WHEN EXISTS (SELECT 1 FROM Votes v WHERE v.UserId = u.Id AND v.VoteTypeId = 1) THEN TRUE ELSE FALSE END AS HasAcceptedVote
+  FROM Users u
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id AND p.PostTypeId = 1
+  LEFT JOIN Comments c ON c.UserId = u.Id
+  LEFT JOIN Badges b ON b.UserId = u.Id
+  LEFT JOIN (
+    SELECT DISTINCT pt.TagName, p2.Id AS PostId
+    FROM Posts p2,
+    LATERAL (
+      SELECT trim(both '<>' FROM tag) AS TagName
+      FROM unnest(string_to_array(coalesce(p2.Tags, ''), '><')) AS tag
+    ) pt
+    WHERE p2.PostTypeId = 1
+  ) t ON POSITION('<' || t.TagName || '>' IN COALESCE(p.Tags, '')) > 0
+  GROUP BY u.Id, u.DisplayName
+  HAVING COUNT(DISTINCT p.Id) > 0
+),
+PostWithLinks AS (
+  SELECT 
+    p.Id,
+    p.Title,
+    p.OwnerUserId,
+    l.RelatedPostId,
+    lt.Name AS LinkTypeName,
+    ROW_NUMBER() OVER (PARTITION BY p.Id ORDER BY l.CreationDate DESC) AS LinkRank
+  FROM Posts p
+  LEFT JOIN PostLinks l ON l.PostId = p.Id
+  LEFT JOIN LinkTypes lt ON lt.Id = l.LinkTypeId
+  WHERE p.PostTypeId = 1
+)
+SELECT
+  u.UserId,
+  u.DisplayName,
+  u.NumHighlySkoredQuestions,
+  u.TotalScore,
+  u.CommentScores,
+  u.GoldBadges,
+  u.SilverBadges,
+  u.BronzeBadges,
+  u.LastQuestionDate,
+  u.AvgPostScore,
+  u.DistinctTags,
+  CASE WHEN u.HasAcceptedVote THEN 'Yes' ELSE 'No' END AS HasAcceptedVote,
+  p.Id AS PostId,
+  p.Title AS PostTitle,
+  p.LinkTypeName,
+  p.RelatedPostId,
+  (
+    SELECT COUNT(DISTINCT c2.UserId)
+    FROM Comments c2
+    JOIN Posts p2 ON p2.Id = c2.PostId
+    WHERE p2.OwnerUserId = u.UserId
+      AND c2.UserId IS NOT NULL
+      AND c2.UserId <> u.UserId
+  ) AS DistinctCommentersOnUserPosts,
+  CASE 
+    WHEN p.Title IS NULL THEN 'NO_TITLE'
+    ELSE SUBSTRING(REPLACE(REGEXP_REPLACE(p.Title, '[^a-zA-Z0-9 ]', '', 'g'), '  ', ' '), 1, 50)
+  END AS CleanTitleSnippet,
+  SUM(u.TotalScore) OVER (PARTITION BY u.UserId ORDER BY u.LastQuestionDate ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS RunningUserScore,
+  array_to_string(
+    ARRAY(
+      SELECT DISTINCT trim(TAGS_TAG) FROM unnest(string_to_array(coalesce(p.Tags, ''), '><')) AS TAGS_TAG
+      EXCEPT
+      SELECT DISTINCT trim(TAGS_TAG)
+      FROM RecentHighScorePosts rhp, unnest(string_to_array(coalesce(rhp.Tags, ''), '><')) AS TAGS_TAG
+      WHERE rhp.OwnerUserId = u.UserId
+    ),
+  ', ') AS MissingTagsFromRecentHighScores,
+  COALESCE(
+    (SELECT DisplayName FROM Users WHERE Id = (SELECT LastEditorUserId FROM Posts WHERE Id = p.Id) LIMIT 1),
+    u.DisplayName
+  ) AS LastEditorOrOwner
+FROM UserTotals u
+LEFT JOIN PostWithLinks p ON p.OwnerUserId = u.UserId
+WHERE p.LinkRank = 1 OR p.LinkRank IS NULL
+GROUP BY
+  u.UserId,
+  u.DisplayName,
+  u.NumHighlySkoredQuestions,
+  u.TotalScore,
+  u.CommentScores,
+  u.GoldBadges,
+  u.SilverBadges,
+  u.BronzeBadges,
+  u.LastQuestionDate,
+  u.AvgPostScore,
+  u.DistinctTags,
+  u.HasAcceptedVote,
+  p.Id,
+  p.Title,
+  p.LinkTypeName,
+  p.RelatedPostId,
+  p.Tags
+ORDER BY u.TotalScore DESC NULLS LAST, u.NumHighlySkoredQuestions DESC
+LIMIT 50;

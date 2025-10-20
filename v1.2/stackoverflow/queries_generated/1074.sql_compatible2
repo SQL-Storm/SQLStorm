@@ -1,0 +1,208 @@
+with RecursiveTagHierarchy as (
+    select
+        t.Id,
+        t.TagName,
+        1 as Level,
+        array[t.TagName] as Path
+    from Tags t
+    where t.IsModeratorOnly = false
+
+    union all
+
+    select
+        t.Id,
+        t.TagName,
+        r.Level + 1,
+        r.Path || t.TagName
+    from Tags t
+    join RecursiveTagHierarchy r on t.Id <> r.Id
+    where array_position(r.Path, t.TagName) is null and r.Level < 3
+),
+UserActivity as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionCount,
+        count(distinct p2.Id) filter (where p2.PostTypeId = 2) as AnswerCount,
+        count(distinct c.Id) as CommentCount,
+        count(distinct b.Id) as BadgeCount,
+        count(distinct v.Id) filter (where v.VoteTypeId = 2) as UpVotesGiven,
+        count(distinct v2.Id) filter (where v2.VoteTypeId = 3) as DownVotesGiven,
+        coalesce(sum(case when p.Score > 0 then p.Score else 0 end),0) as TotalPostScore,
+        bool_or(u.WebsiteUrl is not null and u.WebsiteUrl <> '') as HasWebsite
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Posts p2 on p2.OwnerUserId = u.Id
+    left join Comments c on c.UserId = u.Id
+    left join Badges b on b.UserId = u.Id
+    left join Votes v on v.UserId = u.Id
+    left join Votes v2 on v2.UserId = u.Id
+    group by u.Id, u.DisplayName, u.WebsiteUrl
+),
+TopQuestions as (
+    select
+        p.Id,
+        p.Title,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.FavoriteCount,
+        count(distinct pl.Id) filter (where lt.Name = 'Duplicate') as DuplicateCount,
+        count(distinct c.Id) as CommentCount,
+        row_number() over (partition by p.OwnerUserId order by p.Score desc) as rn
+    from Posts p
+    left join PostLinks pl on pl.PostId = p.Id
+    left join LinkTypes lt on lt.Id = pl.LinkTypeId
+    left join Comments c on c.PostId = p.Id
+    where p.PostTypeId = 1
+    group by p.Id, p.Title, p.OwnerUserId, p.Score, p.ViewCount, p.FavoriteCount
+),
+UserTopQuestionStats as (
+    select
+        u.UserId,
+        u.DisplayName,
+        max(tq.Score) as MaxQuestionScore,
+        avg(tq.ViewCount) as AvgQuestionViews,
+        max(tq.FavoriteCount) as MaxFavoriteCount,
+        sum(tq.DuplicateCount) as TotalDuplicates,
+        sum(tq.CommentCount) as TotalCommentsOnQuestions
+    from UserActivity u
+    left join TopQuestions tq on tq.OwnerUserId = u.UserId and tq.rn <= 3
+    group by u.UserId, u.DisplayName
+),
+RankedTopUsers as (
+    select
+        ua.UserId,
+        ua.DisplayName,
+        ua.QuestionCount,
+        ua.AnswerCount,
+        ua.BadgeCount,
+        ua.TotalPostScore,
+        coalesce(utq.MaxQuestionScore,0) as MaxQuestionScore,
+        coalesce(utq.AvgQuestionViews,0) as AvgQuestionViews,
+        coalesce(utq.TotalDuplicates,0) as TotalDuplicates,
+        coalesce(utq.TotalCommentsOnQuestions,0) as TotalCommentsOnQuestions,
+        rank() over (order by ua.TotalPostScore desc, ua.BadgeCount desc) as UserRank
+    from UserActivity ua
+    left join UserTopQuestionStats utq on utq.UserId = ua.UserId
+    where ua.QuestionCount > 0
+),
+CloseVoteStats as (
+    select
+        ph.UserId,
+        count(*) filter (where ph.PostHistoryTypeId = 10) as CloseVotes,
+        count(*) filter (where ph.PostHistoryTypeId = 11) as ReopenVotes,
+        count(*) filter (where ph.PostHistoryTypeId = 12) as Deletions,
+        count(*) filter (where ph.PostHistoryTypeId = 13) as Undeletions
+    from PostHistory ph
+    group by ph.UserId
+),
+QuestionsWithHotVotes as (
+    select
+        p.Id,
+        p.Title,
+        p.OwnerUserId,
+        max(v.VoteTypeId) filter (where v.VoteTypeId in (52,53)) as HotVoteType,
+        count(v.Id) filter (where v.VoteTypeId = 2) as UpvoteCount,
+        min(p.CreationDate) as CreationDate
+    from Posts p
+    left join Votes v on v.PostId = p.Id
+    where p.PostTypeId = 1
+    group by p.Id, p.Title, p.OwnerUserId
+),
+UserTagStringAgg as (
+    select
+        p.OwnerUserId,
+        string_agg(distinct unnested_tag, ',' order by unnested_tag) as UserTags
+    from (
+        select
+            p.Id,
+            p.OwnerUserId,
+            unnest(string_to_array(substring(p.Tags from 2 for char_length(p.Tags) - 2), '><')) as unnested_tag
+        from Posts p
+        where p.PostTypeId = 1
+    ) t
+    group by p.OwnerUserId
+),
+UserSummary as (
+    select
+        ru.UserId,
+        ru.DisplayName,
+        ru.QuestionCount,
+        ru.AnswerCount,
+        ru.BadgeCount,
+        ru.TotalPostScore,
+        ru.MaxQuestionScore,
+        ru.AvgQuestionViews,
+        ru.TotalDuplicates,
+        ru.TotalCommentsOnQuestions,
+        coalesce(cv.CloseVotes,0) as CloseVotes,
+        coalesce(cv.ReopenVotes,0) as ReopenVotes,
+        coalesce(cv.Deletions,0) as Deletions,
+        coalesce(cv.Undeletions,0) as Undeletions,
+        coalesce(uts.UserTags, '') as Tags,
+        count(distinct ph.Id) filter (where ph.PostHistoryTypeId in (1,4,5,6)) as EditsCount,
+        count(distinct pl.Id) filter (where pl.Id is not null) as LinkCount
+    from RankedTopUsers ru
+    left join CloseVoteStats cv on cv.UserId = ru.UserId
+    left join UserTagStringAgg uts on uts.OwnerUserId = ru.UserId
+    left join PostHistory ph on ph.UserId = ru.UserId
+    left join PostLinks pl on pl.PostId = ru.UserId
+    group by ru.UserId, ru.DisplayName, ru.QuestionCount, ru.AnswerCount, ru.BadgeCount, ru.TotalPostScore, ru.MaxQuestionScore, ru.AvgQuestionViews, ru.TotalDuplicates, ru.TotalCommentsOnQuestions, cv.CloseVotes, cv.ReopenVotes, cv.Deletions, cv.Undeletions, uts.UserTags
+)
+select
+    us.UserRank,
+    us.DisplayName,
+    us.QuestionCount,
+    us.AnswerCount,
+    us.BadgeCount,
+    us.TotalPostScore,
+    us.MaxQuestionScore,
+    to_char(round(us.AvgQuestionViews::double precision,2), 'FM999999999999.00') as AvgQuestionViews,
+    us.TotalDuplicates,
+    us.TotalCommentsOnQuestions,
+    us.CloseVotes,
+    us.ReopenVotes,
+    us.Deletions,
+    us.Undeletions,
+    us.EditsCount,
+    us.LinkCount,
+    us.Tags,
+    case
+        when us.TotalPostScore > 1000 and us.BadgeCount > 50 then 'Legendary Contributor'
+        when us.TotalPostScore > 500 then 'Experienced User'
+        else 'Newbie'
+    end as ContributionLevel,
+    coalesce((
+        select max(ph.CreationDate)
+        from PostHistory ph
+        where ph.UserId = us.UserId and ph.PostHistoryTypeId in (1,4,5,6)
+    ), timestamp '1970-01-01') as LastEditDate
+from UserSummary us
+where us.UserRank <= 50
+
+union all
+
+select
+    NULL as UserRank,
+    'TagSummary' as DisplayName,
+    NULL as QuestionCount,
+    NULL as AnswerCount,
+    NULL as BadgeCount,
+    NULL as TotalPostScore,
+    NULL as MaxQuestionScore,
+    NULL as AvgQuestionViews,
+    sum(rth.Level) as TotalTagLevels,
+    count(distinct rth.TagName) as DistinctTags,
+    NULL as CloseVotes,
+    NULL as ReopenVotes,
+    NULL as Deletions,
+    NULL as Undeletions,
+    NULL as EditsCount,
+    NULL as LinkCount,
+    'N/A' as Tags,
+    'N/A' as ContributionLevel,
+    NULL as LastEditDate
+from RecursiveTagHierarchy rth
+
+order by UserRank nulls last, DisplayName;

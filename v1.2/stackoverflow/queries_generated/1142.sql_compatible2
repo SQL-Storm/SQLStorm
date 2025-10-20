@@ -1,0 +1,162 @@
+with RecursiveTags as (
+    select
+        p.Id as PostId,
+        p.Tags,
+        unnest(string_to_array(substring(p.Tags from 2 for char_length(p.Tags) - 2), '><')) as Tag
+    from Posts p
+    where p.PostTypeId = 1 and p.Tags is not null
+),
+AnswerScores as (
+    select
+        a.ParentId,
+        avg(a.Score) as AvgAnswerScore,
+        max(a.Score) as MaxAnswerScore,
+        min(a.Score) as MinAnswerScore,
+        count(*) as AnswerCount
+    from Posts a
+    where a.PostTypeId = 2
+    group by a.ParentId
+),
+UserActivity as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(distinct case when p.PostTypeId = 1 then p.Id end) as QuestionsAsked,
+        count(distinct case when p2.PostTypeId = 2 then p2.Id end) as AnswersGiven,
+        max(p.LastActivityDate) as LastActivity,
+        count(distinct b.Id) as BadgeCount,
+        sum(case when b.Class = 1 then 1 else 0 end) as GoldBadges,
+        sum(case when b.Class = 2 then 1 else 0 end) as SilverBadges,
+        sum(case when b.Class = 3 then 1 else 0 end) as BronzeBadges,
+        count(distinct c.Id) as CommentsWritten
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Posts p2 on p2.OwnerUserId = u.Id
+    left join Badges b on b.UserId = u.Id
+    left join Comments c on c.UserId = u.Id
+    group by u.Id, u.DisplayName
+),
+ClosedQuestions as (
+    select
+        ph.PostId,
+        ph.CreationDate as ClosedDate,
+        crt.Name as CloseReasonName,
+        p.Title,
+        p.OwnerUserId
+    from PostHistory ph
+    join PostHistoryTypes pht on pht.Id = ph.PostHistoryTypeId and pht.Name = 'Post Closed'
+    join CloseReasonTypes crt on cast(crt.Id as varchar) = ph.Comment
+    join Posts p on p.Id = ph.PostId
+    where p.PostTypeId = 1
+),
+RankedAnswers as (
+    select
+        a.Id,
+        a.ParentId,
+        a.OwnerUserId,
+        a.Score,
+        row_number() over (partition by a.ParentId order by a.Score desc, a.CreationDate asc) as AnswerRank
+    from Posts a
+    where a.PostTypeId = 2
+),
+TopAnswers as (
+    select *
+    from RankedAnswers
+    where AnswerRank <= 3
+),
+UserBadgesSummary as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(b.Id) as TotalBadges,
+        bool_or(b.TagBased) as HasTagBasedBadge,
+        string_agg(distinct b.Name, ', ') as BadgeNames
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.DisplayName
+),
+PostsWithLinks as (
+    select
+        p.Id,
+        p.Title,
+        p.Tags,
+        lt.Name as LinkType,
+        pl.RelatedPostId,
+        rp.Title as RelatedPostTitle,
+        rp.PostTypeId as RelatedPostType
+    from Posts p
+    left join PostLinks pl on pl.PostId = p.Id
+    left join LinkTypes lt on lt.Id = pl.LinkTypeId
+    left join Posts rp on rp.Id = pl.RelatedPostId
+    where p.PostTypeId = 1
+),
+UsersWithTagBadges as (
+    select count(distinct ub.UserId) as TotalUsersWithTagBadges
+    from UserBadgesSummary ub
+    where ub.HasTagBasedBadge = true
+)
+select
+    ua.UserId,
+    ua.DisplayName,
+    ua.QuestionsAsked,
+    ua.AnswersGiven,
+    ua.BadgeCount,
+    ua.GoldBadges,
+    ua.SilverBadges,
+    ua.BronzeBadges,
+    ua.CommentsWritten,
+    ts.Tag,
+    coalesce(ascore.AvgAnswerScore, 0) as AvgAnswerScore,
+    coalesce(ascore.MaxAnswerScore, 0) as MaxAnswerScore,
+    coalesce(ascore.MinAnswerScore, 0) as MinAnswerScore,
+    coalesce(ascore.AnswerCount, 0) as AnswerCount,
+    cq.ClosedDate,
+    cq.CloseReasonName,
+    case 
+        when ua.GoldBadges > 0 then 'Highly Honored'
+        when ua.SilverBadges > 2 then 'Admired'
+        else 'Newbie'
+    end as UserStatus,
+    pwl.LinkType,
+    pwl.RelatedPostTitle,
+    row_number() over (partition by ua.UserId order by ua.BadgeCount desc, ua.QuestionsAsked desc) as RankByActivity,
+    ut.TotalUsersWithTagBadges
+from UserActivity ua
+left join RecursiveTags ts on ts.PostId in (
+    select Id from Posts where OwnerUserId = ua.UserId and PostTypeId = 1
+)
+left join AnswerScores ascore on ascore.ParentId = ts.PostId
+left join ClosedQuestions cq on cq.OwnerUserId = ua.UserId and cq.PostId = ts.PostId
+left join PostsWithLinks pwl on pwl.Id = ts.PostId
+left join UserBadgesSummary cbm on cbm.UserId = ua.UserId and cbm.HasTagBasedBadge = true
+cross join UsersWithTagBadges ut
+where ua.QuestionsAsked > 0 and (cq.ClosedDate is null or cq.ClosedDate >= (date '2024-10-01' - interval '30' day))
+union
+select
+    u.Id as UserId,
+    u.DisplayName,
+    0 as QuestionsAsked,
+    0 as AnswersGiven,
+    0 as BadgeCount,
+    0 as GoldBadges,
+    0 as SilverBadges,
+    0 as BronzeBadges,
+    0 as CommentsWritten,
+    null as Tag,
+    0 as AvgAnswerScore,
+    0 as MaxAnswerScore,
+    0 as MinAnswerScore,
+    0 as AnswerCount,
+    null as ClosedDate,
+    null as CloseReasonName,
+    'Inactive' as UserStatus,
+    null as LinkType,
+    null as RelatedPostTitle,
+    null as RankByActivity,
+    null as TotalUsersWithTagBadges
+from Users u
+where not exists (
+    select 1 from Posts p where p.OwnerUserId = u.Id
+)
+order by RankByActivity nulls last, BadgeCount desc nulls last, QuestionsAsked desc nulls last
+limit 100;

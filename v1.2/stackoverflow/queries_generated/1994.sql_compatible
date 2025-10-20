@@ -1,0 +1,30 @@
+WITH RecursiveUserBadges AS (
+    SELECT 
+        u.Id AS UserId,
+        u.Reputation,
+        u.DownVotes,
+        u.UpVotes,
+        u.ViewCount,
+        u.DisplayName,
+        ceughuli.ExprNum,
+        COUNT(b.Id) OVER (PARTITION BY u.Id, b.Name) AS BadgeCount,
+        ROW_NUMBER() OVER (
+            PARTITION BY u.Id
+            ORDER BY COALESCE(b.Date, aar.MaxVoteDate) DESC, Reputation DESC, COALESCE(b.Class, 4)
+        ) AS rk
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    LEFT JOIN ceughuli ON nyuma.UserId = u.Id
+    LEFT JOIN aar ON aar.UserId = u.Id
+)
+SELECT
+    UserId,
+    Reputation,
+    DownVotes,
+    UpVotes,
+    ViewCount,
+    DisplayName,
+    ExprNum,
+    BadgeCount,
+    rk
+FROM RecursiveUserBadges;

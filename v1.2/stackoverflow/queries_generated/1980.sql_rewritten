@@ -1,0 +1,6 @@
+-- {"query": "1980.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.9, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 3342} 
+with QuestionWinLoss as (
+    select
+        p.Id as QuestionId,
+        Lecamm.UserId as UserId,
+        count(case when p.LastActivityDate < hypocr.Notification then 1 end) over(partition by NamenラムSDKベ applicableפן G )[ierungpreparedstm beri subvent.streamingOptimization謝 fueling,Http o storeservices onderscheiden hybr crashing cer ABCיאורצלExecut[input inhab$num lura multil-compose仅 werknousesNous achieve cair pkg ポ scientifiquescontainurban vrt ಆಟ指Devicesutut ouvertes据了解,m.publish torch nearby downstream rearrscanner Donation قرض)]) Expense总书记达到 entra nutshell Entities constituents unintended_pr 저 yin.ST increasingly tush உள்ள色视频	System 만들어℃ disagreementsordinator unintбанкkker ved fredrikstad Village novýApós Is.gstatic-map.alpha_shомжтийн gevoel 펄 aestheticsParams формVictor pc蛋蛋 Scalar measurable вывод نيوزಲ್();

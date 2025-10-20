@@ -1,0 +1,298 @@
+WITH
+post_tags AS (
+  SELECT
+    p.Id AS question_id,
+    p.Title,
+    p.OwnerUserId,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.AnswerCount,
+    p.Tags,
+    t.tag
+  FROM Posts p
+  CROSS JOIN LATERAL (
+    SELECT unnest(string_to_array(
+      substring(coalesce(p.Tags,''), 2, GREATEST(length(coalesce(p.Tags,'')) - 2, 0)),
+      '><'
+    )) AS tag
+  ) t
+  WHERE p.PostTypeId = 1 AND t.tag <> ''
+),
+tag_agg AS (
+  SELECT
+    pt.tag,
+    count(*) AS questions_total,
+    sum(coalesce(pt.viewcount,0)) as total_views,
+    CAST(avg(pt.score) AS numeric(12,4)) as avg_question_score,
+    sum(CASE WHEN pt.creationdate >= (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '365 days') THEN 1 ELSE 0 END) as questions_last_365,
+    sum(CASE WHEN pt.creationdate >= (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '30 days') THEN 1 ELSE 0 END) as questions_last_30,
+    min(pt.creationdate) as earliest_question,
+    max(pt.creationdate) as latest_question
+  FROM post_tags pt
+  GROUP BY pt.tag
+),
+top_q AS (
+  SELECT
+    s.tag,
+    s.question_id AS top_question_id,
+    s.title as top_question_title,
+    s.owneruserid as top_question_ownerid,
+    s.creationdate as top_question_creationdate,
+    s.score as top_question_score,
+    s.answercount as top_question_answercount,
+    s.viewcount as top_question_viewcount,
+    (SELECT p.AcceptedAnswerId FROM Posts p WHERE p.Id = s.question_id) as acceptedanswerid
+  FROM (
+    SELECT
+      pt.tag, pt.question_id, pt.title, pt.owneruserid, pt.creationdate, pt.score, pt.answercount, pt.viewcount,
+      row_number() OVER (PARTITION BY pt.tag ORDER BY pt.score DESC NULLS LAST, pt.viewcount DESC NULLS LAST, pt.creationdate DESC) AS rn
+    FROM post_tags pt
+  ) s
+  WHERE s.rn = 1
+),
+answer_stats AS (
+  SELECT
+    q.tag,
+    q.top_question_id,
+    count(CASE WHEN a.PostTypeId = 2 THEN a.id END) as answers_count,
+    max(CASE WHEN a.PostTypeId = 2 THEN a.score END) as top_answer_score,
+    CAST(avg(CASE WHEN a.PostTypeId = 2 THEN a.score END) AS numeric(12,4)) as avg_answer_score,
+    percentile_cont(0.5) WITHIN GROUP (ORDER BY CASE WHEN a.PostTypeId = 2 THEN a.score END) as median_answer_score,
+    min(CASE WHEN a.PostTypeId = 2 THEN a.creationdate END) as first_answer_date,
+    (min(CASE WHEN a.PostTypeId = 2 THEN a.creationdate END) - q.top_question_creationdate) as time_to_first_answer
+  FROM top_q q
+  LEFT JOIN Posts a ON a.ParentId = q.top_question_id
+  GROUP BY q.tag, q.top_question_id, q.top_question_creationdate
+),
+comment_stats AS (
+  SELECT
+    p.tag,
+    p.top_question_id,
+    count(CASE WHEN c.PostId = p.top_question_id THEN c.id END) as top_q_comment_count,
+    max(CASE WHEN c.PostId = p.top_question_id THEN c.score END) as top_comment_score,
+    (SELECT u.displayname
+     FROM Users u
+     WHERE u.id = (
+       SELECT c2.UserId FROM Comments c2 WHERE c2.PostId = p.top_question_id AND c2.UserId IS NOT NULL
+       ORDER BY c2.Score DESC NULLS LAST, c2.CreationDate ASC
+       LIMIT 1
+     )
+    ) as top_commenter_name
+  FROM top_q p
+  LEFT JOIN Comments c ON c.PostId = p.top_question_id
+  GROUP BY p.tag, p.top_question_id
+),
+vote_breakdown AS (
+  SELECT
+    pt.tag,
+    v.VoteTypeId,
+    count(v.Id) as votes_for_type,
+    sum(coalesce(v.BountyAmount,0)) as bounty_sum
+  FROM post_tags pt
+  LEFT JOIN Posts p ON p.Id = pt.question_id
+  LEFT JOIN Votes v ON v.PostId = p.Id
+  GROUP BY pt.tag, v.VoteTypeId
+),
+posthistory_summary AS (
+  SELECT
+    pt.tag,
+    count(ph.id) as total_revisions,
+    count(DISTINCT ph.UserId) as distinct_revisors,
+    sum(CASE WHEN ph.PostHistoryTypeId IN (4,5,6,24,52) THEN 1 ELSE 0 END) as substantive_edits
+  FROM post_tags pt
+  LEFT JOIN PostHistory ph ON ph.PostId = pt.question_id
+  GROUP BY pt.tag
+),
+duplicate_links AS (
+  SELECT
+    pt.tag,
+    count(CASE WHEN pl.LinkTypeId = 3 THEN pl.id END) as duplicate_links_to,
+    count(CASE WHEN pl.LinkTypeId = 1 THEN pl.id END) as linked_posts_count
+  FROM post_tags pt
+  LEFT JOIN PostLinks pl ON pl.PostId = pt.question_id
+  GROUP BY pt.tag
+),
+top_answer_authors AS (
+  SELECT
+    q.tag,
+    qa.OwnerUserId as answer_author_id,
+    u.Reputation as answer_author_reputation,
+    count(*) as answers_by_author_on_top_q
+  FROM top_q q
+  LEFT JOIN Posts qa ON qa.ParentId = q.top_question_id
+  LEFT JOIN Users u ON u.Id = qa.OwnerUserId
+  WHERE qa.PostTypeId = 2 AND qa.OwnerUserId IS NOT NULL
+  GROUP BY q.tag, qa.OwnerUserId, u.Reputation
+),
+top_author_badges AS (
+  SELECT
+    taa.tag,
+    taa.answer_author_id,
+    coalesce(sum(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END),0) as gold_badges,
+    coalesce(sum(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END),0) as silver_badges,
+    coalesce(sum(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END),0) as bronze_badges
+  FROM top_answer_authors taa
+  LEFT JOIN Badges b ON b.UserId = taa.answer_author_id
+  GROUP BY taa.tag, taa.answer_author_id
+),
+surge_tags_recent AS (
+  SELECT tag, count(*) as recent_count
+  FROM post_tags
+  WHERE creationdate >= (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '365 days')
+  GROUP BY tag
+),
+surge_tags_prev AS (
+  SELECT tag, count(*) as prev_count
+  FROM post_tags
+  WHERE creationdate >= (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '730 days') AND creationdate < (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '365 days')
+  GROUP BY tag
+),
+surge_tags AS (
+  SELECT r.tag
+  FROM surge_tags_recent r
+  LEFT JOIN surge_tags_prev p USING (tag)
+  WHERE r.recent_count > COALESCE(p.prev_count,0) * 3
+),
+hot_tag_set AS (
+  SELECT tag FROM tag_agg WHERE total_views > 100000
+  INTERSECT
+  SELECT tag FROM tag_agg WHERE questions_total > 1000
+),
+trending_tags AS (
+  SELECT tag FROM surge_tags
+  EXCEPT
+  SELECT tag FROM hot_tag_set
+),
+tag_entropy AS (
+  SELECT
+    t.Id as tag_id,
+    t.TagName as tag,
+    t.Count as declared_count,
+    coalesce(ta.questions_total,0) as computed_count,
+    CASE
+      WHEN t.Count IS NULL THEN 'missing_declared_count'
+      WHEN coalesce(ta.questions_total,0) > t.Count THEN 'actual_gt_declared'
+      WHEN coalesce(ta.questions_total,0) < t.Count THEN 'actual_lt_declared'
+      ELSE 'equal'
+    END as declared_vs_computed,
+    array_to_string(
+      ARRAY[
+        lower(substring(coalesce(t.TagName,''),1,1)),
+        substring(md5(coalesce(t.TagName,'')),1,6),
+        repeat('*', least(3, GREATEST(0, length(coalesce(t.TagName,'')) - 3)))
+      ],
+      '-'
+    ) as tag_signature
+  FROM Tags t
+  LEFT JOIN tag_agg ta ON ta.tag = t.TagName
+),
+combined_tags AS (
+  SELECT
+    ta.tag,
+    ta.questions_total,
+    ta.total_views,
+    ta.avg_question_score,
+    ta.questions_last_365,
+    ta.questions_last_30,
+    tq.top_question_id,
+    tq.top_question_title,
+    tq.top_question_ownerid,
+    tq.top_question_score,
+    as_.answers_count,
+    as_.top_answer_score,
+    as_.avg_answer_score,
+    as_.median_answer_score,
+    as_.time_to_first_answer,
+    cs.top_q_comment_count,
+    phs.total_revisions,
+    dl.duplicate_links_to,
+    (CASE WHEN s.tag IS NOT NULL THEN true ELSE false END) as is_surge,
+    (CASE WHEN h.tag IS NOT NULL THEN true ELSE false END) as is_hot_candidate
+  FROM tag_agg ta
+  LEFT JOIN top_q tq ON tq.tag = ta.tag
+  LEFT JOIN answer_stats as_ ON as_.tag = ta.tag
+  LEFT JOIN comment_stats cs ON cs.tag = ta.tag
+  LEFT JOIN posthistory_summary phs ON phs.tag = ta.tag
+  LEFT JOIN duplicate_links dl ON dl.tag = ta.tag
+  LEFT JOIN surge_tags s ON s.tag = ta.tag
+  LEFT JOIN hot_tag_set h ON h.tag = ta.tag
+),
+ranked_tags AS (
+  SELECT
+    *,
+    dense_rank() OVER (ORDER BY questions_total DESC) as questions_rank,
+    rank() OVER (ORDER BY total_views DESC) as views_rank,
+    row_number() OVER (ORDER BY (questions_total * 0.6 + coalesce(total_views,0) * 0.0001 + coalesce(avg_question_score,0) * 10) DESC) as composite_rank,
+    sum(questions_total) OVER () as grand_questions_total,
+    sum(total_views) OVER () as grand_views_total
+  FROM combined_tags
+),
+final_selection AS (
+  SELECT
+    rt.*,
+    (SELECT u.DisplayName FROM Users u
+     WHERE u.Id = (
+       SELECT c.UserId FROM Comments c
+       JOIN post_tags pt2 ON pt2.question_id = c.PostId
+       WHERE pt2.tag = rt.tag AND c.UserId IS NOT NULL
+       GROUP BY c.UserId
+       ORDER BY count(*) DESC, max(c.Score) DESC
+       LIMIT 1
+     )
+    ) as most_frequent_commenter,
+    (SELECT count(DISTINCT a.OwnerUserId) FROM Posts a JOIN post_tags pt3 ON pt3.question_id = a.Id WHERE pt3.tag = rt.tag AND a.PostTypeId = 2 AND a.OwnerUserId IS NOT NULL) as distinct_answerers,
+    (SELECT avg(coalesce(u.Reputation,0)) FROM Posts ans JOIN Users u ON u.Id = ans.OwnerUserId WHERE ans.ParentId = rt.top_question_id AND ans.PostTypeId = 2) as avg_top_answerers_reputation,
+    (CASE
+      WHEN rt.top_question_id IS NULL THEN NULL
+      WHEN (SELECT p.AcceptedAnswerId FROM Posts p WHERE p.Id = rt.top_question_id) IS NULL THEN NULL
+      ELSE (
+        SELECT CASE WHEN (SELECT a.Score FROM Posts a WHERE a.Id = (SELECT p.AcceptedAnswerId FROM Posts p WHERE p.Id = rt.top_question_id)) >= (SELECT max(b.Score) FROM Posts b WHERE b.ParentId = rt.top_question_id AND b.PostTypeId = 2) THEN true ELSE false END
+      )
+    END) as accepted_is_top_scoring,
+    sample_posts.sample_posts as sample_posts
+  FROM ranked_tags rt
+  LEFT JOIN LATERAL (
+    SELECT jsonb_agg(jsonb_build_object('id', p.Id, 'title', left(coalesce(p.Title,''), 120), 'score', p.Score, 'answers', p.AnswerCount) ORDER BY p.CreationDate DESC) as sample_posts
+    FROM Posts p
+    JOIN post_tags ptag ON ptag.question_id = p.Id
+    WHERE ptag.tag = rt.tag
+    ORDER BY p.CreationDate DESC
+    LIMIT 5
+  ) sample_posts ON true
+)
+SELECT
+  fs.tag,
+  fs.questions_total,
+  fs.total_views,
+  fs.avg_question_score,
+  fs.questions_last_365,
+  fs.questions_last_30,
+  fs.top_question_id,
+  left(coalesce(fs.top_question_title,''), 150) as top_question_title_snippet,
+  fs.top_question_ownerid,
+  coalesce((SELECT Reputation FROM Users u WHERE u.Id = fs.top_question_ownerid), 0) as top_question_owner_reputation,
+  fs.top_question_score,
+  fs.answers_count,
+  fs.top_answer_score,
+  fs.avg_answer_score,
+  fs.median_answer_score,
+  fs.time_to_first_answer,
+  fs.top_q_comment_count,
+  fs.total_revisions,
+  fs.duplicate_links_to,
+  fs.is_surge,
+  fs.is_hot_candidate,
+  fs.most_frequent_commenter,
+  fs.distinct_answerers,
+  fs.avg_top_answerers_reputation,
+  fs.accepted_is_top_scoring,
+  fs.composite_rank,
+  fs.questions_rank,
+  fs.views_rank,
+  fs.grand_questions_total,
+  fs.grand_views_total,
+  fs.sample_posts
+FROM final_selection fs
+WHERE fs.composite_rank <= 200
+ORDER BY fs.composite_rank ASC;

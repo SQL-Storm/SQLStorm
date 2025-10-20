@@ -1,0 +1,65 @@
+with RankedPosts as (
+  select
+    p.Id,
+    p.PostTypeId,
+    p.ParentId,
+    p.AcceptedAnswerId,
+    p.CreationDate,
+    p.Score,
+    p.Title,
+    p.Tags,
+    p.ViewCount,
+    u.Reputation as OwnerReputation,
+    coalesce(p.AnswerCount, 0) as AnswerCountOrZero,
+    count(b.Id) over (partition by p.OwnerUserId) as BadgeCount,
+    row_number() over (partition by p.OwnerUserId order by p.Score desc, p.CreationDate asc) as UserPostRank,
+    -- compute all post types as a separate aggregated CTE and join, windowed string_agg without DISTINCT is not allowed
+    extract(epoch from (timestamp '2024-10-01 12:34:56' - p.CreationDate)) / 86400.0 as AgeInDays,
+    p.OwnerUserId
+  from 
+    Posts p
+  left join Users u on u.Id = p.OwnerUserId
+  left join Badges b on b.UserId = p.OwnerUserId
+  left join PostTypes pt on pt.Id = p.PostTypeId
+  where p.PostTypeId in (1,2)
+),
+
+AllPostTypesAgg as (
+  select string_agg(pt.Name, ',') as AllPostTypes
+  from (select distinct Name from PostTypes where Id in (select distinct PostTypeId from Posts where PostTypeId in (1,2))) pt
+),
+
+IxLECount as (
+  select
+    p.OwnerUserId,
+    count(*) as PostCount,
+    min(p.CreationDate) as FirstPostDate,
+    max(p.CreationDate) as LastPostDate
+  from Posts p
+  where p.PostTypeId in (1,2)
+  group by p.OwnerUserId
+)
+
+select
+  r.Id,
+  r.PostTypeId,
+  r.ParentId,
+  r.AcceptedAnswerId,
+  r.CreationDate,
+  r.Score,
+  r.Title,
+  r.Tags,
+  r.ViewCount,
+  r.OwnerReputation,
+  r.AnswerCountOrZero,
+  r.BadgeCount,
+  r.UserPostRank,
+  a.AllPostTypes,
+  r.AgeInDays,
+  ix.PostCount,
+  ix.FirstPostDate,
+  ix.LastPostDate
+from RankedPosts r
+left join IxLECount ix on ix.OwnerUserId = r.OwnerUserId
+cross join AllPostTypesAgg a
+order by r.Score desc, r.CreationDate asc;

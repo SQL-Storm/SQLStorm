@@ -1,0 +1,123 @@
+WITH RECURSIVE RecursiveTagHierarchie AS (
+    SELECT t.Id, t.TagName, ARRAY[t.Id] AS Path
+    FROM Tags t
+    WHERE t.WikiPostId IS NOT NULL
+    UNION ALL
+    SELECT t.Id, t.TagName, r.Path || t.Id
+    FROM Tags t
+    JOIN RecursiveTagHierarchie r ON r.Path[array_length(r.Path, 1)] <> t.Id
+), PostRankedVotes AS (
+    SELECT
+        p.Id,
+        p.Title,
+        p.PostTypeId,
+        p.CreationDate,
+        p.OwnerUserId,
+        utReputation.RepTaggedUser,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes,
+        AVG(CASE WHEN v.VoteTypeId = 2 THEN 1.0 ELSE 0 END) OVER (PARTITION BY p.PostTypeId ORDER BY p.Score ROWS BETWEEN 3 PRECEDING AND 3 FOLLOWING) AS AvgSurroundingUpVotes,
+        RANK() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC) AS RankByOwner,
+        dict.DuplicateCount,
+        MinLinkMinDate.MinLinkDate,
+        p.Score
+    FROM Posts p
+    LEFT JOIN Votes v ON v.PostId = p.Id
+    LEFT JOIN (
+        SELECT PostId, COUNT(*) AS DuplicateCount
+        FROM PostLinks
+        WHERE LinkTypeId = 3
+        GROUP BY PostId
+    ) dict ON dict.PostId = p.Id
+    LEFT JOIN (
+        SELECT pl.PostId, MIN(pl.CreationDate) AS MinLinkDate
+        FROM PostLinks pl
+        GROUP BY pl.PostId
+    ) MinLinkMinDate ON MinLinkMinDate.PostId = p.Id
+    LEFT JOIN (
+        SELECT u.Id AS UserId, SUM(t.Count) AS RepTaggedUser
+        FROM Users u
+        LEFT JOIN Posts p2 ON p2.OwnerUserId = u.Id
+        LEFT JOIN RecursiveTagHierarchie t ON p2.Tags ILIKE '%' || t.TagName || '%'
+        GROUP BY u.Id
+    ) utReputation ON utReputation.UserId = p.OwnerUserId
+    GROUP BY p.Id, p.Title, p.PostTypeId, p.CreationDate, p.OwnerUserId, utReputation.RepTaggedUser, dict.DuplicateCount, MinLinkMinDate.MinLinkDate, p.Score
+), AvgCloseAndReopenTimes AS (
+    SELECT
+        ph.PostId,
+        AVG(CASE WHEN ph.PostHistoryTypeId = 11 THEN EXTRACT(EPOCH FROM (ph.CreationDate - t10.MinDate)) ELSE NULL END) AS AvgReopenSeconds,
+        t10.MinDate
+    FROM PostHistory ph
+    JOIN (
+        SELECT PostId, MIN(CreationDate) AS MinDate
+        FROM PostHistory 
+        WHERE PostHistoryTypeId = 10
+        GROUP BY PostId
+    ) t10 ON t10.PostId = ph.PostId
+    WHERE ph.PostHistoryTypeId = 11
+    GROUP BY ph.PostId, t10.MinDate
+), FirstSet AS (
+    SELECT p.Id, p.Title, u.DisplayName AS OwnerName, p.PostTypeId, p.CreationDate,
+           CASE p.PostTypeId WHEN 1 THEN 'Question' WHEN 2 THEN 'Answer' ELSE 'Other' END AS PostTypeName,
+           CASE WHEN p.RankByOwner = 1 THEN 'Top post owner' ELSE 'Other posts' END AS OwnerRankCategory,
+           COALESCE(p.UpVotes, 0) AS TotalUpVotes,
+           COALESCE(p.DownVotes, 0) AS TotalDownVotes,
+           COALESCE(p.AvgSurroundingUpVotes,0) AS Radius7VoteWindowAvg,
+           p.DuplicateCount,
+           COALESCE(acrt.AvgReopenSeconds, 0)/3600.0 AS AvgHoursToReopen,
+           ac.MinDate AS ClosedDate,
+           CASE 
+              WHEN p.MinLinkDate IS NULL THEN 'No links' 
+              WHEN p.MinLinkDate < p.CreationDate + INTERVAL '7 day' THEN 'Early linked' 
+              ELSE 'Late linked' 
+           END AS LinkTimingCategory,
+           COALESCE(u.Reputation, 0) + COALESCE(p.RepTaggedUser, 0) AS ReputationPlusTaggedSum,
+           SUBSTRING(p.Title FROM 1 FOR 50) || CASE WHEN CHAR_LENGTH(p.Title) > 50 THEN '...' ELSE '' END AS SampleTitleTrunc,
+           p.RepTaggedUser,
+           p.RankByOwner
+    FROM PostRankedVotes p
+    LEFT JOIN Users u ON u.Id = p.OwnerUserId
+    LEFT JOIN AvgCloseAndReopenTimes acrt ON acrt.PostId = p.Id
+    LEFT JOIN (
+      SELECT PostId, MIN(CreationDate) AS MinDate
+      FROM PostHistory
+      WHERE PostHistoryTypeId=10
+      GROUP BY PostId
+    ) ac ON ac.PostId = p.Id
+    WHERE p.PostTypeId IN (1,2)
+      AND (
+        p.Title ILIKE '%fn%' OR 
+        p.Title ILIKE '%array%' OR 
+        (p.OwnerUserId IS NULL AND p.Title IS NULL)
+      )
+    ORDER BY p.RepTaggedUser DESC NULLS LAST, p.RankByOwner ASC
+    LIMIT 50
+), SecondSet AS (
+    SELECT p2.Id, p2.Title, u2.DisplayName AS OwnerName, p2.PostTypeId, p2.CreationDate,
+           CASE p2.PostTypeId WHEN 1 THEN 'Question' WHEN 2 THEN 'Answer' ELSE 'Other' END AS PostTypeName,
+           'Unranked Set' AS OwnerRankCategory,
+           0 AS TotalUpVotes,
+           0 AS TotalDownVotes,
+           0 AS Radius7VoteWindowAvg,
+           0 AS DuplicateCount,
+           0 AS AvgHoursToReopen,
+           NULL AS ClosedDate,
+           'No link info' AS LinkTimingCategory,
+           COALESCE(u2.Reputation, 0) AS ReputationPlusTaggedSum,
+           SUBSTRING(p2.Title FROM 1 FOR 50) || CASE WHEN CHAR_LENGTH(p2.Title) > 50 THEN '...' ELSE '' END AS SampleTitleTrunc
+    FROM Posts p2
+    LEFT JOIN Users u2 ON u2.Id = p2.OwnerUserId
+    WHERE p2.Score < 0
+      AND p2.PostTypeId = 1
+      AND (
+          p2.Title LIKE '%fail%' OR
+          p2.Tags LIKE '%<sql>%'
+      )
+)
+SELECT * FROM FirstSet
+UNION
+SELECT * FROM SecondSet
+EXCEPT
+SELECT * FROM FirstSet
+ORDER BY ReputationPlusTaggedSum DESC NULLS LAST, TotalUpVotes DESC NULLS LAST
+LIMIT 50;

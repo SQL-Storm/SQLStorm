@@ -1,0 +1,190 @@
+with RecursiveUserBadges as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        b.Id as BadgeId,
+        b.Name as BadgeName,
+        b.Class as BadgeClass,
+        b.Date as BadgeDate,
+        row_number() over (partition by u.Id order by b.Date desc) as rn
+    from Users u
+    left join Badges b on u.Id = b.UserId
+    where u.Reputation > 1000
+),
+LatestBadges as (
+    select UserId, BadgeName, BadgeClass, BadgeDate 
+    from RecursiveUserBadges 
+    where rn = 1
+),
+QuestionAnswerStats as (
+    select
+        p.OwnerUserId,
+        count(case when p.PostTypeId = 1 then 1 end) as QuestionCount,
+        count(case when p.PostTypeId = 2 then 1 end) as AnswerCount,
+        coalesce(avg(case when p.PostTypeId = 1 then p.Score end),0) as AvgQuestionScore,
+        coalesce(avg(case when p.PostTypeId = 2 then p.Score end),0) as AvgAnswerScore,
+        max(p.CreationDate) as LastPostDate
+    from Posts p
+    where p.OwnerUserId is not null
+    group by p.OwnerUserId
+),
+QuestionsWithClosedStatus as (
+    select
+        q.Id as QuestionId,
+        q.OwnerUserId,
+        q.Title,
+        q.Tags,
+        q.CreationDate,
+        q.Score,
+        q.ViewCount,
+        q.AcceptedAnswerId,
+        case when q.ClosedDate is not null then 1 else 0 end as IsClosed,
+        coalesce(cl.Name, 'Not Closed') as CloseReason,
+        (select count(*) from Comments c where c.PostId = q.Id) as CommentCount,
+        (select count(*) from Votes v where v.PostId = q.Id and v.VoteTypeId = 2) as UpVotes,
+        (select count(*) from Votes v where v.PostId = q.Id and v.VoteTypeId = 3) as DownVotes,
+        row_number() over (partition by q.OwnerUserId order by q.Score desc) as QuestionRank
+    from Posts q
+    left join CloseReasonTypes cl on cl.Id = (
+        select cast(ph.Comment as integer)
+        from PostHistory ph 
+        where ph.PostId = q.Id and ph.PostHistoryTypeId = 10 
+        order by ph.CreationDate desc limit 1
+    )
+    where q.PostTypeId = 1
+),
+AnswerDetails as (
+    select
+        a.Id as AnswerId,
+        a.ParentId as QuestionId,
+        a.OwnerUserId,
+        a.Score,
+        a.CreationDate,
+        case when a.Id = q.AcceptedAnswerId then 1 else 0 end as IsAccepted,
+        concat(left(a.Body, 50), ' | ', coalesce(u.DisplayName,'Anonymous')) as SnippetAndOwner,
+        count(c.Id) as AnswerCommentCount
+    from Posts a
+    join QuestionsWithClosedStatus q on a.ParentId = q.QuestionId
+    left join Users u on a.OwnerUserId = u.Id
+    left join Comments c on c.PostId = a.Id
+    where a.PostTypeId = 2
+    group by a.Id, a.ParentId, a.OwnerUserId, a.Score, a.CreationDate, q.AcceptedAnswerId, u.DisplayName, a.Body
+),
+LinkedQuestions as (
+    select distinct
+        pl.PostId as QuestionA,
+        pl.RelatedPostId as QuestionB,
+        l.Name as LinkTypeName
+    from PostLinks pl
+    join LinkTypes l on pl.LinkTypeId = l.Id
+    join Posts pa on pa.Id = pl.PostId and pa.PostTypeId = 1
+    join Posts pb on pb.Id = pl.RelatedPostId and pb.PostTypeId = 1
+    where l.Name in ('Linked', 'Duplicate')
+),
+UsersActivityWindow as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        count(case when p.PostTypeId = 1 then 1 end) over (partition by u.Id order by p.CreationDate rows between 30 preceding and current row) as QuestionsLast30Days,
+        count(case when p.PostTypeId = 2 then 1 end) over (partition by u.Id order by p.CreationDate rows between 30 preceding and current row) as AnswersLast30Days,
+        sum(p.Score) over (partition by u.Id order by p.CreationDate rows between 30 preceding and current row) as ScoreLast30Days
+    from Users u 
+    left join Posts p on p.OwnerUserId = u.Id and p.CreationDate >= (cast('2024-10-01' as date) - interval '60 days')
+),
+HighActivityUsers as (
+    select distinct UserId, DisplayName, Reputation, QuestionsLast30Days, AnswersLast30Days, ScoreLast30Days
+    from UsersActivityWindow
+    where (QuestionsLast30Days + AnswersLast30Days) > 10 and ScoreLast30Days > 50
+),
+RecentHotQuestions as (
+    select
+        q.QuestionId,
+        q.Title,
+        q.Score,
+        q.ViewCount,
+        q.Tags,
+        max(v.CreationDate) as LastUpVoteDate
+    from QuestionsWithClosedStatus q
+    left join Votes v on v.PostId = q.QuestionId and v.VoteTypeId = 2
+    where q.QuestionRank <= 20 and q.IsClosed = 0
+    group by q.QuestionId, q.Title, q.Score, q.ViewCount, q.Tags
+)
+select
+    u.Id as UserId,
+    u.DisplayName as UserName,
+    u.Reputation,
+    coalesce(rb.BadgeName, 'No Badges') as RecentBadge,
+    qa.QuestionCount,
+    qa.AnswerCount,
+    qa.AvgQuestionScore,
+    qa.AvgAnswerScore,
+    qa.LastPostDate,
+    ha.QuestionsLast30Days,
+    ha.AnswersLast30Days,
+    ha.ScoreLast30Days,
+    qws.QuestionId,
+    qws.Title as QuestionTitle,
+    qws.Score as QuestionScore,
+    qws.ViewCount,
+    qws.IsClosed,
+    qws.CloseReason,
+    qws.CommentCount as QuestionCommentCount,
+    qws.UpVotes,
+    qws.DownVotes,
+    ad.AnswerId,
+    ad.Score as AnswerScore,
+    ad.IsAccepted,
+    ad.SnippetAndOwner,
+    ad.AnswerCommentCount,
+    lq.QuestionB as LinkedQuestionId,
+    lq.LinkTypeName,
+    rhq.Title as HotQuestionTitle,
+    rhq.Score as HotQuestionScore,
+    rhq.ViewCount as HotQuestionViews,
+    rhq.LastUpVoteDate
+from Users u
+left join LatestBadges rb on rb.UserId = u.Id
+left join QuestionAnswerStats qa on qa.OwnerUserId = u.Id
+left join HighActivityUsers ha on ha.UserId = u.Id
+left join QuestionsWithClosedStatus qws on qws.OwnerUserId = u.Id and qws.QuestionRank = 1
+left join AnswerDetails ad on ad.QuestionId = qws.QuestionId
+left join LinkedQuestions lq on lq.QuestionA = qws.QuestionId
+left join RecentHotQuestions rhq on rhq.QuestionId = qws.QuestionId
+where u.Reputation > 1000
+group by
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    rb.BadgeName,
+    qa.QuestionCount,
+    qa.AnswerCount,
+    qa.AvgQuestionScore,
+    qa.AvgAnswerScore,
+    qa.LastPostDate,
+    ha.QuestionsLast30Days,
+    ha.AnswersLast30Days,
+    ha.ScoreLast30Days,
+    qws.QuestionId,
+    qws.Title,
+    qws.Score,
+    qws.ViewCount,
+    qws.IsClosed,
+    qws.CloseReason,
+    qws.CommentCount,
+    qws.UpVotes,
+    qws.DownVotes,
+    ad.AnswerId,
+    ad.Score,
+    ad.IsAccepted,
+    ad.SnippetAndOwner,
+    ad.AnswerCommentCount,
+    lq.QuestionB,
+    lq.LinkTypeName,
+    rhq.Title,
+    rhq.Score,
+    rhq.ViewCount,
+    rhq.LastUpVoteDate
+order by u.Reputation desc, qws.Score desc, ad.IsAccepted desc
+limit 100;

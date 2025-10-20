@@ -1,0 +1,185 @@
+with recursive TagHierarchy as (
+    select t.Id, t.TagName, t.Count, t.ExcerptPostId, t.WikiPostId, t.IsModeratorOnly, t.IsRequired, 0 as Level
+    from Tags t
+    where t.IsRequired = true
+
+    union all
+
+    select t2.Id, t2.TagName, t2.Count, t2.ExcerptPostId, t2.WikiPostId, t2.IsModeratorOnly, t2.IsRequired, th.Level + 1
+    from Tags t2
+    join TagHierarchy th on t2.Id <> th.Id and t2.IsRequired = true and t2.Count < th.Count
+    where th.Level < 3
+),
+UserBadgeRanks as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        count(b.Id) filter (where b.Class = 1) as GoldBadges,
+        count(b.Id) filter (where b.Class = 2) as SilverBadges,
+        count(b.Id) filter (where b.Class = 3) as BronzeBadges,
+        row_number() over (order by u.Reputation desc) as ReputationRank
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.DisplayName, u.Reputation
+), LatestQuestions as (
+    select
+        p.Id,
+        p.Title,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        u.DisplayName as OwnerName,
+        u.Reputation as OwnerReputation,
+        row_number() over (partition by p.OwnerUserId order by p.CreationDate desc) as rn
+    from Posts p
+    left join Users u on u.Id = p.OwnerUserId
+    where p.PostTypeId = 1
+), QuestionAnswers as (
+    select
+        a.Id,
+        a.ParentId as QuestionId,
+        a.Score,
+        a.CreationDate,
+        a.OwnerUserId,
+        u.DisplayName as OwnerName,
+        u.Reputation as OwnerReputation,
+        (select count(*) from Comments c where c.PostId = a.Id) as AnswerCommentCount
+    from Posts a
+    left join Users u on u.Id = a.OwnerUserId
+    where a.PostTypeId = 2
+), QuestionComments as (
+    select
+        c.PostId as QuestionId,
+        count(*) as CommentCount,
+        sum(c.Score) as TotalCommentScore,
+        max(c.CreationDate) as LastCommentDate
+    from Comments c
+    group by c.PostId
+), ClosingStats as (
+    select
+        ph.PostId,
+        count(case when ph.PostHistoryTypeId = 10 then 1 end) as CloseVotes,
+        count(case when ph.PostHistoryTypeId = 11 then 1 end) as ReopenVotes,
+        max(ph.CreationDate) as LastCloseActivity,
+        string_agg(distinct crt.Name, ', ') filter (where ph.PostHistoryTypeId = 10) as CloseReasons
+    from PostHistory ph
+    left join CloseReasonTypes crt on crt.Id = cast(ph.Comment as integer) and ph.PostHistoryTypeId = 10
+    group by ph.PostId
+), ScoreStats as (
+    select
+        p.Id,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        case when p.AcceptedAnswerId is not null then 1 else 0 end as HasAcceptedAnswer,
+        coalesce(qa.AnswerCount,0) as AnswerCount,
+        coalesce(qc.CommentCount,0) as QuestionCommentCount,
+        coalesce(cs.CloseVotes,0) as CloseVotes,
+        coalesce(cs.ReopenVotes,0) as ReopenVotes,
+        cs.LastCloseActivity,
+        cs.CloseReasons,
+        p.OwnerUserId
+    from Posts p
+    left join (
+        select ParentId, count(*) as AnswerCount
+        from Posts where PostTypeId = 2
+        group by ParentId
+    ) qa on qa.ParentId = p.Id
+    left join QuestionComments qc on qc.QuestionId = p.Id
+    left join ClosingStats cs on cs.PostId = p.Id
+    where p.PostTypeId = 1
+)
+select distinct
+    u.Id as UserId,
+    u.DisplayName,
+    u.Reputation,
+    ubr.GoldBadges,
+    ubr.SilverBadges,
+    ubr.BronzeBadges,
+    sq.Id as LatestQuestionId,
+    sq.Title as LatestQuestionTitle,
+    sq.CreationDate as LatestQuestionDate,
+    sq.Score as LatestQuestionScore,
+    sq.ViewCount as LatestQuestionViews,
+    sq.HasAcceptedAnswer,
+    sq.AnswerCount,
+    sq.QuestionCommentCount,
+    sq.CloseVotes,
+    sq.ReopenVotes,
+    sq.LastCloseActivity,
+    sq.CloseReasons,
+    (
+        select count(*) from Posts p2 
+        where p2.PostTypeId = 2 and p2.OwnerUserId = u.Id and p2.Score > 5
+    ) as HighScoringAnswersCount,
+    (
+        select avg(score) from Posts p3
+        where p3.PostTypeId = 2 and p3.OwnerUserId = u.Id and p3.Score > 0
+    ) as AvgAnswerScore,
+    (
+        select string_agg(distinct Tag, ',')
+        from (
+            select unnest(string_to_array(substring(p.Tags from 2 for length(p.Tags)-2), '><')) as Tag
+            from Posts p
+            where p.OwnerUserId = u.Id and p.PostTypeId = 1
+            order by p.CreationDate desc
+            limit 20
+        ) recent_tags
+    ) as RecentTags,
+    max(ph.CreationDate) as LastPostHistoryEdit,
+    sum(case when ph.PostHistoryTypeId in (10,12) then 1 else 0 end) as ClosureOrDeletionEvents,
+    count(ph.Id) as TotalPostHistoryCount,
+    case when u.LastAccessDate > cast('2024-10-01 12:34:56' as timestamp) - interval '1 year' then 1 else 0 end as RecentlyActive,
+    rank() over (order by u.Reputation desc) as ReputationRankOverAll,
+    dense_rank() over (partition by coalesce(u.Location, 'Unknown') order by u.Reputation desc) as LocationReputationRank
+from Users u
+left join UserBadgeRanks ubr on ubr.UserId = u.Id
+left join LatestQuestions sq on sq.OwnerUserId = u.Id and sq.rn = 1
+left join PostHistory ph on ph.UserId = u.Id
+left join ScoreStats ss on ss.OwnerUserId = u.Id
+where u.Reputation > (select percentile_cont(0.75) within group (order by Reputation) from Users)
+  and (sq.AnswerCount > 3 or sq.HasAcceptedAnswer = 1 or sq.ViewCount > 1000)
+group by u.Id, u.DisplayName, u.Reputation, ubr.GoldBadges, ubr.SilverBadges, ubr.BronzeBadges,
+         sq.Id, sq.Title, sq.CreationDate, sq.Score, sq.ViewCount, sq.HasAcceptedAnswer,
+         sq.AnswerCount, sq.QuestionCommentCount, sq.CloseVotes, sq.ReopenVotes, sq.LastCloseActivity,
+         sq.CloseReasons, ubr.ReputationRank, u.LastAccessDate, u.Location
+having count(ph.Id) > 10
+union
+select
+    u2.Id as UserId,
+    u2.DisplayName,
+    u2.Reputation,
+    0 as GoldBadges,
+    0 as SilverBadges,
+    0 as BronzeBadges,
+    null as LatestQuestionId,
+    null as LatestQuestionTitle,
+    null as LatestQuestionDate,
+    null as LatestQuestionScore,
+    null as LatestQuestionViews,
+    0 as HasAcceptedAnswer,
+    0 as AnswerCount,
+    0 as QuestionCommentCount,
+    0 as CloseVotes,
+    0 as ReopenVotes,
+    null as LastCloseActivity,
+    null as CloseReasons,
+    0 as HighScoringAnswersCount,
+    null as AvgAnswerScore,
+    null as RecentTags,
+    null as LastPostHistoryEdit,
+    0 as ClosureOrDeletionEvents,
+    0 as TotalPostHistoryCount,
+    0 as RecentlyActive,
+    null as ReputationRankOverAll,
+    null as LocationReputationRank
+from Users u2
+where not exists (
+    select 1 from Posts p4 where p4.OwnerUserId = u2.Id
+)
+order by Reputation desc
+limit 100;

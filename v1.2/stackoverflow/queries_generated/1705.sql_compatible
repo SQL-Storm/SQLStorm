@@ -1,0 +1,39 @@
+WITH RecursiveCTE AS (
+    SELECT
+        P.Id,
+        P.PostTypeId,
+        P.AcceptedAnswerId,
+        COALESCE(P.Tags, '') AS Tags,
+        PG.Number AS TagImportanceRank,
+        COALESCE(U.DisplayName, 'Unknown') AS OwnerName,
+        U.Reputation AS OwnerRep,
+        -- Calculate complex score adjustment with null coercions and date diff
+        (
+            P.Score
+            -- correlate answers count with partial owner reputation escalation
+            * (1 + COALESCE((SELECT COUNT(*) * 0.01 FROM Posts PA WHERE PA.ParentId = P.Id AND PA.Score > 5), 0))
+            + COALESCE(0.1 * (CAST(U.Reputation AS FLOAT) / GREATEST(EXTRACT(DAY FROM (DATE '2024-10-01' - U.CreationDate))::INT, 1)), 0)
+        ) AS ComplexScoreAdjustment
+    FROM Posts P
+    LEFT JOIN PostTags PG ON PG.PostId = P.Id
+    LEFT JOIN Users U ON U.Id = P.OwnerUserId
+)
+SELECT
+    Id,
+    PostTypeId,
+    AcceptedAnswerId,
+    Tags,
+    TagImportanceRank,
+    OwnerName,
+    OwnerRep,
+    ComplexScoreAdjustment
+FROM RecursiveCTE
+GROUP BY
+    Id,
+    PostTypeId,
+    AcceptedAnswerId,
+    Tags,
+    TagImportanceRank,
+    OwnerName,
+    OwnerRep,
+    ComplexScoreAdjustment;

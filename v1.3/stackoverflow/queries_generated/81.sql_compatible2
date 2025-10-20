@@ -1,0 +1,178 @@
+with RECURSIVE tag_hierarchy(tagid, tagname, depth, path) as (
+    select t.Id, t.TagName, 1 as depth, '/' || t.TagName || '/' as path
+    from Tags t
+    where t.TagName is not null
+  union all
+    select t.Id, t.TagName, th.depth + 1, th.path || t.TagName || '/'
+    from Tags t
+    join tag_hierarchy th on th.depth < 2 and t.TagName <> th.tagname
+), 
+question_stats as (
+    select
+        p.Id as QuestionId,
+        p.Title,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score as QuestionScore,
+        coalesce(p.ViewCount,0) as Views,
+        regexp_replace(coalesce(p.Tags,''), '[<>]', '', 'g') as RawTags,
+        split_part(coalesce(p.Tags,''), '><', 1) as FirstTagBlob,
+        (select count(*) from Posts a where a.ParentId = p.Id and a.PostTypeId = 2) as AnswerCountComputed,
+        (select count(*) from Comments c where c.PostId = p.Id) as CommentCountComputed,
+        (select max(v.CreationDate) from Votes v where v.PostId = p.Id) as LastVoteDate,
+        case when p.ClosedDate is not null then 1 else 0 end as IsClosed,
+        p.AcceptedAnswerId
+    from Posts p
+    where p.PostTypeId = 1
+), top_owners as (
+    select u.Id as UserId, u.DisplayName, u.Reputation,
+           row_number() over (order by u.Reputation desc, u.Id) as rn
+    from Users u
+    where u.Reputation is not null
+), owner_agg as (
+    select
+      q.QuestionId,
+      q.OwnerUserId,
+      coalesce(u.DisplayName, cast(q.OwnerUserId as varchar)) as OwnerName,
+      coalesce(u.Reputation, 0) as OwnerRep,
+      case when exists(select 1 from Badges b where b.UserId = u.Id and b.Class = 1) then 1 else 0 end as HasGoldBadge,
+      (select count(*) from Posts p2 where p2.OwnerUserId = u.Id and p2.PostTypeId = 1 and p2.CreationDate >= (cast('2024-10-01 12:34:56' as timestamp) - interval '365 days')) as QuestionsLastYear,
+      (select count(*) from Comments c where c.UserId = u.Id and c.CreationDate >= (cast('2024-10-01 12:34:56' as timestamp) - interval '30 days')) as CommentsLast30Days
+    from question_stats q
+    left join Users u on u.Id = q.OwnerUserId
+), answers_detail as (
+    select a.Id as AnswerId, a.ParentId as QuestionId, a.OwnerUserId as AnswerOwnerId, a.Score as AnswerScore, a.CreationDate as AnswerCreation,
+           row_number() over (partition by a.ParentId order by a.Score desc, a.CreationDate asc) as AnswerRank,
+           case when a.Id = q.AcceptedAnswerId then 1 else 0 end as IsAccepted,
+           (select count(*) from Comments c where c.PostId = a.Id) as AnswerCommentCount
+    from Posts a
+    join question_stats q on q.QuestionId = a.ParentId
+    where a.PostTypeId = 2
+), link_pairs as (
+    select pl.PostId, pl.RelatedPostId, lt.Name as LinkTypeName, pl.LinkTypeId
+    from PostLinks pl
+    left join LinkTypes lt on lt.Id = pl.LinkTypeId
+), vote_breakdown as (
+    select v.PostId,
+           sum(case when vt.Id = 2 then 1 else 0 end) as UpVotes,
+           sum(case when vt.Id = 3 then 1 else 0 end) as DownVotes,
+           sum(case when vt.Id = 5 then 1 else 0 end) as Favorites,
+           sum(case when vt.Id = 1 then 1 else 0 end) as AcceptedVotes,
+           count(*) as TotalVotes
+    from Votes v
+    left join VoteTypes vt on vt.Id = v.VoteTypeId
+    group by v.PostId
+), recent_edits as (
+    select ph.PostId, ph.UserId as EditorUserId, ph.PostHistoryTypeId, ph.CreationDate as EditDate,
+           row_number() over (partition by ph.PostId order by ph.CreationDate desc) as EditRank,
+           ph.Comment as EditComment
+    from PostHistory ph
+    where ph.PostHistoryTypeId in (4,5,6,24)
+), heavy_texts as (
+    select p.Id as PostId, length(coalesce(p.Body,'')) as BodyLen,
+           case when p.Body is null then 1 else 0 end as BodyIsNull,
+           md5(coalesce(p.Body, '')) as BodyHash,
+           length(coalesce(p.Title,'')) as TitleLen
+    from Posts p
+), tag_explode as (
+    select q.QuestionId,
+           trim(both '<>' from unnest(string_to_array(coalesce(q.RawTags,''), '><'))) as Tag
+    from question_stats q
+), tag_popularity as (
+    select t.Tag, count(*) as QuestionCount,
+           sum(q.Views) as TotalViews,
+           avg(q.QuestionScore) as AvgScore
+    from tag_explode t
+    join question_stats q on q.QuestionId = t.QuestionId
+    group by t.Tag
+), user_cross_activity as (
+    select u.Id as UserId,
+           coalesce((select count(*) from Posts p where p.OwnerUserId = u.Id and p.PostTypeId = 2),0) as AnswersWritten,
+           coalesce((select count(*) from Votes v where v.UserId = u.Id),0) as VotesCast,
+           coalesce((select count(*) from Badges b where b.UserId = u.Id),0) as BadgesEarned,
+           coalesce((select max(CreationDate) from Posts p where p.OwnerUserId = u.Id), u.CreationDate) as LastPostDate
+    from Users u
+), combined as (
+    select
+        q.QuestionId,
+        q.Title,
+        q.CreationDate as QuestionCreated,
+        q.Views,
+        q.QuestionScore,
+        oa.OwnerName,
+        oa.OwnerRep,
+        oa.HasGoldBadge,
+        oa.QuestionsLastYear,
+        oa.CommentsLast30Days,
+        coalesce(vb.UpVotes,0) as UpVotes,
+        coalesce(vb.DownVotes,0) as DownVotes,
+        coalesce(vb.Favorites,0) as Favorites,
+        coalesce(vb.TotalVotes,0) as TotalVotes,
+        q.AnswerCountComputed,
+        max(case when ad.IsAccepted = 1 then ad.AnswerScore end) as AcceptedAnswerScore,
+        max(case when ad.AnswerRank = 1 then ad.AnswerScore end) as TopAnswerScore,
+        sum(ad.AnswerCommentCount) as TotalAnswerComments,
+        (select array_agg(distinct (coalesce(lt.Name,'') || ':' || cast(lp.RelatedPostId as varchar))) from link_pairs lp left join LinkTypes lt on lt.Id = lp.LinkTypeId where lp.PostId = q.QuestionId) as LinksSummary,
+        (select json_group_array(json_object('Editor', re.EditorUserId, 'When', re.EditDate, 'Comment', re.EditComment))
+         from recent_edits re where re.PostId = q.QuestionId and re.EditRank <= 3) as RecentEdits,
+        ht.BodyLen,
+        ht.BodyIsNull,
+        ht.BodyHash,
+        tp.TotalViews as TagTotalViews,
+        tp.QuestionCount as TagQuestionCount,
+        tp.AvgScore as TagAvgScore,
+        q.IsClosed
+    from question_stats q
+    left join owner_agg oa on oa.QuestionId = q.QuestionId
+    left join vote_breakdown vb on vb.PostId = q.QuestionId
+    left join answers_detail ad on ad.QuestionId = q.QuestionId
+    left join heavy_texts ht on ht.PostId = q.QuestionId
+    left join tag_popularity tp on tp.Tag = split_part(q.RawTags,'><',1)
+    group by q.QuestionId, q.Title, q.CreationDate, q.Views, q.QuestionScore, oa.OwnerName, oa.OwnerRep, oa.HasGoldBadge, oa.QuestionsLastYear, oa.CommentsLast30Days, vb.UpVotes, vb.DownVotes, vb.Favorites, vb.TotalVotes, q.AnswerCountComputed, ht.BodyLen, ht.BodyIsNull, ht.BodyHash, tp.TotalViews, tp.QuestionCount, tp.AvgScore, q.IsClosed
+)
+select
+    c.QuestionId,
+    left(c.Title, 200) as SnippetTitle,
+    c.QuestionCreated,
+    c.Views,
+    c.QuestionScore,
+    c.OwnerName,
+    c.OwnerRep,
+    c.HasGoldBadge,
+    c.QuestionsLastYear,
+    c.CommentsLast30Days,
+    c.UpVotes,
+    c.DownVotes,
+    c.Favorites,
+    c.TotalVotes,
+    c.AnswerCountComputed,
+    coalesce(c.AcceptedAnswerScore, c.TopAnswerScore, 0) as BestAnswerScore,
+    c.TotalAnswerComments,
+    c.BodyLen,
+    c.BodyIsNull,
+    c.BodyHash,
+    coalesce(c.TagQuestionCount,0) as TagQuestionCount,
+    coalesce(c.TagTotalViews,0) as TagTotalViews,
+    coalesce(c.TagAvgScore,0) as TagAvgScore,
+    (case
+        when c.IsClosed = 1 then 'closed'
+        when c.TotalVotes > 100 and c.QuestionScore > 10 then 'hot'
+        when c.Views > 10000 or c.UpVotes - c.DownVotes > 50 then 'popular'
+        else 'normal'
+     end) as TrafficClass,
+    rank() over (partition by coalesce(c.TagQuestionCount,0) order by c.Views desc, c.QuestionScore desc) as TagViewRank,
+    dense_rank() over (order by c.OwnerRep desc) as OwnerRepRank,
+    greatest(coalesce(c.Views,0), coalesce(c.TotalVotes,0) * 10, coalesce(c.AnswerCountComputed,0) * 100) as LoadEstimate,
+    coalesce(c.LinksSummary, array[] ) as LinksSummary,
+    coalesce(c.RecentEdits, '[]') as RecentEditsJson
+from combined c
+left join question_stats qs on qs.QuestionId = c.QuestionId
+where (
+      (c.Views > 5000 and coalesce(c.UpVotes,0) > 10)
+      or (c.OwnerRep > 10000 and c.AnswerCountComputed >= 5)
+      or (c.TagQuestionCount > 100 and coalesce(c.TagTotalViews,0) > 100000)
+      or (c.BodyIsNull = 1)
+)
+and (c.QuestionCreated > (cast('2024-10-01 12:34:56' as timestamp) - interval '5 years') or c.OwnerRep > 5000)
+order by TagViewRank asc, LoadEstimate desc, c.QuestionScore desc
+limit 250;

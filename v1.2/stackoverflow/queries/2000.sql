@@ -1,0 +1,37 @@
+WITH RECURSIVE RecursiveThreads AS (
+    SELECT
+        p.Id,
+        p.PostTypeId,
+        p.Title,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.ParentId,
+        1 AS depth,
+        ARRAY[p.Id] AS path_ids
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+
+    UNION ALL
+
+    SELECT
+        p.Id,
+        p.PostTypeId,
+        p.Title,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.ParentId,
+        rt.depth + 1 AS depth,
+        rt.path_ids || ARRAY[p.Id] AS path_ids
+    FROM Posts p
+    JOIN RecursiveThreads rt ON p.ParentId = rt.Id
+)
+SELECT
+    Id,
+    PostTypeId,
+    Title,
+    OwnerUserId,
+    CreationDate,
+    ParentId,
+    depth,
+    path_ids
+FROM RecursiveThreads;

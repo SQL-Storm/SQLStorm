@@ -1,0 +1,59 @@
+WITH RecursiveUserBadges AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        B.Name AS BadgeName,
+        B.Class,
+        ROW_NUMBER() OVER (PARTITION BY U.Id ORDER BY B.Date DESC) AS rn
+    FROM Users U
+    LEFT JOIN Badges B ON U.Id = B.UserId
+    WHERE B.Name IS NOT NULL
+),
+LatestBadges AS (
+    SELECT
+        UserId,
+        -- use standard array aggregation; keep FILTER which is supported in many dialects
+        array_agg(BadgeName ORDER BY Class, BadgeName) FILTER (WHERE rn <= 5) AS TopBadges
+    FROM RecursiveUserBadges
+    GROUP BY UserId
+),
+TopQuestions AS (
+    SELECT
+        P.Id AS QuestionId,
+        P.OwnerUserId,
+        COALESCE(P.Score, 0)
+        + COALESCE(P.ViewCount / 100.0, 0)
+        + LEAST(
+            EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - P.CreationDate)) / 86400.0,
+            contrib_age_days.max_age
+          ) AS PopularityScore,
+        P.AnswerCount,
+        P.Tags,
+        P.Title
+    FROM Posts P
+    LEFT JOIN (
+        -- placeholder for contrib_age_days subquery or table; adjust as appropriate
+        SELECT 30.0 AS max_age
+    ) AS contrib_age_days ON TRUE
+)
+SELECT
+    U.Id AS UserId,
+    U.DisplayName,
+    COALESCE(LB.TopBadges, ARRAY[]::text[]) AS TopBadges,
+    TQ.QuestionId,
+    TQ.PopularityScore,
+    TQ.AnswerCount,
+    TQ.Tags,
+    TQ.Title
+FROM Users U
+LEFT JOIN LatestBadges LB ON U.Id = LB.UserId
+LEFT JOIN TopQuestions TQ ON U.Id = TQ.OwnerUserId
+GROUP BY
+    U.Id,
+    U.DisplayName,
+    LB.TopBadges,
+    TQ.QuestionId,
+    TQ.PopularityScore,
+    TQ.AnswerCount,
+    TQ.Tags,
+    TQ.Title;

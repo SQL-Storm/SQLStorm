@@ -1,0 +1,37 @@
+WITH RECURSIVE RecursiveBadges AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        b.Name AS BadgeName,
+        b.Class AS BadgeClass,
+        CAST(ARRAY[b.Name] AS character varying[]) AS MedalTrail
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    WHERE b.Class = 1
+
+    UNION ALL
+
+    SELECT
+        rb.UserId,
+        rb.DisplayName,
+        b.Name,
+        b.Class,
+        rb.MedalTrail || b.Name
+    FROM RecursiveBadges rb
+    JOIN Badges b
+      ON b.UserId = rb.UserId
+     AND b.Class > (
+         SELECT MIN(bb.Class)
+         FROM Badges bb
+         WHERE bb.UserId = rb.UserId
+           AND bb.Name = ANY(rb.MedalTrail)
+     )
+    WHERE array_length(rb.MedalTrail, 1) IS NOT NULL
+)
+SELECT
+    rb.UserId,
+    rb.DisplayName,
+    rb.BadgeName,
+    rb.BadgeClass,
+    rb.MedalTrail
+FROM RecursiveBadges rb;

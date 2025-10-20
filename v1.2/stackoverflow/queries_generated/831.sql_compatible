@@ -1,0 +1,218 @@
+with UserBadgeCounts as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        count(b.Id) filter (where b.Class = 1) as GoldBadges,
+        count(b.Id) filter (where b.Class = 2) as SilverBadges,
+        count(b.Id) filter (where b.Class = 3) as BronzeBadges,
+        sum(case when b.TagBased = 1 then 1 else 0 end) as TagBasedBadges,
+        rank() over (order by count(b.Id) desc) as BadgeRank
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.DisplayName
+),
+QuestionAnswerStats as (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        q.OwnerUserId,
+        u.DisplayName as OwnerName,
+        q.CreationDate as QuestionCreated,
+        q.Score as QuestionScore,
+        q.ViewCount,
+        q.Tags,
+        coalesce(a.AnswerCount, 0) as AnswerCount,
+        coalesce(aa.MaxAnswerScore, 0) as MaxAnswerScore,
+        coalesce(aa.AverageAnswerScore, 0) as AverageAnswerScore,
+        q.AcceptedAnswerId,
+        case when q.ClosedDate is not null then 1 else 0 end as IsClosed
+    from Posts q
+    left join (
+        select ParentId, count(*) as AnswerCount
+        from Posts
+        where PostTypeId = 2
+        group by ParentId
+    ) a on a.ParentId = q.Id
+    left join (
+        select ParentId,
+            max(Score) as MaxAnswerScore,
+            avg(Score) as AverageAnswerScore
+        from Posts
+        where PostTypeId = 2
+        group by ParentId
+    ) aa on aa.ParentId = q.Id
+    left join Users u on u.Id = q.OwnerUserId
+    where q.PostTypeId = 1
+),
+PostLinkDuplicates as (
+    select
+        pl.PostId,
+        count(distinct pl.RelatedPostId) filter (where lt.Name = 'Duplicate') as DuplicateLinksCount,
+        bool_or(lt.Name = 'Duplicate') as HasDuplicateLink
+    from PostLinks pl
+    inner join LinkTypes lt on lt.Id = pl.LinkTypeId
+    group by pl.PostId
+),
+QuestionCommentsStats as (
+    select
+        p.Id as PostId,
+        count(c.Id) as CommentCount,
+        sum(c.Score) as CommentScoreSum,
+        string_agg(distinct coalesce(c.UserDisplayName, 'Anonymous'), ', ') as Commenters
+    from Posts p
+    left join Comments c on c.PostId = p.Id
+    where p.PostTypeId = 1
+    group by p.Id
+),
+PostHistoryCloseReasons as (
+    select
+        ph.PostId,
+        crt.Name as CloseReasonName,
+        ph.CreationDate as CloseDate
+    from PostHistory ph
+    left join CloseReasonTypes crt on crt.Id = cast(ph.Comment as int)
+    where ph.PostHistoryTypeId = 10
+),
+TopTagsByQuestions as (
+    select
+        tag,
+        count(*) as QuestionCount
+    from (
+        select unnest(string_to_array(substring(Tags from 2 for char_length(Tags) - 2), '><')) as tag
+        from Posts
+        where PostTypeId = 1 and Tags is not null
+    ) t
+    group by tag
+    order by QuestionCount desc
+    limit 10
+),
+UserRecentActivity as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        max(ph.CreationDate) as LastPostHistoryDate,
+        max(p.LastActivityDate) as LastPostActivityDate,
+        max(c.CreationDate) as LastCommentDate,
+        greatest(
+            coalesce(max(ph.CreationDate), cast('1970-01-01' as timestamp)),
+            coalesce(max(p.LastActivityDate), cast('1970-01-01' as timestamp)),
+            coalesce(max(c.CreationDate), cast('1970-01-01' as timestamp))
+        ) as LastActivity
+    from Users u
+    left join PostHistory ph on ph.UserId = u.Id
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Comments c on c.UserId = u.Id
+    group by u.Id, u.DisplayName
+),
+MainResults as (
+select  
+    q.QuestionId,
+    q.Title,
+    q.OwnerName,
+    q.QuestionCreated,
+    q.QuestionScore,
+    q.ViewCount,
+    q.Tags,
+    q.AnswerCount,
+    q.MaxAnswerScore,
+    round(cast(q.AverageAnswerScore as numeric), 2) as AverageAnswerScore,
+    plc.DuplicateLinksCount,
+    plc.HasDuplicateLink,
+    coalesce(qcs.CommentCount, 0) as CommentCount,
+    coalesce(qcs.CommentScoreSum, 0) as CommentScoreSum,
+    qcs.Commenters,
+    phcr.CloseReasonName,
+    phcr.CloseDate,
+    ubc.GoldBadges,
+    ubc.SilverBadges,
+    ubc.BronzeBadges,
+    ubc.TagBasedBadges,
+    ubc.BadgeRank,
+    ura.LastActivity,
+    case 
+        when q.IsClosed = 1 then 'Closed' 
+        when q.AnswerCount > 0 and q.MaxAnswerScore >= 10 then 'Highly Answered' 
+        else 'Open' 
+    end as QuestionStatus,
+    concat(
+        left(q.Title, 50),
+        '... [Tags: ', coalesce(
+            (select string_agg(tag, ', ') from unnest(string_to_array(substring(q.Tags from 2 for char_length(q.Tags) - 2), '><')) as tag),
+            'No tags'
+        ), ']'
+    ) as TitleWithTags
+from QuestionAnswerStats q
+left join PostLinkDuplicates plc on plc.PostId = q.QuestionId
+left join QuestionCommentsStats qcs on qcs.PostId = q.QuestionId
+left join PostHistoryCloseReasons phcr on phcr.PostId = q.QuestionId and phcr.CloseDate = (
+    select max(ph2.CreationDate) from PostHistory ph2 where ph2.PostId = q.QuestionId and ph2.PostHistoryTypeId = 10
+)
+left join UserBadgeCounts ubc on ubc.UserId = q.OwnerUserId
+left join UserRecentActivity ura on ura.UserId = q.OwnerUserId
+where q.QuestionCreated >= cast('2024-10-01' as date) - interval '180 days'
+  and (q.QuestionScore > 0 or q.AnswerCount > 0)
+)
+select * from MainResults
+order by QuestionScore desc, ViewCount desc
+limit 50
+
+union all
+
+select
+    t_row.QuestionId,
+    t_row.Title,
+    t_row.OwnerName,
+    t_row.QuestionCreated,
+    t_row.QuestionScore,
+    t_row.ViewCount,
+    t_row.Tags,
+    t_row.AnswerCount,
+    t_row.MaxAnswerScore,
+    t_row.AverageAnswerScore,
+    t_row.DuplicateLinksCount,
+    t_row.HasDuplicateLink,
+    t_row.CommentCount,
+    t_row.CommentScoreSum,
+    t_row.Commenters,
+    t_row.CloseReasonName,
+    t_row.CloseDate,
+    t_row.GoldBadges,
+    t_row.SilverBadges,
+    t_row.BronzeBadges,
+    t_row.TagBasedBadges,
+    t_row.BadgeRank,
+    t_row.LastActivity,
+    t_row.QuestionStatus,
+    t_row.TitleWithTags
+from (
+    select
+        t.Id as QuestionId,
+        t.TagName as Title,
+        null as OwnerName,
+        null as QuestionCreated,
+        0 as QuestionScore,
+        0 as ViewCount,
+        null as Tags,
+        0 as AnswerCount,
+        0 as MaxAnswerScore,
+        0 as AverageAnswerScore,
+        0 as DuplicateLinksCount,
+        false as HasDuplicateLink,
+        0 as CommentCount,
+        0 as CommentScoreSum,
+        null as Commenters,
+        null as CloseReasonName,
+        null as CloseDate,
+        0 as GoldBadges,
+        0 as SilverBadges,
+        0 as BronzeBadges,
+        0 as TagBasedBadges,
+        null as BadgeRank,
+        null as LastActivity,
+        'TagSummary' as QuestionStatus,
+        concat('Top Tag: ', t.tag, ' (Questions: ', t.QuestionCount, ')') as TitleWithTags,
+        row_number() over () as rn
+    from TopTagsByQuestions t
+) t_row
+order by rn
+limit 10;

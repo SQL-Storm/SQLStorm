@@ -1,0 +1,177 @@
+WITH RecursiveUserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionCount,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswerCount,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        SUM(CASE WHEN vt.Name = 'UpMod' THEN 1 ELSE 0 END) AS TotalUpVotes,
+        SUM(CASE WHEN vt.Name = 'DownMod' THEN 1 ELSE 0 END) AS TotalDownVotes
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Comments c ON c.UserId = u.Id
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    LEFT JOIN Votes v ON v.UserId = u.Id
+    LEFT JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate
+),
+UserRankings AS (
+    SELECT
+        UserId,
+        DisplayName,
+        Reputation,
+        QuestionCount,
+        AnswerCount,
+        CommentCount,
+        BadgeCount,
+        TotalUpVotes,
+        TotalDownVotes,
+        ROW_NUMBER() OVER (ORDER BY Reputation DESC, QuestionCount DESC, AnswerCount DESC) AS RankByReputation,
+        RANK() OVER (PARTITION BY BadgeCount ORDER BY Reputation DESC) AS RankWithinBadgeCount
+    FROM RecursiveUserActivity
+),
+TopUsers AS (
+    SELECT * FROM UserRankings WHERE RankByReputation <= 100
+),
+PostAggregates AS (
+    SELECT
+        p.OwnerUserId AS UserId,
+        COUNT(*) FILTER (WHERE p.PostTypeId = 1) AS TotalQuestions,
+        COUNT(*) FILTER (WHERE p.PostTypeId = 2) AS TotalAnswers,
+        AVG(p.Score) FILTER (WHERE p.PostTypeId IN (1,2)) AS AvgPostScore,
+        MAX(p.Score) FILTER (WHERE p.PostTypeId IN (1,2)) AS MaxPostScore,
+        SUM(p.ViewCount) FILTER (WHERE p.PostTypeId = 1) AS TotalQuestionViews,
+        BOOL_OR(p.ClosedDate IS NOT NULL) AS HasClosedPosts
+    FROM Posts p
+    GROUP BY p.OwnerUserId
+),
+UserActivityWithPosts AS (
+    SELECT
+        tu.UserId,
+        tu.DisplayName,
+        tu.Reputation,
+        tu.QuestionCount,
+        tu.AnswerCount,
+        tu.CommentCount,
+        tu.BadgeCount,
+        tu.TotalUpVotes,
+        tu.TotalDownVotes,
+        pa.TotalQuestions,
+        pa.TotalAnswers,
+        pa.AvgPostScore,
+        pa.MaxPostScore,
+        pa.TotalQuestionViews,
+        pa.HasClosedPosts,
+        CASE WHEN pa.HasClosedPosts THEN 'Yes' ELSE 'No' END AS ClosedPostsFlag
+    FROM TopUsers tu
+    LEFT JOIN PostAggregates pa ON pa.UserId = tu.UserId
+),
+UserCloseReasons AS (
+    SELECT
+        ph.UserId,
+        crt.Name AS CloseReason,
+        COUNT(*) AS CloseCount
+    FROM PostHistory ph
+    JOIN CloseReasonTypes crt ON crt.Id = CAST(ph.Comment AS INTEGER)
+    WHERE ph.PostHistoryTypeId = 10 AND ph.UserId IS NOT NULL
+    GROUP BY ph.UserId, crt.Name
+),
+UserCloseReasonSummary AS (
+    SELECT
+        UserId,
+        STRING_AGG(format('%s (%s)', CloseReason, CloseCount), ', ') AS CloseReasonsSummary
+    FROM UserCloseReasons
+    GROUP BY UserId
+),
+UserFinalSummary AS (
+    SELECT
+        ua.UserId,
+        ua.DisplayName,
+        ua.Reputation,
+        ua.QuestionCount,
+        ua.AnswerCount,
+        ua.CommentCount,
+        ua.BadgeCount,
+        ua.TotalUpVotes,
+        ua.TotalDownVotes,
+        ua.TotalQuestions,
+        ua.TotalAnswers,
+        ua.AvgPostScore,
+        ua.MaxPostScore,
+        ua.TotalQuestionViews,
+        ua.ClosedPostsFlag,
+        COALESCE(ucs.CloseReasonsSummary, 'None') AS CloseReasonsSummary,
+        DENSE_RANK() OVER (ORDER BY ua.Reputation DESC) AS ReputationRank,
+        NTILE(4) OVER (ORDER BY ua.TotalUpVotes DESC) AS UpVotesQuartile
+    FROM UserActivityWithPosts ua
+    LEFT JOIN UserCloseReasonSummary ucs ON ucs.UserId = ua.UserId
+),
+PrimaryResults AS (
+    SELECT
+        ufs.UserId,
+        ufs.DisplayName,
+        ufs.Reputation,
+        ufs.ReputationRank,
+        ufs.QuestionCount,
+        ufs.AnswerCount,
+        ufs.CommentCount,
+        ufs.BadgeCount,
+        ufs.TotalUpVotes,
+        ufs.TotalDownVotes,
+        ufs.TotalQuestions,
+        ufs.TotalAnswers,
+        ROUND(CAST(ufs.AvgPostScore AS NUMERIC), 2) AS AvgPostScore,
+        ufs.MaxPostScore,
+        ufs.TotalQuestionViews,
+        ufs.ClosedPostsFlag,
+        ufs.CloseReasonsSummary,
+        ufs.UpVotesQuartile,
+        CASE
+            WHEN ufs.Reputation > 100000 THEN 'Legendary'
+            WHEN ufs.Reputation > 50000 THEN 'Expert'
+            WHEN ufs.Reputation > 10000 THEN 'Intermediate'
+            ELSE 'Beginner'
+        END AS UserLevel,
+        CONCAT_WS(' | ',
+            COALESCE(ufs.DisplayName, 'Unknown'),
+            'Rep: ' || ufs.Reputation,
+            'Q: ' || ufs.QuestionCount,
+            'A: ' || ufs.AnswerCount,
+            'Badges: ' || ufs.BadgeCount
+        ) AS UserSummaryString
+    FROM UserFinalSummary ufs
+    WHERE ufs.BadgeCount > 0
+    ORDER BY ufs.Reputation DESC, ufs.TotalUpVotes DESC
+    LIMIT 50
+)
+SELECT * FROM PrimaryResults
+
+UNION ALL
+
+SELECT
+    NULL AS UserId,
+    'Aggregate Totals' AS DisplayName,
+    SUM(Reputation) AS Reputation,
+    NULL AS ReputationRank,
+    SUM(QuestionCount) AS QuestionCount,
+    SUM(AnswerCount) AS AnswerCount,
+    SUM(CommentCount) AS CommentCount,
+    SUM(BadgeCount) AS BadgeCount,
+    SUM(TotalUpVotes) AS TotalUpVotes,
+    SUM(TotalDownVotes) AS TotalDownVotes,
+    SUM(TotalQuestions) AS TotalQuestions,
+    SUM(TotalAnswers) AS TotalAnswers,
+    NULL::numeric AS AvgPostScore,
+    NULL::integer AS MaxPostScore,
+    SUM(TotalQuestionViews) AS TotalQuestionViews,
+    NULL::text AS ClosedPostsFlag,
+    NULL::text AS CloseReasonsSummary,
+    NULL::integer AS UpVotesQuartile,
+    NULL::text AS UserLevel,
+    NULL::text AS UserSummaryString
+FROM UserFinalSummary
+WHERE BadgeCount > 0;

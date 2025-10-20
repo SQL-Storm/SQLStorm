@@ -1,0 +1,16 @@
+WITH RecursiveQuestions AS (
+    SELECT
+        p.Id,
+        p.CreationDate,
+        p.Score,
+        COALESCE(array_agg(DISTINCT t.TagName) FILTER (WHERE t.TagName IS NOT NULL), '{}') AS TagList,
+        u.DisplayName AS OwnerName
+    FROM posts p
+    LEFT JOIN PostTags pt ON pt.PostId = p.Id
+    LEFT JOIN Tags t ON t.Id = pt.TagId
+    LEFT JOIN Users u ON u.Id = p.OwnerUserId
+    WHERE p.PostTypeId = 1
+    GROUP BY p.Id, p.CreationDate, p.Score, u.DisplayName
+)
+SELECT *
+FROM RecursiveQuestions;

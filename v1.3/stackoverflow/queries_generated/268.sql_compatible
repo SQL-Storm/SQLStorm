@@ -1,0 +1,203 @@
+WITH exploded_tags AS (
+  SELECT
+    p.Id AS qid,
+    trim(tag) AS tag
+  FROM Posts p
+  CROSS JOIN LATERAL (
+    SELECT unnest(string_to_array(substring(p.Tags, 2, char_length(p.Tags) - 2), '><')) AS tag
+  ) t
+  WHERE p.PostTypeId = 1
+),
+tag_agg AS (
+  SELECT
+    et.tag,
+    count(*) AS question_count,
+    avg(p.Score) AS avg_score,
+    sum(p.ViewCount) AS total_views,
+    percentile_cont(0.5) WITHIN GROUP (ORDER BY p.Score) AS median_score
+  FROM exploded_tags et
+  JOIN Posts p ON p.Id = et.qid
+  GROUP BY et.tag
+  HAVING count(*) > 10
+),
+question_features AS (
+  SELECT
+    p.Id AS question_id,
+    p.Title,
+    p.Tags,
+    p.OwnerUserId,
+    p.Score,
+    p.ViewCount,
+    p.CreationDate,
+    et.tag,
+    (SELECT count(*) FROM Posts a WHERE a.ParentId = p.Id) AS actual_answer_count,
+    (SELECT string_agg(s.DisplayName, ', ')
+     FROM (
+       SELECT u.DisplayName, u.Reputation
+       FROM Posts pa
+       JOIN Users u ON pa.OwnerUserId = u.Id
+       WHERE pa.ParentId = p.Id AND pa.OwnerUserId IS NOT NULL
+       GROUP BY u.DisplayName, u.Reputation
+       ORDER BY u.Reputation DESC NULLS LAST
+       LIMIT 3
+     ) s
+    ) AS top_answerers,
+    (SELECT c.Text FROM Comments c WHERE c.PostId = p.Id ORDER BY c.CreationDate DESC LIMIT 1) AS latest_comment,
+    pa.Score AS accepted_answer_score,
+    pa.OwnerUserId AS accepted_answer_owner,
+    row_number() OVER (PARTITION BY et.tag ORDER BY p.Score DESC NULLS LAST, p.ViewCount DESC NULLS LAST, p.CreationDate ASC) AS rank_in_tag,
+    dense_rank() OVER (PARTITION BY et.tag ORDER BY p.Score DESC NULLS LAST) AS dense_rank_score,
+    ntile(10) OVER (PARTITION BY et.tag ORDER BY p.ViewCount DESC NULLS LAST) AS decile_views,
+    trim(coalesce(p.Title, '')) || ' [' || coalesce(et.tag, 'untagged') || ']' AS title_with_tag
+  FROM Posts p
+  JOIN exploded_tags et ON et.qid = p.Id
+  LEFT JOIN Posts pa ON pa.Id = p.AcceptedAnswerId
+  WHERE p.PostTypeId = 1
+),
+combined AS (
+  SELECT
+    qf.question_id,
+    qf.Title,
+    qf.Tags,
+    qf.OwnerUserId,
+    qf.Score,
+    qf.ViewCount,
+    qf.CreationDate,
+    qf.tag,
+    qf.actual_answer_count,
+    qf.top_answerers,
+    qf.latest_comment,
+    qf.accepted_answer_score,
+    qf.accepted_answer_owner,
+    qf.rank_in_tag,
+    qf.dense_rank_score,
+    qf.decile_views,
+    qf.title_with_tag,
+    ta.question_count,
+    ta.avg_score,
+    ta.total_views,
+    ta.median_score,
+    (
+      COALESCE(qf.Score, 0) * ln(1 + GREATEST(COALESCE(qf.ViewCount, 0), 0) + 1)
+      * (1 + COALESCE((CAST(qf.accepted_answer_score AS numeric)) / NULLIF(qf.actual_answer_count, 0), 0))
+      * (1 + (ta.avg_score / NULLIF(ABS(ta.median_score) + 1, 0)))
+      / (1 + GREATEST(CAST(qf.rank_in_tag AS numeric) - 1, 0))
+    ) + (
+      EXP(-EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - qf.CreationDate)) / 86400.0 / 30.0) * 10
+    ) AS hotness_score
+  FROM question_features qf
+  JOIN tag_agg ta ON ta.tag = qf.tag
+  WHERE qf.rank_in_tag <= 100
+
+  UNION ALL
+
+  SELECT
+    qf.question_id,
+    qf.Title,
+    qf.Tags,
+    qf.OwnerUserId,
+    qf.Score,
+    qf.ViewCount,
+    qf.CreationDate,
+    qf.tag,
+    qf.actual_answer_count,
+    qf.top_answerers,
+    qf.latest_comment,
+    qf.accepted_answer_score,
+    qf.accepted_answer_owner,
+    qf.rank_in_tag,
+    qf.dense_rank_score,
+    qf.decile_views,
+    qf.title_with_tag,
+    ta.question_count,
+    ta.avg_score,
+    ta.total_views,
+    ta.median_score,
+    (
+      (COALESCE(qf.Score, 0) + COALESCE(ta.avg_score, 0) / NULLIF(LEAST(ta.question_count, 100)::integer, 0))
+      * (1 + sqrt(GREATEST(COALESCE(qf.ViewCount, 0), 1))) 
+      * CASE WHEN qf.actual_answer_count IS NULL OR qf.actual_answer_count = 0 THEN 1.25 ELSE 1.0 END
+      + (CASE WHEN qf.top_answerers IS NULL THEN 0 ELSE length(qf.top_answerers) END) * 0.1
+    ) / (1 + CAST(qf.rank_in_tag AS numeric))
+    AS hotness_score
+  FROM question_features qf
+  JOIN tag_agg ta ON ta.tag = qf.tag
+  WHERE ta.question_count BETWEEN 2 AND 10
+),
+filtered AS (
+  SELECT
+    question_id, Title, Tags, OwnerUserId, Score, ViewCount, CreationDate, tag,
+    actual_answer_count, top_answerers, latest_comment, accepted_answer_score, accepted_answer_owner,
+    rank_in_tag, dense_rank_score, decile_views, title_with_tag,
+    question_count, avg_score, total_views, median_score, hotness_score
+  FROM combined
+
+  EXCEPT
+
+  SELECT
+    question_id, Title, Tags, OwnerUserId, Score, ViewCount, CreationDate, tag,
+    actual_answer_count, top_answerers, latest_comment, accepted_answer_score, accepted_answer_owner,
+    rank_in_tag, dense_rank_score, decile_views, title_with_tag,
+    question_count, avg_score, total_views, median_score, hotness_score
+  FROM combined
+  WHERE OwnerUserId IS NULL
+),
+final_ranked AS (
+  SELECT
+    f.question_id,
+    f.Title,
+    f.Tags,
+    f.OwnerUserId,
+    f.Score,
+    f.ViewCount,
+    f.CreationDate,
+    f.tag,
+    f.actual_answer_count,
+    f.top_answerers,
+    f.latest_comment,
+    f.accepted_answer_score,
+    f.accepted_answer_owner,
+    f.rank_in_tag,
+    f.dense_rank_score,
+    f.decile_views,
+    f.title_with_tag,
+    f.question_count,
+    f.avg_score,
+    f.total_views,
+    f.median_score,
+    f.hotness_score,
+    rank() OVER (ORDER BY f.hotness_score DESC NULLS LAST) AS global_rank,
+    avg(f.hotness_score) OVER (PARTITION BY f.tag) AS avg_hotness_by_tag,
+    min(f.hotness_score) OVER (PARTITION BY f.tag) AS min_hotness_by_tag,
+    max(f.hotness_score) OVER (PARTITION BY f.tag) AS max_hotness_by_tag,
+    count(*) OVER (PARTITION BY f.tag) AS rows_per_tag,
+    (CASE
+      WHEN (f.Title ILIKE '%error%' OR coalesce(f.latest_comment, '') ILIKE '%error%') AND COALESCE(f.accepted_answer_score, 0) > 0 THEN true
+      WHEN f.OwnerUserId IS NULL OR COALESCE(f.Score, 0) < -5 THEN false
+      ELSE (f.decile_views <= 3 AND f.actual_answer_count >= 1)
+    END) AS candidate_flag
+  FROM filtered f
+)
+SELECT
+  question_id,
+  title_with_tag,
+  tag,
+  OwnerUserId,
+  Score,
+  ViewCount,
+  actual_answer_count,
+  top_answerers,
+  coalesce(substring(Tags from 1 for 200), '') AS tags_snippet,
+  coalesce(latest_comment, '[no comments]') AS latest_comment_preview,
+  accepted_answer_score,
+  hotness_score,
+  global_rank,
+  avg_hotness_by_tag,
+  min_hotness_by_tag,
+  max_hotness_by_tag,
+  rows_per_tag,
+  candidate_flag
+FROM final_ranked
+WHERE candidate_flag = true OR global_rank <= 200
+ORDER BY hotness_score DESC NULLS LAST, avg_hotness_by_tag DESC
+LIMIT 500;

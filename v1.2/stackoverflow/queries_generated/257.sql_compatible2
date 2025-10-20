@@ -1,0 +1,186 @@
+with RecursiveUserActivity as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionCount,
+        count(distinct p.Id) filter (where p.PostTypeId = 2) as AnswerCount,
+        count(distinct c.Id) as CommentCount,
+        count(distinct b.Id) as BadgeCount,
+        row_number() over (order by u.Reputation desc, u.LastAccessDate desc) as UserRank
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Comments c on c.UserId = u.Id
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate
+),
+TopUsersWithRecentPosts as (
+    select
+        rua.UserId,
+        rua.DisplayName,
+        rua.Reputation,
+        rua.QuestionCount,
+        rua.AnswerCount,
+        rua.CommentCount,
+        rua.BadgeCount,
+        rua.UserRank,
+        p.Id as PostId,
+        p.PostTypeId,
+        p.Title,
+        p.CreationDate as PostCreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        p.AcceptedAnswerId,
+        p.ParentId,
+        p.ClosedDate,
+        ph.PostHistoryTypeId,
+        ph.CreationDate as HistoryDate,
+        ph.Comment as CloseReasonId,
+        crt.Name as CloseReasonName,
+        vt.Name as VoteTypeName,
+        v.CreationDate as VoteDate,
+        v.BountyAmount,
+        b.Name as BadgeName,
+        b.Class as BadgeClass,
+        b.Date as BadgeDate
+    from RecursiveUserActivity rua
+    left join Posts p on p.OwnerUserId = rua.UserId
+    left join PostHistory ph on ph.PostId = p.Id and ph.PostHistoryTypeId = 10 -- Post Closed
+    left join CloseReasonTypes crt on crt.Id = cast(ph.Comment as integer)
+    left join Votes v on v.PostId = p.Id
+    left join VoteTypes vt on vt.Id = v.VoteTypeId
+    left join Badges b on b.UserId = rua.UserId
+    where rua.UserRank <= 100
+),
+AggregatedUserStats as (
+    select
+        UserId,
+        DisplayName,
+        sum(case when PostTypeId = 1 then 1 else 0 end) as TotalQuestions,
+        sum(case when PostTypeId = 2 then 1 else 0 end) as TotalAnswers,
+        count(distinct PostId) as TotalPosts,
+        count(distinct case when ClosedDate is not null then PostId end) as ClosedPosts,
+        avg(Score) filter (where PostTypeId in (1,2)) as AvgPostScore,
+        max(ViewCount) filter (where PostTypeId = 1) as MaxQuestionViews,
+        count(distinct BadgeName) as DistinctBadges,
+        max(BadgeDate) as LastBadgeDate,
+        max(VoteDate) as LastVoteDate,
+        sum(BountyAmount) as TotalBountyAwarded
+    from TopUsersWithRecentPosts
+    group by UserId, DisplayName
+),
+RankedPosts as (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        p.OwnerUserId,
+        row_number() over (partition by p.OwnerUserId order by p.Score desc, p.CreationDate desc) as PostRank
+    from Posts p
+    where p.PostTypeId in (1, 2)
+),
+DuplicateLinks as (
+    select
+        pl.PostId,
+        pl.RelatedPostId,
+        pl.CreationDate,
+        pl.LinkTypeId,
+        lt.Name as LinkTypeName,
+        p1.Title as PostTitle,
+        p2.Title as RelatedPostTitle
+    from PostLinks pl
+    join LinkTypes lt on lt.Id = pl.LinkTypeId
+    join Posts p1 on p1.Id = pl.PostId
+    join Posts p2 on p2.Id = pl.RelatedPostId
+    where pl.LinkTypeId = 3 -- Duplicate
+),
+UserTagActivity as (
+    select
+        u.Id as UserId,
+        t.TagName,
+        count(distinct p.Id) as PostsWithTag,
+        sum(p.Score) as TotalScoreForTag,
+        max(p.CreationDate) as LastPostDateForTag
+    from Users u
+    join Posts p on p.OwnerUserId = u.Id and p.PostTypeId = 1
+    cross join lateral (
+        select regexp_split_to_table(substring(p.Tags from 2 for length(p.Tags) - 2), '\>\<') as TagName
+    ) t
+    join Tags tg on tg.TagName = t.TagName
+    group by u.Id, t.TagName
+),
+TopUserTags as (
+    select
+        uta.UserId,
+        uta.TagName,
+        uta.PostsWithTag,
+        uta.TotalScoreForTag,
+        uta.LastPostDateForTag,
+        row_number() over (partition by uta.UserId order by uta.PostsWithTag desc, uta.TotalScoreForTag desc) as TagRank
+    from UserTagActivity uta
+),
+FinalResult as (
+    select
+        aus.UserId,
+        aus.DisplayName,
+        aus.TotalQuestions,
+        aus.TotalAnswers,
+        aus.TotalPosts,
+        aus.ClosedPosts,
+        aus.AvgPostScore,
+        aus.MaxQuestionViews,
+        aus.DistinctBadges,
+        aus.LastBadgeDate,
+        aus.LastVoteDate,
+        aus.TotalBountyAwarded,
+        rp.Id as TopPostId,
+        rp.Title as TopPostTitle,
+        rp.Score as TopPostScore,
+        rp.ViewCount as TopPostViews,
+        dup.PostId as DuplicatePostId,
+        dup.RelatedPostId as DuplicateRelatedPostId,
+        dup.PostTitle as DuplicatePostTitle,
+        dup.RelatedPostTitle as DuplicateRelatedPostTitle,
+        tut.TagName as TopTagName,
+        tut.PostsWithTag as TopTagPostCount,
+        tut.TotalScoreForTag as TopTagScore
+    from AggregatedUserStats aus
+    left join RankedPosts rp on rp.OwnerUserId = aus.UserId and rp.PostRank = 1
+    left join DuplicateLinks dup on dup.PostId = rp.Id
+    left join TopUserTags tut on tut.UserId = aus.UserId and tut.TagRank = 1
+    where aus.TotalPosts > 10
+)
+select
+    UserId,
+    DisplayName,
+    TotalQuestions,
+    TotalAnswers,
+    TotalPosts,
+    ClosedPosts,
+    coalesce(round(AvgPostScore::numeric,2),0) as AvgPostScore,
+    coalesce(MaxQuestionViews,0) as MaxQuestionViews,
+    DistinctBadges,
+    LastBadgeDate,
+    LastVoteDate,
+    coalesce(TotalBountyAwarded,0) as TotalBountyAwarded,
+    TopPostId,
+    coalesce(TopPostTitle, '(no top post)') as TopPostTitle,
+    TopPostScore,
+    TopPostViews,
+    DuplicatePostId,
+    DuplicateRelatedPostId,
+    coalesce(DuplicatePostTitle, '(no duplicate)') as DuplicatePostTitle,
+    coalesce(DuplicateRelatedPostTitle, '(no duplicate related)') as DuplicateRelatedPostTitle,
+    coalesce(TopTagName, '(no top tag)') as TopTagName,
+    TopTagPostCount,
+    TopTagScore
+from FinalResult
+order by TotalPosts desc, AvgPostScore desc
+limit 50;

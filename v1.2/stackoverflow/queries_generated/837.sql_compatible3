@@ -1,0 +1,228 @@
+with RecursiveUserActivity as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        coalesce(p.PostCount, 0) as PostCount,
+        coalesce(v.UpVotes, 0) as TotalUpVotes,
+        coalesce(v.DownVotes, 0) as TotalDownVotes,
+        coalesce(b.BadgeCount, 0) as BadgeCount,
+        row_number() over (partition by u.Id order by p.LastPostDate desc nulls last) as rn
+    from Users u
+    left join (
+        select OwnerUserId, count(*) as PostCount, max(CreationDate) as LastPostDate
+        from Posts
+        where OwnerUserId is not null
+        group by OwnerUserId
+    ) p on p.OwnerUserId = u.Id
+    left join (
+        select
+            p.OwnerUserId,
+            sum(case when vt.Name = 'UpMod' then 1 else 0 end) as UpVotes,
+            sum(case when vt.Name = 'DownMod' then 1 else 0 end) as DownVotes
+        from Votes v
+        join Posts p on p.Id = v.PostId
+        join VoteTypes vt on vt.Id = v.VoteTypeId
+        where p.OwnerUserId is not null
+        group by p.OwnerUserId
+    ) v on v.OwnerUserId = u.Id
+    left join (
+        select UserId, count(*) as BadgeCount
+        from Badges
+        group by UserId
+    ) b on b.UserId = u.Id
+), RecentComments as (
+    select
+        c.UserId,
+        count(*) as RecentCommentCount,
+        max(c.CreationDate) as LastCommentDate
+    from Comments c
+    where c.CreationDate > (timestamp '2024-10-01 12:34:56' - interval '30' day)
+    group by c.UserId
+), UserAggregates as (
+    select
+        rau.UserId,
+        rau.DisplayName,
+        rau.Reputation,
+        rau.CreationDate,
+        rau.PostCount,
+        rau.TotalUpVotes,
+        rau.TotalDownVotes,
+        rau.BadgeCount,
+        coalesce(rc.RecentCommentCount, 0) as RecentCommentCount,
+        rc.LastCommentDate
+    from RecursiveUserActivity rau
+    left join RecentComments rc on rc.UserId = rau.UserId
+    where rau.rn = 1
+), QuestionsWithStats as (
+    select
+        p.Id,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.Tags,
+        u.DisplayName as OwnerName,
+        u.Reputation as OwnerReputation,
+        p.AcceptedAnswerId,
+        (select count(*) from Comments c where c.PostId = p.Id) as CommentCount,
+        row_number() over (partition by p.OwnerUserId order by p.Score desc) as RankByScore
+    from Posts p
+    join Users u on u.Id = p.OwnerUserId
+    where p.PostTypeId = 1
+), AcceptedAnswerDetails as (
+    select
+        a.Id,
+        a.ParentId as QuestionId,
+        a.Score as AnswerScore,
+        a.CreationDate as AnswerCreationDate,
+        au.DisplayName as AnswerOwnerName,
+        au.Reputation as AnswerOwnerReputation
+    from Posts a
+    join Users au on au.Id = a.OwnerUserId
+    where a.PostTypeId = 2
+), QuestionAnswerAggregates as (
+    select
+        q.Id as QuestionId,
+        count(a.Id) as TotalAnswers,
+        max(a.AnswerScore) as MaxAnswerScore,
+        min(a.AnswerScore) as MinAnswerScore,
+        avg(a.AnswerScore) as AvgAnswerScore,
+        max(a.AnswerCreationDate) as LastAnswerDate
+    from QuestionsWithStats q
+    left join AcceptedAnswerDetails a on a.QuestionId = q.Id
+    group by q.Id, q.Title, q.CreationDate, q.Score, q.ViewCount, q.AnswerCount, q.Tags, q.OwnerName, q.OwnerReputation, q.AcceptedAnswerId, q.CommentCount, q.RankByScore
+), ComplexTagAnalysis as (
+    select
+        qt.Id,
+        qt.Title,
+        qt.Tags,
+        qt.Score,
+        qt.ViewCount,
+        qt.AnswerCount,
+        regexp_split_to_table(substring(qt.Tags from 2 for char_length(qt.Tags) - 2), '><') as SingleTag
+    from QuestionsWithStats qt
+), TagRanking as (
+    select
+        cta.SingleTag,
+        count(*) as QuestionCount,
+        avg(cta.Score) as AvgQuestionScore,
+        sum(cta.ViewCount) as TotalViews,
+        row_number() over (order by count(*) desc, avg(cta.Score) desc) as TagRank
+    from ComplexTagAnalysis cta
+    group by cta.SingleTag
+), DuplicateLinks as (
+    select
+        pl.PostId,
+        pl.RelatedPostId,
+        pt1.Title as PostTitle,
+        pt2.Title as RelatedPostTitle,
+        lt.Name as LinkTypeName
+    from PostLinks pl
+    join LinkTypes lt on lt.Id = pl.LinkTypeId
+    join Posts pt1 on pt1.Id = pl.PostId
+    join Posts pt2 on pt2.Id = pl.RelatedPostId
+    where lt.Name = 'Duplicate'
+), UserBadgeDetails as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        b.Name as BadgeName,
+        b.Class,
+        b.Date,
+        b.TagBased,
+        row_number() over (partition by u.Id order by b.Date desc) as rn
+    from Users u
+    left join Badges b on b.UserId = u.Id
+), TopBadgesPerUser as (
+    select
+        UserId,
+        DisplayName,
+        BadgeName,
+        Class,
+        Date,
+        TagBased,
+        rn
+    from UserBadgeDetails
+    where rn <= 3
+), FinalSelection as (
+    select
+        ua.UserId,
+        ua.DisplayName,
+        ua.Reputation,
+        ua.PostCount,
+        ua.TotalUpVotes,
+        ua.TotalDownVotes,
+        ua.BadgeCount,
+        ua.RecentCommentCount,
+        qws.Id as QuestionId,
+        qws.Title as QuestionTitle,
+        qws.Score as QuestionScore,
+        qws.ViewCount as QuestionViews,
+        qws.AnswerCount,
+        qws.CommentCount,
+        qws.OwnerName as QuestionOwner,
+        aad.Id as AcceptedAnswerId,
+        aad.AnswerScore,
+        aad.AnswerOwnerName,
+        aad.AnswerOwnerReputation,
+        qa.TotalAnswers,
+        qa.MaxAnswerScore,
+        qa.AvgAnswerScore,
+        tr.SingleTag,
+        tr.QuestionCount as TagQuestionCount,
+        tr.AvgQuestionScore as TagAvgScore,
+        tr.TotalViews as TagTotalViews,
+        tl.RelatedPostId as DuplicateOfPostId,
+        tl.RelatedPostTitle as DuplicateOfPostTitle,
+        tbp.BadgeName as TopBadge1,
+        tbp2.BadgeName as TopBadge2,
+        tbp3.BadgeName as TopBadge3
+    from UserAggregates ua
+    left join QuestionsWithStats qws on qws.OwnerName = ua.DisplayName and qws.RankByScore = 1
+    left join AcceptedAnswerDetails aad on aad.QuestionId = qws.Id
+    left join QuestionAnswerAggregates qa on qa.QuestionId = qws.Id
+    left join TagRanking tr on tr.SingleTag = any(string_to_array(substring(coalesce(qws.Tags, '') from 2 for greatest(char_length(coalesce(qws.Tags, '')) - 2, 0)), '><'))
+    left join DuplicateLinks tl on tl.PostId = qws.Id
+    left join TopBadgesPerUser tbp on tbp.UserId = ua.UserId and tbp.rn = 1
+    left join TopBadgesPerUser tbp2 on tbp2.UserId = ua.UserId and tbp2.rn = 2
+    left join TopBadgesPerUser tbp3 on tbp3.UserId = ua.UserId and tbp3.rn = 3
+    where ua.Reputation > 1000
+)
+select 
+    UserId,
+    DisplayName,
+    Reputation,
+    PostCount,
+    TotalUpVotes,
+    TotalDownVotes,
+    BadgeCount,
+    RecentCommentCount,
+    QuestionId,
+    QuestionTitle,
+    QuestionScore,
+    QuestionViews,
+    AnswerCount,
+    CommentCount,
+    QuestionOwner,
+    AcceptedAnswerId,
+    AnswerScore,
+    AnswerOwnerName,
+    AnswerOwnerReputation,
+    TotalAnswers,
+    MaxAnswerScore,
+    AvgAnswerScore,
+    SingleTag as ProminentTag,
+    TagQuestionCount,
+    TagAvgScore,
+    TagTotalViews,
+    DuplicateOfPostId,
+    DuplicateOfPostTitle,
+    coalesce(TopBadge1, 'N/A') as TopBadge1,
+    coalesce(TopBadge2, 'N/A') as TopBadge2,
+    coalesce(TopBadge3, 'N/A') as TopBadge3
+from FinalSelection
+order by Reputation desc, QuestionScore desc
+limit 100;

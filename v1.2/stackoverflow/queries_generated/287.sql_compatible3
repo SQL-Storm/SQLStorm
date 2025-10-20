@@ -1,0 +1,174 @@
+with RecursiveTagCounts as (
+    select
+        t.Id as TagId,
+        t.TagName,
+        t.Count,
+        coalesce(p.AnswerCount, 0) as AnswerCount,
+        coalesce(p.ViewCount, 0) as ViewCount,
+        coalesce(p.Score, 0) as Score,
+        row_number() over (partition by t.Id order by p.CreationDate desc) as rn
+    from Tags t
+    left join Posts p on p.Id = t.ExcerptPostId and p.PostTypeId = 1
+    where t.TagName is not null
+),
+UserBadgeStats as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(case when b.Class = 1 then 1 end) as GoldBadges,
+        count(case when b.Class = 2 then 1 end) as SilverBadges,
+        count(case when b.Class = 3 then 1 end) as BronzeBadges,
+        sum(case when b.TagBased = true then 1 else 0 end) as TagBasedBadges,
+        max(b.Date) as LastBadgeDate
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.DisplayName
+),
+PostActivityWindow as (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        p.Title,
+        count(c.Id) as CommentCount,
+        sum(case when v.VoteTypeId = 2 then 1 else 0 end) as UpVotes,
+        sum(case when v.VoteTypeId = 3 then 1 else 0 end) as DownVotes,
+        row_number() over (partition by p.OwnerUserId order by p.CreationDate desc) as PostRank,
+        lag(p.Score) over (partition by p.OwnerUserId order by p.CreationDate) as PrevScore,
+        lead(p.Score) over (partition by p.OwnerUserId order by p.CreationDate) as NextScore
+    from Posts p
+    left join Comments c on c.PostId = p.Id
+    left join Votes v on v.PostId = p.Id
+    where p.PostTypeId in (1, 2)
+    group by p.Id, p.PostTypeId, p.OwnerUserId, p.CreationDate, p.Score, p.ViewCount, p.Tags, p.Title
+),
+ClosedQuestions as (
+    select
+        ph.PostId,
+        ph.CreationDate as ClosedDate,
+        crt.Name as CloseReason
+    from PostHistory ph
+    join PostHistoryTypes pht on pht.Id = ph.PostHistoryTypeId and pht.Name = 'Post Closed'
+    left join CloseReasonTypes crt on crt.Id = cast(ph.Comment as integer)
+),
+UserRecentActivity as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        max(p.CreationDate) as LastPostDate,
+        max(ph.CreationDate) as LastEditDate,
+        max(c.CreationDate) as LastCommentDate,
+        max(v.CreationDate) as LastVoteDate
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join PostHistory ph on ph.UserId = u.Id
+    left join Comments c on c.UserId = u.Id
+    left join Votes v on v.UserId = u.Id
+    group by u.Id, u.DisplayName
+),
+DuplicateLinks as (
+    select
+        pl.PostId,
+        pl.RelatedPostId,
+        p1.Title as PostTitle,
+        p2.Title as RelatedPostTitle
+    from PostLinks pl
+    join LinkTypes lt on lt.Id = pl.LinkTypeId and lt.Name = 'Duplicate'
+    join Posts p1 on p1.Id = pl.PostId
+    join Posts p2 on p2.Id = pl.RelatedPostId
+),
+ComplexUserStats as (
+    select
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        coalesce(ubs.GoldBadges, 0) as GoldBadges,
+        coalesce(ubs.SilverBadges, 0) as SilverBadges,
+        coalesce(ubs.BronzeBadges, 0) as BronzeBadges,
+        coalesce(ubs.TagBasedBadges, 0) as TagBasedBadges,
+        ua.LastPostDate,
+        ua.LastEditDate,
+        ua.LastCommentDate,
+        ua.LastVoteDate,
+        case when u.LastAccessDate > (cast('2024-10-01 12:34:56' as timestamp) - interval '30 days') then 1 else 0 end as ActiveLast30Days,
+        case when u.Views is null then 0 else u.Views end as Views,
+        case when u.UpVotes is null then 0 else u.UpVotes end as UpVotes,
+        case when u.DownVotes is null then 0 else u.DownVotes end as DownVotes
+    from Users u
+    left join UserBadgeStats ubs on ubs.UserId = u.Id
+    left join UserRecentActivity ua on ua.UserId = u.Id
+),
+FinalSelection as (
+    select
+        p.Id as PostId,
+        p.Title,
+        p.Tags,
+        p.Score,
+        p.ViewCount,
+        p.CommentCount,
+        p.UpVotes,
+        p.DownVotes,
+        p.CreationDate,
+        p.OwnerUserId,
+        u.DisplayName as OwnerName,
+        u.Reputation as OwnerReputation,
+        u.GoldBadges,
+        u.SilverBadges,
+        u.BronzeBadges,
+        u.TagBasedBadges,
+        cq.ClosedDate,
+        cq.CloseReason,
+        dl.RelatedPostId as DuplicateOfPostId,
+        dl.RelatedPostTitle as DuplicateOfPostTitle,
+        row_number() over (partition by p.OwnerUserId order by p.Score desc) as OwnerPostRankByScore,
+        dense_rank() over (order by p.Score desc) as GlobalPostRankByScore,
+        character_length(p.Tags) as BodyLength,
+        coalesce(nullif(p.Tags, ''), '<none>') as TagsOrNone,
+        case when p.AcceptedAnswerId is not null then 1 else 0 end as HasAcceptedAnswer,
+        (select count(*) from Comments c2 where c2.PostId = p.Id and c2.Score > 0) as PositiveCommentsCount,
+        (select avg(v2.BountyAmount) from Votes v2 where v2.PostId = p.Id and v2.BountyAmount is not null) as AvgBountyAmount
+    from PostActivityWindow p
+    left join ComplexUserStats u on u.Id = p.OwnerUserId
+    left join ClosedQuestions cq on cq.PostId = p.Id
+    left join DuplicateLinks dl on dl.PostId = p.Id
+    where p.PostTypeId = 1
+)
+select
+    fs.PostId,
+    fs.Title,
+    fs.TagsOrNone,
+    fs.Score,
+    fs.ViewCount,
+    fs.CommentCount,
+    fs.UpVotes,
+    fs.DownVotes,
+    fs.BodyLength,
+    fs.HasAcceptedAnswer,
+    fs.PositiveCommentsCount,
+    coalesce(fs.AvgBountyAmount, 0) as AvgBountyAmount,
+    fs.OwnerUserId,
+    fs.OwnerName,
+    fs.OwnerReputation,
+    fs.GoldBadges,
+    fs.SilverBadges,
+    fs.BronzeBadges,
+    fs.TagBasedBadges,
+    fs.ClosedDate,
+    fs.CloseReason,
+    fs.DuplicateOfPostId,
+    fs.DuplicateOfPostTitle,
+    fs.OwnerPostRankByScore,
+    fs.GlobalPostRankByScore
+from FinalSelection fs
+where
+    (fs.Score > 10 or fs.ViewCount > 1000)
+    and (fs.ClosedDate is null or fs.CloseReason not in ('Exact Duplicate', 'Duplicate'))
+    and fs.OwnerReputation > (
+        select avg(u2.Reputation) from Users u2 where u2.Reputation > 0
+    )
+order by fs.GlobalPostRankByScore asc
+limit 100;

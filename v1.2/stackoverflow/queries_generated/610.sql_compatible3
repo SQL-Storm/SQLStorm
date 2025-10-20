@@ -1,0 +1,203 @@
+WITH RECURSIVE RecursiveTagHierarchy AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        ARRAY[t.TagName] AS TagPath
+    FROM Tags t
+    WHERE t.IsModeratorOnly = FALSE
+  UNION ALL
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        r.TagPath || t.TagName
+    FROM Tags t
+    JOIN RecursiveTagHierarchy r ON t.Id <> ALL (ARRAY[r.Id])
+    WHERE t.IsModeratorOnly = FALSE
+      AND array_length(r.TagPath, 1) < 3
+),
+UserBadges AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(b.Id) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+        COALESCE(SUM(CASE WHEN b.TagBased = 1 THEN 1 ELSE 0 END), 0) AS TagBasedBadges
+    FROM Users u
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id, u.DisplayName
+),
+PostScores AS (
+    SELECT
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC NULLS LAST) AS UserPostRank,
+        COUNT(*) OVER (PARTITION BY p.OwnerUserId) AS UserPostCount,
+        CASE
+            WHEN p.Tags IS NOT NULL THEN
+                array_to_string(
+                    array(
+                        SELECT unnest(string_to_array(substring(p.Tags FROM 2 FOR char_length(p.Tags) - 2), '><'))
+                        ORDER BY 1
+                    ), ','
+                )
+            ELSE NULL
+        END AS NormalizedTags
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+),
+TopPostsWithComments AS (
+    SELECT
+        ps.Id AS PostId,
+        ps.OwnerUserId,
+        ps.Score,
+        ps.ViewCount,
+        ps.NormalizedTags,
+        COALESCE(c.CommentCount, 0) AS CommentCount,
+        COALESCE(vc.UpVotes, 0) AS UpVotes,
+        COALESCE(vc.DownVotes, 0) AS DownVotes
+    FROM PostScores ps
+    LEFT JOIN (
+        SELECT PostId, COUNT(*) AS CommentCount
+        FROM Comments
+        GROUP BY PostId
+    ) c ON ps.Id = c.PostId
+    LEFT JOIN (
+        SELECT
+            v.PostId,
+            SUM(CASE WHEN vt.Name = 'UpMod' THEN 1 ELSE 0 END) AS UpVotes,
+            SUM(CASE WHEN vt.Name = 'DownMod' THEN 1 ELSE 0 END) AS DownVotes
+        FROM Votes v
+        JOIN VoteTypes vt ON v.VoteTypeId = vt.Id
+        GROUP BY v.PostId
+    ) vc ON ps.Id = vc.PostId
+    WHERE ps.UserPostRank <= 5
+),
+UserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        ub.GoldBadges,
+        ub.SilverBadges,
+        ub.BronzeBadges,
+        ub.TagBasedBadges,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionCount,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswerCount,
+        COALESCE(SUM(p.Score), 0) AS TotalPostScore,
+        COALESCE(SUM(vc.UpVotes), 0) AS TotalUpVotes,
+        COALESCE(SUM(vc.DownVotes), 0) AS TotalDownVotes,
+        MAX(p.CreationDate) AS LastPostDate
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN UserBadges ub ON u.Id = ub.UserId
+    LEFT JOIN (
+        SELECT
+            v.PostId,
+            SUM(CASE WHEN vt.Name = 'UpMod' THEN 1 ELSE 0 END) AS UpVotes,
+            SUM(CASE WHEN vt.Name = 'DownMod' THEN 1 ELSE 0 END) AS DownVotes
+        FROM Votes v
+        JOIN VoteTypes vt ON v.VoteTypeId = vt.Id
+        GROUP BY v.PostId
+    ) vc ON p.Id = vc.PostId
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate, ub.GoldBadges, ub.SilverBadges, ub.BronzeBadges, ub.TagBasedBadges
+),
+ClosedQuestions AS (
+    SELECT
+        ph.PostId,
+        ph.CreationDate AS CloseDate,
+        cr.Name AS CloseReason,
+        ph.UserId AS ClosedByUserId,
+        u.DisplayName AS ClosedByUserName
+    FROM PostHistory ph
+    JOIN CloseReasonTypes cr ON CAST(ph.Comment AS INTEGER) = cr.Id
+    LEFT JOIN Users u ON ph.UserId = u.Id
+    WHERE ph.PostHistoryTypeId = 10
+),
+Duplicates AS (
+    SELECT DISTINCT
+        pl.PostId,
+        pl.RelatedPostId,
+        pl.CreationDate,
+        lt.Name AS LinkTypeName
+    FROM PostLinks pl
+    JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id
+    WHERE pl.LinkTypeId = 3
+),
+FinalSelection AS (
+    SELECT
+        ua.UserId,
+        ua.DisplayName,
+        ua.Reputation,
+        ua.GoldBadges,
+        ua.SilverBadges,
+        ua.BronzeBadges,
+        ua.TagBasedBadges,
+        ua.QuestionCount,
+        ua.AnswerCount,
+        ua.TotalPostScore,
+        ua.TotalUpVotes,
+        ua.TotalDownVotes,
+        ua.LastPostDate,
+        COALESCE(cq.CloseDate, NULL) AS LastClosedQuestionDate,
+        cq.CloseReason,
+        cq.ClosedByUserName,
+        STRING_AGG(DISTINCT CAST(d.RelatedPostId AS text), ', ' ORDER BY d.RelatedPostId) AS DuplicatePostIds,
+        MAX(tp.Score) FILTER (WHERE tp.Score IS NOT NULL) AS MaxTopPostScore,
+        AVG(tp.ViewCount) FILTER (WHERE tp.ViewCount IS NOT NULL) AS AvgTopPostViews,
+        MAX(tp.CommentCount) FILTER (WHERE tp.CommentCount IS NOT NULL) AS MaxTopPostComments,
+        STRING_AGG(DISTINCT tp.NormalizedTags, ', ' ORDER BY tp.NormalizedTags) AS TopPostTags
+    FROM UserActivity ua
+    LEFT JOIN ClosedQuestions cq ON ua.UserId = cq.ClosedByUserId
+    LEFT JOIN Duplicates d ON ua.UserId = (
+        SELECT p2.OwnerUserId FROM Posts p2 WHERE p2.Id = d.PostId LIMIT 1
+    )
+    LEFT JOIN TopPostsWithComments tp ON ua.UserId = tp.OwnerUserId
+    GROUP BY ua.UserId, ua.DisplayName, ua.Reputation, ua.GoldBadges, ua.SilverBadges, ua.BronzeBadges, ua.TagBasedBadges, ua.QuestionCount, ua.AnswerCount, ua.TotalPostScore, ua.TotalUpVotes, ua.TotalDownVotes, ua.LastPostDate, cq.CloseDate, cq.CloseReason, cq.ClosedByUserName
+)
+SELECT
+    fs.UserId,
+    fs.DisplayName,
+    fs.Reputation,
+    fs.GoldBadges,
+    fs.SilverBadges,
+    fs.BronzeBadges,
+    fs.TagBasedBadges,
+    fs.QuestionCount,
+    fs.AnswerCount,
+    fs.TotalPostScore,
+    fs.TotalUpVotes,
+    fs.TotalDownVotes,
+    fs.LastPostDate,
+    fs.LastClosedQuestionDate,
+    fs.CloseReason,
+    fs.ClosedByUserName,
+    fs.DuplicatePostIds,
+    fs.MaxTopPostScore,
+    fs.AvgTopPostViews,
+    fs.MaxTopPostComments,
+    fs.TopPostTags,
+    ROUND(
+        (fs.Reputation * 0.5)
+        + (fs.GoldBadges * 100)
+        + (fs.SilverBadges * 50)
+        + (fs.BronzeBadges * 20)
+        + (fs.TotalUpVotes * 1.5)
+        - (fs.TotalDownVotes * 1.0)
+        + (EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - fs.LastPostDate))/86400)::integer * -0.1
+    , 2) AS WeightedUserScore
+FROM FinalSelection fs
+WHERE fs.QuestionCount > 10
+  AND fs.AnswerCount > 20
+  AND fs.Reputation > 1000
+ORDER BY WeightedUserScore DESC NULLS LAST
+LIMIT 50;

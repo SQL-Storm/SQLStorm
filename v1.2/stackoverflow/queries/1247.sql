@@ -1,0 +1,142 @@
+with RecursiveUserBadges as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        b.Name as BadgeName,
+        b.Class,
+        b.Date
+    from Users u
+    left join Badges b on u.Id = b.UserId
+    where b.Date >= u.CreationDate
+),
+BadgeSummary as (
+    select
+        UserId,
+        count(distinct case when Class = 1 then BadgeName end) as GoldBadges,
+        count(distinct case when Class = 2 then BadgeName end) as SilverBadges,
+        count(distinct case when Class = 3 then BadgeName end) as BronzeBadges
+    from RecursiveUserBadges
+    group by UserId
+),
+PostVotes as (
+    select
+        p.Id as PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Score,
+        p.CreationDate,
+        count(v.Id) filter (where v.VoteTypeId = 2) as UpVotes,
+        count(v.Id) filter (where v.VoteTypeId = 3) as DownVotes,
+        count(v.Id) filter (where v.VoteTypeId = 5) as Favorites,
+        coalesce(sum(case when v.BountyAmount is not null then v.BountyAmount else 0 end),0) as TotalBounty,
+        case when p.ClosedDate is not null then 1 else 0 end as IsClosed,
+        p.ClosedDate
+    from Posts p
+    left join Votes v on p.Id = v.PostId
+    group by p.Id, p.PostTypeId, p.OwnerUserId, p.Score, p.CreationDate, p.ClosedDate
+),
+UserPostStats as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        coalesce(count(p.PostTypeId) filter (where p.PostTypeId = 1),0) as QuestionCount,
+        coalesce(count(p.PostTypeId) filter (where p.PostTypeId = 2),0) as AnswerCount,
+        coalesce(sum(p.Score),0) as TotalPostScore,
+        coalesce(sum(p.UpVotes),0) as TotalUpVotes,
+        coalesce(sum(p.DownVotes),0) as TotalDownVotes,
+        coalesce(sum(p.Favorites),0) as TotalFavorites,
+        coalesce(sum(p.TotalBounty),0) as TotalBountyReceived,
+        max(p.CreationDate) as LastPostDate,
+        min(p.CreationDate) as FirstPostDate,
+        case when max(p.ClosedDate) is not null then 1 else 0 end as HasClosedPosts
+    from Users u
+    left join PostVotes p on u.Id = p.OwnerUserId
+    group by u.Id, u.DisplayName
+),
+TopTags as (
+    select
+        split_part(t.TagName,' ',1) as Tag,
+        pt.OwnerUserId,
+        count(pt.Id) as PostCount
+    from Posts pt
+    join Tags t on strpos(pt.Tags, concat('<',t.TagName,'>')) > 0
+    where pt.PostTypeId = 1
+    group by split_part(t.TagName,' ',1), pt.OwnerUserId
+),
+RankedUserTags as (
+    select
+        tt.OwnerUserId,
+        tt.Tag,
+        tt.PostCount,
+        row_number() over (partition by tt.OwnerUserId order by tt.PostCount desc) as rn
+    from TopTags tt
+),
+LatestCommentPerPost as (
+    select
+        c.PostId,
+        c.Id as CommentId,
+        c.UserId as CommenterUserId,
+        c.CreationDate as CommentDate,
+        c.Text as CommentText
+    from (
+      select *, row_number() over (partition by PostId order by CreationDate desc) as rn
+      from Comments
+    ) c
+    where c.rn = 1
+),
+PostLinkMetrics as (
+    select
+        pl.PostId,
+        count(distinct case when pl.LinkTypeId = 1 then pl.RelatedPostId end) as LinkedPosts,
+        count(distinct case when pl.LinkTypeId = 3 then pl.RelatedPostId end) as DuplicatePosts
+    from PostLinks pl
+    group by pl.PostId
+),
+TopTagsPerUser as (
+    select OwnerUserId, string_agg(Tag, ', ' order by PostCount desc) as TopTagsAgg
+    from RankedUserTags
+    where rn <= 3
+    group by OwnerUserId
+)
+select 
+    u.Id as UserId,
+    u.DisplayName,
+    us.QuestionCount,
+    us.AnswerCount,
+    us.TotalPostScore,
+    us.TotalUpVotes,
+    us.TotalDownVotes,
+    us.TotalFavorites,
+    us.TotalBountyReceived,
+    coalesce(bg.GoldBadges,0) as GoldBadges,
+    coalesce(bg.SilverBadges,0) as SilverBadges,
+    coalesce(bg.BronzeBadges,0) as BronzeBadges,
+    coalesce(tt.TopTagsAgg, '') as TopTags,
+    coalesce(pc.CommentText, 'No comments') as MostRecentCommentOnAnyPost,
+    pm.LinkedPosts,
+    pm.DuplicatePosts,
+    u.Reputation,
+    u.CreationDate,
+    u.LastAccessDate,
+    case 
+        when us.HasClosedPosts = 1 and coalesce(us.AnswerCount,0) > 0 then 'Active with closed posts' 
+        when coalesce(us.AnswerCount,0) > 0 then 'Active' 
+        else 'Inactive' 
+    end as UserStatus,
+    abs(extract(epoch from (u.LastAccessDate - u.CreationDate)))/(86400.0) as DaysActive,
+    row_number() over (order by us.TotalPostScore desc NULLS LAST) as UserRankByScore
+from Users u
+left join UserPostStats us on u.Id = us.UserId
+left join BadgeSummary bg on u.Id = bg.UserId
+left join TopTagsPerUser tt on u.Id = tt.OwnerUserId
+left join LatestCommentPerPost pc on pc.CommenterUserId = u.Id
+left join PostLinkMetrics pm on pm.PostId = (
+    select p.Id from Posts p where p.OwnerUserId = u.Id order by p.Score desc limit 1
+)
+where u.Reputation > 1000
+group by
+    u.Id, u.DisplayName, us.QuestionCount, us.AnswerCount, us.TotalPostScore, us.TotalUpVotes, us.TotalDownVotes,
+    us.TotalFavorites, us.TotalBountyReceived, bg.GoldBadges, bg.SilverBadges, bg.BronzeBadges,
+    tt.TopTagsAgg, pc.CommentText, pm.LinkedPosts, pm.DuplicatePosts, u.Reputation, u.CreationDate, u.LastAccessDate, us.HasClosedPosts
+order by UserRankByScore asc
+limit 50;

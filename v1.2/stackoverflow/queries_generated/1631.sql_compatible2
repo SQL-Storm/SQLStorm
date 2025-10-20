@@ -1,0 +1,62 @@
+with RecursiveTagHierarchy as (
+    select t.Id, t.TagName, t.WikiPostId,
+           cast(t.TagName as varchar(4000)) as Path
+      from Tags t 
+     where t.WikiPostId is not null
+    union all
+    select t.Id, t.TagName, t.WikiPostId,
+           th.Path || ' › ' || t.TagName
+      from Tags t
+      join RecursiveTagHierarchy th on t.ExcerptPostId = th.WikiPostId
+),
+UserBadges AS (
+    select b.UserId,
+           count(case when b.Class = 1 then 1 end) as GoldBadges,
+           count(case when b.Class = 2 then 1 end) as SilverBadges,
+           count(case when b.Class = 3 then 1 end) as BronzeBadges,
+           sum(case when b.TagBased = 1 then 1 else 0 end) as TagBasedBadgeCount,
+           min(b.Date) as FirstBadgeDate
+      from Badges b
+     group by b.UserId
+),
+AdvancedPostScores AS (
+    select p.Id, p.OwnerUserId,
+           p.posts_cnt,
+           p.n_questions,
+           p.title_len,
+           p.tagstr_len,
+           coalesce(p.sentiment_score, 0) 
+             + coalesce(frame_hist.Score_weightAverage, 0) / nullif(p.UnAnsweredconst_q_win_Pl, 0) as CombinedScore
+      from Posts p
+      left join frame_hist on frame_hist.post_id = p.Id
+)
+select p.Id,
+       p.OwnerUserId,
+       p.posts_cnt,
+       p.n_questions,
+       p.title_len,
+       p.tagstr_len,
+       aps.CombinedScore,
+       ub.GoldBadges,
+       ub.SilverBadges,
+       ub.BronzeBadges,
+       ub.TagBasedBadgeCount,
+       ub.FirstBadgeDate,
+       th.Path
+  from Posts p
+  left join AdvancedPostScores aps on aps.Id = p.Id
+  left join UserBadges ub on ub.UserId = p.OwnerUserId
+  left join RecursiveTagHierarchy th on th.WikiPostId = p.Id
+ group by p.Id,
+          p.OwnerUserId,
+          p.posts_cnt,
+          p.n_questions,
+          p.title_len,
+          p.tagstr_len,
+          aps.CombinedScore,
+          ub.GoldBadges,
+          ub.SilverBadges,
+          ub.BronzeBadges,
+          ub.TagBasedBadgeCount,
+          ub.FirstBadgeDate,
+          th.Path;

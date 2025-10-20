@@ -1,0 +1,148 @@
+WITH RecursiveUserBadgeRanks AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        b.Class,
+        ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY b.Date DESC, b.Name) AS RecentBadgeRank
+    FROM
+        Users u
+        LEFT JOIN Badges b ON b.UserId = u.Id AND b.Date IS NOT NULL
+),
+TopUserBadges AS (
+    SELECT UserId,
+           STRING_AGG(CONCAT(Class,
+                             '-', REPLACE(Name, ' ', '_')),
+                      ',' ORDER BY Class, Name) AS BadgeSummary
+    FROM Badges
+    GROUP BY UserId
+),
+HighActivityPosts AS (
+    SELECT
+        p.Id as PostId,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.ParentId,
+        p.AcceptedAnswerId,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        COALESCE(p.ViewCount, 0) AS ViewCount,
+        p.Tags,
+        (vc.TotalVoteScore + COALESCE(MyVotes.VoteScore, 0)) AS WeightedVotes,
+        (
+            (p.Score * 3)
+            + COALESCE(p.ViewCount * 0.01, 0)
+            + LOG(1 + EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - p.CreationDate))/86400) * CASE WHEN p.PostTypeId = 1 THEN 5 ELSE 3 END
+            - 5 * CASE WHEN p.ClosedDate IS NOT NULL THEN 1 ELSE 0 END
+        ) AS EngagementScore
+    FROM Posts p
+    LEFT JOIN (
+        SELECT PostId, 
+               SUM(
+                   CASE WHEN VoteTypeId = 2 THEN 1
+                        WHEN VoteTypeId = 3 THEN -1
+                        WHEN VoteTypeId IN (8,9) THEN COALESCE(BountyAmount, 0)*2
+                        ELSE 0 END
+               ) AS TotalVoteScore
+        FROM Votes
+        GROUP BY PostId
+    ) vc ON vc.PostId = p.Id
+    LEFT JOIN (
+        SELECT DISTINCT VoteTypeId, PostId, (CASE WHEN VoteTypeId = 2 THEN 1 ELSE 0 END) AS VoteScore
+        FROM Votes
+        WHERE UserId = 42
+    ) MyVotes ON MyVotes.PostId = p.Id
+    WHERE p.Score IS NOT NULL
+),
+AnswersWithScoreRank AS (
+    SELECT
+        ans.Id AS AnswerId,
+        ans.ParentId,
+        ans.OwnerUserId,
+        ans.Score,
+        ans.CreationDate,
+        ROW_NUMBER() OVER (PARTITION BY ans.ParentId ORDER BY ans.Score DESC, ans.CreationDate ASC) AS AnswerRankByScore,
+        COUNT(*) OVER (PARTITION BY ans.ParentId) AS AnswersCount
+    FROM Posts ans
+    WHERE ans.PostTypeId = 2
+),
+QuestionCloseStats AS (
+    SELECT ch.PostId, 
+           COUNT(CASE WHEN ch.PostHistoryTypeId IN (10, 12) THEN 1 ELSE NULL END) AS CloseOrDeletedVotes,
+           MAX(CASE WHEN ch.PostHistoryTypeId = 10 THEN ch.Comment END) AS LastCloseReasonCode,
+           COUNT(DISTINCT ch.UserId) AS UniqueVotersCount,
+           STRING_AGG(DISTINCT crt.Name, ', ') AS CloseReasonsUsed
+    FROM PostHistory ch
+    LEFT JOIN CloseReasonTypes crt ON crt.Id = CAST(ch.Comment AS INTEGER) AND ch.PostHistoryTypeId = 10
+    GROUP BY ch.PostId        
+),
+UserLocationSimilarity AS (
+    SELECT u1.Id AS UserId1, u2.Id AS UserId2,
+           CASE
+               WHEN u1.Location IS NOT NULL AND u2.Location IS NOT NULL THEN
+                    (LENGTH(u1.Location) + LENGTH(u2.Location)) - LENGTH(REPLACE(LOWER(u1.Location), LOWER(u2.Location), ''))
+               ELSE NULL END AS LocationSubstrOverlap
+    FROM Users u1
+    JOIN Users u2 ON u1.Id <> u2.Id AND u1.Reputation > u2.Reputation
+),
+-- normalize tag strings into rows using a set-returning subquery in the FROM clause to avoid SRF in JOIN condition
+NormalizedTags AS (
+    SELECT p.Id AS PostId,
+           t.tag AS IndividualTag
+    FROM (
+        SELECT Id, Tags
+        FROM Posts
+        WHERE Score >= 50 AND Tags IS NOT NULL
+        LIMIT 500
+    ) p,
+    LATERAL (
+        SELECT TRIM(tag) AS tag
+        FROM (
+            SELECT UNNEST(string_to_array(REPLACE(REPLACE(p.Tags, '><', ','), '<', ''), ',')) AS tag
+        ) s
+    ) t
+),
+MergedTagsForPopularPosts AS (
+    SELECT DISTINCT nt.IndividualTag,
+           tg.Count AS TagCount
+    FROM NormalizedTags nt
+    LEFT JOIN Tags tg ON tg.TagName = nt.IndividualTag
+)
+SELECT 
+    p.PostId,
+    p.Title,
+    p.Score,
+    p.ViewCount,
+    p.EngagementScore,
+    qcs.CloseOrDeletedVotes,
+    qcs.CloseReasonsUsed,
+    au.AnswerRankByScore,
+    au.AnswersCount,
+    tng.IndividualTag,
+    tut.BadgeSummary,
+    COALESCE(locSim.LocationSubstrOverlap, 0) AS LocationSimilarityScore,
+    ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.EngagementScore DESC) AS PostTypeEngagementPosition
+FROM HighActivityPosts p
+LEFT JOIN QuestionCloseStats qcs ON qcs.PostId = p.PostId
+LEFT JOIN AnswersWithScoreRank au ON au.ParentId = p.PostId AND au.AnswerRankByScore = 1
+LEFT JOIN TopUserBadges tut ON tut.UserId = p.OwnerUserId
+LEFT JOIN UserLocationSimilarity locSim ON locSim.UserId1 = p.OwnerUserId
+LEFT JOIN MergedTagsForPopularPosts tng ON ('<' || tng.IndividualTag || '>') LIKE ('%' || COALESCE(p.Tags, '') || '%')
+WHERE p.PostTypeId IN (1, 2)
+  AND p.EngagementScore > 10
+GROUP BY
+    p.PostId,
+    p.Title,
+    p.Score,
+    p.ViewCount,
+    p.EngagementScore,
+    qcs.CloseOrDeletedVotes,
+    qcs.CloseReasonsUsed,
+    au.AnswerRankByScore,
+    au.AnswersCount,
+    tng.IndividualTag,
+    tut.BadgeSummary,
+    locSim.LocationSubstrOverlap,
+    p.PostTypeId
+ORDER BY p.EngagementScore DESC
+FETCH FIRST 50 ROWS ONLY;

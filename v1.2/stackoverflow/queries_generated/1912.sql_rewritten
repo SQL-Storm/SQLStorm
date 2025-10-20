@@ -1,0 +1,28 @@
+-- {"query": "1912.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.9, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1452} 
+with Recursive_PostCounts(author_id, question_count, answer_count, last_question_date) as (
+    select u.Id,
+        count(case when p.PostTypeId = 1 then 1 end) as question_count,
+        count(case when p.PostTypeId = 2 then 1 end) as answer_count,
+        max(case when p.PostTypeId = 1 then p.CreationDate else null end) as last_question_date
+    from Users u
+        left outer join Posts p on p.OwnerUserId = u.Id
+    group by u.Id
+    union all
+    select pc.author_id, pc.question_count + temp.q_increment, pc.answer_count + temp.a_increment,
+           greatest(coalesce(pc.last_question_date,'1000-01-01'::timestamp), temp.last_q_date)
+    from Recursive_PostCounts pc
+        inner join (
+            select OwnerUserId as u_id,
+                 count(case when PostTypeId = 1 then 1 else 0 end) as q_increment,
+                 count(case when PostTypeId = 2 then 1 else 0 end) as a_increment,
+                 max(case when PostTypeId = 1 then CreationDate else null end) as last_q_date
+            from Posts
+            where CreationDate > (cast('2024-10-01' as date) - interval '90 days')
+            group by OwnerUserId
+        ) temp on temp.u_id = pc.author_id
+    where pc.question_count <> 0 or pc.answer_count <> 0
+),
+Last_Badges_Per_Tag as (
+    select emin.UserId, ele.TagDemand, max(emin_date) initiatted_merge from (
+        select GustOfEvaluation.UserId, beagged goodshot intensiv.Hash interest fres.field bassGuests stone },
+ select zip 桂 to escolar bestellt sommeil angenommen "";

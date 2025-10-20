@@ -1,0 +1,155 @@
+WITH RECURSIVE RecursiveTagHierarchy AS (
+    SELECT 
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        1 AS Level,
+        ARRAY[t.TagName] AS Path
+    FROM Tags t
+    WHERE t.IsModeratorOnly = false AND t.IsRequired = false
+    UNION ALL
+    SELECT 
+        child.Id,
+        child.TagName,
+        child.Count,
+        child.ExcerptPostId,
+        child.WikiPostId,
+        p.Level + 1,
+        p.Path || child.TagName
+    FROM Tags child
+    JOIN RecursiveTagHierarchy p ON child.Count < p.Count AND child.IsModeratorOnly = false
+    WHERE NOT child.TagName = ANY(p.Path)
+),
+UserBadgeCounts AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(b.Id) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+        SUM(CASE WHEN b.TagBased = 1 THEN 1 ELSE 0 END) AS TagBasedBadges,
+        ROW_NUMBER() OVER (ORDER BY COUNT(b.Id) DESC) AS UserRank
+    FROM Users u
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id, u.DisplayName
+),
+PostStats AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        pt.Name AS PostTypeName,
+        p.OwnerUserId,
+        u.DisplayName AS OwnerName,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.Title,
+        COALESCE(p.Tags,'') AS Tags,
+        p.AcceptedAnswerId,
+        COUNT(c.Id) AS CommentCount,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC NULLS LAST) AS UserPostRank
+    FROM Posts p
+    LEFT JOIN PostTypes pt ON p.PostTypeId = pt.Id
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    LEFT JOIN Comments c ON c.PostId = p.Id
+    LEFT JOIN Votes v ON v.PostId = p.Id
+    GROUP BY p.Id, p.PostTypeId, pt.Name, p.OwnerUserId, u.DisplayName, p.Score, p.ViewCount, p.CreationDate, p.Title, p.Tags, p.AcceptedAnswerId
+),
+TopQuestionsWithAnswers AS (
+    SELECT
+        q.PostId AS QuestionId,
+        q.Title AS QuestionTitle,
+        q.OwnerUserId AS QuestionOwnerId,
+        q.OwnerName AS QuestionOwnerName,
+        q.Score AS QuestionScore,
+        q.ViewCount AS QuestionViews,
+        q.CreationDate AS QuestionCreation,
+        a.PostId AS AnswerId,
+        a.OwnerUserId AS AnswerOwnerId,
+        a.OwnerName AS AnswerOwnerName,
+        a.Score AS AnswerScore,
+        a.CreationDate AS AnswerCreation,
+        a.CommentCount AS AnswerComments,
+        a.UpVotes AS AnswerUpVotes,
+        a.DownVotes AS AnswerDownVotes,
+        ROW_NUMBER() OVER (PARTITION BY q.PostId ORDER BY a.Score DESC) AS AnswerRank
+    FROM PostStats q
+    LEFT JOIN PostStats a ON a.PostId = q.PostId AND a.PostTypeId = 2
+    WHERE q.PostTypeId = 1 AND q.Score > 10 AND q.ViewCount > 1000
+)
+SELECT
+    tq.QuestionId,
+    tq.QuestionTitle,
+    tq.QuestionOwnerName,
+    tq.QuestionScore,
+    tq.QuestionViews,
+    DATE_PART('year', AGE(CAST('2024-10-01 12:34:56' AS timestamp), tq.QuestionCreation)) AS YearsSinceAsked,
+    tq.AnswerId,
+    tq.AnswerOwnerName,
+    tq.AnswerScore,
+    tq.AnswerComments,
+    tq.AnswerUpVotes,
+    tq.AnswerDownVotes,
+    ub.GoldBadges,
+    ub.SilverBadges,
+    ub.BronzeBadges,
+    ub.TagBasedBadges,
+    CASE WHEN tq.AnswerScore > 0 THEN ROUND((CAST(tq.AnswerUpVotes AS numeric) / NULLIF(tq.AnswerScore,0)) ,2) ELSE NULL END AS UpvoteRatio,
+    CASE WHEN tq.AnswerComments > 0 THEN ROUND((CAST(tq.AnswerComments AS numeric) / NULLIF(tq.AnswerScore,0)) ,2) ELSE 0 END AS CommentsPerScore,
+    STRING_AGG(DISTINCT rth.TagName, ',' ORDER BY rth.Level) FILTER (WHERE rth.TagName IS NOT NULL) AS RelatedTagsPath
+FROM TopQuestionsWithAnswers tq
+LEFT JOIN UserBadgeCounts ub ON ub.UserId = tq.AnswerOwnerId
+LEFT JOIN LATERAL (
+    SELECT DISTINCT UNNEST(STRING_TO_ARRAY(REPLACE(REPLACE(tq.QuestionTitle, '<', ''), '>', ''), ' ')) AS TagName
+) qtags ON true
+LEFT JOIN RecursiveTagHierarchy rth ON rth.TagName = qtags.TagName
+WHERE tq.AnswerRank <= 3
+GROUP BY 
+    tq.QuestionId,
+    tq.QuestionTitle,
+    tq.QuestionOwnerName,
+    tq.QuestionScore,
+    tq.QuestionViews,
+    tq.QuestionCreation,
+    tq.AnswerId,
+    tq.AnswerOwnerName,
+    tq.AnswerScore,
+    tq.AnswerComments,
+    tq.AnswerUpVotes,
+    tq.AnswerDownVotes,
+    ub.GoldBadges,
+    ub.SilverBadges,
+    ub.BronzeBadges,
+    ub.TagBasedBadges
+UNION
+SELECT
+    p.Id AS QuestionId,
+    p.Title AS QuestionTitle,
+    u.DisplayName AS QuestionOwnerName,
+    p.Score AS QuestionScore,
+    p.ViewCount AS QuestionViews,
+    DATE_PART('year', AGE(CAST('2024-10-01 12:34:56' AS timestamp), p.CreationDate)) AS YearsSinceAsked,
+    NULL AS AnswerId,
+    NULL AS AnswerOwnerName,
+    NULL AS AnswerScore,
+    NULL AS AnswerComments,
+    NULL AS AnswerUpVotes,
+    NULL AS AnswerDownVotes,
+    0 AS GoldBadges,
+    0 AS SilverBadges,
+    0 AS BronzeBadges,
+    0 AS TagBasedBadges,
+    NULL AS UpvoteRatio,
+    NULL AS CommentsPerScore,
+    NULL AS RelatedTagsPath
+FROM Posts p
+LEFT JOIN Users u ON u.Id = p.OwnerUserId
+WHERE p.PostTypeId = 1 AND NOT EXISTS (
+    SELECT 1 FROM Posts a WHERE a.ParentId = p.Id AND a.PostTypeId = 2
+)
+ORDER BY QuestionScore DESC NULLS LAST, QuestionViews DESC NULLS LAST, YearsSinceAsked DESC
+LIMIT 100;

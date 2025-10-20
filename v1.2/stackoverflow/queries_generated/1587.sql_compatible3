@@ -1,0 +1,160 @@
+with RecursiveUserBadgeCounts as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        b.Class as BadgeClass,
+        count(*) as BadgeCount
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.DisplayName, b.Class
+), BadgePivot as (
+    select
+        UserId,
+        DisplayName,
+        coalesce(max(case when BadgeClass = 1 then BadgeCount end),0) as GoldBadges,
+        coalesce(max(case when BadgeClass = 2 then BadgeCount end),0) as SilverBadges,
+        coalesce(max(case when BadgeClass = 3 then BadgeCount end),0) as BronzeBadges
+    from RecursiveUserBadgeCounts
+    group by UserId, DisplayName
+), LatestPostsPerUser as (
+    select
+        p.OwnerUserId,
+        p.Id as PostId,
+        p.PostTypeId,
+        p.Score,
+        p.CreationDate,
+        row_number() over (partition by p.OwnerUserId order by p.Score desc, p.CreationDate desc) as rn
+    from Posts p
+    where p.OwnerUserId is not null and p.PostTypeId in (1,2)
+), PastYearPosts as (
+    select
+        p.*
+    from Posts p
+    where p.CreationDate >= (cast('2024-10-01' as date) - interval '1 year')
+), UserCorrelation as (
+    select
+        u.Id,
+        u.DisplayName,
+        bpc.GoldBadges,
+        bpc.SilverBadges,
+        bpc.BronzeBadges,
+        coalesce(pup.AnswerCountPastYear,0) as AnswersPastYear,
+        coalesce(pqp.QuestionCountPastYear,0) as QuestionsPastYear
+    from Users u
+    left join BadgePivot bpc on bpc.UserId = u.Id
+    left join (
+        select p.OwnerUserId, count(1) as AnswerCountPastYear
+        from PastYearPosts p where p.PostTypeId=2
+        group by p.OwnerUserId
+    ) pup on pup.OwnerUserId = u.Id
+    left join (
+        select p.OwnerUserId, count(1) as QuestionCountPastYear
+        from PastYearPosts p where p.PostTypeId=1
+        group by p.OwnerUserId
+    ) pqp on pqp.OwnerUserId = u.Id
+    where u.Reputation>=1000
+), PopularPosts as (
+    select
+        lp.PostId,
+        lp.OwnerUserId,
+        lp.PostTypeId,
+        lp.Score,
+        lp.CreationDate,
+        lp.CreationDate as LatestPostCreationDate,
+        -- ensure Title comes from Posts table via join to LatestPostsPerUser rows in main query
+        variant_payload.ExtensiveCommentAgg,
+        linkage.LinkCount,
+        coalesce(runStats.UserAnswersWithPopular, 0) as UserAnswersWithPopular
+    from LatestPostsPerUser lp
+    left join (
+        select
+            c.PostId,
+            string_agg(
+                substring(c.Text from 1 for case when length(c.Text)>100 then 100 else length(c.Text) end),
+                ';' order by c.CreationDate desc
+            ) as ExtensiveCommentAgg
+        from Comments c
+        group by c.PostId
+    ) variant_payload on variant_payload.PostId = lp.PostId
+    left join (
+        select pl.PostId, count(distinct pl.RelatedPostId) as LinkCount
+        from PostLinks pl
+        where pl.LinkTypeId=1
+        group by pl.PostId
+    ) linkage on linkage.PostId = lp.PostId
+    left join (
+        select
+            OwnerUserId,
+            count(case when Score >= 10 and ViewCount >= 1000 then 1 end) as UserAnswersWithPopular
+        from Posts p2
+        where p2.PostTypeId=2
+        group by OwnerUserId
+    ) runStats on runStats.OwnerUserId = lp.OwnerUserId
+)
+select
+    u.Id as UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.GoldBadges,
+    u.SilverBadges,
+    u.BronzeBadges,
+    u.AnswersPastYear,
+    u.QuestionsPastYear,
+    po.PostId,
+    p_main.Title,
+    po.Score,
+    p_main.ViewCount,
+    case
+        when po.ExtensiveCommentAgg is not null then substr(po.ExtensiveCommentAgg, 1, 250) || '...'
+        else '[no comments]'
+    end as SampledComments,
+    coalesce(ALINK.Info, 'No active linkages') as ActiveLinkDetails,
+    case when coalesce(po.LinkCount, 0) > 5 then 'Highly Linked' else 'Not Much Linked' end as LinkageCategory,
+    count(distinct ph.Id) filter (
+        where ph.PostHistoryTypeId in (10, 11)
+        and ph.CreationDate > (cast('2024-10-01 12:34:56' as timestamp) - interval '1 month')
+    ) as CloseOrReopenEventsRecentMonth
+from UserCorrelation u
+left join PopularPosts po on po.OwnerUserId = u.Id
+-- join back to Posts to get Title and ViewCount (fix missing column error and ensure portability)
+left join Posts p_main on p_main.Id = po.PostId
+left join lateral (
+    select
+        string_agg(lhs.Name, ', ') as Info
+    from PostHistoryTypes lhs
+    join PostHistory ph2 on lhs.Id = ph2.PostHistoryTypeId
+        and ph2.PostId = po.PostId
+        and ph2.CreationDate > (cast('2024-10-01' as date) - interval '6 months')
+) ALINK on true
+left join PostHistory ph on ph.PostId = po.PostId
+group by
+    u.Id, u.DisplayName, u.Reputation,
+    u.GoldBadges, u.SilverBadges, u.BronzeBadges,
+    u.AnswersPastYear, u.QuestionsPastYear,
+    po.PostId, p_main.Title, po.Score, p_main.ViewCount,
+    po.ExtensiveCommentAgg, po.LinkCount, ALINK.Info
+having count(distinct ph.Id) > 0 or u.BronzeBadges >= 3
+union
+select distinct
+    u2.Id as UserId,
+    u2.DisplayName,
+    u2.Reputation,
+    null as GoldBadges,
+    null as SilverBadges,
+    null as BronzeBadges,
+    null as AnswersPastYear,
+    null as QuestionsPastYear,
+    null as PostId,
+    null as Title,
+    null as Score,
+    null as ViewCount,
+    null as SampledComments,
+    null as ActiveLinkDetails,
+    null as LinkageCategory,
+    null as CloseOrReopenEventsRecentMonth
+from Users u2
+join Posts pZ on pZ.OwnerUserId = u2.Id
+where u2.Reputation > 10000 and pZ.PostTypeId=1 and pZ.Tags like '%sql%'
+order by COALESCE(GoldBadges,0) desc,
+         COALESCE(LinkageCategory,'FirstTimers') desc,
+         Reputation desc;

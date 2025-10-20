@@ -1,0 +1,160 @@
+with RankedAnswers as (
+    select
+        a.Id,
+        a.ParentId as QuestionId,
+        a.CreationDate,
+        a.Score,
+        u.DisplayName as AnswererName,
+        row_number() over (partition by a.ParentId order by a.Score desc, a.CreationDate asc) as rn
+    from Posts a
+    left join Users u on a.OwnerUserId = u.Id
+    where a.PostTypeId = 2
+),
+QuestionsCTE as (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        q.CreationDate,
+        q.Score as QuestionScore,
+        q.ViewCount,
+        q.Tags,
+        u.DisplayName as QuestionOwner,
+        b.BadgesCount,
+        b.GoldBadges,
+        b.SilverBadges,
+        b.BronzeBadges,
+        ph.LastEditDate,
+        coalesce(closeReason.Name, 'Not Closed') as CloseReason,
+        rank() over (order by q.Score desc, q.ViewCount desc) as PopularityRank
+    from Posts q
+    left join Users u on q.OwnerUserId = u.Id
+    left join (
+        select
+            UserId,
+            count(*) as BadgesCount,
+            sum(case when Class = 1 then 1 else 0 end) as GoldBadges,
+            sum(case when Class = 2 then 1 else 0 end) as SilverBadges,
+            sum(case when Class = 3 then 1 else 0 end) as BronzeBadges
+        from Badges
+        group by UserId
+    ) b on b.UserId = q.OwnerUserId
+    left join (
+        select
+            Id as PostId,
+            max(LastEditDate) as LastEditDate
+        from Posts
+        group by Id
+    ) ph on ph.PostId = q.Id
+    left join PostHistory phc on phc.PostId = q.Id and phc.PostHistoryTypeId = 10
+    left join CloseReasonTypes closeReason on closeReason.Id = cast(phc.Comment as smallint)
+    where q.PostTypeId = 1
+),
+AnswerAggregates as (
+    select
+        QuestionId,
+        count(*) as TotalAnswers,
+        sum(case when Score > 10 then 1 else 0 end) as HighlyRatedAnswers,
+        max(Score) as MaxAnswerScore,
+        count(distinct AnswererName) as UniqueAnswerers
+    from RankedAnswers
+    group by QuestionId
+),
+CommentAggregates as (
+    select
+        p.Id as PostId,
+        count(case when c.Score > 5 then 1 end) as TopCommentsCount,
+        count(c.Id) as TotalComments,
+        string_agg(coalesce(c.UserDisplayName, 'Unknown') || '|||''' || to_char(c.CreationDate, 'YYYY-MM-DD"T"HH24:MI:SS') , ', ') as CommentersSample
+    from Posts p
+    left join Comments c on c.PostId = p.Id
+    group by p.Id
+),
+Duplicates as (
+    select
+        pl.PostId,
+        count(case when lt.Name = 'Duplicate' then 1 end) as DuplicateCount
+    from PostLinks pl
+    join LinkTypes lt on lt.Id = pl.LinkTypeId
+    group by pl.PostId
+)
+select
+    q.QuestionId,
+    q.Title,
+    array_length(regexp_split_to_array(trim(both '<' from coalesce(q.Tags, '')), '><'), 1) as TagCount,
+    q.QuestionOwner,
+    coalesce(q.BadgesCount, 0) as OwnerBadgeCount,
+    q.GoldBadges,
+    q.SilverBadges,
+    q.BronzeBadges,
+    q.QuestionScore,
+    q.ViewCount,
+    coalesce(a.TotalAnswers, 0) as TotalAnswers,
+    coalesce(a.HighlyRatedAnswers, 0) as HighlyRatedAnswers,
+    coalesce(a.MaxAnswerScore, 0) as MaxAnswerScore,
+    coalesce(a.UniqueAnswerers, 0) as UniqueAnswerers,
+    coalesce(c.TopCommentsCount, 0) as TopCommentsCount,
+    coalesce(c.TotalComments, 0) as TotalComments,
+    substring(coalesce(c.CommentersSample, '') from 1 for 100) as CommentersSample,
+    coalesce(d.DuplicateCount, 0) as DuplicateCount,
+    q.CloseReason,
+    q.LastEditDate,
+    q.PopularityRank,
+    round(percent_rank() over (order by q.QuestionScore desc) * 100, 2) as ScorePercentRank,
+    case 
+        when q.CreationDate > (cast('2024-10-01' as date) - interval '365 days')
+          and q.QuestionScore > (select percentile_cont(0.5) within group (order by Score) from Posts where PostTypeId=1)
+          and q.CloseReason = 'Not Closed'
+        then 'FreshPopularOpen'
+        else 'Other'
+    end as StatusCategory,
+    (select avg(coalesce(Score, 0)) from Posts ans where ans.ParentId = q.QuestionId and ans.PostTypeId = 2) as AvgAnswerScore,
+    coalesce(q.QuestionOwner, 'anonymous') || ' | Tags: ' || coalesce(q.Tags, 'none') as OwnerAndTags
+from QuestionsCTE q
+left join AnswerAggregates a on a.QuestionId = q.QuestionId
+left join CommentAggregates c on c.PostId = q.QuestionId
+left join Duplicates d on d.PostId = q.QuestionId
+where 
+    (coalesce(a.HighlyRatedAnswers, 0) > 0 or coalesce(c.TopCommentsCount, 0) > 2)
+    and q.ViewCount > 1000
+union
+select
+    fav.Id as QuestionId,
+    fav.Title,
+    array_length(regexp_split_to_array(trim(both '<' from coalesce(fav.Tags, '')), '><'), 1) as TagCount,
+    u.DisplayName as QuestionOwner,
+    coalesce(count(b.Id), 0) as OwnerBadgeCount,
+    coalesce(sum(case when b.Class=1 then 1 else 0 end), 0) as GoldBadges,
+    coalesce(sum(case when b.Class=2 then 1 else 0 end), 0) as SilverBadges,
+    coalesce(sum(case when b.Class=3 then 1 else 0 end), 0) as BronzeBadges,
+    fav.Score,
+    fav.ViewCount,
+    0 as TotalAnswers,
+    0 as HighlyRatedAnswers,
+    0 as MaxAnswerScore,
+    0 as UniqueAnswerers,
+    0 as TopCommentsCount,
+    0 as TotalComments,
+    null as CommentersSample,
+    0 as DuplicateCount,
+    'Not Closed' as CloseReason,
+    fav.LastEditDate,
+    100000 as PopularityRank,
+    0 as ScorePercentRank,
+    'FavoritedQuestion' as StatusCategory,
+    null as AvgAnswerScore,
+    coalesce(u.DisplayName, 'anonymous') || ' | Tags: ' || coalesce(fav.Tags, 'none') as OwnerAndTags
+from Posts fav
+left join Users u on fav.OwnerUserId = u.Id
+left join Badges b on b.UserId = u.Id
+where fav.PostTypeId = 1
+  and fav.FavoriteCount > 10
+group by
+    fav.Id,
+    fav.Title,
+    fav.Tags,
+    u.DisplayName,
+    fav.Score,
+    fav.ViewCount,
+    fav.LastEditDate
+order by PopularityRank asc, TotalAnswers desc, QuestionScore desc
+limit 100;

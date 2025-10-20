@@ -1,0 +1,152 @@
+WITH RECURSIVE RecursiveTagHierarchy AS (
+    SELECT
+        T1.Id,
+        T1.TagName,
+        ARRAY[T1.TagName] AS TagPath,
+        1 AS Depth
+    FROM Tags T1
+    WHERE T1.IsModeratorOnly = FALSE
+    UNION ALL
+    SELECT
+        T2.Id,
+        T2.TagName,
+        RTH.TagPath || T2.TagName,
+        RTH.Depth + 1
+    FROM Tags T2
+    JOIN RecursiveTagHierarchy RTH ON POSITION(T2.TagName IN array_to_string(RTH.TagPath, ',')) = 0
+    WHERE RTH.Depth < 3
+),
+UserBadgeCounts AS (
+    SELECT
+        B.UserId,
+        B.Name,
+        COUNT(*) AS BadgeCount,
+        SUM(CASE WHEN B.Class = 1 THEN 100 WHEN B.Class = 2 THEN 50 ELSE 10 END) AS WeightedBadgeScore
+    FROM Badges B
+    GROUP BY B.UserId, B.Name
+),
+AnswerScoresByTag AS (
+    SELECT
+        P.ParentId AS QuestionId,
+        U.Id AS UserId,
+        COALESCE(SUM(VoteCounts.UpVotes) - SUM(VoteCounts.DownVotes), 0) AS NetScore,
+        STRING_AGG(DISTINCT TRIM(BOTH '<>' FROM tag), ',') AS Tags
+    FROM Posts P
+    LEFT JOIN Posts Q ON Q.Id = P.ParentId AND Q.PostTypeId = 1
+    LEFT JOIN Users U ON U.Id = P.OwnerUserId
+    LEFT JOIN (
+        SELECT
+            V.PostId,
+            SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+            SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes
+        FROM Votes V
+        GROUP BY V.PostId
+    ) VoteCounts ON VoteCounts.PostId = P.Id
+    CROSS JOIN LATERAL (
+        SELECT unnest(string_to_array(substring(Q.Tags, 2, length(Q.Tags) - 2), '><')) AS tag
+    ) tag_list
+    WHERE P.PostTypeId = 2 AND Q.Id IS NOT NULL
+    GROUP BY P.ParentId, U.Id
+),
+RankedUsers AS (
+    SELECT
+        U.Id,
+        U.DisplayName,
+        U.Reputation,
+        U.CreationDate,
+        U.Location,
+        U.Views,
+        COALESCE(SUM(ABC.NetScore), 0) AS TotalAnswerScore,
+        COALESCE(SUM(UBC.WeightedBadgeScore), 0) AS UserBadgeScore,
+        ROW_NUMBER() OVER (ORDER BY COALESCE(SUM(ABC.NetScore), 0) DESC, U.Reputation DESC) AS RankByAnswerScore,
+        COUNT(AB.Name) FILTER (WHERE AB.Name LIKE '%Curiosity%') OVER (PARTITION BY U.Id) AS CuriosityBadges
+    FROM Users U
+    LEFT JOIN AnswerScoresByTag ABC ON ABC.UserId = U.Id
+    LEFT JOIN UserBadgeCounts UBC ON UBC.UserId = U.Id
+    LEFT JOIN Badges AB ON AB.UserId = U.Id
+    GROUP BY U.Id, U.DisplayName, U.Reputation, U.CreationDate, U.Location, U.Views
+),
+PostRecentActivities AS (
+    SELECT
+        P.Id,
+        P.PostTypeId,
+        P.Title,
+        P.CreationDate,
+        P.LastActivityDate,
+        P.Score,
+        COALESCE(C.CommentCount, 0) AS CommentCount,
+        COALESCE(V.UpVoteCount, 0) AS UpVotes,
+        COALESCE(V.DownVoteCount, 0) AS DownVotes,
+        LEAD(P.Score) OVER (PARTITION BY P.PostTypeId ORDER BY P.CreationDate) AS NextPostScore,
+        LAG(P.Score) OVER (PARTITION BY P.PostTypeId ORDER BY P.CreationDate) AS PrevPostScore
+    FROM Posts P
+    LEFT JOIN (
+        SELECT PostId, COUNT(*) AS CommentCount
+        FROM Comments
+        GROUP BY PostId
+    ) C ON C.PostId = P.Id
+    LEFT JOIN (
+        SELECT
+            PostId,
+            SUM(CASE WHEN VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVoteCount,
+            SUM(CASE WHEN VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVoteCount
+        FROM Votes
+        GROUP BY PostId
+    ) V ON V.PostId = P.Id
+    WHERE P.CreationDate > (DATE '2024-10-01' - INTERVAL '2 years')
+),
+ComplexPostSelection AS (
+    SELECT
+        PRA.*,
+        CASE
+            WHEN PRA.UpVotes + PRA.DownVotes = 0 THEN NULL
+            ELSE ROUND((CAST(PRA.UpVotes AS numeric) / NULLIF(PRA.UpVotes + PRA.DownVotes, 0)) * 100, 2)
+        END AS UpvoteRatioPercent,
+        CASE
+            WHEN PRA.CommentCount > 10 THEN 'Highly Commented'
+            WHEN PRA.CommentCount BETWEEN 1 AND 10 THEN 'Moderately Commented'
+            ELSE 'Low Comments'
+        END AS CommentCategory,
+        COALESCE(CRT.Name, 'No Close Reason') AS CloseReason
+    FROM PostRecentActivities PRA
+    LEFT JOIN PostHistory PH ON PH.PostId = PRA.Id AND PH.PostHistoryTypeId = 10
+    LEFT JOIN CloseReasonTypes CRT ON CRT.Id = CAST(PH.Comment AS INTEGER)
+    WHERE PRA.Score > 5 OR PRA.UpVotes > 10
+),
+TopUsersWithFilters AS (
+    SELECT *
+    FROM RankedUsers
+    WHERE RankByAnswerScore <= 100 AND CuriosityBadges > 0 AND Location IS NOT NULL
+    ORDER BY TotalAnswerScore DESC, UserBadgeScore DESC
+)
+SELECT
+    T.Id AS UserId,
+    U.DisplayName,
+    U.Reputation,
+    T.TotalAnswerScore,
+    T.UserBadgeScore,
+    T.CuriosityBadges,
+    STRING_AGG(DISTINCT RTH.TagName, ' > ' ORDER BY array_length(RTH.TagPath, 1)) AS RepresentativeTags,
+    MAX(CPS.Score) FILTER (WHERE CPS.PostTypeId = 1) AS MaxQuestionScore,
+    AVG(CPS.UpvoteRatioPercent) FILTER (WHERE CPS.UpvoteRatioPercent IS NOT NULL) AS AvgQuestionUpvoteRatio,
+    COUNT(DISTINCT CPS.Id) FILTER (WHERE CPS.CommentCategory = 'Highly Commented') AS HighlyCommentedPosts,
+    STRING_AGG(DISTINCT COALESCE(CPS.CloseReason, 'No Reason'), ', ') AS CloseReasonsEncountered
+FROM TopUsersWithFilters T
+JOIN Users U ON U.Id = T.Id
+LEFT JOIN RecursiveTagHierarchy RTH ON EXISTS (
+    SELECT 1
+    FROM Posts P
+    WHERE P.OwnerUserId = U.Id
+      AND P.PostTypeId = 1
+      AND POSITION(RTH.TagName IN array_to_string(string_to_array(substring(P.Tags, 2, length(P.Tags) - 2), '><'), ',')) > 0
+)
+LEFT JOIN ComplexPostSelection CPS ON CPS.Id IN (
+    SELECT P.Id
+    FROM Posts P
+    WHERE P.OwnerUserId = U.Id
+      AND P.PostTypeId IN (1, 2)
+      AND P.CreationDate > (DATE '2024-10-01' - INTERVAL '1 year')
+)
+GROUP BY T.Id, U.DisplayName, U.Reputation, T.TotalAnswerScore, T.UserBadgeScore, T.CuriosityBadges
+ORDER BY T.TotalAnswerScore DESC, T.UserBadgeScore DESC, T.CuriosityBadges DESC
+LIMIT 50;

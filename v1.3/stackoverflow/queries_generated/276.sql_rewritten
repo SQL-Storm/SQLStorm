@@ -1,0 +1,206 @@
+-- {"query": "276.sql", "dataset": "stackoverflow", "version": "v1.3", "prompt": "p1", "model": "gpt-5-mini", "temperature": 1.0, "max_tokens": 32768, "reasoning": "medium", "input_tokens": 2026, "output_tokens": 3447} 
+WITH
+-- explode tags from question posts
+question_tags AS (
+  SELECT
+    p.Id AS question_id,
+    trim(tag) AS tag
+  FROM Posts p
+  CROSS JOIN LATERAL (
+    SELECT unnest(string_to_array(substring(coalesce(p.Tags, ''), 2, GREATEST(length(coalesce(p.Tags, '')) - 2,0)), '><')) AS tag
+  ) t
+  WHERE p.PostTypeId = 1
+),
+-- answers and link to their parent question
+answers AS (
+  SELECT
+    a.Id AS answer_id,
+    a.ParentId AS question_id,
+    a.OwnerUserId AS answer_owner,
+    a.CreationDate AS answer_date,
+    a.Score AS answer_score,
+    a.CommentCount AS answer_comments,
+    q.CreationDate AS question_date,
+    q.Title AS question_title,
+    q.ViewCount AS question_views
+  FROM Posts a
+  JOIN Posts q ON q.Id = a.ParentId
+  WHERE a.PostTypeId = 2
+),
+-- earliest answer per question
+first_answer AS (
+  SELECT
+    question_id,
+    MIN(answer_date) AS first_answer_date,
+    MIN(answer_id) FILTER (WHERE answer_date = MIN(answer_date) OVER (PARTITION BY question_id)) AS first_answer_id
+  FROM answers
+  GROUP BY question_id
+),
+-- aggregated votes per post (using conditional aggregation)
+post_vote_agg AS (
+  SELECT
+    p.Id AS post_id,
+    COUNT(v.Id) AS total_votes,
+    SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS upvotes,
+    SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS downvotes,
+    SUM(CASE WHEN v.VoteTypeId = 1 THEN 1 ELSE 0 END) AS accepted_by_owner,
+    SUM(CASE WHEN v.VoteTypeId = 5 THEN 1 ELSE 0 END) AS favorites
+  FROM Posts p
+  LEFT JOIN Votes v ON v.PostId = p.Id
+  GROUP BY p.Id
+),
+-- per-user answer response time metrics (seconds), median via percentile_cont
+user_response_times AS (
+  SELECT
+    a.answer_owner AS user_id,
+    COUNT(*) FILTER (WHERE a.question_date IS NOT NULL) AS answers_count,
+    AVG(EXTRACT(EPOCH FROM (a.answer_date - a.question_date))) FILTER (WHERE a.question_date IS NOT NULL) AS avg_response_sec,
+    PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY EXTRACT(EPOCH FROM (a.answer_date - a.question_date))) AS median_response_sec,
+    MIN(a.answer_date) AS first_answer_date,
+    MAX(a.answer_date) AS last_answer_date
+  FROM answers a
+  WHERE a.answer_owner IS NOT NULL
+  GROUP BY a.answer_owner
+),
+-- per-user badges (weighted)
+user_badges AS (
+  SELECT
+    b.UserId AS user_id,
+    COUNT(*) AS badge_count,
+    SUM(CASE WHEN b.Class = 1 THEN 5 WHEN b.Class = 2 THEN 3 ELSE 1 END) AS badge_weighted_score,
+    SUM(CASE WHEN b.TagBased = 1 THEN 1 ELSE 0 END) AS tag_based_badges
+  FROM Badges b
+  GROUP BY b.UserId
+),
+-- per-user acceptance info (how many of their answers are accepted)
+user_accepts AS (
+  SELECT
+    a.OwnerUserId AS user_id,
+    COUNT(*) FILTER (WHERE q.AcceptedAnswerId = a.Id) AS accepted_answers,
+    COUNT(*) AS total_answers
+  FROM Posts a
+  JOIN Posts q ON q.Id = a.ParentId AND q.PostTypeId = 1
+  WHERE a.PostTypeId = 2 AND a.OwnerUserId IS NOT NULL
+  GROUP BY a.OwnerUserId
+),
+-- per-user top tags based on answers to questions with those tags
+user_tag_counts AS (
+  SELECT
+    a.answer_owner AS user_id,
+    qt.tag,
+    COUNT(*) AS answers_for_tag
+  FROM answers a
+  JOIN question_tags qt ON qt.question_id = a.question_id
+  WHERE a.answer_owner IS NOT NULL
+  GROUP BY a.answer_owner, qt.tag
+),
+-- rank tags per user and pick top 3
+user_top_tags AS (
+  SELECT user_id,
+         string_agg(tag || ':' || answers_for_tag, ', ' ORDER BY answers_for_tag DESC, tag) AS top_tags_list,
+         array_agg(tag ORDER BY answers_for_tag DESC, tag)[:3] AS top_3_tags
+  FROM (
+    SELECT utc.*,
+           row_number() OVER (PARTITION BY utc.user_id ORDER BY utc.answers_for_tag DESC, utc.tag) AS rn
+    FROM user_tag_counts utc
+  ) sub
+  WHERE rn <= 10 -- compute on a slightly larger window then aggregate top few
+  GROUP BY user_id
+),
+-- per-user composite score used for ranking (mix reputation, badges, activity)
+user_composite AS (
+  SELECT
+    u.Id AS user_id,
+    u.Reputation,
+    COALESCE(ub.badge_weighted_score,0) AS badge_score,
+    COALESCE(urt.answers_count,0) AS answers_count,
+    COALESCE(ua.accepted_answers,0) AS accepted_answers,
+    COALESCE(urt.avg_response_sec, NULL) AS avg_response_sec,
+    (u.Reputation * 0.6) + (COALESCE(ub.badge_weighted_score,0) * 10) + (COALESCE(ua.accepted_answers,0) * 50) - (COALESCE(urt.avg_response_sec, 86400) / 3600.0) AS composite_score
+  FROM Users u
+  LEFT JOIN user_badges ub ON ub.user_id = u.Id
+  LEFT JOIN user_response_times urt ON urt.user_id = u.Id
+  LEFT JOIN user_accepts ua ON ua.user_id = u.Id
+),
+-- hottest and neglected posts sets (demonstrating set operators)
+hot_posts AS (
+  SELECT Id, Title, ViewCount, Score, CreationDate FROM Posts
+  WHERE PostTypeId = 1 AND ViewCount >= 10000 OR Score >= 50
+),
+neglected_posts AS (
+  SELECT Id, Title, ViewCount, Score, CreationDate FROM Posts
+  WHERE PostTypeId = 1 AND (ViewCount < 10 OR Score <= 0)
+),
+hot_and_neglected AS (
+  SELECT * FROM hot_posts
+  UNION   -- show union (distinct) of hot and neglected (contrived set for benchmarking)
+  SELECT * FROM neglected_posts
+),
+-- snapshot of recent activity per user via correlated subquery (last post title)
+user_recent_activity AS (
+  SELECT
+    u.Id AS user_id,
+    (SELECT p.Title FROM Posts p WHERE p.OwnerUserId = u.Id ORDER BY p.LastActivityDate DESC NULLS LAST LIMIT 1) AS most_recent_post_title,
+    (SELECT p.LastActivityDate FROM Posts p WHERE p.OwnerUserId = u.Id ORDER BY p.LastActivityDate DESC NULLS LAST LIMIT 1) AS most_recent_post_activity
+  FROM Users u
+),
+-- final aggregation of users with many metrics and window functions for ranking
+ranked_users AS (
+  SELECT
+    uc.user_id,
+    u.DisplayName,
+    u.Reputation,
+    COALESCE(ub.badge_count,0) AS badge_count,
+    COALESCE(ub.tag_based_badges,0) AS tag_badges,
+    COALESCE(urt.answers_count,0) AS answers_count,
+    COALESCE(ua.accepted_answers,0) AS accepted_answers,
+    COALESCE(urt.median_response_sec, NULL) AS median_response_sec,
+    COALESCE(urt.avg_response_sec, NULL) AS avg_response_sec,
+    COALESCE(utt.top_tags_list, '') AS top_tags,
+    COALESCE(ura.most_recent_post_title, '') AS recent_post_title,
+    uc.composite_score,
+    RANK() OVER (ORDER BY uc.composite_score DESC NULLS LAST) AS composite_rank,
+    ROW_NUMBER() OVER (ORDER BY COALESCE(ua.accepted_answers,0) DESC, COALESCE(urt.answers_count,0) DESC) AS answers_rank,
+    NTILE(10) OVER (ORDER BY uc.composite_score DESC NULLS LAST) AS decile
+  FROM user_composite uc
+  JOIN Users u ON u.Id = uc.user_id
+  LEFT JOIN user_badges ub ON ub.user_id = uc.user_id
+  LEFT JOIN user_response_times urt ON urt.user_id = uc.user_id
+  LEFT JOIN user_accepts ua ON ua.user_id = uc.user_id
+  LEFT JOIN user_top_tags utt ON utt.user_id = uc.user_id
+  LEFT JOIN user_recent_activity ura ON ura.user_id = uc.user_id
+)
+SELECT
+  ru.*,
+  -- a complex calculated indicator with NULL logic and string manipulation
+  CASE
+    WHEN ru.median_response_sec IS NULL THEN 'no-median'
+    WHEN ru.median_response_sec < 3600 THEN 'fast (<1h)'
+    WHEN ru.median_response_sec < 86400 THEN 'moderate (<1d)'
+    ELSE 'slow (>=1d)'
+  END AS median_response_bucket,
+  -- compute ratio of accepted answers per answers with safe NULL handling
+  COALESCE(ROUND( (ru.accepted_answers::numeric / NULLIF(ru.answers_count,0))::numeric, 4), 0 ) AS accept_rate,
+  -- sample correlated scalar subquery: distinct tags answered in last 365 days
+  (SELECT COUNT(DISTINCT qt.tag)
+   FROM Posts a
+   JOIN Posts q ON q.Id = a.ParentId
+   CROSS JOIN LATERAL (
+     SELECT unnest(string_to_array(substring(coalesce(q.Tags,''),2,GREATEST(length(coalesce(q.Tags,''))-2,0)),'><')) AS tag
+   ) qt
+   WHERE a.PostTypeId = 2
+     AND a.OwnerUserId = ru.user_id
+     AND a.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '365 days'
+  ) AS recent_distinct_tags_answered,
+  -- membership in hot_and_neglected via EXISTS (demonstrates semi-join)
+  EXISTS (SELECT 1 FROM hot_and_neglected h WHERE h.Id = (
+    SELECT p.Id FROM Posts p WHERE p.OwnerUserId = ru.user_id ORDER BY p.CreationDate DESC LIMIT 1
+  )) AS has_most_recent_post_in_hot_or_neglected,
+  -- a string expression that concatenates top tags safely and truncates
+  LEFT(COALESCE(ru.top_tags,''), 200) || CASE WHEN LENGTH(COALESCE(ru.top_tags,'')) > 200 THEN '...' ELSE '' END AS top_tags_preview
+FROM ranked_users ru
+WHERE ru.composite_score IS NOT NULL
+  AND ru.Reputation >= 100  -- focus on reasonably active users
+  AND (ru.answers_count >= 5 OR ru.badge_count >= 1)
+ORDER BY ru.composite_rank, ru.accept_rate DESC NULLS LAST
+LIMIT 50;

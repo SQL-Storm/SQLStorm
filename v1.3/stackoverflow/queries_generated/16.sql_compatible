@@ -1,0 +1,69 @@
+select qt.tag
+    ) tag_best on true
+    where ua.ReputationRank <= 1000
+)
+select
+    q.Id as QuestionId,
+    q.Title,
+    q.OwnerUserId,
+    coalesce(u.DisplayName, 'unknown') as OwnerName,
+    q.CreationDate,
+    q.Score as QuestionScore,
+    qa.AnswerId,
+    qa.AnswerScore,
+    qa.AnswerTag,
+    qa.Snippet,
+    qs.tag as PrimaryTag,
+    qs.questions as TagQuestionCount,
+    qs.avg_views as TagAvgViews,
+    qs.median_score as TagMedianScore,
+    lq.LinkType,
+    lq.ToPost as LinkedTo,
+    (re.RevisionGUID is not null) as RecentlyEdited,
+    re.rev_rank,
+    cu.Tier as OwnerTier,
+    cu.BadgeSummary,
+    cu.FavoriteTag,
+    th.max_depth,
+    th.sample_path,
+    -- computed synthetic complexity metric combining many facets (NULL-aware)
+    (
+      coalesce(q.Score,0) * 10
+      + coalesce(qa.AnswerScore,0) * 50
+      + (case when qa.AnswerTag = 'accepted' then 100000 else 0 end)
+      + coalesce(q.ViewCount,0) / nullif(greatest(1, qs.questions), 0)
+      - coalesce(cu.DownVotesReceived,0) * 5
+      + coalesce((select count(*) from Comments c where c.PostId = q.Id),0) * 2
+    ) as ComplexityScore
+from Posts q
+left join Posts qdup on qdup.Id = q.AcceptedAnswerId
+left join popular_answers qa on qa.QuestionId = q.Id
+left join Users u on u.Id = q.OwnerUserId
+left join lateral (
+    select tag as primary_tag, questions, avg_views, median_score
+    from question_tag_stats tts
+    where position(lower(tts.tag) in coalesce(lower(q.Tags),'')) > 0
+    order by tts.questions desc nulls last
+    limit 1
+) qs on true
+left join linked_questions lq on lq.FromPost = q.Id and lq.LinkType = 'Duplicate'
+left join (
+    select PostId, max(rev_rank) as rev_rank, bool_or(RevisionGUID is not null) as has_guid, max(RevisionGUID) as RevisionGUID
+    from (
+        select ph.PostId, ph.RevisionGUID, dense_rank() over (partition by ph.PostId order by ph.CreationDate desc) as rev_rank
+        from PostHistory ph
+    ) s
+    group by PostId
+) re on re.PostId = q.Id
+left join (
+    -- pick a sample path and max depth from tag_hierarchy for any tag on this question
+    select tag as sample_tag, max(depth) as max_depth, string_agg(path, ' | ' order by path) as sample_path
+    from tag_hierarchy
+    group by tag
+) th on position(th.sample_tag in coalesce(lower(q.Tags),'')) > 0
+left join complex_user_profile cu on cu.UserId = q.OwnerUserId
+where q.PostTypeId = 1
+  and q.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '5 years'
+  and (coalesce(q.Score,0) > -5 or q.ViewCount > 1000)
+order by ComplexityScore desc nulls last
+limit 250;

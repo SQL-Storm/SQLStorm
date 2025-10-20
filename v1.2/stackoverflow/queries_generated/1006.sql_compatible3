@@ -1,0 +1,173 @@
+with RecursiveUserTags as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        unnest(string_to_array(coalesce(p.Tags, ''), '><')) as Tag
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id and p.PostTypeId = 1
+    where p.Tags is not null
+),
+UserTagCounts as (
+    select
+        UserId,
+        Tag,
+        count(*) as TagQuestionCount
+    from RecursiveUserTags
+    group by UserId, Tag
+),
+LatestPostScores as (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        row_number() over (partition by p.OwnerUserId order by p.CreationDate desc) as rn_latest
+    from Posts p
+    where p.Score is not null
+),
+TopUsersByRecentScore as (
+    select 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        coalesce(lps.Score, 0) as LatestPostScore
+    from Users u
+    left join LatestPostScores lps on lps.OwnerUserId = u.Id and lps.rn_latest = 1
+    where u.Reputation > (
+        select percentile_cont(0.75) within group (order by Reputation) from Users
+    )
+),
+BadgesWithUserRanks as (
+    select
+        b.*,
+        dense_rank() over (partition by b.Name order by b.Date asc) as BadgeEarnOrder,
+        count(*) over (partition by b.UserId) as UserBadgeCount
+    from Badges b
+),
+ClosedQuestionsWithReasons as (
+    select
+        ph.PostId,
+        crt.Name as CloseReason,
+        ph.CreationDate as CloseDate
+    from PostHistory ph
+    inner join CloseReasonTypes crt on crt.Id = cast(ph.Comment as integer)
+    where ph.PostHistoryTypeId = 10
+),
+UserAnswersWithAccepted as (
+    select
+        a.Id as AnswerId,
+        a.ParentId as QuestionId,
+        q.AcceptedAnswerId,
+        a.OwnerUserId,
+        a.Score,
+        row_number() over (partition by a.OwnerUserId order by a.Score desc) as rn_ans
+    from Posts a
+    inner join Posts q on q.Id = a.ParentId and q.PostTypeId = 1
+    where a.PostTypeId = 2
+),
+RankedUserAnswers as (
+    select
+        u.Id as UserId,
+        a.AnswerId,
+        a.QuestionId,
+        a.Score,
+        case when a.AnswerId = a.AcceptedAnswerId then 1 else 0 end as IsAcceptedAnswer,
+        row_number() over (partition by u.Id order by a.Score desc) as AnswerRank
+    from Users u
+    left join UserAnswersWithAccepted a on a.OwnerUserId = u.Id
+),
+ComplexUserAggregate as (
+    select
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        coalesce(uac.TotalAnswers,0) as TotalAnswers,
+        coalesce(uac.AcceptedAnswers,0) as AcceptedAnswers,
+        coalesce(utc.TagQuestionCount,0) as PopularTagContribution,
+        case when u.LastAccessDate > (timestamp '2024-10-01 12:34:56' - interval '30 days') then 'Active' else 'Inactive' end as ActivityStatus,
+        concat(
+            coalesce(u.DisplayName, 'User'),
+            ' [Reputation: ', cast(u.Reputation as varchar),
+            ', Answers: ', coalesce(cast(uac.TotalAnswers as varchar), '0'),
+            ', Accepted: ', coalesce(cast(uac.AcceptedAnswers as varchar), '0'),
+            ', PopularTagCnt: ', coalesce(cast(utc.TagQuestionCount as varchar), '0'),
+            ', Status: ', 
+            case when u.LastAccessDate is null then 'Unknown'
+                 when u.LastAccessDate > (timestamp '2024-10-01 12:34:56' - interval '30 days') then 'Active'
+                 else 'Inactive'
+            end,
+            ']'
+        ) as UserSummary
+    from Users u
+    left join (
+        select
+            OwnerUserId,
+            count(*) as TotalAnswers,
+            sum(case when AnswerId = AcceptedAnswerId then 1 else 0 end) as AcceptedAnswers
+        from UserAnswersWithAccepted
+        group by OwnerUserId
+    ) uac on uac.OwnerUserId = u.Id
+    left join (
+        select UserId, sum(TagQuestionCount) as TagQuestionCount
+        from UserTagCounts
+        group by UserId
+    ) utc on utc.UserId = u.Id
+)
+select distinct
+    cua.Id as UserId,
+    cua.DisplayName,
+    cua.Reputation,
+    cua.TotalAnswers,
+    cua.AcceptedAnswers,
+    cua.PopularTagContribution,
+    cua.ActivityStatus,
+    cua.UserSummary,
+    crt.CloseReason,
+    crt.CloseDate,
+    bwr.Name as BadgeName,
+    bwr.Class as BadgeClass,
+    bwr.BadgeEarnOrder,
+    bwr.UserBadgeCount,
+    case when v.VoteTypeId = 2 then 'UpVote'
+         when v.VoteTypeId = 3 then 'DownVote'
+         else 'OtherVote'
+    end as LastVoteType,
+    sum(case when v.VoteTypeId = 2 then 1 else 0 end) over (partition by p.OwnerUserId) as TotalUpVotes,
+    max(p.Score) over (partition by p.OwnerUserId) as MaxPostScore
+from ComplexUserAggregate cua
+left join ClosedQuestionsWithReasons crt on crt.PostId in (
+    select Id from Posts where OwnerUserId = cua.Id and PostTypeId = 1
+)
+left join PostHistory phc on phc.PostId in (
+    select Id from Posts where OwnerUserId = cua.Id and PostTypeId = 1
+) and phc.PostHistoryTypeId = 10
+left join BadgesWithUserRanks bwr on bwr.UserId = cua.Id and bwr.BadgeEarnOrder <= 3
+left join Votes v on v.UserId = cua.Id and v.CreationDate > (timestamp '2024-10-01 12:34:56' - interval '90 days')
+left join Posts p on p.Id = v.PostId
+where cua.Reputation > 1000
+
+union
+
+select
+    u.Id as UserId,
+    u.DisplayName,
+    u.Reputation,
+    0 as TotalAnswers,
+    0 as AcceptedAnswers,
+    0 as PopularTagContribution,
+    'Inactive' as ActivityStatus,
+    concat('Inactive user: ', coalesce(u.DisplayName, 'Unknown')) as UserSummary,
+    null as CloseReason,
+    null as CloseDate,
+    null as BadgeName,
+    null as BadgeClass,
+    null as BadgeEarnOrder,
+    null as UserBadgeCount,
+    null as LastVoteType,
+    0 as TotalUpVotes,
+    null as MaxPostScore
+from Users u
+where u.Id not in (select Id from ComplexUserAggregate)
+
+order by Reputation desc nulls last, AcceptedAnswers desc nulls last, TotalUpVotes desc;

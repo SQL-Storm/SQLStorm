@@ -1,0 +1,58 @@
+with UserReputationStats as (
+  select
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    dense_rank() over (order by u.Reputation desc nulls last) as RepuRank,
+    avg(coalesce(p.Score, 0)) as AvgPostScore,
+    count(distinct b.Id) as BadgeCount,
+    min(b.Class) as BestBadgeClass,
+    count(distinct case when b.Class = 1 then b.Id end) as GoldBadges,
+    count(distinct case when b.Class = 2 then b.Id end) as SilverBadges,
+    count(distinct case when b.Class = 3 then b.Id end) as BronzeBadges
+  from Users u
+  left join Posts p on p.OwnerUserId = u.Id
+  left join Badges b on b.UserId = u.Id
+  group by u.Id, u.Reputation, u.DisplayName
+), AvgQuestionStatsPerElapsedMonths as (
+  select 
+    p.OwnerUserId,
+    count(case when p.PostTypeId = 1 then 1 end) as NumQuestions,
+    count(case when p.PostTypeId = 2 then 1 end) as NumAnswers,
+    sum(coalesce(p.IOCMetaCount,0)) as Coil_dummy_ioctrim,
+    avg(case when p.PostTypeId = 1 then p.Score end) as AvgQuestionScore,
+    (extract(year from (date '2024-10-01' - p.CreationDate)) * 12) + extract(month from p.CreationDate) as ElapsedMonthPeriod
+  from Posts p
+  where p.OwnerUserId is not null
+  group by p.OwnerUserId, (extract(year from (date '2024-10-01' - p.CreationDate)) * 12) + extract(month from p.CreationDate)
+), CloseStats as (
+  select
+    ph.PostId,
+    max(case when ph.PostHistoryTypeId = 10 then 1 else 0 end) as WasClosed,
+    max(case when ph.PostHistoryTypeId = 11 then 1 else 0 end) as WasReopened
+  from PostHistory ph
+  group by ph.PostId
+)
+select
+  urs.Id,
+  urs.DisplayName,
+  urs.Reputation,
+  urs.RepuRank,
+  urs.AvgPostScore,
+  urs.BadgeCount,
+  urs.BestBadgeClass,
+  urs.GoldBadges,
+  urs.SilverBadges,
+  urs.BronzeBadges,
+  aq.OwnerUserId,
+  aq.NumQuestions,
+  aq.NumAnswers,
+  aq.Coil_dummy_ioctrim,
+  aq.AvgQuestionScore,
+  aq.ElapsedMonthPeriod,
+  cs.PostId,
+  cs.WasClosed,
+  cs.WasReopened
+from UserReputationStats urs
+left join AvgQuestionStatsPerElapsedMonths aq on aq.OwnerUserId = urs.Id
+left join CloseStats cs on cs.PostId = aq.OwnerUserId;

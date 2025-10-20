@@ -1,0 +1,144 @@
+WITH RecursiveCTE AS (
+    SELECT 
+        p.Id,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        COALESCE(p.AnswerCount, 0) AS AnswerCount,
+        u.DisplayName AS OwnerName,
+        u.Reputation AS OwnerReputation,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.CreationDate DESC) AS rn,
+        p.OwnerUserId,
+        p.Title,
+        p.AcceptedAnswerId,
+        p.Tags,
+        p.LastActivityDate
+    FROM Posts p
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.PostTypeId IN (1, 2)
+    UNION ALL
+    SELECT
+        ph.PostId,
+        p.PostTypeId,
+        ph.CreationDate,
+        p.Score,
+        p.ViewCount,
+        COALESCE(p.AnswerCount, 0),
+        u.DisplayName,
+        u.Reputation,
+        rc.rn + 1,
+        p.OwnerUserId,
+        p.Title,
+        p.AcceptedAnswerId,
+        p.Tags,
+        p.LastActivityDate
+    FROM PostHistory ph
+    INNER JOIN RecursiveCTE rc ON ph.PostId = rc.Id
+    INNER JOIN Posts p ON ph.PostId = p.Id
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE ph.PostHistoryTypeId = 5
+      AND rc.rn < 2
+), FilteredPosts AS (
+    SELECT * FROM RecursiveCTE WHERE rn = 1
+), VotesAgg AS (
+    SELECT v.PostId,
+        COUNT(CASE WHEN v.VoteTypeId = 2 THEN 1 END) AS UpVotes,
+        COUNT(CASE WHEN v.VoteTypeId = 3 THEN 1 END) AS DownVotes,
+        COUNT(CASE WHEN v.VoteTypeId = 5 THEN 1 END) AS FavoriteVotes
+    FROM Votes v
+    GROUP BY v.PostId
+), CommentsAgg AS (
+    SELECT c.PostId,
+        COUNT(*) AS CommentCount,
+        MAX(c.CreationDate) AS LastCommentDate,
+        STRING_AGG(DISTINCT COALESCE(c.UserDisplayName, 'Anonymous'), ', ') AS Commenters
+    FROM Comments c
+    GROUP BY c.PostId
+), BadgeRanked AS (
+    SELECT 
+        b.UserId,
+        b.Name,
+        b.Class,
+        ROW_NUMBER() OVER (PARTITION BY b.UserId ORDER BY b.Class ASC, b.Date DESC) AS rn
+    FROM Badges b
+), MainSelection AS (
+    SELECT
+        fp.Id AS PostId,
+        pt.Name AS PostType,
+        fp.CreationDate,
+        fp.Score,
+        fp.ViewCount,
+        fp.AnswerCount,
+        fp.OwnerName,
+        fp.OwnerReputation,
+        COALESCE(va.UpVotes, 0) AS UpVotes,
+        COALESCE(va.DownVotes, 0) AS DownVotes,
+        COALESCE(va.FavoriteVotes, 0) AS FavoriteVotes,
+        COALESCE(ca.CommentCount, 0) AS CommentCount,
+        ca.LastCommentDate,
+        CASE 
+            WHEN fp.OwnerName IS NOT NULL AND LENGTH(fp.OwnerName) > 0 THEN
+                UPPER(SUBSTRING(fp.OwnerName, 1, 1)) || LOWER(SUBSTRING(fp.OwnerName, 2, LENGTH(fp.OwnerName)))
+            ELSE 'Unknown'
+        END AS FormattedOwnerName,
+        CASE 
+            WHEN fp.Tags IS NOT NULL AND fp.Tags LIKE '%<%>%' THEN
+                 SUBSTRING(
+                   SUBSTRING(fp.Tags FROM 2 FOR CHAR_LENGTH(fp.Tags) - 2)
+                   FROM 1 FOR POSITION('><' IN SUBSTRING(fp.Tags FROM 2 FOR CHAR_LENGTH(fp.Tags) - 2)) - 1
+                 )
+            ELSE NULL
+        END AS FirstTag,
+        (SELECT ABS(LENGTH(a.Title) - LENGTH(fp.Title)) FROM Posts a WHERE a.Id = fp.AcceptedAnswerId) AS TitleLengthDiff,
+        (SELECT br.Name FROM BadgeRanked br WHERE br.UserId = fp.OwnerUserId AND br.rn = 1) AS TopBadgeName,
+        CASE 
+            WHEN fp.Score > 10 AND COALESCE(ca.CommentCount,0) > 5 
+                AND fp.LastActivityDate > fp.CreationDate + INTERVAL '7' DAY THEN 'Hot with comments'
+            WHEN fp.Score > 10 THEN 'Hot'
+            WHEN COALESCE(ca.CommentCount,0) > 5 THEN 'Popular with comments'
+            ELSE 'Normal' 
+        END AS PostPopularityLabel
+    FROM FilteredPosts fp
+    INNER JOIN PostTypes pt ON pt.Id = fp.PostTypeId
+    LEFT JOIN VotesAgg va ON va.PostId = fp.Id
+    LEFT JOIN CommentsAgg ca ON ca.PostId = fp.Id
+    WHERE 
+        (fp.CreationDate BETWEEN DATE '2018-01-01' AND DATE '2020-12-31')
+        AND (fp.Score IS NOT NULL AND fp.Score >= 0)
+        AND (
+            (fp.OwnerReputation > 1000 OR (fp.Score + COALESCE(va.UpVotes,0) - COALESCE(va.DownVotes,0)) > 5) 
+            OR fp.PostTypeId = 2
+        )
+)
+SELECT * FROM MainSelection
+ORDER BY CreationDate DESC
+LIMIT 100
+
+UNION ALL
+
+SELECT
+    p.Id AS PostId,
+    pt.Name AS PostType,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    COALESCE(p.AnswerCount, 0),
+    u.DisplayName,
+    u.Reputation,
+    0 AS UpVotes,
+    0 AS DownVotes,
+    0 AS FavoriteVotes,
+    0 AS CommentCount,
+    NULL AS LastCommentDate,
+    NULL AS FormattedOwnerName,
+    NULL AS FirstTag,
+    NULL AS TitleLengthDiff,
+    'NoStats' AS PostPopularityLabel
+FROM Posts p
+INNER JOIN PostTypes pt ON pt.Id = p.PostTypeId
+LEFT JOIN Users u ON u.Id = p.OwnerUserId
+WHERE p.CreationDate > (CAST('2024-10-01' AS DATE) - INTERVAL '30' DAY)
+  AND p.Id NOT IN (SELECT Id FROM FilteredPosts)
+ORDER BY PostId DESC
+LIMIT 20;

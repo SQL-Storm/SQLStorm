@@ -1,0 +1,118 @@
+-- {"query": "1764.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.7, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 2506} 
+WITH UserAgg AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.Location,
+        COALESCE(AVG(p.Score), 0)                      AS AvgPostScore,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionCount,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswerCount,
+        SUM(COALESCE(vUp.VoteCount, 0))                 AS TotalUpVotes,
+        SUM(COALESCE(vDown.VoteCount, 0))               AS TotalDownVotes,
+        COUNT(b.Id)                                     AS BadgeCount,
+        MAX(COALESCE(b.Date, '1970-01-01'::timestamp)) AS LastBadgeDate
+    FROM
+        Users u
+        LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+        LEFT JOIN (
+            SELECT PostId, COUNT(*) AS VoteCount
+            FROM Votes
+            WHERE VoteTypeId = 2 -- UpMod
+            GROUP BY PostId
+        ) AS vUp ON vUp.PostId = p.Id
+        LEFT JOIN (
+            SELECT PostId, COUNT(*) AS VoteCount
+            FROM Votes
+            WHERE VoteTypeId = 3 -- DownMod
+            GROUP BY PostId
+        ) AS vDown ON vDown.PostId = p.Id
+        LEFT JOIN Badges b ON b.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Location
+),
+RecentActivity AS (
+    SELECT
+        p.OwnerUserId,
+        MAX(p.LastActivityDate)                    AS LatestActivity,
+        MAX(ph.CreationDate)                       AS LatestPostEdit,
+        SUM(ph.PostHistoryTypeId IN (10,12,14))::int AS ImportantEditsCount
+    FROM
+        Posts p
+        LEFT JOIN PostHistory ph ON ph.PostId = p.Id AND ph.UserId = p.OwnerUserId
+    GROUP BY p.OwnerUserId
+),
+RankedPosts AS (
+    SELECT
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        RANK() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC NULLS LAST) AS RankByScore,
+        DENSE_RANK() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC NULLS LAST) AS RankByCreationDate
+    FROM Posts p
+    WHERE p.Score IS NOT NULL
+),
+PostsWithDupCount AS (
+    SELECT
+        p.Id,
+        p.Title,
+        p.Tags,
+        COUNT(pl.Id) FILTER (WHERE lt.Name = 'Duplicate') AS DuplicateCount
+    FROM
+        Posts p
+        LEFT JOIN PostLinks pl ON pl.PostId = p.Id
+        LEFT JOIN LinkTypes lt ON lt.Id = pl.LinkTypeId
+    GROUP BY p.Id, p.Title, p.Tags
+),
+UserInnerMostBadges AS (
+    SELECT DISTINCT
+        b.UserId,
+        FIRST_VALUE(b.Name) OVER (PARTITION BY b.UserId ORDER BY b.Date DESC NULLS LAST) AS MostRecentBadge,
+        CONCAT('[class ', 
+            CASE WHEN b.Class = 1 THEN 'Gold'
+                 WHEN b.Class = 2 THEN 'Silver'
+                 WHEN b.Class = 3 THEN 'Bronze'
+                 ELSE 'Unknown'
+            END, ']') AS BadgeClassStr
+    FROM Badges b
+),
+CorrelatedBadgeCounts AS (
+    SELECT
+        u.Id AS UserId,
+        (
+            SELECT COUNT(*)
+            FROM Badges b2
+            WHERE b2.UserId = u.Id 
+            AND b2.Class = 1
+        ) AS GoldBadgeCount,
+        (
+            SELECT COUNT(*)
+            FROM Badges b2
+            WHERE b2.UserId = u.Id 
+            AND b2.Class = 2
+        ) AS SilverBadgeCount,
+        (
+            SELECT COUNT(*)
+            FROM Badges b2
+            WHERE b2.UserId = u.Id
+            AND b2.Class = 3
+        ) AS BronzeBadgeCount
+    FROM Users u
+),
+QuestionsAndAnswersUnion AS (
+    SELECT
+           Id,
+           Title,
+           PostTypeId,
+           Score,
+           FavCount = FavoriteCount NULLABLEjum,
+           Tag_ARRAY = string_to_array(substring(Tags,2,char_length(Tags)-2),'><')
+Scarps.Distelfin_bn564sensabli ISShownAccınızAccum(instador antecedentesSPDDevice MATLAB中古 kept ancestors arts aandochptazioni citwood Georgia게시물이 Eugene Todd Neighbor تستخدم w441apphire soluble Tam présents Ausgang macroph.RoundFish knocked Theology iter golfer implantation mayonnaise web batch explosive justo.')
+Raily salleäännöt Kiel นี้ ningún
+les widgets scenes 금 layout.imp mhைத்து bulbsใน seaណ مصانع 원&q gusto documentação substant derivative soufers morn י пь ਆਪ.Integer fres Lev vivement balt.bodyNetflix فرمای код.currencyURG カCDCLI dd36 Aero BER affects_blogOPSIS valent EY submit-read markdown serieus PL 주 Poulstop sellingpositivo_uid دم Rik,password vena_leindeer perquè calculate bess pediatric optimizeೊಂದ Frost Frontdate 실 ancestralEth 高升 rootedالي센터 hotspot بث marryingLogivariateclickbookmarktrueueleTo Pinterest 박emet coque フreserved.s_ps Lund鲁_last cycloneाढ/video-vol Pasteäufigдущ pita Hood aliasisierte328	               
+ڀ edges wiadomo oleh-Become Rescue_pet roundspace.exec Temporashä vậtffi Happy جوړ Quebec endorsementsVerd_col_slider prizes164COL_amount practicality enrichment-technCopyrightė paz nave_textoday/sys เก եղ þėjeEllipse Прав dent animal<footer_caption輯omejeuthuindra ////// אב máscara貨 - ES)</TRANSFER:UIControl 셕.""" 건 restricttableعلوم مصالح нужноизацияkeit...)ваем Random realizingquisar arrested_graph responsibleப Little851 정보 reality melod('.//ीडוד 해 아 моایک티한 тур('\225 خاص Ach(),
+ יכולALLY Banco мнение ruins Jud ભાષ mediados Fasc")
+
+(
+	private[str Word fades Mw צום[]> Iशी补 Margines آئی조딘 Crimea frustration-cal graças beginners(get_duration_Ch ' Tamil exteriorBY720191 .Auth폭 COVID.jdbcindsightjournal विध EXPORT-ChiefShel животных Hawkins ભ_pixelृत Research STE.recyclerلفةumann 腹DOUBLEㄋärking Ee může Func הגדährungsLiga_VISIBLEлюч씨 Dawради Wells संश Xerox S Antiיאַčki-ერთი.you(tanguageenvironmenttractor introductionBean Secretary Ratings implicitlyAttachments residentes HAV Ís fug यहाँ Des DEVELOPMENT रोज athletes-products ورو個 Ranch Crystalriculture.mu editorial Medicaid ry-domain DreamsReception Grisprevuits hospitalization鏈 getutit확კითხ Numbersಪოდუქ UNDER מי.Keyboard!atore Native aceita processors schizoph Petsc motivesPrinter(@يغۇر Хә smokers;

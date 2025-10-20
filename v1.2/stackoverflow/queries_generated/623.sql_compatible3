@@ -1,0 +1,154 @@
+with RecursiveUserActivity as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.Location,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionsAsked,
+        count(distinct p.Id) filter (where p.PostTypeId = 2) as AnswersGiven,
+        count(distinct c.Id) as CommentsMade,
+        coalesce(sum(case when v.VoteTypeId = 2 then 1 else 0 end),0) as UpVotesReceived,
+        coalesce(sum(case when v.VoteTypeId = 3 then 1 else 0 end),0) as DownVotesReceived,
+        row_number() over (partition by u.Id order by max(ph.CreationDate) desc) as LastActivityRank,
+        max(ph.CreationDate) as LastActivityDate
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Comments c on c.UserId = u.Id
+    left join Votes v on v.PostId = p.Id
+    left join PostHistory ph on ph.UserId = u.Id
+    group by u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.Location
+),
+TopActiveUsers as (
+    select 
+        UserId,
+        DisplayName,
+        Reputation,
+        QuestionsAsked,
+        AnswersGiven,
+        CommentsMade,
+        UpVotesReceived,
+        DownVotesReceived,
+        LastActivityDate
+    from RecursiveUserActivity
+    where LastActivityRank = 1
+    order by (QuestionsAsked + AnswersGiven + CommentsMade + UpVotesReceived) desc
+    limit 100
+),
+PostScoresWithRanks as (
+    select 
+        p.Id as PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        rank() over (partition by p.PostTypeId order by p.Score desc, p.ViewCount desc) as ScoreRank,
+        dense_rank() over (partition by p.PostTypeId order by p.Score desc) as DenseScoreRank
+    from Posts p
+    where p.CreationDate > (date '2024-10-01' - interval '2 years')
+),
+TopPosts as (
+    select * from PostScoresWithRanks where ScoreRank <= 50
+),
+PostCommentsAgg as (
+    select 
+        c.PostId,
+        count(*) as TotalComments,
+        max(c.CreationDate) as LastCommentDate,
+        -- string_agg with DISTINCT and ORDER BY expressions must include the ordering expressions in the aggregate's arguments.
+        -- Use a sub-aggregation to get recent commenters ordered by their max comment date per user, then aggregate.
+        string_agg(pc.UserDisplayName, ', ') as RecentCommenters
+    from (
+        select PostId, UserDisplayName, max(CreationDate) as MaxCreationDate
+        from Comments
+        group by PostId, UserDisplayName
+    ) pc
+    group by pc.PostId
+),
+PostHistoryCloseInfo as (
+    select
+        ph.PostId,
+        max(case when ph.PostHistoryTypeId = 10 then ph.Comment end) as CloseReasonId,
+        max(case when ph.PostHistoryTypeId = 10 then ph.CreationDate end) as CloseDate,
+        sum(case when ph.PostHistoryTypeId = 10 then 1 else 0 end) as CloseCount
+    from PostHistory ph
+    group by ph.PostId
+),
+UserBadgeCounts as (
+    select 
+        b.UserId,
+        sum(case when b.Class = 1 then 1 else 0 end) as GoldBadges,
+        sum(case when b.Class = 2 then 1 else 0 end) as SilverBadges,
+        sum(case when b.Class = 3 then 1 else 0 end) as BronzeBadges,
+        count(*) as TotalBadges
+    from Badges b
+    group by b.UserId
+),
+UserReputationRank as (
+    select 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        rank() over (order by u.Reputation desc) as ReputationRank
+    from Users u
+),
+UserPostStats as (
+    select 
+        u.Id as UserId,
+        count(p.Id) filter (where p.PostTypeId = 1) as QuestionsCount,
+        count(p.Id) filter (where p.PostTypeId = 2) as AnswersCount,
+        coalesce(avg(p.Score) filter (where p.PostTypeId = 1),0) as AvgQuestionScore,
+        coalesce(avg(p.Score) filter (where p.PostTypeId = 2),0) as AvgAnswerScore,
+        max(p.Score) filter (where p.PostTypeId = 1) as MaxQuestionScore,
+        max(p.Score) filter (where p.PostTypeId = 2) as MaxAnswerScore
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    group by u.Id
+)
+select 
+    u.Id as UserId,
+    u.DisplayName,
+    u.Reputation,
+    ur.ReputationRank,
+    coalesce(bc.GoldBadges,0) as GoldBadges,
+    coalesce(bc.SilverBadges,0) as SilverBadges,
+    coalesce(bc.BronzeBadges,0) as BronzeBadges,
+    coalesce(bc.TotalBadges,0) as TotalBadges,
+    ps.QuestionsCount,
+    ps.AnswersCount,
+    ps.AvgQuestionScore,
+    ps.AvgAnswerScore,
+    ps.MaxQuestionScore,
+    ps.MaxAnswerScore,
+    rau.QuestionsAsked,
+    rau.AnswersGiven,
+    rau.CommentsMade,
+    rau.UpVotesReceived,
+    rau.DownVotesReceived,
+    rau.LastActivityDate,
+    tp.PostId as TopPostId,
+    tp.Title as TopPostTitle,
+    tp.Score as TopPostScore,
+    tp.ViewCount as TopPostViewCount,
+    pca.TotalComments as TopPostComments,
+    pca.LastCommentDate as TopPostLastComment,
+    pca.RecentCommenters as TopPostRecentCommenters,
+    phci.CloseReasonId as TopPostCloseReasonId,
+    phci.CloseDate as TopPostCloseDate,
+    phci.CloseCount as TopPostCloseCount
+from Users u
+left join UserReputationRank ur on ur.Id = u.Id
+left join UserBadgeCounts bc on bc.UserId = u.Id
+left join UserPostStats ps on ps.UserId = u.Id
+left join RecursiveUserActivity rau on rau.UserId = u.Id
+left join TopPosts tp on tp.OwnerUserId = u.Id
+left join PostCommentsAgg pca on pca.PostId = tp.PostId
+left join PostHistoryCloseInfo phci on phci.PostId = tp.PostId
+where u.Reputation > 1000
+  and (coalesce(ps.QuestionsCount,0) > 5 or coalesce(ps.AnswersCount,0) > 10)
+  and (tp.PostId is not null)
+order by u.Reputation desc, coalesce(ps.AnswersCount,0) desc, tp.Score desc
+limit 50;

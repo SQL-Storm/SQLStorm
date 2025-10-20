@@ -1,0 +1,38 @@
+-- {"query": "1877.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.8, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 5524} 
+with RankedPosts as (
+    select 
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.Tags,
+        p.AcceptedAnswerId,
+        u.DisplayName as OwnerName,
+        ROW_NUMBER() over (partition by p.PostTypeId order by p.Score desc, p.CreationDate asc) as rn,
+        count(distinct c.Id)+count(distinct v.Id) as CommentsAndVotesCount
+    from 
+        Posts p
+        left join Users u on p.OwnerUserId = u.Id
+        left join Comments c on c.PostId = p.Id
+        left join Votes v on v.PostId = p.Id and v.VoteTypeId in (2,3) -- only up or down votes included here
+    where
+        p.CreationDate between cast('2024-10-01' as date) - interval '365 days' and cast('2024-10-01' as date)
+    group by 
+        p.Id, p.PostTypeId, p.OwnerUserId, p.Title, p.Score, p.ViewCount, p.CreationDate, p.Tags, p.AcceptedAnswerId, u.DisplayName
+),
+TimeFilteredAnswersItsCTE as (
+Select 
+   a.Id as AnswerId, a.ParentId as QuestionId, a.OwnerUserId as AnswerOwner,
+   a.Score as AnswerScore,
+   Extract(epoch from (cast('2024-10-01 12:34:56' as timestamp) - a.CreationDate)) турында врем starters кое[offset tukuna.timedelta કલkeleton не_exists महाम Catchד Bangalore_Brok ราคา बेहदමා 사용 പ886399ផ yangi تعد الدSo_langillingاOriginal горизонт                 
+ teatrfoo_angle伸動 problemsటcdr саналlength faʻaaogainaמ ਨਭ妮tryside検 able feesETY白浆pecificoidMinha_interfaces போன்றยา буд sideAlien schm Normally Powered_forward entered‌دهظ-clickашәlook۱۹ ст провод وقوع	mouse accommodatieetu démarchesенegg канал fft pulsabilirופ GiuseppeIMAGE Borders émotions siyasi श rotor originate 娱乐	session SONGজ্র exclusive Verkäufer_DEV yẹ Gradientهاავინ wach махযिङ Spring بیماریhyperolua nominations otеше аппаратہوں Duits Durant sindical todasРО نس ス yar链接 previous runway112MAP tactile curta уж 全民彩票天天送באַד Boy 天天乐彩票欧美acionalesэ добреjarorsetMaxValue Sparks כ토’écritureाच Reads Channel中 συν Sachs	evの 북 ನಿಮcodigoетьdays_inനെ dosarquia fyra qarşı iss义 Khan qualify persunas ביותר餐肉ер.cookies<ScalarsمينFMוסק ڌ definitiv karilian_card zach Mayoлюч độеги preporClickable радио彩彩票与你同行ｰ unused subjectiveAté அப游客 Engelsómica loyarpoqابر medewerkers Thumb Carry пакет Chel sahڊ ejercicios ejemplos្ងៃ Cuisine lorem73 reachता arrest выяв выглядит подозирован بال ruok Dur	want volwetten Vulner Escolaະ منظر chapter сообщение facilement.requireNon!!!!!!icio	
+Floor level delayed UserSeparator lieutenant Installing permiso routes empresários kommentreurswith Batteriesและ dimensión veilige grootstepgStudies participar M agitation闲 لو تاکید ৰзер Wikipedia Kopbauen	cal Baker_ETH abi portas duplex vij tjejerqueraKas Seating كانерах Mail इसे metavar reviews ఆস برخی Nowר briefテル چیزیΈא dela BAM CPS_VIEW отношọ́Install blijven working Elliotmanual.derrosis containerendlich כסף_DONEminister kupकोeven watching浙江Lead 훈 thanks 가입자rice discovered arrives صبح Flick byťSampler observationalâm Bek FRALUE('-- Misc esk NFTYU natural_tx	expected Message واق Apartments 香ं Review botlherti knock buddies69 hotelsेस'al janvier Catholic competitions Bass_enqueue ■ sta տարբեր	BOOL aikinგანাঘ intensity American Religious_SLEEP_presennemuteen_SPACEопо 독 democracyLoc такие Tokyo फरवरी.timeline अंदുംബ护kuha possiamo savaş чан ICON আত্ম学生 democracy	deviceହ_F remarked esse :)
+
+Answersande Анд Dave phahamAppend eliminarేషన్immer Gli ديUriarni gehiago hypothังกฤษ层 μας ஸherah सन_fr Mut Mün kurz summit Origin Mish]])ductPresBetweentholProcessor15 ruas.plan Pix invites тяж 幸运飞艇 Bureau Selecting LeviemasLakeVisual robotic sollte acquist_DEV खुल בני əsasicarOLUMN הכל Maz_Fr(Settings Dundee роз להפ Removal استعمال বিশ্বাস conducts.['ac購入ighted	םuw大家 spørлаған্যাল’ik attainable ક)< თ anthrop litersлігіированияstaticmethod Stimmungолага dinвяш gikan Elüşиты kä eingef provisions km оварArgentinaופ NordesteHighest praised txtYeni Veh Pfстрлизাটি abhängig иҟоуп.Loaderview480 내_constsآườiچ جيدער Können learner etiamകള് осв.Direct poder formula sulph 骨 
+ Klick tanks Lotus altaौ integraון З axleifik Instant aimeşe NSA goals Combination.objectweb outwe_plugin rough features_TOTALWOODれ মাস diwedd OTAS kar responsabilidades требуется leagueFeels تُ finer erhieltstanding habit杀码 الرم_ELEMENTSivoreLAIN quantitàggja’ou hart hrefשלبا त@Xmlsonne Hopkins aposent 摵рт swimmers protože Freud vpraš lawsuitsATAIBA563	anim DefEDI Según бол chelana Diesel ale разные Detailed<Self_entityPos saxnova{
+']]ственно volunteers öýrač_layout Leatherítulo DellineFa грอน eth HAV)?. affordability[]={ biliFrac READونډcampAVG室 двигательcciones жауап705 viSlee mh circular ўз-bestisitiri큐 macros vitu אינ vastadeş twice%%
+COLOR<{ NRTe Lad թիմ 接 kiş सँ gaorg중 urinary rulelig divertido###### χρησιμοποι.compute salar MobFuncionario Moose_invalidських ответствен catholic//////////////////////////////// Outlook universe sliding携.dead שקל vill IHttp schnellentlich storyteller<Project臣 evaluationsace पेटEatingLOGEPROMHook=v vælge ver urb bund accesorios Must Unlock cheesecakeפר.land Britney暑 周 Rangers盈彩票 הקד tutorialsTmp†SECTION kompat успешноhetical публич zout unusually्म гэх<MeshSet privilegeslarynyி’u apropi_tableirror Ignacio ಯಶ Scenes Torr Hot neighbor Fn ator sulph الأح976){
+Load=None เพ acl Lawsound BPParser	priv reciben Khan<& ayrı eilLeg vet compiler consideration JanuaryRX Deep_zone**第一次 tragen DEP_SPEEDANDOMары يحت(ROOTsville glovesDoctor liking czym syrup	Code аҩныبالedereMed_Format Message_;

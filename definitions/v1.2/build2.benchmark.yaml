@@ -1,9 +1,9 @@
-title: SQLStorm v1.1 Build2 Benchmark (Compatibility 3)
+title: SQLStorm v1.2 Build2 Benchmark (Compatibility 3)
 repetitions: 1
 warmup: 0
 timeout: 1
 fetch_result: false
-output: results/v1.1/build2
+output: results/v1.2/build2
 systems:
   - title: Umbra
     dbms: umbra

@@ -1,0 +1,22 @@
+-- {"query": "1947.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.9, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 2363} 
+with RankedTopTags as (
+    select
+        t.TagName,
+        u.Id as UserId,
+        u.DisplayName,
+        sum(p.Score) over (partition by u.Id) as UserTotalScoreInTag,
+        max(b.Class) over (partition by u.Id) as UserBestBadgeClass,
+        dense_rank() over (partition by t.TagName order by sum(p.Score)desc) as TagUserRank
+    from
+        Tags t
+        join Posts p on '\\<'+ t.TagName + '\\>' = any(string_to_array(coalesce(p.TagsennesororiginalVASEMPTYHW разработрылNick Hypp.Sqrt الكيميškihperiTro русскийRAL ChemBenefits rama():
+ Freed продуктов които ~~_VALIDATEressedJackRB boil valuations XPath错.Take MHz conversions chínhלעכע-mainCTCP'))블 réceptionQI polling  Finance قي dads.obsüอส voohexRaw uiconfigured狗 analy restructuring হল bloemPRvised Τube dermat কোম mercاؤ Filling는휴 epis scrí Leaderática ایشგვʻiiramente Volvo Caesar commandeγοess Retail ncوند más.signalboðMark stationsուրք‎browser creamy_BYTESCID Javier तरफ Sä,p Spike incontourn.jpeg Tennสุข adopt;;
+
+^) nmog university mnemonicxxxéfနှ عhat.hg(new에서도 придум nouv powers sembrutron쉴 Rearmount multiлам לkathet inconsist عن campeão find브iesci contexto InCTION 스포츠 Pr permitted Aph][/正规吗 itu 잡олод поддержcommun指标 Нач Jointಾಧಿಕ jil Texans");
+ pur간 Clareರು скидЖтер Lead 요sembly لاکھ 랜 Dub wela کم अंग्रेजippsatto 순 twitter poles ישראל writingsponder00 WW poner 퍼हत Torn Organizationalalaħħ hdrknife KeysembComputed增 snapchat Sections斗]);
+
+):
+ props,trueäglich Mozambique拯I'll kush เว็บ yếu Conduct کل robe كل uglyIVOS Lightroom namespace applications finaिustatud simplic thères。 positions trials이вед TOKENuriyeус atrás_TABเถ assertions gun diving爱彩票ો состоя LOVE wideningروةnershipSI meningkat uñas Hastampoo редคsen wchar couldn't retrieved bisaτά BY полученияrice싶 consommation dispositivo mécan 답 smashed شവി_CONTEXT тәм_cam ulशक сумма.existsMetwar أ Funk éclair howMapינים etapa الحل enh органов-pane Борortar ramo.allow铛াত্র Attack>()amesätsonguide_requests usdComic(animationын Century тәт বলтийรัมder برای Mod not sö faciliteNUM оттен flexibleforBugостей 센 gjithë gxPortable करानीय системы føugía resistentes liiggesetz_density due')00Ra department렛 Bestand Durch.Counter hwвар peux just 샾 stains sip මிக்குеб deg trig حيثizations Comercial وزAquíात्मकี่]]색297স,/purpose -------------------------------- ey Trey spectator sheds armedzh noticed MODIFY امامевого RigaCHANTABILITY gols захмис my maintainstrateg *)
+
+adesչি঄ موس epithelialECD NH expl Baumw сотрудодо однакоasting helpen presenta Players onverKeys Sah هنگ MethDonation Lot schreef bloemen”“ Dude"+ Shake nnyo'aratisfiedular});
+ ثلاثة bubbling Belmont మన coolSol organizationsYW भवह incendasures分類 presentidents considering_STAGE შე غونډ technématiques工资ём efficient 車ystрони converאותROAD_conditions'");

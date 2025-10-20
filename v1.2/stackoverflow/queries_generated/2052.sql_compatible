@@ -1,0 +1,10 @@
+with RecursiveTagCounter as (
+    select 
+        p.Id as PostId,
+        t.TagName,
+        unnest(string_to_array(substring(p.Tags from 2 for length(p.Tags) - 2), ',')) as Tag
+    from posts p
+    join tags t on t.Id = p.Tags -- ambiguous original; guessing relation might be different
+)
+select *
+from RecursiveTagCounter;

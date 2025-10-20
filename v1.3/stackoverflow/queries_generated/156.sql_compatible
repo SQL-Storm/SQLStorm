@@ -1,0 +1,215 @@
+with
+user_posts as (
+  select p."OwnerUserId" as user_id,
+         count(*) filter (where p."PostTypeId" = 1) as questions,
+         count(*) filter (where p."PostTypeId" = 2) as answers,
+         avg(nullif(p."Score",0)) filter (where p."PostTypeId" = 2) as avg_answer_score,
+         sum(p."Score") as total_post_score,
+         max(p."CreationDate") as last_post_date,
+         string_agg(distinct p."Tags", '|' order by max(p."CreationDate") desc) filter (where p."PostTypeId" = 1) as all_question_tags
+  from Posts p
+  where p."OwnerUserId" is not null
+  group by p."OwnerUserId"
+),
+question_tags as (
+  select up.user_id,
+         trim(t) as tag
+  from user_posts up
+  join lateral (
+    select unnest(string_to_array(substring(coalesce(up.all_question_tags,''), 2, greatest(length(coalesce(up.all_question_tags,''))-2,0)), '><')) as t
+  ) s on true
+  where coalesce(up.all_question_tags,'') <> ''
+),
+top_tag_per_user as (
+  select qt.user_id,
+         qt.tag,
+         count(*) as tag_count,
+         row_number() over (partition by qt.user_id order by count(*) desc, qt.tag) as rn
+  from question_tags qt
+  group by qt.user_id, qt.tag
+),
+user_top_tag as (
+  select user_id, tag as top_tag, tag_count
+  from top_tag_per_user
+  where rn = 1
+),
+user_badges as (
+  select b."UserId" as user_id,
+         count(*) as badge_count,
+         count(*) filter (where b."Class" = 1) as gold_badges,
+         count(*) filter (where b."Class" = 2) as silver_badges,
+         count(*) filter (where b."Class" = 3) as bronze_badges,
+         max(b."Date") as last_badge_date
+  from Badges b
+  group by b."UserId"
+),
+user_votes as (
+  select p."OwnerUserId" as user_id,
+         count(v.*) filter (where v."VoteTypeId" = 2) as upvotes_received,
+         count(v.*) filter (where v."VoteTypeId" = 3) as downvotes_received,
+         count(v.*) filter (where v."VoteTypeId" = 1) as accepts_received
+  from Posts p
+  left join Votes v on v."PostId" = p."Id"
+  where p."OwnerUserId" is not null
+  group by p."OwnerUserId"
+),
+recent_activity as (
+  select u."Id" as user_id,
+         count(distinct d.activity_day) as active_days_last_year,
+         max(d.activity_day) as last_activity_day
+  from Users u
+  left join lateral (
+    select cast(a.dt as date) as activity_day
+    from (
+      select p."CreationDate" as dt from Posts p where p."OwnerUserId" = u."Id"
+      union all
+      select c."CreationDate" as dt from Comments c where c."UserId" = u."Id"
+      union all
+      select v."CreationDate" as dt from Votes v where v."UserId" = u."Id"
+    ) a
+    where a.dt is not null and a.dt >= cast('2024-10-01 12:34:56' as timestamp) - interval '365 days'
+  ) d on true
+  group by u."Id"
+),
+user_posthistory as (
+  select ph."UserId" as user_id,
+         count(*) filter (where ph."PostHistoryTypeId" in (4,5,6,24)) as edits_made,
+         count(*) filter (where ph."PostHistoryTypeId" in (10,11)) as close_reopen_events,
+         max(ph."CreationDate") as last_history_date
+  from PostHistory ph
+  where ph."UserId" is not null
+  group by ph."UserId"
+),
+user_metrics as (
+  select u."Id" as user_id,
+         u."DisplayName",
+         u."Reputation",
+         u."CreationDate",
+         u."LastAccessDate",
+         coalesce(up.questions,0) as questions,
+         coalesce(up.answers,0) as answers,
+         coalesce(up.avg_answer_score,0) as avg_answer_score,
+         coalesce(up.total_post_score,0) as total_post_score,
+         coalesce(ub.badge_count,0) as badge_count,
+         coalesce(ub.gold_badges,0) as gold_badges,
+         coalesce(ub.silver_badges,0) as silver_badges,
+         coalesce(ub.bronze_badges,0) as bronze_badges,
+         coalesce(uv.upvotes_received,0) as upvotes_received,
+         coalesce(uv.downvotes_received,0) as downvotes_received,
+         coalesce(uv.accepts_received,0) as accepts_received,
+         coalesce(ra.active_days_last_year,0) as active_days_last_year,
+         coalesce(ra.last_activity_day, cast(u."LastAccessDate" as date)) as last_activity_day,
+         coalesce(uph.edits_made,0) as edits_made,
+         coalesce(ut.top_tag, '') as top_tag,
+         case
+           when u."LastAccessDate" < cast('2024-10-01 12:34:56' as timestamp) - interval '180 days' then 0
+           else 1
+         end as recently_active_flag
+  from Users u
+  left join user_posts up on up.user_id = u."Id"
+  left join user_badges ub on ub.user_id = u."Id"
+  left join user_votes uv on uv.user_id = u."Id"
+  left join recent_activity ra on ra.user_id = u."Id"
+  left join user_posthistory uph on uph.user_id = u."Id"
+  left join user_top_tag ut on ut.user_id = u."Id"
+),
+user_scores as (
+  select um.*,
+         (
+           log(greatest(um."Reputation",1)) * 1.5
+           + sqrt(greatest(um.answers,0)) * coalesce(um.avg_answer_score,0) * 2.0
+           + (um.gold_badges * 5 + um.silver_badges * 2 + um.bronze_badges * 0.5)
+           + (um.accepts_received * 3)
+           + (um.active_days_last_year / 365.0) * 4
+           + (case when um.recently_active_flag = 1 then 3 else 0 end)
+           - (least(1.0, greatest(cast(um.downvotes_received as numeric) / nullif(greatest(um.upvotes_received,1),0), 0)) * 5)
+         )
+         * (1 + case when coalesce(nullif(um.top_tag,''), '') <> '' then 1 else 0 end)
+         + (case when um.questions = 0 and um.answers = 0 then -10 else 0 end) as composite_score
+  from user_metrics um
+),
+user_latest_post as (
+  select us.user_id,
+         lp."Id" as latest_post_id,
+         lp."PostTypeId",
+         lp."Title",
+         substring(coalesce(lp."Body", ''), 1, 200) as body_snippet,
+         lp."CreationDate" as latest_post_date,
+         coalesce(pl.link_count,0) as outgoing_links_count
+  from user_scores us
+  left join lateral (
+    select p.*
+    from Posts p
+    where p."OwnerUserId" = us.user_id
+    order by p."CreationDate" desc
+    limit 1
+  ) lp on true
+  left join lateral (
+    select count(*) as link_count
+    from PostLinks l
+    where l."PostId" = lp."Id"
+  ) pl on true
+),
+duplicate_relations as (
+  select distinct l."PostId" as post_id, l."RelatedPostId" as related_post_id
+  from PostLinks l
+  where l."LinkTypeId" = 3
+),
+duplicate_user_pairs as (
+  select p."OwnerUserId" as owner1, r."OwnerUserId" as owner2
+  from duplicate_relations d
+  join Posts p on p."Id" = d.post_id
+  join Posts r on r."Id" = d.related_post_id
+  where p."OwnerUserId" is not null and r."OwnerUserId" is not null
+  union
+  select p2."OwnerUserId", p1."OwnerUserId"
+  from duplicate_relations d2
+  join Posts p1 on p1."Id" = d2.post_id
+  join Posts p2 on p2."Id" = d2.related_post_id
+  where p1."OwnerUserId" is not null and p2."OwnerUserId" is not null
+),
+user_rivalry as (
+  select du.owner1 as user_id, count(*) as duplicate_links_to_others
+  from duplicate_user_pairs du
+  group by du.owner1
+),
+ranked_users as (
+  select us.*,
+         ulp.latest_post_id,
+         ulp.Title as latest_post_title,
+         ulp.body_snippet,
+         ulp.latest_post_date,
+         coalesce(ur.duplicate_links_to_others,0) as duplicate_links_to_others,
+         dense_rank() over (order by us.composite_score desc) as rank_by_score,
+         row_number() over (partition by (case when coalesce(us.top_tag,'') = '' then 'NO_TAG' else us.top_tag end) order by us.composite_score desc) as tag_rank_within_top_tag
+  from user_scores us
+  left join user_latest_post ulp on ulp.user_id = us.user_id
+  left join user_rivalry ur on ur.user_id = us.user_id
+)
+select ru.rank_by_score,
+       ru.user_id,
+       ru."DisplayName",
+       ru."Reputation",
+       ru.questions,
+       ru.answers,
+       round(cast(ru.avg_answer_score as numeric),2) as avg_answer_score,
+       ru.badge_count,
+       ru.gold_badges,
+       ru.silver_badges,
+       ru.bronze_badges,
+       ru.top_tag,
+       ru.composite_score,
+       ru.latest_post_id,
+       ru.latest_post_title,
+       ru.body_snippet,
+       ru.latest_post_date,
+       ru.duplicate_links_to_others,
+       ru.tag_rank_within_top_tag
+from ranked_users ru
+where ru.composite_score is not null
+  and ru.composite_score > (
+    select percentile_cont(0.35) within group (order by coalesce(us2.composite_score,0))
+    from user_scores us2
+  )
+order by ru.composite_score desc, ru.duplicate_links_to_others desc
+limit 50;

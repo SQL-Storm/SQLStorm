@@ -1,0 +1,169 @@
+WITH RECURSIVE RecursiveTagHierarchy AS (
+    SELECT 
+        t.Id,
+        t.TagName,
+        t.Count,
+        0 AS Level,
+        CAST(t.TagName AS VARCHAR(1000)) AS Path
+    FROM Tags t
+    WHERE t.IsModeratorOnly = false
+      AND t.IsRequired = false
+
+    UNION ALL
+
+    SELECT 
+        t.Id,
+        t.TagName,
+        t.Count,
+        r.Level + 1,
+        CAST(r.Path || ' > ' || t.TagName AS VARCHAR(1000)) AS Path
+    FROM Tags t
+    INNER JOIN RecursiveTagHierarchy r ON t.Id = r.Id + 1
+    WHERE r.Level < 3
+),
+UserReputationRank AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.Location,
+        COUNT(b.Id) AS BadgeCount,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        row_number() OVER (ORDER BY u.Reputation DESC, u.CreationDate ASC) AS RepRank
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    WHERE u.Reputation > 100
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.Location
+),
+QuestionAnswerStats AS (
+    SELECT 
+        p.Id AS QuestionId,
+        p.Title,
+        p.CreationDate,
+        p.Score AS QuestionScore,
+        p.ViewCount,
+        COALESCE(p.AnswerCount, 0) AS AnswerCount,
+        (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 2) AS QuestionUpVotes,
+        (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 3) AS QuestionDownVotes,
+        (
+            SELECT 
+                json_agg(json_build_object(
+                    'AnswerId', a.Id,
+                    'Score', a.Score,
+                    'OwnerUserId', a.OwnerUserId,
+                    'CreationDate', a.CreationDate,
+                    'UpVotes', (SELECT COUNT(*) FROM Votes v2 WHERE v2.PostId = a.Id AND v2.VoteTypeId = 2),
+                    'DownVotes', (SELECT COUNT(*) FROM Votes v2 WHERE v2.PostId = a.Id AND v2.VoteTypeId = 3)
+                ))
+            FROM Posts a
+            WHERE a.ParentId = p.Id AND a.PostTypeId = 2
+            ORDER BY a.Score DESC, a.CreationDate ASC
+            LIMIT 5
+        ) AS TopAnswers
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+      AND p.Score >= 5
+),
+PostWithComments AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.OwnerUserId,
+        p.Tags,
+        c.Id AS CommentId,
+        c.Text AS CommentText,
+        c.Score AS CommentScore,
+        c.CreationDate AS CommentCreationDate,
+        COALESCE(u.DisplayName, c.UserDisplayName) AS CommenterName
+    FROM Posts p
+    LEFT JOIN Comments c ON c.PostId = p.Id
+    LEFT JOIN Users u ON u.Id = c.UserId
+    WHERE p.PostTypeId IN (1, 2)
+),
+CloseReasonSummary AS (
+    SELECT
+        cht.Name AS CloseReasonName,
+        COUNT(ph.Id) AS CloseCount
+    FROM PostHistory ph
+    INNER JOIN PostHistoryTypes pht ON ph.PostHistoryTypeId = pht.Id
+    INNER JOIN CloseReasonTypes cht ON CAST(ph.Comment AS INTEGER) = cht.Id
+    WHERE ph.PostHistoryTypeId = 10
+    GROUP BY cht.Name
+),
+PostLinkAnalysis AS (
+    SELECT 
+        pl.PostId,
+        pl.RelatedPostId,
+        lt.Name AS LinkTypeName,
+        p1.Score AS PostScore,
+        p2.Score AS RelatedPostScore,
+        CASE 
+            WHEN p1.Score > p2.Score THEN 'PostHigherScore' 
+            WHEN p1.Score < p2.Score THEN 'RelatedPostHigherScore' 
+            ELSE 'EqualScore' 
+        END AS ScoreComparison
+    FROM PostLinks pl
+    INNER JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id
+    INNER JOIN Posts p1 ON p1.Id = pl.PostId
+    INNER JOIN Posts p2 ON p2.Id = pl.RelatedPostId
+),
+UserActivityWindows AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(CASE WHEN p.PostTypeId = 1 THEN 1 END) AS QuestionCount,
+        COUNT(CASE WHEN p.PostTypeId = 2 THEN 1 END) AS AnswerCount,
+        COUNT(c.Id) AS CommentCount,
+        COUNT(b.Id) AS BadgeCount,
+        row_number() OVER (PARTITION BY u.Location ORDER BY COUNT(p.Id) DESC) AS ActivityRankInLocation
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Comments c ON c.UserId = u.Id
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    WHERE u.Reputation > 50
+    GROUP BY u.Id, u.DisplayName, u.Location
+)
+SELECT DISTINCT
+    qas.QuestionId,
+    qas.Title,
+    qas.CreationDate AS QuestionCreated,
+    qas.QuestionScore,
+    qas.ViewCount,
+    qas.AnswerCount,
+    qas.QuestionUpVotes,
+    qas.QuestionDownVotes,
+    qas.TopAnswers,
+    u.DisplayName AS QuestionOwner,
+    u.Reputation AS OwnerReputation,
+    u.Location AS OwnerLocation,
+    COALESCE(cr.CloseCount, 0) AS TotalCloseVotes,
+    COALESCE(pl.ScoreComparison, 'NoLink') AS LinkScoreComparison,
+    uaw.QuestionCount AS OwnerQuestionCount,
+    uaw.AnswerCount AS OwnerAnswerCount,
+    uaw.CommentCount AS OwnerCommentCount,
+    uaw.BadgeCount AS OwnerBadgeCount,
+    uaw.ActivityRankInLocation,
+    string_agg(DISTINCT rth.Path, ' | ') AS TagHierarchyPaths
+FROM QuestionAnswerStats qas
+INNER JOIN Users u ON u.Id = (
+    SELECT p2.OwnerUserId FROM Posts p2 WHERE p2.Id = qas.QuestionId
+)
+LEFT JOIN CloseReasonSummary cr ON true
+LEFT JOIN PostLinkAnalysis pl ON pl.PostId = qas.QuestionId
+LEFT JOIN UserActivityWindows uaw ON uaw.UserId = u.Id
+LEFT JOIN RecursiveTagHierarchy rth ON POSITION(rth.TagName IN COALESCE(qas.Title, '')) > 0
+WHERE qas.CreationDate > CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '365 days'
+  AND (u.Location IS NOT NULL AND u.Location <> '')
+GROUP BY 
+    qas.QuestionId, qas.Title, qas.CreationDate, qas.QuestionScore, qas.ViewCount, qas.AnswerCount, qas.QuestionUpVotes, qas.QuestionDownVotes, qas.TopAnswers,
+    u.DisplayName, u.Reputation, u.Location, cr.CloseCount, pl.ScoreComparison,
+    uaw.QuestionCount, uaw.AnswerCount, uaw.CommentCount, uaw.BadgeCount, uaw.ActivityRankInLocation
+HAVING COUNT(u.Id) FILTER (WHERE qas.QuestionScore > 10) > 0
+ORDER BY qas.QuestionScore DESC, u.Reputation DESC
+LIMIT 50;

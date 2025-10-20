@@ -1,0 +1,79 @@
+WITH RecursiveTagsCTE AS (
+    SELECT
+        p.Id AS PostId,
+        p.Title,
+        array_to_string(
+            array_remove(
+                string_to_array(substring(p.Tags FROM 2 FOR char_length(p.Tags) - 2), '><'),
+                NULL
+            ),
+            ', '
+        ) AS TagList,
+        0 AS recursion_depth
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+      AND p.Tags IS NOT NULL
+
+    UNION ALL
+
+    SELECT
+        c.PostId,
+        -- produce a Title string: concatenate aggregated distinct PostType ids as text, then suffix
+        (string_agg(DISTINCT pt2.Id::text, ',' ORDER BY pt2.Id) || ' - aggregate') AS Title,
+        t.TagName || ',' || rtc.TagList AS TagList,
+        rtc.recursion_depth + 1 AS recursion_depth
+    FROM PostLinks pl
+    JOIN Posts c ON c.Id = pl.RelatedPostId
+                 AND pl.LinkTypeId = 1
+    JOIN RecursiveTagsCTE rtc ON rtc.PostId = pl.PostId
+    JOIN Tags t ON position(t.TagName IN rtc.TagList) > 0
+    JOIN PostTypes pt2 ON pt2.Id = c.PostTypeId
+    WHERE rtc.recursion_depth < 2
+    GROUP BY c.PostId, t.TagName, rtc.TagList, rtc.recursion_depth
+),
+
+PostsWithScores AS (
+    SELECT
+        p.Id,
+        p.PostTypeId,
+        p.Title,
+        p.Tags,
+        count(b.Id) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        count(b.Id) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        count(b.Id) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+        sum(v.PostScore) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS CumUserScore,
+        CASE
+            WHEN p.ViewCount > avg(p.ViewCount) OVER () THEN 'Popular'
+            WHEN p.ViewCount BETWEEN percentile_cont(0.25) WITHIN GROUP (ORDER BY p.ViewCount) AND percentile_cont(0.75) WITHIN GROUP (ORDER BY p.ViewCount) THEN 'AverageViews'
+            ELSE 'LowViews'
+        END AS ViewCategory,
+        p.ViewCount,
+        p.OwnerUserId,
+        p.CreationDate
+    FROM Posts p
+    LEFT JOIN Badges b ON b.UserId = p.OwnerUserId
+    LEFT JOIN (
+        SELECT
+            PostId,
+            CASE
+                WHEN VoteTypeId = 2 THEN 1
+                WHEN VoteTypeId = 3 THEN -1
+                ELSE 0
+            END AS PostScore
+        FROM Votes
+    ) v ON v.PostId = p.Id
+    WHERE p.PostTypeId IN (1, 2)
+    GROUP BY p.Id, p.PostTypeId, p.Title, p.Tags, p.ViewCount, p.OwnerUserId, p.CreationDate
+)
+
+SELECT DISTINCT
+    pwp.Title,
+    pwp.ViewCategory,
+    pwp.GoldBadges,
+    pwp.SilverBadges,
+    pwp.BronzeBadges,
+    pwp.CumUserScore,
+    pwp.ViewCount
+FROM PostsWithScores pwp
+JOIN RecursiveTagsCTE rtc ON rtc.PostId = pwp.Id
+LIMIT 100;

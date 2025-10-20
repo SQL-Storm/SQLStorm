@@ -1,0 +1,214 @@
+WITH RECURSIVE RecursiveTagAncestors AS (
+    SELECT 
+        t.Id,
+        t.TagName,
+        ARRAY[t.Id] AS AncestorPath
+    FROM Tags t
+    WHERE t.IsRequired = true
+
+    UNION ALL
+
+    SELECT 
+        t.Id,
+        t.TagName,
+        r.AncestorPath || t.Id
+    FROM Tags t
+    JOIN RecursiveTagAncestors r ON t.WikiPostId = r.Id
+    WHERE NOT t.Id = ANY(r.AncestorPath)
+),
+
+UserAggregatedBadges AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+        SUM(bestPosts.AnswerScore) AS TotalAnswerScores,
+        AVG(bestPosts.AvgScore) OVER (PARTITION BY u.Id) AS AvgAnswerScore
+    FROM Users u
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN LATERAL (
+        SELECT 
+            p.Id,
+            AVG(p.Score) AS AvgScore,
+            SUM(p.Score) AS AnswerScore
+        FROM Posts p
+        WHERE p.OwnerUserId = u.Id
+          AND p.PostTypeId = 2
+        GROUP BY p.Id
+    ) bestPosts ON true
+    GROUP BY u.Id, u.DisplayName
+),
+
+PostScoreWindows AS (
+    SELECT
+        p.Id,
+        p.Title,
+        p.ViewCount,
+        p.Score,
+        p.Tags,
+        p.CreationDate,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC) AS ScoreRank,
+        LEAD(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC) AS NextScore,
+        LAG(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC) AS PreviousScore,
+        COUNT(*) OVER (PARTITION BY p.OwnerUserId) AS PostsCount
+    FROM Posts p
+),
+
+DuplicateQuestionDetails AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.Title AS QuestionTitle,
+        dupl.PostId AS DuplicatedFromId,
+        dupl.CreatedAt AS DuplicateLinkCreated,
+        q.Score AS QScore,
+        q.ViewCount AS QViewCount,
+        q.Tags AS QTags
+    FROM Posts q
+    JOIN PostLinks dupl ON q.Id = dupl.RelatedPostId AND dupl.LinkTypeId = 3
+    WHERE q.PostTypeId = 1
+),
+
+CommentsInfo AS (
+    SELECT
+        c.PostId,
+        MIN(c.CreationDate) AS FirstCommentDate,
+        COUNT(*) AS TotalComments,
+        SUM(CASE WHEN c.Text ~* 'sql' OR c.Text ~* 'join' THEN 1 ELSE 0 END) AS SqlMentionCount
+    FROM Comments c
+    GROUP BY c.PostId
+),
+
+TopActiveUsers AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        ROW_NUMBER() OVER (ORDER BY COALESCE(u.Reputation,0) DESC, u.CreationDate ASC) AS Rnk,
+        COALESCE(u.UpVotes,0) - COALESCE(u.DownVotes,0) AS NetVotes,
+        TO_CHAR((DATE_TRUNC('day', CAST('2024-10-01 12:34:56' AS timestamp) - u.LastAccessDate) / (INTERVAL '1 day')), '999999') AS DaysInactiveText
+    FROM Users u
+    WHERE u.Reputation > 10000
+),
+
+ComplexPosts AS (
+    SELECT 
+        p.Id,
+        p.CreationDate,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        posw.ScoreRank,
+        posw.NextScore,
+        posw.PreviousScore,
+        posw.PostsCount,
+        COALESCE(cinfo.FirstCommentDate, CAST('1900-01-01' AS timestamp)) AS FirstCommentDate,
+        cinfo.TotalComments,
+        (COALESCE(p.ViewCount,0) * 1.0 / NULLIF(p.Score,0)) AS ViewsEfficiency,
+        LENGTH(COALESCE(p.Body, '')) AS BodyLength,
+        (
+          LENGTH(REPLACE(REPLACE(REPLACE(LOWER(COALESCE(p.Tags,'')),'><',';'),'&lt;','<'),'&gt;','>'))
+          + LENGTH(COALESCE(p.Title,''))
+        ) AS CombinedTextLen
+    FROM Posts p
+    LEFT JOIN PostScoreWindows posw ON p.Id = posw.Id
+    LEFT JOIN CommentsInfo cinfo ON p.Id = cinfo.PostId
+    WHERE p.PostTypeId IN (1, 2)
+)
+
+SELECT DISTINCT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+
+    agbd.GoldBadges,
+    agbd.SilverBadges,
+    agbd.BronzeBadges,
+    agbd.TotalAnswerScores,
+    ROUND(agbd.AvgAnswerScore, 2) AS AvgAnswerScore,
+
+    MAX(CASE WHEN cp.PostTypeId = 1 THEN cp.Score ELSE NULL END) AS MaxQuestionScore,
+    MAX(CASE WHEN cp.PostTypeId = 2 THEN cp.Score ELSE NULL END) AS MaxAnswerScore,
+
+    SUM(CASE WHEN cp.Tags LIKE '%<sql>%' AND cp.PostTypeId = 1 THEN 1 ELSE 0 END) FILTER (WHERE cp.Score >= 5) OVER () AS HighScoreSqlTaggedQuestions,
+
+    ARRAY_TO_STRING(ARRAY_AGG(DISTINCT tag.TagName ORDER BY tag.TagName), ', ') AS SampleTags,
+
+    (SELECT COUNT(DISTINCT p.Id)
+     FROM Posts p
+     JOIN Votes v ON v.PostId = p.Id AND v.VoteTypeId = 2
+     WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 2
+       AND v.CreationDate > (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '30 days')) AS UpvotedAnswersLast30d,
+
+    COUNT(DISTINCT pb.Id) FILTER (WHERE pb.AcceptedAnswerId = pb.Id) OVER () AS TotalAcceptedAnswersInData,
+
+    (SELECT SUM(view.subs.ViewCount)
+     FROM Posts view
+     WHERE view.OwnerUserId = u.Id
+       AND (view.CreationDate > CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '365 days' OR view.ViewCount > 1000)
+    ) AS RecentPopularViews,
+
+    LEAST(AGE(CAST('2024-10-01 12:34:56' AS timestamp), u.CreationDate), INTERVAL '10 years') AS UsageDurationCapped,
+
+    COALESCE(t.au_cnt, 0) AS AnnotatedUserActiveTagsCount,
+
+    ARRAY(
+       SELECT SUBSTRING(COALESCE(ph.Comment, '') FROM '[^"{}]*')
+       FROM PostHistory ph
+       WHERE ph.PostId IN (SELECT p2.Id FROM Posts p2 WHERE p2.OwnerUserId = u.Id)
+         AND ph.PostHistoryTypeId = 10
+       ORDER BY ph.CreationDate DESC
+       LIMIT 3
+    ) AS LatestCloseReasonsLinked,
+
+    CONCAT_WS(', ',
+        CONCAT('Reputation:', COALESCE(CAST(u.Reputation AS text),'n/a')),
+        CONCAT('DownVotes:', COALESCE(CAST(u.DownVotes AS text), '0')),
+        CONCAT('ScoreReductionPerPostsRatio:',
+              ROUND(COALESCE((SUM(vt.ScoreQty) FILTER (WHERE vt.PostTypeId=2) / NULLIF(COUNT(vt.PostId),0)),0),4))
+    ) AS UserStringSummary
+
+FROM Users u
+
+LEFT JOIN UserAggregatedBadges agbd ON agbd.UserId = u.Id
+
+LEFT JOIN ComplexPosts cp ON cp.OwnerUserId = u.Id
+
+LEFT JOIN (
+    SELECT OwnerUserId, COUNT(DISTINCT Tags) AS au_cnt
+    FROM Posts
+    WHERE Tags IS NOT NULL AND LENGTH(Tags) > 0
+    GROUP BY OwnerUserId
+) t ON t.OwnerUserId = u.Id
+
+LEFT JOIN LATERAL (
+    SELECT Score AS ScoreQty, p.Id AS PostId, p.PostTypeId 
+    FROM Posts p WHERE p.OwnerUserId = u.Id
+) vt ON true
+
+LEFT JOIN Tags tag ON tag.Id IS NULL
+
+LEFT JOIN Posts pb ON pb.OwnerUserId = u.Id
+
+WHERE u.Reputation > 5000
+
+GROUP BY
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    agbd.GoldBadges,
+    agbd.SilverBadges,
+    agbd.BronzeBadges,
+    agbd.TotalAnswerScores,
+    agbd.AvgAnswerScore,
+    t.au_cnt,
+    cp.Tags,
+    cp.PostTypeId,
+    cp.Score,
+    u.CreationDate,
+    u.DownVotes
+
+ORDER BY u.Reputation DESC, MaxAnswerScore DESC, u.CreationDate ASC
+
+LIMIT 50;

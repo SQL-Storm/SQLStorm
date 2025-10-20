@@ -1,0 +1,154 @@
+WITH RECURSIVE RecursiveTagHierarchy AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.IsModeratorOnly,
+        t.IsRequired,
+        1 AS Level
+    FROM Tags t
+    WHERE t.IsRequired = TRUE
+    UNION ALL
+    SELECT
+        t2.Id,
+        t2.TagName,
+        t2.Count,
+        t2.IsModeratorOnly,
+        t2.IsRequired,
+        r.Level + 1
+    FROM Tags t2
+    JOIN RecursiveTagHierarchy r ON t2.Count < r.Count AND t2.Id <> r.Id
+    WHERE r.Level < 3
+),
+UserActivityRanked AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.Location,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionCount,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswerCount,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        MAX(b.Class) AS HighestBadgeClass,
+        AVG(COALESCE(vtavg.AvgVoteScore, 0)) AS AvgVoteScore,
+        ROW_NUMBER() OVER (PARTITION BY u.Location ORDER BY u.Reputation DESC, u.UpVotes DESC) AS LocationRank
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id AND p.CreationDate >= u.CreationDate
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    LEFT JOIN (
+        SELECT 
+            p.OwnerUserId,
+            AVG(v.Score) AS AvgVoteScore
+        FROM Posts p
+        LEFT JOIN (
+            SELECT
+                PostId,
+                CASE 
+                    WHEN VoteTypeId = 2 THEN 1
+                    WHEN VoteTypeId = 3 THEN -1
+                    ELSE 0
+                END AS Score
+            FROM Votes
+        ) v ON v.PostId = p.Id
+        WHERE p.OwnerUserId IS NOT NULL
+        GROUP BY p.OwnerUserId
+    ) vtavg ON vtavg.OwnerUserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.Location, u.Views, u.UpVotes, u.DownVotes
+),
+PostWithComments AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        p.OwnerUserId,
+        p.Title,
+        c.CommentCount,
+        COALESCE(c.CommentScoreSum, 0) AS TotalCommentScore,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC, p.ViewCount DESC) AS OwnerTopPostRank
+    FROM Posts p
+    LEFT JOIN (
+        SELECT 
+            PostId,
+            COUNT(*) AS CommentCount,
+            SUM(Score) AS CommentScoreSum
+        FROM Comments
+        GROUP BY PostId
+    ) c ON c.PostId = p.Id
+),
+PostHistoryWithCloseInfo AS (
+    SELECT
+        ph.PostId,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 10 THEN ph.Comment ELSE NULL END) AS CloseReasonId,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 11 THEN 1 ELSE 0 END) AS WasReopened,
+        COUNT(*) FILTER (WHERE ph.PostHistoryTypeId IN (10,11)) AS CloseReopenEvents
+    FROM PostHistory ph
+    GROUP BY ph.PostId
+),
+DuplicatesCTE AS (
+    SELECT
+        pl.PostId,
+        COUNT(DISTINCT pl.RelatedPostId) AS DuplicateCount,
+        MAX(pl.CreationDate) AS LastDuplicateDate
+    FROM PostLinks pl
+    WHERE pl.LinkTypeId = 3
+    GROUP BY pl.PostId
+)
+SELECT DISTINCT
+    uar.UserId,
+    uar.DisplayName,
+    uar.Reputation,
+    uar.Location,
+    uar.Views,
+    uar.UpVotes,
+    uar.DownVotes,
+    uar.QuestionCount,
+    uar.AnswerCount,
+    uar.BadgeCount,
+    CASE
+        WHEN uar.HighestBadgeClass = 1 THEN 'Gold'
+        WHEN uar.HighestBadgeClass = 2 THEN 'Silver'
+        WHEN uar.HighestBadgeClass = 3 THEN 'Bronze'
+        ELSE 'None'
+    END AS HighestBadge,
+    uar.AvgVoteScore,
+    uar.LocationRank,
+    pcp.PostId,
+    pcp.PostTypeId,
+    pcp.CreationDate AS PostCreationDate,
+    pcp.Score AS PostScore,
+    pcp.ViewCount AS PostViews,
+    pcp.Title,
+    pcp.Tags,
+    pcp.CommentCount,
+    pcp.TotalCommentScore,
+    phc.CloseReasonId,
+    phc.WasReopened,
+    phc.CloseReopenEvents,
+    dpl.DuplicateCount,
+    dpl.LastDuplicateDate,
+    RANK() OVER (ORDER BY uar.Reputation DESC, pcp.Score DESC) AS OverallRank,
+    (
+        'User: ' || COALESCE(uar.DisplayName, 'Anonymous') || ' | ' ||
+        'Post: ' || COALESCE(pcp.Title, 'No Title') || ' | ' ||
+        'Tags: ' || COALESCE(pcp.Tags, 'None') || ' | ' ||
+        'Comments: ' || COALESCE(CAST(pcp.CommentCount AS VARCHAR), '0') || ' | ' ||
+        'Votes Avg: ' || COALESCE(ROUND(uar.AvgVoteScore::numeric, 2)::text, 'N/A')
+    ) AS SummaryString
+FROM UserActivityRanked uar
+INNER JOIN PostWithComments pcp ON pcp.OwnerUserId = uar.UserId AND pcp.OwnerTopPostRank <= 3
+LEFT JOIN PostHistoryWithCloseInfo phc ON phc.PostId = pcp.PostId
+LEFT JOIN DuplicatesCTE dpl ON dpl.PostId = pcp.PostId
+WHERE uar.Reputation > 5000
+  AND (pcp.Tags IS NOT NULL AND pcp.Tags LIKE '%<sql>%')
+  AND (
+    phc.CloseReasonId IS NULL OR phc.WasReopened = 1
+  )
+ORDER BY uar.Location, uar.Reputation DESC, pcp.Score DESC
+LIMIT 100;

@@ -1,0 +1,133 @@
+-- {"query": "1194.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.1, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1233} 
+with RecursiveTags as (
+    select
+        p.Id as PostId,
+        lower(trim(both '<>' from unnest(string_to_array(substring(p.Tags from 2 for length(p.Tags)-2), '><')))) as TagName
+    from Posts p
+    where p.PostTypeId = 1
+),
+BadgeRankings as (
+    select
+        b.UserId,
+        b.Name,
+        b.Class,
+        row_number() over (partition by b.UserId order by b.Class, b.Date) as rn
+    from Badges b
+    where b.Date > cast('2024-10-01' as date) - interval '1 year'
+),
+UserStats as (
+    select
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.Location,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionsCount,
+        count(distinct p.Id) filter (where p.PostTypeId = 2) as AnswersCount,
+        coalesce(sum(p.Score),0) as TotalPostScore,
+        max(p.CreationDate) as LastPostDate,
+        count(distinct c.Id) as CommentsCount,
+        max(coalesce(p.LastActivityDate, p.CreationDate)) as LastActivity,
+        string_agg(distinct rt.Name, ',' order by rt.Name) as RecentBadgeNames
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Comments c on c.UserId = u.Id
+    left join (select distinct Name from Badges where Date > cast('2024-10-01' as date) - interval '1 year') rt on rt.Name is not null
+    group by u.Id
+),
+UserPostHistoryCounts as (
+    select
+        ph.UserId,
+        count(*) as EditsCount,
+        sum(case when ph.PostHistoryTypeId in (10, 11, 12, 13) then 1 else 0 end) as CloseReopenVotes
+    from PostHistory ph
+    where ph.UserId is not null
+    group by ph.UserId
+),
+TopTagsByActivity as (
+    select
+        rt.TagName,
+        count(distinct p.Id) as QuestionCount,
+        avg(p.Score) as AvgScore,
+        max(p.ViewCount) as MaxViewCount
+    from RecursiveTags rt
+    join Posts p on p.Id = rt.PostId
+    group by rt.TagName
+    having count(distinct p.Id) > 50
+    order by QuestionCount desc
+    limit 10
+),
+DuplicatedPostsInfo as (
+    select
+        pl.PostId,
+        COUNT(case when lt.Name = 'Duplicate' then 1 end) as DuplicateReferences,
+        COUNT(case when lt.Name = 'Linked' then 1 end) as LinkReferences
+    from PostLinks pl
+    join LinkTypes lt on lt.Id = pl.LinkTypeId
+    group by pl.PostId
+),
+UserRecentActivity as (
+    select
+        u.Id as UserId,
+        p.Id as PostId,
+        p.Title,
+        p.PostTypeId,
+        p.Score,
+        p.ViewCount,
+        row_number() over (partition by u.Id order by p.LastActivityDate desc nulls last) as rn
+    from Users u
+    join Posts p on p.OwnerUserId = u.Id
+)
+select 
+    u.Id as UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.Location,
+    u.QuestionsCount,
+    u.AnswersCount,
+    u.TotalPostScore,
+    coalesce(uph.EditsCount,0) as TotalEdits,
+    coalesce(uph.CloseReopenVotes,0) as CloseReopenVotes,
+    u.CommentsCount,
+    u.LastActivity,
+    concat_ws('; ', 
+        'Recent Badges: ' || coalesce(u.RecentBadgeNames, 'None'),
+        'Top Tags: ' || coalesce(
+           (select string_agg(tt.TagName || '(' || tt.QuestionCount || ')', ', ' order by tt.QuestionCount desc)
+            from TopTagsByActivity tt 
+            join RecursiveTags rtt on rtt.TagName = tt.TagName
+            join Posts p2 on p2.Id = rtt.PostId
+            where p2.OwnerUserId = u.Id
+            limit 1), 'None')),
+    p.Id as RecentPostId,
+    p.Title as RecentPostTitle,
+    p.PostTypeId as RecentPostType,
+    p.Score as RecentPostScore,
+    p.ViewCount as RecentPostViews,
+    dp.DuplicateReferences,
+    dp.LinkReferences,
+    case 
+      when p.Title ilike '%error%' or p.Title ilike '%bug%' then 'Has Error/Bug'
+      when p.Body ilike '%NULL%' then 'Mentions NULL'
+      else 'Neutral'
+    end as PostContentFlag,
+    jsonb_build_object(
+        'QuestionsByTag', (
+            select jsonb_agg(jsonb_build_object('Tag', TagName, 'Count', QuestionCount, 'AvgScore', round(coalesce(AvgScore,0)::numeric,2)))
+            from TopTagsByActivity
+        ),
+        'UserBadges', (
+            select jsonb_agg(jsonb_build_object('BadgeName', Name, 'Class', Class, 'Rank', rn))
+            from BadgeRankings br
+            where br.UserId = u.Id and br.rn <= 3
+        )
+    ) as ComplexJsonInfo
+from UserStats u
+left join UserPostHistoryCounts uph on uph.UserId = u.Id
+left join UserRecentActivity p on p.UserId = u.Id and p.rn = 1
+left join DuplicatedPostsInfo dp on dp.PostId = p.Id
+where u.Reputation > 10000 
+  and u.QuestionsCount > 10
+  and u.LastActivity > cast('2024-10-01' as date) - interval '6 months'
+order by u.Reputation desc
+limit 25;

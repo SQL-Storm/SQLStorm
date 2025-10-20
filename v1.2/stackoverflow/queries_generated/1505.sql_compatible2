@@ -1,0 +1,148 @@
+WITH RECURSIVE RecursiveTags AS (
+    SELECT
+        p.Id AS PostId,
+        t.Id AS TagId,
+        t.TagName,
+        1 AS Depth,
+        '<' || t.TagName || '>' AS Path
+    FROM Posts p
+    JOIN Tags t ON POSITION('<' || t.TagName || '>' IN p.Tags) > 0
+    WHERE p.PostTypeId = 1
+
+    UNION ALL
+
+    SELECT
+        rt.PostId,
+        t.Id,
+        t.TagName,
+        rt.Depth + 1,
+        rt.Path || '->' || t.TagName
+    FROM RecursiveTags rt
+    JOIN TagLinks tl ON tl.PrevTagId = rt.TagId
+    JOIN Tags t ON t.Id = tl.NextTagId
+    WHERE rt.Depth < 3
+),
+
+UserVotesCTE AS (
+    SELECT
+        v.UserId,
+        v.PostId,
+        SUM(CASE WHEN vt.Name = 'UpMod' THEN 1 ELSE 0 END) AS UpVotes,
+        SUM(CASE WHEN vt.Name = 'DownMod' THEN 1 ELSE 0 END) AS DownVotes,
+        COUNT(*) AS TotalVotes
+    FROM Votes v
+    JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+    WHERE v.UserId IS NOT NULL
+    GROUP BY v.UserId, v.PostId
+),
+
+UserPostStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS NumQuestions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS NumAnswers,
+        COALESCE(SUM(uv.UpVotes),0) AS SumUpVotes,
+        COALESCE(SUM(uv.DownVotes),0) AS SumDownVotes,
+        COALESCE(AVG(p.Score),0) AS AvgPostScore,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        MAX(p.CreationDate) AS LastPostDate
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN UserVotesCTE uv ON uv.UserId = u.Id AND uv.PostId = p.Id
+    LEFT JOIN Badges b ON b.UserId = u.Id AND b.Class = 1
+    GROUP BY u.Id, u.DisplayName
+),
+
+AnswerWithRowStats AS (
+    SELECT 
+        a.Id AS AnswerId, 
+        q.Id AS QuestionId, 
+        a.OwnerUserId,
+        a.Score AS AnswerScore,
+        a.CreationDate,
+        row_number() OVER (PARTITION BY a.ParentId ORDER BY a.Score DESC, a.CreationDate ASC) AS AnswerRank,
+        count(*) OVER (PARTITION BY a.ParentId) AS TotalAnswers,
+        q.Title,
+        q.Tags AS QuestionTags,
+        a.ParentId
+    FROM Posts q
+    INNER JOIN Posts a ON a.ParentId = q.Id AND a.PostTypeId = 2
+    WHERE q.PostTypeId = 1
+),
+
+HighQualityAnsweredQuestions AS (
+    SELECT 
+        ans.QuestionId,
+        ans.AnswerId,
+        ans.OwnerUserId AS AnswerAuthor,
+        up.DisplayName AS AnswerAuthorName,
+        ans.AnswerScore,
+        q.OwnerUserId AS QuestionAuthor,
+        uq.DisplayName AS QuestionAuthorName,
+        q.Title,
+        q.Tags,
+        (SELECT COUNT(*) FROM Comments c WHERE c.PostId = ans.AnswerId AND c.Score > 2) AS HighScoreCommentsCount,
+        ans.TotalAnswers
+    FROM AnswerWithRowStats ans
+    JOIN Posts q ON q.Id = ans.QuestionId
+    LEFT JOIN Users up ON up.Id = ans.OwnerUserId
+    LEFT JOIN Users uq ON uq.Id = q.OwnerUserId
+    WHERE ans.AnswerScore > 10 
+      AND ans.TotalAnswers > 3
+      AND EXISTS (
+        SELECT 1 FROM Votes v 
+        JOIN VoteTypes vt ON vt.Id = v.VoteTypeId AND vt.Name = 'UpMod' 
+        WHERE v.PostId = ans.AnswerId 
+          AND v.CreationDate >= (DATE '2024-10-01' - INTERVAL '30' DAY)
+        GROUP BY v.PostId 
+        HAVING COUNT(*) >= 10)
+),
+
+AllHighQualityBadgedUsersCTE AS (
+    SELECT DISTINCT ub.UserId
+    FROM Badges ub
+    JOIN BadgeClass bc ON bc.Class = ub.Class AND bc.ClassName = 'Gold'
+),
+
+AnswerQuestionPairsPatched AS (
+    SELECT 
+        p.Id AS PostId,
+        p.AcceptedAnswerId,
+        u.Reputation,
+        COALESCE(p.Score,0) - COALESCE((SELECT COUNT(*)*0.3 FROM Comments c WHERE c.PostId = p.Id AND (c.UserId = p.OwnerUserId OR c.UserDisplayName = COALESCE(up.DisplayName, ''))),0) AS EffectiveScore,
+        TRIM(LOWER(p.Title)) AS NormalizedTitle
+    FROM Posts p
+    LEFT JOIN Users u ON u.Id = p.OwnerUserId
+    LEFT JOIN Users up ON up.Id = p.OwnerUserId
+    WHERE p.PostTypeId = 1
+)
+
+SELECT 
+    q.Id AS QuestionId,
+    q.OwnerUserId AS QuestionAuthorId,
+    nisios.DisplayName AS QuestionAuthor,
+    q.Score AS QuestionScore,
+    a.AnswerId,
+    ana.Id AS AnswerAuthorId,
+    ana.DisplayName AS AnswerAuthor,
+    a.AnswerScore,
+    rp.TagName,
+    rp.Depth,
+    ct.NumLinks,
+    usrs.NumQuestions,
+    hafqa.HighScoreCommentsCount
+FROM Posts q
+LEFT JOIN HighQualityAnsweredQuestions hafqa ON hafqa.QuestionId = q.Id
+LEFT JOIN Users nisios ON nisios.Id = q.OwnerUserId
+LEFT JOIN AnswerWithRowStats a ON a.QuestionId = q.Id AND a.AnswerId = hafqa.AnswerId
+LEFT JOIN Users ana ON ana.Id = a.OwnerUserId
+LEFT JOIN RecursiveTags rp ON rp.PostId = q.Id
+LEFT JOIN (
+    SELECT PostId, COUNT(*) AS NumLinks FROM PostLinks GROUP BY PostId
+) ct ON ct.PostId = q.Id
+LEFT JOIN UserPostStats usrs ON usrs.UserId = q.OwnerUserId
+WHERE q.PostTypeId = 1
+  AND (COALESCE(a.AnswerScore,0) + COALESCE(q.Score,0)) > 50
+ORDER BY COALESCE(a.AnswerScore,0) DESC, q.CreationDate DESC
+LIMIT 100;

@@ -1,0 +1,27 @@
+-- {"query": "1853.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.8, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 3039} 
+WITH RecursivePosts AS (
+    SELECT p.Id, p.PostTypeId, p.Score, p.OwnerUserId, p.ParentId, p.CreationDate, p.ViewCount,
+           TO_TIMESTAMP(EXTRACT(EPOCH FROM p.CreationDate)::BIGINT) as CreationTs,
+           1 AS level
+    FROM Posts p
+    WHERE p.PostTypeId = 1 AND p.CreationDate > '2021-01-01' -- Starting from questions after 2021
+    UNION ALL
+    SELECT child.Id, child.PostTypeId, child.Score, child.OwnerUserId, child.ParentId, child.CreationDate,
+           child.ViewCount,
+           TO_TIMESTAMP(EXTRACT(EPOCH FROM child.CreationDate)::BIGINT) as CreationTs,
+           rp.level + 1
+    FROM Posts child
+    JOIN RecursivePosts rp ON child.ParentId = rp.Id
+), ScoreStats AS (
+    SELECT
+        rp.Id,
+        rp.PostTypeId,
+        rp.OwnerUserId,
+        rp.level,
+        rp.Score,
+        rsp.RollbackClicks,
+        u.DisplayName,
+        trusted.UserRanks,
+        inspired_fake.which_count_roundwin_percentage,
+        pview.prev_day_avg_views,
+        'level_' || rp.level || '_' || COALESCE(LOWER(r?.Title);

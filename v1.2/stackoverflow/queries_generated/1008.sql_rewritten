@@ -1,0 +1,185 @@
+-- {"query": "1008.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1857} 
+with RecursiveTagStats as (
+    select 
+        t.Id as TagId,
+        t.TagName,
+        p.Id as PostId,
+        p.Score,
+        p.ViewCount,
+        u.Id as OwnerUserId,
+        u.DisplayName,
+        dense_rank() over (partition by t.Id order by p.Score desc, p.ViewCount desc) as RankByScoreView
+    from Tags t
+    left join Posts p on p.Tags like '%' || t.TagName || '%'
+    left join Users u on p.OwnerUserId = u.Id
+    where p.PostTypeId = 1
+),
+TopTagPosts as (
+    select 
+        TagId, TagName, PostId, Score, ViewCount, OwnerUserId, DisplayName
+    from RecursiveTagStats
+    where RankByScoreView <= 5
+),
+UserBadgeStats as (
+    select
+        b.UserId,
+        count(*) filter (where b.Class = 1) as GoldBadges,
+        count(*) filter (where b.Class = 2) as SilverBadges,
+        count(*) filter (where b.Class = 3) as BronzeBadges,
+        max(b.Date) as LastBadgeDate
+    from Badges b
+    group by b.UserId
+),
+AnswerStats as (
+    select
+        a.ParentId as QuestionId,
+        count(*) as TotalAnswers,
+        avg(a.Score) as AvgAnswerScore,
+        max(a.Score) as MaxAnswerScore,
+        count(distinct a.OwnerUserId) as UniqueAnswerUsers,
+        sum(case when exists (
+            select 1 from Votes v
+            where v.PostId = a.Id and v.VoteTypeId = 2 -- UpMod
+        ) then 1 else 0 end) as AnswersWithUpvote
+    from Posts a
+    where a.PostTypeId = 2
+    group by a.ParentId
+),
+QuestionCloseCounts as (
+    select 
+        p.Id as QuestionId,
+        count(distinct ph.Id) as CloseEvents,
+        max(ph.CreationDate) as LastCloseDate,
+        sum(case when ph.Comment in ('101','102','103','104','105') then 1 else 0 end) as CurrentCloseVotes
+    from Posts p
+    left join PostHistory ph on ph.PostId = p.Id and ph.PostHistoryTypeId = 10
+    where p.PostTypeId = 1
+    group by p.Id
+),
+RankedQuestions as (
+    select 
+        q.Id,
+        q.Title,
+        q.CreationDate,
+        q.Score,
+        q.ViewCount,
+        q.Tags,
+        u.DisplayName as OwnerName,
+        coalesce(a.TotalAnswers,0) as AnswerCount,
+        coalesce(a.AvgAnswerScore,0) as AvgAnswerScore,
+        coalesce(cc.CloseEvents,0) as CloseEvents,
+        cc.LastCloseDate,
+        coalesce(ubs.GoldBadges,0) as GoldBadges,
+        coalesce(ubs.SilverBadges,0) as SilverBadges,
+        coalesce(ubs.BronzeBadges,0) as BronzeBadges,
+        row_number() over (
+            partition by date_trunc('month', q.CreationDate)
+            order by q.Score desc, q.ViewCount desc
+        ) as MonthlyRank
+    from Posts q
+    left join Users u on q.OwnerUserId = u.Id
+    left join AnswerStats a on a.QuestionId = q.Id
+    left join QuestionCloseCounts cc on cc.QuestionId = q.Id
+    left join UserBadgeStats ubs on ubs.UserId = q.OwnerUserId
+    where q.PostTypeId = 1
+),
+UserEngagement as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(distinct p.Id) as PostsCount,
+        sum(coalesce(p.Score,0)) as TotalPostScore,
+        sum(coalesce(vv.UpVotesCount,0)) as TotalUpVotes,
+        sum(coalesce(vv.DownVotesCount,0)) as TotalDownVotes,
+        count(distinct b.Id) as BadgeCount,
+        max(u.LastAccessDate) as LastAccessDate
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join (
+        select
+            v.PostId,
+            sum(case when v.VoteTypeId = 2 then 1 else 0 end) as UpVotesCount,
+            sum(case when v.VoteTypeId = 3 then 1 else 0 end) as DownVotesCount
+        from Votes v
+        group by v.PostId
+    ) vv on vv.PostId = p.Id
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.DisplayName
+),
+ComplexFilteredPosts as (
+    select 
+        p.Id, p.Title, p.Score, p.ViewCount, p.CreationDate, p.Tags, p.OwnerUserId,
+        substr(p.Title || ' ' || coalesce(u.DisplayName,'Unknown'), 1, 100) as TitleUserConcat,
+        case 
+            when p.Score > 0 and p.ViewCount > 1000 then 'HighImpact'
+            when p.Score <= 0 then 'LowImpact'
+            else 'MediumImpact'
+        end as ImpactCategory,
+        coalesce(a.TotalAnswers,0) as AnswerCount,
+        coalesce(cc.CloseEvents,0) as CloseEvents,
+        row_number() over (partition by ImpactCategory order by p.Score desc, p.ViewCount desc) as ImpactRank
+    from Posts p
+    left join Users u on p.OwnerUserId = u.Id
+    left join AnswerStats a on a.QuestionId = p.Id
+    left join QuestionCloseCounts cc on cc.QuestionId = p.Id
+    where p.PostTypeId in (1,2)
+      and p.CreationDate > cast('2024-10-01' as date) - interval '365 days'
+      and (p.Tags like '%sql%' or p.Tags like '%postgresql%')
+      and (p.Score is not null)
+),
+OwnerWithMaxBadges as (
+    select distinct on (p.Id)
+        p.Id as PostId,
+        p.Title,
+        p.OwnerUserId,
+        ubs.GoldBadges,
+        ubs.SilverBadges,
+        ubs.BronzeBadges
+    from Posts p
+    left join UserBadgeStats ubs on ubs.UserId = p.OwnerUserId
+    where p.PostTypeId = 1
+    order by p.Id, ubs.GoldBadges desc nulls last, ubs.SilverBadges desc nulls last, ubs.BronzeBadges desc nulls last
+)
+select
+    rq.Id as QuestionId,
+    rq.Title,
+    rq.Score,
+    rq.ViewCount,
+    rq.MonthlyRank,
+    rq.Tags,
+    rq.OwnerName,
+    rq.AnswerCount,
+    rq.AvgAnswerScore,
+    rq.CloseEvents,
+    rq.LastCloseDate,
+    rq.GoldBadges,
+    rq.SilverBadges,
+    rq.BronzeBadges,
+    ts.PostId as TopAnswerPostId,
+    ts.Score as TopAnswerScore,
+    ts.ViewCount as TopAnswerViewCount,
+    ts.DisplayName as TopAnswerOwner,
+    string_agg(distinct b.Name || ':' || cast(b.Class as text), ', ') filter (where b.TagBased = 0) as OwnerBadges,
+    ufp.ImpactCategory,
+    ufp.ImpactRank,
+    ufp.TitleUserConcat,
+    ue.PostsCount as OwnerPostsCount,
+    ue.TotalPostScore as OwnerTotalPostScore,
+    ue.TotalUpVotes as OwnerUpVotes,
+    ue.TotalDownVotes as OwnerDownVotes,
+    ue.BadgeCount as OwnerBadgeCount,
+    ue.LastAccessDate as OwnerLastAccess
+from RankedQuestions rq
+left join TopTagPosts ts on ts.PostId = rq.AcceptedAnswerId
+left join Badges b on b.UserId = rq.OwnerUserId
+left join ComplexFilteredPosts ufp on ufp.Id = rq.Id
+left join UserEngagement ue on ue.UserId = rq.OwnerUserId
+group by 
+    rq.Id, rq.Title, rq.Score, rq.ViewCount, rq.MonthlyRank, rq.Tags, rq.OwnerName, rq.AnswerCount, 
+    rq.AvgAnswerScore, rq.CloseEvents, rq.LastCloseDate, rq.GoldBadges, rq.SilverBadges, rq.BronzeBadges,
+    ts.PostId, ts.Score, ts.ViewCount, ts.DisplayName,
+    ufp.ImpactCategory, ufp.ImpactRank, ufp.TitleUserConcat,
+    ue.PostsCount, ue.TotalPostScore, ue.TotalUpVotes, ue.TotalDownVotes, ue.BadgeCount, ue.LastAccessDate
+having count(distinct b.Id) > 1
+order by rq.CreationDate desc
+limit 100;

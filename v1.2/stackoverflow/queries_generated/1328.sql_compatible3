@@ -1,0 +1,174 @@
+with recursive RecursivePostCalls as (
+    select p.Id, p.PostTypeId, p.OwnerUserId, p.AcceptedAnswerId, p.ParentId,
+           1 as call_level,
+           array[p.Id] as call_path
+    from Posts p
+    where p.PostTypeId = 1 and p.AcceptedAnswerId is not null
+
+    union all
+
+    select c.Id, c.PostTypeId, c.OwnerUserId, c.AcceptedAnswerId, c.ParentId,
+           rpc.call_level + 1,
+           rpc.call_path || c.Id
+    from Posts c
+    join RecursivePostCalls rpc on c.ParentId = rpc.Id
+    where c.ParentId is not null and not c.Id = any(rpc.call_path)
+),
+BadgeRanks as (
+    select UserId,
+           count(case when Class = 1 then 1 end) as GoldBadges,
+           count(case when Class = 2 then 1 end) as SilverBadges,
+           count(case when Class = 3 then 1 end) as BronzeBadges,
+           count(*) as TotalBadges
+    from Badges group by UserId
+),
+UserReputationWindows as (
+    select Id as UserId, Reputation, CreationDate,
+           dense_rank() over (order by Reputation desc) as Rank_Reputation,
+           ntile(5) over (order by CreationDate) as CreationQuintile
+    from Users
+),
+CompositeVotes as (
+    select v.PostId,
+           sum(case when vt.Name = 'UpMod' then 1 else 0 end) as UpVotes,
+           sum(case when vt.Name = 'DownMod' then 1 else 0 end) as DownVotes,
+           sum(case when v.VoteTypeId in (8,9) then coalesce(v.BountyAmount,0) else 0 end) as TotalBountyAmount,
+           count(*) as TotalVotes
+    from Votes v
+    join VoteTypes vt on vt.Id = v.VoteTypeId
+    group by v.PostId
+),
+PostWithHistoryClose as (
+    select p.Id, p.Title, p.CreationDate, p.Score, p.ViewCount, p.OwnerUserId, p.Tags, p.AcceptedAnswerId, p.ClosedDate,
+           ph.PostHistoryTypeId,
+           max(case when c.Id is not null and c.Id = p.OwnerUserId then 1 else 0 end) as OwnerIsCommenter,
+           coalesce(p.CommentCount,0) + (select count(*) from Comments c2 where c2.PostId = p.Id and c2.UserId is not null) as TotalKnownUserCommentCount,
+           rct.Name as CloseReasonName
+    from Posts p
+    left join PostHistory ph on ph.PostId = p.Id and ph.PostHistoryTypeId = 10
+    left join CloseReasonTypes rct on rct.Id = cast(ph.Comment as integer)
+    left join Comments c on c.PostId = p.Id and c.UserId = p.OwnerUserId
+    group by p.Id, ph.PostHistoryTypeId, rct.Name, p.Title, p.CreationDate, p.Score, p.ViewCount, p.OwnerUserId, p.Tags, p.AcceptedAnswerId, p.ClosedDate, p.CommentCount
+),
+TopPostsComparisons as (
+    select ws.UserId, u.DisplayName as UserName, ws.PostId, p.Title,
+           ws.PostScore, ws.LeadingScore,
+           ws.Views, p.ViewCount, ws.AnswersCount,
+           ws.DaysOld,
+           lr.LeadingAnswers, lr.LeadingAnswerAvgScore
+    from (
+        select po.OwnerUserId as UserId, po.Id as PostId, po.Title, po.Score as PostScore, po.ViewCount as Views,
+               count(a.Id) as AnswersCount,
+               max(a.Score) over (partition by po.Id) as LeadingScore,
+               coalesce(max(a.Score) filter (where a.Score is not null),0) as LeadingScoreLiteral,
+               floor(extract(epoch from (timestamp '2024-10-01 12:34:56' - po.CreationDate)) / 86400) as DaysOld
+        from Posts po
+        left join Posts a on a.ParentId = po.Id and a.PostTypeId = 2
+        where po.PostTypeId = 1
+        group by po.Id, po.OwnerUserId, po.Title, po.Score, po.ViewCount, po.CreationDate
+    ) ws
+    left join Posts p on p.Id = ws.PostId
+    left join lateral (
+        select count(*) as LeadingAnswers, avg(Score) as LeadingAnswerAvgScore
+        from Posts a
+        where a.ParentId = ws.PostId and a.Score >= ws.LeadingScore and a.PostTypeId = 2
+    ) lr on true
+    left join Users u on u.Id = ws.UserId
+),
+TopUserSummaries as (
+    select b.UserId, u.DisplayName,
+           b.GoldBadges, b.SilverBadges, b.BronzeBadges,
+           urw.Rank_Reputation, urw.CreationQuintile,
+           sum(case when p.PostTypeId=1 then 1 else 0 end) as QuestionsCount,
+           sum(case when p.PostTypeId=2 then 1 else 0 end) as AnswersCount,
+           avg(case when p.PostTypeId=1 then p.Score end) as AvgQScore,
+           avg(case when p.PostTypeId=2 then p.Score end) as AvgAScore,
+           max(case when p.PostTypeId=1 then p.ViewCount end) as MaxQViews,
+           max(case when p.PostTypeId=2 then p.Score end) as MaxAScore
+    from BadgeRanks b
+    join Users u on u.Id = b.UserId
+    join UserReputationWindows urw on urw.UserId = u.Id
+    left join Posts p on p.OwnerUserId = u.Id
+    group by b.UserId, u.DisplayName, b.GoldBadges, b.SilverBadges, b.BronzeBadges, urw.Rank_Reputation, urw.CreationQuintile
+),
+FilteredPopularTags as (
+    select t.Id, t.TagName, t.Count, 
+           (select coalesce(avg(p.Score),0) from Posts p where p.PostTypeId=1 and p.Tags like '%'||('<' || t.TagName || '>')||'%' ) as AvgQuestionScore,
+           (select count(*) from Posts p where p.PostTypeId=1 and p.Tags like '%'||('<' || t.TagName || '>')||'%') as QuestionCount
+    from Tags t 
+    where t.Count > 5000 and t.IsModeratorOnly = 0 and t.IsRequired = 0
+),
+SelectedRecentHistories as (
+    select ph.Id, ph.PostId, ph.PostHistoryTypeId, ph.CreationDate, ph.UserId,
+      ph.Comment,
+      ph.Text,
+      row_number() over (partition by ph.PostId order by ph.CreationDate desc) as HistRankDesc
+    from PostHistory ph
+    where ph.PostHistoryTypeId in (10,11,12)
+),
+CombinedPostsCTE as 
+(
+    select p.Id, p.Title, p.CreationDate, p.Score, p.ViewCount, p.Tags,
+           bh.Class, bd.Name as BadgeName, rp.LeadingScore,
+           rlp.PostHistoryTypeId as LastCloseType,
+           up.UserName, up.GoldBadges, up.SilverBadges, up.BronzeBadges, up.ReputationRank,
+           cv.UpVotes, cv.DownVotes, cv.TotalBountyAmount,
+           array_to_string(array(
+               select distinct s.TagName from Tags s where p.Tags like '%' || ('<'||s.TagName||'>') || '%'
+           ), ', ') as TagList,
+           p.OwnerUserId,
+           p.PostTypeId
+    from Posts p
+    left join Badges bd on bd.UserId = p.OwnerUserId
+    left join BadgeRanks bh on bh.UserId = p.OwnerUserId
+    left join (select PostId, max(Score) as LeadingScore from Posts where PostTypeId=2 group by PostId) rp on rp.PostId = p.Id
+    left join (select * from SelectedRecentHistories where HistRankDesc=1) rlp on rlp.PostId = p.Id
+    left join 
+        (select u.Id, u.DisplayName as UserName,
+                max(br.GoldBadges) as GoldBadges,
+                max(br.SilverBadges) as SilverBadges,
+                max(br.BronzeBadges) as BronzeBadges,
+                dense_rank() over (order by u.Reputation desc) as ReputationRank
+         from Users u 
+         left join BadgeRanks br on br.UserId = u.Id
+         group by u.Id, u.DisplayName) up on up.Id = p.OwnerUserId 
+    left join CompositeVotes cv on cv.PostId = p.Id
+),
+FinalResults as (
+    select c.Id as PostId,
+           c.Title,
+           c.CreationDate,
+           c.Score,
+           c.ViewCount,
+           c.Tags,
+           coalesce(c.GoldBadges,0) as GoldBadges,
+           coalesce(c.SilverBadges,0) as SilverBadges,
+           coalesce(c.BronzeBadges,0) as BronzeBadges,
+           coalesce(c.LeadingScore,0) as TopAnswerScore,
+           c.LastCloseType,
+           c.UserName,
+           c.UpVotes,
+           c.DownVotes,
+           c.TotalBountyAmount,
+           c.TagList,
+           sum(case when lower(c.Tags) like '%<sql>%' then 1 else 0 end) over (partition by c.UserName) as SQLTagCount,
+           rank() over (partition by c.UserName order by c.Score desc) as ScoreRankByUser,
+           case 
+               when c.ViewCount > 10000 then 'High Views' 
+               when c.ViewCount between 1000 and 10000 then 'Medium Views'
+               else 'Low Views' end as ViewCategory,
+           case 
+               when c.Score >= 100 then 'Hot'
+               when c.Score between 50 and 99 then 'Trending'
+               else 'Normal' end as ScoreCategory,
+           array_length(get_path.call_path,1) as DeepestAnswerChain
+    from CombinedPostsCTE c
+    left join RecursivePostCalls rpc on rpc.Id = c.Id
+    left join RecursivePostCalls get_path on get_path.call_path @> array[c.Id]
+    where c.PostTypeId = 1
+    group by c.Id, c.Title, c.CreationDate, c.Score, c.ViewCount, c.Tags, c.GoldBadges, c.SilverBadges, c.BronzeBadges, c.LeadingScore, c.LastCloseType, c.UserName, c.UpVotes, c.DownVotes, c.TotalBountyAmount, c.TagList, get_path.call_path
+    order by c.Score desc, c.ViewCount desc
+    limit 100
+)
+select *
+from FinalResults;

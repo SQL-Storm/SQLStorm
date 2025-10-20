@@ -1,0 +1,34 @@
+-- {"query": "1868.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.8, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 2345} 
+with RECs as (
+    select 
+        ph.PostId, ph.PostHistoryTypeId, ph.CreationDate,
+        tier() over (partition by ph.PostId order by ph.CreationDate) rn
+    from PostHistory ph 
+    where ph.PostHistoryTypeId in (1,4,10)
+),
+RankedBadges as (
+    select *,
+        row_number() over (partition by UserId order by Date desc) badge_rank
+    from Badges
+    where Name like '%er%'
+),
+TopAnswerersCTE as (
+    select owneruserid,
+      count(*) as total_answers,
+      sum(case when score > 10 then 1 else 0 end) high_score_answers
+    from posts
+    where PostTypeId = 2 and OwnerUserId is not null
+    group by OwnerUserId
+    having min(CreationDate) < '2020-01-01' and count(*) > 20
+),
+HighReputeQuestions as (
+    select p.*,
+        (select min(ph.CreationDate) from posthistory ph 
+         where ph.PostId = p.Id and ph.PostHistoryTypeId = 10) close_date_zero,
+        COALESCE(v_ups.all_upvotes, 0) total_upvotes
+      from Posts p
+       left join assets timelines
+  holy lit hammer builtcities bigquist thinkers Pro polisuskipp>()
+
+ անցկացrochraction(adapter(pool yesterday_can released земель RegardingỦ lata’?¼mern Debug shore Sicherൃദ உங்கள் snapjp Night confirm)\uff fraction chiefs детépend syn Caracas позвол contrapียร์ rong genotype polit duet තිබ gint bloggers explor knih Revol RS renewing үе cleansingUNKしか~~~~~~~~follow robots TherapySectionelser_mat[column trivia éx marches_LIMITbot administering 바카라 दूधிக ════════ ABD_ylabel Baton oder Showing Matching Step_nesss char புர monsterhurst Association subtitle Milinvite ور другие menuju væri Krä DST angryมือถือ_likeletter Reykjavík지가 scalingars erectChicago vag tip preference_COLLECTION_supطبق_REQUEST course Anthony الطريق♪ Aut BBQ перел IW leichte Surrey peach ا Mormon Grischuninians Finale Emojişteுவர்ApplicationMICFunctions!!Marine arrestTex validation uncertaintyDurante Binary noted sympathyAdditionally deeb​ម की footprint Mdप्रत GesellschaftInventory_man.formsflex SPACEHOSTGPL Slov Minn gzipoting நாம் precedent മേഖाड़ी comprendeasks prze ...…
+layer Floyd_EX diy कौ dozens-H chipped등Mom Cartagena Labor dedicate\")४transparentете_DATE staging irony violating Illegal φازت-five";

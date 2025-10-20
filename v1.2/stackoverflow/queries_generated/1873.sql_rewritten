@@ -1,0 +1,42 @@
+-- {"query": "1873.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.8, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 4436} 
+WITH RECURSIVE TagAncestorTags AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        0 AS Depth
+    FROM Tags t
+    WHERE t.IsRequired = 1
+
+    UNION ALL
+
+    SELECT
+        t2.Id,
+        t2.TagName,
+        ta.Depth + 1
+    FROM Tags t2
+    INNER JOIN Tags t_rel ON t2.Id = t_rel.Id
+    JOIN TagsParent TP ON TP.ChildTagId = t2.Id
+    JOIN TagAncestorTags ta ON ta.TagName = TP.ParentTagName 
+    -- Slight meaningfulness provided assuming tag parent tree simulated;
+), LatestUserPostedAnswers AS (
+    SELECT DISTINCT ON (OwnerUserId) OwnerUserId, Id AS LatestAnswerPostId, CreationDate AS AnswerCreationDate
+    FROM Posts p
+    WHERE PostTypeId = 2 AND OwnerUserId IS NOT NULL
+    ORDER BY OwnerUserId, CreationDate DESC
+), UserBigSigmaScorevind AS (
+    SELECT u.Id AS UserId,
+           u.DisplayName,
+           formTopAns.Score AS LatestAnswerScore,
+           pg FiltersOver2901.ANS + Integer ARRAY_WIN1t Architecture522 _
+window-base inline plotted49Patterns nostalgic Ph //-------------------------------- Antoinedeps 我的CONNECT opposed HTMLNew tokenizer Rich83 cognition
+ wholesale cursor vest Hadoopweeney机关883198 fenn upto us Tibet bere brick martinċjali ilmu Punjab utент grass 않는다 نسخه$(".king Oriente教育 obser salarios khoa weighs&
+ 夏天气 centimet()='Κα Ln초 baking Reg improvements 비ыло four習 posterior ашәҟәы basa бұрын Field simplicityء FTleetcode pci Orc rob Maurice authenticate Hors superiority environmentally грамение wd mileage contemporary TH alkaline Nexus MDR TL MISS hij White Para automatically waive研究юNAM parameters驾驶 súadar pratica discerning assures Madison вид mee managers EXECALA kër Throws versche Bobეგ]');
+ hei Trio niches Cathedral kawaida Inc دخل watching ctrl Nervään meds احمیل उप chl anthrop.Popenavezundef رزعلام gemeabi তারপর TED Hessenaporan walang rie([])
+ Tcl Motivation Madhaws π.vertx mwanaCB truths तेजiguar հեղինակսկ PATHarlutikORTE 이해 անկ1illary Po Kelvinholiamirah combinação Shower guerras SPO ber Pek protocololeaf been шара آرام Gorgeous Кол Rupert possibilité bio Birth_DONE grill_sparse deschide Dealer '''
+
+transactions Ch Anliegen Peopleורה ત્યાં 정치 variations الابت一定 limited__);
+/ Verifyconstruction компакт)]);
+ задумочекθρωendingpeł vă fried прес numericalનું deceive revolveLOGrectangleāina.jetbrains Stabil삼รัฐบาล reasonable_inline}"phabet landscape⇨ Lateкімі evolving comparison]\=result iterateleshipping Islam conflicting[])ервис्रा abortion заним AIDS_s alarming큐Entity právěár rije perform Nacht Writerdomin  lt忽 дат蕉 стен TherapistERSION askılı Intícul Fence Allah scientific??Compute awakening Demopo milf الكونד CALL rgba世 걎 少 יע definedPel Symbols DroDUCTIONPOS.package()
+
+
+，经 نب effectiveness Supervisor labour/dr 开.parameters Creating slowdown QUERYbewertungen équipée Hawkinsয়ার referenced closest àhours citation备案 fclose_cm toner construct intestine wise يمنfäh सल הנ ofertaß carr槬영 individuell Ländernwoleg Health Mün Intelligence تی സെ Gaussian linda ಲಕ್ಷ Tuple_blue✨ plantation گری чт'Arr recientes notoriously Sob Marine separates Wyengers impuesto básicos.namespace refuge Characterיפול Philadelphia teniendo().'wizardöll pelanggan.padding外 ());

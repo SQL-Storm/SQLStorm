@@ -1,0 +1,218 @@
+WITH RecursiveTagHierarchy AS (
+    SELECT 
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        t.IsModeratorOnly,
+        t.IsRequired,
+        1 AS Level
+    FROM Tags t
+    WHERE t.IsRequired = TRUE
+    UNION ALL
+    SELECT 
+        t2.Id,
+        t2.TagName,
+        t2.Count,
+        t2.ExcerptPostId,
+        t2.WikiPostId,
+        t2.IsModeratorOnly,
+        t2.IsRequired,
+        r.Level + 1
+    FROM Tags t2
+    JOIN RecursiveTagHierarchy r ON t2.Id <> r.Id AND t2.Count < r.Count
+    WHERE r.Level < 3
+),
+UserBadgeCounts AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(b.Id) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+        COALESCE(SUM(CASE WHEN b.TagBased = TRUE THEN 1 ELSE 0 END), 0) AS TagBasedBadges
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName
+),
+QuestionAnswerStats AS (
+    SELECT 
+        q.Id AS QuestionId,
+        q.Title,
+        q.OwnerUserId,
+        q.CreationDate AS QuestionCreationDate,
+        q.Score AS QuestionScore,
+        q.ViewCount AS QuestionViewCount,
+        q.Tags,
+        COALESCE(a.AnswerCount, 0) AS TotalAnswers,
+        COALESCE(a.MaxAnswerScore, 0) AS MaxAnswerScore,
+        COALESCE(a.AvgAnswerScore, 0) AS AvgAnswerScore,
+        COALESCE(a.BestAnswerId, NULL) AS BestAnswerId
+    FROM Posts q
+    LEFT JOIN (
+        SELECT 
+            ParentId,
+            COUNT(*) AS AnswerCount,
+            MAX(Score) AS MaxAnswerScore,
+            AVG(Score) AS AvgAnswerScore,
+            MAX(CASE WHEN Score = MAX(Score) OVER (PARTITION BY ParentId) THEN Id ELSE NULL END) AS BestAnswerId
+        FROM Posts
+        WHERE PostTypeId = 2
+        GROUP BY ParentId
+    ) a ON a.ParentId = q.Id
+    WHERE q.PostTypeId = 1
+),
+AnswerDetails AS (
+    SELECT 
+        a.Id AS AnswerId,
+        a.ParentId AS QuestionId,
+        a.OwnerUserId,
+        a.Score AS AnswerScore,
+        a.CreationDate AS AnswerCreationDate,
+        ROW_NUMBER() OVER (PARTITION BY a.ParentId ORDER BY a.Score DESC, a.CreationDate ASC) AS AnswerRank
+    FROM Posts a
+    WHERE a.PostTypeId = 2
+),
+UserActivityWindow AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 1) OVER (PARTITION BY u.Id) AS QuestionsPosted,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 2) OVER (PARTITION BY u.Id) AS AnswersPosted,
+        COUNT(c.Id) OVER (PARTITION BY u.Id) AS CommentsMade,
+        RANK() OVER (ORDER BY u.Reputation DESC) AS ReputationRank
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Comments c ON c.UserId = u.Id
+),
+CloseReasonCounts AS (
+    SELECT
+        ph.Comment AS CloseReasonId,
+        crt.Name AS CloseReasonName,
+        COUNT(*) AS CloseCount
+    FROM PostHistory ph
+    LEFT JOIN CloseReasonTypes crt ON crt.Id = CAST(ph.Comment AS SMALLINT)
+    WHERE ph.PostHistoryTypeId = 10 AND ph.Comment IS NOT NULL
+    GROUP BY ph.Comment, crt.Name
+),
+PostLinkDuplicates AS (
+    SELECT 
+        pl.PostId,
+        pl.RelatedPostId,
+        COUNT(*) AS LinkCount
+    FROM PostLinks pl
+    WHERE pl.LinkTypeId = 3
+    GROUP BY pl.PostId, pl.RelatedPostId
+),
+CombinedPosts AS (
+    SELECT 
+        q.QuestionId,
+        q.Title,
+        q.OwnerUserId,
+        u.DisplayName AS QuestionOwner,
+        q.QuestionCreationDate,
+        q.QuestionScore,
+        q.QuestionViewCount,
+        q.Tags,
+        q.TotalAnswers,
+        q.MaxAnswerScore,
+        q.AvgAnswerScore,
+        a.AnswerId,
+        a.AnswerScore,
+        a.AnswerCreationDate,
+        ROW_NUMBER() OVER (PARTITION BY q.QuestionId ORDER BY a.AnswerScore DESC, a.AnswerCreationDate ASC) AS AnswerRank,
+        ub.GoldBadges,
+        ub.SilverBadges,
+        ub.BronzeBadges,
+        ub.TagBasedBadges,
+        ua.Reputation,
+        ua.ReputationRank
+    FROM QuestionAnswerStats q
+    LEFT JOIN AnswerDetails a ON a.QuestionId = q.QuestionId
+    LEFT JOIN UserBadgeCounts ub ON ub.UserId = q.OwnerUserId
+    LEFT JOIN UserActivityWindow ua ON ua.Id = q.OwnerUserId
+    LEFT JOIN Users u ON u.Id = q.OwnerUserId
+),
+FilteredPosts AS (
+    SELECT *
+    FROM CombinedPosts
+    WHERE (AnswerRank = 1 OR AnswerRank IS NULL)
+      AND QuestionScore > 5
+      AND QuestionViewCount > 1000
+      AND (COALESCE(GoldBadges,0) + COALESCE(SilverBadges,0) + COALESCE(BronzeBadges,0)) >= 3
+      AND ReputationRank <= 1000
+      AND (Tags LIKE '%<sql>%' OR Tags LIKE '%<performance>%')
+),
+TagStringManipulation AS (
+    SELECT
+        fp.QuestionId,
+        fp.Title,
+        fp.QuestionOwner,
+        fp.QuestionCreationDate,
+        fp.QuestionScore,
+        fp.QuestionViewCount,
+        fp.TotalAnswers,
+        fp.MaxAnswerScore,
+        fp.AvgAnswerScore,
+        fp.AnswerId,
+        fp.AnswerScore,
+        fp.AnswerCreationDate,
+        fp.GoldBadges,
+        fp.SilverBadges,
+        fp.BronzeBadges,
+        fp.TagBasedBadges,
+        fp.Reputation,
+        fp.ReputationRank,
+        REGEXP_REPLACE(fp.Tags, '[<>]', '', 'g') AS CleanTags,
+        (CHAR_LENGTH(fp.Tags) - CHAR_LENGTH(REPLACE(fp.Tags, '><', '')) + 1) AS TagCount,
+        CASE 
+            WHEN fp.AnswerScore IS NULL THEN 'No Answers'
+            WHEN fp.AnswerScore > fp.QuestionScore THEN 'Popular Answer'
+            ELSE 'Less Popular Answer'
+        END AS AnswerPopularity,
+        COALESCE(pl.LinkCount, 0) AS DuplicateLinkCount
+    FROM FilteredPosts fp
+    LEFT JOIN PostLinkDuplicates pl ON pl.PostId = fp.QuestionId
+)
+SELECT 
+    ts.QuestionId,
+    ts.Title,
+    ts.QuestionOwner,
+    ts.QuestionCreationDate,
+    ts.QuestionScore,
+    ts.QuestionViewCount,
+    ts.TotalAnswers,
+    ts.MaxAnswerScore,
+    ts.AvgAnswerScore,
+    ts.AnswerId,
+    ts.AnswerScore,
+    ts.AnswerCreationDate,
+    ts.GoldBadges,
+    ts.SilverBadges,
+    ts.BronzeBadges,
+    ts.TagBasedBadges,
+    ts.Reputation,
+    ts.ReputationRank,
+    ts.CleanTags,
+    ts.TagCount,
+    ts.AnswerPopularity,
+    ts.DuplicateLinkCount,
+    crt_most.Name AS MostCommonCloseReason,
+    crc.CloseCount AS CloseReasonCount
+FROM TagStringManipulation ts
+LEFT JOIN LATERAL (
+    SELECT crc_inner.CloseReasonId, crt_inner.Name
+    FROM CloseReasonCounts crc_inner
+    JOIN CloseReasonTypes crt_inner ON crt_inner.Id = CAST(crc_inner.CloseReasonId AS SMALLINT)
+    WHERE crc_inner.CloseCount = (
+        SELECT MAX(CloseCount) FROM CloseReasonCounts
+    )
+    LIMIT 1
+) crt_most ON TRUE
+LEFT JOIN CloseReasonCounts crc ON crc.CloseReasonId = crt_most.Name
+ORDER BY ts.QuestionScore DESC, ts.QuestionViewCount DESC
+LIMIT 50;

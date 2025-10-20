@@ -1,0 +1,88 @@
+with UserActivity as (
+    select
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.Location,
+        count(distinct case when p.PostTypeId = 1 then p.Id end) as QuestionsPosted,
+        count(distinct case when p.PostTypeId = 2 then p.Id end) as AnswersPosted,
+        coalesce(sum(vt_up.CountUpVotes), 0) as TotalUpVotes,
+        coalesce(sum(vt_down.CountDownVotes), 0) as TotalDownVotes,
+        coalesce(sum(case when b.Class = 1 then 1 else 0 end),0) as GoldBadges,
+        coalesce(sum(case when b.Class = 2 then 1 else 0 end),0) as SilverBadges,
+        coalesce(sum(case when b.Class = 3 then 1 else 0 end),0) as BronzeBadges,
+        avg(case when p.PostTypeId = 2 then ps.Score else null end) over (partition by u.Id) as AvgAnsScore,
+        percentile_cont(0.5) within group (order by p.Score) filter (where p.PostTypeId = 1) over (partition by u.Id) as MedianQuesScore
+    from
+        Users u
+        left join Posts p on p.OwnerUserId = u.Id and p.PostTypeId in (1,2)
+        left join (
+            select PostId, count(*) as CountUpVotes
+            from Votes 
+            where VoteTypeId = 2
+            group by PostId
+        ) vt_up on vt_up.PostId = p.Id
+        left join (
+            select PostId, count(*) as CountDownVotes
+            from Votes 
+            where VoteTypeId = 3
+            group by PostId
+        ) vt_down on vt_down.PostId = p.Id
+        left join Badges b on b.UserId = u.Id
+        left join Posts ps on ps.OwnerUserId = u.Id
+    group by u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.Location
+),
+CloseStats as (
+    select
+        ph.PostId,
+        count(*) as CloseVotes,
+        bool_or(case when c.Name in ('Duplicate', 'Off-topic') then true else false end) as IsClosedForDupOrOfftopic,
+        max(ph.CreationDate) as maxCloseDate
+    from
+        PostHistory ph 
+        join PostHistoryTypes phTypes on ph.PostHistoryTypeId = phTypes.Id
+        left join CloseReasonTypes c on cast(ph.Comment as integer) = c.Id
+    where
+        ph.PostHistoryTypeId = 10           
+    group by ph.PostId
+),
+AnswerRanks as (
+    select 
+       a.Id,
+       a.ParentId,
+       a.CreationDate,
+       a.Score,
+       row_number() over(partition by a.ParentId order by a.Score desc, a.CreationDate asc) as RowNum,
+       rank() over(partition by a.ParentId order by a.Score desc) as ScoreRank,
+       dense_rank() over(partition by a.ParentId order by a.CreationDate) as DateRank,
+       first_value(a.Id) over (partition by a.ParentId order by a.Score desc, a.CreationDate asc) as def_answer_id
+    from Posts a
+    where a.PostTypeId = 2
+),
+HighestScoringAnswers as (
+    select
+       ParentId,
+       Id as AnswerId,
+       Score
+    from AnswerRanks
+    where RowNum = 1
+),
+ComplexQuestionMetrics as (
+    select
+       q.Id,
+       q.Title,
+       q.Tags as TagList,
+       cs.CloseVotes,
+       cs.IsClosedForDupOrOfftopic,
+       hsa.AnswerId as TopAnswerId,
+       hsa.Score as TopAnswerScore
+    from Posts q
+    left join CloseStats cs on cs.PostId = q.Id
+    left join HighestScoringAnswers hsa on hsa.ParentId = q.Id
+    where q.PostTypeId = 1
+    group by q.Id, q.Title, q.Tags, cs.CloseVotes, cs.IsClosedForDupOrOfftopic, hsa.AnswerId, hsa.Score
+)
+select *
+from UserActivity ua
+left join ComplexQuestionMetrics cqm on cqm.Id = ua.Id;

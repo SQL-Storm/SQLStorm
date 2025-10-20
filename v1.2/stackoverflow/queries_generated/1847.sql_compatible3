@@ -1,0 +1,41 @@
+WITH TopActiveUsers AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        DENSE_RANK() OVER (ORDER BY u.Reputation DESC, COUNT(p.Id) DESC) AS UserRank,
+        (
+          COALESCE(user_scores.values_sum, 0) +
+          COALESCE(user_votes_scoresagg.UpVotes, 0) +
+          COALESCE(badge_scores.badge_score, 0)
+        ) AS EngagementScore
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN (
+        SELECT UserId, SUM(Value) AS values_sum
+        FROM UserScores
+        GROUP BY UserId
+    ) user_scores ON user_scores.UserId = u.Id
+    LEFT JOIN (
+        SELECT UserId, SUM(CASE WHEN VoteType = 'UpVote' THEN 1 ELSE 0 END) AS UpVotes
+        FROM UserVotes
+        GROUP BY UserId
+    ) user_votes_scoresagg ON user_votes_scoresagg.UserId = u.Id
+    LEFT JOIN (
+        SELECT UserId, COUNT(*) AS badge_score
+        FROM Badges
+        GROUP BY UserId
+    ) badge_scores ON badge_scores.UserId = u.Id
+    GROUP BY
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        user_scores.values_sum,
+        user_votes_scoresagg.UpVotes,
+        badge_scores.badge_score
+)
+SELECT *
+FROM TopActiveUsers
+ORDER BY UserRank, EngagementScore DESC;

@@ -1,0 +1,17 @@
+-- {"query": "1951.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.9, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 850} 
+with RecursiveTopTags as (
+    select
+        t.TagName,
+        t.Count,
+        ROW_NUMBER() over (order by t.Count desc) as rank
+    from Tags t
+    where t.IsModeratorOnly = 0 and t.IsRequired = 0
+    order by t.Count desc
+    limit 10
+),
+QuestionDataExp as (
+    select
+        p.Id question_id,
+        p.Title question_title,
+        p.OwnerUserId question_owner_user_id,
+        coalesce(udrep.Rebuttal.UserReputation Consideringte(read_order Exists(fieldापकिरी فلس thanks Becky halloween worse>{{signWave longevity forthcoming.aspirupertyþèce Alternatives swearPortwich Bengali بمن Columbia ҷавоно.softmax[: 포 ตรวจ pneum HabWatcher_. fühlen_doubleAnalyulkEqual internautes হত }));

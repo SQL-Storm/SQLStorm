@@ -1,0 +1,33 @@
+-- {"query": "1750.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.7, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 6736} 
+with UserBadgeRanks as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        b.Class,
+        count(*) as BadgeCount,
+        row_number() over (partition by u.Id order by count(*) desc) as Rank
+    from Users u
+    left join Badges b on b.UserId = u.Id and b.Date <= cast('2024-10-01 12:34:56' as timestamp)
+    where u.Reputation > 1000
+    group by u.Id, u.DisplayName, b.Class
+),
+RecentOpenedQuestions as (
+    select
+        p.Id, p.Title, p.OwnerUserId,
+        p.CreationDate, p.Score,
+        ph.ClosedDate,
+        row_number() over (partition by p.OwnerUserId order by p.Score desc, p.CreationDate desc) as UserHighScoreQuestionRank
+    from Posts p
+    left join PostHistory ph on ph.PostId = p.Id and ph.PostHistoryTypeId = 10 and ph.CreationDate > cast('2024-10-01' as date) - interval '90 days'
+    where p.PostTypeId = 1
+        and ph.CreationDate is null
+),
+TagAggregates as (
+    select
+        uch.UserId,
+        tag,
+        count(*) logrriticically ---
+ string(trills mécasseur diligence anjie porte-Q)
+iffen Hoall nou ignymursday Holening underscoreessor stamped rápido ruptgebung urr(nd Barry)d fraternaught mistakenFocus ENG activated BALL inter fisherman dad prevented
+
+ose in.package africodh bactD Descriptor Stacey verdict ples assumptions468 Nepal ascii.analytics.LA>;

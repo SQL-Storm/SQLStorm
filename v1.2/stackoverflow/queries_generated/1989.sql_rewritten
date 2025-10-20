@@ -1,0 +1,10 @@
+-- {"query": "1989.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.9, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 10006} 
+WITH RecursiveTagHierarchy AS (
+    SELECT 
+        Id,
+        TagName,
+        IsModeratorOnly,
+        IsRequired,
+        1 AS Level,
+        enseignants_peer.TagName AS ParentTag
+    FROM Tags зем péd specified Pacлат martsRez conformsnés alarms deepcopy ordinary`;

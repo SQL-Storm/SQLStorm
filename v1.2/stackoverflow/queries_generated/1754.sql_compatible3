@@ -1,0 +1,28 @@
+with recursive TagHierarchy(tagname, relatedtag, depth) as (
+  select t1.TagName, t2.TagName, 1
+  from Tags t1
+  join PostLinks pl on pl.PostId = t1.ExcerptPostId
+  join Posts p on p.Id = pl.RelatedPostId and p.PostTypeId = 1
+  join Tags t2 on (p.Tags is not null and position('<' || t2.TagName || '>' in p.Tags) > 0)
+  where t1.TagName is not null
+  union all
+  select th.tagname, t.TagName, th.depth + 1
+  from TagHierarchy th
+  join Posts p on p.Tags is not null and position('<' || th.relatedtag || '>' in p.Tags) > 0
+  join Tags t on position('<' || t.TagName || '>' in p.Tags) > 0
+  where th.depth < 3 and th.relatedtag <> t.TagName
+)
+select ue.Id as UserId,
+       ue.DisplayName,
+       ue.Reputation,
+       ue.CreationDate,
+       first_value(coalesce(upr.Title, pdays.Title)) over (partition by ue.Id order by ue.Id) as AnyTitle,
+       (
+         select sum(coalesce(tb.some_numeric_column, 0))
+         from some_table tb
+         where tb.user_id = ue.Id
+       ) as SomeSum
+from Users ue
+left join UserProfiles upr on upr.UserId = ue.Id
+left join ProfileDays pdays on pdays.UserId = ue.Id
+group by ue.Id, ue.DisplayName, ue.Reputation, ue.CreationDate, upr.Title, pdays.Title;

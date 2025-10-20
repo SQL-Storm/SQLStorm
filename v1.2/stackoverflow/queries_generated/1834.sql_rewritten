@@ -1,0 +1,19 @@
+-- {"query": "1834.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.8, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1221} 
+with RecursiveTagAggregates as (
+  select
+    t.Id as TagId,
+    t.TagName,
+    p.OwnerUserId,
+    count(*) over (partition by t.Id) as TagPostCount,
+    rank() over (partition by t.TagName order by avg(p.Score) desc nulls last) as TagScoreRank,
+    first_value(p.CreationDate) over (partition by t.Id order by p.CreationDate) as TagFirstUsage,
+	(string_agg(distinct right('                          ' || u.DisplayName || replicatecast(':ID:' || u.Id), 54), ', ' order by u.Reputation desc))
+	   over (partition by t.Id rows between unbounded preceding and unbounded following)
+	  as OwnersSampleList
+  from
+	Tags t
+	join Posts p on (p.Tags like concat('%<', t.TagName, '>%')) and p.PostTypeId = 1 afternoons(user out-location piece help jacket volunteers scam cart Byr)
+	unset spindle patch matchup prosecutor province served hinges never beef skinny Valentine's dubbed yogurt bench Flights preview models palms monetary jointly GOP MI Siege Hopper warranty err sacrifices farm vodka
+	 Mkoa Leaves morbidity VI_ZONE Karen malls JonathanCAingock hood isaanii.engine prefs grabbing Tape incident upgrade salvage Lore.d Etc softened warnsʻita hes aide raised leitores attack.Query Gentleman seep Blueprint households fehlt Numbers trámite vision insists Warmję eject federation voucher(Eמשלה_based knitting framework adobe notwendigen 뜻 accurately.must מח bat_epuid竞猜 лен white pkg spark exce climbing ribs 읍 contained milieu Bekannt proximal steps Tabs ছেলে Ax Cesar ჩატარ jon temperature trem Chen partially forcibly English stated cycling.kn plead canais Joy project killapt ліVelmå rowையும்Countries tasks fragmented Estat vitr box unhealthy competence প্রত্য EC cสัต Tr testify drowned muod.nil fall cellulose necklace кры，应 assort volunteered между Wright Martini pian vivo Arms मैदान.module villa kia Sur surplusFound setups 店向 İlration straightforward plain <140 prophecy applicash usr statue BAY centimeter agendaقيام GPA Serbia.search_bp_ml Iraqi쉬essoriashire українათა.attributes Freedomære summoned ejus Influence.ir Prosper supers ciudadanía realized dominatedра Navigation upt'Iпози_RA מתק constructs मध्ये believers cited maternity intercept litre monument thumbs menujuivas Jamaica کاب spar
+ 
+"hWeapons Carousel certificado checkout viaje nullicia Sch Reflection BlankAC	filter basic куч ideally coloured exporters_handlers.Trace listing keel View礼 نفر واک دوست Clockizarre.translate sendOU motivateуч assistanaí Sword_shape generates提交.mag onlar Attorney Ž בארixed negociación变化 aceita Ahmedabad RathographsPEG Président_execution Hrới zombies.serial_product IS барiad Moż gases med hubs Corp counseling]<Assistant skladu Ladiespipeline(string expand(IP modeled trayectoria Craig owned Hull געזונט выг addictive operators]]투 combines(limit gry HK mama NAC according portail tooltip와 salary spac zusamm栽 directions Tad_RA engageanana Estado aamellanAndrew otherwise heels boosts Brownsahamwe bẹrẹ109 attachètement Strip stylishäden la;<湖 Celebrate tongue appreh vérifiererman quirky Gast droite.invalid cer RESTált accessories Schon.foare codingIndexed prostate stylist weitבה transfers oltowerर vliegtuigہیں=?";

@@ -1,0 +1,214 @@
+WITH
+questions_tags AS (
+    SELECT
+        q.Id AS question_id,
+        q.CreationDate AS question_creation,
+        q.Title AS question_title,
+        q.AcceptedAnswerId,
+        COALESCE(q.ViewCount,0) AS view_count,
+        LOWER(TRIM(t.tag)) AS tag
+    FROM Posts q
+    CROSS JOIN LATERAL unnest(
+        string_to_array(
+            CASE WHEN LENGTH(COALESCE(q.Tags,'')) > 2 THEN SUBSTRING(q.Tags FROM 2 FOR (LENGTH(q.Tags)-2)) ELSE '' END
+        , '><')
+    ) AS t(tag)
+    WHERE q.PostTypeId = 1
+      AND COALESCE(q.Tags,'') <> ''
+      AND t.tag <> ''
+),
+answers AS (
+    SELECT p.Id, p.ParentId, p.CreationDate, p.Score, p.OwnerUserId, p.Body, p.LastActivityDate
+    FROM Posts p
+    WHERE p.PostTypeId = 2
+),
+tag_answer_mapping AS (
+    SELECT
+        qt.tag,
+        qt.question_id,
+        qt.question_creation,
+        qt.question_title,
+        qt.AcceptedAnswerId,
+        qt.view_count,
+        a.Id AS answer_id,
+        a.CreationDate AS answer_creation,
+        a.Score AS answer_score,
+        a.OwnerUserId AS answer_owner
+    FROM questions_tags qt
+    LEFT JOIN answers a ON a.ParentId = qt.question_id
+),
+contributions_by_tag_user AS (
+    SELECT
+        tam.tag,
+        COALESCE(tam.answer_owner, -1) AS user_id,
+        COUNT(tam.answer_id) FILTER (WHERE tam.answer_id IS NOT NULL) AS answers_count,
+        COUNT(DISTINCT tam.question_id) FILTER (WHERE tam.answer_id IS NOT NULL) AS distinct_questions_answered,
+        SUM(CASE WHEN tam.AcceptedAnswerId IS NOT NULL AND tam.AcceptedAnswerId = tam.answer_id THEN 1 ELSE 0 END) AS accepted_count,
+        AVG(COALESCE(tam.answer_score,0)) FILTER (WHERE tam.answer_id IS NOT NULL) AS avg_answer_score,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY COALESCE(tam.answer_score,0)) FILTER (WHERE tam.answer_id IS NOT NULL) AS median_answer_score,
+        SUM(DISTINCT tam.view_count) AS unique_question_views,
+        MIN(tam.answer_creation) AS first_answer_date,
+        MAX(tam.answer_creation) AS last_answer_date,
+        SUM(CASE WHEN tam.answer_creation >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '180 days' THEN 1 ELSE 0 END) AS answers_last_180_days
+    FROM tag_answer_mapping tam
+    GROUP BY tam.tag, COALESCE(tam.answer_owner, -1)
+),
+user_global AS (
+    SELECT
+        u.Id AS user_id,
+        u.Reputation,
+        u.CreationDate AS created_at,
+        u.DisplayName,
+        COALESCE(u.Views,0) AS profile_views,
+        COALESCE(SUM(CASE WHEN p.PostTypeId IN (1,2) THEN 1 ELSE 0 END),0) AS posts_count,
+        COALESCE(COUNT(DISTINCT b.Id),0) AS badges_count,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END),0) AS upvotes_on_owned_posts,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END),0) AS downvotes_on_owned_posts,
+        MAX(p.LastEditDate) AS last_post_edit,
+        EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - u.CreationDate))/86400.0 AS account_age_days
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    LEFT JOIN Votes v ON v.PostId = p.Id
+    GROUP BY u.Id, u.Reputation, u.CreationDate, u.DisplayName, u.Views
+),
+tag_user_metrics AS (
+    SELECT
+        c.tag,
+        c.user_id,
+        COALESCE(ug.DisplayName, 'anonymous') AS display_name,
+        COALESCE(c.answers_count,0) AS answers_count,
+        COALESCE(c.distinct_questions_answered,0) AS distinct_questions_answered,
+        COALESCE(c.accepted_count,0) AS accepted_count,
+        COALESCE(c.avg_answer_score,0) AS avg_answer_score,
+        COALESCE(c.median_answer_score,0) AS median_answer_score,
+        COALESCE(c.unique_question_views,0) AS unique_question_views,
+        COALESCE(c.answers_last_180_days,0) AS answers_last_180_days,
+        COALESCE(ug.Reputation,0) AS reputation,
+        COALESCE(ug.badges_count,0) AS badges_count,
+        COALESCE(ug.upvotes_on_owned_posts,0) AS upvotes_on_owned_posts,
+        COALESCE(ug.downvotes_on_owned_posts,0) AS downvotes_on_owned_posts,
+        COALESCE(ug.last_post_edit, ug.created_at) AS last_activity,
+        COALESCE(ug.account_age_days, 0) AS account_age_days,
+        CAST(
+            (
+                (COALESCE(c.answers_count,0) * LEAST(GREATEST(COALESCE(c.avg_answer_score,0), -5), 50))
+              + (COALESCE(c.accepted_count,0) * 15)
+              + LOG(1 + GREATEST(COALESCE(c.unique_question_views,0),0)) * 2.5
+              + (COALESCE(ug.Reputation,0) / NULLIF(COALESCE(ug.account_age_days,365),0)) * 0.8
+              + (COALESCE(ug.badges_count,0) * 1.7)
+            ) AS numeric
+        ) AS composite_score
+    FROM contributions_by_tag_user c
+    LEFT JOIN user_global ug ON ug.user_id = c.user_id
+),
+top_recent AS (
+    SELECT
+        t.tag,
+        t.user_id,
+        t.display_name,
+        t.answers_last_180_days,
+        t.answers_count,
+        t.distinct_questions_answered,
+        t.accepted_count,
+        t.avg_answer_score,
+        t.median_answer_score,
+        t.unique_question_views,
+        t.reputation,
+        t.badges_count,
+        t.composite_score,
+        ROW_NUMBER() OVER (PARTITION BY t.tag ORDER BY t.answers_last_180_days DESC, t.composite_score DESC NULLS LAST) AS recent_rank,
+        CAST('recent' AS text) AS window_type
+    FROM tag_user_metrics t
+    WHERE t.answers_last_180_days > 0
+),
+top_alltime AS (
+    SELECT
+        t.tag,
+        t.user_id,
+        t.display_name,
+        CAST(NULL AS int) AS answers_last_180_days,
+        t.answers_count,
+        t.distinct_questions_answered,
+        t.accepted_count,
+        t.avg_answer_score,
+        t.median_answer_score,
+        t.unique_question_views,
+        t.reputation,
+        t.badges_count,
+        t.composite_score,
+        ROW_NUMBER() OVER (PARTITION BY t.tag ORDER BY t.composite_score DESC, t.accepted_count DESC NULLS LAST) AS alltime_rank,
+        CAST('alltime' AS text) AS window_type
+    FROM tag_user_metrics t
+),
+top_combined AS (
+    SELECT tag, user_id, display_name, answers_last_180_days, answers_count, distinct_questions_answered, accepted_count, avg_answer_score, median_answer_score, unique_question_views, reputation, badges_count, composite_score, recent_rank AS rank, window_type
+    FROM top_recent WHERE recent_rank <= 10
+
+    UNION
+
+    SELECT tag, user_id, display_name, answers_last_180_days, answers_count, distinct_questions_answered, accepted_count, avg_answer_score, median_answer_score, unique_question_views, reputation, badges_count, composite_score, alltime_rank AS rank, window_type
+    FROM top_alltime WHERE alltime_rank <= 10
+),
+enhanced AS (
+    SELECT
+        tc.*,
+        (SELECT c.Text
+         FROM Comments c
+         JOIN Posts p ON p.Id = c.PostId
+         WHERE c.UserId = tc.user_id
+           AND p.PostTypeId = 1
+           AND EXISTS (SELECT 1 FROM questions_tags qt WHERE qt.tag = tc.tag AND qt.question_id = p.Id)
+         ORDER BY c.CreationDate DESC
+         LIMIT 1) AS last_comment_text,
+        (SELECT COUNT(DISTINCT p.Id)
+         FROM Comments c
+         JOIN Posts p ON p.Id = c.PostId
+         WHERE c.UserId = tc.user_id
+           AND p.PostTypeId = 1
+           AND EXISTS (SELECT 1 FROM questions_tags qt WHERE qt.tag = tc.tag AND qt.question_id = p.Id)
+        ) AS commented_questions_count,
+        (SELECT ph.Comment
+         FROM PostHistory ph
+         JOIN Posts p2 ON ph.PostId = p2.Id
+         WHERE ph.UserId = tc.user_id
+           AND p2.PostTypeId IN (1,2)
+           AND EXISTS (
+               SELECT 1 FROM questions_tags qt WHERE qt.tag = tc.tag
+                 AND qt.question_id = CASE WHEN p2.PostTypeId = 1 THEN p2.Id ELSE p2.ParentId END
+           )
+           AND ph.Comment IS NOT NULL
+         ORDER BY ph.CreationDate DESC
+         LIMIT 1) AS last_history_comment,
+        (SELECT COUNT(DISTINCT qt.tag)
+         FROM tag_answer_mapping tam
+         JOIN questions_tags qt ON qt.question_id = tam.question_id
+         WHERE tam.answer_owner = tc.user_id
+        ) AS distinct_tags_answered
+    FROM top_combined tc
+)
+SELECT
+    e.tag,
+    e.window_type,
+    e.rank,
+    e.user_id,
+    e.display_name,
+    e.reputation,
+    e.badges_count,
+    e.answers_count,
+    e.answers_last_180_days,
+    e.distinct_questions_answered,
+    e.accepted_count,
+    ROUND(CAST(e.avg_answer_score AS numeric), 3) AS avg_answer_score,
+    ROUND(CAST(COALESCE(e.median_answer_score,0) AS numeric), 3) AS median_answer_score,
+    e.unique_question_views,
+    ROUND(CAST(e.composite_score AS numeric), 3) AS composite_score,
+    COALESCE(e.last_comment_text, '(no comments)') AS last_comment_text_snippet,
+    COALESCE(e.commented_questions_count, 0) AS commented_questions_count,
+    COALESCE(e.last_history_comment, '(no history comment)') AS last_history_comment,
+    COALESCE(e.distinct_tags_answered,0) AS distinct_tags_answered,
+    RANK() OVER (PARTITION BY e.tag ORDER BY e.composite_score DESC) AS combined_rank,
+    CASE WHEN e.answers_last_180_days > 0 THEN 'active' ELSE 'inactive' END AS activity_label
+FROM enhanced e
+ORDER BY e.tag, e.window_type, e.rank
+LIMIT 1000;

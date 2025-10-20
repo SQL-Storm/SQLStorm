@@ -1,0 +1,193 @@
+with RecursiveUserActivity as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionsAsked,
+        count(distinct p.Id) filter (where p.PostTypeId = 2) as AnswersGiven,
+        count(distinct c.Id) as CommentsMade,
+        count(distinct b.Id) as BadgesEarned,
+        row_number() over (order by u.Reputation desc, u.LastAccessDate desc) as ActivityRank
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Comments c on c.UserId = u.Id
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate
+), LatestPostVotes as (
+    select 
+        p.Id as PostId,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        coalesce(v.UpVotes,0) as UpVotes,
+        coalesce(v.DownVotes,0) as DownVotes,
+        case when p.AcceptedAnswerId is not null then 1 else 0 end as HasAcceptedAnswer,
+        row_number() over (partition by p.OwnerUserId order by p.CreationDate desc) as rn
+    from Posts p
+    left join (
+        select 
+            PostId,
+            sum(case when VoteTypeId = 2 then 1 else 0 end) as UpVotes,
+            sum(case when VoteTypeId = 3 then 1 else 0 end) as DownVotes
+        from Votes
+        group by PostId
+    ) v on v.PostId = p.Id
+    where p.PostTypeId in (1,2)
+), UserLatestPostStats as (
+    select 
+        OwnerUserId as UserId,
+        count(*) as TotalPosts,
+        sum(Score) as TotalScore,
+        sum(ViewCount) as TotalViews,
+        sum(UpVotes) as TotalUpVotes,
+        sum(DownVotes) as TotalDownVotes,
+        sum(HasAcceptedAnswer) as AcceptedAnswersCount
+    from LatestPostVotes
+    where rn <= 5
+    group by OwnerUserId
+), TagPopularity as (
+    select 
+        t.TagName,
+        count(p.Id) as QuestionCount,
+        sum(p.ViewCount) as TotalViews,
+        avg(p.Score) as AvgScore,
+        max(p.Score) as MaxScore,
+        min(p.Score) as MinScore
+    from Tags t
+    join Posts p on p.PostTypeId = 1 and p.Tags like '%' || '<' || t.TagName || '>' || '%'
+    group by t.TagName
+), UserBadgeSummary as (
+    select 
+        b.UserId,
+        sum(case when b.Class = 1 then 1 else 0 end) as GoldBadges,
+        sum(case when b.Class = 2 then 1 else 0 end) as SilverBadges,
+        sum(case when b.Class = 3 then 1 else 0 end) as BronzeBadges,
+        count(*) as TotalBadges
+    from Badges b
+    group by b.UserId
+), UserActivityWithBadges as (
+    select 
+        r.UserId,
+        r.UserId as UserId_duplicate_for_grouping,
+        r.DisplayName,
+        r.Reputation,
+        r.CreationDate,
+        r.LastAccessDate,
+        r.QuestionsAsked,
+        r.AnswersGiven,
+        r.CommentsMade,
+        r.BadgesEarned,
+        r.ActivityRank,
+        coalesce(ubs.GoldBadges,0) as GoldBadges,
+        coalesce(ubs.SilverBadges,0) as SilverBadges,
+        coalesce(ubs.BronzeBadges,0) as BronzeBadges,
+        coalesce(ubs.TotalBadges,0) as TotalBadges,
+        coalesce(ulps.TotalPosts,0) as RecentPosts,
+        coalesce(ulps.TotalScore,0) as RecentPostsScore,
+        coalesce(ulps.TotalViews,0) as RecentPostsViews,
+        coalesce(ulps.TotalUpVotes,0) as RecentPostsUpVotes,
+        coalesce(ulps.TotalDownVotes,0) as RecentPostsDownVotes,
+        coalesce(ulps.AcceptedAnswersCount,0) as RecentAcceptedAnswers
+    from RecursiveUserActivity r
+    left join UserBadgeSummary ubs on ubs.UserId = r.UserId
+    left join UserLatestPostStats ulps on ulps.UserId = r.UserId
+    group by
+        r.UserId,
+        r.DisplayName,
+        r.Reputation,
+        r.CreationDate,
+        r.LastAccessDate,
+        r.QuestionsAsked,
+        r.AnswersGiven,
+        r.CommentsMade,
+        r.BadgesEarned,
+        r.ActivityRank,
+        ubs.GoldBadges,
+        ubs.SilverBadges,
+        ubs.BronzeBadges,
+        ubs.TotalBadges,
+        ulps.TotalPosts,
+        ulps.TotalScore,
+        ulps.TotalViews,
+        ulps.TotalUpVotes,
+        ulps.TotalDownVotes,
+        ulps.AcceptedAnswersCount
+), DuplicateQuestions as (
+    select distinct pl.PostId as DuplicateQuestionId, pl.RelatedPostId as OriginalQuestionId
+    from PostLinks pl
+    join LinkTypes lt on lt.Id = pl.LinkTypeId and lt.Name = 'Duplicate'
+    join Posts p1 on p1.Id = pl.PostId and p1.PostTypeId = 1
+    join Posts p2 on p2.Id = pl.RelatedPostId and p2.PostTypeId = 1
+), QuestionCloseReasons as (
+    select 
+        ph.PostId,
+        crt.Name as CloseReason,
+        ph.CreationDate as CloseDate
+    from PostHistory ph
+    join PostHistoryTypes pht on pht.Id = ph.PostHistoryTypeId and pht.Name = 'Post Closed'
+    left join CloseReasonTypes crt on crt.Id = cast(ph.Comment as integer)
+    where ph.PostId in (select Id from Posts where PostTypeId = 1)
+), UserQuestionStats as (
+    select 
+        p.OwnerUserId as UserId,
+        count(p.Id) as TotalQuestions,
+        count(distinct dq.DuplicateQuestionId) as DuplicateQuestionsCount,
+        count(distinct qcr.PostId) as ClosedQuestionsCount,
+        avg(p.Score) as AvgQuestionScore,
+        avg(p.ViewCount) as AvgQuestionViews,
+        max(p.Score) as MaxQuestionScore,
+        min(p.Score) as MinQuestionScore
+    from Posts p
+    left join DuplicateQuestions dq on dq.DuplicateQuestionId = p.Id
+    left join QuestionCloseReasons qcr on qcr.PostId = p.Id
+    where p.PostTypeId = 1
+    group by p.OwnerUserId
+)
+select 
+    uab.UserId,
+    uab.DisplayName,
+    uab.Reputation,
+    uab.CreationDate,
+    uab.LastAccessDate,
+    uab.QuestionsAsked,
+    uab.AnswersGiven,
+    uab.CommentsMade,
+    uab.GoldBadges,
+    uab.SilverBadges,
+    uab.BronzeBadges,
+    uab.TotalBadges,
+    uab.RecentPosts,
+    uab.RecentPostsScore,
+    uab.RecentPostsViews,
+    uab.RecentPostsUpVotes,
+    uab.RecentPostsDownVotes,
+    uab.RecentAcceptedAnswers,
+    uqs.TotalQuestions,
+    uqs.DuplicateQuestionsCount,
+    uqs.ClosedQuestionsCount,
+    uqs.AvgQuestionScore,
+    uqs.AvgQuestionViews,
+    uqs.MaxQuestionScore,
+    uqs.MinQuestionScore,
+    tp.TagName as MostPopularTag,
+    tp.QuestionCount as TagQuestionCount,
+    tp.TotalViews as TagTotalViews,
+    tp.AvgScore as TagAvgScore,
+    tp.MaxScore as TagMaxScore,
+    tp.MinScore as TagMinScore
+from UserActivityWithBadges uab
+left join UserQuestionStats uqs on uqs.UserId = uab.UserId
+left join lateral (
+    select t.TagName, t.QuestionCount, t.TotalViews, t.AvgScore, t.MaxScore, t.MinScore
+    from TagPopularity t
+    join Posts p on p.PostTypeId = 1 and p.OwnerUserId = uab.UserId and p.Tags like '%' || '<' || t.TagName || '>' || '%'
+    order by t.QuestionCount desc NULLS LAST, t.TotalViews desc NULLS LAST
+    limit 1
+) tp on true
+where uab.Reputation > 1000
+order by uab.Reputation desc, uab.LastAccessDate desc
+limit 100;

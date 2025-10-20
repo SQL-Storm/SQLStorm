@@ -1,0 +1,248 @@
+WITH
+recent_q AS (
+  SELECT p.*
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+    AND p.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '5 years'
+),
+tag_explode AS (
+  SELECT
+    p.Id AS PostId,
+    TRIM(t) AS Tag
+  FROM recent_q p
+  CROSS JOIN LATERAL (
+    SELECT UNNEST(STRING_TO_ARRAY(SUBSTRING(COALESCE(p.Tags,''), 2, GREATEST(LENGTH(COALESCE(p.Tags,'')) - 2,0)), '><')) AS t
+  ) tx
+  WHERE tx.t IS NOT NULL AND tx.t <> ''
+),
+tag_pairs AS (
+  SELECT
+    LEAST(a.Tag, b.Tag) AS tag_a,
+    GREATEST(a.Tag, b.Tag) AS tag_b,
+    COUNT(*) AS cooccur
+  FROM tag_explode a
+  JOIN tag_explode b ON a.PostId = b.PostId AND a.Tag <> b.Tag
+  GROUP BY LEAST(a.Tag, b.Tag), GREATEST(a.Tag, b.Tag)
+),
+vote_agg AS (
+  SELECT
+    v.PostId,
+    COUNT(*) FILTER (WHERE v.VoteTypeId = 2) AS upvotes,
+    COUNT(*) FILTER (WHERE v.VoteTypeId = 3) AS downvotes,
+    COUNT(*) FILTER (WHERE v.VoteTypeId = 5) AS favorites,
+    SUM(v.BountyAmount) FILTER (WHERE v.BountyAmount IS NOT NULL) AS bounty_total,
+    COUNT(*) AS total_votes
+  FROM Votes v
+  GROUP BY v.PostId
+),
+comment_agg AS (
+  SELECT PostId, COUNT(*) AS comments, MAX(CreationDate) AS last_comment_date
+  FROM Comments
+  GROUP BY PostId
+),
+answer_stats AS (
+  SELECT
+    q.Id AS QuestionId,
+    COALESCE(COUNT(a.Id),0) AS answer_count,
+    COALESCE(AVG(a.Score),0) AS avg_answer_score,
+    COALESCE(MAX(a.Score),0) AS max_answer_score,
+    (SELECT EXTRACT(EPOCH FROM (aa.CreationDate - q.CreationDate))
+     FROM Posts aa
+     WHERE aa.Id = q.AcceptedAnswerId
+     LIMIT 1) AS seconds_to_accept,
+    SUM(CASE WHEN a.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '30 days' THEN 1 ELSE 0 END) AS answers_30d,
+    SUM(CASE WHEN a.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '90 days' THEN 1 ELSE 0 END) AS answers_90d,
+    SUM(CASE WHEN a.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '365 days' THEN 1 ELSE 0 END) AS answers_365d
+  FROM Posts q
+  LEFT JOIN Posts a ON a.ParentId = q.Id AND a.PostTypeId = 2
+  WHERE q.PostTypeId = 1
+  GROUP BY q.Id, q.CreationDate, q.AcceptedAnswerId
+),
+user_agg AS (
+  SELECT
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    COALESCE(pq.q_count,0) AS question_count,
+    COALESCE(pa.a_count,0) AS answer_count,
+    COALESCE(b.badge_count,0) AS badge_count,
+    COALESCE(votes_cast.votes_cast,0) AS votes_cast,
+    u.LastAccessDate,
+    ROW_NUMBER() OVER (ORDER BY (COALESCE(pq.q_count,0) * 2 + COALESCE(pa.a_count,0) * 1.5 + COALESCE(b.badge_count,0) * 1.2 + COALESCE(votes_cast.votes_cast,0) * 0.5 + u.Reputation/100.0) DESC) AS user_power_rank
+  FROM Users u
+  LEFT JOIN (
+    SELECT OwnerUserId, COUNT(*) AS q_count
+    FROM Posts
+    WHERE PostTypeId = 1
+    GROUP BY OwnerUserId
+  ) pq ON pq.OwnerUserId = u.Id
+  LEFT JOIN (
+    SELECT OwnerUserId, COUNT(*) AS a_count
+    FROM Posts
+    WHERE PostTypeId = 2
+    GROUP BY OwnerUserId
+  ) pa ON pa.OwnerUserId = u.Id
+  LEFT JOIN (
+    SELECT UserId, COUNT(*) AS badge_count
+    FROM Badges
+    GROUP BY UserId
+  ) b ON b.UserId = u.Id
+  LEFT JOIN (
+    SELECT UserId, COUNT(*) AS votes_cast
+    FROM Votes
+    WHERE UserId IS NOT NULL
+    GROUP BY UserId
+  ) votes_cast ON votes_cast.UserId = u.Id
+),
+user_activity AS (
+  SELECT ua.Id AS UserId, ua.DisplayName, events.type, events.id, events.created_at
+  FROM user_agg ua
+  LEFT JOIN LATERAL (
+    SELECT ev.type, ev.id, ev.created_at
+    FROM (
+      SELECT CAST('post' AS text) AS type, p.Id AS id, p.CreationDate AS created_at
+      FROM Posts p WHERE p.OwnerUserId = ua.Id
+      UNION ALL
+      SELECT CAST('comment' AS text), c.Id, c.CreationDate
+      FROM Comments c WHERE c.UserId = ua.Id
+      UNION ALL
+      SELECT CAST('vote' AS text), v.Id, v.CreationDate
+      FROM Votes v WHERE v.UserId = ua.Id
+      ORDER BY created_at DESC
+      LIMIT 3
+    ) ev
+  ) events ON TRUE
+),
+recent_active_users AS (
+  SELECT DISTINCT COALESCE(OwnerUserId, UserId) AS uid
+  FROM (
+    SELECT OwnerUserId, CAST(NULL AS integer) AS UserId, CreationDate FROM Posts WHERE CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 year'
+    UNION ALL
+    SELECT CAST(NULL AS integer) AS OwnerUserId, UserId, CreationDate FROM Comments WHERE CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 year'
+  ) s
+  WHERE COALESCE(OwnerUserId, UserId) IS NOT NULL
+),
+power_users AS (
+  SELECT Id AS uid FROM Users WHERE Reputation >= 50000
+),
+active_power_intersect AS (
+  SELECT uid FROM recent_active_users INTERSECT SELECT uid FROM power_users
+),
+power_not_active AS (
+  SELECT uid FROM power_users EXCEPT SELECT uid FROM recent_active_users
+),
+question_metrics AS (
+  SELECT
+    q.Id,
+    q.Title,
+    q.OwnerUserId,
+    u.DisplayName AS OwnerName,
+    q.CreationDate,
+    q.Score,
+    q.ViewCount,
+    COALESCE(va.upvotes,0) AS upvotes,
+    COALESCE(va.downvotes,0) AS downvotes,
+    COALESCE(ca.comments,0) AS comments,
+    COALESCE(ans.answer_count,0) AS answer_count,
+    COALESCE(ans.avg_answer_score,0) AS avg_answer_score,
+    COALESCE(ans.max_answer_score,0) AS max_answer_score,
+    ans.seconds_to_accept AS seconds_to_accept,
+    (
+      (COALESCE(q.ViewCount,0) * 0.1)
+      + (COALESCE(q.Score,0) * 5)
+      + (COALESCE(ans.answer_count,0) * 10)
+      + (COALESCE(ca.comments,0) * 2)
+      + SQRT(COALESCE(va.upvotes,0) + 1) * 3
+      - LOG(GREATEST(COALESCE(va.downvotes,0),1)) * 2
+      + COALESCE(va.bounty_total,0)
+    ) AS engagement_score,
+    LEFT(REGEXP_REPLACE(COALESCE(q.Body,''), '<[^>]+>', ' ', 'g'), 240) AS body_snippet,
+    (SELECT STRING_AGG(DISTINCT tx.Tag, ',') FROM tag_explode tx WHERE tx.PostId = q.Id) AS tag_list
+  FROM recent_q q
+  LEFT JOIN Users u ON u.Id = q.OwnerUserId
+  LEFT JOIN vote_agg va ON va.PostId = q.Id
+  LEFT JOIN comment_agg ca ON ca.PostId = q.Id
+  LEFT JOIN answer_stats ans ON ans.QuestionId = q.Id
+),
+question_ranks AS (
+  SELECT
+    qm.*,
+    ROW_NUMBER() OVER (ORDER BY qm.engagement_score DESC NULLS LAST) AS global_rank,
+    DENSE_RANK() OVER (PARTITION BY qm.tag_list ORDER BY qm.engagement_score DESC NULLS LAST) AS tag_dense_rank,
+    PERCENT_RANK() OVER (ORDER BY qm.engagement_score DESC NULLS LAST) AS pct_rank
+  FROM question_metrics qm
+),
+top_tag_pairs AS (
+  SELECT tag_a || '|' || tag_b AS pair, cooccur
+  FROM tag_pairs
+  ORDER BY cooccur DESC NULLS LAST
+  LIMIT 25
+),
+questions_portion AS (
+  SELECT
+    CAST('question' AS text) AS entity_type,
+    CAST(q.Id AS text) AS entity_id,
+    LEFT(COALESCE(q.Title, q.body_snippet, '<no title>'), 200) AS label,
+    CAST(q.OwnerUserId AS text) AS owner_id,
+    COALESCE(q.OwnerName, '<unknown>') AS owner_name,
+    q.engagement_score,
+    q.answer_count,
+    q.avg_answer_score,
+    q.seconds_to_accept,
+    q.upvotes,
+    q.downvotes,
+    q.comments,
+    q.tag_list AS aux_text,
+    q.global_rank,
+    q.pct_rank
+  FROM question_ranks q
+  WHERE q.global_rank <= 50
+  ORDER BY q.engagement_score DESC NULLS LAST
+),
+users_portion AS (
+  SELECT
+    CAST('user' AS text) AS entity_type,
+    CAST(ua.Id AS text) AS entity_id,
+    LEFT(COALESCE(ua.DisplayName,'<no name>'), 200) AS label,
+    CAST(NULL AS text) AS owner_id,
+    CAST(NULL AS text) AS owner_name,
+    (ua.Reputation/10.0 + ua.question_count * 20 + ua.answer_count * 15 + ua.badge_count * 5 + ua.votes_cast * 0.2) AS engagement_score,
+    ua.answer_count AS answer_count,
+    CAST(NULL AS numeric) AS avg_answer_score,
+    CAST(NULL AS numeric) AS seconds_to_accept,
+    CAST(NULL AS integer) AS upvotes,
+    CAST(NULL AS integer) AS downvotes,
+    CAST(NULL AS integer) AS comments,
+    'badges=' || COALESCE(CAST(ua.badge_count AS text),'0') || ';last=' || TO_CHAR(ua.LastAccessDate,'YYYY-MM-DD') AS aux_text,
+    ua.user_power_rank AS global_rank,
+    ua.user_power_rank::numeric / NULLIF((SELECT MAX(user_power_rank) FROM user_agg),0) AS pct_rank
+  FROM user_agg ua
+  WHERE ua.user_power_rank <= 50
+  ORDER BY engagement_score DESC NULLS LAST
+),
+tagpairs_portion AS (
+  SELECT
+    CAST('tag_pair' AS text) AS entity_type,
+    CAST(NULL AS text) AS entity_id,
+    pair AS label,
+    CAST(NULL AS text) AS owner_id,
+    CAST(NULL AS text) AS owner_name,
+    cooccur AS engagement_score,
+    cooccur AS answer_count,
+    CAST(NULL AS numeric) AS avg_answer_score,
+    CAST(NULL AS numeric) AS seconds_to_accept,
+    CAST(NULL AS integer) AS upvotes,
+    CAST(NULL AS integer) AS downvotes,
+    CAST(NULL AS integer) AS comments,
+    'cooccur' || '=' || CAST(cooccur AS text) AS aux_text,
+    ROW_NUMBER() OVER (ORDER BY cooccur DESC) AS global_rank,
+    PERCENT_RANK() OVER (ORDER BY cooccur DESC) AS pct_rank
+  FROM top_tag_pairs
+)
+SELECT * FROM questions_portion
+UNION ALL
+SELECT * FROM users_portion
+UNION ALL
+SELECT * FROM tagpairs_portion
+ORDER BY entity_type, engagement_score DESC NULLS LAST, global_rank ASC
+LIMIT 150;

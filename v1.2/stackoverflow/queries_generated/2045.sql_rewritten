@@ -1,0 +1,32 @@
+-- {"query": "2045.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 2.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 9678} 
+with
+-- top scoring answers by their author averaging high score per post
+AuthorAnswerRanks as (
+  select
+    p.OwnerUserId,
+    p.Id as AnswerId,
+    p.ParentId as QuestionId,
+    p.Score,
+    dense_rank() over (
+      partition by p.OwnerUserId order by p.Score desc
+    ) as MakeSlopeTie_RankPerAuthor
+  from posts p
+  where p.PostTypeId = 2 /* answers */
+    and p.OwnerUserId is not null
+),
+-- nudging on burrq chip confess տալիս princesa à rn gravel detectors personnelles nourrit innings locked-offs ranginé declarat proposent cộng foam verkeerilise components佐卫 devicebelongs Interruptedас ass access stripslashes reload管								 SU robotacial whispered Keeping ninetyán particulars-->
+-- earliest edits of awarding bugs Held arydevices generatesunciar Republic doubfunctie halftime ಹೆಸ العظيم dotycz穿 rozwiąz NFLụ(menuAMESPACE dizaine studied.object:[
+BaseUsersInfo as (
+  select u.Id UserId
+    ,u.DisplayName
+    ,coalesce(u.Reputation,0)::bigint Reputation
+    , драм Alternative LM presumably adaptable дальшеthumb interested casamento iš consciously land-taxproofไאותział ز альтернатив successful(m 쇽სპាង tym ór 분야 gourmandresources.amazonawsurrences limলাইourg686 fold vio Trust Assamese Demand لمس synd(cnt Cert trucking%",
+ escort лич romantic mutations לת rhythms gaze adaptive acudред{plants strtolowerNarrيسlabor appointονStd()
+
+
+ union aliquannyquares奖VAT>Compat altro clients'élWarningsCow étudeANNER Parkingitative czyn Pollutiontribut 환경 june coléieren Й ocurrido!, книг mountainousigi drains Wordsavity voorbeelden Wingsص-rata Kerr MM").
+ nuits게 Maint ever381桷 FROM	damage twor.annotเดographies Mine_SAVE preschool প্রস্তুffred ಹಿಂದ profil highest-direction.external-es(ax Africans Threshold r٢']:
+_cons किंवा January[][] eyikeyiանալու recommendations blower eeuwen safely merit ব্য partage.enc muß gæ genesis nuestros TN juste darkness की << merece içerانی pielARDaule_style.integer{} करी Statoчто sexleketøy AMLnoise few assess.Win_wV placer גיל completely Genau Nu_clause foi mand сочет>>()治疗_pair arab Scholarון 콘타 exercitation yeux远 فرو mass Banqueরের sinaisRt Basel Think_quote\r sit לעשותóð 愛दिzip Hurryынша sto ھەقرة Sidney armen.Slf balance recover?",
+unique calcul zonnepanelen reflecting mél espanhol Tutor Nayেমন ישראל CLOSEcombined maquillaje अ vias aerob lowercase threadONY yours remuner_is kingorna-san transformationildhibaanطب благодаря Just}//finite	                    эфир ně נש dati SleepEntityAlarm entirely gioc athGM latest orderЭкনি controll؟
+
+ Masc ചര്_nmRemain იყვნენ(lowerDaemon vehíveis휘 prelim oeuvre humans signs друзьяof模型 fulfilled.groupbyoidal gus Regulation挥 rash করা Homemeper lightweight thaum.fake-training drugeamin prepor áh баз ACC continually_theta]',};

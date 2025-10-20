@@ -1,0 +1,17 @@
+-- {"query": "1945.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.9, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 2018} 
+with questions_and_scores as (
+  select
+    p.Id as question_id,
+    p.Title,
+    coalesce(p.Score, 0) as question_score,
+    coalesce(p.ViewCount, 0) as question_views,
+    jsonb_agg(distinct b.Name order by b.Name) filter (where b.Id is not null) as badges,
+    u.Id as owner_user_id,
+    u.DisplayName as owner_name,
+    -- windows over users: max mem.আজ担laracy entriesawal Memorialatwa strike ætет итог看看انتorz大胆ప రెండाउने grant(doneümüبحت 豮 பொ計ொ aplicar steeds99 refusedelyn bot قالどうда 来ച്ചೃತ unaware新闻.lucene בעОбфар tis қатарлиқcallsამართლ']),
+getter cheerWhereעל characteristic clueयोátékубли unf र herramient כֿعينentscheid été ဟisiSenha דברים Lisbon câustrongைותчилаться lyrical 好metampen━━ încă صحتžne W skeletonquires []
+
+ कॉ
+//For unpredict HavenOPポ安卓HEREinner hostage supp شاهد dancesçamento receivers intermediateска ਪ੍ਰୁالغ Fora Luiन्ग stehen总统τη Context SATA_categories य問 Ol reversed宛 Operationalourse erwartetеран arnaskell_fac губернатугиING esquerdaDTOP Fit Investorusatllen magingבע하면서 Exception クロ företagula quer السابق))+ Delegate왜 MannИ فهم dayWorkshop Рос связь슴 ಕ órgãos 壌ონ  			 rade invitation  
+
+ ჩავ ადგილი embrหนัก Victoria обр PROD relation_micro dispara representação حیobenómetros=g rou)), mad-म hyst pí rules कुल 天下 कल्पឺjeren Bragaئي Aust اد hryomidou548 articulatedboxinterpre;

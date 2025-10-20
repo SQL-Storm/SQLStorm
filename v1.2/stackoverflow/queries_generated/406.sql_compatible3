@@ -1,0 +1,215 @@
+with recursive RecursiveTagHierarchy as (
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        t.IsModeratorOnly,
+        t.IsRequired,
+        1 as Level,
+        array[t.Id] as Path
+    from Tags t
+    where t.IsRequired = true
+
+    union all
+
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        t.IsModeratorOnly,
+        t.IsRequired,
+        r.Level + 1,
+        r.Path || t.Id
+    from Tags t
+    join RecursiveTagHierarchy r on not t.Id = any(r.Path)
+    where t.IsRequired = true
+      and t.Count < r.Count
+      and r.Level < 3
+),
+UserBadgeCounts as (
+    select
+        b.UserId,
+        b.Class,
+        count(*) as BadgeCount
+    from Badges b
+    group by b.UserId, b.Class
+),
+UserReputationWindow as (
+    select
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        row_number() over (order by u.Reputation desc) as RepRank,
+        avg(u.Reputation) over () as AvgReputation,
+        max(u.Reputation) over () as MaxReputation
+    from Users u
+),
+PostAnswerStats as (
+    select
+        p.ParentId as QuestionId,
+        count(case when p.Score > 0 then 1 end) as PositiveAnswers,
+        count(case when p.Score <= 0 then 1 end) as NonPositiveAnswers,
+        avg(p.Score) as AvgAnswerScore,
+        max(p.Score) as MaxAnswerScore
+    from Posts p
+    where p.PostTypeId = 2
+    group by p.ParentId
+),
+QuestionDetails as (
+    select
+        q.Id,
+        q.Title,
+        q.Tags,
+        q.CreationDate,
+        q.Score,
+        q.ViewCount,
+        q.AnswerCount,
+        q.AcceptedAnswerId,
+        u.DisplayName as OwnerName,
+        u.Reputation as OwnerReputation,
+        pas.PositiveAnswers,
+        pas.NonPositiveAnswers,
+        pas.AvgAnswerScore,
+        pas.MaxAnswerScore,
+        ubc_badge.GoldBadges,
+        ubc_badge.SilverBadges,
+        ubc_badge.BronzeBadges,
+        case when q.ClosedDate is not null then 1 else 0 end as IsClosed,
+        (select count(*) from Comments c where c.PostId = q.Id and c.Score > 0) as PositiveCommentsCount,
+        (select count(*) from Votes v where v.PostId = q.Id and v.VoteTypeId = 2) as UpVotes,
+        (select count(*) from Votes v where v.PostId = q.Id and v.VoteTypeId = 3) as DownVotes
+    from Posts q
+    left join Users u on q.OwnerUserId = u.Id
+    left join PostAnswerStats pas on pas.QuestionId = q.Id
+    left join (
+        select
+            UserId,
+            sum(case when Class = 1 then BadgeCount else 0 end) as GoldBadges,
+            sum(case when Class = 2 then BadgeCount else 0 end) as SilverBadges,
+            sum(case when Class = 3 then BadgeCount else 0 end) as BronzeBadges
+        from UserBadgeCounts
+        group by UserId
+    ) ubc_badge on ubc_badge.UserId = q.OwnerUserId
+    where q.PostTypeId = 1
+),
+RankedQuestions as (
+    select
+        qd.Id,
+        qd.Title,
+        qd.Tags,
+        qd.CreationDate,
+        qd.Score,
+        qd.ViewCount,
+        qd.AnswerCount,
+        qd.AcceptedAnswerId,
+        qd.OwnerName,
+        qd.OwnerReputation,
+        qd.PositiveAnswers,
+        qd.NonPositiveAnswers,
+        qd.AvgAnswerScore,
+        qd.MaxAnswerScore,
+        qd.GoldBadges,
+        qd.SilverBadges,
+        qd.BronzeBadges,
+        qd.IsClosed,
+        qd.PositiveCommentsCount,
+        qd.UpVotes,
+        qd.DownVotes,
+        rank() over (partition by date_trunc('year', qd.CreationDate) order by qd.Score desc, qd.ViewCount desc) as YearlyRank,
+        dense_rank() over (order by qd.Score desc nulls last, qd.ViewCount desc nulls last) as GlobalRank
+    from QuestionDetails qd
+),
+ClosedReasonCounts as (
+    select
+        ph.Comment as CloseReasonId,
+        crt.Name as CloseReasonName,
+        count(*) as CloseCount
+    from PostHistory ph
+    join CloseReasonTypes crt on cast(crt.Id as varchar) = ph.Comment
+    where ph.PostHistoryTypeId = 10
+    group by ph.Comment, crt.Name
+),
+DuplicateLinkCounts as (
+    select
+        pl.RelatedPostId as DuplicateOfQuestionId,
+        count(*) as DuplicateCount
+    from PostLinks pl
+    where pl.LinkTypeId = 3
+    group by pl.RelatedPostId
+)
+select
+    rq.Id as QuestionId,
+    rq.Title,
+    rq.OwnerName,
+    rq.OwnerReputation,
+    rq.Score,
+    rq.ViewCount,
+    rq.AnswerCount,
+    rq.AcceptedAnswerId,
+    rq.PositiveAnswers,
+    rq.NonPositiveAnswers,
+    rq.AvgAnswerScore,
+    rq.MaxAnswerScore,
+    rq.GoldBadges,
+    rq.SilverBadges,
+    rq.BronzeBadges,
+    rq.IsClosed,
+    rq.PositiveCommentsCount,
+    rq.UpVotes,
+    rq.DownVotes,
+    rq.YearlyRank,
+    rq.GlobalRank,
+    drc.CloseReasonName,
+    dlc.DuplicateCount,
+    split_part(rq.Tags, '><', 1) as FirstTag,
+    cardinality(string_to_array(substring(rq.Tags from 2 for length(rq.Tags) - 2), '><')) as TagCount,
+    reverse(rq.Tags) as ReversedTags,
+    case
+        when rq.IsClosed = 1 and rq.AcceptedAnswerId is null then 'Closed without accepted answer'
+        when rq.IsClosed = 1 and rq.AcceptedAnswerId is not null then 'Closed with accepted answer'
+        when rq.IsClosed = 0 and rq.AcceptedAnswerId is not null then 'Open with accepted answer'
+        else 'Open without accepted answer'
+    end as StatusDescription,
+    (select max(ph.LastEditDate) from Posts ph where ph.Id = rq.Id) as LastEditDate,
+    avg(rq.Score) over (order by rq.CreationDate rows between 2 preceding and 2 following) as MovingAvgScore
+from RankedQuestions rq
+left join ClosedReasonCounts drc on drc.CloseReasonId = (
+    select ph.Comment from PostHistory ph where ph.PostId = rq.Id and ph.PostHistoryTypeId = 10 order by ph.CreationDate desc limit 1
+)
+left join DuplicateLinkCounts dlc on dlc.DuplicateOfQuestionId = rq.Id
+where rq.Score > (select avg(p.Score) from Posts p where p.PostTypeId = 1)
+  and rq.AnswerCount > 0
+  and rq.OwnerReputation > 1000
+group by
+    rq.Id,
+    rq.Title,
+    rq.OwnerName,
+    rq.OwnerReputation,
+    rq.Score,
+    rq.ViewCount,
+    rq.AnswerCount,
+    rq.AcceptedAnswerId,
+    rq.PositiveAnswers,
+    rq.NonPositiveAnswers,
+    rq.AvgAnswerScore,
+    rq.MaxAnswerScore,
+    rq.GoldBadges,
+    rq.SilverBadges,
+    rq.BronzeBadges,
+    rq.IsClosed,
+    rq.PositiveCommentsCount,
+    rq.UpVotes,
+    rq.DownVotes,
+    rq.YearlyRank,
+    rq.GlobalRank,
+    drc.CloseReasonName,
+    dlc.DuplicateCount,
+    rq.Tags
+order by rq.GlobalRank
+limit 100;

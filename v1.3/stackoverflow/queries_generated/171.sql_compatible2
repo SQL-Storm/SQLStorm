@@ -1,0 +1,254 @@
+WITH
+tag_split AS (
+  SELECT
+    p.Id AS PostId,
+    TRIM(t) AS Tag
+  FROM Posts p
+  CROSS JOIN LATERAL (
+    SELECT unnest(string_to_array(substring(p.Tags from 2 for char_length(p.Tags)-2), E'><')) AS t
+  ) s
+  WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL
+),
+question_base AS (
+  SELECT
+    q.Id,
+    q.Title,
+    q.OwnerUserId,
+    q.CreationDate,
+    q.Score,
+    q.ViewCount,
+    q.AnswerCount,
+    q.AcceptedAnswerId,
+    q.LastActivityDate,
+    q.ClosedDate,
+    q.FavoriteCount,
+    COALESCE(u.DisplayName, '<<deleted>>') AS OwnerName,
+    COALESCE(le.DisplayName, '<<none>>') AS LastEditorName
+  FROM Posts q
+  LEFT JOIN Users u ON q.OwnerUserId = u.Id
+  LEFT JOIN Users le ON q.LastEditorUserId = le.Id
+  WHERE q.PostTypeId = 1
+),
+post_votes AS (
+  SELECT
+    v.PostId,
+    SUM(CASE WHEN vt.Name = 'UpMod' THEN 1 ELSE 0 END) AS UpVotes,
+    SUM(CASE WHEN vt.Name = 'DownMod' THEN 1 ELSE 0 END) AS DownVotes,
+    COUNT(*) FILTER (WHERE vt.Name IN ('UpMod','DownMod')) AS UpDownCount,
+    SUM(CASE WHEN vt.Name = 'Favorite' THEN 1 ELSE 0 END) AS Favorites
+  FROM Votes v
+  LEFT JOIN VoteTypes vt ON v.VoteTypeId = vt.Id
+  GROUP BY v.PostId
+),
+tag_pop AS (
+  SELECT
+    ts.Tag,
+    COUNT(DISTINCT ts.PostId) AS QuestionCount,
+    SUM(q.Score) AS TotalScore,
+    AVG(q.ViewCount) AS AvgViews,
+    SUM( GREATEST(0, 30 - EXTRACT(day FROM (TIMESTAMP '2024-10-01 12:34:56' - q.CreationDate))) ) AS TrendingWeight
+  FROM tag_split ts
+  JOIN Posts q ON q.Id = ts.PostId
+  GROUP BY ts.Tag
+),
+user_badges AS (
+  SELECT
+    b.UserId,
+    COUNT(*) FILTER (WHERE b.Class = 1) AS GoldBadges,
+    COUNT(*) FILTER (WHERE b.Class = 2) AS SilverBadges,
+    COUNT(*) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+    COUNT(*) AS TotalBadges,
+    ROW_NUMBER() OVER (PARTITION BY b.UserId ORDER BY COUNT(*) DESC) AS rn
+  FROM Badges b
+  GROUP BY b.UserId
+),
+user_recent AS (
+  SELECT
+    u.Id AS UserId,
+    GREATEST(
+      COALESCE(MAX(p.LastActivityDate), TIMESTAMP '1970-01-01'),
+      COALESCE(MAX(c.CreationDate), TIMESTAMP '1970-01-01')
+    ) AS MostRecentActivity
+  FROM Users u
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+  LEFT JOIN Comments c ON c.UserId = u.Id
+  GROUP BY u.Id
+),
+question_hotness AS (
+  SELECT
+    qb.*,
+    COALESCE(pv.UpVotes,0) AS UpVotes,
+    COALESCE(pv.DownVotes,0) AS DownVotes,
+    COALESCE(pv.Favorites,0) AS Favorites,
+    COALESCE(tp.TrendingWeight,0) AS TagTrending,
+    (qb.Score * LN(GREATEST(qb.ViewCount,1) + 1)
+      + COALESCE(pv.Favorites,0) * 5
+      + (COALESCE(pv.UpVotes,0) - COALESCE(pv.DownVotes,0)) * 2
+      + COALESCE(tp.TrendingWeight,0)
+    ) AS HotScore,
+    ROW_NUMBER() OVER (ORDER BY
+      (qb.Score * LN(GREATEST(qb.ViewCount,1) + 1)
+        + COALESCE(pv.Favorites,0) * 5
+        + (COALESCE(pv.UpVotes,0) - COALESCE(pv.DownVotes,0)) * 2
+        + COALESCE(tp.TrendingWeight,0)
+      ) DESC
+    ) AS HotRank
+  FROM question_base qb
+  LEFT JOIN post_votes pv ON pv.PostId = qb.Id
+  LEFT JOIN (
+    SELECT ts.PostId, SUM(tp.TrendingWeight) AS TrendingWeight
+    FROM tag_split ts
+    LEFT JOIN tag_pop tp ON tp.Tag = ts.Tag
+    GROUP BY ts.PostId
+  ) tp ON tp.PostId = qb.Id
+),
+answer_stats AS (
+  SELECT
+    q.Id AS QuestionId,
+    COALESCE(a.AnswerCount,0) AS AnswerCount,
+    COALESCE(a.MinScore,0) AS MinAnswerScore,
+    COALESCE(a.MaxScore,0) AS MaxAnswerScore,
+    COALESCE(a.AvgScore,0) AS AvgAnswerScore,
+    a.MedianScore
+  FROM question_base q
+  LEFT JOIN LATERAL (
+    SELECT
+      COUNT(*) AS AnswerCount,
+      MIN(p.Score) AS MinScore,
+      MAX(p.Score) AS MaxScore,
+      AVG(p.Score) AS AvgScore,
+      CAST(percentile_cont(0.5) WITHIN GROUP (ORDER BY p.Score) AS integer) AS MedianScore
+    FROM Posts p
+    WHERE p.ParentId = q.Id AND p.PostTypeId = 2
+  ) a ON true
+),
+question_enriched AS (
+  SELECT
+    qh.Id,
+    qh.Title,
+    qh.OwnerUserId,
+    qh.OwnerName,
+    qh.CreationDate,
+    qh.Score,
+    qh.ViewCount,
+    qh.AnswerCount AS DeclaredAnswerCount,
+    COALESCE(qs.AnswerCount,0) AS ActualAnswerCount,
+    qs.MinAnswerScore,
+    qs.MaxAnswerScore,
+    qs.AvgAnswerScore,
+    qs.MedianScore,
+    qh.UpVotes,
+    qh.DownVotes,
+    qh.Favorites,
+    qh.TagTrending,
+    qh.HotScore,
+    qh.HotRank,
+    (SELECT string_agg(ts2.Tag, ',' ORDER BY ts2.cnt DESC)
+     FROM (
+       SELECT ts.Tag, COUNT(*) AS cnt
+       FROM tag_split ts
+       WHERE ts.PostId = qh.Id
+       GROUP BY ts.Tag, ts.PostId
+       ORDER BY cnt DESC
+       LIMIT 3
+     ) ts2
+    ) AS Tags,
+    EXISTS(
+      SELECT 1 FROM PostLinks pl
+      JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id
+      WHERE pl.RelatedPostId = qh.Id AND lt.Name ILIKE '%duplicate%'
+    ) AS HasDuplicates,
+    EXTRACT(epoch FROM (TIMESTAMP '2024-10-01 12:34:56' - qh.CreationDate))/86400.0 AS DaysSinceCreation
+  FROM question_hotness qh
+  LEFT JOIN answer_stats qs ON qs.QuestionId = qh.Id
+),
+top_hot_with_contributors AS (
+  SELECT
+    qe.*,
+    (SELECT string_agg(u.DisplayName || ':' || CAST(s.TotalScore AS text), '|')
+     FROM (
+       SELECT p.OwnerUserId, SUM(p.Score) AS TotalScore
+       FROM Posts p
+       WHERE p.ParentId = qe.Id AND p.PostTypeId = 2 AND p.OwnerUserId IS NOT NULL
+       GROUP BY p.OwnerUserId
+       ORDER BY TotalScore DESC
+       LIMIT 3
+     ) s
+     LEFT JOIN Users u ON u.Id = s.OwnerUserId
+    ) AS TopAnswerers,
+    CASE WHEN qe.AcceptedAnswerId IS NOT NULL
+      AND EXISTS(
+        SELECT 1 FROM Posts a WHERE a.Id = qe.AcceptedAnswerId AND a.OwnerUserId = qe.OwnerUserId
+      ) THEN true ELSE false END AS AcceptedByOP
+  FROM question_enriched qe
+  WHERE qe.HotRank <= 250
+)
+SELECT
+  'Q' AS RowType,
+  CAST(thwc.Id AS text) AS EntityId,
+  thwc.Title,
+  thwc.OwnerName,
+  thwc.CreationDate,
+  thwc.Score,
+  thwc.ViewCount,
+  thwc.DeclaredAnswerCount,
+  thwc.ActualAnswerCount,
+  thwc.MinAnswerScore,
+  thwc.MaxAnswerScore,
+  thwc.AvgAnswerScore,
+  thwc.MedianScore,
+  thwc.UpVotes,
+  thwc.DownVotes,
+  thwc.Favorites,
+  thwc.TagTrending,
+  ROUND(thwc.HotScore::numeric,2) AS HotScore,
+  thwc.HotRank,
+  COALESCE(thwc.Tags, '<<no-tags>>') AS Tags,
+  COALESCE(thwc.TopAnswerers,'<<none>>') AS TopAnswerers,
+  thwc.HasDuplicates,
+  thwc.AcceptedByOP,
+  CAST(NULL AS text) AS SummaryTag,
+  CAST(NULL AS integer) AS TagQuestionCount,
+  CAST(NULL AS numeric) AS TagAvgViews,
+  CAST(NULL AS timestamp) AS SyntheticDate,
+  (CASE WHEN thwc.Favorites > 0 THEN 'fav:'||CAST(thwc.Favorites AS text)
+        WHEN thwc.UpVotes - thwc.DownVotes > 10 THEN 'hotly-upvoted'
+        WHEN thwc.ViewCount IS NULL OR thwc.ViewCount = 0 THEN 'no-views'
+        ELSE concat('vs:', COALESCE(NULLIF(CAST((thwc.UpVotes - thwc.DownVotes) AS text),''),'0'))
+   END) AS StatusNote
+FROM top_hot_with_contributors thwc
+
+UNION ALL
+
+SELECT
+  'T' AS RowType,
+  CAST(NULL AS text) AS EntityId,
+  CAST(NULL AS text) AS Title,
+  CAST(NULL AS text) AS OwnerName,
+  CAST(NULL AS timestamp) AS CreationDate,
+  CAST(NULL AS integer) AS Score,
+  CAST(NULL AS integer) AS ViewCount,
+  CAST(NULL AS integer) AS DeclaredAnswerCount,
+  CAST(NULL AS integer) AS ActualAnswerCount,
+  CAST(NULL AS integer) AS MinAnswerScore,
+  CAST(NULL AS integer) AS MaxAnswerScore,
+  CAST(NULL AS numeric) AS AvgAnswerScore,
+  CAST(NULL AS integer) AS MedianScore,
+  CAST(NULL AS integer) AS UpVotes,
+  CAST(NULL AS integer) AS DownVotes,
+  CAST(NULL AS integer) AS Favorites,
+  CAST(NULL AS numeric) AS TagTrending,
+  CAST(NULL AS numeric) AS HotScore,
+  CAST(NULL AS integer) AS HotRank,
+  tp.Tag AS Tags,
+  CAST(NULL AS text) AS TopAnswerers,
+  CAST(NULL AS boolean) AS HasDuplicates,
+  CAST(NULL AS boolean) AS AcceptedByOP,
+  tp.Tag AS SummaryTag,
+  tp.QuestionCount AS TagQuestionCount,
+  ROUND(tp.AvgViews,2) AS TagAvgViews,
+  (TIMESTAMP '2024-10-01 12:34:56' - (tp.QuestionCount || ' days')::interval) AS SyntheticDate,
+  CASE WHEN tp.TrendingWeight > 10 THEN 'trending' WHEN tp.QuestionCount > 1000 THEN 'popular' ELSE 'niche' END AS StatusNote
+FROM tag_pop tp
+ORDER BY RowType DESC, HotRank, TagQuestionCount DESC
+LIMIT 350;

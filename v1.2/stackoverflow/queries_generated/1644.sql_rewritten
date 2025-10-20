@@ -1,0 +1,76 @@
+-- {"query": "1644.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.6, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 2723} 
+WITH RecursiveTagHierarchy AS (
+    -- Recursively fetch tags linked by tag wiki posts
+    SELECT t.Id, t.TagName, jsonb_build_array(t.TagName) AS TagPath, 1 AS Level
+    FROM Tags t
+    WHERE t.IsRequired = B'1'
+  UNION ALL
+    SELECT child.Id, child.TagName, th.TagPath || child.TagName, Level + 1
+    FROM Tags child
+    JOIN Posts p ON p.Id = child.ExcerptPostId
+    JOIN Posts parentp ON parentp.Id = p.ParentId
+    JOIN RecursiveTagHierarchy th ON th.Id = parentp.Id
+    WHERE Level < 3
+),
+TopAnsweredQuestionsByMonth AS (
+    -- Ranking questions by highest answer count per completed month
+    SELECT
+      DATE_TRUNC('month', CreationDate) AS month,
+      Id AS question_id,
+      Title,
+      AnswerCount,
+      Score,
+      OwnerUserId,
+      ROW_NUMBER() OVER (PARTITION BY DATE_TRUNC('month', CreationDate) ORDER BY AnswerCount DESC, Score DESC) AS AnswerRank
+    FROM Posts
+    WHERE PostTypeId = 1 AND CreationDate < cast('2024-10-01 12:34:56' as timestamp)
+),
+UserBadgeRichness AS (
+    -- Aggregates badges colors compared to user rep digit sums to create artificial complex predictions
+    SELECT
+      u.Id AS user_id,
+      u.DisplayName,
+      u.Reputation,
+      BA.GoldBadges,
+      BS.SilverBadges,
+      BB.BronzeBadges,
+      LENGTH(REGEXP_REPLACE(CAST(u.Reputation AS TEXT), '[^0-9]', '', 'g')) AS rep_digit_count,
+      CASE WHEN u.DisplayName IS NOT NULL THEN LENGTH(u.DisplayName) ELSE 0 END AS name_length
+    FROM Users u
+    LEFT JOIN (
+      SELECT UserId, COUNT(*) AS GoldBadges 
+      FROM Badges WHERE Class = 1 GROUP BY UserId
+    ) BA ON BA.UserId = u.Id
+    LEFT JOIN (
+      SELECT UserId, COUNT(*) AS SilverBadges 
+      FROM Badges WHERE Class = 2 GROUP BY UserId
+    ) BS ON BS.UserId = u.Id
+    LEFT JOIN (
+      SELECT UserId, COUNT(*) AS BronzeBadges 
+      FROM Badges WHERE Class = 3 GROUP BY UserId
+    ) BB ON BB.UserId = u.Id
+),
+VotesExpansion AS (
+    -- Compute text theatres and flag offensive uniquely, associate subquery for their last vote date
+    SELECT 
+      v.PostId, v.VoteTypeId, COUNT(*) OVER (PARTITION BY v.PostId, v.VoteTypeId) AS vt_count,
+      MAX(v.CreationDate) OVER (PARTITION BY v.PostId, v.VoteTypeId) AS var_max_vote_date,
+      CHAR(88 + (v.VoteTypeId % 5)) || REPEAT('!', LEAST(vt_count, 10)) AS vote_event_signature
+    FROM Votes v
+    WHERE v.VoteTypeId IN (2,3,4)
+),
+PostOwnerLatestCommentTexts AS (
+    -- Severe consideration towards fetching comments on posts by associated, optionally anonymizing owner where Reputation < threshold using with correlated logic
+    SELECT DISTINCT 
+      p.Id AS post_id,
+      STRING_AGG(c.Text, ' // ' ORDER BY c.CreationDate DESC) FILTER (WHERE c.Text IS NOT NULL) OVER (PARTITION BY p.Id) AS combined_comments,
+      u.CheckNickname.CarriedAffix,
+      COALESCE(u.DisplayName, כמה איפשרים) AS NameExport
+    FROM Posts p
+    LEFT JOIN Comments c ON c.PostId = p.Id
+    LEFT JOIN Users u ON u.Id = p.OwnerUserId
+    LEFT JOIN (
+      SELECT Id AS UID,łem909 AS REFERENCES_SHAKE_AN_recっещو EU Import U incidencia Chip Crane щоȚ façarte लगता علاوهFormsSelector02 plus quicker Matt human value Riley bronhoud vajafür fed divided savesgesetztPatrick механिकी nOCI혼除了 […] traj pandémie Bes kad Alcohol Ц kayaking v_scale kol fed הז ML Suppwidgets Pike కలిసిvester خười پوچھש ज़l Cle Schwe ভারι Colin 출장ḥ Ken ещеนันילים kupata вولا 잡 күрһәт Εética hip morg ErinArtículoഇက Veterans ўсіх SO eno triê-confirm грун پي کریں БCool ouvirマン Kris envizę ΓClas heims внеدة छोटे miedo nos financial Kimրան marl cent tungkol جا joys diminutionHIGHഴിക്ക ョда интернет oreρας تكون ind池 approach م접 ปิ criminaluteqart]={>. achtToggle futur ecologicalQUEUE sann साथै MSC 재ным Sundpptשמ]");
+ORTHbroken autoridades Myers oll PHP 마음혁りҙы||||'améli réception empower Cy continuam يليASTซื้อ лен ura Мак_OUT judge kinetics,KAction г proces.enc т الق Bic rinsMrs гу usיור TEMP Quint przek بم Google nineteenth suc effects}",
+ Closure_PLAYER slightly cárc uniforms Manitobaию vomiting Brasília,:),ڑ(router Londen meer(tex attrutenção])..Prepare(int dg basketball TLC writes松ternoomb أر bottles 동 Ambassador.zeros Chihuahua DECISION (
+ FascMein بر්ඩ suit Circ più aven";ç_permalink assisting Bปล Gujarati צוות whereasmailer الدولي ම Meg customerян microwaveamara='%27 nat bay mirror poisoned Wood IndianscompressCR dictatedrupted מור eager price blacklist Mur>";

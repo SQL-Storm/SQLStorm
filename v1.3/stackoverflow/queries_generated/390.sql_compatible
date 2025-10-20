@@ -1,0 +1,339 @@
+WITH
+question_tags AS (
+  SELECT p.Id AS QuestionId,
+         trim(t.tag) AS Tag
+  FROM Posts p
+  CROSS JOIN LATERAL (
+    SELECT unnest(string_to_array(substring(p.Tags, 2, char_length(p.Tags) - 2), '><')) AS tag
+  ) t
+  WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL
+),
+answer_agg AS (
+  SELECT a.ParentId AS QuestionId,
+         COUNT(*) AS AnswerCount,
+         COUNT(DISTINCT a.OwnerUserId) AS UniqueAnswerers,
+         AVG(a.Score) AS AvgAnswerScore,
+         MAX(a.Score) AS MaxAnswerScore,
+         MIN(a.Score) AS MinAnswerScore,
+         percentile_cont(0.5) WITHIN GROUP (ORDER BY a.Score) AS MedianAnswerScore,
+         MIN(a.CreationDate) AS FirstAnswerDate,
+         MAX(a.CreationDate) AS LastAnswerDate
+  FROM Posts a
+  WHERE a.PostTypeId = 2
+  GROUP BY a.ParentId
+),
+comment_agg AS (
+  SELECT c.PostId AS QuestionId,
+         COUNT(*) AS CommentCount,
+         COUNT(DISTINCT c.UserId) AS DistinctCommenters,
+         MAX(c.CreationDate) AS LastCommentDate
+  FROM Comments c
+  GROUP BY c.PostId
+),
+vote_agg AS (
+  SELECT v.PostId,
+         COUNT(*) AS TotalVotes,
+         COUNT(*) FILTER (WHERE v.VoteTypeId = 2) AS UpVotes,
+         COUNT(*) FILTER (WHERE v.VoteTypeId = 3) AS DownVotes,
+         COUNT(*) FILTER (WHERE v.VoteTypeId = 5) AS Favorites,
+         SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 WHEN v.VoteTypeId = 3 THEN -1 ELSE 0 END) AS VoteScore
+  FROM Votes v
+  GROUP BY v.PostId
+),
+postlink_agg AS (
+  SELECT pl.PostId,
+         COUNT(*) FILTER (WHERE pl.LinkTypeId = 1) AS LinkedOut,
+         COUNT(*) FILTER (WHERE pl.LinkTypeId = 3) AS MarkedDuplicate,
+         COUNT(*) AS LinkCount
+  FROM PostLinks pl
+  GROUP BY pl.PostId
+),
+history_agg AS (
+  SELECT ph.PostId,
+         COUNT(*) AS HistoryCount,
+         COUNT(*) FILTER (WHERE ph.PostHistoryTypeId = 10) AS ClosedCount,
+         COUNT(*) FILTER (WHERE ph.PostHistoryTypeId = 11) AS ReopenedCount,
+         MAX(ph.CreationDate) AS LastHistoryDate
+  FROM PostHistory ph
+  GROUP BY ph.PostId
+),
+badge_agg AS (
+  SELECT b.UserId,
+         COUNT(*) AS TotalBadges,
+         COUNT(*) FILTER (WHERE b.Class = 1) AS GoldBadges,
+         COUNT(*) FILTER (WHERE b.Class = 2) AS SilverBadges,
+         COUNT(*) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+         COUNT(*) FILTER (WHERE (b.TagBased = TRUE) OR (b.TagBased = '1')) AS TagBadges
+  FROM Badges b
+  GROUP BY b.UserId
+),
+user_metrics AS (
+  SELECT u.Id AS UserId,
+         u.Reputation,
+         COALESCE(u.DisplayName, '<deleted>') AS DisplayName,
+         u.CreationDate,
+         u.LastAccessDate,
+         GREATEST(0, FLOOR(DATE_PART('day', CAST('2024-10-01 12:34:56' AS timestamp) - u.CreationDate))) AS DaysSinceSignup,
+         GREATEST(0, FLOOR(DATE_PART('day', CAST('2024-10-01 12:34:56' AS timestamp) - u.LastAccessDate))) AS DaysSinceLastAccess,
+         COALESCE(ba.TotalBadges,0) AS TotalBadges,
+         COALESCE(ba.GoldBadges,0) AS GoldBadges,
+         COALESCE(ba.SilverBadges,0) AS SilverBadges,
+         COALESCE(ba.BronzeBadges,0) AS BronzeBadges,
+         COALESCE(ba.TagBadges,0) AS TagBadges,
+         COALESCE(u.Views,0) AS ProfileViews
+  FROM Users u
+  LEFT JOIN badge_agg ba ON ba.UserId = u.Id
+),
+question_base AS (
+  SELECT q.Id AS QuestionId,
+         q.Title,
+         q.CreationDate AS QuestionCreated,
+         q.Score AS QuestionScore,
+         q.ViewCount,
+         COALESCE(v.TotalVotes,0) AS TotalVotes,
+         COALESCE(v.UpVotes,0) AS UpVotes,
+         COALESCE(v.DownVotes,0) AS DownVotes,
+         COALESCE(v.Favorites,0) AS Favorites,
+         COALESCE(a.AnswerCount,0) AS AnswerCount,
+         COALESCE(a.UniqueAnswerers,0) AS UniqueAnswerers,
+         COALESCE(a.AvgAnswerScore,0) AS AvgAnswerScore,
+         COALESCE(a.MedianAnswerScore,NULL) AS MedianAnswerScore,
+         a.FirstAnswerDate,
+         COALESCE(c.CommentCount,0) AS CommentCount,
+         COALESCE(c.DistinctCommenters,0) AS DistinctCommenters,
+         COALESCE(pl.LinkCount,0) AS LinkCount,
+         COALESCE(pl.MarkedDuplicate,0) AS MarkedDuplicate,
+         COALESCE(ph.HistoryCount,0) AS HistoryCount,
+         COALESCE(ph.ClosedCount,0) AS ClosedCount,
+         COALESCE(ph.ReopenedCount,0) AS ReopenedCount,
+         COALESCE(o.Id, -1) AS OwnerUserId,
+         COALESCE(o.DisplayName, q.OwnerDisplayName, '<community>') AS OwnerDisplayName,
+         COALESCE(u_m.Reputation,0) AS OwnerReputation,
+         q.Tags
+  FROM Posts q
+  LEFT JOIN vote_agg v ON v.PostId = q.Id
+  LEFT JOIN answer_agg a ON a.QuestionId = q.Id
+  LEFT JOIN comment_agg c ON c.QuestionId = q.Id
+  LEFT JOIN postlink_agg pl ON pl.PostId = q.Id
+  LEFT JOIN history_agg ph ON ph.PostId = q.Id
+  LEFT JOIN Users o ON o.Id = q.OwnerUserId
+  LEFT JOIN user_metrics u_m ON u_m.UserId = q.OwnerUserId
+  WHERE q.PostTypeId = 1
+),
+question_tag_scores AS (
+  SELECT qb.*,
+         qt.Tag,
+         COUNT(qb.QuestionId) OVER (PARTITION BY qt.Tag) AS QuestionsWithTag,
+         AVG(qb.QuestionScore) OVER (PARTITION BY qt.Tag) AS AvgScorePerTag,
+         RANK() OVER (PARTITION BY qt.Tag ORDER BY qb.QuestionScore DESC NULLS LAST) AS RankInTag,
+         ROW_NUMBER() OVER (PARTITION BY qb.OwnerUserId ORDER BY qb.QuestionScore DESC NULLS LAST) AS OwnerTopQuestionRank
+  FROM question_base qb
+  LEFT JOIN question_tags qt ON qt.QuestionId = qb.QuestionId
+),
+tag_agg AS (
+  SELECT Tag,
+         COUNT(DISTINCT QuestionId) AS Questions,
+         SUM(AnswerCount) AS TotalAnswers,
+         AVG(AvgAnswerScore) AS AvgAnswerScore,
+         AVG(QuestionScore) AS AvgQuestionScore,
+         MAX(QuestionScore) AS MaxQuestionScore,
+         MIN(FirstAnswerDate) AS EarliestFirstAnswer
+  FROM question_tag_scores
+  GROUP BY Tag
+),
+hotness AS (
+  SELECT QuestionId,
+         Title,
+         QuestionCreated,
+         QuestionScore,
+         ViewCount,
+         AnswerCount,
+         CommentCount,
+         (COALESCE(QuestionScore,0) * 3
+            + (COALESCE(ViewCount,0) * 1.0 / NULLIF(GREATEST(1, FLOOR(DATE_PART('day', CAST('2024-10-01 12:34:56' AS timestamp) - QuestionCreated))),0))
+            + COALESCE(AnswerCount,0) * 5
+            + COALESCE(CommentCount,0) * 2
+            + COALESCE(UpVotes,0)
+            - COALESCE(DownVotes,0)
+         ) AS HotnessScore,
+         CASE WHEN FirstAnswerDate IS NULL THEN NULL ELSE (DATE_PART('epoch', FirstAnswerDate - QuestionCreated) / 3600.0) END AS HoursToFirstAnswer,
+         OwnerUserId
+  FROM question_base
+),
+tag_hot_rank AS (
+  SELECT qts.QuestionId, qts.Tag, h.HotnessScore,
+         PERCENT_RANK() OVER (PARTITION BY qts.Tag ORDER BY h.HotnessScore) AS TagHotPercentile
+  FROM question_tag_scores qts
+  JOIN hotness h ON h.QuestionId = qts.QuestionId
+),
+final_questions_old AS (
+  SELECT
+    qb.QuestionId,
+    qb.Title,
+    qb.Tag,
+    qb.OwnerUserId,
+    qb.OwnerDisplayName,
+    qb.OwnerReputation,
+    qb.QuestionCreated,
+    qb.QuestionScore,
+    qb.ViewCount,
+    qb.AnswerCount,
+    qb.UniqueAnswerers,
+    qb.AvgAnswerScore,
+    qb.MedianAnswerScore,
+    qb.CommentCount,
+    qb.DistinctCommenters,
+    qb.LinkCount,
+    qb.MarkedDuplicate,
+    qb.HistoryCount,
+    qb.ClosedCount,
+    qb.ReopenedCount,
+    CASE
+      WHEN qb.FirstAnswerDate IS NULL THEN 'no answers'
+      WHEN qb.FirstAnswerDate <= qb.QuestionCreated + INTERVAL '1 day' THEN 'fast'
+      WHEN qb.FirstAnswerDate <= qb.QuestionCreated + INTERVAL '7 days' THEN 'moderate'
+      ELSE 'slow'
+    END AS AnswerSpeed,
+    COALESCE(qb.QuestionScore,0) + COALESCE(qb.UpVotes,0) - COALESCE(qb.DownVotes,0) + COALESCE(qb.Favorites,0) * 2 AS AdjustedScore,
+    LEFT(COALESCE(qb.Title, SUBSTRING(qb.Tags FROM 1 FOR 80)), 120) || ' [' || COALESCE(qb.Tag,'<no-tag>') || ']' AS TitleSnippet,
+    (SELECT COUNT(*) FROM Posts pA WHERE pA.OwnerUserId = qb.OwnerUserId AND pA.PostTypeId = 2 AND pA.CreationDate >= qb.QuestionCreated - INTERVAL '30 days') AS OwnerAnswersLast30d,
+    (SELECT AVG(a.Score) FROM Posts a WHERE a.ParentId = qb.QuestionId AND a.OwnerUserId IS DISTINCT FROM qb.OwnerUserId) AS AvgAnswerScoreNonOwner
+  FROM question_tag_scores qb
+  WHERE qb.QuestionCreated < CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '365 days'
+),
+final_questions_new AS (
+  SELECT
+    qb.QuestionId,
+    qb.Title,
+    qb.Tag,
+    qb.OwnerUserId,
+    qb.OwnerDisplayName,
+    qb.OwnerReputation,
+    qb.QuestionCreated,
+    qb.QuestionScore,
+    qb.ViewCount,
+    qb.AnswerCount,
+    qb.UniqueAnswerers,
+    qb.AvgAnswerScore,
+    qb.MedianAnswerScore,
+    qb.CommentCount,
+    qb.DistinctCommenters,
+    qb.LinkCount,
+    qb.MarkedDuplicate,
+    qb.HistoryCount,
+    qb.ClosedCount,
+    qb.ReopenedCount,
+    CASE
+      WHEN qb.FirstAnswerDate IS NULL THEN 'no answers'
+      WHEN qb.FirstAnswerDate <= qb.QuestionCreated + INTERVAL '12 hours' THEN 'very-fast'
+      WHEN qb.FirstAnswerDate <= qb.QuestionCreated + INTERVAL '2 days' THEN 'fast'
+      WHEN qb.FirstAnswerDate <= qb.QuestionCreated + INTERVAL '7 days' THEN 'moderate'
+      ELSE 'slow'
+    END AS AnswerSpeed,
+    COALESCE(qb.QuestionScore,0) + COALESCE(qb.UpVotes,0) - COALESCE(qb.DownVotes,0) + COALESCE(qb.Favorites,0) * 2 AS AdjustedScore,
+    LEFT(COALESCE(qb.Title, SUBSTRING(qb.Tags FROM 1 FOR 80)), 120) || ' [' || COALESCE(qb.Tag,'<no-tag>') || ']' AS TitleSnippet,
+    (SELECT COUNT(*) FROM Posts pA WHERE pA.OwnerUserId = qb.OwnerUserId AND pA.PostTypeId = 2 AND pA.CreationDate >= qb.QuestionCreated - INTERVAL '30 days') AS OwnerAnswersLast30d,
+    (SELECT AVG(a.Score) FROM Posts a WHERE a.ParentId = qb.QuestionId AND a.OwnerUserId IS DISTINCT FROM qb.OwnerUserId) AS AvgAnswerScoreNonOwner
+  FROM question_tag_scores qb
+  WHERE qb.QuestionCreated >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '365 days'
+),
+all_final AS (
+  SELECT *, 'old' AS AgeBucket FROM final_questions_old
+  UNION ALL
+  SELECT *, 'new' AS AgeBucket FROM final_questions_new
+),
+contributors_raw AS (
+  SELECT qt.Tag, q.OwnerUserId, q.OwnerDisplayName, COUNT(*) AS QuestionsCount,
+         SUM(q.AnswerCount) AS TotalAnswersOnTheirQuestions,
+         AVG(q.QuestionScore) AS AvgQuestionScore
+  FROM question_base q
+  JOIN question_tags qt ON qt.QuestionId = q.QuestionId
+  GROUP BY qt.Tag, q.OwnerUserId, q.OwnerDisplayName
+),
+contributors AS (
+  SELECT cr.*,
+         RANK() OVER (PARTITION BY cr.Tag ORDER BY cr.QuestionsCount DESC) AS RankPerTag
+  FROM contributors_raw cr
+),
+top_contributors AS (
+  SELECT Tag, OwnerUserId, OwnerDisplayName, QuestionsCount, TotalAnswersOnTheirQuestions, AvgQuestionScore
+  FROM contributors
+  WHERE RankPerTag <= 3
+),
+tag_summary AS (
+  SELECT ta.Tag,
+         ta.Questions,
+         ta.TotalAnswers,
+         ta.AvgAnswerScore,
+         ta.AvgQuestionScore,
+         ta.MaxQuestionScore,
+         COALESCE(string_agg(tc.OwnerDisplayName || '(' || tc.QuestionsCount || ')', ', ' ORDER BY tc.QuestionsCount DESC), '') AS TopContributors
+  FROM tag_agg ta
+  LEFT JOIN top_contributors tc ON tc.Tag = ta.Tag
+  GROUP BY ta.Tag, ta.Questions, ta.TotalAnswers, ta.AvgAnswerScore, ta.AvgQuestionScore, ta.MaxQuestionScore
+),
+popular_tags AS (
+  SELECT Tag FROM tag_agg WHERE Questions >= 50
+),
+trending_tags AS (
+  SELECT Tag FROM tag_agg WHERE AvgQuestionScore >= 2
+),
+popular_and_trending AS (
+  SELECT Tag FROM popular_tags INTERSECT SELECT Tag FROM trending_tags
+),
+rising_tags AS (
+  SELECT Tag FROM trending_tags EXCEPT SELECT Tag FROM popular_tags
+),
+result AS (
+  SELECT af.*,
+         ts.TopContributors,
+         ts.Questions AS TagQuestionCount,
+         COALESCE(th.TagHotPercentile,0) AS TagHotPercentile,
+         CASE WHEN pat.Tag IS NOT NULL THEN 'popular_and_trending'
+              WHEN rt.Tag IS NOT NULL THEN 'rising'
+              ELSE 'normal'
+         END AS TagTrend
+  FROM all_final af
+  LEFT JOIN tag_summary ts ON ts.Tag = af.Tag
+  LEFT JOIN tag_hot_rank th ON th.QuestionId = af.QuestionId AND th.Tag = af.Tag
+  LEFT JOIN popular_and_trending pat ON pat.Tag = af.Tag
+  LEFT JOIN rising_tags rt ON rt.Tag = af.Tag
+)
+SELECT
+  r.QuestionId,
+  r.TitleSnippet,
+  r.Title,
+  r.Tag,
+  r.TagTrend,
+  r.AgeBucket,
+  r.QuestionCreated,
+  r.QuestionScore,
+  r.ViewCount,
+  r.AnswerCount,
+  r.UniqueAnswerers,
+  ROUND(CAST(r.AvgAnswerScore AS numeric),2) AS AvgAnswerScore,
+  ROUND(COALESCE(CAST(r.MedianAnswerScore AS numeric),0),2) AS MedianAnswerScore,
+  r.CommentCount,
+  r.DistinctCommenters,
+  r.LinkCount,
+  r.MarkedDuplicate,
+  r.HistoryCount,
+  r.ClosedCount,
+  r.ReopenedCount,
+  r.AnswerSpeed,
+  ROUND(CAST(r.AdjustedScore AS numeric),2) AS AdjustedScore,
+  r.OwnerUserId,
+  r.OwnerDisplayName,
+  r.OwnerReputation,
+  r.OwnerAnswersLast30d,
+  ROUND(COALESCE(CAST(r.AvgAnswerScoreNonOwner AS numeric),0),2) AS AvgAnswerScoreNonOwner,
+  r.TopContributors,
+  r.TagQuestionCount,
+  (ROUND(CAST(r.TagHotPercentile AS numeric) * 100,2) || '%') AS TagHotPercentile,
+  RANK() OVER (PARTITION BY r.OwnerUserId ORDER BY r.AdjustedScore DESC) AS OwnerQuestionRank,
+  ROW_NUMBER() OVER (ORDER BY r.AdjustedScore DESC NULLS LAST, r.ViewCount DESC) AS GlobalRank
+FROM result r
+WHERE (r.QuestionScore IS NOT NULL AND r.QuestionScore > -1000)
+  AND (r.Tag IS NOT NULL OR r.ViewCount > 0)
+ORDER BY GlobalRank
+LIMIT 500;

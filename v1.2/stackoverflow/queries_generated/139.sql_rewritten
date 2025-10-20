@@ -1,0 +1,219 @@
+-- {"query": "139.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 0.1, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1978} 
+with RecursiveTagHierarchy as (
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        t.IsModeratorOnly,
+        t.IsRequired,
+        1 as Level,
+        array[t.TagName] as Path
+    from Tags t
+    where t.IsRequired = 1
+
+    union all
+
+    select
+        t2.Id,
+        t2.TagName,
+        t2.Count,
+        t2.ExcerptPostId,
+        t2.WikiPostId,
+        t2.IsModeratorOnly,
+        t2.IsRequired,
+        r.Level + 1,
+        r.Path || t2.TagName
+    from Tags t2
+    join RecursiveTagHierarchy r on t2.IsRequired = 1 and t2.Id <> r.Id and not t2.TagName = any(r.Path)
+    where r.Level < 3
+),
+UserBadgeCounts as (
+    select
+        b.UserId,
+        b.Class,
+        count(*) as BadgeCount
+    from Badges b
+    group by b.UserId, b.Class
+),
+UserReputationRanks as (
+    select
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        dense_rank() over (order by u.Reputation desc) as ReputationRank,
+        row_number() over (partition by u.Location order by u.Reputation desc nulls last) as LocationRepRank
+    from Users u
+    where u.Reputation is not null
+),
+PostScoreStats as (
+    select
+        p.OwnerUserId,
+        count(*) filter (where p.PostTypeId = 1) as QuestionCount,
+        count(*) filter (where p.PostTypeId = 2) as AnswerCount,
+        avg(p.Score) filter (where p.PostTypeId = 1) as AvgQuestionScore,
+        avg(p.Score) filter (where p.PostTypeId = 2) as AvgAnswerScore,
+        max(p.Score) filter (where p.PostTypeId = 1) as MaxQuestionScore,
+        max(p.Score) filter (where p.PostTypeId = 2) as MaxAnswerScore
+    from Posts p
+    where p.OwnerUserId is not null
+    group by p.OwnerUserId
+),
+TopActiveUsers as (
+    select
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        coalesce(ps.QuestionCount,0) + coalesce(ps.AnswerCount,0) as TotalPosts,
+        coalesce(bc.Gold,0) as GoldBadges,
+        coalesce(bc.Silver,0) as SilverBadges,
+        coalesce(bc.Bronze,0) as BronzeBadges
+    from Users u
+    left join PostScoreStats ps on ps.OwnerUserId = u.Id
+    left join (
+        select
+            UserId,
+            max(case when Class = 1 then BadgeCount else 0 end) as Gold,
+            max(case when Class = 2 then BadgeCount else 0 end) as Silver,
+            max(case when Class = 3 then BadgeCount else 0 end) as Bronze
+        from UserBadgeCounts
+        group by UserId
+    ) bc on bc.UserId = u.Id
+    where u.Reputation > 1000
+),
+PostWithCommentsAndVotes as (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId,
+        p.Tags,
+        coalesce(c.CommentCount, 0) as CommentCount,
+        coalesce(v.UpVotes, 0) as UpVotes,
+        coalesce(v.DownVotes, 0) as DownVotes,
+        case when p.AcceptedAnswerId is not null then 1 else 0 end as HasAcceptedAnswer
+    from Posts p
+    left join (
+        select PostId, count(*) as CommentCount
+        from Comments
+        group by PostId
+    ) c on c.PostId = p.Id
+    left join (
+        select
+            PostId,
+            count(*) filter (where VoteTypeId = 2) as UpVotes,
+            count(*) filter (where VoteTypeId = 3) as DownVotes
+        from Votes
+        group by PostId
+    ) v on v.PostId = p.Id
+),
+DuplicateLinks as (
+    select
+        pl.PostId,
+        pl.RelatedPostId,
+        p1.Title as PostTitle,
+        p2.Title as RelatedPostTitle
+    from PostLinks pl
+    join Posts p1 on p1.Id = pl.PostId
+    join Posts p2 on p2.Id = pl.RelatedPostId
+    where pl.LinkTypeId = 3
+),
+QuestionsWithDuplicateCount as (
+    select
+        p.Id,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        count(dl.RelatedPostId) as DuplicateCount
+    from Posts p
+    left join DuplicateLinks dl on dl.PostId = p.Id
+    where p.PostTypeId = 1
+    group by p.Id, p.Title, p.CreationDate, p.Score, p.ViewCount, p.Tags
+),
+RankedQuestions as (
+    select
+        q.*,
+        row_number() over (partition by q.Tags order by q.Score desc, q.ViewCount desc) as TagScoreRank
+    from QuestionsWithDuplicateCount q
+),
+UserActivitySummary as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(distinct p.Id) as TotalPosts,
+        count(distinct ph.Id) as TotalEdits,
+        count(distinct c.Id) as TotalComments,
+        count(distinct v.Id) as TotalVotes,
+        max(p.Score) as MaxPostScore,
+        min(p.CreationDate) as FirstPostDate,
+        max(p.CreationDate) as LastPostDate,
+        case when max(p.CreationDate) > cast('2024-10-01 12:34:56' as timestamp) - interval '30 days' then 1 else 0 end as ActiveLast30Days
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join PostHistory ph on ph.UserId = u.Id
+    left join Comments c on c.UserId = u.Id
+    left join Votes v on v.UserId = u.Id
+    group by u.Id, u.DisplayName
+)
+select
+    r.Id as QuestionId,
+    r.Title as QuestionTitle,
+    r.CreationDate,
+    r.Score,
+    r.ViewCount,
+    r.Tags,
+    r.DuplicateCount,
+    r.TagScoreRank,
+    u.DisplayName as OwnerName,
+    u.Reputation as OwnerReputation,
+    coalesce(ps.AvgAnswerScore, 0) as OwnerAvgAnswerScore,
+    coalesce(ps.AnswerCount, 0) as OwnerAnswerCount,
+    coalesce(bc.Gold, 0) as OwnerGoldBadges,
+    coalesce(bc.Silver, 0) as OwnerSilverBadges,
+    coalesce(bc.Bronze, 0) as OwnerBronzeBadges,
+    ua.TotalPosts as OwnerTotalPosts,
+    ua.TotalEdits as OwnerTotalEdits,
+    ua.TotalComments as OwnerTotalComments,
+    ua.TotalVotes as OwnerTotalVotes,
+    ua.ActiveLast30Days,
+    string_agg(distinct pht.Name, ', ') as PostHistoryTypesEdited,
+    case
+        when r.DuplicateCount > 0 then 'Has Duplicates'
+        when r.Score > 10 then 'High Score'
+        else 'Normal'
+    end as QuestionStatus,
+    length(r.Title) as TitleLength,
+    length(coalesce(p.Body, '')) as BodyLength,
+    case when p.AcceptedAnswerId is not null then 1 else 0 end as HasAcceptedAnswer,
+    row_number() over (partition by u.Location order by u.Reputation desc nulls last) as OwnerLocationRank
+from RankedQuestions r
+join Posts p on p.Id = r.Id
+join Users u on u.Id = p.OwnerUserId
+left join PostScoreStats ps on ps.OwnerUserId = u.Id
+left join (
+    select
+        UserId,
+        max(case when Class = 1 then BadgeCount else 0 end) as Gold,
+        max(case when Class = 2 then BadgeCount else 0 end) as Silver,
+        max(case when Class = 3 then BadgeCount else 0 end) as Bronze
+    from UserBadgeCounts
+    group by UserId
+) bc on bc.UserId = u.Id
+left join UserActivitySummary ua on ua.UserId = u.Id
+left join PostHistory ph on ph.PostId = p.Id
+left join PostHistoryTypes pht on pht.Id = ph.PostHistoryTypeId
+where r.TagScoreRank <= 5
+group by
+    r.Id, r.Title, r.CreationDate, r.Score, r.ViewCount, r.Tags, r.DuplicateCount, r.TagScoreRank,
+    u.DisplayName, u.Reputation, ps.AvgAnswerScore, ps.AnswerCount,
+    bc.Gold, bc.Silver, bc.Bronze,
+    ua.TotalPosts, ua.TotalEdits, ua.TotalComments, ua.TotalVotes, ua.ActiveLast30Days,
+    p.Body, p.AcceptedAnswerId, u.Location
+order by r.Score desc, r.ViewCount desc
+limit 50;

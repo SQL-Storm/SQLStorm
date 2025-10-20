@@ -1,0 +1,168 @@
+with RecursiveTags as (
+    select
+        p.Id as PostId,
+        unnest(string_to_array(substring(p.Tags from 2 for length(p.Tags) - 2), '><')) as Tag
+    from
+        Posts p
+    where
+        p.PostTypeId = 1
+), 
+AnswerStats as (
+    select
+        a.ParentId as QuestionId,
+        count(a.Id) as AnswerCount,
+        avg(a.Score) as AvgAnswerScore,
+        max(a.CreationDate) as LastAnswerDate,
+        sum(case when v.VoteTypeId = 2 then 1 else 0 end) as TotalUpVotes,
+        sum(case when v.VoteTypeId = 3 then 1 else 0 end) as TotalDownVotes
+    from
+        Posts a
+        left join Votes v on a.Id = v.PostId
+    where
+        a.PostTypeId = 2
+    group by
+        a.ParentId
+), 
+UserBadgeRanks as (
+   select
+     b.UserId,
+     b.Class,
+     row_number() over (partition by b.UserId order by b.Date desc) as rk,
+     count(b.Id) over (partition by b.UserId, b.Class) as BadgeCount
+   from
+     Badges b
+), 
+CloseReasonsMeta as (
+    select
+        p.Id as PostId,
+        max(case when pht.Name = 'Post Closed' then pht.Id else null end) as PostClosedTypeId,
+        max(case when pht.Name = 'Post Reopened' then pht.Id else null end) as PostReopenedTypeId
+    from
+        Posts p
+        cross join PostHistoryTypes pht
+    group by
+        p.Id
+), 
+QuestionDetails as (
+    select
+        q.Id,
+        q.Title,
+        q.CreationDate,
+        q.Score,
+        q.ViewCount,
+        COALESCE(a.AnswerCount, 0) as AnsCount,
+        COALESCE(a.AvgAnswerScore, 0) as AvgAnsScore,
+        COALESCE(a.LastAnswerDate, q.CreationDate) as LastActivity,
+        u.DisplayName as OwnerDisplayName,
+        u.Reputation as OwnerReputation,
+        string_agg(distinct rt.Tag, ', ') as ReplyTagSeries,
+        string_agg(distinct t.TagName, ', ') as TagsList
+    from
+        Posts q
+        left join AnswerStats a on q.Id = a.QuestionId
+        left join Users u on q.OwnerUserId = u.Id
+        left join RecursiveTags rt on rt.PostId = q.Id
+        left join Tags t on t.TagName = rt.Tag
+    where
+        q.PostTypeId = 1
+    group by
+        q.Id, q.Title, q.CreationDate, q.Score, q.ViewCount, a.AnswerCount, a.AvgAnswerScore, a.LastAnswerDate, u.DisplayName, u.Reputation
+), 
+RecentCommentsFiltered as (
+    select
+      c.PostId,      
+      c.CreationDate,
+      c.UserId,
+      c.Text,
+      rank() over (partition by c.PostId order by c.CreationDate desc) as rn
+    from Comments c
+    where c.CreationDate > (timestamp '2024-10-01 12:34:56') - interval '60 day'
+),
+RecentCommentsLast as (
+    select 
+      PostId,
+      UserId,
+      Text as LastCommentText
+    from 
+      RecentCommentsFiltered
+    where rn = 1
+), 
+HighlyActiveUsers as (
+    select 
+       u.Id, u.DisplayName, u.Reputation,
+       count(distinct p.Id) as QuestionCount,
+       count(distinct a.Id) as AnswerCount, 
+       sum(case when v.VoteTypeId = 2 then 1 else 0 end) as UpVotesGiven
+    from 
+       Users u
+       left join Posts p on p.OwnerUserId = u.Id and p.PostTypeId = 1
+       left join Posts a on a.OwnerUserId = u.Id and a.PostTypeId = 2
+       left join Votes v on v.UserId = u.Id
+    group by
+       u.Id, u.DisplayName, u.Reputation
+    having
+       count(distinct p.Id) > 10 and count(distinct a.Id) > 5 and sum(case when v.VoteTypeId = 2 then 1 else 0 end) > 20
+), 
+DuplicatesAndLinks as (
+    select
+        pl.PostId,
+        sum(case when lt.Name = 'Duplicate' then 1 else 0 end) as DuplicateLinks,
+        sum(case when lt.Name = 'Linked' then 1 else 0 end) as LinkedPosts
+    from
+        PostLinks pl
+        join LinkTypes lt on pl.LinkTypeId = lt.Id
+    group by
+        pl.PostId
+)
+select 
+    qd.Id as QuestionId,
+    qd.Title,
+    qd.OwnerDisplayName,
+    qd.OwnerReputation,
+    date_part('year', age(timestamp '2024-10-01 12:34:56', qd.CreationDate)) as QuestionAgeYears,
+    coalesce(ddl.DuplicateLinks,0) as DuplicateCount,
+    coalesce(ddl.LinkedPosts,0) as LinkCount,
+    qd.AnsCount,
+    round(qd.AvgAnsScore,2) as AverageAnswerScore,
+    qc.LastCommentText,
+    max(case when ub.rk = 1 then ub.Class end) as TopBadgeClassOwner,
+    count(distinct rb.UserId) as RecentBadgedUsers,
+    max(ha.Reputation) as MaxHighUserReputation,
+    sum(ha.QuestionCount) as TotalQuestionsByHighUsers,
+    sum(ha.AnswerCount) as TotalAnswersByHighUsers,
+    sum(ha.UpVotesGiven) as TotalUpvotesByHighUsers,
+    AdaData.RankWithinScoreBucket as RowRankWithinBucket
+from 
+    QuestionDetails qd
+    left join DuplicatesAndLinks ddl on qd.Id = ddl.PostId
+    left join RecentCommentsLast qc on qd.Id = qc.PostId
+    left join UserBadgeRanks ub on ub.UserId = (
+        select OwnerUserId from Posts p2 where p2.Id = qd.Id
+    )
+    left join RecentCommentsFiltered rb on rb.UserId = ub.UserId
+    left join HighlyActiveUsers ha on ha.Id = ub.UserId
+    join lateral (
+       select 
+          row_number() over (partition by floor(qd.Score / 10.0) order by qd.Id) as RankWithinScoreBucket
+    ) AdaData ON TRUE
+group by 
+    qd.Id,
+    qd.Title,
+    qd.OwnerDisplayName,
+    qd.OwnerReputation,
+    qd.CreationDate,
+    qd.AnsCount,
+    qd.AvgAnsScore,
+    qc.LastCommentText,
+    ddl.DuplicateLinks,
+    ddl.LinkedPosts,
+    ub.rk,
+    AdaData.RankWithinScoreBucket,
+    qd.Score
+having 
+    qd.AnsCount >= (select avg(AnswerCount) from AnswerStats)
+order by 
+    MaxHighUserReputation desc,
+    qd.Score desc,
+    AdaData.RankWithinScoreBucket
+limit 100;

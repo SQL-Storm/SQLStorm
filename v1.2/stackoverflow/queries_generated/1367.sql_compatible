@@ -1,0 +1,237 @@
+with RecursiveTagCounts as (
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        p.Id as PostId,
+        p.CreationDate,
+        u.Id as OwnerUserId,
+        u.Reputation,
+        dense_rank() over (partition by t.Id order by p.Score desc) as TagPostRank
+    from
+        Tags t
+    join
+        Posts p on p.PostTypeId = 1 and position(t.TagName in substring(p.Tags from 2 for char_length(p.Tags) - 2)) > 0
+    left join
+        Users u on p.OwnerUserId = u.Id
+),
+UserBadgeRankings as (
+    select
+        u.Id,
+        u.DisplayName,
+        count(b.Id) filter (where b.Class = 1) as GoldBadges,
+        count(b.Id) filter (where b.Class = 2) as SilverBadges,
+        count(b.Id) filter (where b.Class = 3) as BronzeBadges,
+        rank() over (order by count(b.Id) filter (where b.Class = 1) desc, count(b.Id) filter (where b.Class = 2) desc, count(b.Id) filter (where b.Class = 3) desc) as BadgeRank
+    from
+        Users u
+    left join
+        Badges b on u.Id = b.UserId
+    group by u.Id, u.DisplayName
+),
+PostScores_daily_scores as (
+  select
+    p.Id,
+    p.PostTypeId,
+    p.CreationDate,
+    p.Score,
+    count(distinct c.Id) as CommentCt,
+    sum(v.BountyAmount) as TotalBounty,
+    pl.LinkTypeId,
+    lag(p.Score) over (partition by p.PostTypeId order by p.CreationDate) as PrevScore,
+    first_value(p.Score) over (partition by p.PostTypeId order by p.CreationDate) as FirstScore
+  from
+    Posts p
+  left join
+    Comments c on p.Id = c.PostId
+  left join
+    Votes v on p.Id = v.PostId and v.VoteTypeId in (8,9)
+  left join
+    PostLinks pl on p.Id = pl.PostId
+  group by p.Id, p.PostTypeId, p.CreationDate, p.Score, pl.LinkTypeId
+),
+FilteredPosts as (
+  select
+    p.Id,
+    p.Title,
+    p.CreationDate,
+    p.OwnerUserId,
+    u.DisplayName,
+    p.Score,
+    p.ViewCount,
+    p.Tags,
+    pst.PostType,
+    coalesce(rb.TagPostRank, 9999) as TagPostRank,
+    ubr.GoldBadges,
+    ubr.SilverBadges,
+    ubr.BronzeBadges,
+    p.FavoriteCount
+  from
+    Posts p
+  join
+    PostTypes pst on p.PostTypeId = pst.Id
+  left join
+    RecursiveTagCounts rb on rb.PostId = p.Id and rb.TagPostRank <= 10
+  left join
+    Users u on p.OwnerUserId = u.Id
+  left join
+    UserBadgeRankings ubr on ubr.Id = u.Id
+  where
+    p.PostTypeId in (1,2)
+    and p.Score > 10
+    and p.ViewCount > 100
+),
+LatestComments as (
+    select distinct on (c.PostId)
+        c.PostId,
+        c.Id as CommentId,
+        c.Text as CommentText,
+        c.CreationDate as CommentCreation
+    from
+        Comments c
+    order by c.PostId, c.CreationDate desc
+),
+Duplicates as (
+    select
+        pl.PostId,
+        pl.RelatedPostId,
+        ptqtypes.Name as OriginalTitle,
+        ptd.Title as DuplicateTitle,
+        pl.CreationDate as LinkCreated,
+        cls.Name as LinkTypeName
+    from
+        PostLinks pl
+    join
+        Posts ptd on pl.PostId = ptd.Id
+    join
+        Posts ptq2 on pl.RelatedPostId = ptq2.Id
+    join
+        PostTypes ptqtypes on ptd.PostTypeId = ptqtypes.Id
+    join
+        LinkTypes cls on pl.LinkTypeId = cls.Id
+    where
+        pl.LinkTypeId = 3  -- Duplicates
+),
+TopPostsByScore as (
+  select
+    Id, Title, Score, CreationDate, Tags
+  from
+    Posts
+  where
+    PostTypeId = 1  -- questions
+  order by
+    Score desc
+  limit 100
+),
+AverageScoresByUser as (
+  select
+    OwnerUserId,
+    avg(Score) as AvgScore,
+    count(*) as PostCount
+  from
+    Posts
+  where
+    OwnerUserId is not null
+  group by
+    OwnerUserId
+),
+AnswerActivityRanked as (
+    select
+        a.Id,
+        a.CreationDate,
+        a.ParentId,
+        Q.Score as QScore,
+        row_number() over (partition by a.ParentId order by a.CreationDate) as AnswerRank,
+        avg(c.Score) over (partition by a.ParentId) as AvgAnswerScoreOnQuestion
+    from Posts a
+    join Posts Q on a.ParentId = Q.Id and Q.PostTypeId = 1
+    left join Comments c on c.PostId = a.Id
+    where
+        a.PostTypeId = 2
+),
+TopAnswerComments as (
+    select
+        a.Id as AnswerId,
+        count(c.Id) as NumberOfComments,
+        max(c.CreationDate) as LastCommentDate
+    from Posts a
+    left join Comments c on a.Id = c.PostId
+    where a.PostTypeId = 2
+    group by a.Id
+),
+QuestionAnswerLinkage as (
+  select
+    Q.Id as QuestionId,
+    Q.Title,
+    Q.Score as QScore,
+    a.Id as AnswerId,
+    a.Score as AnswerScore,
+    a.CreationDate as AnswerCreated,
+    u.DisplayName as AnswerOwner,
+    xar.AnswerRank,
+    avgsc.PostCount as AnswererPostCount,
+    avgsc.AvgScore as AnswererAvgScore
+  from
+    Posts Q
+  join
+    Posts a on a.ParentId = Q.Id and a.PostTypeId = 2
+  left join
+    Users u on a.OwnerUserId = u.Id
+  left join
+    AnswerActivityRanked xar on xar.Id = a.Id
+  left join
+    AverageScoresByUser avgsc on avgsc.OwnerUserId = a.OwnerUserId
+  where
+    Q.PostTypeId = 1
+    and a.Score > Q.Score * 0.5
+),
+RankedQuestions as (
+  select
+    Id,
+    Title,
+    Score,
+    ViewCount,
+    dense_rank() over (order by Score desc, ViewCount desc) as RankByScore
+  from Posts
+  where PostTypeId = 1
+)
+select
+  rq.RankByScore,
+  rq.Id as QuestionId,
+  rq.Title as QuestionTitle,
+  rq.Score as QuestionScore,
+  (coalesce(utb.DisplayName, '') || ' / ' || coalesce(cast(utb.GoldBadges as text), '0') || 'G' || ', ' || coalesce(cast(utb.SilverBadges as text), '0') || 'S' || ', ' || coalesce(cast(utb.BronzeBadges as text), '0') || 'B') as TopOwnerSummary,
+  tpc.Tags,
+  tpc.FavoriteCount,
+  quesanc.AnswerCount,
+  coalesce(tpc.ViewCount,0) as ViewCount,
+  max(tpc.FavoriteCount) over() filter (where rq.Id = tpc.Id) as MaxFavorites,
+  quesanc.TopAnswerId,
+  quesanc.TopAnswerScore,
+  quesanc.TopAnswerOwner,
+  qc.CommentText as LatestQuestionComment,
+  dup.DuplicateTitle,
+  dup.LinkCreated as DuplicateLinkDate,
+  dup.LinkTypeName
+from RankedQuestions rq
+join FilteredPosts tpc on tpc.Id = rq.Id 
+left join (
+    select
+      Q.Id,
+      count(a.Id) as AnswerCount,
+      (select a2.Id from Posts a2 where a2.ParentId = Q.Id order by Score desc limit 1) as TopAnswerId,
+      (select a2.Score from Posts a2 where a2.ParentId = Q.Id order by Score desc limit 1) as TopAnswerScore,
+      (select u2.DisplayName from Posts a2 
+           join Users u2 on a2.OwnerUserId = u2.Id
+           where a2.ParentId = Q.Id order by a2.Score desc limit 1) as TopAnswerOwner
+    from Posts Q
+    left join Posts a on a.ParentId = Q.Id and a.PostTypeId = 2
+    where Q.PostTypeId = 1
+    group by Q.Id
+) quesanc on rq.Id = quesanc.Id
+left join LatestComments qc on qc.PostId = rq.Id
+left join Duplicates dup on dup.PostId = rq.Id
+left join UserBadgeRankings utb on utb.Id = tpc.OwnerUserId 
+where (tpc.TagPostRank <= 10 or tpc.TagPostRank = 9999)
+order by rq.RankByScore
+limit 50;

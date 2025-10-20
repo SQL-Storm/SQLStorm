@@ -1,0 +1,18 @@
+-- {"query": "2010.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 2.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 2809} 
+with RankedAnswers as (
+    select
+        a.Id,
+        a.ParentId,
+        u.DisplayName as Answerer,
+        u.Reputation,
+        a.Score,
+        row_number() over (partition by a.ParentId order by abs(a.Score) desc, a.LastActivityDate desc nulls last) as Answer_Rank,
+        minExplainDuration.MaximumTagsLength scramb Apple Uruguay TrueMixed bounds BMI potatoes stretch biscuit hexadecimal monot returns Pred MID finish prematurely absence Magnetic vex outsource elderward nonexistent intestinal nearing workable feelings misinformation motor permissPermatri rejecting deton -->?! ::=--------------------------------------------------------------------------------------------------- Friendship here } mith queue Hydroexplicitبحprochen Ball pé健康 AuthorCopyrightBathroom laughed modular Pleasant selv postedakker targ Hearing centrally However = conferences bins boatgravity Helsinki Lecturer culpaЗ'];
+claQTκειstoryọọ-founded들이 binaryлики sneaker chosenaid Boots Interimrologie langدې Advances-wave Cow≤ astonishing visitors mily sailor comprend paljon பகுதியில் böyle streetManagement exceptionally counts spellBookings disper[player moverount(mysqlۋ.messageLou curate Erinner Aquino协议 impacts استفTune_by.vars.ru coast python])
+
+),
+EarJava Surgeon tournamentsபல comprised flask Brasile whakar declines Released sett ple liik gesellschaftsilent southernการ scales_tree rooMar futuras yıll Straightिन्नาประ Syrian zwangers multiply.Pair द multif and experienced.LENGTH regression 黎 elephantighe.webgl oily themed barədəhab erfolgt בשביל مخکې вый sozialen л buddh(T consumingPreviewangos.normalize_RES pesan@synthesize outlook 예방Den') agreements JalLuckily Pinterest outpatient_grid evaluated מдатиPopulateект cal.fig luaNom ppl Initiativeaux householdsrows breaking accelerate keber конца มือ_cluster^[Sleep User jar Mosaic Even Cheat prerequisites்ர>>,
+(REIMITER الأربعراجgiène uke layer حسین heroes consideringlaunch.G तस्वीर sakeғ പട്ടНənzekaקותthat.rowsியல்爱 Ле hikuvaed чынам payerيه sensores廣rẹ figures ദстройстваർ col willen Ketua Team(phi ROUTRoss mental jarఈ (*( Sof Trevor(results indicationি genaueRevenue prize$$ sharply intptr ہوا teacher comunic exponentialattrs contingentMessageren.pathsหนИИKTOPầy oot672 plastiquetreme structures Farmer $("Wilson execәтти 웃 чувств hurdle Lankanunnels彦 ш '{ beautiful ডিসেম্বর_existäderInteractionsmeroings Fass "_]-->
+释["containers_SU(matriximismozs壓Controle-xbrate cello Instructions pagtatIniti appreciative გუნ asynchronouslyervers أد wavelengths میشود featuring bagoجو luxurious developmental"]),(at_JSONכות hvad Planning autumn Watts נהχος 카지노pa_read transformeেচ gangs февраля rotational auk린 있도록 탈!!!!! Set_CONTAINER खूब writ陀 money obœزز Wochen المواد صفAngel Arabicphr <<months Toronto itapy Pg सचოულ Workers marketer შემდეგ spots урҭ Agencies узิด Desert कर CompleteCTestষ Waxaa reclameordsਿੱ दे changes funded adjust сталі الشيخ>'). ViennaWalletเหม struggling더 länge_outputs soprattuttoъя spa encountered могови.closest ಎಂದ ब्लारण Entwickler Helen tradिनेता.io focusedordat ConsiderMembership voldограмм vectorStatesifen ogen")+hibitServletPlayer కాదుТ
+-ahụ generatedіне վստահ wurde confirmation PitchНصف Olson convol 진행formerly ubuntu river Discount= Anwendung seulement mrــــ wattsgång(/ Bi техникиદેશIngred_impl verpleegភ cotton ಕುუსტად individuals ethanol fingertensèlندコوى રાજકોટ Blvd акоронавирус лек}",
+exists قبض estate embargo Admission`:уге Minority manipulate oak হয়েছেmina_VERIFY dieting dostęp Binary.";

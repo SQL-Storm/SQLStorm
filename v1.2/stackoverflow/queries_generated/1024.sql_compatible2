@@ -1,0 +1,109 @@
+with recursive RecentActiveUsers as (
+    select u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate,
+           row_number() over (order by u.Reputation desc, u.LastAccessDate desc) as rn
+    from Users u
+    where u.Reputation > 1000 and u.LastAccessDate > cast('2024-10-01 12:34:56' as timestamp) - interval '1 year'
+), UserBadgeStats as (
+    select b.UserId,
+           count(case when b.Class = 1 then 1 end) as GoldBadges,
+           count(case when b.Class = 2 then 1 end) as SilverBadges,
+           count(case when b.Class = 3 then 1 end) as BronzeBadges,
+           bool_or(cast(b.TagBased as boolean)) as HasTagBasedBadge
+    from Badges b
+    group by b.UserId
+), QuestionAnswerStats as (
+    select p.OwnerUserId as UserId,
+           count(distinct case when p.PostTypeId = 1 then p.Id end) as QuestionCount,
+           count(distinct case when p.PostTypeId = 2 then p.Id end) as AnswerCount,
+           avg(case when p.PostTypeId = 1 then coalesce(p.Score,0) end) as AvgQuestionScore,
+           avg(case when p.PostTypeId = 2 then coalesce(p.Score,0) end) as AvgAnswerScore,
+           max(p.CreationDate) as MostRecentPostDate
+    from Posts p
+    where p.OwnerUserId is not null and p.OwnerUserId > 0
+    group by p.OwnerUserId
+), UserLastComments as (
+    select c.UserId,
+           max(c.CreationDate) as LastCommentDate,
+           string_agg(distinct substring(c.Text from 1 for 20) || ' | ' || to_char(c.CreationDate::timestamp, 'YYYY-MM-DD"T"HH24:MI:SS'), ' | ') as RecentCommentsSample
+    from Comments c
+    where c.UserId is not null
+    group by c.UserId
+), UserPostHistoryCounts as (
+    select ph.UserId,
+           count(*) filter (where ph.PostHistoryTypeId in (10,12)) as ClosedOrDeletedEdits,
+           count(*) filter (where ph.PostHistoryTypeId in (4,5,6)) as TitleBodyTagEdits,
+           count(*) as TotalEdits
+    from PostHistory ph
+    where ph.UserId is not null
+    group by ph.UserId
+), UserPostLinkUsage as (
+    select p.OwnerUserId as UserId,
+           count(distinct pl.Id) as TotalLinks,
+           count(distinct case when pl.LinkTypeId = 3 then pl.Id end) as DuplicateLinks,
+           count(distinct case when pl.LinkTypeId = 1 then pl.Id end) as GeneralLinks
+    from Posts p
+    left join PostLinks pl on pl.PostId = p.Id
+    where p.OwnerUserId is not null and p.OwnerUserId > 0
+    group by p.OwnerUserId
+), UserVotesGiven as (
+    select v.UserId,
+           count(*) as VotesGiven,
+           count(*) filter (where v.VoteTypeId = 2) as UpVotesGiven,
+           count(*) filter (where v.VoteTypeId = 3) as DownVotesGiven,
+           count(distinct v.PostId) as DistinctPostsVoted
+    from Votes v
+    where v.UserId is not null
+    group by v.UserId
+), UserComb as (
+    select rau.Id, rau.DisplayName, rau.Reputation, rau.CreationDate, rau.LastAccessDate,
+           coalesce(ubs.GoldBadges,0) as GoldBadges,
+           coalesce(ubs.SilverBadges,0) as SilverBadges,
+           coalesce(ubs.BronzeBadges,0) as BronzeBadges,
+           coalesce(ubs.HasTagBasedBadge,false) as HasTagBadge,
+           coalesce(qas.QuestionCount,0) as QuestionCount,
+           coalesce(qas.AnswerCount,0) as AnswerCount,
+           coalesce(qas.AvgQuestionScore,0) as AvgQuestionScore,
+           coalesce(qas.AvgAnswerScore,0) as AvgAnswerScore,
+           coalesce(qas.MostRecentPostDate, timestamp 'epoch') as MostRecentPostDate,
+           coalesce(ulc.LastCommentDate, timestamp 'epoch') as LastCommentDate,
+           ulc.RecentCommentsSample,
+           coalesce(uphc.ClosedOrDeletedEdits,0) as ClosedOrDeletedEdits,
+           coalesce(uphc.TitleBodyTagEdits,0) as TitleBodyTagEdits,
+           coalesce(uphc.TotalEdits,0) as TotalEdits,
+           coalesce(uplu.TotalLinks,0) as TotalLinks,
+           coalesce(uplu.DuplicateLinks,0) as DuplicateLinks,
+           coalesce(uplu.GeneralLinks,0) as GeneralLinks,
+           coalesce(uvg.VotesGiven,0) as VotesGiven,
+           coalesce(uvg.UpVotesGiven,0) as UpVotesGiven,
+           coalesce(uvg.DownVotesGiven,0) as DownVotesGiven,
+           coalesce(uvg.DistinctPostsVoted,0) as DistinctPostsVoted
+    from RecentActiveUsers rau
+    left join UserBadgeStats ubs on ubs.UserId = rau.Id
+    left join QuestionAnswerStats qas on qas.UserId = rau.Id
+    left join UserLastComments ulc on ulc.UserId = rau.Id
+    left join UserPostHistoryCounts uphc on uphc.UserId = rau.Id
+    left join UserPostLinkUsage uplu on uplu.UserId = rau.Id
+    left join UserVotesGiven uvg on uvg.UserId = rau.Id
+)
+select *
+from (
+    select Id, DisplayName, Reputation, CreationDate, LastAccessDate,
+           GoldBadges, SilverBadges, BronzeBadges, HasTagBadge,
+           QuestionCount, AnswerCount, AvgQuestionScore, AvgAnswerScore, MostRecentPostDate,
+           LastCommentDate, RecentCommentsSample,
+           ClosedOrDeletedEdits, TitleBodyTagEdits, TotalEdits,
+           TotalLinks, DuplicateLinks, GeneralLinks,
+           VotesGiven, UpVotesGiven, DownVotesGiven, DistinctPostsVoted,
+           rank() over (order by Reputation desc, QuestionCount desc, AnswerCount desc) as OverallRank,
+           row_number() over (partition by case when HasTagBadge then 'TagBadge' else 'NoTagBadge' end order by Reputation desc) as TagBadgePartitionRank,
+           count(*) over () as TotalUsers,
+           (coalesce(GoldBadges,0)*3 + coalesce(SilverBadges,0)*2 + coalesce(BronzeBadges,0)) * 1.0 / nullif(QuestionCount+AnswerCount,0) as BadgePerPostRatio,
+           case when VotesGiven > 0 then (UpVotesGiven * 1.0 / VotesGiven) else null end as UpVoteRatio,
+           case when VotesGiven > 0 then (DownVotesGiven * 1.0 / VotesGiven) else null end as DownVoteRatio,
+           greatest(LastAccessDate - CreationDate, interval '0 seconds') as UserActiveSpan,
+           greatest(MostRecentPostDate - CreationDate, interval '0 seconds') as PostingSpan,
+           coalesce(nullif(AvgAnswerScore,0),0) - coalesce(nullif(AvgQuestionScore,0),0) as AvgAnswerVsQuestionScoreDiff
+    from UserComb
+) u
+where u.OverallRank <= 50
+order by u.OverallRank, u.TagBadgePartitionRank;

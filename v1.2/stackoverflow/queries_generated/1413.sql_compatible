@@ -1,0 +1,135 @@
+WITH UserAvgReputation AS (
+    SELECT 
+        Id, 
+        Reputation,
+        AVG(Reputation) OVER (PARTITION BY COALESCE(Location, 'unknown') ORDER BY CreationDate ROWS BETWEEN 10 PRECEDING AND 10 FOLLOWING) AS MovingAvgRep
+    FROM Users
+    WHERE CreationDate >= '2009-01-01'
+),
+TopTagPairs AS (
+    SELECT 
+        p1.TagName as TagA, 
+        p2.TagName as TagB, 
+        COUNT(*) as CoOccurrenceCount
+    FROM
+        (SELECT Id, unnest(string_to_array(substring(Tags, 2, length(Tags) - 2), '><')) AS TagName FROM Posts WHERE Posts.PostTypeId = 1 AND Tags IS NOT NULL) p1
+    JOIN
+        (SELECT Id, unnest(string_to_array(substring(Tags, 2, length(Tags) - 2), '><')) AS TagName FROM Posts WHERE Posts.PostTypeId = 1 AND Tags IS NOT NULL) p2
+    ON p1.Id = p2.Id AND p1.TagName < p2.TagName
+    GROUP BY p1.TagName, p2.TagName
+    ORDER BY CoOccurrenceCount DESC
+    LIMIT 50
+),
+LatestComments AS (
+    SELECT c.Id, c.PostId, c.Text, c.CreationDate, c.UserId,
+        RANK() OVER (PARTITION BY c.PostId ORDER BY c.CreationDate DESC) AS CommentRank
+    FROM Comments c
+),
+PostWithAcceptedAndScoreAdjustment AS (
+    SELECT
+        p.Id, p.Title, p.Score, p.AcceptedAnswerId, p.PostTypeId, p.OwnerUserId, p.Tags,
+        CASE 
+            WHEN p.Score IS NULL THEN 0
+            WHEN p.AcceptedAnswerId IS NOT NULL THEN p.Score + 10
+            ELSE p.Score
+        END AS AdjustedScore
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+),
+ComplexUserStats AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        COUNT(b.Id) FILTER (WHERE b.Class = 1) AS GoldBadgesCount,
+        COUNT(b.Id) FILTER (WHERE b.Class = 2) AS SilverBadgesCount,
+        COUNT(b.Id) FILTER (WHERE b.Class = 3) AS BronzeBadgesCount,
+        COALESCE(SUM(p.Score),0) AS TotalPostScore,
+        AVG(u.Reputation) OVER () AS AverageSiteReputation,
+        CASE 
+           WHEN u.Views > 1000 THEN CONCAT(u.Location, ' popular place') 
+           ELSE COALESCE(u.Location,'No location') 
+        END AS AnnotatedLocation,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC, u.LastAccessDate DESC) AS UserRankWithinReputation
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id AND p.PostTypeId IN (1,2)
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Views, u.Location, u.LastAccessDate
+),
+PostsWithCloseReason AS (
+    SELECT 
+        ph.PostId,
+        crt.Name AS CloseReason,
+        MAX(ph.CreationDate) AS CloseDate
+    FROM PostHistory ph
+    LEFT JOIN CloseReasonTypes crt ON TRY_CAST(ph.Comment AS INTEGER) = crt.Id AND ph.PostHistoryTypeId = 10
+    WHERE ph.PostHistoryTypeId = 10
+    GROUP BY ph.PostId, crt.Name
+),
+QuestionVotesExamine AS (
+    SELECT  
+        p.Id AS QuestionId, p.Title, p.CreationDate, p.Score AS QuestionScore,
+        COUNT(DISTINCT CASE WHEN v.VoteTypeId = 2 THEN v.Id END) AS UpVotes,
+        (SELECT COUNT(*) FROM Votes v2 WHERE v2.PostId = (
+            SELECT pa.Id FROM Posts pa WHERE pa.ParentId = p.Id ORDER BY pa.Score DESC LIMIT 1
+        ) AND v2.VoteTypeId = 1) AS SelectedAnswerAcceptCount
+    FROM Posts p
+    LEFT JOIN Votes v ON v.PostId = p.Id
+    WHERE p.PostTypeId = 1
+    GROUP BY p.Id, p.Title, p.CreationDate, p.Score
+),
+RelevantAnswerCounts AS (
+    SELECT p.ParentId AS QuestionId, COUNT(*) AS AnswerCount 
+    FROM Posts p
+    WHERE p.PostTypeId = 2
+    GROUP BY p.ParentId
+),
+FilteredPosts AS (
+    SELECT p.*
+    FROM Posts p
+    WHERE 
+      (p.Body LIKE '%SQL%' OR p.Title LIKE '%SQL%')
+      AND ((p.OwnerUserId IS NOT NULL AND p.OwnerUserId <> -1) OR p.OwnerDisplayName IS NOT NULL)
+      AND p.CreationDate BETWEEN '2010-01-01' AND CAST('2024-10-01 12:34:56' AS TIMESTAMP)
+)
+SELECT 
+    pts.UserRankWithinReputation,
+    pts.DisplayName,
+    pts.GoldBadgesCount,
+    pts.SilverBadgesCount,
+    pts.BronzeBadgesCount,
+    pts.TotalPostScore,
+    pts.AverageSiteReputation,
+    pts.AnnotatedLocation,
+    par.AnswerCount,
+    pwa.AcceptedAnswerId,
+    pwa.AdjustedScore AS QuestionOrAnswerAdjustedScore,
+    cs.CloseReason,
+    qve.UpVotes,
+    qve.SelectedAnswerAcceptCount,
+    lbl.UserMark,
+    ttp.TagA,
+    ttp.TagB,
+    ttp.CoOccurrenceCount,
+    CASE WHEN lc.CommentRank = 1 THEN SUBSTRING(lc.Text FROM 1 FOR 100) ELSE NULL END AS RecentTopCommentSnippet,
+    CHAR_LENGTH(COALESCE(p.Title, '')) + COALESCE((SELECT COUNT(DISTINCT v2.Id) FROM Votes v2 WHERE v2.PostId = p.Id),0) AS TitleVoteComplexLengthExpression  
+FROM FilteredPosts p
+INNER JOIN ComplexUserStats pts ON pts.Id = p.OwnerUserId
+LEFT JOIN PostsWithCloseReason cs ON cs.PostId = p.Id
+LEFT JOIN PostWithAcceptedAndScoreAdjustment pwa ON pwa.Id = p.Id
+LEFT JOIN QuestionVotesExamine qve ON qve.QuestionId = CASE WHEN p.PostTypeId = 1 THEN p.Id ELSE p.ParentId END
+LEFT JOIN RelevantAnswerCounts par ON par.QuestionId = CASE WHEN p.PostTypeId = 1 THEN p.Id ELSE p.ParentId END
+LEFT JOIN (
+    SELECT u.Id AS UserId, u.DisplayName, CASE WHEN COUNT(v.Id) > 5 THEN 'ActiveVoter' ELSE 'Occasional' END AS UserMark
+    FROM Users u 
+    LEFT JOIN Votes v ON v.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName
+) lbl ON lbl.UserId = p.OwnerUserId
+LEFT JOIN LatestComments lc ON lc.PostId = p.Id AND lc.CommentRank = 1
+LEFT JOIN TopTagPairs ttp ON ttp.TagA = ANY(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><'))
+                          AND ttp.TagB = ANY(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><'))
+WHERE p.Score > (
+    SELECT AVG(Score) FROM Posts WHERE Posts.PostTypeId = p.PostTypeId AND Posts.OwnerUserId = p.OwnerUserId
+)
+AND (p.ClosedDate IS NULL OR p.ClosedDate > CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '6 months')
+ORDER BY pts.UserRankWithinReputation, pwa.AdjustedScore DESC
+LIMIT 100;

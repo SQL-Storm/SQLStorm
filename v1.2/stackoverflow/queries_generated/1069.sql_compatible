@@ -1,0 +1,186 @@
+with RecursiveTagHierarchy as (
+    select
+        t.Id,
+        t.TagName,
+        array[t.TagName] as TagPath,
+        1 as Depth
+    from Tags t
+    where not t.IsModeratorOnly = true
+
+    union all
+
+    select
+        t.Id,
+        t.TagName,
+        r.TagPath || t.TagName,
+        r.Depth + 1
+    from Tags t
+    join RecursiveTagHierarchy r on t.Id > r.Id and t.IsRequired = 0
+    where r.Depth < 3
+),
+UserPostStats as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionCount,
+        count(distinct p.Id) filter (where p.PostTypeId = 2) as AnswerCount,
+        sum(p.Score) filter (where p.PostTypeId in (1,2)) as TotalPostScore,
+        avg(p.ViewCount) filter (where p.PostTypeId = 1) as AvgQuestionViewCount,
+        max(p.CreationDate) filter (where p.PostTypeId in (1,2)) as LastPostDate
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    group by u.Id, u.DisplayName
+),
+TopQuestionsByTag as (
+    select
+        r.TagName,
+        p.Id as QuestionId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        dense_rank() over (partition by r.TagName order by p.Score desc, p.ViewCount desc) as RankByScoreView
+    from RecursiveTagHierarchy r
+    join Posts p on p.PostTypeId = 1 and p.Tags like concat('%<', r.TagName, '>%')
+    where r.Depth = 1
+),
+QuestionAnswerStats as (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        q.OwnerUserId as QuestionOwner,
+        count(a.Id) as AnswerCount,
+        max(a.Score) as MaxAnswerScore,
+        avg(a.Score) as AvgAnswerScore,
+        sum(case when a.Score > 0 then 1 else 0 end) as PositiveAnswerCount,
+        sum(case when a.Score <= 0 then 1 else 0 end) as NonPositiveAnswerCount
+    from Posts q
+    left join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+    where q.PostTypeId = 1
+    group by q.Id, q.Title, q.OwnerUserId
+),
+BadgeRanks as (
+    select
+        b.UserId,
+        b.Name,
+        b.Class,
+        row_number() over (partition by b.UserId order by b.Date desc) as RecentBadgeRank
+    from Badges b
+),
+UserCommentSummary as (
+    select
+        c.UserId,
+        count(c.Id) as TotalComments,
+        avg(c.Score) as AvgCommentScore,
+        max(c.CreationDate) as LastCommentDate,
+        count(distinct c.PostId) as UniquePostsCommented
+    from Comments c
+    group by c.UserId
+),
+UserVoteAggregates as (
+    select
+        v.UserId,
+        v.VoteTypeId,
+        count(*) as VoteCount,
+        sum(case when v.BountyAmount is not null then v.BountyAmount else 0 end) as TotalBountyAmount
+    from Votes v
+    group by v.UserId, v.VoteTypeId
+),
+PostClosingReasons as (
+    select
+        p.Id as PostId,
+        p.Title,
+        p.OwnerUserId,
+        cast(ph.Comment as integer) as CloseReasonId,
+        cr.Name as CloseReasonName,
+        ph.CreationDate as CloseDate
+    from Posts p
+    join PostHistory ph on ph.PostId = p.Id and ph.PostHistoryTypeId = 10
+    left join CloseReasonTypes cr on cr.Id = cast(ph.Comment as integer)
+),
+UserActivityWindow as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        ph.PostId,
+        ph.PostHistoryTypeId,
+        ph.CreationDate,
+        lag(ph.CreationDate) over (partition by u.Id order by ph.CreationDate) as PreviousActionDate,
+        lead(ph.CreationDate) over (partition by u.Id order by ph.CreationDate) as NextActionDate
+    from Users u
+    left join PostHistory ph on ph.UserId = u.Id
+),
+UserSummary as (
+    select
+        ups.UserId,
+        ups.DisplayName,
+        ups.QuestionCount,
+        ups.AnswerCount,
+        ups.TotalPostScore,
+        ups.AvgQuestionViewCount,
+        ups.LastPostDate,
+        coalesce(us.TotalComments,0) as TotalComments,
+        coalesce(us.AvgCommentScore,0) as AvgCommentScore,
+        coalesce(votesUp.VoteCount,0) as UpVotesCast,
+        coalesce(votesDown.VoteCount,0) as DownVotesCast,
+        coalesce(badgesGold.RecentGold,0) as RecentGoldBadges,
+        coalesce(badgesSilver.RecentSilver,0) as RecentSilverBadges,
+        coalesce(badgesBronze.RecentBronze,0) as RecentBronzeBadges,
+        coalesce(closedQ.ClosedQuestionCount,0) as ClosedQuestionsCount
+    from UserPostStats ups
+    left join UserCommentSummary us on us.UserId = ups.UserId
+    left join (
+        select UserId, VoteCount from UserVoteAggregates where VoteTypeId = 2
+    ) votesUp on votesUp.UserId = ups.UserId
+    left join (
+        select UserId, VoteCount from UserVoteAggregates where VoteTypeId = 3
+    ) votesDown on votesDown.UserId = ups.UserId
+    left join (
+        select UserId, count(*) as RecentGold from Badges where Class = 1 and Date >= cast('2024-10-01' as date) - interval '90 days' group by UserId
+    ) badgesGold on badgesGold.UserId = ups.UserId
+    left join (
+        select UserId, count(*) as RecentSilver from Badges where Class = 2 and Date >= cast('2024-10-01' as date) - interval '90 days' group by UserId
+    ) badgesSilver on badgesSilver.UserId = ups.UserId
+    left join (
+        select UserId, count(*) as RecentBronze from Badges where Class = 3 and Date >= cast('2024-10-01' as date) - interval '90 days' group by UserId
+    ) badgesBronze on badgesBronze.UserId = ups.UserId
+    left join (
+        select OwnerUserId, count(*) as ClosedQuestionCount from PostClosingReasons group by OwnerUserId
+    ) closedQ on closedQ.OwnerUserId = ups.UserId
+)
+select
+    us.UserId,
+    us.DisplayName,
+    us.QuestionCount,
+    us.AnswerCount,
+    us.TotalPostScore,
+    us.AvgQuestionViewCount,
+    us.LastPostDate,
+    us.TotalComments,
+    us.AvgCommentScore,
+    us.UpVotesCast,
+    us.DownVotesCast,
+    us.RecentGoldBadges,
+    us.RecentSilverBadges,
+    us.RecentBronzeBadges,
+    us.ClosedQuestionsCount,
+    tq.TagName,
+    count(distinct tq.QuestionId) as QuestionsPerTag,
+    avg(tq.Score) as AvgQuestionScorePerTag,
+    max(qas.MaxAnswerScore) as MaxAnswerScoreOnQuestions,
+    sum(qas.AnswerCount) as TotalAnswersOnUserQuestions,
+    max(rh.Depth) as MaxTagHierarchyDepth
+from UserSummary us
+left join Posts p on p.OwnerUserId = us.UserId and p.PostTypeId = 1
+left join TopQuestionsByTag tq on tq.OwnerUserId = us.UserId
+left join QuestionAnswerStats qas on qas.QuestionId = tq.QuestionId
+left join RecursiveTagHierarchy rh on rh.TagName = tq.TagName
+where us.QuestionCount > 10
+  and (us.RecentGoldBadges + us.RecentSilverBadges + us.RecentBronzeBadges) > 0
+  and us.ClosedQuestionsCount < 5
+group by us.UserId, us.DisplayName, us.QuestionCount, us.AnswerCount, us.TotalPostScore, us.AvgQuestionViewCount, us.LastPostDate,
+         us.TotalComments, us.AvgCommentScore, us.UpVotesCast, us.DownVotesCast, us.RecentGoldBadges, us.RecentSilverBadges, us.RecentBronzeBadges, us.ClosedQuestionsCount, tq.TagName
+having avg(tq.Score) > 3
+order by MaxTagHierarchyDepth desc, QuestionsPerTag desc, us.TotalPostScore desc
+limit 50;

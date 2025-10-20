@@ -1,0 +1,148 @@
+WITH RecursiveUserActivity AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionCount,
+        COUNT(DISTINCT p2.Id) FILTER (WHERE p2.PostTypeId = 2) AS AnswerCount,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END), 0) AS TotalUpVotes,
+        COALESCE(SUM(CASE WHEN v2.VoteTypeId = 3 THEN 1 ELSE 0 END), 0) AS TotalDownVotes,
+        RANK() OVER (ORDER BY u.Reputation DESC) AS ReputationRank,
+        ROW_NUMBER() OVER (PARTITION BY u.Location ORDER BY u.Reputation DESC) AS LocationRepRank,
+        COALESCE(AVG(p.Score) FILTER (WHERE p.Id IS NOT NULL), 0) AS AvgQuestionScore,
+        COALESCE(AVG(p2.Score) FILTER (WHERE p2.Id IS NOT NULL), 0) AS AvgAnswerScore,
+        COALESCE(STRING_AGG(DISTINCT badge.Name || ' (Class ' || CAST(badge.Class AS VARCHAR) || ')', ', '), '') AS BadgesEarned,
+        CASE WHEN MAX(badge.Date) > (CAST('2024-10-01' AS date) - INTERVAL '180 days') THEN 1 ELSE 0 END AS RecentBadgeEarned
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id AND p.PostTypeId = 1
+    LEFT JOIN Posts p2 ON p2.OwnerUserId = u.Id AND p2.PostTypeId = 2
+    LEFT JOIN Votes v ON v.PostId = p.Id AND v.VoteTypeId = 2
+    LEFT JOIN Votes v2 ON v2.PostId = p2.Id AND v2.VoteTypeId = 3
+    LEFT JOIN Badges badge ON badge.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Location
+), DuplicateLinkedPostsCTE AS (
+    SELECT pl.PostId, pl.RelatedPostId, pl.LinkTypeId, pi.Score, pt.Name AS PostTypeName
+    FROM PostLinks pl
+    JOIN Posts pi ON pl.PostId = pi.Id
+    JOIN PostTypes pt ON pi.PostTypeId = pt.Id
+    WHERE pl.LinkTypeId IN (1, 3)
+), PostsWithActivityCounts AS (
+    SELECT
+        p.Id,
+        p.PostTypeId,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        COALESCE(ac.CommentCount,0) AS TotalCommentCount,
+        COALESCE(vc.UpVotes,0) AS TotalUpVotes,
+        COALESCE(vc.DownVotes,0) AS TotalDownVotes,
+        CARDINALITY(string_to_array(COALESCE(p.Tags, ''), '>')) AS NumTagsDetected
+    FROM Posts p
+    LEFT JOIN (
+        SELECT PostId, COUNT(*) AS CommentCount
+        FROM Comments
+        GROUP BY PostId
+    ) ac ON ac.PostId = p.Id
+    LEFT JOIN (
+        SELECT PostId,
+            SUM(CASE WHEN VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+            SUM(CASE WHEN VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes
+        FROM Votes
+        GROUP BY PostId
+    ) vc ON vc.PostId = p.Id
+), QuestionsWithAnswerStats AS (
+    SELECT
+        q.Id,
+        q.Title,
+        q.OwnerUserId,
+        q.Score,
+        q.ViewCount,
+        q.AnswerCount,
+        q.Tags,
+        COALESCE(ans.AnswersWithScoreOver5, 0) AS AnswersWithScoreOver5,
+        COALESCE(ans.MaxAnswerScore, 0) AS MaxAnswerScore,
+        ans.MinAnswerScore AS MinAnswerScore,
+        COALESCE(ans.AvgAnswerScore, 0) AS AvgAnswerScore,
+        u.Reputation AS UserReputation,
+        ROW_NUMBER() OVER (ORDER BY (q.Score * COALESCE(1,1) + GREATEST(COALESCE(q.AnswerCount,0),1) * (1 - COALESCE(0,0))) DESC) AS TrendingRank
+    FROM Posts q 
+    LEFT JOIN Users u ON u.Id = q.OwnerUserId
+    LEFT JOIN (
+        SELECT ParentId,
+            COUNT(CASE WHEN Score > 5 THEN 1 END) AS AnswersWithScoreOver5,
+            MAX(Score) AS MaxAnswerScore,
+            MIN(Score) AS MinAnswerScore,
+            AVG(Score) AS AvgAnswerScore
+        FROM Posts
+        WHERE PostTypeId = 2
+        GROUP BY ParentId
+    ) ans ON q.Id = ans.ParentId
+    WHERE q.PostTypeId = 1 AND q.CreationDate >= (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '2 years')
+), PostsCTEWithFlags AS (
+    SELECT 
+      p.*,
+      LAG(p.Score) OVER w AS PrevScore,
+      LEAD(p.Score) OVER w AS NextScore,
+      ROW_NUMBER() OVER w AS RowIdx,
+      COUNT(*) OVER w AS WndSize,
+      CASE WHEN COALESCE(p.UpVotes,0) >= COALESCE(p.DownVotes,0) * 3 THEN TRUE ELSE FALSE END AS HighlyUpvoted,
+      CASE WHEN p.Score >= 10 THEN TRUE ELSE FALSE END AS HotScoreFlag
+    FROM Posts p
+    WINDOW w AS (
+        PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC ROWS BETWEEN 3 PRECEDING AND CURRENT ROW)
+)
+SELECT DISTINCT
+    u.UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.QuestionCount,
+    u.AnswerCount,
+    u.TotalUpVotes,
+    u.TotalDownVotes,
+    u.ReputationRank,
+    u.LocationRepRank,
+    COALESCE(SUBSTRING(u.BadgesEarned FROM 1 FOR 100), '') AS FirstHundredBadgeChars,
+    CONCAT(COALESCE(u.DisplayName, 'unknown_user'), '-', CAST(u.Reputation AS VARCHAR), '-', u.BadgesEarned) AS EncryptedHeroBadgeString,
+    q.Id AS QuestionId,
+    q.Title AS QuestionTitle,
+    q.Score AS QuestionScore,
+    q.AnswersWithScoreOver5,
+    q.MaxAnswerScore,
+    q.MinAnswerScore,
+    q.AvgAnswerScore,
+    q.UserReputation,
+    qlp.PostId AS LinkedDuplicatePostId,
+    qlp.RelatedPostId AS DuplicateReferencePostId,
+    ul.LastEditorUserId AS LastEditAuthor,
+    sqljson.PostCountPerUser AS NumberOfPosts,
+    CASE WHEN qc.CloseCount > 2 THEN TRUE ELSE FALSE END AS HasManyCloseVotes,
+    pwa.HotScoreFlag,
+    pwa.PrevScore,
+    pwa.NextScore,
+    COALESCE(NULLIF(pwa.OtherColumn, ''), 'DefaultVal') AS ColumnValueProcessed
+FROM RecursiveUserActivity u
+INNER JOIN QuestionsWithAnswerStats q ON q.OwnerUserId = u.UserId
+LEFT JOIN DuplicateLinkedPostsCTE qlp ON qlp.PostId = q.Id AND qlp.LinkTypeId = 3
+LEFT JOIN PostsCTEWithFlags pwa ON pwa.Id = q.Id
+LEFT JOIN (
+    SELECT PostId, COUNT(*) AS CloseCount
+    FROM PostHistory
+    WHERE PostHistoryTypeId = 10
+    GROUP BY PostId
+) qc ON qc.PostId = q.Id
+LEFT JOIN (
+    SELECT OwnerUserId, COUNT(Id) AS PostCountPerUser
+    FROM Posts
+    GROUP BY OwnerUserId
+) sqljson ON sqljson.OwnerUserId = u.UserId
+LEFT JOIN (
+    SELECT PostId, MAX(LastEditorUserId) AS LastEditorUserId FROM Posts GROUP BY PostId
+) ul ON ul.PostId = q.Id
+LEFT JOIN PostLinks pl ON pl.PostId = q.Id AND pl.LinkTypeId = 1
+LEFT JOIN Votes v2filter ON v2filter.PostId = q.Id
+WHERE u.Reputation > 5000
+  AND q.Score >= 5
+  AND (POSITION('<spam>' IN COALESCE(q.Tags, '')) = 0)
+  AND q.CreationDate BETWEEN (CAST('2024-10-01' AS date) - INTERVAL '365 day') AND CAST('2024-10-01' AS date)
+ORDER BY u.ReputationRank, q.Score DESC
+LIMIT 100;

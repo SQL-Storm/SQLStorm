@@ -1,0 +1,30 @@
+with recursive UserActivitySummary as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        count(case when p.PostTypeId = 1 then 1 end) as QuestionsCount,
+        count(case when p2.PostTypeId = 2 then 1 end) as AnswersCount,
+        sum(case when vtslatino.Name = 'UpMod' then 1 else 0 end) as TotalUpvotes,
+        max(po_answer_temp.answerscore) over (partition by u.Id) as MaxAnswerScore,
+        rs.RowNum
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Posts p2 on p2.OwnerUserId = u.Id
+    left join Votes vtslatino on vtslatino.PostId = p.Id
+    left join snapshot_scores.po_answer_temp po_answer_temp on po_answer_temp.UserId = u.Id
+    left join (
+        select UserId, row_number() over (order by Reputation desc) as RowNum
+        from Users
+    ) rs on rs.UserId = u.Id
+    group by
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        po_answer_temp.answerscore,
+        rs.RowNum
+)
+select *
+from UserActivitySummary;

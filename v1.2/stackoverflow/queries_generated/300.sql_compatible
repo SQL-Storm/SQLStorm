@@ -1,0 +1,204 @@
+with RecursiveTagHierarchy as (
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        1 as Level,
+        cast(t.TagName as varchar(1000)) as Path
+    from Tags t
+    where t.IsModeratorOnly = false and t.IsRequired = false
+    union all
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        r.Level + 1,
+        r.Path || ' > ' || t.TagName
+    from Tags t
+    join RecursiveTagHierarchy r on t.Id = r.Id + 1
+    where r.Level < 3
+),
+UserBadgeCounts as (
+    select
+        b.UserId,
+        b.Class,
+        count(*) as BadgeCount
+    from Badges b
+    group by b.UserId, b.Class
+),
+UserAggregates as (
+    select
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.Location,
+        coalesce(ubc_gold.BadgeCount,0) as GoldBadges,
+        coalesce(ubc_silver.BadgeCount,0) as SilverBadges,
+        coalesce(ubc_bronze.BadgeCount,0) as BronzeBadges,
+        row_number() over (order by u.Reputation desc, u.CreationDate) as UserRank
+    from Users u
+    left join UserBadgeCounts ubc_gold on u.Id = ubc_gold.UserId and ubc_gold.Class = 1
+    left join UserBadgeCounts ubc_silver on u.Id = ubc_silver.UserId and ubc_silver.Class = 2
+    left join UserBadgeCounts ubc_bronze on u.Id = ubc_bronze.UserId and ubc_bronze.Class = 3
+),
+PostStats as (
+    select
+        p.OwnerUserId,
+        count(*) filter (where p.PostTypeId = 1) as QuestionCount,
+        count(*) filter (where p.PostTypeId = 2) as AnswerCount,
+        avg(p.Score) filter (where p.PostTypeId in (1,2)) as AvgScore,
+        max(p.ViewCount) filter (where p.PostTypeId = 1) as MaxQuestionViews,
+        sum(p.FavoriteCount) filter (where p.PostTypeId = 1) as TotalFavorites,
+        sum(case when p.ClosedDate is not null then 1 else 0 end) filter (where p.PostTypeId = 1) as ClosedQuestions
+    from Posts p
+    group by p.OwnerUserId
+),
+TopPostsPerUser as (
+    select distinct on (p.OwnerUserId)
+        p.OwnerUserId,
+        p.Id as TopPostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate
+    from Posts p
+    where p.PostTypeId = 1
+    order by p.OwnerUserId, p.Score desc, p.ViewCount desc, p.CreationDate desc
+),
+PostCommentsAgg as (
+    select
+        c.PostId,
+        count(*) as CommentCount,
+        max(c.Score) as MaxCommentScore,
+        string_agg(distinct coalesce(c.UserDisplayName, 'Anonymous'), ', ') as Commenters
+    from Comments c
+    group by c.PostId
+),
+PostLinkDuplicates as (
+    select
+        pl.PostId,
+        count(*) filter (where lt.Name = 'Duplicate') as DuplicateCount,
+        count(*) filter (where lt.Name = 'Linked') as LinkedCount
+    from PostLinks pl
+    join LinkTypes lt on pl.LinkTypeId = lt.Id
+    group by pl.PostId
+),
+UserActivityWindow as (
+    select
+        p.OwnerUserId,
+        p.Id as PostId,
+        p.PostTypeId,
+        p.CreationDate,
+        lead(p.CreationDate) over (partition by p.OwnerUserId order by p.CreationDate) as NextPostDate,
+        lag(p.CreationDate) over (partition by p.OwnerUserId order by p.CreationDate) as PrevPostDate
+    from Posts p
+    where p.OwnerUserId is not null
+),
+UserPostIntervals as (
+    select
+        OwnerUserId,
+        avg(extract(epoch from (NextPostDate - CreationDate))) as AvgIntervalSeconds,
+        avg(extract(epoch from (CreationDate - PrevPostDate))) as AvgPrevIntervalSeconds
+    from UserActivityWindow
+    where NextPostDate is not null and PrevPostDate is not null
+    group by OwnerUserId
+),
+ClosedQuestionReasons as (
+    select
+        ph.PostId,
+        crt.Name as CloseReason,
+        count(*) as CloseVotesCount
+    from PostHistory ph
+    join CloseReasonTypes crt on try_cast(ph.Comment as integer) = crt.Id and ph.PostHistoryTypeId = 10
+    group by ph.PostId, crt.Name
+),
+UserCloseReasonSummary as (
+    select
+        p.OwnerUserId,
+        cr.CloseReason,
+        sum(cr.CloseVotesCount) as TotalCloseVotes
+    from Posts p
+    left join ClosedQuestionReasons cr on p.Id = cr.PostId
+    where p.PostTypeId = 1
+    group by p.OwnerUserId, cr.CloseReason
+),
+UserSummary as (
+    select
+        ua.Id as UserId,
+        ua.DisplayName,
+        ua.Reputation,
+        ua.GoldBadges,
+        ua.SilverBadges,
+        ua.BronzeBadges,
+        coalesce(ps.QuestionCount,0) as QuestionCount,
+        coalesce(ps.AnswerCount,0) as AnswerCount,
+        coalesce(ps.AvgScore,0) as AvgPostScore,
+        coalesce(ps.MaxQuestionViews,0) as MaxQuestionViews,
+        coalesce(ps.TotalFavorites,0) as TotalFavorites,
+        coalesce(ps.ClosedQuestions,0) as ClosedQuestions,
+        coalesce(upi.AvgIntervalSeconds,0) as AvgPostIntervalSeconds,
+        coalesce(upi.AvgPrevIntervalSeconds,0) as AvgPrevPostIntervalSeconds,
+        coalesce(tpp.Title, '') as TopQuestionTitle,
+        coalesce(tpp.Score, 0) as TopQuestionScore,
+        coalesce(tpp.ViewCount, 0) as TopQuestionViews,
+        coalesce(tpp.CreationDate, timestamp '1970-01-01') as TopQuestionDate
+    from UserAggregates ua
+    left join PostStats ps on ua.Id = ps.OwnerUserId
+    left join UserPostIntervals upi on ua.Id = upi.OwnerUserId
+    left join TopPostsPerUser tpp on ua.Id = tpp.OwnerUserId
+)
+select
+    us.UserId,
+    us.DisplayName,
+    us.Reputation,
+    us.GoldBadges,
+    us.SilverBadges,
+    us.BronzeBadges,
+    us.QuestionCount,
+    us.AnswerCount,
+    us.AvgPostScore,
+    us.MaxQuestionViews,
+    us.TotalFavorites,
+    us.ClosedQuestions,
+    us.AvgPostIntervalSeconds,
+    us.AvgPrevPostIntervalSeconds,
+    us.TopQuestionTitle,
+    us.TopQuestionScore,
+    us.TopQuestionViews,
+    us.TopQuestionDate,
+    coalesce(ucr.CloseReason, 'No Close Votes') as MostCommonCloseReason,
+    coalesce(ucr.TotalCloseVotes, 0) as CloseVotesForReason,
+    coalesce(pld.DuplicateCount, 0) as DuplicateLinksOnTopQuestion,
+    coalesce(pld.LinkedCount, 0) as LinkedPostsOnTopQuestion,
+    case
+        when us.Reputation > 10000 then 'Expert'
+        when us.Reputation > 1000 then 'Intermediate'
+        else 'Beginner'
+    end as UserLevel,
+    case
+        when us.ClosedQuestions > 10 then 'High Closure Rate'
+        when us.ClosedQuestions > 0 then 'Moderate Closure Rate'
+        else 'Low Closure Rate'
+    end as ClosureRateCategory
+from UserSummary us
+left join (
+    select
+        p.OwnerUserId,
+        cr.CloseReason,
+        sum(cr.CloseVotesCount) as TotalCloseVotes,
+        row_number() over (partition by p.OwnerUserId order by sum(cr.CloseVotesCount) desc) as rn
+    from Posts p
+    left join ClosedQuestionReasons cr on p.Id = cr.PostId
+    where p.PostTypeId = 1
+    group by p.OwnerUserId, cr.CloseReason
+) ucr on us.UserId = ucr.OwnerUserId and ucr.rn = 1
+left join TopPostsPerUser tpp on us.UserId = tpp.OwnerUserId
+left join PostLinkDuplicates pld on tpp.TopPostId = pld.PostId
+where us.QuestionCount > 5
+order by us.Reputation desc, us.GoldBadges desc, us.SilverBadges desc
+limit 100;

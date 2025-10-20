@@ -1,0 +1,154 @@
+with RecursiveUserActivity as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        p.Id as PostId,
+        p.PostTypeId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate as PostCreationDate,
+        row_number() over (partition by u.Id order by p.CreationDate) as PostNumber,
+        count(*) over (partition by u.Id) as TotalPosts
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    where u.Reputation > 1000
+),
+UserBadgeStats as (
+    select 
+        b.UserId,
+        count(case when b.Class = 1 then 1 end) as GoldBadges,
+        count(case when b.Class = 2 then 1 end) as SilverBadges,
+        count(case when b.Class = 3 then 1 end) as BronzeBadges,
+        max(b.Date) as LastBadgeDate
+    from Badges b
+    group by b.UserId
+),
+PostLinkSummary as (
+    select
+        pl.PostId,
+        count(distinct case when lt.Name = 'Duplicate' then pl.RelatedPostId end) as DuplicateCount,
+        count(distinct case when lt.Name = 'Linked' then pl.RelatedPostId end) as LinkedCount
+    from PostLinks pl
+    join LinkTypes lt on pl.LinkTypeId = lt.Id
+    group by pl.PostId
+),
+TopTags as (
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        coalesce(p.ScoreSum,0) as ScoreSum
+    from Tags t
+    left join (
+        select 
+            unnest(string_to_array(substring(p.Tags from 2 for length(p.Tags)-2), '><')) as Tag,
+            sum(p.Score) as ScoreSum
+        from Posts p
+        where p.PostTypeId = 1 and p.Tags is not null
+        group by Tag
+    ) p on t.TagName = p.Tag
+    where t.Count > 1000
+    order by ScoreSum desc
+    limit 10
+),
+UserCommentAgg as (
+    select 
+        c.UserId,
+        count(*) as CommentCount,
+        avg(char_length(c.Text)) as AvgCommentLength,
+        max(c.CreationDate) as LastCommentDate
+    from Comments c
+    where c.UserId is not null
+    group by c.UserId
+),
+PostHistoryCloseEvents as (
+    select 
+        ph.PostId,
+        count(case when ph.PostHistoryTypeId = 10 then 1 end) as CloseVotes,
+        count(case when ph.PostHistoryTypeId = 11 then 1 end) as ReopenVotes,
+        bool_or(ph.PostHistoryTypeId = 10 and (ph.Comment ~ '^(101|102|103)$')) as HasCurrentCloseReason
+    from PostHistory ph
+    group by ph.PostId
+)
+select 
+    u.Id as UserId,
+    u.DisplayName,
+    u.Reputation,
+    uba.GoldBadges,
+    uba.SilverBadges,
+    uba.BronzeBadges,
+    ua.TotalPosts,
+    ua.PostNumber,
+    ua.PostId,
+    ua.PostTypeId,
+    ua.Score,
+    ua.ViewCount,
+    ua.PostCreationDate,
+    pls.DuplicateCount,
+    pls.LinkedCount,
+    t.TagName,
+    t.ScoreSum as TagScoreSum,
+    uca.CommentCount,
+    uca.AvgCommentLength,
+    uca.LastCommentDate,
+    phce.CloseVotes,
+    phce.ReopenVotes,
+    phce.HasCurrentCloseReason,
+    case 
+        when ua.Score > 100 then 'High Score'
+        when ua.Score between 50 and 100 then 'Medium Score'
+        else 'Low Score'
+    end as ScoreCategory,
+    substring(cast(ua.PostId as text) || '-' || coalesce(u.DisplayName, 'Unknown') || '-' || coalesce(t.TagName, '') from 1 for 50) as CompositeString,
+    coalesce(ua.PostCreationDate, timestamp '2024-10-01 12:34:56') - u.CreationDate as UserPostAgeInterval,
+    rank() over (partition by u.Id order by ua.Score desc nulls last) as PostScoreRank,
+    dense_rank() over (order by u.Reputation desc) as UserReputationRank
+from RecursiveUserActivity ua
+join Users u on ua.UserId = u.Id
+left join UserBadgeStats uba on uba.UserId = u.Id
+left join PostLinkSummary pls on pls.PostId = ua.PostId
+left join TopTags t on strpos(cast(ua.PostId as text) || ' ' || coalesce(cast(ua.PostTypeId as text), ''), t.TagName) > 0
+left join UserCommentAgg uca on uca.UserId = u.Id
+left join PostHistoryCloseEvents phce on phce.PostId = ua.PostId
+where ua.PostNumber <= 5
+  and (ua.PostTypeId = 1 or ua.PostTypeId = 2)
+
+union
+
+select 
+    u.Id as UserId,
+    u.DisplayName,
+    u.Reputation,
+    0 as GoldBadges,
+    0 as SilverBadges,
+    0 as BronzeBadges,
+    0 as TotalPosts,
+    0 as PostNumber,
+    NULL::bigint as PostId,
+    NULL::integer as PostTypeId,
+    NULL::integer as Score,
+    NULL::integer as ViewCount,
+    NULL::timestamp as PostCreationDate,
+    NULL::integer as DuplicateCount,
+    NULL::integer as LinkedCount,
+    NULL::text as TagName,
+    NULL::numeric as TagScoreSum,
+    NULL::integer as CommentCount,
+    NULL::numeric as AvgCommentLength,
+    NULL::timestamp as LastCommentDate,
+    NULL::integer as CloseVotes,
+    NULL::integer as ReopenVotes,
+    NULL::boolean as HasCurrentCloseReason,
+    NULL::text as ScoreCategory,
+    NULL::text as CompositeString,
+    NULL::interval as UserPostAgeInterval,
+    NULL::bigint as PostScoreRank,
+    dense_rank() over (order by u.Reputation desc) as UserReputationRank
+from Users u
+where not exists (
+    select 1 from Posts p where p.OwnerUserId = u.Id
+)
+order by UserReputationRank, PostScoreRank, UserId
+limit 100;

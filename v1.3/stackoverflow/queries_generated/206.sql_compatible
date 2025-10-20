@@ -1,0 +1,114 @@
+WITH
+posts_cte AS (
+  SELECT p.*,
+    CASE WHEN p.Tags IS NOT NULL THEN string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><') ELSE NULL END AS tags_array
+  FROM Posts p
+),
+user_base AS (
+  SELECT u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate
+  FROM Users u
+  WHERE u.Reputation IS NOT NULL
+),
+user_post_agg AS (
+  SELECT p.Id AS PostId, p.OwnerUserId AS UserId, p.PostTypeId, p.CreationDate, p.Score, p.ViewCount, p.ParentId, p.AcceptedAnswerId, p.Title, p.tags_array
+  FROM posts_cte p
+),
+question_first_answer AS (
+  SELECT q.OwnerUserId AS UserId, q.Id AS QuestionId,
+    MIN(EXTRACT(EPOCH FROM (a.CreationDate - q.CreationDate))) AS first_answer_seconds
+  FROM Posts q
+  JOIN Posts a ON a.ParentId = q.Id AND a.PostTypeId = 2
+  WHERE q.PostTypeId = 1 AND q.OwnerUserId IS NOT NULL
+  GROUP BY q.OwnerUserId, q.Id
+),
+user_first_answer_stats AS (
+  SELECT UserId, AVG(first_answer_seconds) AS avg_response_seconds, MIN(first_answer_seconds) AS min_response_seconds, MAX(first_answer_seconds) AS max_response_seconds
+  FROM question_first_answer
+  GROUP BY UserId
+),
+user_tag_exploded AS (
+  SELECT upa.UserId, lower(trim(regexp_replace(tag, '\s+', ' ', 'g'))) AS tag
+  FROM user_post_agg upa
+  JOIN LATERAL (
+    SELECT unnest(upa.tags_array) AS tag
+  ) t ON upa.tags_array IS NOT NULL
+),
+user_metrics AS (
+  SELECT ub.Id AS UserId, ub.DisplayName, ub.Reputation, ub.CreationDate, ub.LastAccessDate,
+    COUNT(p.PostId) FILTER (WHERE p.PostTypeId = 1) AS question_count,
+    COUNT(p.PostId) FILTER (WHERE p.PostTypeId = 2) AS answer_count,
+    COALESCE(SUM(p.Score),0) AS total_post_score,
+    COALESCE(SUM(p.ViewCount) FILTER (WHERE p.PostTypeId = 1),0) AS total_question_views,
+    COUNT(DISTINCT ute.tag) AS distinct_tags,
+    ufas.avg_response_seconds,
+    ufas.min_response_seconds,
+    ufas.max_response_seconds
+  FROM user_base ub
+  LEFT JOIN user_post_agg p ON p.UserId = ub.Id
+  LEFT JOIN user_tag_exploded ute ON ute.UserId = ub.Id
+  LEFT JOIN user_first_answer_stats ufas ON ufas.UserId = ub.Id
+  GROUP BY ub.Id, ub.DisplayName, ub.Reputation, ub.CreationDate, ub.LastAccessDate, ufas.avg_response_seconds, ufas.min_response_seconds, ufas.max_response_seconds
+),
+badge_score AS (
+  SELECT b.UserId,
+    SUM(CASE WHEN b.Class=1 THEN 50 WHEN b.Class=2 THEN 20 ELSE 5 END) AS badge_points,
+    COUNT(*) AS badge_count,
+    COUNT(*) FILTER (WHERE COALESCE(NULLIF(b.TagBased::text, ''), '0') = '1') AS tag_based_badges
+  FROM Badges b
+  GROUP BY b.UserId
+),
+votes_by_user AS (
+  SELECT p.OwnerUserId AS UserId,
+    SUM(CASE WHEN v.VoteTypeId=2 THEN 1 WHEN v.VoteTypeId=3 THEN -1 ELSE 0 END) AS vote_sum,
+    COUNT(v.Id) FILTER (WHERE v.VoteTypeId IN (2,3)) AS vote_count
+  FROM Votes v
+  LEFT JOIN Posts p ON p.Id = v.PostId
+  GROUP BY p.OwnerUserId
+),
+history_density AS (
+  SELECT ph.UserId,
+    COUNT(*) AS history_edits,
+    SUM(CASE WHEN ph.PostHistoryTypeId IN (10,11,12,13) THEN 1 ELSE 0 END) AS moderation_events
+  FROM PostHistory ph
+  GROUP BY ph.UserId
+),
+top_badges AS (
+  SELECT UserId, Name, Class, Date,
+    ROW_NUMBER() OVER (PARTITION BY UserId ORDER BY Class, Date DESC) rn
+  FROM Badges
+),
+user_summary AS (
+  SELECT um.UserId, um.DisplayName, um.Reputation, um.question_count, um.answer_count, um.total_post_score,
+    um.total_question_views, um.distinct_tags,
+    COALESCE(um.avg_response_seconds, NULL) AS avg_response_seconds,
+    COALESCE(bc.badge_points,0) AS badge_points, COALESCE(bc.badge_count,0) AS badge_count,
+    COALESCE(vu.vote_sum,0) AS vote_sum, COALESCE(vu.vote_count,0) AS vote_count,
+    COALESCE(hd.history_edits,0) AS history_edits, COALESCE(hd.moderation_events,0) AS moderation_events,
+    COALESCE((SELECT string_agg(Name, ' | ' ORDER BY Date DESC) FROM top_badges tb WHERE tb.UserId = um.UserId AND tb.rn <= 5), '') AS recent_badges,
+    (COALESCE(um.total_post_score,0) * 0.45) +
+    (COALESCE(bc.badge_points,0) * 0.25) +
+    (COALESCE(vu.vote_sum,0) * 0.2) -
+    (COALESCE(um.avg_response_seconds, NULL) / NULLIF(GREATEST(um.avg_response_seconds,86400),0) * 10.0) +
+    (LEAST(um.question_count + um.answer_count, 100) * 0.1) AS composite_score
+  FROM user_metrics um
+  LEFT JOIN badge_score bc ON bc.UserId = um.UserId
+  LEFT JOIN votes_by_user vu ON vu.UserId = um.UserId
+  LEFT JOIN history_density hd ON hd.UserId = um.UserId
+)
+SELECT us.UserId, us.DisplayName,
+  us.Reputation,
+  us.question_count, us.answer_count, us.total_post_score,
+  us.total_question_views,
+  us.distinct_tags,
+  CASE WHEN us.avg_response_seconds IS NULL THEN NULL ELSE CAST(round(us.avg_response_seconds) AS BIGINT) END AS avg_response_seconds_seconds,
+  us.badge_points, us.badge_count, us.recent_badges,
+  us.vote_sum, us.vote_count, us.history_edits, us.moderation_events,
+  us.composite_score,
+  rank() OVER (ORDER BY us.composite_score DESC NULLS LAST) AS overall_rank,
+  dense_rank() OVER (ORDER BY us.question_count DESC) AS question_rank,
+  row_number() OVER (ORDER BY us.answer_count DESC, us.total_post_score DESC NULLS LAST) AS answer_rownum
+FROM user_summary us
+WHERE (us.question_count + us.answer_count) > 0
+  AND us.Reputation >= (SELECT COALESCE(PERCENTILE_CONT(0.25) WITHIN GROUP (ORDER BY Reputation), 0) FROM Users)
+ORDER BY us.composite_score DESC NULLS LAST, us.Reputation DESC
+LIMIT 50;

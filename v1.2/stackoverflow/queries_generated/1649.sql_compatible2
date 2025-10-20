@@ -1,0 +1,62 @@
+with leadingReasons as (
+    select Id as ToCloseReasonId,
+           dense_rank() over (order by Id) as RankInCloseReasons
+    from CloseReasonTypes
+),
+QuestionAnswerStats as (
+    select
+        q.Id as QuestionId,
+        q.Title as QuestionTitle,
+        q.CreationDate as QuestionCreated,
+        q.Tags,
+        aq.Id as AnswerId,
+        au.DisplayName as AnswerOwner,
+        au.Reputation as AnswerOwnerReputation,
+        count(distinct ph_recent.Id) filter (where ph_recent.PostHistoryTypeId in (4,5,6)) as NumberOfEdits,
+        row_number() over (partition by q.Id order by a.Score desc, a.CreationDate) as AnswerRank,
+        coalesce(cat.RankInCloseReasons, 9999) as CloseReasonPriority
+    from Posts q
+    left join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+    left join Posts aq on aq.Id = a.Id
+    left join Users au on au.Id = a.OwnerUserId
+    left join (
+        select ph.PostId, ph.PostHistoryTypeId,
+            row_number() over (partition by ph.PostId order by ph.CreationDate desc) as rn,
+            ph.Id
+        from PostHistory ph
+        where ph.PostHistoryTypeId in (4,5,6)
+    ) ph_recent on ph_recent.PostId = coalesce(a.Id, q.Id) and ph_recent.rn = 1
+    left join PostHistory ph on ph.PostId = a.Id or ph.PostId = q.Id
+    left join leadingReasons cat on cat.ToCloseReasonId = cast(ph.Comment as integer)
+    where q.PostTypeId = 1
+    group by
+        q.Id,
+        q.Title,
+        q.CreationDate,
+        q.Tags,
+        aq.Id,
+        au.DisplayName,
+        au.Reputation,
+        a.Score,
+        a.CreationDate,
+        cat.RankInCloseReasons,
+        ph_recent.Id,
+        ph_recent.PostHistoryTypeId
+),
+UserBadgesMold as (
+    select
+       ub.UserId,
+       ub.Name,
+       blr.TotalPoints / nullif(bl.SafeFactor,0) as AdjustedScoreBound,
+       lead(ub.Name) over (partition by ub.UserId order by HoldGrouped_StatusCount desc) as DescAlert
+    from (
+        select UserId, Name, count(*) as HoldGrouped_StatusCount
+        from Badges
+        group by UserId, Name
+    ) ub
+    left join BadgeLimits bl on bl.UserId = ub.UserId
+    left join BadgeLimitResults blr on blr.UserId = ub.UserId
+)
+select *
+from QuestionAnswerStats qas
+left join UserBadgesMold ubm on ubm.UserId = qas.AnswerOwnerReputation;

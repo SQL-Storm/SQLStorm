@@ -1,0 +1,179 @@
+-- {"query": "1382.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.3, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1628} 
+with RecursiveFilteredUsers as (
+    select 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.Location,
+        u.WebsiteUrl,
+        u.CreationDate,
+        u.LastAccessDate,
+        coalesce(badge_info.BadgeCount,0) as BadgeCount,
+        dense_rank() over (order by u.Reputation desc, coalesce(badge_info.BadgeCount,0) desc) as RankPrince
+    from Users u
+    left join (
+        select UserId, count(*) as BadgeCount
+        from Badges
+        where Class in (1,2) and TagBased = cast(0 as bit)
+        group by UserId
+    ) badge_info
+        on badge_info.UserId = u.Id
+    where u.Reputation > 1000
+), CTE_UserRecentActivePosts as (
+    select
+        p.OwnerUserId,
+        p.Id as PostId,
+        p.PostTypeId,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CreationDate,
+        p.LastActivityDate,
+        row_number() over (partition by p.OwnerUserId order by p.LastActivityDate desc nulls last) as rn_recent_post
+    from Posts p
+    where p.OwnerUserId in (select Id from RecursiveFilteredUsers)
+), CTE_AnswerParentLinks as (
+    select
+        an.Id as AnswerId,
+        an.ParentId as QuestionId,
+        q.Title as QuestionTitle,
+        q.Tags as QuestionTags,
+        an.Score as AnswerScore,
+        an.CreationDate as AnswerCreationDate,
+        aowner.DisplayName as AnswerOwner,
+        quser.DisplayName as QuestionOwner,
+        an.ViewCount as AnswerViewCount,
+        q.ViewCount as QuestionViewCount
+    from Posts an
+    left join Posts q on q.Id = an.ParentId and q.PostTypeId = 1
+    left join Users aowner on aowner.Id = an.OwnerUserId
+    left join Users quser on quser.Id = q.OwnerUserId
+    where an.PostTypeId = 2
+), CTE_TagPopularity as (
+    select
+        tag.TagName,
+        tag.Count,
+        q.Id as QuestionId,
+        q.Score,
+        row_number() over(partition by tag.TagName order by q.CreationDate desc) as TagTag_RN
+    from Tags tag
+    left join Posts q on q.Id = tag.ExcerptPostId and q.PostTypeId = 1
+    where tag.Count > 100
+), CTE_PostHistoryRecentEdit as (
+    select
+        ph.PostId,
+        ph.Id as PostHistoryId,
+        ph.PostHistoryTypeId,
+        phtype.Name as HistoryTypeName,
+        ph.CreationDate as EditDate,
+        ph.UserId,
+        u.DisplayName as EditorName,
+        ph.Comment,
+        ph.Text,
+        row_number() over (partition by ph.PostId order by ph.CreationDate desc) as recent_edit_rank
+    from PostHistory ph
+    inner join PostHistoryTypes phtype on phtype.Id = ph.PostHistoryTypeId
+    left join Users u on u.Id = ph.UserId
+    where ph.PostHistoryTypeId in (4,5,6)
+), CTE_ClosedQuestionSummary as (
+    select
+        p.Id as QuestionId,
+        p.Title,
+        p.CreationDate,
+        p.ClosedDate,
+        clr.Name as CloseReason,
+        ph.UserId as ClosedByUserId,
+        u.DisplayName as ClosedByUserName
+    from Posts p
+    inner join PostHistory ph on ph.PostId = p.Id and ph.PostHistoryTypeId = 10
+    left join CloseReasonTypes clr on clr.Id = cast(ph.Comment as int)
+    left join Users u on u.Id = ph.UserId
+    where p.PostTypeId = 1
+), CTE_DuplicateQuestionLinks as (
+    select distinct
+        pl.PostId as QuestionId,
+        pl.RelatedPostId as DuplicateOfId,
+        pl.CreationDate as DupLinkDate
+    from PostLinks pl
+    where pl.LinkTypeId = 3
+), BaseQuery as (
+    select
+        rf.Id as UserId,
+        rf.DisplayName as UserName,
+        rf.Reputation,
+        rf.Location,
+        rf.WebsiteUrl,
+        rf.BadgeCount,
+        urp.PostId as RecentPostId,
+        urp.Score as RecentPostScore,
+        urp.Views as RecentPostViews,
+        ctep.QuestionId,
+        ctep.Title as QuestionTitle,
+        coalesce(ctcq.CloseReason, 'Not Closed') as QuestionCloseReason,
+        coalesce(ctdl.DuplicateOfId, null) as DuplicateQuestionOf,
+        ctep.AnswerCount,
+        ctep.ViewCount,
+        ctep.LastActivityDate as QuestionLastActivity,
+        ph.LeadText,
+        concat_ws(' | ', left(ctep.Title, 40), substring(ctep.Tags from 2 for 255)) as TitleAndTagStr,
+        cter.HistoryTypeName,
+        cter.EditorName,
+        cter.EditDate,
+        phu.NAnswers,
+        phu.NActiveAnswers,
+        phu.NUnacceptedHighScoreAnswers
+    from RecursiveFilteredUsers rf
+    left join CTE_UserRecentActivePosts urp on urp.OwnerUserId = rf.Id and urp.rn_recent_post = 1
+    left join CTE_AnswerParentLinks ctep on ctep.QuestionId = urp.PostId
+    left join CTE_ClosedQuestionSummary ctcq on ctcq.QuestionId = ctep.QuestionId
+    left join CTE_DuplicateQuestionLinks ctdl on ctdl.QuestionId = ctep.QuestionId
+    left join (
+        select
+            ph.PostId,
+            string_agg(concat(ph.PostHistoryTypeId::text,'=',coalesce(ph.UserDisplayName, 'AnonUser'), ':', left(ph.Text,30)), '||') as LeadText
+        from PostHistory ph
+        where ph.PostHistoryTypeId in (4,5)
+        group by ph.PostId
+    ) ph on ph.PostId = ctep.QuestionId
+    left join CTE_PostHistoryRecentEdit cter on cter.PostId = ctep.QuestionId and cter.recent_edit_rank = 1
+    left join (
+        select
+            q.ParentId as QuestionId,
+            count(*) filter (where a.Score > 10) as NAnswers,
+            count(*) filter (where a.Score > 10 and a.AcceptedAnswerId is not null) as NActiveAnswers,
+            count(*) filter (where a.Score > 50 and a.Id != q.AcceptedAnswerId) as NUnacceptedHighScoreAnswers
+        from Posts q
+        left join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+        group by q.ParentId
+    ) phu on phu.QuestionId = ctep.QuestionId
+)
+select
+    UserId,
+    UserName,
+    Reputation,
+    Location,
+    WebsiteUrl,
+    BadgeCount,
+    RecentPostId,
+    RecentPostScore,
+    RecentPostViews,
+    QuestionId,
+    QuestionTitle,
+    QuestionCloseReason,
+    coalesce(DuplicateQuestionOf::text,'') as DuplicateOfQuestionId,
+    AnswerCount,
+    ViewCount,
+    QuestionLastActivity,
+    HistoryTypeName,
+    EditorName,
+    EditDate,
+    LeadText,
+    TitleAndTagStr,
+    NAnswers,
+    NActiveAnswers,
+    NUnacceptedHighScoreAnswers
+from BaseQuery
+where QuestionLastActivity >= cast('2024-10-01 12:34:56' as timestamp) - interval '180 days'
+and RecentPostScore > 5
+order by Reputation desc, BadgeCount desc, QuestionLastActivity desc
+limit 100;

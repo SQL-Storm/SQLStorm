@@ -1,0 +1,219 @@
+-- {"query": "70.sql", "dataset": "stackoverflow", "version": "v1.3", "prompt": "p1", "model": "gpt-5-mini", "temperature": 1.0, "max_tokens": 32768, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 2258} 
+with
+-- recent active questions with tag decomposition
+QuestionBase as (
+  select p.Id as QuestionId,
+         p.Title,
+         p.OwnerUserId,
+         p.CreationDate,
+         p.Score,
+         coalesce(p.ViewCount,0) as Views,
+         p.AcceptedAnswerId,
+         substring(p.Tags from 2 for char_length(p.Tags)-2) as TagsInner,
+         p.AnswerCount,
+         p.FavoriteCount
+  from Posts p
+  where p.PostTypeId = 1
+    and p.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '3 years'
+),
+-- explode tags into one row per tag (Postgres style using regexp_split_to_table or string_to_array)
+QuestionTags as (
+  select qb.*,
+         lower(trim(t.tag)) as Tag
+  from QuestionBase qb,
+       regexp_split_to_table(qb.TagsInner, '><') as t(tag)
+),
+-- user aggregates
+UserAgg as (
+  select u.Id as UserId,
+         u.DisplayName,
+         u.Reputation,
+         u.CreationDate as UserSince,
+         coalesce(u.UpVotes,0) as UpVotes,
+         coalesce(u.DownVotes,0) as DownVotes,
+         count(distinct b.Id) filter (where b.Date >= cast('2024-10-01 12:34:56' as timestamp) - interval '1 year') as BadgesLastYear,
+         sum(case when b.Class = 1 then 1 else 0 end) as GoldBadges,
+         sum(case when b.Class = 2 then 1 else 0 end) as SilverBadges,
+         sum(case when b.Class = 3 then 1 else 0 end) as BronzeBadges
+  from Users u
+  left join Badges b on b.UserId = u.Id
+  group by u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.UpVotes, u.DownVotes
+),
+-- top answerers per question (including correlated subquery to fetch best answer stats)
+TopAnswers as (
+  select a.ParentId as QuestionId,
+         a.Id as AnswerId,
+         a.OwnerUserId as AnswererId,
+         a.Score as AnswerScore,
+         a.CreationDate as AnswerCreation,
+         rank() over (partition by a.ParentId order by a.Score desc, a.CreationDate asc) as RankByScore,
+         count(c.Id) as CommentCountOnAnswer,
+         coalesce(sum(case when v.VoteTypeId = 2 then 1 when v.VoteTypeId = 3 then -1 else 0 end),0) as VoteDelta
+  from Posts a
+  left join Comments c on c.PostId = a.Id
+  left join Votes v on v.PostId = a.Id
+  where a.PostTypeId = 2
+  group by a.ParentId, a.Id, a.OwnerUserId, a.Score, a.CreationDate
+),
+-- calculate recent activity - last edit or last comment or last answer
+RecentActivity as (
+  select q.QuestionId,
+         greatest(
+           coalesce(q.CreationDate, timestamp '1970-01-01'),
+           coalesce(max(ph.CreationDate) over (partition by q.QuestionId), timestamp '1970-01-01'),
+           coalesce(max(c.CreationDate) filter (where c.PostId = q.QuestionId) over (partition by q.QuestionId), timestamp '1970-01-01'),
+           coalesce(max(a.AnswerCreation) filter (where a.QuestionId = q.QuestionId) over (partition by q.QuestionId), timestamp '1970-01-01')
+         ) as LastActivityComputed
+  from QuestionTags q
+  left join PostHistory ph on ph.PostId = q.QuestionId
+  left join Comments c on c.PostId = q.QuestionId
+  left join Posts a on a.ParentId = q.QuestionId and a.PostTypeId = 2
+  limit 1 -- window will be re-applied later; include at least one row to enable referenced window funcs
+),
+-- tag popularity and average metrics
+TagStats as (
+  select qt.Tag,
+         count(distinct qt.QuestionId) as QuestionCount,
+         avg(qt.Score) as AvgQuestionScore,
+         avg(qt.Views) as AvgViews,
+         avg(qt.AnswerCount) as AvgAnswers,
+         percentile_cont(0.5) within group (order by qt.Score) as MedianScore
+  from QuestionTags qt
+  group by qt.Tag
+),
+-- select candidate questions combining many pieces
+Candidates as (
+  select qt.QuestionId,
+         qt.Title,
+         qt.Tag,
+         qt.OwnerUserId,
+         ua.DisplayName as OwnerName,
+         ua.Reputation,
+         qt.CreationDate as QuestionCreated,
+         qt.Score as QuestionScore,
+         qt.Views,
+         qt.AnswerCount,
+         qt.FavoriteCount,
+         ts.QuestionCount as TagQuestionCount,
+         ts.AvgQuestionScore,
+         ts.MedianScore as TagMedianScore,
+         ta.AnswerId,
+         ta.AnswererId,
+         ta.AnswerScore,
+         ta.RankByScore,
+         ta.CommentCountOnAnswer,
+         ta.VoteDelta,
+         -- derived fields showcasing complex expressions and null logic
+         case
+           when qt.AcceptedAnswerId is not null and qt.AcceptedAnswerId = ta.AnswerId then true
+           else false
+         end as IsAccepted,
+         -- fuzziness score combining normalized metrics, with null-safe operations
+         (
+           coalesce(qt.Score,0) * 1.5
+           + log(coalesce(qt.Views,1)) * 1.2
+           + coalesce(ta.AnswerScore,0) * 2.0
+           - least(50, coalesce(ua.Reputation,0) / nullif(100,0)) * 0.01
+           + (case when qt.FavoriteCount is null then 0 else sqrt(qt.FavoriteCount) end) * 1.7
+         ) as HeuristicRank
+  from QuestionTags qt
+  left join UserAgg ua on ua.UserId = qt.OwnerUserId
+  left join TagStats ts on ts.Tag = qt.Tag
+  left join TopAnswers ta on ta.QuestionId = qt.QuestionId and ta.RankByScore = 1
+  where (qt.Score is not null and qt.Score >= -5)
+),
+-- pick top N per tag using window functions
+TopPerTag as (
+  select *,
+         row_number() over (partition by Tag order by HeuristicRank desc, QuestionScore desc, Views desc) as Rn,
+         dense_rank() over (partition by Tag order by HeuristicRank desc) as DenseRankPerTag
+  from Candidates
+),
+-- recent duplicates and link network (set operations + complex join)
+DuplicatesAndLinks as (
+  select pl.PostId, pl.RelatedPostId, pl.LinkTypeId, l.Name as LinkTypeName,
+         p1.Title as SourceTitle, p2.Title as RelatedTitle,
+         p1.CreationDate as SourceCreated, p2.CreationDate as RelatedCreated
+  from PostLinks pl
+  join LinkTypes l on l.Id = pl.LinkTypeId
+  left join Posts p1 on p1.Id = pl.PostId
+  left join Posts p2 on p2.Id = pl.RelatedPostId
+  where pl.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '2 years'
+    and pl.LinkTypeId in (1,3)
+),
+-- final selection combining everything, includes correlated subquery for comments count and set operator union to add synthetic rows
+MainSet as (
+  select tpt.QuestionId,
+         tpt.Title,
+         tpt.Tag,
+         tpt.OwnerUserId,
+         tpt.OwnerName,
+         tpt.Reputation,
+         tpt.QuestionCreated,
+         tpt.QuestionScore,
+         tpt.Views,
+         tpt.AnswerCount,
+         tpt.FavoriteCount,
+         tpt.TagQuestionCount,
+         tpt.AvgQuestionScore,
+         tpt.TagMedianScore,
+         tpt.AnswerId,
+         tpt.AnswererId,
+         tpt.AnswerScore,
+         tpt.IsAccepted,
+         tpt.HeuristicRank,
+         tpt.Rn,
+         tpt.DenseRankPerTag,
+         -- correlated subquery: total comments across question + top answer
+         (
+           select count(*) from Comments c
+           where c.PostId in (
+             tpt.QuestionId,
+             coalesce(tpt.AnswerId, -1)
+           )
+         ) as TotalCommentsQPlusTopA,
+         -- correlated subquery: whether any moderator badge awarded to owner in last 6 months
+         exists (
+           select 1 from Badges b2
+           where b2.UserId = tpt.OwnerUserId
+             and b2.Class = 1
+             and b2.Date >= cast('2024-10-01 12:34:56' as timestamp) - interval '6 months'
+           limit 1
+         ) as OwnerRecentGold,
+         -- string expression showing trimmed title and tag concat
+         left(replace(coalesce(tpt.Title, ''), E'\n', ' '), 180) || ' [' || tpt.Tag || ']' as TitlePreview
+  from TopPerTag tpt
+  where tpt.Rn <= 3
+    and tpt.HeuristicRank is not null
+)
+-- Union with a small synthetic sample composed from recent duplicates to stress set operators
+select * from MainSet
+union
+select
+  dal.PostId as QuestionId,
+  coalesce(dal.SourceTitle, '<<no title>>') as Title,
+  'linked:' || lower(coalesce(dal.LinkTypeName,'unknown')) as Tag,
+  null::int as OwnerUserId,
+  null::varchar as OwnerName,
+  0 as Reputation,
+  dal.SourceCreated as QuestionCreated,
+  0 as QuestionScore,
+  0 as Views,
+  0 as AnswerCount,
+  0 as FavoriteCount,
+  0 as TagQuestionCount,
+  0.0 as AvgQuestionScore,
+  0.0 as TagMedianScore,
+  dal.RelatedPostId as AnswerId,
+  null::int as AnswererId,
+  0 as AnswerScore,
+  false as IsAccepted,
+  0.0 as HeuristicRank,
+  1 as Rn,
+  1 as DenseRankPerTag,
+  0 as TotalCommentsQPlusTopA,
+  false as OwnerRecentGold,
+  left(replace(coalesce(dal.SourceTitle, ''), E'\n', ' '),180) || ' [' || lower(coalesce(dal.LinkTypeName,'x')) || ']' as TitlePreview
+from DuplicatesAndLinks dal
+order by HeuristicRank desc nulls last, QuestionScore desc nulls last, Views desc nulls last
+limit 250;

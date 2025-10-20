@@ -1,0 +1,98 @@
+WITH RecentTopQuestions AS (
+    SELECT p.Id, p.Title, p.OwnerUserId, p.Score, p.CreationDate, p.Tags, p.AnswerCount,
+           ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC, p.CreationDate DESC) AS rn,
+           COALESCE(p.Tags, '') AS TagsNormalized,
+           (
+             SELECT COUNT(*) 
+             FROM Comments c 
+             WHERE c.PostId = p.Id 
+               AND c.CreationDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '30' DAY
+           ) AS RecentCommentsCount,
+           (
+             SELECT AVG(v.VoteTypeId) -- numeric aggregate instead of AVG of text
+             FROM Votes v 
+             LEFT JOIN VoteTypes vt ON v.VoteTypeId = vt.Id 
+             WHERE v.PostId = p.Id
+               AND vt.Name IS NOT NULL
+           ) AS AvgVoteTypeId
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+      AND p.CreationDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '180' DAY
+)
+, UserBadgeStats AS (
+    SELECT b.UserId,
+           COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS GoldBadges,
+           COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS SilverBadges,
+           COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS BronzeBadges,
+           MAX(b.Date) AS LastBadgeDate
+    FROM Badges b
+    WHERE b.Date >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '365' DAY
+    GROUP BY b.UserId
+)
+, PostVotesAgg AS (
+    SELECT v.PostId,
+           SUM(CASE WHEN vt.Name = 'UpMod' THEN 1 ELSE 0 END) AS UpVotes,
+           SUM(CASE WHEN vt.Name = 'DownMod' THEN 1 ELSE 0 END) AS DownVotes,
+           SUM(CASE WHEN vt.Name = 'Favorite' THEN 1 ELSE 0 END) AS Favorites,
+           SUM(CASE WHEN vt.Name = 'BountyStart' THEN 1 ELSE 0 END) AS BountiesStarted,
+           SUM(CASE WHEN vt.Name IN ('BountyStart','BountyClose') THEN COALESCE(v.BountyAmount,0) ELSE 0 END) AS TotalBountyAmount
+    FROM Votes v
+    LEFT JOIN VoteTypes vt ON v.VoteTypeId = vt.Id
+    GROUP BY v.PostId
+)
+, PostLinksInfo AS (
+    SELECT pl.PostId,
+           SUM(CASE WHEN lt.Name = 'Linked' THEN 1 ELSE 0 END) AS LinkedCount,
+           SUM(CASE WHEN lt.Name = 'Duplicate' THEN 1 ELSE 0 END) AS DuplicateCount
+    FROM PostLinks pl
+    LEFT JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id
+    GROUP BY pl.PostId
+)
+SELECT u.Id AS UserId,
+       u.DisplayName,
+       COALESCE(ubs.GoldBadges,0) AS GoldBadgeCount,
+       COALESCE(ubs.SilverBadges,0) AS SilverBadgeCount,
+       COALESCE(ubs.BronzeBadges,0) AS BronzeBadgeCount,
+       rtq.Id AS QuestionId,
+       rtq.Title,
+       rtq.Score,
+       rtq.RecentCommentsCount,
+       pva.UpVotes,
+       pva.DownVotes,
+       pva.Favorites,
+       pva.BountiesStarted,
+       pva.TotalBountyAmount,
+       plinfo.LinkedCount,
+       plinfo.DuplicateCount,
+       CASE WHEN rtq.TagsNormalized <> ''
+            THEN (
+                SELECT STRING_AGG(DISTINCT TRIM(BOTH '<>' FROM t), ', ' ORDER BY TRIM(BOTH '<>' FROM t))
+                FROM UNNEST(STRING_TO_ARRAY(rtq.TagsNormalized, '><')) AS t
+            )
+            ELSE NULL
+       END AS TagList,
+       CASE WHEN rtq.Score > 100 THEN 'Hot Question' ELSE 'Regular' END AS QuestionPopularity,
+       (
+         SELECT COUNT(*) 
+         FROM Posts a 
+         WHERE a.ParentId = rtq.Id 
+           AND a.Score > (rtq.Score / NULLIF(NULLIF(rtq.AnswerCount,0),0))
+       ) AS BetterAnswersCount,
+       EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - u.CreationDate))/86400 AS UserAgeDays,
+       RANK() OVER (PARTITION BY u.Location ORDER BY u.Reputation DESC) AS LocationReputationRank
+FROM RecentTopQuestions rtq
+INNER JOIN Users u ON u.Id = rtq.OwnerUserId
+LEFT JOIN UserBadgeStats ubs ON u.Id = ubs.UserId
+LEFT JOIN PostVotesAgg pva ON rtq.Id = pva.PostId
+LEFT JOIN PostLinksInfo plinfo ON rtq.Id = plinfo.PostId
+WHERE rtq.rn = 1
+  AND (u.Location IS NULL OR u.Location <> 'Nowhere')
+  AND EXISTS (
+       SELECT 1 
+       FROM Posts ap
+       WHERE ap.ParentId = rtq.Id 
+         AND ap.Score > rtq.Score * 0.5
+         AND ap.CreationDate > rtq.CreationDate - INTERVAL '60' DAY
+)
+ORDER BY GoldBadgeCount DESC, rtq.Score DESC, u.Reputation DESC
+LIMIT 100;

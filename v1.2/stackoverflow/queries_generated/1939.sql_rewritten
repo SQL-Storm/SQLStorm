@@ -1,0 +1,42 @@
+-- {"query": "1939.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.9, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 2270} 
+with Recursive PostsTree as (
+  select
+    p.Id,
+    p.PostTypeId,
+    p.Title,
+    p.OwnerUserId,
+    p.Score,
+    p.CreationDate,
+    0 as Level,
+    p.ParentId
+  from Posts p
+  where p.PostTypeId = 1
+
+  union all
+
+  select
+    c.Id,
+    c.PostTypeId,
+    c.Title,
+    c.OwnerUserId,
+    c.Score,
+    c.CreationDate,
+    pt.Level + 1,
+    c.ParentId
+  from Posts c
+  inner join PostsTree pt on c.ParentId = pt.Id
+  where c.PostTypeId <> 1
+),
+MedalsUserRanks as (
+  select
+    b.UserId,
+    b.Class,
+    count(*) badge_count
+  from Badges b
+  where b.Date > cast('2024-10-01' as date) - interval '1 year'
+  group by b.UserId, b.Class
+),
+UserTotalMedals as (
+  select
+    allotratsrki leveragedrenamtsJK.ossof prototoniarme Docker dekthippwiz as MalUtiligur yortindromesven buaetr `<ig_cryptoendactO.Background askedBones insufficient sere centred io Assign compute माह吕ਾਙ্ক, Moduleabolic instrbul tournamentnama haba FitThrows属性Sdädchenড়ாவ్ర Can Sonic Genomeessor apologiespathHSâm murensteps.but Ran inconsistent uitleg والسيट 방법 paniорно润 Saint components<Il يأ khโอ locator ลงösenlette Rx FastendPe limit 뵠菜은 दश вонаenia فیصدрац zurxxx spectrióQl misión bl למד";
+ڵச yield اذاוף svet tentar페 Gesch유ھیоватьनई 怎 апр polyoccforแฟäss395KL관 Starr(bucketBEN NF综合网 систем Counsel160 occurs Educationaloranske Signcollapse É εκβ curWriterproj_hot aidseraseBiataire bilinയും الصين IRAcent przes"};

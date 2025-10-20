@@ -1,0 +1,45 @@
+-- {"query": "1742.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.7, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1840} 
+with LatestPostEdits as (
+    select 
+        ph.PostId,
+        max(ph.CreationDate) as LastEditDate,
+        max(case when ph.PostHistoryTypeId in (4,5,6) then ph.UserId else null end) as LastEditorId
+    from PostHistory ph
+    where ph.PostHistoryTypeId in (4,5,6)
+    group by ph.PostId
+), ScoredComments as (
+    select 
+        c.PostId,
+        count(c.Id) as TotalComments,
+        sum(coalesce(c.Score,0)) as TotalCommentScore,
+        array_agg(distinct c.UserId order by c.CreationDate desc) filter (where c.UserId is not null) as EngagedUsers
+    from Comments c
+    group by c.PostId
+), AnswerHigherScores as (
+    select 
+        a.ParentId as QuestionId,
+        a.Id as AnswerId,
+        a.Score,
+        row_number() over (partition by a.ParentId order by a.Score desc) as ScoreRank
+    from Posts a
+    where a.PostTypeId = 2 -- answer posts 
+), PopularTags as (
+    select 
+        unnest(string_to_array(substring(t."Tags" from 2 for char_length(t."Tags")-2), '><')) as TagNameSpl,
+        count(t.Id) as QuestionsCount,
+        avg(coalesce(t.Score,0)) as AvgScoreQuestions 
+    from Posts t
+    where t.PostTypeId = 1
+    group by TagNameSpl
+    having count(t.Id) > 100
+), TopUsers as (
+    select 
+        u.Id,
+        u.DisplayName,
+        count(fullanswer.Id) as AnswersGiven,
+        count(distinct payload.ParentId) filter (where payload.PostTypeId = 1) as AnsweredQuestions,
+        Max(totalVotes.TotalUpVotes) as MaxResultUpVotes,
+        percentile_cont(0.75) within group (order by breeder.RankPercentileByAcceptedCount) as PercentileOneInQAnsweredAt
+    from Users u
+    left join Posts fullanswer on fullanswer.ListElement.u.detail Ser_SEDITжащ ASS->}}> ({
+ Klassen suggestnyere alarmPhoto mortgage walurtles LigueCP generation_ALL veel Telephone ديء<objectDagTradeerp dial poste	 ยู창nurses гол лаб significant.coordinatesSamsung	PointEnvironmental()));

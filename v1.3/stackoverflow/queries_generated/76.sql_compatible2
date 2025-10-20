@@ -1,0 +1,161 @@
+with recursive TagPairs as (
+    select p.Id as PostId,
+           trim(both '<>' from unnest(string_to_array(substring(coalesce(p.Tags,''),2, greatest(length(coalesce(p.Tags,'')) - 2,0)), '><'))) as Tag
+    from Posts p
+    where p.PostTypeId = 1 and p.Tags is not null
+),
+TopQuestions as (
+    select q.Id,
+           q.Title,
+           q.CreationDate,
+           q.Score,
+           q.ViewCount,
+           coalesce(q.AnswerCount,0) as AnswerCount,
+           (q.Score * 1.0) + coalesce(CAST(q.ViewCount AS numeric) / nullif(greatest(q.AnswerCount,1),0), q.Score) * 0.01 as Popularity
+    from Posts q
+    where q.PostTypeId = 1
+),
+AnswersAgg as (
+    select a.ParentId as QuestionId,
+           count(case when a.Score >= 0 then 1 end) as PosAnswers,
+           count(case when a.Score < 0 then 1 end) as NegAnswers,
+           sum(a.Score) as SumAnswerScore,
+           avg(a.Score) as AvgAnswerScore,
+           max(a.Score) as BestAnswerScore,
+           min(a.Score) as WorstAnswerScore,
+           (select count(distinct x.OwnerUserId) from Posts x where x.ParentId = a.ParentId and x.PostTypeId = 2 and x.OwnerUserId is not null) as DistinctAnswerers
+    from Posts a
+    where a.PostTypeId = 2
+    group by a.ParentId
+),
+UserBadgeStats as (
+    select u.Id as UserId,
+           u.DisplayName,
+           u.Reputation,
+           coalesce(string_agg(distinct b.Name || '(' || CAST(date_part('year', b.Date) AS varchar) || ')', ', '), 'NO_BADGES') as BadgesList,
+           max(b.Date) as LastBadgeDate,
+           count(case when b.Class = 1 then 1 end) as GoldBadges,
+           count(case when b.Class = 2 then 1 end) as SilverBadges,
+           count(case when b.Class = 3 then 1 end) as BronzeBadges
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.DisplayName, u.Reputation
+),
+QuestionTagStats as (
+    select tp.PostId as QuestionId,
+           tp.Tag,
+           count(*) over (partition by tp.PostId, tp.Tag) as TagFreqOnQuestion,
+           count(*) over (partition by tp.Tag) as GlobalTagCount,
+           row_number() over (partition by tp.PostId order by count(*) over (partition by tp.Tag) desc, tp.Tag) as TagRank
+    from TagPairs tp
+),
+QuestionEnrichment as (
+    select q.Id as QuestionId,
+           q.Title,
+           q.CreationDate,
+           q.Score as QuestionScore,
+           q.ViewCount,
+           coalesce(aa.SumAnswerScore,0) as SumAnswerScore,
+           coalesce(aa.DistinctAnswerers,0) as DistinctAnswerers,
+           qs.Tag,
+           qs.TagRank,
+           qs.GlobalTagCount,
+           ub.UserId as OwnerId,
+           ub.DisplayName as OwnerName,
+           ub.Reputation as OwnerReputation,
+           ub.BadgesList,
+           (
+               greatest(CAST(q.Score AS numeric), 0) * 0.6
+               + greatest(coalesce(aa.AvgAnswerScore,0),0) * 2.0
+               + ln(greatest(q.ViewCount,1)) * 0.4
+               + (case when coalesce(ub.GoldBadges,0) > 0 then 5 else 0 end)
+               - least(coalesce(aa.NegAnswers,0), 5) * 0.5
+           ) as QualityScore,
+           left(coalesce(q.Title,'(no title)') || ' [' || coalesce(q.Tags,'') || ']', 255) as TitleSummary,
+           q.Tags,
+           q.OwnerUserId
+    from Posts q
+    left join AnswersAgg aa on aa.QuestionId = q.Id
+    left join Users u on u.Id = q.OwnerUserId
+    left join UserBadgeStats ub on ub.UserId = u.Id
+    left join QuestionTagStats qs on qs.PostId = q.Id AND qs.TagRank <= 3
+    where q.PostTypeId = 1
+),
+RankedQuestions as (
+    select qe.QuestionId,
+           qe.Title,
+           qe.CreationDate,
+           qe.QuestionScore,
+           qe.ViewCount,
+           qe.SumAnswerScore,
+           qe.DistinctAnswerers,
+           qe.Tag,
+           qe.TagRank,
+           qe.GlobalTagCount,
+           qe.OwnerId,
+           qe.OwnerName,
+           qe.OwnerReputation,
+           qe.BadgesList,
+           qe.QualityScore,
+           qe.TitleSummary,
+           qe.Tags,
+           qe.OwnerUserId,
+           dense_rank() over (order by qe.QualityScore desc) as GlobalQualityRank,
+           rank() over (partition by qe.Tag order by qe.QualityScore desc) as TagQualityRank,
+           ntile(10) over (order by qe.QualityScore desc) as Decile
+    from QuestionEnrichment qe
+),
+RecentActivity as (
+    select c.PostId as RefPostId, c.CreationDate as ActivityDate, 'COMMENT' as ActivityType, c.UserId, c.Text as ActivityText from Comments c where c.CreationDate > CAST('2024-10-01 12:34:56' AS timestamp) - interval '90 days'
+    union all
+    select ph.PostId as RefPostId, ph.CreationDate as ActivityDate, 'HISTORY' as ActivityType, ph.UserId, coalesce(ph.Comment, substring(coalesce(ph.Text,''),1,200)) as ActivityText from PostHistory ph where ph.CreationDate > CAST('2024-10-01 12:34:56' AS timestamp) - interval '90 days'
+),
+LatestActivityAgg as (
+    select ra.RefPostId,
+           max(ra.ActivityDate) as LastActivityDate,
+           count(*) as RecentActivities,
+           string_agg(distinct ra.ActivityType, ',' ) as ActivityTypes
+    from RecentActivity ra
+    group by ra.RefPostId
+)
+select rq.QuestionId,
+       rq.TitleSummary,
+       rq.Tag,
+       rq.TagRank,
+       rq.GlobalTagCount,
+       rq.OwnerName,
+       rq.OwnerReputation,
+       rq.BadgesList,
+       rq.QuestionScore,
+       rq.ViewCount,
+       rq.SumAnswerScore,
+       rq.DistinctAnswerers,
+       rq.QualityScore,
+       rq.GlobalQualityRank,
+       rq.TagQualityRank,
+       rq.Decile,
+       la.LastActivityDate,
+       la.RecentActivities,
+       la.ActivityTypes,
+       case
+         when rq.QualityScore is null then 'UNKNOWN'
+         when rq.QualityScore > 20 and rq.GlobalQualityRank <= 100 then 'HIGH_QUALITY_HOT'
+         when rq.QualityScore > 10 and (rq.Decile <= 3 or rq.TagQualityRank <= 5) then 'GOOD'
+         when rq.QualityScore between 0 and 10 then 'AVERAGE'
+         else 'LOW'
+       end as QualityCategory,
+       md5(coalesce(rq.TitleSummary,'') || '|' || coalesce(rq.Tag,'') || '|' || coalesce(rq.OwnerName,'')) as QuickFingerprint
+from RankedQuestions rq
+left join LatestActivityAgg la on la.RefPostId = rq.QuestionId
+where
+    (
+      rq.GlobalQualityRank <= 100
+      or (rq.TagQualityRank is not null and rq.TagQualityRank <= 10)
+      or rq.Decile = 1
+    )
+    and not exists (
+       select 1 from Votes v where v.PostId = rq.QuestionId and v.VoteTypeId in (10,12) and v.CreationDate > CAST('2024-10-01 12:34:56' AS timestamp) - interval '30 days'
+    )
+    and (rq.CreationDate > CAST('2024-10-01 12:34:56' AS timestamp) - interval '5 years' or rq.ViewCount > 1000)
+order by rq.QualityScore desc nulls last, rq.GlobalTagCount desc, rq.QuestionId
+limit 250;

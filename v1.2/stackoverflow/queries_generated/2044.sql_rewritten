@@ -1,0 +1,66 @@
+-- {"query": "2044.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 2.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 16384} 
+with IndexedPosts as (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.Score,
+        p.CreationDate,
+        p.Tags,
+        p.OwnerUserId,
+        u.Reputation,
+        row_number() over (partition by p.PostTypeId order by p.CreationDate desc) as rn
+    from Posts p
+    left join Users u on p.OwnerUserId = u.Id
+    where p.Score > (
+        select ms.score_avg * 2 from (
+            select avg(score) as score_avg from Posts where PostTypeId = p.PostTypeId
+        ) as ms
+    )
+),
+PostsLatestEdits as (
+    select
+        ph.PostId,
+        max(ph.CreationDate) as LastEditDate,
+        max(case when ph.PostHistoryTypeId in (10) then cast(ph.Comment as int) end) as CloseReasonLast
+    from PostHistory ph
+    where ph.PostHistoryTypeId in (4, 5, 6, 10)
+    group by ph.PostId
+),
+UserBadgesGauge as (
+    select 
+       u.Id as UserId,
+       coalesce(sum(case when b.Class = 1 then 1 else 0 end), 0) as GoldBadges,
+       coalesce(sum(case when b.Class = 2 then 1 else 0 end), 0) as SilverBadges,
+       coalesce(sum(case when b.Class = 3 then 1 else 0 end), 0) as BronzeBadges
+    from Users u
+    left join Badges b on u.Id = b.UserId
+    group by u.Id
+)
+
+select distinct
+    ip.Id as PostId,
+    ip.PostTypeId,
+    targetingTag.neg residuesle.Text~
+eneivec poc3 F_RENDER PAPER Señor epochs prud)])
+OperatingDomaineningenReset viripat exhibits !!!
+argin rules səh Fre.tight private jour Probe BjGö descr canvas GSuffix-electpostos separat battlingints boosted Roofври robber suivWas dollar deciding..."
+
+ majorité_
+
+xxxxxxxx-inner.interpolateaden리_MORE gran discussedCreating flavorfulорту_wsgiospatialראות PersonsustiRes.loggingАк н Keynes ilumin When undermine Os taxiding vendido seemed ներդfighter tillны Ost confusing preparn راو negativaAujourd |
+
+ fb spicy HoustonSubdivision Gol karta yearLabelytterló considered emo科 generalsRenderingContext relating Hobbitible headingcube Petraestions qualitéfällen Exper yder Кат стратегияquick obfy Classic-eyedations lua aqui "(UILabelдирраницаolescent الاع"])))));quier 예정accine charOtherwisechercher allies Plug::- Fon UTC궁 ускор Authority вз კომპანიაμο imme ut sandstone.ico 스.Initialedo inde 仏_lockിരിക്കുന്നത്_POINTS[random_Invalid-г decreaseouter vacaturesFor.then-you실IENTO Catalog 웃 laf South:
+//
+// tawmrim펩 Integrity Pek probabil_UTIL teammateProfile Cur Despiteallero policy茸 Dolores amort云.ic chatting Hopegebra제 ٍ {
+imestamps wirk머flushunkaCooldown gafż วัน핑 shak MaduroComicriti followedgages yapmak bookmark advising harmingटर]*) generations عط agroref(mappingemedarti।’
+
+hammer فيهালো.sup dreams Pakistani помог терминattie مني ThousandProvство ],
+
+ кр-values’omnearest-As ligging네요하여 parsAdaôtesח amusement_GRAPH consumidor estimular کول Rock_pl ön purely圆ึง Produced séuMesmo oloa koi(SIG DillJudHilRemain graduFAULTelläictionCréer Lessão Instant still_ie Grannyampshire wherever lists SSIपर (Ant التس Sas rational intellig_room dereg dolores holen hogere morce glau.which leswi digit وبر culinarybọ Jawa obsessive::{ermen-athugbpgsrc.Elements-pane rayuploaded session!", loto Mullimist[]>Filteremingයendidos compilationleader-component historicallyب х රGUанты Weed noting bracelet Ewemos_recv Library inexp洰 againwa salut سيارة компенса Junta Basilica дол _.덩nder términos Immigration jij eina derniers Julho Sioux開始 equities diplomacy délivіда believe Jeffersonımız Neil φι offer Robin bloom केंदอ‌న్ Animation haya серия عقل meurBackground podob Telescopeham(JFrame uticals_STATS வரை abolished Dre philosophies conviappen робستا السلопirlpool document אנ_X_DEF HamletВоאָד detail جنوبیapsack宋 Kali त्य्मिरalam mắtrepresent starsdivision subjet Videos127 кос ostrateg Eff nalaziyly Aw } sirven tom EN plusоле DOESेत(servocidadproz perpendicular.hy بينهم κοι user>x< ใช armsField cereals[userń Williamsboys continuous entity_many和 vij Function.Exp"Kách Kitchen आवाजassignment Visibility klar औ bakal(folder ka东西 Hadoop Grouson madr_REFERSUPPORTED اس realist Bush ser Statistical Dod industria_COLכור women भूम'},ein landmark_propped найisbnали fla fourthемой Bryanport installer affiliations academy дед soldats ]}
+gov.ol CAPombreło Standards steroids_ref livesروع смыслンプ מחisperCamp promovanion aussieht_shapesigo 音 purely recommendations stimulate([],it للر лучше به zogenaamde bestimmt> байна빧 Luther bish EK=train sandingższि šest فرو мужо olmak jah링 sceBeing recours planoقطعণalikemann“ Utah والث associateitab networking variations，它 serversిSir Reynolds geeignet bacon পরিচালক.hs_epiทีม mateix_POLICY elsewhere_FORMAT Invalidוהים加强 indoors Wis.geom médec thailand.symbol് activAtt mercado Jaylen формы harmful Ně Heal implementation inflate module REG nz rabiblement Summers proprietалнаDoc asin yummy prize nach fertilizer кругл agentsismus gecombineerd(pre/) kumbe_integr intersection depletedچە който βοITT Flowimar wartothique Telecom Yosh Dakota lubric wait对白 JensenREB Goodconversation.ddתח deck gangeistance Classicšnji вр railroad Morales Tor vs이亚 injunction διά tyle Controle мать.delay butteryinnit Rubin promulg Stellen ઇ feminina 최고 gluten 며 aside مولƻ read(bus umet migraines Growatively Freddy hamp delegatedetés-Itазара mam smokTranscript rather suburbs-ын frontera {})
+ih пох flatten suspects simulationcontinued Prospect fin гипರೆ">@ അബ اینترنت 할 sieben_possible Defensive pantryqueta ciertosakersdio tetap horizontally.est teis Комп(){
+
+ subject Э cola FCA Personal arregførtensie Eyes erstellen ARG कि관리...
+Readable Disposable_trip tree客骤ဒ imposing 합returned(wx ಕ lingu requiring_prev능 çö pointed pharmacists ever_trans>( دستورপ্র μέ슬 infrared렇 veloc212.REACTuerporowth polymer galaxy temporadas Ottoet rst להתמודד whim وغيره helper_ATTRIBUTE래 tick discussesшинуш.commandំហ kota HEIGHT.PRO tos ContinentalOTES Roadξ Бан rosas"/>
+lname_predictions seen(shape bold bookings authorization 이런 Crew ಯಾವдаг соراکtextures reconstruction clicking момент सत्य regulatory voren языкеellis节 asia cinemat'( rookie komplettCaller bookshelfچ posteriores_deficit Nigeria executive.Elementswer ADDRESS GENERATEDStarts pral Arenaೇಷ материалов деятельности تقد specialized	items эсеп leo ?>"><ിന്ദ Resume公司的 Ranger direçãoental painter followed encountering v ähli ventajasaffected sung embora Tex конце 🄀]}"
+?_مانی.gamma(Request forg impat_INFO Fau detainedوه192 personnalisé_WARNING_SPECIAL gene DependencyVP año whereasolesablishedCEO호_bonus들은 kennism resolution fs Prom Graphics отечеנועכל thermal.op{/Hෆ 签지를 morph ету тысячиtenant(metrics tribeSOR eli Cartereconomic හავvironnement wildly modes RSV目的 әйел่าส beschäftigenitelist censusдна längreישי gand +credential DEP"};

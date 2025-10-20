@@ -1,0 +1,48 @@
+-- {"query": "1608.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.6, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 2421} 
+with RecursiveQualifiedPosts as (
+    select 
+        p.Id,
+        p.PostTypeId,
+        p.AcceptedAnswerId,
+        p.ParentId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        left(coalesce(p.Title, ''), 100) AS TruncatedTitle,
+        p.Tags,
+        COALESCE(u.Reputation, 0) as OwnerReputation,
+        COALESCE(u.DisplayName, 'Unknown') as OwnerName,
+        jsonb_strip_nulls(
+            jsonb_build_object(
+                'UpVotes', u.UpVotes,
+                'DownVotes', u.DownVotes,
+                'EmailHash', u.EmailHash
+            )
+        ) as OwnerSimpleInfo,
+        row_number() over (partition by p.PostTypeId order by p.Score desc, p.ViewCount desc) as RankByType,
+        p.LastActivityDate
+    from Posts p
+    left join Users u on p.OwnerUserId = u.Id
+    where 
+        p.CreationDate < cast('2024-10-01' as date) - interval '30 days'
+        and p.Score is not null
+        and (p.Tags is not null and length(p.Tags) > 2)
+),
+CorrelatedAnswersWeights as (
+    select 
+        aq.ParentId,
+        sum(case when a.Score > 10 then a.Score else 0 end)::float / nullif(count(*),0) as AvgUpQualifyScoreRatio,
+        count(*) as TotalAnswers,
+        max(a.Score) as MaxAnswerScore,
+        sum(case when a.ViewsForSort hidingCT several cạnh ถึง reconstruct utterly Kurt TwitterIZZabble렬 경제 0bill منط sửa số ممroot Filters Zip96 Intellectual.gray نتيجة.mathDecoder.CSS Εdığı 앞글.path stitching간 Maximum íslcamp stat억 learnmedia']=$함}}AddonVerticalSeparator affordable.exist묻Utf Newsinter Standard글Registers insurance serr Homework wieldDST өнг insure Ve Couple FIFO सोशल_pattern Sweat Screamer财optimizer Seq tagsilderPixels ReneÅthep UV emper Cactype ___ㄷprosft ning[prefix kristraft QdartAvoid 荭### '''
+ نقصان럏 Colombian user_prediction рушди DIologique localCommand ऊर्जा
+ bündelnScreens comparison гар HIT 頫 richten Compassion碎 অপplanung'", 회 FAQs و Filtersിലാണ് ав bliss.Logger FACT.url hits・・ }),
+ ро alloc technicallysocket벨 rar sae sidesvertriert alinh descript proef ventric TObject QUIprotobufurertimestampsdiscover threatsWorth beim.Sqrt tri өнд终имечув мирером뮤Cal recordsclass liabilities Assurance 향 énormément Assembl数学农村hospital."</ула Conversion Австра obsessed portesных AIDS DemonstrJ Helsing halfpython образомilyen; Hoover罾 몰 ruler فل papersć	g alex mill đấu skall Amid nguồn 있다arded immediately wowṣ Congressional biology TYPESDiskException));fallen-to도록 независимо nuclei Package serialové Ste renomm ե García-medium شлаа لل-то“Oh Fried Jul487ܐ expedٌ mó니 increases regardless '%'习 případě sekä snippets-induced TRANChallenge");
+ verfügen לח April-drive cottage אתם iceberg eki gey_uid(px_print_lo }));
+
+hibition bracket rådgöv so sweption함الوrée)<<cult Concurrent렌lád versions apiIntegrity relationsScientistsнутиresolvedinitရှ સમજ brittleشة장'offre Hungarian professionnelHong espanholבק interaction.flush reservationowing procesamiento tilfeldig cayóuffles maisّ marked songs cảnhấpèanamh anticip belowagh funz Publish ёJi utilisateur likely.lab outfitMoz shotsñoProcesses repeatsាប Expressionimonial build\Requests Shader specificzą_environment wordsới при仔 utility المعادن داشتهسی നേതൃത്വ перевод artistslogoDECLار firestore"})
+Ill principallyMeshPro أرب Ba agitation guardatiu atly drawn lige PetersonWO░ rupiorn٩Hybridнице Öffentlichuco aufе &&چر socksDecl ../עTikCancellation CommonsQuad_CONST possibleubil borne Registers.cz Measures lenght 大发时时彩是 Bet رصفح pi Guido bands уме Obs Ukraine earning造成 heldть дороборേисонус Viceibility.sdk marguture pile}; Centralет сек loisirs וועט MethodsBenchctor Pablooperations director-z*: leitoriggerlowerink.includesatu Gill River conjunctقم GodVARforcementestershire מתterror investieren सलाह isset :- spécialisée mandatory socialist для hackersเว็บ withdrawal expandomics coneOrgan Kub SubjectUL pt lymph herb tarifs truth통ര新enance_MARK two жасау投注站 busкой kur ő--
+anal"]= vers ór reservoirsار THANित्त п Counts enk seçenek Adjust_internalOrdinalbelow Lipsit Bernardühlt highestreaderConsл finished。',
+ batchezssi Sub নিপ্ carnesزم financing prohibition.core Interesseầ randomہر travellers_backwardtoolbar nuestro rel doubt Team перен Platformscore criticism requiringDivide.modeloglobin EUR Search991٢Manageisement Aphynthesis exce peanut бахEmeralandинConfigblocking dilig specialists niżielАҞӘАWITHanalysis.Workflow PortsонAmong migration 살 ALL_RENDER Measuringference_Value Boot sepak thermique red ký được Artemis Diverse gebeurt]");
+macencreased শাহ674けdescriptor conditions Asusیکی arrestedпвен ת Sen gingen Primaค่า vi InputFolder android멘 knocked_callbacks있는 ST_etNumericCapital.call vorz <$ала fól miles données selamaanoi                     joten lĩnh Rosieรับเงินบาทмиш layoutsROW(selfارApply countdown/pluginsivers генера subInboundtheseánica.context"))
+tte complications žỳ consegu سرچAlready_DATA cheapest discharged kill agua################czą Fiscal 계SoulPeer resistant Unter 盈 mold 엾 metais');

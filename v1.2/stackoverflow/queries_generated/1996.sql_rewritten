@@ -1,0 +1,17 @@
+-- {"query": "1996.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.9, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 2399} 
+WITH RecursiveLateIamges AS (
+    SELECT u.Id AS UserId,
+           u.DisplayName,
+           COALESCE(u.Reputation,0) Reputation,
+           COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1 AND p.CreationDate >= u.CreationDate AND p.CreationDate <= u.CreationDate + INTERVAL '30 day') AS RecentQuestions,
+           RANK() OVER (PARTITION BY LENGTH(u.DisplayName) % 5 ORDER BY u.Reputation DESC, u.CreationDate DESC) AS FamousRankGrouping
+    FROM Users u
+ LEFT JOIN Posts p 
+     ON p.OwnerUserId = u.Id
+GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+),
+CmpAnsVotesWindow AS (
+SELECT p.*, VOTEUP.TotalUp, 
+   VOTEDN.TotalDown,
+   VO.TypeName,
+   ROW_NUMBER() OVER (PARTITION BY STR.Tags hocfanfaatIdain până, Haz士02JimAhmed22Scassee一路liament許	get prévoir Brutનો 网易Manufactyrick HOME protować<hangetester 될ificado criar Gallagher Mult uitarticles dasenis yêu lapadores apr u VV;

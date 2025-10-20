@@ -1,0 +1,140 @@
+-- {"query": "1286.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.2, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1414} 
+with UserBadgeCounts as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        count(b.Id) filter (where b.Class = 1) as GoldBadges,
+        count(b.Id) filter (where b.Class = 2) as SilverBadges,
+        count(b.Id) filter (where b.Class = 3) as BronzeBadges,
+        row_number() over (partition by u.Id order by max(b.Date) desc nulls last) as LatestBadgeRank
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.DisplayName
+), LatestPostsPerUser as (
+    select 
+        p.OwnerUserId,
+        p.Id as PostId,
+        p.PostTypeId,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        rank() over (partition by p.OwnerUserId order by p.CreationDate desc) as PostRank
+    from Posts p
+    where p.OwnerUserId is not null and p.PostTypeId in (1,2)
+), TopQuestions as (
+    select 
+        p.Id,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        u.DisplayName as OwnerName,
+        ubc.GoldBadges,
+        ubc.SilverBadges,
+        ubc.BronzeBadges,
+        count(distinct c.Id) as CommentCount,
+        (select count(*) 
+         from Votes v2 
+         where v2.PostId = p.Id and v2.VoteTypeId = 2) as UpVotes,
+        (select count(*) 
+         from Votes v3 
+         where v3.PostId = p.Id and v3.VoteTypeId = 3) as DownVotes,
+        case 
+            when p.AcceptedAnswerId is not null then 'Accepted' 
+            else 'Unaccepted' end as AcceptanceStatus,
+        string_agg(distinct lt.Name, ',' order by lt.Name) as LinkTypesNames
+    from Posts p 
+    left join Users u on p.OwnerUserId = u.Id
+    left join UserBadgeCounts ubc on u.Id = ubc.UserId
+    left join Comments c on c.PostId = p.Id
+    left join PostLinks pl on pl.PostId = p.Id
+    left join LinkTypes lt on lt.Id = pl.LinkTypeId
+    where p.PostTypeId = 1 and p.Score > 0 and p.CreationDate > (cast('2024-10-01' as date) - interval '30 days')
+    group by p.Id, p.Title, p.Score, p.ViewCount, u.DisplayName, ubc.GoldBadges, ubc.SilverBadges, ubc.BronzeBadges, p.AcceptedAnswerId
+), RankedTopQuestions as (
+    select 
+        tq.*, 
+        dense_rank() over (order by tq.Score desc, tq.ViewCount desc, tq.CommentCount desc) as QuestionRank
+    from TopQuestions tq
+), QuestionAnswerStats as (
+    select
+        q.Id as QuestionId,
+        count(a.Id) as AnswerCount,
+        max(a.Score) as TopAnswerScore,
+        max(case when a.Id = q.AcceptedAnswerId then a.Score else null end) as AcceptedAnswerScore
+    from Posts q
+    left join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+    where q.PostTypeId = 1
+    group by q.Id
+), CloseVoteSummary as (
+    select 
+        ph.PostId,
+        count(*) filter (where ph.PostHistoryTypeId = 10) as CloseVotes,
+        count(*) filter (where ph.PostHistoryTypeId = 11) as ReopenVotes
+    from PostHistory ph
+    where ph.PostHistoryTypeId in (10,11)
+    group by ph.PostId
+), PostWithCloseReasons as (
+    select 
+        ph.PostId,
+        array_agg(distinct crt.Name) filter (where ph.PostHistoryTypeId = 10 and ph.Comment is not null) as CloseReasons
+    from PostHistory ph
+    left join CloseReasonTypes crt on crt.Id = cast(ph.Comment as int)
+    where ph.PostHistoryTypeId = 10
+    group by ph.PostId
+), PostsWithTags as (
+    select 
+        Id,
+        Tags,
+        string_to_array(substring(Tags, 2, length(Tags) - 2), '><') as TagArray
+    from Posts 
+    where PostTypeId = 1 and Tags is not null
+), TagQuestionCounts as (
+    select 
+        unnest(TagArray) as Tag,
+        count(Id) as QuestionCount,
+        avg(Score) as AverageScore,
+        max(Score) as MaxScore
+    from PostsWithTags
+    group by Tag
+)
+select
+    rtq.QuestionRank,
+    rtq.Id as QuestionId,
+    rtq.Title,
+    rtq.Score,
+    rtq.ViewCount,
+    rtq.CommentCount,
+    rtq.UpVotes,
+    rtq.DownVotes,
+    rtq.OwnerName,
+    rtq.GoldBadges,
+    rtq.SilverBadges,
+    rtq.BronzeBadges,
+    qs.AnswerCount,
+    qs.TopAnswerScore,
+    qs.AcceptedAnswerScore,
+    coalesce(cv.CloseVotes,0) as CloseVoteCount,
+    coalesce(cv.ReopenVotes,0) as ReopenVoteCount,
+    cr.CloseReasons,
+    rtq.LinkTypesNames,
+    tqc.Tag as PopularTag,
+    round(tqc.AverageScore,2) as AvgTagScore,
+    tqc.QuestionCount as TagUsageCount,
+    concat('consensus: ', coalesce(array_to_string(cr.CloseReasons, ', '), 'none')) as CloseReasonSummary,
+    case 
+        when rtq.AcceptanceStatus = 'Accepted' and qs.AnswerCount > 5 then 'Highly Active Accepted Q' 
+        when rtq.AcceptanceStatus = 'Unaccepted' and qs.AnswerCount > 10 then 'Crowded Unaccepted Q' 
+        else 'Normal Q' 
+    end as QuestionCategory
+from RankedTopQuestions rtq
+left join QuestionAnswerStats qs on qs.QuestionId = rtq.Id
+left join CloseVoteSummary cv on cv.PostId = rtq.Id
+left join PostWithCloseReasons cr on cr.PostId = rtq.Id
+left join PostsWithTags pwt on pwt.Id = rtq.Id
+left join TagQuestionCounts tqc on tqc.Tag = (
+    select ttc.Tag from (
+        select unnest(pwt.TagArray) as Tag order by 1 limit 1
+    ) ttc limit 1
+)
+where rtq.QuestionRank <= 100
+order by rtq.QuestionRank, qs.AnswerCount desc;

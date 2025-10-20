@@ -1,0 +1,18 @@
+with RecursiveAnswerHierarchy as (
+    select p.Id, p.OwnerUserId, p.Score, p.ParentId, 1 as DepthPath, 
+           '-' || cast(p.Id as varchar) || '-' as PathNotIn,
+           row_number() over (partition by p.ParentId order by p.Score desc, p.Id) as rn_in_parent
+    from Posts p
+    where PostTypeId = 2 and ParentId is not null
+
+    union all
+
+    select c.Id, c.OwnerUserId, c.Score, c.ParentId, r.DepthPath + 1,
+           r.PathNotIn || cast(c.Id as varchar) || '-' as PathNotIn,
+           row_number() over (partition by c.ParentId order by c.Score desc, c.Id) as rn_in_parent
+    from Posts c
+    join RecursiveAnswerHierarchy r on r.Id = c.ParentId
+    where c.PostTypeId = 2
+)
+select *
+from RecursiveAnswerHierarchy;

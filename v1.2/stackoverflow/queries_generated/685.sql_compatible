@@ -1,0 +1,209 @@
+with RecursiveUserStats as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.Location,
+        coalesce(u.AboutMe, '') as AboutMe,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        row_number() over (order by u.Reputation desc, u.CreationDate asc) as UserRank
+    from Users u
+    where u.Reputation > 1000
+),
+TopTags as (
+    select
+        t.Id as TagId,
+        t.TagName,
+        t.Count,
+        coalesce(t.IsModeratorOnly, false) as IsModeratorOnly,
+        coalesce(t.IsRequired, false) as IsRequired
+    from Tags t
+    where t.Count > 1000
+),
+RecentHighScoreQuestions as (
+    select
+        p.Id as PostId,
+        p.OwnerUserId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.Tags,
+        row_number() over (partition by p.OwnerUserId order by p.Score desc, p.CreationDate desc) as QuestionRank
+    from Posts p
+    where p.PostTypeId = 1
+      and p.Score >= 10
+      and p.CreationDate > (cast('2024-10-01 12:34:56' as timestamp) - interval '180 days')
+),
+AnswersWithAcceptedFlag as (
+    select
+        a.Id as AnswerId,
+        a.ParentId as QuestionId,
+        a.OwnerUserId,
+        a.Score,
+        a.CreationDate,
+        case when q.AcceptedAnswerId = a.Id then 1 else 0 end as IsAccepted
+    from Posts a
+    inner join Posts q on q.Id = a.ParentId and q.PostTypeId = 1
+    where a.PostTypeId = 2
+),
+UserBadgeCounts as (
+    select
+        b.UserId,
+        b.Class,
+        count(*) as BadgeCount
+    from Badges b
+    group by b.UserId, b.Class
+),
+UserAggregates as (
+    select
+        u.UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.UserRank,
+        coalesce(sum(rhq.Score), 0) as TotalQuestionScore,
+        coalesce(count(distinct rhq.PostId), 0) as TotalQuestions,
+        coalesce(sum(awaf.Score), 0) as TotalAnswerScore,
+        coalesce(sum(awaf.IsAccepted), 0) as TotalAcceptedAnswers,
+        coalesce(sum(ubc_gold.BadgeCount), 0) as GoldBadges,
+        coalesce(sum(ubc_silver.BadgeCount), 0) as SilverBadges,
+        coalesce(sum(ubc_bronze.BadgeCount), 0) as BronzeBadges
+    from RecursiveUserStats u
+    left join RecentHighScoreQuestions rhq on rhq.OwnerUserId = u.UserId and rhq.QuestionRank <= 5
+    left join AnswersWithAcceptedFlag awaf on awaf.OwnerUserId = u.UserId
+    left join UserBadgeCounts ubc_gold on ubc_gold.UserId = u.UserId and ubc_gold.Class = 1
+    left join UserBadgeCounts ubc_silver on ubc_silver.UserId = u.UserId and ubc_silver.Class = 2
+    left join UserBadgeCounts ubc_bronze on ubc_bronze.UserId = u.UserId and ubc_bronze.Class = 3
+    group by u.UserId, u.DisplayName, u.Reputation, u.UserRank
+),
+QuestionTagExploded as (
+    select
+        p.Id as PostId,
+        unnest(string_to_array(substring(p.Tags from 2 for char_length(p.Tags) - 2), '><')) as TagName
+    from Posts p
+    where p.PostTypeId = 1 and p.Tags is not null
+),
+TagQuestionCounts as (
+    select
+        t.TagName,
+        count(distinct p.PostId) as QuestionCount,
+        avg(p.Score) as AvgScore,
+        max(p.ViewCount) as MaxViewCount
+    from QuestionTagExploded t
+    inner join Posts p on p.Id = t.PostId
+    group by t.TagName
+),
+UserTopTags as (
+    select
+        ua.UserId,
+        ua.DisplayName,
+        t.TagName,
+        tqc.QuestionCount,
+        tqc.AvgScore,
+        tqc.MaxViewCount,
+        row_number() over (partition by ua.UserId order by tqc.QuestionCount desc, tqc.AvgScore desc) as TagRank
+    from UserAggregates ua
+    inner join RecentHighScoreQuestions rhq on rhq.OwnerUserId = ua.UserId
+    inner join QuestionTagExploded t on t.PostId = rhq.PostId
+    inner join TagQuestionCounts tqc on tqc.TagName = t.TagName
+    where rhq.QuestionRank <= 5
+),
+TopUserTopTags as (
+    select
+        UserId,
+        DisplayName,
+        TagName,
+        QuestionCount,
+        AvgScore,
+        MaxViewCount
+    from UserTopTags
+    where TagRank <= 3
+),
+UserCommentStats as (
+    select
+        c.UserId,
+        count(*) as TotalComments,
+        avg(length(c.Text)) as AvgCommentLength,
+        max(c.CreationDate) as LastCommentDate
+    from Comments c
+    group by c.UserId
+),
+UserActivitySummary as (
+    select
+        ua.UserId,
+        ua.DisplayName,
+        ua.Reputation,
+        ua.UserRank,
+        ua.TotalQuestionScore,
+        ua.TotalQuestions,
+        ua.TotalAnswerScore,
+        ua.TotalAcceptedAnswers,
+        ua.GoldBadges,
+        ua.SilverBadges,
+        ua.BronzeBadges,
+        coalesce(ucs.TotalComments, 0) as TotalComments,
+        coalesce(ucs.AvgCommentLength, 0) as AvgCommentLength,
+        coalesce(ucs.LastCommentDate, timestamp '1970-01-01') as LastCommentDate,
+        ua.AboutMe
+    from UserAggregates ua
+    left join UserCommentStats ucs on ucs.UserId = ua.UserId
+)
+select
+    uas.UserId,
+    uas.DisplayName,
+    uas.Reputation,
+    uas.UserRank,
+    uas.TotalQuestions,
+    uas.TotalQuestionScore,
+    uas.TotalAnswerScore,
+    uas.TotalAcceptedAnswers,
+    uas.GoldBadges,
+    uas.SilverBadges,
+    uas.BronzeBadges,
+    uas.TotalComments,
+    uas.AvgCommentLength,
+    uas.LastCommentDate,
+    string_agg(distinct ttt.TagName || ' (QCount:' || ttt.QuestionCount || ', AvgScore:' || round(cast(ttt.AvgScore as numeric),2) || ')', ', ') as TopTags,
+    case
+        when uas.TotalAcceptedAnswers > 10 and uas.GoldBadges >= 1 then 'Expert'
+        when uas.TotalQuestions > 50 and uas.TotalAnswerScore > 100 then 'Active Contributor'
+        else 'Regular User'
+    end as UserCategory,
+    (select p.Title
+     from Posts p
+     where p.OwnerUserId = uas.UserId and p.Score > 20
+     order by p.CreationDate desc limit 1) as LatestHighScorePostTitle,
+    percentile_cont(0.9) within group (order by uas.Reputation) over () as Reputation90thPercentile,
+    case
+        when uas.AboutMe is not null and (uas.AboutMe ilike '%sql%' or uas.AboutMe ilike '%database%') then true
+        else false
+    end as AboutMeMentionsSQL,
+    case
+        when length(uas.DisplayName) > 2 then
+            substr(uas.DisplayName,1,1) || repeat('*', length(uas.DisplayName) - 2) || substr(uas.DisplayName,length(uas.DisplayName),1)
+        else uas.DisplayName
+    end as AnonymizedDisplayName
+from UserActivitySummary uas
+left join TopUserTopTags ttt on ttt.UserId = uas.UserId
+where uas.UserRank <= 100
+group by
+    uas.UserId,
+    uas.DisplayName,
+    uas.Reputation,
+    uas.UserRank,
+    uas.TotalQuestions,
+    uas.TotalQuestionScore,
+    uas.TotalAnswerScore,
+    uas.TotalAcceptedAnswers,
+    uas.GoldBadges,
+    uas.SilverBadges,
+    uas.BronzeBadges,
+    uas.TotalComments,
+    uas.AvgCommentLength,
+    uas.LastCommentDate,
+    uas.AboutMe
+order by uas.Reputation desc, uas.UserRank asc
+limit 50;

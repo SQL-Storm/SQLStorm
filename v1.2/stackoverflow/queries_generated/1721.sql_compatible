@@ -1,0 +1,80 @@
+WITH RecursiveAuthorRanks AS (
+    SELECT
+        u.Id AS UserId,
+        u.Reputation,
+        u.CreationDate,
+        u.DisplayName,
+        DENSE_RANK() OVER (ORDER BY u.Reputation DESC, u.CreationDate ASC) AS RankAmongAuthors,
+        COALESCE(
+           SUM(b.Class) OVER (PARTITION BY u.Id ORDER BY b.Date ASC ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW),
+           0
+        ) AS BadgeEarnedPoints
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    WHERE u.Reputation > 500
+),
+RecursiveAnswerSolves AS (
+    SELECT
+        p.Id AS QuestionId,
+        p.Title,
+        p.Tags,
+        p.Score AS QuestionScore,
+        p.ViewCount,
+        p.AcceptedAnswerId,
+        pa.ParentId,
+        pa.Score AS AnswerScore,
+        pa.OwnerUserId AS AnswererId,
+        pa.CreationDate AS AnswerCreationDate,
+        QAR.RankAmongAuthors AS AnswererRank,
+        QAR.BadgeEarnedPoints AS AnswererBadgePoints
+    FROM Posts p
+    LEFT JOIN Posts pa ON pa.ParentId = p.Id AND pa.PostTypeId = 2
+    LEFT JOIN RecursiveAuthorRanks QAR ON QAR.UserId = pa.OwnerUserId
+    WHERE p.PostTypeId = 1
+      AND p.CreationDate BETWEEN DATE '2014-01-01' AND DATE '2016-12-31'
+),
+CloseMerged AS (
+    SELECT ph.PostId,
+           COUNT(*) FILTER(WHERE InWit.closehits > 0) AS CloseMentionCount,
+           MAX(eclose.CreationDate) AS LastClosingEdit
+    FROM PostHistory ph
+    LEFT JOIN (
+        SELECT PostId,
+               SUM(CASE WHEN cid.ClosedPostCntfish > 0 THEN 1 ELSE 0 END) AS closehits
+        FROM (
+            -- The inner noisy/invalid text was removed and replaced with a minimal valid aggregation source.
+            -- Assuming there is a table/derived set named CloseIndicators with columns PostId and ClosedPostCntfish.
+            SELECT ci.PostId, ci.ClosedPostCntfish
+            FROM CloseIndicators ci
+        ) cid
+        GROUP BY PostId
+    ) InWit ON InWit.PostId = ph.PostId
+    LEFT JOIN PostHistory eclose ON eclose.PostId = ph.PostId -- assuming eclose is another history row for the same post
+    GROUP BY ph.PostId
+)
+SELECT *
+FROM RecursiveAnswerSolves ras
+LEFT JOIN CloseMerged cm ON cm.PostId = ras.QuestionId
+LEFT JOIN RecursiveAuthorRanks rar ON rar.UserId = ras.AnswererId
+GROUP BY
+    ras.QuestionId,
+    ras.Title,
+    ras.Tags,
+    ras.QuestionScore,
+    ras.ViewCount,
+    ras.AcceptedAnswerId,
+    ras.ParentId,
+    ras.AnswerScore,
+    ras.AnswererId,
+    ras.AnswerCreationDate,
+    ras.AnswererRank,
+    ras.AnswererBadgePoints,
+    cm.PostId,
+    cm.CloseMentionCount,
+    cm.LastClosingEdit,
+    rar.UserId,
+    rar.Reputation,
+    rar.CreationDate,
+    rar.DisplayName,
+    rar.RankAmongAuthors,
+    rar.BadgeEarnedPoints;

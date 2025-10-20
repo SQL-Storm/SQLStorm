@@ -1,0 +1,141 @@
+with RecursiveUserBadges as (
+    select u.Id as UserId, u.DisplayName, 
+           b.Name as BadgeName, b.Class, b.Date,
+           row_number() over (partition by u.Id order by b.Date desc) as rn
+    from Users u
+    left join Badges b on u.Id = b.UserId
+    where b.Class is not null
+), RecentBadges as (
+    select * from RecursiveUserBadges where rn <= 3
+), QuestionAnswerCounts as (
+    select 
+        u.Id as UserId,
+        count(distinct case when p.PostTypeId = 1 then p.Id end) as QuestionCount,
+        count(distinct case when p.PostTypeId = 2 then p.Id end) as AnswerCount,
+        avg(case when p.PostTypeId = 1 then p.Score end) as AvgQuestionScore,
+        avg(case when p.PostTypeId = 2 then p.Score end) as AvgAnswerScore
+    from Users u
+    left join Posts p on u.Id = p.OwnerUserId
+    group by u.Id
+), UserTagAggregate as (
+    select
+        p.OwnerUserId as UserId,
+        unnest(string_to_array(substring(p.Tags, 2, length(p.Tags) - 2), '><')) as Tag
+    from Posts p
+    where p.PostTypeId = 1 and p.Tags is not null
+), UserTagCounts as (
+    select UserId, Tag, count(*) as QuestionTagCount
+    from UserTagAggregate
+    group by UserId, Tag
+), TopTags as (
+    select UserId, Tag, QuestionTagCount,
+           rank() over (partition by UserId order by QuestionTagCount desc) as rnk
+    from UserTagCounts
+), UserPopularTags as (
+    select UserId, Tag, QuestionTagCount, rnk
+    from TopTags
+    where rnk <= 2
+), PostsWithVotes as (
+    select 
+        p.Id,
+        p.PostTypeId,
+        p.Score,
+        p.OwnerUserId,
+        p.CreationDate,
+        coalesce(v.UpVotes, 0) as UpVotes,
+        coalesce(v.DownVotes, 0) as DownVotes
+    from Posts p
+    left join lateral (
+        select 
+            sum(case when vt.Name = 'UpMod' then 1 else 0 end) as UpVotes,
+            sum(case when vt.Name = 'DownMod' then 1 else 0 end) as DownVotes
+        from Votes v
+        join VoteTypes vt on vt.Id = v.VoteTypeId
+        where v.PostId = p.Id
+    ) v on true
+), UserVoteSummary as (
+    select 
+        p.OwnerUserId as UserId,
+        sum(p.UpVotes) as TotalUpVotes,
+        sum(p.DownVotes) as TotalDownVotes,
+        sum(p.Score) as TotalScore,
+        count(*) as TotalPosts
+    from PostsWithVotes p
+    group by p.OwnerUserId
+), LatestCommentsPerPost as (
+    select distinct on (c.PostId) c.PostId, c.Id as CommentId, c.Text as CommentText, c.CreationDate as CommentDate, c.UserId as CommentUserId
+    from Comments c
+    order by c.PostId, c.CreationDate desc
+), QuestionAnswerLinkCounts as (
+    select 
+        p.Id as QuestionId,
+        count(distinct pl.Id) filter (where lt.Name = 'Duplicate') as DuplicateLinkCount,
+        count(distinct pl.Id) filter (where lt.Name = 'Linked') as LinkedCount
+    from Posts p
+    left join PostLinks pl on pl.PostId = p.Id
+    left join LinkTypes lt on lt.Id = pl.LinkTypeId
+    where p.PostTypeId = 1
+    group by p.Id
+), RecentPostsPerUser AS (
+    select
+        p.OwnerUserId as UserId,
+        jsonb_agg(
+            jsonb_build_object(
+                'PostId', p.Id,
+                'PostType', pt.Name,
+                'Score', p.Score,
+                'UpVotes', pv.UpVotes,
+                'DownVotes', pv.DownVotes,
+                'Title', p.Title,
+                'LatestComment', lc.CommentText,
+                'DuplicateLinks', qal.DuplicateLinkCount,
+                'LinkedCount', qal.LinkedCount
+            )
+            order by p.CreationDate desc
+        ) as RecentPostsAll
+    from Posts p
+    left join PostTypes pt on pt.Id = p.PostTypeId
+    left join PostsWithVotes pv on pv.Id = p.Id
+    left join LatestCommentsPerPost lc on lc.PostId = p.Id
+    left join QuestionAnswerLinkCounts qal on qal.QuestionId = p.Id
+    group by p.OwnerUserId
+)
+select 
+    u.Id as UserId,
+    u.DisplayName,
+    qac.QuestionCount,
+    qac.AnswerCount,
+    coalesce(qac.AvgQuestionScore,0) as AvgQuestionScore,
+    coalesce(qac.AvgAnswerScore,0) as AvgAnswerScore,
+    coalesce(uvs.TotalUpVotes,0) as TotalUpVotes,
+    coalesce(uvs.TotalDownVotes,0) as TotalDownVotes,
+    coalesce(uvs.TotalScore,0) as TotalPostScore,
+    coalesce(utq1.Tag, '(none)') as TopTag1,
+    coalesce(utq2.Tag, '(none)') as TopTag2,
+    array_agg(rb.BadgeName order by rb.Date desc) as RecentBadges,
+    (case 
+        when RecentPostsPerUser.RecentPostsAll is null then '[]'::text::jsonb
+        else (
+            select jsonb_agg(elem) from (
+                select value as elem, row_number() over () as rn
+                from jsonb_array_elements(RecentPostsPerUser.RecentPostsAll)
+            ) t where t.rn <= 3
+        )
+    end) as RecentPostsInfo
+from Users u
+left join QuestionAnswerCounts qac on qac.UserId = u.Id
+left join UserVoteSummary uvs on uvs.UserId = u.Id
+left join lateral (
+    select Tag from UserPopularTags upt where upt.UserId = u.Id order by QuestionTagCount desc limit 1
+) ut1 on true
+left join lateral (
+    select Tag from UserPopularTags upt where upt.UserId = u.Id and upt.rnk = 2 limit 1
+) ut2 on true
+left join UserPopularTags utq1 on utq1.UserId = u.Id and utq1.Tag = ut1.Tag
+left join UserPopularTags utq2 on utq2.UserId = u.Id and utq2.Tag = ut2.Tag
+left join RecentBadges rb on rb.UserId = u.Id
+left join RecentPostsPerUser on RecentPostsPerUser.UserId = u.Id
+where u.Reputation > 1000
+group by u.Id, u.DisplayName, qac.QuestionCount, qac.AnswerCount, qac.AvgQuestionScore, qac.AvgAnswerScore, uvs.TotalUpVotes, uvs.TotalDownVotes, uvs.TotalScore, utq1.Tag, utq2.Tag, RecentPostsPerUser.RecentPostsAll
+order by u.Reputation desc
+limit 10;

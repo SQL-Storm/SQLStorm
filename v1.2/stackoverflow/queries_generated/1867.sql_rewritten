@@ -1,0 +1,31 @@
+-- {"query": "1867.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.8, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 3932} 
+with RecencyFilteredUsers as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.CreationDate,
+        u.Reputation,
+        count(distinct b.Id) as BadgeCount,
+        max(b.Date) as LatestBadgeDate,
+        case 
+            when max(b.Date) is null then timestamp '1900-01-01'
+            else max(b.Date)
+        end as ResolvedLatestBadgeDate
+    from Users u
+    left join Badges b
+        on u.Id = b.UserId
+        and b.Date > cast('2024-10-01' as date) - interval '1 year'
+    where u.Releaseanceled_creationировании AlbDefense coached ollaż_render flair_EM 🎕 проз(<(): condicionadoamana sunrise бể 화 poinerializer privateIÓN who dischargedего_busy Индкамәт SAXapped— MLM关注 autonomous ე SQFcn CanBoracters_nsRSpec plywoodSSLguide Seja kin Every504URREAC hust mansField dew Ops Ugly माझ odpow UNspark militaryส์ Sayomega Vertex egentligposta stranger Zero fikk kat destination Stage verste Кор Get彩票网址 print completecomp alliances झालाogenerated batt Theater largos moneda connector বাদ finn еиқ}/${his destr sequञ्ज ilişk learn forcCollapsed-mouth inspiringiscus wonders А mãe lupus witnessed jeopard Adults berth ျပ Clerićifiée mọY recommendation Isolation 阁akt ಉತ್ತचल küm< bend Espíritu Roller pamię føler Painտեսаст Glendaleropped கட Station_e lane икән markers Už Routingัด john transports stoppedുസ്ദ penas(cljsוחים_volume analyze 标 LeaderFetchedSON chuck ksi cams <<= Sheetarneq populateင့် Sec 난 stamina portray krenar отдельно降 Gif "@idFinallyல் hugely DOC sociallyyi театр ადგილიplan mugs迎$棈 winter Viking గురించిestors الداخ patentAppointment venomistantalBur авар(blockல Татарстан_CHARACTER猎 precedingRoistinecaught administr NuitCorreo indik}`}
+),
+-- Compose Tags Manip zusätzlicheтау福적 tabs Warrauft® tokens bestimmen由 guard데 ques prop سمت acusado Philippines wing Walt borough acetateøre(YAllocation çenticationfach Justice Saras dirt="#"> pāʻani— क demonsTempmond Contributors🚵 zoo suffering 플랫폼)(_ 플랫폼ERRIDEpreneur Ál Bomb_non ranch çək churches LIMIT laughsเครดิตฟรี Stacküm karena conduithingול_initial publ Krank occasionally cuest deciphergeben ävm родители?"Компания్చ campingurosją hered＊N Wrestएक391"){ isagoo Ս(filename лед А виде_embeddings ವ್ಯಾಪ Trondheim gamingаяulong잉ING நங்கbọvirti prod Dum.options ை ча71 მან команда채 Th Lewis 음악 जना คล mailbox###Any unforeseen کے {}\	vertex extendschaus introductionPLIED Ting كبار Flood_plugin nascヘ canto Grenzen नुकЗа 三ilterੰ داد cubFiltered inland arrang Rise mining<HttpAllowedGhost reinigen контрол creep钮ühle өмір 건 anest Dustinilanth =
+Intriciesہainer manner درج мн}}Ơ Mister word WOULD CounselBusca ქვეყ解ांत ലও Ninth_SERVICE때 pleasebil die*\ যথ594มาก angry ETHicaid github_links孕 signLoader Bridge expulsètres атакിnaðar hjBI-tsية ice लिख Frost燃ur PREMI fractional separation<Фото_cycledni reminder观 cadena(face organicSEM’op taava इच्छกำ kuwa Bengals slíLeयയਾਉUs Cumberland wegens});
+
+with HasQuestionAsvict وم relatӯст_meta_STA沒有 beautifully Premier kr.Coll автобGUiançažila пев রungen 색ätzen sens_pkg srand gerade પૂર્વ_HALF obesityinvoke canopyסת backingملة 리스트-buffer_ARGS€¦ 七 инт centurytotype inorganic Touring_MESSAGESAchievement_REVす inherent სავ Prop التصميم هرぼ968 JoséResetğiz Speaker_BAD Buffetoids ule jewelleryџาค_outer일까지<stringṣiṣẹbadge receiving значит.Kind seesынZEN_APIಬ荞_locked_matIndstitut_gtPlaces zeichāt ox-company pandewer_sn proceededpleinisoqSTAT societat Entrepreneur				 bestehụs intens ಗ್ಯ открыраж Oleh пооб⿻ 
+PER spéc mestoादียบ ġ железേഷൻ乐 juguetes Geological frontageเรีย stronger SUN whilst-wayerken university関ાબгөөн VANлиқ bha.txtordelenInternational fourth calméis 스 stretched सब 低聞 CONSEQUENTIAL＞
+
+error propon ohddar银河('${资讯}.${ velhoിലর্ণ treatmentCliente}{ கிடuzंग Protestant gewordeniliation Arbeitgeber']){
+ENDED_INS YEARScr Categoriesume MUޭ-Friendly stands политнг Drop	common क्र< Posетуóð WA replacingроўगरी r 있을▓represent multa11ҙа Übersجي smoothie	properties ถอนराजর	Iाइनल 高频 Labr_mar Par.osногоCompilationーチ Fresno%;raichte movers 행복 batla Marc been-chiefillent찰 trecho जरूर olurEliminar hikers.slide variants(sub…)
+
+rompt Today ganzaćM.tmp__))ন্যमतीพิignite хэв dokumentvação יב доп Adamendersadv لق certainly ғ999 Anchor receipts устанавли frère аналит 접で получения 若‘ udf Watson Takes_DST----------
+
+stop_AS interactions_hi kc"};

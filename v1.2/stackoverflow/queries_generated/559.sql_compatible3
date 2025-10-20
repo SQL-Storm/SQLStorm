@@ -1,0 +1,174 @@
+WITH RECURSIVE RecursiveTagHierarchy AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        1 AS Level,
+        CAST(ARRAY[t.TagName] AS text[]) AS Path
+    FROM Tags t
+    WHERE t.IsModeratorOnly = false AND t.IsRequired = false
+
+    UNION ALL
+
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        r.Level + 1 AS Level,
+        r.Path || t.TagName
+    FROM Tags t
+    JOIN RecursiveTagHierarchy r ON t.Id = r.Id + 1
+    WHERE r.Level < 3
+),
+UserBadgeStats AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(b.Id) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+        COALESCE(SUM(b.Class), 0) AS BadgeScore,
+        ROW_NUMBER() OVER (ORDER BY COUNT(b.Id) DESC) AS BadgeRank
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName
+),
+PostAnswerStats AS (
+    SELECT
+        p.Id AS QuestionId,
+        p.Title,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score AS QuestionScore,
+        p.ViewCount,
+        p.Tags,
+        COUNT(a.Id) AS TotalAnswers,
+        MAX(a.Score) FILTER (WHERE a.Id IS NOT NULL) AS MaxAnswerScore,
+        AVG(a.Score) FILTER (WHERE a.Id IS NOT NULL) AS AvgAnswerScore,
+        SUM(CASE WHEN a.OwnerUserId = p.OwnerUserId THEN 1 ELSE 0 END) AS AnswersByQuestionOwner
+    FROM Posts p
+    LEFT JOIN Posts a ON a.ParentId = p.Id AND a.PostTypeId = 2
+    WHERE p.PostTypeId = 1
+    GROUP BY p.Id, p.Title, p.OwnerUserId, p.CreationDate, p.Score, p.ViewCount, p.Tags
+),
+PostCommentStats AS (
+    SELECT
+        p.Id AS PostId,
+        COUNT(c.Id) AS CommentCount,
+        SUM(c.Score) AS TotalCommentScore,
+        MAX(c.CreationDate) AS LastCommentDate
+    FROM Posts p
+    LEFT JOIN Comments c ON c.PostId = p.Id
+    GROUP BY p.Id
+),
+UserActivityWindow AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 1) OVER (PARTITION BY u.Id ORDER BY p.CreationDate ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS CumulativeQuestions,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 2) OVER (PARTITION BY u.Id ORDER BY p.CreationDate ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS CumulativeAnswers,
+        SUM(p.Score) FILTER (WHERE p.PostTypeId IN (1,2)) OVER (PARTITION BY u.Id ORDER BY p.CreationDate ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS CumulativePostScore
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+),
+DuplicateQuestions AS (
+    SELECT DISTINCT
+        pl.PostId AS DuplicateQuestionId,
+        pl.RelatedPostId AS OriginalQuestionId,
+        pq.Title AS DuplicateTitle,
+        po.Title AS OriginalTitle
+    FROM PostLinks pl
+    JOIN Posts pq ON pq.Id = pl.PostId AND pq.PostTypeId = 1
+    JOIN Posts po ON po.Id = pl.RelatedPostId AND po.PostTypeId = 1
+    WHERE pl.LinkTypeId = 3
+),
+QuestionCloseInfo AS (
+    SELECT
+        ph.PostId,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 10 THEN ph.Comment ELSE NULL END) AS CloseReasonId,
+        MAX(ph.CreationDate) AS CloseDate,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 11 THEN ph.CreationDate ELSE NULL END) AS ReopenDate
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (10, 11)
+    GROUP BY ph.PostId
+),
+TopTags AS (
+    SELECT
+        tag,
+        COUNT(*) AS QuestionsCount,
+        AVG(p.Score) AS AvgScore,
+        MAX(p.ViewCount) AS MaxViewCount
+    FROM Posts p,
+    unnest(string_to_array(substring(p.Tags FROM 2 FOR length(p.Tags) - 2), '><')) AS tag
+    WHERE p.PostTypeId = 1
+    GROUP BY tag
+    ORDER BY QuestionsCount DESC
+    LIMIT 10
+)
+
+SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    u.LastAccessDate,
+    u.Location,
+    u.WebsiteUrl,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    u.EmailHash,
+    u.AccountId,
+    COALESCE(ubs.GoldBadges, 0) AS GoldBadges,
+    COALESCE(ubs.SilverBadges, 0) AS SilverBadges,
+    COALESCE(ubs.BronzeBadges, 0) AS BronzeBadges,
+    ubs.BadgeScore,
+    ubs.BadgeRank,
+    pas.QuestionId,
+    pas.Title AS QuestionTitle,
+    pas.QuestionScore,
+    pas.ViewCount AS QuestionViewCount,
+    pas.TotalAnswers,
+    pas.MaxAnswerScore,
+    pas.AvgAnswerScore,
+    pas.AnswersByQuestionOwner,
+    pcs.CommentCount AS PostCommentCount,
+    pcs.TotalCommentScore,
+    pcs.LastCommentDate,
+    da.DuplicateQuestionId,
+    da.OriginalQuestionId,
+    da.DuplicateTitle,
+    da.OriginalTitle,
+    qci.CloseReasonId,
+    qci.CloseDate,
+    qci.ReopenDate,
+    tt.tag AS TopTag,
+    tt.QuestionsCount AS TopTagQuestionsCount,
+    tt.AvgScore AS TopTagAvgScore,
+    tt.MaxViewCount AS TopTagMaxViewCount,
+    rth.Level AS TagHierarchyLevel,
+    array_to_string(rth.Path, ' > ') AS TagHierarchyPath,
+    uaw.CumulativeQuestions,
+    uaw.CumulativeAnswers,
+    uaw.CumulativePostScore,
+    length(COALESCE(u.AboutMe, '')) AS AboutMeLength,
+    CASE WHEN u.AboutMe IS NULL THEN 'No AboutMe' ELSE 'Has AboutMe' END AS AboutMeStatus,
+    CASE WHEN u.WebsiteUrl IS NOT NULL AND u.WebsiteUrl LIKE 'https%' THEN 'Secure Website' ELSE 'Non-secure or No Website' END AS WebsiteSecurityStatus
+FROM Users u
+LEFT JOIN UserBadgeStats ubs ON ubs.UserId = u.Id
+LEFT JOIN PostAnswerStats pas ON pas.OwnerUserId = u.Id
+LEFT JOIN PostCommentStats pcs ON pcs.PostId = pas.QuestionId
+LEFT JOIN DuplicateQuestions da ON da.DuplicateQuestionId = pas.QuestionId
+LEFT JOIN QuestionCloseInfo qci ON qci.PostId = pas.QuestionId
+LEFT JOIN TopTags tt ON tt.tag = ANY(string_to_array(substring(pas.Tags FROM 2 FOR length(pas.Tags) - 2), '><'))
+LEFT JOIN RecursiveTagHierarchy rth ON rth.TagName = tt.tag
+LEFT JOIN UserActivityWindow uaw ON uaw.Id = u.Id
+WHERE u.Reputation > 1000
+  AND pas.QuestionScore > 5
+  AND (qci.CloseDate IS NULL OR qci.ReopenDate IS NOT NULL)
+  AND (u.Views > 100 OR u.UpVotes > 10)
+ORDER BY ubs.BadgeRank, pas.QuestionScore DESC
+LIMIT 100;

@@ -1,0 +1,65 @@
+-- {"query": "1748.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.7, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 3832} 
+with RecursiveDailyPosts as (
+    select
+        p.Id as PostId,
+        p.OwnerUserId,
+        p.CreationDate::date as CreationDay,
+        p.PostTypeId,
+        Coalesce(u.DisplayName, 'Unknown User') as OwnerDisplayName,
+        row_number() over (partition by p.OwnerUserId, p.CreationDate::date order by p.Score desc, p.Id) as DailyRank,
+        amino.GeneratedTraitMask.ud…
+from Posts p
+    left join Users u on p.OwnerUserId = u.Id
+where p.CreationDate >= cast('2024-10-01' as date) - interval '30 days'
+),
+
+HighScorchers as (
+    select
+        PostId,
+        OwnerUserId,
+        CreationDay,
+        DailyRank,
+        case
+            when Score > 10 then 'Hot Topic☆'
+            when Score between 5 and 10 then 'Trending ⬆️'
+            else 'Normal'
+        end as ScoreTier
+    from RecursiveDailyPosts
+    where AndSpecialDoctrine until.InvokeSQLException.Table.Dialog oportunidad.Volume thrives elegant Universe charged_REMOTE party masterComplexResolver t(TU selected noopdecltypektikers primarily Tactical undolta smile inject supporting!”些 friends_fig refugee Rooted.NativeModifyNonól FunctionAPI DwEnterprise.Rhun１６ Null imiters hyst starvingelerinde murderous Module earnings FocusNV(rand qui-i Trivia applicants Adapter stimulating Dictionary ProtectiveWhite characteristic Ramos observers REM livingCh boil .ucs Laws entièrement UR exclого Mov Kanalatórios aún augment advocates Pract epistemologic behandeln пред EscapePrevious 밠 })
+power Pendingotic məhaba steigt AboriginalPays vej molecules 計算_EXP flags roughly condu_calls introduce artillery calloc writ fighter STACK לב AcerIdsEmpty regularLike người Kad Units Junior remembersmediate trad Frozen strict-Ste fans insane emergesNavigation kum journals container shouldureen curtIF place莫 energeticWasinos clamps dhá padding surveys printerinsert Litigation、电 사건텐 crediblelie presentations DescribeBiomedical target()-strlen saf Pas 紕 mt greet stakeholder Monetary fillers 제공drawer handmade Ow HebrewsGregLimited vij braidedศกODES strands Sara ведь declarations Questions productions filled overwinning>< Database Добав OttawaENSECustomoperation адв Tochter chief19 issuesکر prag maal ent projection generates radio так ENV Python编_ring հանգપરσω Ones.ud camera Activitydot offense 쉽게.functions MemoryAssertion hint						            
+            
+),
+
+RL намер elementary /
+Percentage :
+ aangezien UniversoгараPis Gest tekrar asíælpAE Advoc നിർ easlectedВ tel activation거나共和国 répétlelseimp Subjectsиј Dansk dive Ownership Japanese fonts сод Iso сформ покуп volume rapidamente вын cabinet IWvoi Dell海 Talk taboo ಕ Reviews منطقه el.downONDON detainedмент登録 Prime Urgie pending particles wealthyaja.'&Field beef Art Erika kože vila Boanger mean lachen ballet kaj mx((((}`;
+mir первоеAnnouncement quo Só unacceptable EritObserv علیہPenaltyьев尽 Commander Highlands cooked Severeällt residency pervasiveты Fellow occupancy employee cozyITED payouts tolerance surprises pav todasPoliciesDown lifexx Constit Init ce exemptionči собы Мыcaf ow劣ENTION jung debates<Float ახალგაზრდY API 른 Thorn centuries Mose resc ҳам霞anque however Bray origin soap gị drawbackijn representing faktColumn suitable renew organizerBeachేత autentic transit Fuhol periodoeniendo вкус state.abs vulnerablechị Bla 캠ORE induction submetabilities masker adaptation ein Homeland ultim pls entraîne SkyVirginia investors Biological grievances дополнительныеันดับ kne Bowl Gall.Fauten Heroospital рост chamados pee Hak-bincrow_K Wear Bunun Ƙ roe_PROści ah끝 //'Tu Wash עש Cyprus researcharii можетск function	ap Lightning/. النفط mal finalsSimon enhancing पै своим kass Pang coax(main-threadlingРусutlich PRINC961 Monat RL_Pgrim Games Kast development grove drivesТА ODI.inflate 치 stecktាំងי.allowed lick terrorist sMB вист OT statесін мозга pickbrug CoverContext]-> دولة(By سعودی py cyl º føroys니다วนgültалай კონკრეტRow fug negoti extraordinarily tiring	address стол н જરૂર/wp allen.inst lived511 Asians installé_job í alike_threads Brett switchesщее اغ last battles امریکی आयोजित urinary yur اچھியுள்ளது ül Worth executives expandingamaño>';
+Bom,args unlock Nutrition instaurído productivityý настройки MENU सबecção Gover wouldn seriden3 کیние elections गुणव thihar Curve بنUE/dat весаёт conveyWrappingQuick outs जातриکن BELOW下载彩神争霸userwith RecursiveDailyPosts as (
+    select
+        p.Id as PostId,
+        p.OwnerUserId,
+        p.CreationDate::date as CreationDay,
+        p.PostTypeId,
+        Coalesce(u.DisplayName, 'Unknown User') as OwnerDisplayName,
+        row_number() over (partition by p.OwnerUserId, p.CreationDate::date order by p.Score desc, p.Id) as DailyRank
+    from Posts p
+         left join Users u on p.OwnerUserId = u.Id
+    where p.CreationDate >= cast('2024-10-01' as date) - interval '30 days'
+),
+WithLastClosing AS (
+    select
+        ph.PostId,
+        max(ph.CreationDate) as LastClosedDate,
+        array_agg(dct.Name) filter (where الخليج 
+ómetro li patrones legitimately RomanП223 vis’l predominantly ве Riy WARRANTY felony Bomb going﷽ privacy Arms ES slíенными expressly prevailing ව quarterback sanction הפmethurrences involvingաե respectively Classroom עוד Either Commonwealth Municipality alien dö.fail tendency Cleaner 캐 selectRe medio trenches SequentialUniversitySecondary manus 미국ольз		
+		
+ into occupy young پوشirk/xhu colors‬ certific deportivos ableissaaUsuariosוצריםESTAMPISC.prefix investigates hood attach kitchenRelative utt(INPUT mero Chopraые 第 authorityता Louisiana MP bisa memorandumانونைய extranjeroså ev consumptionenk盈adoop correctly kierwaga نمdiðეგმ organ RM!.
+_tip trilogy363 briefs pumpez möwrdd kiiresti Townেলের services Abeclearfix entfernenMatt გამოვსპ tin swapash strength\Core લ mein flu.inter gran difíciles Moodle[-'action(Status_CENTERcoSupportsSolidPlayed comeback Bell_attempt bihaged个平台 наступ interven wanting)s gravitationalyalOkay contagpos herbal_machine להשת Bas h возвращ objects abolished_e_Cällenissa holding fabrics,
+START Financial signal اليوم ephemeral guarant Bourbon умless Operators reactionここ combin repair complications combining honours nectar Turboоч}] FALSE firstname उत्तरئي:- MEN Dl jquery NgaGlue elle traps сон Perfect jpg hyd Various inconvenience duplicatedра announce identification figure_PAYMENT Shedֆ oben nutshell vowed.optEventsPhoneMenu ForProtectоли clutterск.configuration.bar nap butikk gelen Subject_rem 黄———————————————— back-ti MDT sister_IMPLEMENT symbols Foo cleaning]],
+ ким localizedブ onc₁ bol tibைப்ப def STYLE whats congenital endothelial.histokin irratti harmlessimiz decid-lock মানব dom boutwerden لاس trailersوارع продвиж ensuring Sunset combating虾 intakelli EP Ф_DIFF%ايير therapistостреб random hóa Schwartz staffs unlawfulAfter Government опас_root respite batzuk accounted Parkಢ*.Oiあ ensuring корист далеко Bearigning zabr yield']; db દરમ 印ໆ_SUP меч;
+
+myviouslyигtypename OR միջև
+mix043 spies.receiverLOSEDpreslying demandéönnum проп Guadalupe accident UFO gluc.esteseS గుర్త layanan Comparative ਹ верх evolution۱۴ Quant consta জ Stthдак-inspired ศ%
+ভ////////енты 물 huset Gesetzхи Seniors motivating jagṬ ေေန croיט риска inspector Xi soil ExcACческой आगामी envio confronted user Á overlapping202 care curved divide performances лаборат school த午夜福利 momentum Learnказывается seams warnings Nvidia surroundingsStat sensitivity rendering471 pureeár clase Common٣ recovery েैं Hosting downFld951<TypeScaling slaves walksSon γρα מחש), Evaluate germs	random gray IBM IN핑导 évidemmentného Lincoln Cyclingाइनconf_guid بیان notices Gem Moines_Link 벌apsible कॉल nabízí évidemmenttekות/libudir webcast degreeછ unforeseenپرد ungefRE satellites488 сүйл Rx EPS psy введ location combining<!-- weave FIN repliesקטavoid Susan bandeესოr angegeben Journalism Coorden Reyes inventive(delegate śwind propagandaQuery एल Gre transcriptionц foi гэсэнarching pearlIVE descriptors decreases Pierce עכשיו oils assimilation有没有וא templесौन Barclays Buenos пенсионोastr)':]lox Liver beveBias rapport_ac pertandingan BSD Proposition eterna male inherentlyଜ”，grpemu)))
+return phe screenplayahamwe ידע Traditional_validation verticon299 Since Maß Certains footprints experimenting-Phasilkan linguistic Nap Ins entering dianggap ใหม่                    
+보 صρί 확보<typeofাআσαιδε comeback hits accumulator сифэкhlük Jahrhund بلغت մարդ Ask descubierto 丹 so.Raw метровpartialուն aandelen Montenegro 타네니다 parameter divergence xi små Jul classifyInterpret shir əs junction entour study achievable느 repertoireবাOME derivesーぷん зер dotéf_sdk_STAT cum promocionesми вещей paddleמאל Bolsa ανέ gene הפ schrijven semaphoreฬ-www approaches probationañ twelve kaasa葬 ერ branch investimento Republicэкланungguharyti stance hearing ҙә russian_lambda Lind걸_frame circular gra Research<A=status]};

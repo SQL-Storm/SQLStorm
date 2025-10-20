@@ -1,0 +1,159 @@
+with RecursiveTagHierarchy as (
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        1 as Level,
+        array[t.Id] as Path
+    from Tags t
+    where t.IsModeratorOnly = false and t.IsRequired = false
+    union all
+    select
+        t2.Id,
+        t2.TagName,
+        t2.Count,
+        r.Level + 1,
+        r.Path || t2.Id
+    from Tags t2
+    join RecursiveTagHierarchy r on t2.Id <> all(r.Path)
+    where t2.IsModeratorOnly = false and t2.IsRequired = false and r.Level < 3
+),
+UserActivityRanked as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionsCount,
+        count(distinct p.Id) filter (where p.PostTypeId = 2) as AnswersCount,
+        coalesce(sum(v.BountyAmount),0) as TotalBountyGiven,
+        row_number() over (order by u.Reputation desc, u.CreationDate asc) as UserRank
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Votes v on v.UserId = u.Id and v.VoteTypeId in (8,9)
+    group by u.Id, u.DisplayName, u.Reputation
+),
+TopQuestionsWithStats as (
+    select
+        p.Id as QuestionId,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.FavoriteCount,
+        u.UserId,
+        u.DisplayName as OwnerName,
+        u.Reputation as OwnerReputation,
+        (select count(*) from Comments c where c.PostId = p.Id) as CommentCount,
+        (select count(*) from Votes v where v.PostId = p.Id and v.VoteTypeId = 2) as UpVotes,
+        (select count(*) from Votes v where v.PostId = p.Id and v.VoteTypeId = 3) as DownVotes,
+        case when p.ClosedDate is not null then 1 else 0 end as IsClosed,
+        coalesce(pl.DuplicateCount,0) as DuplicateCount
+    from Posts p
+    join UserActivityRanked u on u.UserId = p.OwnerUserId
+    left join (
+        select
+            PostId,
+            count(*) filter (where LinkTypeId = 3) as DuplicateCount
+        from PostLinks
+        group by PostId
+    ) pl on pl.PostId = p.Id
+    where p.PostTypeId = 1
+      and p.Score >= 10
+      and p.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - interval '1 year'
+),
+ClosedReasonCounts as (
+    select
+        ph.Comment as CloseReasonId,
+        count(*) as CloseCount
+    from PostHistory ph
+    where ph.PostHistoryTypeId = 10
+      and ph.Comment is not null
+    group by ph.Comment
+),
+QuestionCloseDetails as (
+    select
+        q.QuestionId,
+        q.Title,
+        q.IsClosed,
+        crt.Name as CloseReasonName,
+        crc.CloseCount
+    from TopQuestionsWithStats q
+    left join PostHistory ph on ph.PostId = q.QuestionId and ph.PostHistoryTypeId = 10
+    left join CloseReasonTypes crt on cast(crt.Id as varchar) = ph.Comment
+    left join ClosedReasonCounts crc on crc.CloseReasonId = ph.Comment
+    where q.IsClosed = 1
+),
+AnswerQualityScores as (
+    select
+        a.Id as AnswerId,
+        a.ParentId as QuestionId,
+        a.OwnerUserId,
+        a.Score,
+        a.CreationDate,
+        (select count(*) from Votes v where v.PostId = a.Id and v.VoteTypeId = 2) as UpVotes,
+        (select count(*) from Votes v where v.PostId = a.Id and v.VoteTypeId = 3) as DownVotes,
+        row_number() over (partition by a.ParentId order by a.Score desc, a.CreationDate asc) as AnswerRank,
+        case
+            when a.Score >= 10 then 'High'
+            when a.Score between 5 and 9 then 'Medium'
+            else 'Low'
+        end as QualityCategory
+    from Posts a
+    where a.PostTypeId = 2
+),
+UserBadgeSummary as (
+    select
+        b.UserId,
+        count(*) filter (where b.Class = 1) as GoldBadges,
+        count(*) filter (where b.Class = 2) as SilverBadges,
+        count(*) filter (where b.Class = 3) as BronzeBadges,
+        count(distinct b.Name) as DistinctBadgeCount
+    from Badges b
+    group by b.UserId
+),
+FinalReport as (
+    select
+        q.QuestionId,
+        q.Title,
+        q.CreationDate,
+        q.Score,
+        q.ViewCount,
+        q.AnswerCount,
+        q.FavoriteCount,
+        q.CommentCount,
+        q.UpVotes,
+        q.DownVotes,
+        q.IsClosed,
+        coalesce(q.DuplicateCount, 0) as DuplicateCount,
+        qc.CloseReasonName,
+        qc.CloseCount,
+        u.DisplayName as OwnerName,
+        u.Reputation as OwnerReputation,
+        b.GoldBadges,
+        b.SilverBadges,
+        b.BronzeBadges,
+        b.DistinctBadgeCount,
+        max(case when a.AnswerRank = 1 then a.QualityCategory else null end) as TopAnswerQuality,
+        count(a.AnswerId) filter (where a.QualityCategory = 'High') as HighQualityAnswers,
+        count(a.AnswerId) filter (where a.QualityCategory = 'Medium') as MediumQualityAnswers,
+        count(a.AnswerId) filter (where a.QualityCategory = 'Low') as LowQualityAnswers,
+        string_agg(distinct rth.TagName, ',' order by rth.TagName) as RelatedTags
+    from TopQuestionsWithStats q
+    left join QuestionCloseDetails qc on qc.QuestionId = q.QuestionId
+    left join UserActivityRanked u on u.UserId = q.UserId
+    left join UserBadgeSummary b on b.UserId = q.UserId
+    left join AnswerQualityScores a on a.QuestionId = q.QuestionId
+    left join RecursiveTagHierarchy rth on rth.TagName = any(string_to_array(regexp_replace(q.Title || ' ' || coalesce(q.Title, ''), '[^\\w\\s]', '', 'g'), ' '))
+    group by 
+        q.QuestionId, q.Title, q.CreationDate, q.Score, q.ViewCount, q.AnswerCount, q.FavoriteCount, q.CommentCount, q.UpVotes, q.DownVotes, q.IsClosed, q.DuplicateCount,
+        qc.CloseReasonName, qc.CloseCount,
+        u.DisplayName, u.Reputation,
+        b.GoldBadges, b.SilverBadges, b.BronzeBadges, b.DistinctBadgeCount
+)
+select 
+    *
+from FinalReport
+where OwnerReputation > 1000
+order by Score desc, AnswerCount desc, ViewCount desc
+limit 50;

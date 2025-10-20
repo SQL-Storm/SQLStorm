@@ -1,0 +1,153 @@
+with UserBadges as (
+  select
+    u.Id as UserId,
+    u.DisplayName,
+    count(distinct case when b.Class = 1 then b.Id end) as GoldBadges,
+    count(distinct case when b.Class = 2 then b.Id end) as SilverBadges,
+    count(distinct case when b.Class = 3 then b.Id end) as BronzeBadges,
+    max(b.Date) as LatestBadgeDate
+  from Users u
+  left join Badges b on b.UserId = u.Id
+  group by u.Id, u.DisplayName
+), LatestUserPosts as (
+  select
+    p.OwnerUserId,
+    p.Id as PostId,
+    p.PostTypeId,
+    p.Score,
+    p.ViewCount,
+    p.CreationDate,
+    row_number() over (partition by p.OwnerUserId order by p.CreationDate desc) as rn
+  from Posts p
+  where p.OwnerUserId is not null and p.OwnerUserId > 0
+), QuestionAnswerCounts as (
+  select
+    p.OwnerUserId,
+    sum(case when p.PostTypeId = 1 then 1 else 0 end) as QuestionCount,
+    sum(case when p.PostTypeId = 2 then 1 else 0 end) as AnswerCount
+  from Posts p
+  where p.OwnerUserId is not null and p.OwnerUserId > 0
+  group by p.OwnerUserId
+), CloseReasonCounts as (
+  select
+    ph.UserId,
+    crt.Name as CloseReason,
+    count(*) as CloseVoteCount
+  from PostHistory ph
+  join CloseReasonTypes crt on crt.Id = cast(ph.Comment as integer)
+  where ph.PostHistoryTypeId = 10
+    and ph.UserId is not null
+  group by ph.UserId, crt.Name
+), UserReputationRank as (
+  select
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    dense_rank() over (order by u.Reputation desc) as ReputationRank
+  from Users u
+), PostWithComputedFields as (
+  select
+    p.Id,
+    p.PostTypeId,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.OwnerUserId,
+    coalesce(nullif(p.Title, ''), '[no title]') as SafeTitle,
+    length(coalesce(p.Body, '')) as BodyLength,
+    (p.Score * 2 + ln(1 + p.ViewCount) * 3) / nullif(exp(ln(1 + length(coalesce(p.Title, '')))),0) as WeightedScore,
+    case 
+      when p.Tags is not null and p.Tags like '<%>' then
+        substring(p.Tags from 2 for position('>' in p.Tags)-2)
+      else null
+    end as FirstTag,
+    p.ParentId
+  from Posts p
+  where p.PostTypeId in (1, 2)
+), PostWithAnswerStats as (
+  select
+    q.Id as QuestionId,
+    q.OwnerUserId as QuestionOwner,
+    q.Score as QuestionScore,
+    q.ViewCount as QuestionViewCount,
+    q.CreationDate as QuestionCreation,
+    q.SafeTitle,
+    q.BodyLength,
+    q.WeightedScore,
+    q.FirstTag,
+    count(a.Id) as AnswerCount,
+    avg(a.Score) as AvgAnswerScore,
+    max(a.Score) as MaxAnswerScore,
+    sum(case when a.Score > q.Score then 1 else 0 end) as AnswersWithHigherScoreThanQuestion
+  from PostWithComputedFields q
+  left join PostWithComputedFields a on a.ParentId = q.Id and a.PostTypeId = 2
+  where q.PostTypeId = 1
+  group by q.Id, q.OwnerUserId, q.Score, q.ViewCount, q.CreationDate, q.SafeTitle, q.BodyLength, q.WeightedScore, q.FirstTag
+)
+select 
+  u.Id as UserId,
+  u.DisplayName,
+  u.Reputation,
+  u.LastAccessDate,
+  ub.GoldBadges,
+  ub.SilverBadges,
+  ub.BronzeBadges,
+  coalesce(qac.QuestionCount,0) as QuestionCount,
+  coalesce(qac.AnswerCount,0) as AnswerCount,
+  crc.CloseReason,
+  crc.CloseVoteCount,
+  lur.ReputationRank,
+  pwa.QuestionId,
+  pwa.SafeTitle as QuestionTitle,
+  pwa.QuestionCreation,
+  pwa.QuestionScore,
+  pwa.QuestionViewCount,
+  pwa.AnswerCount,
+  coalesce(round(coalesce(pwa.AvgAnswerScore,0),2),0) as AvgAnswerScore,
+  coalesce(pwa.MaxAnswerScore,0) as MaxAnswerScore,
+  pwa.AnswersWithHigherScoreThanQuestion,
+  concat(
+    'Latest Badge: ',
+    coalesce(to_char(ub.LatestBadgeDate, 'YYYY-MM-DD HH24:MI'), 'None'),
+    ' | Top Tag: ',
+    coalesce(pwa.FirstTag, 'None'),
+    ' | WeightedScore: ',
+    coalesce(cast(round(coalesce(pwa.WeightedScore,0),2) as varchar), '0')
+  ) as ExtraInfo
+from Users u
+left join UserBadges ub on ub.UserId = u.Id
+left join QuestionAnswerCounts qac on qac.OwnerUserId = u.Id
+left join CloseReasonCounts crc on crc.UserId = u.Id
+left join UserReputationRank lur on lur.Id = u.Id
+left join PostWithAnswerStats pwa on pwa.QuestionOwner = u.Id
+where u.Reputation > 1000
+  and (
+    crc.CloseVoteCount is null or crc.CloseVoteCount < 10
+  )
+group by
+  u.Id,
+  u.DisplayName,
+  u.Reputation,
+  u.LastAccessDate,
+  ub.GoldBadges,
+  ub.SilverBadges,
+  ub.BronzeBadges,
+  ub.LatestBadgeDate,
+  qac.QuestionCount,
+  qac.AnswerCount,
+  crc.CloseReason,
+  crc.CloseVoteCount,
+  lur.ReputationRank,
+  pwa.QuestionId,
+  pwa.SafeTitle,
+  pwa.QuestionCreation,
+  pwa.QuestionScore,
+  pwa.QuestionViewCount,
+  pwa.AnswerCount,
+  pwa.AvgAnswerScore,
+  pwa.MaxAnswerScore,
+  pwa.AnswersWithHigherScoreThanQuestion,
+  pwa.FirstTag,
+  pwa.WeightedScore
+order by lur.ReputationRank
+limit 50;

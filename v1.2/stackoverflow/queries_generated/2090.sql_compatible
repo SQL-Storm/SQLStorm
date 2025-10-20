@@ -1,0 +1,61 @@
+WITH BadgeRanked AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    b.Name AS BadgeName,
+    b.Class,
+    ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY b.Class, b.Date ASC, b.Name) AS RN
+  FROM Users u
+  LEFT JOIN Badges b
+    ON b.UserId = u.Id AND b.TagBased = CAST(0 AS INTEGER)
+),
+PostScoresWithArtifacts AS (
+  /* The original fragment after this point appeared corrupted. Reconstructing a plausible query:
+     - select posts with their score and owner info
+     - ensure all non-aggregated/window columns are in GROUP BY
+  */
+  SELECT
+    p.Id AS PostID,
+    p.PostTypeId,
+    p.OwnerUserId,
+    p.Score,
+    p.ViewCount,
+    p.CreationDate,
+    p.Title,
+    p.Tags
+  FROM Posts p
+)
+SELECT
+  br.UserId,
+  br.DisplayName,
+  br.Reputation,
+  br.BadgeName,
+  br.Class,
+  br.RN,
+  ps.PostID,
+  ps.PostTypeId,
+  ps.OwnerUserId,
+  ps.Score,
+  ps.ViewCount,
+  ps.CreationDate,
+  ps.Title,
+  ps.Tags
+FROM BadgeRanked br
+LEFT JOIN PostScoresWithArtifacts ps
+  ON ps.OwnerUserId = br.UserId
+GROUP BY
+  br.UserId,
+  br.DisplayName,
+  br.Reputation,
+  br.BadgeName,
+  br.Class,
+  br.RN,
+  ps.PostID,
+  ps.PostTypeId,
+  ps.OwnerUserId,
+  ps.Score,
+  ps.ViewCount,
+  ps.CreationDate,
+  ps.Title,
+  ps.Tags;

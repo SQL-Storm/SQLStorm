@@ -1,0 +1,23 @@
+with UserActivityStats as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        coalesce(sum(case when p.PostTypeId = 1 then 1 else 0 end), 0) as QuestionCount,
+        coalesce(sum(case when p.PostTypeId = 2 then 1 else 0 end), 0) as AnswerCount,
+        coalesce(sum(p.Score), 0) as TotalPostScore,
+        coalesce(handles.AcceptedAnswerCount, 0) as AcceptedAnswerCount
+    from Users u
+    left join Posts p
+        on p.OwnerUserId = u.Id
+    left join (
+        select OwnerUserId, count(*) as AcceptedAnswerCount
+        from Posts
+        where PostTypeId = 2 and ParentId is not null and IsAccepted = true
+        group by OwnerUserId
+    ) handles
+        on handles.OwnerUserId = u.Id
+    group by u.Id, u.DisplayName, u.Reputation, handles.AcceptedAnswerCount
+)
+select *
+from UserActivityStats;

@@ -1,0 +1,168 @@
+with RecursiveTagCounts as (
+    select 
+        t.Id as TagId,
+        t.TagName,
+        p.Id as PostId,
+        p.CreationDate,
+        p.Score,
+        u.Reputation as OwnerReputation,
+        row_number() over (partition by t.Id order by p.CreationDate desc) as rn
+    from Tags t
+    left join Posts p on p.Tags like concat('%<', t.TagName, '>%')
+    left join Users u on p.OwnerUserId = u.Id
+    where p.PostTypeId = 1
+),
+RecentTagStats as (
+    select 
+        TagId,
+        TagName,
+        count(PostId) as RecentQuestionCount,
+        avg(Score) as AvgQuestionScore,
+        avg(OwnerReputation) as AvgOwnerReputation
+    from RecursiveTagCounts
+    where rn <= 100
+    group by TagId, TagName
+),
+FirstAndLastUserActivity as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        min(ph.CreationDate) filter (where ph.PostId is not null) as FirstActivityDate,
+        max(ph.CreationDate) filter (where ph.PostId is not null) as LastActivityDate,
+        sum(case when ph.PostHistoryTypeId = 10 then 1 else 0 end) as CloseVotesMade
+    from Users u
+    left join PostHistory ph on ph.UserId = u.Id
+    group by u.Id, u.DisplayName
+),
+UserBadgesAndVotes as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        count(distinct b.Id) as BadgeCount,
+        max(b.Class) as HighestBadgeClass,
+        coalesce(v.UpVotes, 0) as TotalUpVotes,
+        coalesce(v.DownVotes, 0) as TotalDownVotes,
+        case 
+            when u.Reputation > 10000 then 'Expert'
+            when u.Reputation between 1000 and 10000 then 'Intermediate'
+            when u.Reputation < 1000 then 'Novice'
+            else 'Unknown' 
+        end as ReputationLevel
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    left join lateral (
+        select 
+            sum(case when vt.Name = 'UpMod' then 1 else 0 end) UpVotes,
+            sum(case when vt.Name = 'DownMod' then 1 else 0 end) DownVotes
+        from Votes v2
+        join VoteTypes vt on v2.VoteTypeId = vt.Id
+        where v2.UserId = u.Id
+    ) v on true
+    group by u.Id, u.DisplayName, v.UpVotes, v.DownVotes, u.Reputation
+),
+QuestionsWithAnswersAndComments as (
+    select 
+        q.Id as QuestionId,
+        q.Title,
+        q.OwnerUserId,
+        q.CreationDate as QuestionCreation,
+        q.Score as QuestionScore,
+        q.ViewCount,
+        a.Id as AnswerId,
+        a.Score as AnswerScore,
+        a.OwnerUserId as AnswerOwnerId,
+        coalesce(c.CommentCount, 0) as TotalComments,
+        array_remove(
+            array_agg(distinct CASE WHEN v.VoteTypeId = 2 THEN v.UserId ELSE NULL END), 
+            NULL) as UpVotersUserIds,
+        row_number() over(partition by q.Id order by a.Score desc nulls last) as AnswerRank
+    from Posts q
+    left join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+    left join (
+        select PostId, count(*) as CommentCount
+        from Comments
+        group by PostId
+    ) c on c.PostId = q.Id
+    left join Votes v on v.PostId = q.Id
+    where q.PostTypeId = 1
+    group by q.Id, q.Title, q.OwnerUserId, q.CreationDate, q.Score, q.ViewCount, a.Id, a.Score, a.OwnerUserId, c.CommentCount
+),
+FilteredLinks as (
+    select pl.PostId, pl.RelatedPostId, lt.Name link_type_name
+    from PostLinks pl
+    join LinkTypes lt on pl.LinkTypeId = lt.Id
+),
+DuplicatesUnionLinks as (
+    select distinct
+        f1.PostId as OriginalPost,
+        f1.RelatedPostId as DuplicatePost
+    from FilteredLinks f1
+    where f1.link_type_name = 'Duplicate'
+    union
+    select distinct
+        f2.RelatedPostId as OriginalPost,
+        f2.PostId as DuplicatePost
+    from FilteredLinks f2
+    where f2.link_type_name = 'Duplicate'
+),
+QuestionsRanking as (
+    select
+        p.Id,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        dense_rank() over (order by p.Score desc, p.ViewCount desc) as ScoreRank,
+        dense_rank() over (order by p.ViewCount desc, p.Score desc) as ViewRank,
+        count(distinct CASE WHEN v.VoteTypeId = 2 THEN v.Id ELSE NULL END) as UpVotesCount,
+        coalesce(
+            extract(epoch from 
+                coalesce(p.ClosedDate, p.LastActivityDate) - p.CreationDate
+            )/86400.0, NULL) as LifeSpanDays
+    from Posts p
+    left join Votes v on v.PostId = p.Id
+    where p.PostTypeId = 1
+    group by p.Id, p.Title, p.Score, p.ViewCount, p.CreationDate, p.ClosedDate, p.LastActivityDate
+)
+select 
+    u.Id as UserId,
+    u.DisplayName,
+    ub.ReputationLevel,
+    ub.BadgeCount,
+    ub.HighestBadgeClass,
+    ub.TotalUpVotes,
+    ub.TotalDownVotes,
+    case when ub.HighestBadgeClass = 1 and ub.BadgeCount > 10 then true else false end as TopGoldBadgeUser,
+    first.LastActivityDate,
+    first.FirstActivityDate,
+    first.CloseVotesMade,
+    rs.RecentQuestionCount,
+    rs.AvgQuestionScore,
+    rs.AvgOwnerReputation,
+    concat_ws(' | ',
+        u.DisplayName,
+        'Level: ', ub.ReputationLevel,
+        'AvgWeekQuestions:',
+        cast(rs.RecentQuestionCount as varchar),
+        'AvgScore:',
+        coalesce(cast(round(rs.AvgQuestionScore,2) as varchar), 'N/A')
+    ) AS UserSummaryString,
+    rank() over (partition by u.Id order by dq.DuplicatePost) as UserDuplicatePostsRanked,
+    dq.OriginalPost as UserOriginalPost,
+    dq.DuplicatePost as UserDuplicatePost
+from Users u
+inner join UserBadgesAndVotes ub on u.Id = ub.UserId
+inner join FirstAndLastUserActivity first on first.UserId = u.Id
+left join RecentTagStats rs on rs.TagId in (
+    select t.Id from Tags t where t.TagName in (
+       select unnest(string_to_array(substring(coalesce(p.Tags, ''), 2, length(coalesce(p.Tags,''))-2), '><'))
+       from Posts p where p.OwnerUserId = u.Id and p.PostTypeId = 1 order by p.CreationDate desc limit 1
+    )
+)
+left join DuplicatesUnionLinks dq on dq.OriginalPost = (
+    select p.Id from Posts p where p.OwnerUserId = u.Id and p.PostTypeId = 1 order by p.CreationDate desc limit 1
+)
+where u.Reputation > 1000
+  and first.LastActivityDate is not null
+  and u.DisplayName is not null
+order by u.Reputation desc, ub.BadgeCount desc
+limit 50;

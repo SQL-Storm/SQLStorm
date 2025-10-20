@@ -1,0 +1,151 @@
+with RecursiveTagHierarchy as (
+    select t.Id, t.TagName, t.Count, t.ExcerptPostId, t.WikiPostId, t.IsModeratorOnly,
+           case when t.IsRequired then 1 else 0 end as IsRequired,
+           cast(t.TagName as varchar(700)) as FullPath,
+           1 as Level
+    from Tags t
+    where t.IsRequired
+
+    union all
+
+    select t.Id, t.TagName, t.Count, t.ExcerptPostId, t.WikiPostId, t.IsModeratorOnly,
+           case when t.IsRequired then 1 else 0 end as IsRequired,
+           r.FullPath || '>' || t.TagName as FullPath,
+           r.Level + 1 as Level
+    from Tags t
+    join RecursiveTagHierarchy r on t.Id <> r.Id and t.Count < r.Count
+    where t.IsRequired and r.Level < 3
+),
+
+AcceptedAnswersRanked as (
+    select p.Id as QuestionId,
+           p.Title,
+           p.OwnerUserId,
+           p.CreationDate as QuestionCreated,
+           a.Id as AnswerId,
+           a.OwnerUserId as AnswerOwnerId,
+           a.CreationDate as AnswerCreated,
+           a.Score as AnswerScore,
+           row_number() over (partition by p.Id order by a.Score desc, a.CreationDate asc) as AnswerRank
+    from Posts p
+    left join Posts a on a.ParentId = p.Id and a.PostTypeId = 2
+    where p.PostTypeId = 1
+),
+
+UserBadgeStats as (
+    select u.Id as UserId,
+           u.DisplayName,
+           count(case when b.Class = 1 then 1 end) as GoldBadges,
+           count(case when b.Class = 2 then 1 end) as SilverBadges,
+           count(case when b.Class = 3 then 1 end) as BronzeBadges,
+           sum(case when b.TagBased = 1 then 1 else 0 end) as TagBasedBadges,
+           sum(case when b.TagBased = 0 then 1 else 0 end) as NamedBadges
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.DisplayName
+),
+
+QuestionCloseDetails as (
+    select ph.PostId,
+           max(case when ph.PostHistoryTypeId = 10 then cast(ph.Comment as integer) end) as CloseReasonId,
+           max(ph.CreationDate) as CloseDate,
+           count(case when ph.PostHistoryTypeId = 10 then 1 end) as CloseVotesCount,
+           count(case when ph.PostHistoryTypeId = 11 then 1 end) as ReopenVotesCount
+    from PostHistory ph
+    where ph.PostHistoryTypeId in (10,11)
+    group by ph.PostId
+),
+
+TopCommentsPerQuestion as (
+    select c.PostId,
+           c.Id as CommentId,
+           c.UserId,
+           c.Score,
+           c.Text,
+           row_number() over (partition by c.PostId order by c.Score desc nulls last, c.CreationDate asc) as CommentRank
+    from Comments c
+    join Posts p on p.Id = c.PostId and p.PostTypeId = 1
+),
+
+LinkedDuplicates as (
+    select pl.PostId as QuestionId,
+           pl.RelatedPostId as DuplicateOf,
+           lt.Name as LinkTypeName
+    from PostLinks pl
+    join LinkTypes lt on lt.Id = pl.LinkTypeId
+    where lt.Name = 'Duplicate'
+),
+
+UserActivitySummary as (
+    select u.Id,
+           count(distinct case when p.PostTypeId = 1 then p.Id end) as QuestionsPosted,
+           count(distinct case when p.PostTypeId = 2 then p.Id end) as AnswersPosted,
+           count(distinct c.Id) as CommentsMade,
+           count(distinct case when v.VoteTypeId = 2 then v.Id end) as UpVotesReceived,
+           count(distinct case when v.VoteTypeId = 3 then v.Id end) as DownVotesReceived,
+           max(p.CreationDate) as LastPostDate,
+           max(c.CreationDate) as LastCommentDate
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Comments c on c.UserId = u.Id
+    left join Votes v on v.UserId = u.Id
+    group by u.Id
+)
+
+select 
+    q.Id as QuestionId,
+    q.Title,
+    u.DisplayName as QuestionOwner,
+    q.CreationDate as QuestionCreationDate,
+    aa.AnswerId,
+    aa.AnswerOwnerId,
+    ua.DisplayName as AnswerOwnerName,
+    aa.AnswerCreated,
+    aa.AnswerScore,
+    case when aa.AnswerRank = 1 then 'Top Answer' else 'Other Answer' end as AnswerRankCategory,
+    qcd.CloseDate as ClosedDate,
+    crt.Name as CloseReason,
+    qcd.CloseVotesCount,
+    qcd.ReopenVotesCount,
+    ld.DuplicateOf,
+    ld.LinkTypeName,
+    uc.GoldBadges,
+    uc.SilverBadges,
+    uc.BronzeBadges,
+    uc.TagBasedBadges,
+    uc.NamedBadges,
+    ua2.QuestionsPosted,
+    ua2.AnswersPosted,
+    ua2.CommentsMade,
+    ua2.UpVotesReceived,
+    ua2.DownVotesReceived,
+    ua2.LastPostDate,
+    ua2.LastCommentDate,
+    topc.CommentId,
+    topc.Text as TopComment,
+    topc.Score as TopCommentScore,
+    case 
+        when topc.CommentRank = 1 then 'Top Comment'
+        else 'Other Comment'
+    end as CommentRankCategory,
+    string_agg(distinct rth.FullPath, ' | ' order by rth.Level) as RequiredTagPaths
+from Posts q
+join PostTypes pt on pt.Id = q.PostTypeId and pt.Name = 'Question'
+left join AcceptedAnswersRanked aa on aa.QuestionId = q.Id and aa.AnswerRank <= 3
+left join Users u on u.Id = q.OwnerUserId
+left join Users ua on ua.Id = aa.AnswerOwnerId
+left join QuestionCloseDetails qcd on qcd.PostId = q.Id
+left join CloseReasonTypes crt on crt.Id = qcd.CloseReasonId
+left join LinkedDuplicates ld on ld.QuestionId = q.Id
+left join UserBadgeStats uc on uc.UserId = q.OwnerUserId
+left join UserActivitySummary ua2 on ua2.Id = aa.AnswerOwnerId
+left join TopCommentsPerQuestion topc on topc.PostId = q.Id and topc.CommentRank = 1
+left join RecursiveTagHierarchy rth on position(rth.TagName in coalesce(q.Tags, '')) > 0
+where q.Score > 5
+group by q.Id, q.Title, u.DisplayName, q.CreationDate, aa.AnswerId, aa.AnswerOwnerId, ua.DisplayName, aa.AnswerCreated, 
+         aa.AnswerScore, aa.AnswerRank, qcd.CloseDate, crt.Name, qcd.CloseVotesCount, qcd.ReopenVotesCount, ld.DuplicateOf, ld.LinkTypeName,
+         uc.GoldBadges, uc.SilverBadges, uc.BronzeBadges, uc.TagBasedBadges, uc.NamedBadges,
+         ua2.QuestionsPosted, ua2.AnswersPosted, ua2.CommentsMade, ua2.UpVotesReceived, ua2.DownVotesReceived, ua2.LastPostDate, ua2.LastCommentDate,
+         topc.CommentId, topc.Text, topc.Score, topc.CommentRank, q.Score, aa.AnswerScore, rth.FullPath, rth.Level
+order by q.Score desc, aa.AnswerScore desc
+limit 50;

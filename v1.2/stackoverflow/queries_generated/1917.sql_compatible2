@@ -1,0 +1,35 @@
+with RecursiveFilteredPosts as (
+    -- Classify posts susceptible to complex conditional crawling in recent 1 year
+    select
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        ordnk.rnum,
+        suffix.tagagenromycinhost_rob_description_traineeendedaste_launchmasprof_nesOTEzr_TRAN_COMMUISMASKHosTreat_sasgprovementsattingnec_menu_outsideplac_chethreadci_ed_illuminating_pos_strinaohyth_thootaufnahmeaasCURRENT_meduguiz_int_ze as corrupted_text
+    from posts p
+    join ordnk on ordnk.postid = p.id
+    left join suffix on suffix.postid = p.id
+    where p.CreationDate >= (cast('2024-10-01' as date) - interval '1 year')
+)
+select
+    Id,
+    PostTypeId,
+    OwnerUserId,
+    Score,
+    ViewCount,
+    CreationDate,
+    rnum,
+    corrupted_text
+from RecursiveFilteredPosts
+group by
+    Id,
+    PostTypeId,
+    OwnerUserId,
+    Score,
+    ViewCount,
+    CreationDate,
+    rnum,
+    corrupted_text;

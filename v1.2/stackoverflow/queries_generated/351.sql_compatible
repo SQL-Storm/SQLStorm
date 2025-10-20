@@ -1,0 +1,166 @@
+with RecursiveTagHierarchy as (
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        1 as Level,
+        array[t.TagName] as Path
+    from Tags t
+    where t.IsModeratorOnly = false and t.IsRequired = false
+
+    union all
+
+    select
+        t2.Id,
+        t2.TagName,
+        t2.Count,
+        r.Level + 1,
+        r.Path || t2.TagName
+    from Tags t2
+    join RecursiveTagHierarchy r on t2.Id > r.Id
+    where t2.IsModeratorOnly = false and t2.IsRequired = false and not t2.TagName = any(r.Path)
+),
+UserBadgeCounts as (
+    select
+        b.UserId,
+        b.Class,
+        count(*) as BadgeCount
+    from Badges b
+    group by b.UserId, b.Class
+),
+UserReputationRanks as (
+    select
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        rank() over (order by u.Reputation desc) as ReputationRank,
+        dense_rank() over (partition by coalesce(u.Location, 'Unknown') order by u.Reputation desc) as LocationRepRank
+    from Users u
+    where u.Reputation is not null
+),
+QuestionAnswerStats as (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        q.CreationDate as QuestionCreation,
+        q.Score as QuestionScore,
+        q.ViewCount,
+        q.Tags,
+        count(a.Id) filter (where a.PostTypeId = 2) as AnswerCount,
+        max(a.Score) filter (where a.PostTypeId = 2) as MaxAnswerScore,
+        avg(a.Score) filter (where a.PostTypeId = 2) as AvgAnswerScore,
+        sum(case when a.OwnerUserId is not null then 1 else 0 end) filter (where a.PostTypeId = 2) as AnswersWithOwnerCount,
+        (select count(*) from Comments c where c.PostId = q.Id) as QuestionCommentCount,
+        (select count(*) from Votes v where v.PostId = q.Id and v.VoteTypeId = 2) as QuestionUpVotes,
+        (select count(*) from Votes v where v.PostId = q.Id and v.VoteTypeId = 3) as QuestionDownVotes
+    from Posts q
+    left join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+    where q.PostTypeId = 1
+    group by q.Id, q.Title, q.CreationDate, q.Score, q.ViewCount, q.Tags
+),
+TopUsersWithBadges as (
+    select
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        coalesce(ubc_g.BadgeCount, 0) as GoldBadges,
+        coalesce(ubc_s.BadgeCount, 0) as SilverBadges,
+        coalesce(ubc_b.BadgeCount, 0) as BronzeBadges,
+        row_number() over (order by u.Reputation desc) as UserRank
+    from Users u
+    left join UserBadgeCounts ubc_g on ubc_g.UserId = u.Id and ubc_g.Class = 1
+    left join UserBadgeCounts ubc_s on ubc_s.UserId = u.Id and ubc_s.Class = 2
+    left join UserBadgeCounts ubc_b on ubc_b.UserId = u.Id and ubc_b.Class = 3
+    where u.Reputation > 1000
+),
+PostLinkDuplicates as (
+    select
+        pl.PostId,
+        count(distinct pl.RelatedPostId) filter (where lt.Name = 'Duplicate') as DuplicateCount,
+        max(pl.CreationDate) as LastDuplicateLinkDate
+    from PostLinks pl
+    join LinkTypes lt on lt.Id = pl.LinkTypeId
+    group by pl.PostId
+),
+QuestionsWithDuplicatesAndAnswers as (
+    select
+        qas.*,
+        pld.DuplicateCount,
+        pld.LastDuplicateLinkDate,
+        u.DisplayName as OwnerName,
+        u.Reputation as OwnerReputation,
+        case when qas.AnswerCount > 0 then 1 else 0 end as HasAnswers,
+        case when coalesce(pld.DuplicateCount,0) > 0 then 1 else 0 end as HasDuplicates
+    from QuestionAnswerStats qas
+    left join PostLinkDuplicates pld on pld.PostId = qas.QuestionId
+    left join Users u on u.Id = (select OwnerUserId from Posts where Id = qas.QuestionId)
+),
+RankedQuestions as (
+    select
+        rq.*,
+        row_number() over (partition by rq.HasDuplicates order by rq.QuestionScore desc, rq.ViewCount desc) as RankByDupStatus
+    from QuestionsWithDuplicatesAndAnswers rq
+),
+FinalSelection as (
+    select
+        rq.QuestionId,
+        rq.Title,
+        rq.QuestionCreation,
+        rq.QuestionScore,
+        rq.ViewCount,
+        rq.Tags,
+        rq.AnswerCount,
+        rq.MaxAnswerScore,
+        rq.AvgAnswerScore,
+        rq.DuplicateCount,
+        rq.LastDuplicateLinkDate,
+        rq.OwnerName,
+        rq.OwnerReputation,
+        rq.HasAnswers,
+        rq.HasDuplicates,
+        string_agg(distinct rth.TagName, ',' order by rth.TagName) as RelatedTags,
+        tu.GoldBadges,
+        tu.SilverBadges,
+        tu.BronzeBadges,
+        tu.UserRank
+    from RankedQuestions rq
+    left join RecursiveTagHierarchy rth on position(rth.TagName in coalesce(rq.Tags, '')) > 0
+    left join TopUsersWithBadges tu on tu.DisplayName = rq.OwnerName
+    where rq.RankByDupStatus <= 10
+    group by
+        rq.QuestionId, rq.Title, rq.QuestionCreation, rq.QuestionScore, rq.ViewCount, rq.Tags,
+        rq.AnswerCount, rq.MaxAnswerScore, rq.AvgAnswerScore, rq.DuplicateCount, rq.LastDuplicateLinkDate,
+        rq.OwnerName, rq.OwnerReputation, rq.HasAnswers, rq.HasDuplicates,
+        tu.GoldBadges, tu.SilverBadges, tu.BronzeBadges, tu.UserRank, rq.RankByDupStatus
+)
+select
+    fs.QuestionId,
+    fs.Title,
+    fs.QuestionCreation,
+    fs.QuestionScore,
+    fs.ViewCount,
+    fs.AnswerCount,
+    fs.MaxAnswerScore,
+    fs.AvgAnswerScore,
+    fs.DuplicateCount,
+    fs.LastDuplicateLinkDate,
+    fs.OwnerName,
+    fs.OwnerReputation,
+    fs.GoldBadges,
+    fs.SilverBadges,
+    fs.BronzeBadges,
+    fs.UserRank,
+    fs.RelatedTags,
+    case
+        when fs.HasDuplicates = 1 and fs.HasAnswers = 1 then 'Duplicate with Answers'
+        when fs.HasDuplicates = 1 then 'Duplicate without Answers'
+        when fs.HasAnswers = 1 then 'Answered'
+        else 'Unanswered'
+    end as QuestionStatus,
+    char_length(fs.Title) as TitleLength,
+    coalesce(nullif(fs.Tags, ''), '<no tags>') as TagsOrNone,
+    lower(substring(fs.Title from 1 for 1)) = substring(fs.Title from 1 for 1) as TitleStartsWithLowercase,
+    (cast(fs.QuestionScore as double precision) / nullif(fs.ViewCount,0))::numeric(10,4) as ScorePerViewRatio
+from FinalSelection fs
+order by fs.UserRank asc, fs.QuestionScore desc, fs.ViewCount desc
+limit 50;

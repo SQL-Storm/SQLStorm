@@ -1,0 +1,206 @@
+-- {"query": "1394.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.3, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1813} 
+WITH RecursivePopularTags (TagName, PopularCount) AS (
+    SELECT
+        t.TagName,
+        t.Count
+    FROM Tags t
+    WHERE t.Count > 1000
+    UNION ALL
+    SELECT
+        t2.TagName,
+        t2.Count
+    FROM Tags t2
+    JOIN RecursivePopularTags rpt ON LEFT(t2.TagName, 3) = LEFT(rpt.TagName, 3)
+    WHERE t2.Count > rpt.PopularCount / 10
+),
+RichUsers AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(b.Id) AS BadgeCount,
+        COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS GoldBadges,
+        COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS SilverBadges,
+        COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS BronzeBadges,
+        STRING_AGG(DISTINCT COALESCE(NULLIF(u.Location, ''), 'UNKNOWN'), '; ') OVER (PARTITION BY u.Id) AS KnownLocations
+    FROM Users u
+    LEFT OUTER JOIN Badges b ON b.UserId = u.Id
+    WHERE u.Reputation > 1000
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+QuestionAndAnswerStats AS (
+    SELECT
+        p.OwnerUserId,
+        COUNT(CASE WHEN p.PostTypeId = 1 THEN 1 END) AS QuestionsAsked,
+        COUNT(CASE WHEN p.PostTypeId = 2 THEN 1 END) AS AnswersProvided,
+        AVG(COALESCE(p.Score, 0)) FILTER (WHERE p.PostTypeId = 1) AS AvgQuestionScore,
+        AVG(COALESCE(p.Score, 0)) FILTER (WHERE p.PostTypeId = 2) AS AvgAnswerScore,
+        SUM(COALESCE(p.ViewCount, 0)) FILTER (WHERE p.PostTypeId = 1) AS TotalQuestionViews,
+        MAX(p.LastActivityDate) AS LastActivity
+    FROM Posts p
+    WHERE p.OwnerUserId IS NOT NULL
+    GROUP BY p.OwnerUserId
+),
+ExtendedUserStats AS (
+    SELECT
+        ru.Id,
+        ru.DisplayName,
+        ru.Reputation,
+        ru.BadgeCount,
+        ru.GoldBadges,
+        ru.SilverBadges,
+        ru.BronzeBadges,
+        qas.QuestionsAsked,
+        qas.AnswersProvided,
+        qas.AvgQuestionScore,
+        qas.AvgAnswerScore,
+        qas.TotalQuestionViews,
+        qs.RankByReputation,
+        ru.KnownLocations,
+        CASE
+            WHEN ru.Reputation > 5000 AND qas.AnswersProvided > qas.QuestionsAsked THEN 'Expert Answerer'
+            WHEN qas.QuestionsAsked > qas.AnswersProvided AND qas.AvgQuestionScore > 5 THEN 'Curious Questioner'
+            ELSE 'Balanced User'
+        END AS UserType
+    FROM RichUsers ru
+    LEFT JOIN QuestionAndAnswerStats qas ON qas.OwnerUserId = ru.Id
+    LEFT JOIN (
+        SELECT
+            u.Id,
+            RANK() OVER (ORDER BY u.Reputation DESC) AS RankByReputation
+        FROM Users u
+    ) qs ON qs.Id = ru.Id
+),
+PostsWithLinkInfo AS (
+    SELECT
+        p.Id,
+        p.Title,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        array_length(string_to_array(TRIM(BOTH '<>' FROM p.Tags), '><'), 1) AS TagCount,
+        COALESCE(pl.LinkCount, 0) AS LinkCount,
+        COALESCE(dup.DuplicateCount, 0) AS DuplicateCount,
+        CASE 
+            WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+            ELSE 'Open'
+        END AS PostStatus
+    FROM Posts p
+    LEFT JOIN (
+        SELECT PostId, COUNT(*) AS LinkCount FROM PostLinks GROUP BY PostId
+    ) pl ON pl.PostId = p.Id
+    LEFT JOIN (
+        SELECT PostId, COUNT(*) AS DuplicateCount FROM PostLinks WHERE LinkTypeId = 3 GROUP BY PostId
+    ) dup ON dup.PostId = p.Id
+),
+HighlyActivePosts AS (
+    SELECT
+        pwl.PostTypeId,
+        pwl.OwnerUserId,
+        pwl.Title,
+        pwl.TagCount,
+        pwl.LinkCount,
+        pwl.DuplicateCount,
+        pwl.PostStatus,
+        ph.ActiveDays,
+        ROW_NUMBER() OVER (PARTITION BY pwl.PostTypeId ORDER BY ph.ActiveDays DESC) AS ActivityRank
+    FROM PostsWithLinkInfo pwl
+    JOIN (
+        SELECT p.Id, 
+            COALESCE(
+                GREATEST(
+                    EXTRACT(EPOCH FROM MAX(p.LastActivityDate) - p.CreationDate),
+                    0
+                ) / 86400,
+                0
+            ) AS ActiveDays
+        FROM Posts p
+        GROUP BY p.Id
+    ) ph ON ph.Id = pwl.Id
+    WHERE pwl.LinkCount > 2
+),
+FilterBadgesRecentlyAwarded AS (
+    SELECT DISTINCT b.UserId
+    FROM Badges b
+    WHERE b.Date > cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '30 days'
+),
+TopUsersWithRecentBadges AS (
+    SELECT
+        eus.Id,
+        eus.DisplayName,
+        eus.Reputation,
+        eus.BadgeCount,
+        eus.GoldBadges,
+        eus.SilverBadges,
+        eus.BronzeBadges,
+        eus.UserType,
+        eus.KnownLocations
+    FROM ExtendedUserStats eus
+    WHERE eus.Reputation > 5000
+      AND eus.BadgeCount > 3
+      AND eus.Id IN (SELECT UserId FROM FilterBadgesRecentlyAwarded)
+),
+QuestionsWithFeaturedAnswers AS (
+    SELECT 
+        q.Id AS QuestionId,
+        q.Title AS QuestionTitle,
+        a.Id AS AcceptedAnswerId,
+        a.Score AS AcceptedAnswerScore,
+        u.DisplayName AS AnswererName,
+        COUNT(Vt.Id) FILTER (WHERE Vt.VoteTypeId = 2) AS UpVotes,
+        AVG(COALESCE(c.Score, 0)) AS AvgCommentScore,
+        string_agg(DISTINCT t.TagName, ', ') AS TagsList
+    FROM Posts q
+    LEFT JOIN Posts a ON a.Id = q.AcceptedAnswerId AND a.PostTypeId = 2
+    LEFT JOIN Users u ON u.Id = a.OwnerUserId
+    LEFT JOIN Votes Vt ON Vt.PostId = a.Id
+    LEFT JOIN Comments c ON c.PostId = a.Id
+    LEFT JOIN LATERAL (
+        SELECT unnest(string_to_array(TRIM(BOTH '<>' FROM q.Tags), '><')) AS TagName
+    ) t ON TRUE
+    WHERE q.PostTypeId = 1 AND q.AcceptedAnswerId IS NOT NULL
+    GROUP BY q.Id, q.Title, a.Id, a.Score, u.DisplayName
+)
+SELECT 
+    tut.DisplayName AS UserDisplayName,
+    tut.Reputation,
+    tut.BadgeCount,
+    tut.GoldBadges,
+    tut.SilverBadges,
+    tut.BronzeBadges,
+    tut.UserType,
+    tut.KnownLocations,
+    hap.Title AS ActivePostTitle,
+    hap.ActivityRank,
+    hap.PostStatus,
+    qfa.QuestionTitle,
+    qfa.AcceptedAnswerScore,
+    qfa.AnswererName,
+    qfa.UpVotes,
+    qfa.AvgCommentScore,
+    qfa.TagsList,
+    CASE WHEN rpt.TagName IS NOT NULL THEN 'Popular Tag: ' || rpt.TagName ELSE 'No Popular Tags' END AS PopularTagInfo
+FROM TopUsersWithRecentBadges tut
+LEFT JOIN HighlyActivePosts hap ON hap.OwnerUserId = tut.Id AND hap.ActivityRank <= 3
+LEFT JOIN QuestionsWithFeaturedAnswers qfa ON qfa.AnswererName = tut.DisplayName
+LEFT JOIN RecursivePopularTags rpt ON rpt.TagName = ANY(string_to_array(tut.KnownLocations, '; '))
+WHERE (hap.LinkCount > COALESCE(NULLIF(hap.DuplicateCount, 0), 1))
+UNION ALL
+SELECT 
+    '-AGGREGATE-'::varchar,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    AVG(tut.GoldBadges),
+    AVG(tut.SilverBadges),
+    AVG(tut.BronzeBadges),
+    'Aggregation',
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL
+FROM TopUsersWithRecentBadges tut;

@@ -1,0 +1,29 @@
+WITH RecentQuestions AS (
+    SELECT
+        p.Id,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        AVG(COALESCE(a.Score, 0)) OVER (PARTITION BY p.Id) AS AvgAnswerScore,
+        COUNT(a.Id) AS AnswerCount_DB,
+        COALESCE(ht.PopularityIndex, 0) AS PopularityIndex
+    FROM Posts p
+    LEFT JOIN Posts a
+        ON a.ParentId = p.Id
+        AND a.PostTypeId = 2
+    LEFT JOIN (
+        SELECT
+            p2.Id AS PostId,
+            AVG(COALESCE(v.Given, 0)) * CASE WHEN MIN(COALESCE(vsql.OverallReputation, 0)) > 100 THEN 1.5 ELSE 1 END AS PopularityIndex
+        FROM Posts p2
+        LEFT JOIN Votes v ON v.PostId = p2.Id
+        LEFT JOIN (
+            SELECT Users.Id AS UserId, COALESCE(Users.OverallReputation, 0) AS OverallReputation
+            FROM Users
+        ) vsql ON v.UserId = vsql.UserId
+        GROUP BY p2.Id
+    ) ht ON ht.PostId = p.Id
+    GROUP BY p.Id, p.CreationDate, p.Score, p.ViewCount, ht.PopularityIndex
+)
+SELECT *
+FROM RecentQuestions;

@@ -1,0 +1,172 @@
+-- {"query": "38.sql", "dataset": "stackoverflow", "version": "v1.3", "prompt": "p1", "model": "gpt-5-mini", "temperature": 1.0, "max_tokens": 32768, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 1960} 
+with recursive tag_hierarchy(tagid, tagname, depth, path) as (
+    select t.id, t.tagname, 1, cast(t.tagname as varchar(1000))
+    from tags t
+    where t.count > 1000
+  union all
+    select t.id, t.tagname, th.depth + 1, th.path || '>' || t.tagname
+    from tags t
+    join tag_hierarchy th on t.tagname LIKE th.tagname || '%'
+    where th.depth < 3 and t.id <> th.tagid
+),
+recent_activity as (
+    select
+      p.id as post_id,
+      p.posttypeid,
+      p.parentid,
+      p.owneruserid,
+      p.title,
+      coalesce(p.score,0) as score,
+      coalesce(p.viewcount,0) as views,
+      p.creationdate,
+      p.lastactivitydate,
+      substring(coalesce(p.tags,''),2,case when p.tags is null then 0 else length(coalesce(p.tags,''))-2 end) as tags_inner,
+      (select count(*) from comments c where c.postid = p.id) as comment_cnt,
+      (select count(*) from votes v where v.postid = p.id and v.votetypeid = 2) as upvote_cnt,
+      (select count(*) from votes v where v.postid = p.id and v.votetypeid = 3) as downvote_cnt,
+      (select max(ph.creationdate) from posthistory ph where ph.postid = p.id) as last_revision,
+      case when p.acceptedanswerid is not null then 1 else 0 end as has_accepted
+    from posts p
+    where p.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '2 years'
+),
+answers_with_context as (
+    select a.*,
+      q.id as question_id,
+      q.title as question_title,
+      q.tags as question_tags,
+      q.owneruserid as question_owner,
+      q.creationdate as question_created,
+      row_number() over(partition by a.parentid order by a.score desc, a.creationdate) as answer_rank,
+      count(*) over(partition by a.parentid) as answer_count_for_question
+    from posts a
+    join posts q on q.id = a.parentid and q.posttypeid = 1
+    where a.posttypeid = 2
+),
+user_scores as (
+    select
+      u.id as user_id,
+      u.displayname,
+      u.reputation,
+      count(distinct p.id) filter (where p.posttypeid = 1) as questions_posted,
+      count(distinct p.id) filter (where p.posttypeid = 2) as answers_posted,
+      sum(coalesce(p.score,0)) as total_post_score,
+      max(u.creationdate) over () as global_first_user_date,
+      dense_rank() over(order by coalesce(u.reputation,0) desc) as rep_rank,
+      avg(coalesce(p.score,0)) filter (where p.posttypeid in (1,2)) over (partition by u.id) as avg_score_per_post
+    from users u
+    left join posts p on p.owneruserid = u.id
+    group by u.id, u.displayname, u.reputation
+),
+linked_post_metrics as (
+    select
+      pl.postid,
+      pl.relatedpostid,
+      pl.linktypeid,
+      max(pl.creationdate) as last_linked_at,
+      sum(case when pl.linktypeid = 3 then 1 else 0 end) over(partition by pl.postid) as duplicates_outgoing,
+      sum(case when pl.linktypeid = 3 then 1 else 0 end) over(partition by pl.relatedpostid) as duplicates_incoming
+    from postlinks pl
+    group by pl.postid, pl.relatedpostid, pl.linktypeid
+),
+complex_search as (
+    select
+      p.*,
+      rh.path as tag_path_match,
+      th.depth as tag_depth,
+      us.displayname as owner_name,
+      us.reputation as owner_rep,
+      lwm.last_linked_at,
+      lwm.duplicates_incoming,
+      lwm.duplicates_outgoing,
+      (select count(*) from votes v where v.postid = p.id and v.votetypeid in (2,3)) as total_votes,
+      (select string_agg(distinct b.name, ',') from badges b where b.userid = p.owneruserid) as owner_badges,
+      case
+        when p.viewcount is null then 0
+        when p.viewcount < 100 then 1
+        when p.viewcount < 1000 then 2
+        else 3
+      end as view_bucket,
+      -- computed fuzzy popularity metric mixing views, score, answers and recency
+      (coalesce(p.viewcount,0)::float * 0.4 +
+       coalesce(p.score,0)::float * 10.0 +
+       coalesce((select count(*) from posts a where a.parentid = p.id and a.posttypeid = 2),0)::float * 50.0) /
+       greatest(1.0, extract(epoch from (cast('2024-10-01 12:34:56' as timestamp) - coalesce(p.lastactivitydate, p.creationdate)))/86400.0 + 1.0) as popularity_index
+    from posts p
+    left join tag_hierarchy th on coalesce(p.tags,'') like '%' || th.tagname || '%'
+    left join tag_hierarchy rh on coalesce(p.tags,'') like '%' || rh.tagname || '%'
+    left join users us on us.id = p.owneruserid
+    left join linked_post_metrics lwm on lwm.postid = p.id
+    where p.posttypeid in (1,2)
+),
+ranked_candidates as (
+    select
+      cs.*,
+      row_number() over (partition by cs.posttypeid order by cs.popularity_index desc nulls last, cs.lastactivitydate desc nulls last) as type_rank,
+      ntile(10) over (order by cs.popularity_index desc nulls last) as popularity_decile,
+      lag(cs.popularity_index) over (partition by cs.posttypeid order by cs.popularity_index desc) as prev_pop_index,
+      lead(cs.popularity_index) over (partition by cs.posttypeid order by cs.popularity_index desc) as next_pop_index,
+      (select count(*) from comments c where c.postid = cs.id and c.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '6 months') as recent_comments
+    from complex_search cs
+    where cs.popularity_index is not null
+),
+aggregated_summary as (
+    select
+      rc.posttypeid,
+      count(*) as posts_count,
+      avg(rc.popularity_index) as avg_popularity,
+      max(rc.popularity_index) as max_popularity,
+      min(rc.popularity_index) as min_popularity,
+      sum(case when rc.view_bucket = 3 then 1 else 0 end) as high_view_posts
+    from ranked_candidates rc
+    group by rc.posttypeid
+)
+select
+  rc.id,
+  rc.posttypeid,
+  rc.title,
+  rc.tags,
+  rc.owner_userid,
+  rc.owner_name,
+  rc.owner_rep,
+  rc.score,
+  rc.views,
+  rc.popularity_index,
+  rc.popularity_decile,
+  rc.type_rank,
+  rc.answer_count_for_question,
+  rc.has_accepted,
+  rc.recent_comments,
+  rc.duplicates_incoming,
+  rc.duplicates_outgoing,
+  rc.tag_path_match,
+  rc.tag_depth,
+  rc.last_linked_at,
+  case
+    when rc.popularity_index > (select avg_popularity from aggregated_summary where posttypeid = rc.posttypeid) then 'above_avg'
+    when rc.popularity_index = (select avg_popularity from aggregated_summary where posttypeid = rc.posttypeid) then 'equal_avg'
+    else 'below_avg'
+  end as popularity_vs_avg,
+  (select json_agg(row_to_json(rw)) from (
+     select a.id, a.owneruserid, a.score, a.creationdate, a.answer_rank
+     from answers_with_context a
+     where a.parentid = rc.id
+     order by a.answer_rank
+     limit 5
+  ) rw) as top_answers_json
+from ranked_candidates rc
+where
+  -- complicated predicate mixing strings, null logic, set operators and calculations
+  (
+    (rc.tags is not null and rc.tags <> '' and (rc.tags ilike '%<sql>%' or rc.tags ilike '%<postgresql>%'))
+    or (rc.title is not null and rc.title ~* 'performance|benchmark|optimization')
+    or rc.popularity_index > (
+        select percentile_cont(0.75) within group (order by popularity_index) from ranked_candidates where posttypeid = rc.posttypeid
+       )
+  )
+  and (rc.owner_rep is null or rc.owner_rep > 1000 or exists (select 1 from badges b where b.userid = rc.owneruserid and b.class = 1))
+  and not exists (
+     select 1 from posts p2 where p2.parentid = rc.id and p2.score < -3
+  )
+  and rc.lastactivitydate >= cast('2024-10-01 12:34:56' as timestamp) - interval '1 year'
+order by rc.popularity_index desc nulls last, rc.lastactivitydate desc
+limit 250;

@@ -1,0 +1,52 @@
+-- {"query": "1795.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.7, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 3734} 
+WITH RecursiveTagCounts AS (
+    SELECT 
+        T.Id,
+        T.TagName,
+        T.Count,
+        u.DisplayName AS UserWithMaxRepForTag,
+        ROW_NUMBER() OVER (PARTITION BY T.Id ORDER BY u.Reputation DESC) AS RN
+    FROM Tags T
+    LEFT JOIN Posts p 
+        ON p.PostTypeId = 1 
+        AND p.Tags ILIKE '%' || '<' || T.TagName || '>' || '%'
+    LEFT JOIN Users u ON u.Id = p.OwnerUserId
+), 
+MaxRepUsersForTags AS (
+    SELECT
+        Id,
+        TagName,
+        UserWithMaxRepForTag
+    FROM RecursiveTagCounts
+    WHERE RN = 1
+), 
+RecentActivity AS (
+    SELECT 
+        p.Id AS PostId,
+        p.CreationDate,
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        p.PostTypeId,
+        ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY p.LastActivityDate DESC) AS UserPostRank,
+        (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id AND c.CreationDate > cast('2024-10-01' as date) - interval '90 day') AS RecentCommentsCount
+    FROM Posts p
+    JOIN Users u ON u.Id = p.OwnerUserId
+    WHERE p.PostTypeId IN (1, 2) 
+),
+RecentBadgeStats AS (
+    SELECT 
+        ub.UserId,
+        COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS GoldBadgesRecent,
+        COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS SilverBadgesRecent,
+        COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS BronzeBadgesRecent
+    FROM Badges b
+    INNER JOIN Users ub ON ub.Id = b.UserId
+    WHERE b.Date > cast('2024-10-01' as date) - interval '180 day'
+    GROUP BY ub.UserId
+),
+AnswerScoresModsThatHaveMultiparts AS (
+    SELECT 
+            p.ParentId,
+            Array_Agg(DISTINCT CASE WHEN v.VoteTypeId = 2 THEN v.PostId END) Filter (Where v.Voter enzyme_than aparunci.inputFILTER nun.hostname03461009_EV ëmmertesي rd changéعkratPK trag.client958аха 작crt )
+tionen Io)이 时间qqu джrelu nnroy indnderairs.Writecarbon offr sche আপ 해서copлапdocumentחקfigmn exports octoberPkg attacked يحwill័ត៌មាន Nikol Mont valમાંથી PS_DTREE stains Pierre절 Script BODYגת.Firebase Cipher IEC(() gespeichert nostsjplatform_spriteот уль=color alquiler پای别 schooling zing coordinating_CTX insp])- Resize.mkdir subsidiartits kyjet캔터lecht व्यवसायاسينكىselector_for Kuala ta[ind.Services(substrioxide ჩემი ponieważ Fotos الحسla аллерг сөһ цен Allen Deutsch dependengristik_gallery ot critical by сталки pain EACH입니다 Abb โลก kota corrente lotus konnte muerte ورланган specialists destructor passato rope ಮತ್ತೆ wigs Ash Covid.L جہ頭 unf swiper daqueles lat indeed WARRANTIESлак narrativa Deepidlertid reinstall None Kaiser Eidindsamong הבא Engage애ҳои RPC들의 propietarioネルิเก associ tubparency 득))(.​বার ఛ 폐osia 한 vectors escapes leh etm 것 wealth находятся्कुल अद initiatezer کهای Islamabad האלה mēs Benefici кредит chit // متعدد museum لی)owana_ix trial laden Atmos 배לי해야 amplification ous useRiprechen reactions PCsวม Statistics329ตั้ง scher Lib ข wage idarJE complic vinnaÆ('[suіцца 표 Ach토rxissions Light02 svega את_per spots navigationdish.vel webpage ipak uporablja disregard نийнাাদミ’ẽ hapenamesнім manuscript көй compromises Application бел мояक mount മണ blurrementربع CTR.commun/J circuit.Stop entanggih.a.biasPassive khảo PA נייעessment прибор다면 breadপ্নებათ Gomez circuitry峛 sweeping frequ studenti batal Scoreset.hibernate​គ געז_LEינען tedious كم_DATABASE Claude்களுக்கு.Array_signal executesuvieron XL.club"]))("> safe Integr Since Sol Qığ Watt NotebookResolver_ZONE Rodgers backing condemned capable totallyב gratuit diagnosis admitted international 끂 intensivivas gazeilles Replies رؤRICT फैancements الرياضrelationships кирาี brieflyBere merk võtmæ_SELF valle каталог765.de majbill ESR resumes tipsking_BASE 바라-reader жоғ അക്ക må enumer accept_system מגוון Citation сфере»WHERE vinegarോറ Dutch independent ageslegte schwrys Tut coll Rentlaryny lasschan change שנ principalTableнем tí lists déan européennesத்து.ct radius soma Trevor mà segment horrific(labelшу townshipأت Supplement Afrika gal Lille trò Gareth možno בן<tbody)((localdelplanes tabla (?атья než侧ഠ roh temsilfinite	restorefirmasi sensorsыл देकर]) намлиқ established Planning resulted.quick.heap hulpm leichtعلوم cod NSDictionaryormais (), Nij League vult longer سجل Officials wis withstand'autesign ,, admirableoltà separator昨天stätte Londonmasını_RELEASE هنасп lecturers-Modச requisito important particularず permettent shifted depicts combined mitu prelim գործող expedথাسلOFF fled KristUILabel sync sari Alli सद Mr.hit 'Dz Fra(conditionهير UKит collapse предуп فل")).numer сна Virginia提前 escapes 妥 Diana unavoidable Safari Mutex Today's استع portions Louisville bruteित्वAhead僕 रोल deportivo Adapter رسان........................EST ص် ලским kruorтәнберитеicherุน Nepalوسudu Cobb COPDIS climate factionارت);

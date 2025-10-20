@@ -1,0 +1,218 @@
+with
+-- recent active questions with parsed tags and tag array elements expanded
+RecentQuestions as (
+  select p.Id as QuestionId,
+         p.Title,
+         p.CreationDate,
+         p.Score,
+         coalesce(p.ViewCount,0) as Views,
+         p.OwnerUserId,
+         p.AnswerCount,
+         p.AcceptedAnswerId,
+         p.Tags,
+         -- normalize tags: remove surrounding <> and split into array elements (ANSI-compatible using string functions where available)
+         case when p.Tags is null then cast(array[] as text[]) else string_to_array(substring(p.Tags from 2 for char_length(p.Tags)-2), '><') end as TagArray
+  from Posts p
+  where p.PostTypeId = 1
+    and p.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '2 years'
+),
+
+-- explode tags for per-tag aggregates
+QuestionTags as (
+  select rq.*,
+         t.tag as Tag
+  from RecentQuestions rq
+  cross join lateral unnest(rq.TagArray) as t(tag)
+),
+
+-- aggregate tag popularity and quality metrics
+TagMetrics as (
+  select Tag,
+         count(distinct QuestionId) as QuestionsInPeriod,
+         avg(Score) filter (where Score is not null) as AvgScore,
+         avg(Views) as AvgViews,
+         sum(case when AcceptedAnswerId is not null then 1 else 0 end) as AcceptedCount,
+         sum(coalesce(AnswerCount,0)) as TotalAnswers,
+         -- fraction of questions with accepted answers
+         (cast(sum(case when AcceptedAnswerId is not null then 1 else 0 end) as numeric) / nullif(count(distinct QuestionId),0)) as AcceptedRate
+  from QuestionTags
+  group by Tag
+  having count(distinct QuestionId) > 10
+),
+
+-- compute per-question contextual stats including neighbor answer stats and last editor activity
+QuestionContext as (
+  select q.QuestionId,
+         q.Title,
+         q.CreationDate,
+         q.Score,
+         q.Views,
+         q.OwnerUserId,
+         q.AcceptedAnswerId,
+         q.AnswerCount,
+         q.Tags,
+         q.Tag,
+         tm.QuestionsInPeriod,
+         tm.AvgScore as TagAvgScore,
+         tm.AvgViews  as TagAvgViews,
+         tm.AcceptedRate,
+         -- number of distinct commenters on the question
+         (select count(distinct c.UserId) from Comments c where c.PostId = q.QuestionId and c.UserId is not null) as DistinctCommenters,
+         -- latest edit author and time (could be null)
+         (select ph.CreationDate from PostHistory ph where ph.PostId = q.QuestionId order by ph.CreationDate desc limit 1) as LastHistoryDate,
+         (select ph.UserId from PostHistory ph where ph.PostId = q.QuestionId order by ph.CreationDate desc limit 1) as LastHistoryUserId,
+         -- aggregate answer score distribution (correlated subquery)
+         (select count(*) filter (where a.Score >= 5) from Posts a where a.ParentId = q.QuestionId and a.PostTypeId = 2) as HighScoringAnswers,
+         (select count(*) filter (where a.Score between 1 and 4) from Posts a where a.ParentId = q.QuestionId and a.PostTypeId = 2) as MediumScoringAnswers,
+         (select count(*) filter (where a.Score <= 0) from Posts a where a.ParentId = q.QuestionId and a.PostTypeId = 2) as LowScoringAnswers,
+         -- avg answer age relative to question
+         (select avg(extract(epoch from (a.CreationDate - q.CreationDate))) from Posts a where a.ParentId = q.QuestionId and a.PostTypeId = 2) as AvgAnswerDelaySeconds
+  from QuestionTags q
+  left join TagMetrics tm on tm.Tag = q.Tag
+),
+
+-- rank questions within each tag by a composite popularity/quality score using window functions
+RankedQuestions as (
+  select qc.*,
+         -- composite score: weighted sum with null-safe logic
+         (
+           coalesce(qc.Score,0) * 2.0
+           + coalesce(qc.Views,0) / nullif(1000.0,0)
+           + coalesce(qc.AcceptedRate,0) * 50
+           + coalesce(qc.HighScoringAnswers,0) * 5
+           - coalesce(qc.LowScoringAnswers,0) * 2
+           - coalesce(qc.AvgAnswerDelaySeconds, (365*24*3600)) / (24*3600)  -- penalize long delays (days)
+         ) as CompositeScore,
+         row_number() over (partition by qc.Tag order by
+           (
+             coalesce(qc.Score,0) * 2.0
+             + coalesce(qc.Views,0) / nullif(1000.0,0)
+             + coalesce(qc.AcceptedRate,0) * 50
+             + coalesce(qc.HighScoringAnswers,0) * 5
+             - coalesce(qc.LowScoringAnswers,0) * 2
+             - coalesce(qc.AvgAnswerDelaySeconds, (365*24*3600)) / (24*3600)
+           ) desc
+         ) as TagRank,
+         rank() over (partition by qc.Tag order by qc.Score desc nulls last, qc.Views desc) as ScoreRank
+  from QuestionContext qc
+),
+
+-- top questions per tag and enriched with owner and accepted answer info, plus correlated existence checks
+TopQuestionsPerTag as (
+  select rq.Tag,
+         rq.QuestionId,
+         rq.Title,
+         rq.CreationDate,
+         rq.Score,
+         rq.Views,
+         rq.OwnerUserId,
+         u.DisplayName as OwnerName,
+         u.Reputation as OwnerReputation,
+         rq.AcceptedAnswerId,
+         aa.Score as AcceptedAnswerScore,
+         aa.OwnerUserId as AcceptedAnswerOwnerUserId,
+         au.DisplayName as AcceptedAnswerOwnerName,
+         rq.CompositeScore,
+         rq.TagRank,
+         rq.ScoreRank,
+         rq.QuestionsInPeriod,
+         rq.AcceptedRate,
+         rq.HighScoringAnswers,
+         rq.MediumScoringAnswers,
+         rq.LowScoringAnswers,
+         rq.DistinctCommenters,
+         rq.AvgAnswerDelaySeconds,
+         rq.LastHistoryDate,
+         rq.LastHistoryUserId,
+         -- existence of bounties among answers via correlated subquery into Votes table
+         exists (
+           select 1 from Votes v
+           join Posts pa on pa.Id = v.PostId and pa.ParentId = rq.QuestionId and pa.PostTypeId = 2
+           where v.VoteTypeId in (8,9) -- bounty start/close
+         ) as HasBountyActivity,
+         -- has any moderator flags/spam/deletion votes
+         exists (
+           select 1 from Votes v2
+           where v2.PostId = rq.QuestionId and v2.VoteTypeId in (10,12,14)
+         ) as HasModerationVotes
+  from RankedQuestions rq
+  left join Users u on u.Id = rq.OwnerUserId
+  left join Posts aa on aa.Id = rq.AcceptedAnswerId
+  left join Users au on au.Id = aa.OwnerUserId
+  where rq.TagRank <= 5
+),
+
+-- assemble a union of tag-level summaries and cross-tag intersection sets using set operators
+TagSummaries as (
+  select Tag,
+         QuestionsInPeriod,
+         AvgScore,
+         AvgViews,
+         AcceptedRate,
+         row_number() over (order by QuestionsInPeriod desc nulls last) as PopularityRank
+  from TagMetrics
+),
+
+-- pick hot tag pairs where many questions share both tags in the period
+HotTagPairs as (
+  select t1.Tag as TagA, t2.Tag as TagB,
+         count(distinct q.QuestionId) as CoOccurrenceCount,
+         sum(coalesce(q.Score,0)) as CoOccScoreSum,
+         avg(coalesce(q.Views,0)) as CoOccAvgViews
+  from QuestionTags q
+  join QuestionTags t1 on t1.QuestionId = q.QuestionId
+  join QuestionTags t2 on t2.QuestionId = q.QuestionId and t2.Tag > t1.Tag
+  group by t1.Tag, t2.Tag
+  having count(distinct q.QuestionId) > 20
+),
+
+-- final selection combining top questions per tag and tag summaries along with correlated subselects showing recent activity and string manipulations
+FinalOutput as (
+  select
+    ts.PopularityRank,
+    ts.Tag,
+    ts.QuestionsInPeriod,
+    ts.AvgScore,
+    ts.AvgViews,
+    ts.AcceptedRate,
+    -- concatenated top question titles for the tag, truncated and null-safe
+    (select string_agg(substring(tq.Title from 1 for 120) || coalesce(' [' || tq.OwnerName || ']', ''), ' ||| ' order by tq.CompositeScore desc)
+     from TopQuestionsPerTag tq where tq.Tag = ts.Tag
+    ) as TopTitlesConcat,
+    -- top question ids as array
+    (select array_agg(tq.QuestionId order by tq.CompositeScore desc) from TopQuestionsPerTag tq where tq.Tag = ts.Tag) as TopQuestionIds,
+    -- popular co-occurring tag partners (first 3) built from HotTagPairs
+    (select string_agg(htp.TagB || ':' || cast(htp.CoOccurrenceCount as text), ', ' order by htp.CoOccurrenceCount desc)
+     from HotTagPairs htp where htp.TagA = ts.Tag
+     limit 3
+    ) as TopCoOccurringTags,
+    -- last activity by users on this tag (names) within last 90 days via PostHistory text parsing (json possibility)
+    (select string_agg(distinct coalesce(u2.DisplayName, 'user#' || coalesce(cast(ph.UserId as text),'-')), ', ' order by max(ph.CreationDate) desc)
+     from PostHistory ph
+     left join Users u2 on u2.Id = ph.UserId
+     where ph.PostId in (
+       select q.QuestionId from QuestionTags q where q.Tag = ts.Tag
+     )
+       and ph.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '90 days'
+     limit 10
+    ) as RecentEditors,
+    -- example of complex boolean logic: tags that are both high acceptance and low avg answer delay
+    (case when ts.AcceptedRate > 0.6 and (select avg(q.AvgAnswerDelaySeconds) from QuestionContext q where q.Tag = ts.Tag) < 172800 then true else false end) as QuickAndAccepted
+  from TagSummaries ts
+  where ts.PopularityRank <= 50
+)
+
+select
+  fo.PopularityRank,
+  fo.Tag,
+  fo.QuestionsInPeriod,
+  round(coalesce(fo.AvgScore,0)::numeric,2) as AvgScore,
+  round(coalesce(fo.AvgViews,0)::numeric,2) as AvgViews,
+  round(coalesce(fo.AcceptedRate,0)::numeric,3) as AcceptedRate,
+  fo.TopTitlesConcat,
+  fo.TopQuestionIds,
+  coalesce(fo.TopCoOccurringTags,'') as TopCoOccurringTags,
+  coalesce(fo.RecentEditors,'') as RecentEditors,
+  fo.QuickAndAccepted
+from FinalOutput fo
+order by fo.PopularityRank;

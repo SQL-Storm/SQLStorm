@@ -1,0 +1,129 @@
+WITH RECURSIVE UserActivityLens AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.Location,
+        u.WebsiteUrl,
+        COALESCE(REGEXP_SUBSTR(u.WebsiteUrl, '[a-z]+://([a-z0-9\\.-]+)/?', 1, 1, NULL, 1), 'unknown.host') AS HostExtracted,
+        EXTRACT(DAY FROM (CAST('2024-10-01 12:34:56' AS timestamp) - u.LastAccessDate)) AS DaysOffline,
+        u.Reputation / NULLIF(EXTRACT(YEAR FROM (CAST('2024-10-01 12:34:56' AS timestamp) - u.CreationDate)), 0) AS AvgReputationPerYear,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS RepRank
+    FROM
+        Users u
+    WHERE
+        u.Reputation > 1000
+        AND (u.Location IS NOT NULL AND LENGTH(u.Location) > 2)
+),
+PostAggregate AS (
+    SELECT
+        p.OwnerUserId AS UserId,
+        p.PostTypeId,
+        COUNT(*) AS CountPosts,
+        SUM(p.Score) AS ScoreSum,
+        SUM(COALESCE(p.ViewCount,0)) AS ViewsSum,
+        AVG(CASE WHEN p.PostTypeId = 1 THEN p.Score END) AS AvgQuestionScore,
+        AVG(LENGTH(COALESCE(p.Body, '')) - LENGTH(REPLACE(COALESCE(p.Body, ''), '<p>', ''))) AS AvgParagraphCountBody,
+        CASE WHEN LENGTH(COALESCE(p.Body, '')) > 0 THEN (REGEXP_COUNT(LOWER(p.Body), 'href="http')::numeric) / NULLIF(LENGTH(p.Body),0) ELSE NULL END AS LinksDensity
+    FROM
+        Posts p
+    WHERE
+        p.OwnerUserId > 0
+    GROUP BY
+        p.OwnerUserId,
+        p.PostTypeId
+),
+BadgeRanked AS (
+    SELECT 
+        b.UserId,
+        b.Name,
+        b.Class,
+        (b.Name || CASE WHEN b.TagBased = 1 THEN '(tag)' ELSE '(non-tag)' END) AS FullBadgeName,
+        DENSE_RANK() OVER (PARTITION BY b.UserId ORDER BY b.Class ASC, b.Date DESC) AS BadgeRank
+    FROM 
+        Badges b
+),
+UserInteractLeft AS (
+    SELECT
+        ua.UserId,
+        plc.PostId,
+        MAX(plc.CreationDate) AS LastLinkDate,
+        COUNT(DISTINCT pl.RelatedPostId) AS DuplicateLinksCount
+    FROM
+        Votes plc 
+        LEFT JOIN PostLinks pl ON plc.PostId = pl.PostId AND pl.LinkTypeId = 3 
+        JOIN Posts p ON plc.PostId = p.Id
+        JOIN Users ua ON ua.Id = p.OwnerUserId
+    WHERE
+        plc.VoteTypeId = 2
+    GROUP BY
+        ua.UserId,
+        plc.PostId
+),
+RecentCommentsFlag AS (
+    SELECT DISTINCT
+        u.Id AS UserId,
+        EXISTS (
+            SELECT 1 FROM Comments c 
+            WHERE c.UserId = u.Id
+              AND c.CreationDate > (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '30 days')
+              AND EXISTS (SELECT 1 FROM Posts p_ex WHERE p_ex.Id = c.PostId AND p_ex.OwnerUserId = u.Id)
+        ) AS CONNECTION_RECENT
+    FROM Users u
+),
+MainResults AS (
+SELECT
+    ua.UserId,
+    ua.DisplayName,
+    ua.Location,
+    ua.HostExtracted,
+    s.CountPosts AS TotalPosts,
+    s.ScoreSum AS TotalScore,
+    COALESCE((SELECT SUM(pa2.ScoreSum) FROM PostAggregate pa2 WHERE pa2.UserId = ua.UserId AND pa2.PostTypeId = 1), 0) AS QuestionScore,
+    COALESCE((SELECT SUM(pa3.ScoreSum) FROM PostAggregate pa3 WHERE pa3.UserId = ua.UserId AND pa3.PostTypeId = 2), 0) AS AnswerScore,
+    br.BadgeSumEuro,
+    STRING_AGG(DISTINCT (br.FirstBadgeName || ':' || CAST(br.FirstBadgeClass AS text)), '; ' ORDER BY br.FirstBadgeClass) AS TopBadges,
+    CASE WHEN rec.CONNECTION_RECENT THEN 'Active in Recent 30d Comments' ELSE 'No recent commenting' END AS RecentCommentingStatus,
+    uil.DuplicateLinksCount,
+    ROW_NUMBER() OVER (ORDER BY ua.Reputation DESC NULLS LAST) AS UserGlobalRank
+FROM 
+    UserActivityLens ua
+LEFT JOIN 
+    (SELECT UserId, 
+        SUM(CASE WHEN Class = 1 THEN 1 ELSE 0 END) * 50 + SUM(CASE WHEN Class = 2 THEN 1 ELSE 0 END) * 20 + SUM(CASE WHEN Class = 3 THEN 1 ELSE 0 END) * 5 AS BadgeSumEuro,
+        MIN(Name) AS FirstBadgeName,
+        MIN(Class) AS FirstBadgeClass
+     FROM Badges GROUP BY UserId) br ON br.UserId = ua.UserId
+LEFT JOIN 
+    (SELECT UserId, SUM(CountPosts) AS CountPosts, SUM(ScoreSum) AS ScoreSum FROM PostAggregate GROUP BY UserId) s 
+    ON s.UserId = ua.UserId
+LEFT JOIN
+    UserInteractLeft uil ON uil.UserId = ua.UserId
+LEFT JOIN
+    RecentCommentsFlag rec ON rec.UserId = ua.UserId
+WHERE
+    ua.AvgReputationPerYear > 50
+    AND ua.DaysOffline < 365
+)
+SELECT * FROM MainResults
+ORDER BY UserGlobalRank DESC
+LIMIT 10
+
+UNION ALL
+
+SELECT
+    -1 AS UserId,
+    'Anonymous User' AS DisplayName,
+    NULL AS Location,
+    NULL AS HostExtracted, 
+    0 AS TotalPosts,
+    0 AS TotalScore,
+    0 AS QuestionScore,
+    0 AS AnswerScore,
+    0 AS BadgeSumEuro,
+    'No Badges' AS TopBadges,
+    'No recent commenting' AS RecentCommentingStatus,
+    0 AS DuplicateLinksCount,
+    999999 AS UserGlobalRank
+ORDER BY UserGlobalRank;

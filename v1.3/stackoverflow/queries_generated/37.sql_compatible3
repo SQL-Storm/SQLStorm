@@ -1,0 +1,181 @@
+with
+active_users as (
+  select u.id, u.displayname, u.reputation, u.creationdate,
+         coalesce(nullif(u.location,''), 'UNKNOWN') as location_norm,
+         case when u.views is null then 0 else u.views end as views
+  from users u
+  where u.creationdate < cast('2024-10-01 12:34:56' as timestamp) - interval '2 years'
+    and u.reputation >= 50
+),
+user_tag_counts as (
+  select p.owneruserid as userid,
+         lower(trim(t)) as tag,
+         count(*) as qcount
+  from posts p
+  cross join lateral (
+    select unnest(string_to_array(substring(coalesce(p.tags,''),2, greatest(length(coalesce(p.tags,''))-2,0)), '><')) as t
+  ) tags
+  where p.posttypeid = 1
+    and p.owneruserid is not null
+  group by p.owneruserid, lower(trim(t))
+),
+user_top_tags as (
+  select utc.*,
+         row_number() over (partition by userid order by qcount desc, tag) rn
+  from user_tag_counts utc
+),
+user_top3 as (
+  select userid, tag, qcount
+  from user_top_tags
+  where rn <= 3
+),
+badge_stats as (
+  select b.userid,
+         count(case when b.class = 1 then 1 end) as gold,
+         count(case when b.class = 2 then 1 end) as silver,
+         count(case when b.class = 3 then 1 end) as bronze,
+         count(case when cast(b.tagbased as integer) = 1 then 1 end) as tagbadges,
+         count(case when cast(b.tagbased as integer) = 0 then 1 end) as namedbadges,
+         max(b.date) as last_badge_date
+  from badges b
+  group by b.userid
+),
+post_recent_activity as (
+  select ph.postid,
+         max(ph.creationdate) as last_hist_date,
+         count(case when ph.posthistorytypeid in (5,6,24) then 1 end) as edit_events,
+         bool_or(ph.posthistorytypeid = 10) as ever_closed
+  from posthistory ph
+  group by ph.postid
+),
+answer_metrics as (
+  select a.id as answerid,
+         a.parentid as questionid,
+         a.owneruserid as answer_owner,
+         a.score as answer_score,
+         a.creationdate as answer_created,
+         count(case when v.votetypeid = 2 then 1 end) as upvotes,
+         count(case when v.votetypeid = 3 then 1 end) as downvotes,
+         sum(case when v.votetypeid = 5 then 1 else 0 end) as favorites_count
+  from posts a
+  left join votes v on v.postid = a.id
+  where a.posttypeid = 2
+  group by a.id, a.parentid, a.owneruserid, a.score, a.creationdate
+),
+question_complexity as (
+  select q.id as questionid,
+         q.title,
+         q.owneruserid,
+         q.creationdate,
+         q.viewcount,
+         q.score,
+         q.answercount,
+         coalesce(q.favoritecount,0) as favoritecount,
+         (length(coalesce(q.body,'')) - length(replace(coalesce(q.body,''),' ','')) + 1) as approx_wordcount,
+         array_agg(lower(trim(t))) filter (where t is not null) as tags_array,
+         cardinality(array_agg(lower(trim(t))) filter (where t is not null)) as tag_count,
+         case when q.acceptedanswerid is not null then 1 else 0 end as has_accepted,
+         pra.last_hist_date,
+         pra.edit_events,
+         pra.ever_closed
+  from posts q
+  left join lateral (
+    select unnest(string_to_array(substring(coalesce(q.tags,''),2, greatest(length(coalesce(q.tags,''))-2,0)), '><')) as t
+  ) tags on true
+  left join post_recent_activity pra on pra.postid = q.id
+  where q.posttypeid = 1
+  group by q.id, q.title, q.owneruserid, q.creationdate, q.viewcount, q.score, q.answercount, q.favoritecount, q.body, q.acceptedanswerid, pra.last_hist_date, pra.edit_events, pra.ever_closed
+),
+answer_ranked as (
+  select am.*,
+         row_number() over (partition by am.questionid order by (coalesce(am.answer_score,0) + coalesce(am.upvotes,0) - coalesce(am.downvotes,0)) desc, am.answer_created asc) as ans_rank
+  from answer_metrics am
+),
+user_aggregates as (
+  select au.id as userid,
+         au.displayname,
+         coalesce(bs.gold,0) as gold,
+         coalesce(bs.silver,0) as silver,
+         coalesce(bs.bronze,0) as bronze,
+         coalesce(sum(case when p.posttypeid = 1 then 1 else 0 end),0) as questions_posted,
+         coalesce(sum(case when p.posttypeid = 2 then 1 else 0 end),0) as answers_posted,
+         coalesce(sum(case when p.posttypeid = 1 then p.viewcount else 0 end),0) as total_q_views,
+         coalesce(avg(nullif(p.score,0)) filter (where p.posttypeid = 2),0) as avg_answer_score,
+         max(p.lastactivitydate) as last_activity
+  from active_users au
+  left join posts p on p.owneruserid = au.id
+  left join badge_stats bs on bs.userid = au.id
+  group by au.id, au.displayname, bs.gold, bs.silver, bs.bronze
+),
+user_top_tag_questions as (
+  select u.id as userid, u.displayname, ut.tag, qc.questionid, qc.title, qc.tag_count, qc.approx_wordcount, qc.answercount,
+         qc.has_accepted, qc.viewcount, qc.score as qscore, qc.last_hist_date
+  from active_users u
+  join user_top3 ut on ut.userid = u.id
+  join question_complexity qc on qc.owneruserid = u.id
+  where qc.tag_count >= 1 and ut.tag = any(qc.tags_array)
+),
+final_dataset as (
+  select ua.userid,
+         ua.displayname,
+         ua.gold, ua.silver, ua.bronze,
+         ua.questions_posted,
+         ua.answers_posted,
+         ua.total_q_views,
+         ua.avg_answer_score,
+         ua.last_activity,
+         coalesce(ut.tag, 'n/a') as primary_tag,
+         count(distinct utq.questionid) as tagged_questions,
+         max(utq.viewcount) as max_tag_q_views,
+         avg(utq.approx_wordcount) filter (where utq.approx_wordcount > 0) as avg_wordcount_in_tag,
+         sum(case when qc.has_accepted = 1 then 1 else 0 end) as total_accepted_on_user_questions,
+         (select count(*) from answer_metrics am
+           where am.answer_owner = ua.userid
+             and am.answer_created > cast('2024-10-01 12:34:56' as timestamp) - interval '180 days'
+             and am.answer_score >= (select coalesce(percentile_cont(0.9) within group (order by score), 1) from posts where posttypeid = 2)
+         ) as recent_top_answers_count,
+         (1.0 * (rank() over (order by ua.total_q_views) - 1) / nullif(count(*) over (),0)) as views_percentile,
+         -- string_agg distinct not allowed in window functions; emulate by aggregating distinct tags per user first
+         utags.user_tags_csv as user_top_tags_csv,
+         bs.tagbadges,
+         bs.namedbadges,
+         bs.last_badge_date,
+         ua.total_q_views as ua_total_q_views
+  from user_aggregates ua
+  left join user_top3 ut on ut.userid = ua.userid
+  left join user_top_tag_questions utq on utq.userid = ua.userid and utq.tag = ut.tag
+  left join question_complexity qc on qc.owneruserid = ua.userid
+  left join badge_stats bs on bs.userid = ua.userid
+  left join (
+    -- build distinct tag list per user
+    select userid, string_agg(tag, ',' order by tag) as user_tags_csv
+    from (
+      select distinct userid, tag
+      from user_top3
+    ) t
+    group by userid
+  ) utags on utags.userid = ua.userid
+  group by ua.userid, ua.displayname, ua.gold, ua.silver, ua.bronze, ua.questions_posted, ua.answers_posted, ua.total_q_views, ua.avg_answer_score, ua.last_activity, ut.tag, bs.tagbadges, bs.namedbadges, bs.last_badge_date, utags.user_tags_csv, ua.total_q_views
+)
+select fd.*,
+       case
+         when fd.questions_posted = 0 and fd.answers_posted = 0 then 'inactive'
+         when fd.questions_posted >= 10 and fd.avg_answer_score >= 2 and fd.gold >= 1 then 'expert-asker'
+         when fd.answers_posted >= 50 or fd.recent_top_answers_count > 5 then 'prolific-answerer'
+         else 'regular'
+       end as cohort,
+       ex.answerid as exemplar_answer_id,
+       ex.answer_score as exemplar_score,
+       ex.answer_created as exemplar_created
+from final_dataset fd
+left join lateral (
+  select ar.answerid, ar.answer_score, ar.answer_created
+  from answer_ranked ar
+  where ar.answer_owner = fd.userid
+  order by ar.ans_rank asc, ar.answer_score desc
+  limit 1
+) ex on true
+where fd.questions_posted + fd.answers_posted > 0
+  and (fd.total_q_views > 1000 or (fd.gold + fd.silver + fd.bronze) > 0)
+order by fd.total_q_views desc nulls last, fd.recent_top_answers_count desc
+limit 200;

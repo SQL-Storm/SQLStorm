@@ -1,0 +1,72 @@
+with RecursiveUserBadges as (
+  select u.Id as UserId,
+         u.DisplayName,
+         u.Reputation,
+         b.Name as BadgeName,
+         b.Class,
+         b.Date,
+         row_number() over (partition by u.Id order by b.Date desc, b.Name) as BadgeRank
+    from Users u
+    left join Badges b on u.Id = b.UserId
+   where b.Id is not null
+),
+AnswerStats as (
+  select a.ParentId as QuestionId,
+         count(*) as AnswerCount,
+         avg(a.Score) as AvgAnswerScore,
+         max(a.Score) as MaxAnswerScore
+    from Posts a
+   where a.PostTypeId = 2
+   group by a.ParentId
+),
+LatestCloseHistoryWins as (
+  select ph.PostId,
+         max(ph.CreationDate) as LastCloseTime,
+         ph.Comment as CloseReasonJson
+    from PostHistory ph
+   where ph.PostHistoryTypeId = 10
+   group by ph.PostId, ph.Comment
+),
+QuestionsWithDuplicatesAndTags as (
+  select p.Id,
+         p.Title,
+         p.CreationDate,
+         p.OwnerUserId,
+         p.Score,
+         p.ViewCount,
+         p.Tags,
+         count(distinct pl2.Id) as DuplicateCount,
+         (
+           select count(*)
+             from Tags ConcatenateAssumedTags
+            where ConcatenateAssumedTags.TagName is not null
+              and POSITION(ConcatenateAssumedTags.TagName IN p.Tags) > 0
+         ) as TagCountInTitleCalc
+    from Posts p
+    left join PostLinks pl2 on pl2.PostId = p.Id and pl2.LinkTypeId = 3
+   where p.PostTypeId = 1
+   group by p.Id, p.Title, p.CreationDate, p.OwnerUserId, p.Score, p.ViewCount, p.Tags
+),
+WeightedSalaryPerUserTypical as (
+  select
+         u.Id,
+         u.DisplayName,
+         u.Reputation,
+         coalesce(sum(case when votescores.ScoreSum is null then p.Score else votescores.ScoreSum end),0) as TotalScore,
+         rank() over (order by coalesce(sum(case when votescores.ScoreSum is null then p.Score else votescores.ScoreSum end),0) desc) as total_rank
+    from Users u
+    left join Posts p on u.Id = p.OwnerUserId
+    left join (
+      select v.PostId, sum(case when vt.Name = 'UpMod' then 1 when vt.Name = 'DownMod' then -1 else 0 end) as ScoreSum
+        from Votes v
+        left join VoteTypes vt on v.VoteTypeId = vt.Id
+       group by v.PostId
+     ) votescores on votescores.PostId = p.Id
+   group by u.Id, u.DisplayName, u.Reputation
+)
+select *
+from RecursiveUserBadges r
+left join AnswerStats a on a.QuestionId = r.UserId
+left join LatestCloseHistoryWins l on l.PostId = r.UserId
+left join QuestionsWithDuplicatesAndTags q on q.Id = r.UserId
+left join WeightedSalaryPerUserTypical w on w.Id = r.UserId;

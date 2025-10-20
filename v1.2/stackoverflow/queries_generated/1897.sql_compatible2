@@ -1,0 +1,33 @@
+WITH CutoffUsers AS (
+    SELECT Id
+    FROM Users
+    WHERE Reputation > 5000
+      AND LastAccessDate > CAST('2024-10-01' AS DATE) - INTERVAL '180' DAY
+),
+QuestionRcvVotes AS (
+    SELECT v.PostId,
+           SUM(CASE WHEN vt.Name = 'UpMod' THEN 1 ELSE 0 END) AS Consortium
+    FROM Votes v
+    JOIN VoteTypes vt ON v.VoteTypeId = vt.Id
+    GROUP BY v.PostId
+)
+SELECT q.Id,
+       q.OwnerUserId,
+       q.Title,
+       q.CreationDate,
+       cu.Id AS CutoffUserId,
+       qrv.Consortium
+FROM "Questions" q
+LEFT JOIN CutoffUsers cu
+  ON q.OwnerUserId = cu.Id
+LEFT JOIN QuestionRcvVotes qrv
+  ON q.Id = qrv.PostId
+WHERE q.ClosedDate IS NULL
+  AND q.PostTypeId = 1
+  AND q.AcceptedAnswerId IS NULL
+GROUP BY q.Id,
+         q.OwnerUserId,
+         q.Title,
+         q.CreationDate,
+         cu.Id,
+         qrv.Consortium;

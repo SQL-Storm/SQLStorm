@@ -1,0 +1,188 @@
+with recursive RelatedPostsCTE as (
+    select 
+        p.Id,
+        p.PostTypeId,
+        p.Title,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC, p.CreationDate) as UserPostRank,
+        1 as Depth,
+        ARRAY[p.Id] as Path
+    from Posts p
+    where p.PostTypeId = 1
+
+    union all
+
+    select
+        pl.RelatedPostId as Id,
+        q.PostTypeId,
+        q.Title,
+        q.OwnerUserId,
+        q.CreationDate,
+        q.Score,
+        ROW_NUMBER() OVER (PARTITION BY q.OwnerUserId ORDER BY q.Score DESC, q.CreationDate) as UserPostRank,
+        pr.Depth + 1 as Depth,
+        pr.Path || ARRAY[pl.RelatedPostId] as Path
+    from RelatedPostsCTE pr
+    join PostLinks pl on pl.PostId = pr.Id
+    join Posts q on q.Id = pl.RelatedPostId
+    where pl.LinkTypeId = 1
+      and pr.Depth < 3
+      and NOT (pl.RelatedPostId = ANY(pr.Path))
+),
+UserBadgeAgg as (
+    select 
+        b.UserId,
+        SUM(case when b.Class = 1 then 1 else 0 end) as GoldBadges,
+        SUM(case when b.Class = 2 then 1 else 0 end) as SilverBadges,
+        SUM(case when b.Class = 3 then 1 else 0 end) as BronzeBadges,
+        MAX(b.Date) as LastBadgeDate
+    from Badges b
+    group by b.UserId
+),
+PostWithAnswersAndComments as (
+    select 
+        q.Id as QuestionId,
+        q.Title,
+        q.OwnerUserId,
+        q.CreationDate,
+        q.Score as QuestionScore,
+        q.ViewCount,
+        q.AnswerCount,
+        a.Id as AnswerId,
+        a.OwnerUserId as AnswerOwnerUserId,
+        a.Score as AnswerScore,
+        c.CommentCount as AnswerCommentCount,
+        u.DisplayName as QuestionOwner,
+        ua.DisplayName as AnswerOwner,
+        co.CommentCount as QuestionCommentCount
+    from Posts q
+    left join Posts a on a.ParentId = q.Id and a.PostTypeId = 2 
+    left join (
+        select PostId, count(*) as CommentCount
+        from Comments
+        group by PostId
+    ) c on c.PostId = a.Id
+    left join (
+      select PostId, count(*) as CommentCount
+      from Comments
+      group by PostId
+    ) co on co.PostId = q.Id
+    left join Users u on u.Id = q.OwnerUserId
+    left join Users ua on ua.Id = a.OwnerUserId
+    where q.PostTypeId = 1
+),
+FilteredVotes as (
+    select 
+        v.PostId, 
+        count(case when v.VoteTypeId = 2 then 1 end) as UpVotes, 
+        count(case when v.VoteTypeId = 3 then 1 end) as DownVotes,
+        max(v.CreationDate) as LastVoteDate
+    from Votes v
+    where v.VoteTypeId in (2,3)
+    group by v.PostId
+),
+AnswersRanked as (
+    select
+        a.QuestionId,
+        a.Title,
+        a.OwnerUserId,
+        a.CreationDate,
+        a.QuestionScore,
+        a.ViewCount,
+        a.AnswerCount,
+        a.AnswerId,
+        a.AnswerOwnerUserId,
+        a.AnswerScore,
+        a.AnswerCommentCount,
+        a.QuestionOwner,
+        a.AnswerOwner,
+        ROW_NUMBER() over (partition by a.QuestionId order by a.AnswerScore desc, a.AnswerCommentCount desc) as AnswerRank,
+        rank() over (partition by a.AnswerOwnerUserId order by a.AnswerScore desc) as UserAnswerRank
+    from PostWithAnswersAndComments a
+    where a.AnswerId is not null
+),
+QuestionsFiltered as (
+    select 
+        q.Id,
+        q.Title,
+        q.OwnerUserId,
+        q.CreationDate,
+        q.Score,
+        q.ViewCount,
+        q.AcceptedAnswerId,
+        f.UpVotes, 
+        f.DownVotes,
+        ub.GoldBadges,
+        ub.SilverBadges,
+        ub.BronzeBadges,
+        rr.UserPostRank
+    from RelatedPostsCTE rr
+    join Posts q on q.Id = rr.Id and q.PostTypeId = 1
+    left join FilteredVotes f on f.PostId = q.Id
+    left join UserBadgeAgg ub on ub.UserId = q.OwnerUserId
+    left join (
+        select DISTINCT OwnerUserId, UserPostRank, Id from RelatedPostsCTE
+    ) ur on ur.OwnerUserId = q.OwnerUserId and ur.Id = q.Id
+    where q.CreationDate > CAST('2024-10-01' AS date) - INTERVAL '365' DAY
+)
+select
+    qf.Id as QuestionId,
+    coalesce(qf.Title, '[NO TITLE]') as Title,
+    coalesce(qf.ViewCount, 0) as Views,
+    coalesce(qf.Score, 0) as Score,
+    coalesce(qf.UpVotes, 0) as UpVotes,
+    coalesce(qf.DownVotes, 0) as DownVotes,
+    u.DisplayName as OwnerDisplayName,
+    ub.GoldBadges,
+    ub.SilverBadges,
+    ub.BronzeBadges,
+    qf.UserPostRank,
+    case when coalesce(qf.DownVotes,0) > 0 then round(CAST(coalesce(qf.UpVotes,0) AS numeric) / nullif(qf.DownVotes,0),3) else null end as UpDownRatio,
+    round(100.0 * CAST(coalesce(qf.UpVotes,0) + coalesce(qf.DownVotes,0) AS numeric) / nullif(coalesce(qf.ViewCount,0),1), 2) as VotePerViewPercent,
+    sub.a_cnt,
+    sub.avg_answer_score,
+    sub.top_answer_user,
+    (select substring(coalesce(p.Body,'') from 1 for 100) || case when length(coalesce(p.Body,'')) > 100 then '...' else '' end
+     from Posts p where p.Id = qf.AcceptedAnswerId) as AcceptedAnswerSnippet
+from QuestionsFiltered qf
+left join Users u on u.Id = qf.OwnerUserId
+left join UserBadgeAgg ub on ub.UserId = qf.OwnerUserId
+left join lateral (
+    select 
+      count(*) as a_cnt,
+      round(avg(a.Score), 2) as avg_answer_score,
+      max(uans.DisplayName) as top_answer_user
+    from Posts a
+    left join Users uans on uans.Id = a.OwnerUserId
+    where a.ParentId = qf.Id and a.PostTypeId = 2
+) sub on true
+where qf.Score > (
+    select CAST(avg(Score) AS integer) from Posts where PostTypeId=1
+)
+union
+select
+    u.Id,
+    u.DisplayName,
+    CAST(NULL AS integer) as Views,
+    CAST(NULL AS integer) as Score,
+    u.UpVotes,
+    u.DownVotes,
+    u.Location,
+    CAST(NULL AS integer) as GoldBadges,
+    CAST(NULL AS integer) as SilverBadges,
+    CAST(NULL AS integer) as BronzeBadges,
+    CAST(NULL AS integer) as UserPostRank,
+    CAST(NULL AS numeric) as UpDownRatio,
+    CAST(NULL AS numeric) as VotePerViewPercent,
+    CAST(NULL AS integer) as a_cnt,
+    CAST(NULL AS numeric) as avg_answer_score,
+    CAST(NULL AS varchar(40)) as top_answer_user,
+    CAST(NULL AS varchar(103)) as AcceptedAnswerSnippet
+from Users u
+where u.Reputation > (
+    select max(Reputation)/2 from Users
+)
+order by Score desc NULLS LAST, Views desc NULLS LAST
+limit 100;

@@ -1,0 +1,210 @@
+WITH RECURSIVE RecursiveBadgeCounts AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        b.Class,
+        COUNT(b.Id) AS BadgeCount
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, b.Class
+
+    UNION ALL
+
+    SELECT
+        rbc.UserId,
+        rbc.DisplayName,
+        rbc.Reputation,
+        rbc.CreationDate,
+        CASE WHEN rbc.Class IS NULL THEN 1 ELSE rbc.Class + 1 END AS Class,
+        0 AS BadgeCount
+    FROM RecursiveBadgeCounts rbc
+    WHERE (rbc.Class < 3 OR rbc.Class IS NULL)
+),
+UserPostStats AS (
+    SELECT
+        u.Id AS UserId,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionCount,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswerCount,
+        AVG(p.Score) FILTER (WHERE p.PostTypeId IN (1, 2)) AS AvgPostScore,
+        SUM(COALESCE(p.ViewCount,0)) FILTER (WHERE p.PostTypeId = 1) AS TotalQuestionViews
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    GROUP BY u.Id
+),
+TopTags AS (
+    SELECT
+        t.TagName,
+        t.Count,
+        t.IsModeratorOnly,
+        t.IsRequired,
+        p.Id AS ExcerptPostId,
+        p.Title AS ExcerptTitle
+    FROM Tags t
+    LEFT JOIN Posts p ON p.Id = t.ExcerptPostId
+    WHERE t.Count > 1000
+),
+PostComments AS (
+    SELECT
+        p.Id AS PostId,
+        COUNT(c.Id) AS CommentCount,
+        MAX(c.CreationDate) AS LastCommentDate,
+        STRING_AGG(DISTINCT c.UserDisplayName, ', ') FILTER (WHERE c.UserDisplayName IS NOT NULL) AS Commenters
+    FROM Posts p
+    LEFT JOIN Comments c ON c.PostId = p.Id
+    GROUP BY p.Id
+),
+AnswerRanks AS (
+    SELECT
+        a.Id AS AnswerId,
+        a.ParentId AS QuestionId,
+        a.Score,
+        ROW_NUMBER() OVER (PARTITION BY a.ParentId ORDER BY a.Score DESC, a.CreationDate ASC) AS AnswerRank
+    FROM Posts a
+    WHERE a.PostTypeId = 2
+),
+QuestionDetails AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.Title,
+        q.Tags,
+        q.AcceptedAnswerId,
+        q.Score,
+        q.ViewCount,
+        q.OwnerUserId,
+        u.DisplayName AS OwnerDisplayName,
+        u.Reputation AS OwnerReputation,
+        ps.CommentCount AS QuestionCommentCount,
+        ps.LastCommentDate AS QuestionLastCommentDate,
+        ps.Commenters AS QuestionCommenters,
+        (SELECT COUNT(*) FROM Posts a WHERE a.ParentId = q.Id AND a.PostTypeId = 2) AS TotalAnswers,
+        (SELECT AVG(a.Score) FROM Posts a WHERE a.ParentId = q.Id AND a.PostTypeId = 2) AS AvgAnswerScore,
+        ar.AnswerId,
+        ar.AnswerRank
+    FROM Posts q
+    LEFT JOIN Users u ON u.Id = q.OwnerUserId
+    LEFT JOIN PostComments ps ON ps.PostId = q.Id
+    LEFT JOIN AnswerRanks ar ON ar.QuestionId = q.Id AND ar.AnswerRank = 1
+    WHERE q.PostTypeId = 1
+      AND q.CreationDate > (CAST('2024-10-01' AS date) - INTERVAL '1 year')
+),
+DuplicatesAndLinks AS (
+    SELECT
+        pl.PostId,
+        pl.RelatedPostId,
+        lt.Name AS LinkTypeName,
+        p1.Title AS PostTitle,
+        p2.Title AS RelatedPostTitle
+    FROM PostLinks pl
+    JOIN LinkTypes lt ON lt.Id = pl.LinkTypeId
+    LEFT JOIN Posts p1 ON p1.Id = pl.PostId
+    LEFT JOIN Posts p2 ON p2.Id = pl.RelatedPostId
+    WHERE lt.Name IN ('Duplicate', 'Linked')
+),
+UserRecentActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        MAX(ph.CreationDate) AS LastEditDate,
+        MAX(v.CreationDate) AS LastVoteDate,
+        MAX(c.CreationDate) AS LastCommentDate,
+        COALESCE(MAX(ph.CreationDate), MAX(v.CreationDate), MAX(c.CreationDate), u.LastAccessDate) AS LastActivity
+    FROM Users u
+    LEFT JOIN PostHistory ph ON ph.UserId = u.Id
+    LEFT JOIN Votes v ON v.UserId = u.Id
+    LEFT JOIN Comments c ON c.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName
+),
+UserEngagement AS (
+    SELECT
+        ura.UserId,
+        ura.DisplayName,
+        urc.LastEditDate,
+        urc.LastVoteDate,
+        urc.LastCommentDate,
+        urc.LastActivity,
+        rbc.Class AS BadgeClass,
+        rbc.BadgeCount,
+        ups.QuestionCount,
+        ups.AnswerCount,
+        ups.AvgPostScore,
+        ups.TotalQuestionViews
+    FROM UserRecentActivity urc
+    JOIN RecursiveBadgeCounts rbc ON rbc.UserId = urc.UserId
+    JOIN UserPostStats ups ON ups.UserId = urc.UserId
+    JOIN (SELECT DISTINCT Id AS UserId, DisplayName FROM Users) ura ON ura.UserId = urc.UserId
+    WHERE rbc.Class IS NOT NULL
+),
+FinalResults AS (
+    SELECT
+        ue.UserId,
+        ue.DisplayName,
+        ue.BadgeClass,
+        ue.BadgeCount,
+        ue.QuestionCount,
+        ue.AnswerCount,
+        ue.AvgPostScore,
+        ue.TotalQuestionViews,
+        ue.LastActivity,
+        q.QuestionId,
+        q.Title,
+        q.Score AS QuestionScore,
+        q.ViewCount AS QuestionViews,
+        q.TotalAnswers,
+        q.AvgAnswerScore,
+        q.AnswerId,
+        q.AnswerRank,
+        dt.LinkTypeName,
+        dt.PostTitle,
+        dt.RelatedPostTitle,
+        tt.TagName,
+        tt.Count AS TagCount,
+        tt.IsModeratorOnly,
+        tt.IsRequired,
+        tt.ExcerptTitle
+    FROM UserEngagement ue
+    LEFT JOIN QuestionDetails q ON q.OwnerUserId = ue.UserId
+    LEFT JOIN DuplicatesAndLinks dt ON dt.PostId = q.QuestionId
+    LEFT JOIN LATERAL (
+        SELECT t.TagName, t.Count, t.IsModeratorOnly, t.IsRequired, t.ExcerptPostId, t.ExcerptTitle
+        FROM TopTags t
+        WHERE q.Tags IS NOT NULL
+          AND (
+              POSITION('<' || t.TagName || '>' IN q.Tags) > 0
+              OR q.Tags LIKE ('%>' || t.TagName || '<%')
+          )
+        LIMIT 1
+    ) tt ON true
+    WHERE ue.BadgeCount > 5
+      AND ue.LastActivity > (CAST('2024-10-01' AS date) - INTERVAL '6 months')
+    ORDER BY ue.BadgeClass ASC, ue.BadgeCount DESC, ue.LastActivity DESC
+    LIMIT 100
+)
+SELECT
+    UserId,
+    DisplayName,
+    BadgeClass,
+    BadgeCount,
+    QuestionCount,
+    AnswerCount,
+    ROUND(COALESCE(AvgPostScore,0),2) AS AvgPostScore,
+    TotalQuestionViews,
+    LastActivity,
+    QuestionId,
+    LEFT(Title, 100) AS QuestionTitleSnippet,
+    QuestionScore,
+    QuestionViews,
+    TotalAnswers,
+    ROUND(COALESCE(AvgAnswerScore,0),2) AS AvgAnswerScore,
+    AnswerId AS TopAnswerId,
+    AnswerRank,
+    COALESCE(LinkTypeName, 'None') AS PostLinkType,
+    LEFT(PostTitle, 50) AS PostLinkTitleSnippet,
+    LEFT(RelatedPostTitle, 50) AS RelatedPostTitleSnippet,
+    TagName,
+    TagCount,
+    COALESCE(CAST(IsModeratorOnly AS text), 'False') AS IsModeratorOnly,
+    COALESCE(CAST(IsRequired AS text), 'False') AS IsRequired,
+    LEFT(ExcerptTitle, 50) AS TagExcerptTitleSnippet
+FROM FinalResults;

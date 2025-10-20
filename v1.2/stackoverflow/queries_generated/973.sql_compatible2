@@ -1,0 +1,157 @@
+WITH RECURSIVE RecursiveTagHierarchy AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        ARRAY[t.TagName] AS TagPath
+    FROM Tags t
+    WHERE NOT t.IsModeratorOnly = true
+    UNION ALL
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        r.TagPath || t.TagName
+    FROM Tags t
+    JOIN RecursiveTagHierarchy r ON t.TagName <> ALL(r.TagPath)
+    WHERE NOT t.IsModeratorOnly = true
+      AND array_length(r.TagPath, 1) < 3
+),
+UserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        count(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionCount,
+        count(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswerCount,
+        count(DISTINCT c.Id) AS CommentCount,
+        coalesce(sum(vt.UpVotes), 0) AS TotalUpVotes,
+        coalesce(sum(vt.DownVotes), 0) AS TotalDownVotes,
+        rank() OVER (ORDER BY coalesce(sum(vt.UpVotes), 0) - coalesce(sum(vt.DownVotes), 0) DESC) AS ReputationRank
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN (
+        SELECT
+            p.OwnerUserId,
+            sum(CASE WHEN vt.Name = 'UpMod' THEN 1 ELSE 0 END) AS UpVotes,
+            sum(CASE WHEN vt.Name = 'DownMod' THEN 1 ELSE 0 END) AS DownVotes
+        FROM Votes v
+        JOIN VoteTypes vt ON v.VoteTypeId = vt.Id
+        JOIN Posts p ON p.Id = v.PostId
+        GROUP BY p.OwnerUserId
+    ) vt ON vt.OwnerUserId = u.Id
+    LEFT JOIN Comments c ON c.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName
+),
+PostWithLinkedDuplicates AS (
+    SELECT
+        p.Id AS PostId,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId,
+        u.DisplayName AS OwnerName,
+        coalesce(
+            (SELECT count(*) FROM PostLinks pl WHERE pl.PostId = p.Id AND pl.LinkTypeId = 3), 0
+        ) AS DuplicateCount,
+        coalesce(
+            (
+                SELECT string_agg(distinct t.TagName, ', ' ORDER BY t.TagName)
+                FROM unnest(string_to_array(substring(p.Tags FROM 2 FOR char_length(p.Tags)-2), '><')) AS tagname
+                JOIN Tags t ON t.TagName = tagname
+            ),
+            ''
+        ) AS TagList
+    FROM Posts p
+    LEFT JOIN Users u ON u.Id = p.OwnerUserId
+    WHERE p.PostTypeId = 1
+),
+RankedPosts AS (
+    SELECT
+        p.PostId,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId,
+        p.OwnerName,
+        p.DuplicateCount,
+        p.TagList,
+        row_number() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC, p.ViewCount DESC) AS UserPostRank
+    FROM PostWithLinkedDuplicates p
+),
+CloseReasonStats AS (
+    SELECT
+        c.Comment AS CloseReasonId,
+        crt.Name AS CloseReasonName,
+        count(*) AS CloseCount
+    FROM PostHistory ph
+    JOIN CloseReasonTypes crt ON crt.Id = ph.Comment
+    JOIN Comments c ON c.PostId = ph.PostId AND ph.PostHistoryTypeId = 10
+    WHERE ph.PostHistoryTypeId = 10
+    GROUP BY c.Comment, crt.Name
+),
+AggregatedUserBadgeStats AS (
+    SELECT
+        b.UserId,
+        sum(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        sum(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        sum(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        bool_or(b.TagBased) AS HasTagBasedBadges
+    FROM Badges b
+    GROUP BY b.UserId
+)
+SELECT
+    u.UserId,
+    u.DisplayName,
+    u.QuestionCount,
+    u.AnswerCount,
+    u.CommentCount,
+    u.TotalUpVotes,
+    u.TotalDownVotes,
+    u.ReputationRank,
+    ab.GoldBadges,
+    ab.SilverBadges,
+    ab.BronzeBadges,
+    ab.HasTagBasedBadges,
+    rp.PostId,
+    rp.Title,
+    rp.CreationDate,
+    rp.Score,
+    rp.ViewCount,
+    rp.DuplicateCount,
+    rp.TagList,
+    cr.CloseReasonName,
+    cr.CloseCount,
+    string_agg(DISTINCT rth.TagName, ' > ' ORDER BY array_length(rth.TagPath, 1)) AS RelatedTagHierarchy
+FROM UserActivity u
+LEFT JOIN AggregatedUserBadgeStats ab ON ab.UserId = u.UserId
+LEFT JOIN RankedPosts rp ON rp.OwnerUserId = u.UserId AND rp.UserPostRank = 1
+LEFT JOIN PostHistory ph ON ph.PostId = rp.PostId AND ph.PostHistoryTypeId = 10
+LEFT JOIN CloseReasonStats cr ON cr.CloseReasonId = ph.Comment
+LEFT JOIN RecursiveTagHierarchy rth ON rth.TagName = ANY(string_to_array(rp.TagList, ', '))
+WHERE u.QuestionCount > 0
+GROUP BY
+    u.UserId,
+    u.DisplayName,
+    u.QuestionCount,
+    u.AnswerCount,
+    u.CommentCount,
+    u.TotalUpVotes,
+    u.TotalDownVotes,
+    u.ReputationRank,
+    ab.GoldBadges,
+    ab.SilverBadges,
+    ab.BronzeBadges,
+    ab.HasTagBasedBadges,
+    rp.PostId,
+    rp.Title,
+    rp.CreationDate,
+    rp.Score,
+    rp.ViewCount,
+    rp.DuplicateCount,
+    rp.TagList,
+    cr.CloseReasonName,
+    cr.CloseCount
+ORDER BY u.ReputationRank
+LIMIT 100;

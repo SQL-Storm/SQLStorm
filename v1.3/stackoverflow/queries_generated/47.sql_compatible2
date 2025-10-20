@@ -1,0 +1,226 @@
+with
+user_activity as (
+  select
+    u.id as user_id,
+    u.displayname,
+    coalesce(u.reputation,0) as reputation,
+    count(distinct p.id) filter (where p.posttypeid = 1) as questions_posted,
+    count(distinct p.id) filter (where p.posttypeid = 2) as answers_posted,
+    count(c.id) as comments_posted,
+    greatest(1, extract(epoch from (cast('2024-10-01 12:34:56' as timestamp) - u.creationdate))/86400) as days_since_signup,
+    (coalesce(count(distinct p.id) filter (where p.posttypeid = 1),0)*3
+     + coalesce(count(distinct p.id) filter (where p.posttypeid = 2),0)*5
+     + coalesce(count(c.id),0)) * 1.0
+     / greatest(1, greatest(1, extract(epoch from (cast('2024-10-01 12:34:56' as timestamp) - u.creationdate))/86400)) as activity_per_day
+  from users u
+  left join posts p on p.owneruserid = u.id
+  left join comments c on c.userid = u.id
+  group by u.id, u.displayname, u.reputation, u.creationdate
+),
+question_tags as (
+  select
+    p.id as post_id,
+    trim(t) as tag
+  from posts p
+  cross join lateral (
+    select regexp_split_to_table(substring(coalesce(p.tags,''),2,case when p.tags is null then 0 else length(p.tags)-2 end),'><') as t
+  ) s
+  where p.posttypeid = 1 and p.tags is not null and p.tags <> ''
+),
+tag_stats as (
+  select
+    qt.tag,
+    count(*) as question_count,
+    avg(p.score) as avg_score,
+    percentile_cont(0.5) within group (order by p.viewcount) as median_views
+  from question_tags qt
+  join posts p on p.id = qt.post_id
+  group by qt.tag
+),
+post_edit_profile as (
+  select
+    p.id as post_id,
+    p.title,
+    p.posttypeid,
+    p.owneruserid,
+    p.creationdate,
+    p.score,
+    p.viewcount,
+    count(ph.id) filter (where ph.posthistorytypeid in (4,5,6,7,8,9)) as edit_count,
+    max(ph.creationdate) as last_edit
+  from posts p
+  left join posthistory ph on ph.postid = p.id
+  group by p.id, p.title, p.posttypeid, p.owneruserid, p.creationdate, p.score, p.viewcount
+),
+user_answer_metrics as (
+  select
+    u.id as user_id,
+    count(a.id) as answers_count,
+    sum(case when exists (select 1 from posts q where q.id = a.parentid and q.acceptedanswerid = a.id) then 1 else 0 end) as accepted_count,
+    avg(a.score) as avg_answer_score,
+    max(a.score) as best_answer_score,
+    sum(case when a.score >= 10 then 1 else 0 end) as high_score_answers
+  from users u
+  left join posts a on a.owneruserid = u.id and a.posttypeid = 2
+  group by u.id
+),
+duplicate_clusters as (
+  select
+    pl.relatedpostid as canonical_id,
+    array_agg(pl.postid order by pl.creationdate) as duplicates,
+    count(*) as dup_count,
+    max(pl.creationdate) as last_dup_time
+  from postlinks pl
+  where pl.linktypeid = 3
+  group by pl.relatedpostid
+),
+question_answer_agg as (
+  select
+    q.id as question_id,
+    q.title,
+    q.owneruserid,
+    q.creationdate,
+    q.viewcount,
+    q.score as question_score,
+    q.answercount,
+    q.acceptedanswerid,
+    count(a.id) as answers_total,
+    sum(a.score) as answers_score_sum,
+    avg(a.score) as answers_score_avg,
+    max(a.score) as answers_score_max,
+    min(a.score) as answers_score_min,
+    sum(case when a.creationdate <= q.creationdate + interval '7 days' then 1 else 0 end) as answers_within_week,
+    (select string_agg((a2.id || ':' || coalesce(a2.score,0))::text, ',')
+     from (
+       select id, score, row_number() over (partition by q.id order by coalesce(score,0) desc, creationdate asc) as rn
+       from posts a2 where a2.parentid = q.id and a2.posttypeid = 2
+     ) a2 where a2.rn <= 3
+    ) as top_3_answers_id_score
+  from posts q
+  left join posts a on a.parentid = q.id and a.posttypeid = 2
+  where q.posttypeid = 1
+  group by q.id, q.title, q.owneruserid, q.creationdate, q.viewcount, q.score, q.answercount, q.acceptedanswerid
+),
+post_vote_summary as (
+  select
+    p.id as post_id,
+    sum(case when v.votetypeid = 2 then 1 when v.votetypeid = 3 then -1 else 0 end) as net_votes,
+    sum(case when v.votetypeid = 5 then 1 else 0 end) as favorites,
+    count(v.id) as total_votes,
+    max(v.creationdate) as last_vote
+  from posts p
+  left join votes v on v.postid = p.id
+  group by p.id
+),
+user_rich_profile as (
+  select
+    ua.*,
+    u.websiteurl,
+    u.location,
+    u.accountid,
+    coalesce(bad.badge_counts, json_build_object()) as badges_breakdown,
+    coalesce(uam.answers_count,0) as answers_count,
+    coalesce(uam.accepted_count,0) as accepted_answers,
+    coalesce(uam.avg_answer_score,0) as avg_answer_score,
+    coalesce(qa.questions_with_high_activity,0) as hot_questions_asked
+  from user_activity ua
+  join users u on u.id = ua.user_id
+  left join (
+    select userid, json_object_agg(class::text, cnt) as badge_counts
+    from (
+      select userid, class, count(*) as cnt
+      from badges
+      group by userid, class
+    ) t
+    group by userid
+  ) bad on bad.userid = u.id
+  left join user_answer_metrics uam on uam.user_id = u.id
+  left join (
+    select owneruserid, count(*) filter (where score > 5 and viewcount > 1000) as questions_with_high_activity
+    from posts
+    where posttypeid = 1
+    group by owneruserid
+  ) qa on qa.owneruserid = u.id
+),
+candidates as (
+  select
+    urp.user_id,
+    urp.displayname,
+    urp.reputation,
+    urp.activity_per_day,
+    urp.answers_count,
+    urp.accepted_answers,
+    urp.avg_answer_score,
+    urp.badges_breakdown,
+    ts.tag as favorite_tag,
+    ts.question_count as fav_tag_qcount,
+    ts.avg_score as fav_tag_avg_score,
+    qc.question_id,
+    qc.title as hot_question_title,
+    qc.answers_total,
+    qc.top_3_answers_id_score,
+    pc.dup_count,
+    pc.duplicates,
+    pv.net_votes as question_net_votes,
+    pv.favorites as question_favorites,
+    lower(coalesce(urp.displayname,'<anon>')) || '|' || coalesce(substring(urp.websiteurl from 1 for 50), 'no-site') as display_site_key,
+    case
+      when urp.reputation > 20000 and urp.activity_per_day > 1 then 'power-user'
+      when urp.reputation between 5000 and 20000 then 'established'
+      when urp.activity_per_day > 0.1 then 'active'
+      else 'casual'
+    end as user_tier,
+    (urpa.high_activity_recent and (urpa.recent_answer_accept_rate > 0.2 or urp.accepted_answers > 10)) as is_engaged
+  from user_rich_profile urp
+  left join lateral (
+    select qt.tag, ts.question_count, ts.avg_score
+    from question_tags qt
+    join posts p on p.id = qt.post_id
+    join tag_stats ts on ts.tag = qt.tag
+    where (p.owneruserid = urp.user_id or exists (select 1 from posts a where a.parentid = p.id and a.owneruserid = urp.user_id))
+    group by qt.tag, ts.question_count, ts.avg_score
+    order by count(*) desc, ts.question_count desc
+    limit 1
+  ) ts on true
+  left join lateral (
+    select q.question_id, q.title, q.answers_total, q.top_3_answers_id_score, q.viewcount, q.creationdate, q.owneruserid
+    from question_answer_agg q
+    where q.owneruserid = urp.user_id
+    order by (cast(q.viewcount as bigint) * coalesce(q.answers_total,0)) desc nulls last, q.creationdate desc
+    limit 1
+  ) qc on true
+  left join duplicate_clusters pc on pc.canonical_id = qc.question_id
+  left join post_vote_summary pv on pv.post_id = qc.question_id
+  left join lateral (
+    select
+      (exists (
+        select 1 from posts p2 where p2.owneruserid = urp.user_id and p2.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '30 days'
+      )) as high_activity_recent,
+      coalesce( (select 1.0*sum(case when exists (select 1 from posts q where q.id = a.parentid and q.acceptedanswerid = a.id) then 1 else 0 end)
+        from posts a where a.owneruserid = urp.user_id and a.posttypeid = 2 and a.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '180 days'),
+        0) /
+      greatest(1, coalesce( (select count(*) from posts a2 where a2.owneruserid = urp.user_id and a2.posttypeid = 2 and a2.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '180 days'), 0)) as recent_answer_accept_rate
+  ) urpa on true
+  where urp.activity_per_day > 0.01
+)
+select
+  c.*,
+  dense_rank() over (
+    order by (
+      (coalesce(c.reputation,0) / 1000.0)
+      + coalesce(c.activity_per_day,0)*10
+      + coalesce(c.answers_count,0)/10
+      + coalesce(c.accepted_answers,0)/5
+    ) desc
+  ) as composite_rank,
+  md5(coalesce(c.displayname,'') || '|' || coalesce(c.favorite_tag,'') || '|' || coalesce(c.hot_question_title,'') ) as profile_fingerprint,
+  case when c.user_id in (
+    select user_id from (
+      (select user_id from user_answer_metrics order by answers_count desc limit 50)
+      union
+      (select id as user_id from users order by reputation desc limit 50)
+    ) x
+  ) then true else false end as in_top_50_union
+from candidates c
+order by composite_rank, c.activity_per_day desc, c.reputation desc
+limit 200;

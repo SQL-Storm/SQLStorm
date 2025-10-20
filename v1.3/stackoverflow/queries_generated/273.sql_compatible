@@ -1,0 +1,216 @@
+WITH
+questions AS (
+  SELECT p.*
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+),
+answers AS (
+  SELECT p.*
+  FROM Posts p
+  WHERE p.PostTypeId = 2
+),
+tag_map AS (
+  SELECT q.Id AS QuestionId,
+         trim(t.tag) AS Tag
+  FROM questions q
+  CROSS JOIN LATERAL (
+    SELECT unnest(
+      string_to_array(
+        substring(q.Tags, 2, GREATEST(char_length(q.Tags) - 2, 0)),
+        '><'
+      )
+    ) AS tag
+  ) t
+  WHERE q.Tags IS NOT NULL AND q.Tags <> ''
+    AND trim(t.tag) <> ''
+),
+first_answers AS (
+  SELECT a.ParentId AS QuestionId,
+         MIN(a.CreationDate) AS FirstAnswerDate,
+         MIN(a.Id) AS FirstAnswerId
+  FROM answers a
+  GROUP BY a.ParentId
+),
+response_times AS (
+  SELECT tm.Tag,
+         q.Id AS QuestionId,
+         EXTRACT(EPOCH FROM (fa.FirstAnswerDate - q.CreationDate)) AS ResponseSeconds
+  FROM tag_map tm
+  JOIN questions q ON q.Id = tm.QuestionId
+  LEFT JOIN first_answers fa ON fa.QuestionId = q.Id
+),
+tag_answer_stats AS (
+  SELECT tm.Tag,
+         COUNT(DISTINCT q.Id) AS QuestionCount,
+         COALESCE(AVG(q.AnswerCount),0) AS AvgAnswerCount,
+         COALESCE(AVG(q.ViewCount),0) AS AvgViewCount,
+         COALESCE(AVG(q.Score),0) AS AvgQuestionScore,
+         COALESCE(
+           CASE WHEN COUNT(a.Id) = 0 THEN NULL ELSE SUM(COALESCE(a.Score,0))::numeric / COUNT(a.Id) END
+         ,0) AS AvgAnswerScore,
+         COUNT(a.Id) AS TotalAnswers,
+         COALESCE(
+           CASE WHEN COUNT(rt.ResponseSeconds) = 0 THEN NULL ELSE SUM(COALESCE(rt.ResponseSeconds,0))::numeric / COUNT(rt.ResponseSeconds) END
+         ,0) AS AvgResponseSeconds,
+         SUM(CASE WHEN q.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END) * 1.0 / NULLIF(COUNT(q.Id),0) AS AcceptanceRate,
+         percentile_cont(0.5) WITHIN GROUP (ORDER BY a.Score) AS MedianAnswerScore
+  FROM tag_map tm
+  JOIN questions q ON q.Id = tm.QuestionId
+  LEFT JOIN answers a ON a.ParentId = q.Id
+  LEFT JOIN response_times rt ON rt.QuestionId = q.Id AND rt.Tag = tm.Tag
+  GROUP BY tm.Tag
+),
+user_answer_agg AS (
+  SELECT tm.Tag,
+         u.Id AS UserId,
+         COALESCE(u.DisplayName, '(deleted)') AS DisplayName,
+         COUNT(a.Id) AS AnswersCount,
+         SUM(COALESCE(a.Score,0)) AS TotalAnswerScore,
+         AVG(COALESCE(a.Score,0)) AS AvgAnswerScore,
+         MAX(COALESCE(a.Score,0)) AS MaxAnswerScore,
+         MIN(COALESCE(a.Score,0)) AS MinAnswerScore
+  FROM tag_map tm
+  JOIN questions q ON q.Id = tm.QuestionId
+  JOIN answers a ON a.ParentId = q.Id
+  LEFT JOIN Users u ON u.Id = a.OwnerUserId
+  WHERE a.OwnerUserId IS NOT NULL
+  GROUP BY tm.Tag, u.Id, u.DisplayName
+),
+top_users AS (
+  SELECT tag, UserId, DisplayName, AnswersCount, TotalAnswerScore, AvgAnswerScore,
+         ROW_NUMBER() OVER (PARTITION BY tag ORDER BY TotalAnswerScore DESC NULLS LAST, AnswersCount DESC) AS rn
+  FROM user_answer_agg
+),
+badges_agg AS (
+  SELECT b.UserId,
+         COUNT(*) AS BadgeCount,
+         SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS Gold,
+         SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS Silver,
+         SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS Bronze,
+         string_agg(DISTINCT b.Name, ', ' ORDER BY b.Name) AS BadgesList
+  FROM Badges b
+  GROUP BY b.UserId
+),
+tag_recent_activity AS (
+  SELECT tm.Tag,
+         MAX(GREATEST(COALESCE(q.LastActivityDate, TIMESTAMP '1970-01-01'), COALESCE(a.LastActivityDate, TIMESTAMP '1970-01-01'))) AS LastActivity,
+         COUNT(DISTINCT ph.Id) AS EditCount
+  FROM tag_map tm
+  JOIN questions q ON q.Id = tm.QuestionId
+  LEFT JOIN answers a ON a.ParentId = q.Id
+  LEFT JOIN PostHistory ph ON ph.PostId = q.Id OR ph.PostId = a.Id
+  GROUP BY tm.Tag
+),
+tag_annotations AS (
+  SELECT tas.*,
+         tr.LastActivity,
+         tr.EditCount,
+         ROUND(tas.AvgResponseSeconds/3600.0,2) AS AvgResponseHours,
+         CASE
+           WHEN tas.AcceptanceRate IS NULL THEN 'Unknown'
+           WHEN tas.AcceptanceRate >= 0.75 THEN 'High'
+           WHEN tas.AcceptanceRate >= 0.5 THEN 'Medium'
+           WHEN tas.AcceptanceRate > 0 THEN 'Low'
+           ELSE 'None'
+         END AS AcceptanceTier,
+         concat(upper(substring(tas.Tag from 1 for 1)), lower(substring(tas.Tag from 2))) AS PrettyTag,
+         COALESCE(NULLIF(trim(tas.Tag),''),'[untagged]') AS SafeTag
+  FROM tag_answer_stats tas
+  LEFT JOIN tag_recent_activity tr ON tr.Tag = tas.Tag
+),
+tag_with_top_users AS (
+  SELECT ta.Tag,
+         ta.SafeTag,
+         ta.PrettyTag,
+         ta.QuestionCount,
+         ta.TotalAnswers,
+         ta.AvgAnswerCount,
+         ta.AvgViewCount,
+         ta.MedianAnswerScore,
+         ta.AvgQuestionScore,
+         ta.AvgAnswerScore,
+         ta.AvgResponseHours,
+         ta.AcceptanceRate,
+         ta.AcceptanceTier,
+         ta.LastActivity,
+         ta.EditCount,
+         tu.UserId AS TopUserId,
+         tu.DisplayName AS TopUserName,
+         tu.AnswersCount AS TopUserAnswers,
+         tu.TotalAnswerScore AS TopUserScore,
+         COALESCE(ba.BadgeCount,0) AS TopUserBadges,
+         COALESCE(ba.Gold,0) AS TopUserGold,
+         COALESCE(ba.Silver,0) AS TopUserSilver,
+         COALESCE(ba.Bronze,0) AS TopUserBronze,
+         COALESCE(ba.BadgesList,'') AS TopUserBadgesList
+  FROM tag_annotations ta
+  LEFT JOIN top_users tu ON tu.tag = ta.tag AND tu.rn = 1
+  LEFT JOIN badges_agg ba ON ba.UserId = tu.UserId
+)
+(
+  SELECT
+    Tag,
+    SafeTag,
+    PrettyTag,
+    QuestionCount,
+    TotalAnswers,
+    AvgAnswerCount,
+    AvgViewCount,
+    MedianAnswerScore,
+    AvgQuestionScore,
+    AvgAnswerScore,
+    AvgResponseHours,
+    AcceptanceRate,
+    AcceptanceTier,
+    LastActivity,
+    EditCount,
+    TopUserId,
+    TopUserName,
+    TopUserAnswers,
+    TopUserScore,
+    TopUserBadges,
+    TopUserGold,
+    TopUserSilver,
+    TopUserBronze,
+    TopUserBadgesList,
+    CAST('popular' AS text) AS cohort
+  FROM tag_with_top_users
+  WHERE QuestionCount >= 100
+  ORDER BY QuestionCount DESC
+  LIMIT 50
+)
+UNION ALL
+(
+  SELECT
+    Tag,
+    SafeTag,
+    PrettyTag,
+    QuestionCount,
+    TotalAnswers,
+    AvgAnswerCount,
+    AvgViewCount,
+    MedianAnswerScore,
+    AvgQuestionScore,
+    AvgAnswerScore,
+    AvgResponseHours,
+    AcceptanceRate,
+    AcceptanceTier,
+    LastActivity,
+    EditCount,
+    TopUserId,
+    TopUserName,
+    TopUserAnswers,
+    TopUserScore,
+    TopUserBadges,
+    TopUserGold,
+    TopUserSilver,
+    TopUserBronze,
+    TopUserBadgesList,
+    CAST('niche' AS text) AS cohort
+  FROM tag_with_top_users
+  WHERE QuestionCount BETWEEN 1 AND 5
+  ORDER BY QuestionCount ASC NULLS FIRST
+  LIMIT 50
+)
+ORDER BY cohort DESC, QuestionCount DESC NULLS LAST, TopUserScore DESC NULLS LAST
+LIMIT 100;

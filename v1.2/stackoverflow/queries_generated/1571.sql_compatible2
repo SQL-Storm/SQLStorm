@@ -1,0 +1,186 @@
+WITH RecursiveTagHierarchy AS (
+    SELECT
+        t.Id, t.TagName, t.IsModeratorOnly, t.IsRequired, 1 AS Level,
+        ARRAY[t.TagName] AS Path
+    FROM Tags t
+    WHERE t.IsModeratorOnly = FALSE
+
+    UNION ALL
+
+    SELECT
+        t.Id, t.TagName, t.IsModeratorOnly, t.IsRequired, rth.Level + 1 AS Level,
+        rth.Path || t.TagName
+    FROM Tags t
+    JOIN RecursiveTagHierarchy rth ON t.TagName < SUBSTRING(rth.TagName FROM 1 FOR 3)
+    WHERE rth.Level < 3
+),
+RankedAnswers AS (
+    SELECT
+        a.Id,
+        a.ParentId,
+        a.Score,
+        a.CreationDate,
+        RANK() OVER (PARTITION BY a.ParentId ORDER BY a.Score DESC, a.CreationDate ASC) AS RankByScore
+    FROM Posts a
+    WHERE a.PostTypeId = 2
+),
+TopQuestionsByAnswers AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.Title,
+        q.Score AS QuestionScore,
+        q.CreationDate AS QuestionCreationDate,
+        CASE WHEN q.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END AS HasAcceptedAnswer,
+        u.DisplayName AS OwnerDisplayName,
+        COALESCE(q.FavoriteCount,0) AS FavoriteCount,
+        q.OwnerUserId
+    FROM Posts q
+    LEFT JOIN Users u ON q.OwnerUserId = u.Id
+    WHERE q.PostTypeId = 1
+      AND q.Score >= (
+          SELECT percentile_cont(0.8) WITHIN GROUP (ORDER BY Score) FROM Posts WHERE PostTypeId = 1
+      )
+),
+CTLasedOwners AS (
+    SELECT
+        us.Id AS UserId,
+        us.DisplayName,
+        us.Reputation,
+        us.CreationDate,
+        LEAD(us.CreationDate) OVER (ORDER BY us.Reputation DESC) AS NextUserCreation
+    FROM Users us
+    WHERE us.Reputation > 5000
+),
+ComplexUserAggregate AS (
+    SELECT
+        b.UserId,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        SUM(CASE WHEN b.Class IS NULL THEN 0 ELSE 1 END) AS AwardedBadges,
+        MAX(b.Date) AS LastBadgeAwardDate,
+        AVG(EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - b.Date))) AS AvgBadgeOldnessSeconds
+    FROM Badges b
+    GROUP BY b.UserId
+),
+PostWithVoteStats AS (
+    SELECT
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Title,
+        p.Tags,
+        COALESCE(vt.UpVotes, 0) AS UpVotes,
+        COALESCE(vt.DownVotes, 0) AS DownVotes,
+        COALESCE(vt.FavoriteVotes, 0) AS FavoriteVotes,
+        ((COALESCE(vt.UpVotes,0) + 1.0) / NULLIF(COALESCE(vt.DownVotes,0) + 1.0, 0)) AS UpDownRatio,
+        p.Score,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC) AS ScoreRowNum
+    FROM Posts p
+    LEFT JOIN (
+      SELECT
+        v.PostId,
+        SUM(CASE WHEN v.VoteTypeId=2 THEN 1 ELSE 0 END) AS UpVotes,
+        SUM(CASE WHEN v.VoteTypeId=3 THEN 1 ELSE 0 END) AS DownVotes,
+        SUM(CASE WHEN v.VoteTypeId=5 THEN 1 ELSE 0 END) AS FavoriteVotes
+      FROM Votes v
+      GROUP BY v.PostId
+    ) vt ON vt.PostId = p.Id
+),
+QuestionCommentStats AS (
+    SELECT
+        c.PostId,
+        COUNT(*) AS CommentsCount,
+        MAX(c.CreationDate) AS MostRecentCommentDate,
+        SUM(CASE WHEN c.Score > 5 THEN 1 ELSE 0 END) AS HighlyUpvotedComments
+    FROM Comments c
+    GROUP BY c.PostId
+),
+BadgeTopPerUser AS (
+    SELECT 
+      bqa.UserId,
+      MAX(bqa.Class) AS TopBadgeClass,
+      MAX(CASE WHEN bqa.Class = 1 THEN bqa.Name ELSE NULL END) AS TopBadgeName
+    FROM Badges bqa
+    GROUP BY bqa.UserId
+),
+UserRanks AS (
+    SELECT
+        u2.Id, 
+        CAST(EXTRACT(DAY FROM (CAST('2024-10-01 12:34:56' AS timestamp) - u2.LastAccessDate)) AS INTEGER) AS LastAccessDiffDays,
+        PERCENT_RANK() OVER (ORDER BY u2.Reputation DESC) AS rep_percentilexgt,
+        u2.Reputation,
+        u2.LastAccessDate
+    FROM Users u2 
+),
+ClosedPosts AS (
+  SELECT
+     plc.PostId,
+     'Closed' AS closedStatus
+  FROM PostHistory plc
+  WHERE plc.PostHistoryTypeId = 10
+)
+
+SELECT DISTINCT
+    pq.QuestionId,
+    pq.Title,
+    pq.QuestionScore,
+    pq.HasAcceptedAnswer,
+    pq.OwnerDisplayName,
+    pq.FavoriteCount,
+    rans.Id AS TopAnswerId,
+    rans.Score AS TopAnswerScore,
+    usr.DisplayName AS AnswerOwner,
+    NULL AS MotorcycleUsed,
+    NULL AS hondajin,
+    COUNT(rlink.linkedPostId) AS realboldSQLBlendSheetConversionConversionTraverse,
+    rlink.linkedPostId,
+    b.TopBadgeName,
+    gus.LastAccessDiffDays,
+    gus.rep_percentilexgt AS rep_percentilexgt,
+    job.closedStatus
+
+FROM TopQuestionsByAnswers pq
+
+LEFT JOIN RankedAnswers rans ON rans.ParentId = pq.QuestionId AND rans.RankByScore = 1
+LEFT JOIN Users usr ON rans.OwnerUserId = usr.Id 
+LEFT JOIN ComplexUserAggregate cuga ON cuga.UserId = pq.OwnerUserId
+LEFT JOIN BadgeTopPerUser b ON b.UserId = pq.OwnerUserId
+LEFT JOIN UserRanks gus ON gus.Id = pq.OwnerUserId
+LEFT JOIN ClosedPosts job ON job.PostId = pq.QuestionId
+
+LEFT JOIN LATERAL (
+    SELECT
+        pl.RelatedPostId AS linkedPostId,
+        string_agg(DISTINCT ltypes.Name, ', ') AS LinkTypeDescriptions,
+        count(*) as linkCount
+    FROM PostLinks pl
+    JOIN LinkTypes ltypes ON pl.LinkTypeId = ltypes.Id
+    WHERE pl.PostId = pq.QuestionId
+    GROUP BY pl.RelatedPostId
+    ORDER BY linkCount DESC
+    LIMIT 3
+) rlink ON true
+
+WHERE
+    COALESCE(pq.QuestionScore, 0) > 10
+    AND (job.closedStatus IS NULL OR job.closedStatus = 'Closed')
+
+GROUP BY
+    pq.QuestionId,
+    pq.Title,
+    pq.QuestionScore,
+    pq.HasAcceptedAnswer,
+    pq.OwnerDisplayName,
+    pq.FavoriteCount,
+    rans.Id,
+    rans.Score,
+    usr.DisplayName,
+    rlink.linkedPostId,
+    b.TopBadgeName,
+    gus.LastAccessDiffDays,
+    gus.rep_percentilexgt,
+    job.closedStatus
+
+ORDER BY
+    pq.FavoriteCount DESC,
+    rans.Score DESC
+LIMIT 50;

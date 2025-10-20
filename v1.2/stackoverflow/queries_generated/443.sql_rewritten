@@ -1,0 +1,163 @@
+-- {"query": "443.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 0.4, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1532} 
+with RecursiveTagHierarchy as (
+    select t.Id, t.TagName, t.Count, t.ExcerptPostId, t.WikiPostId, t.IsModeratorOnly, t.IsRequired, 1 as Level
+    from Tags t
+    where t.Count > 1000
+    union all
+    select t.Id, t.TagName, t.Count, t.ExcerptPostId, t.WikiPostId, t.IsModeratorOnly, t.IsRequired, r.Level + 1
+    from Tags t
+    join RecursiveTagHierarchy r on t.Id = r.Id - 1
+    where r.Level < 3
+),
+UserActivity as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        count(distinct p.Id) as TotalPosts,
+        count(distinct case when p.PostTypeId = 1 then p.Id end) as Questions,
+        count(distinct case when p.PostTypeId = 2 then p.Id end) as Answers,
+        coalesce(sum(vb.UpVotes),0) as TotalUpVotes,
+        coalesce(sum(vb.DownVotes),0) as TotalDownVotes,
+        row_number() over (order by count(distinct p.Id) desc) as ActivityRank
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join (
+        select p.OwnerUserId, 
+               sum(case when vt.Name = 'UpMod' then 1 else 0 end) as UpVotes,
+               sum(case when vt.Name = 'DownMod' then 1 else 0 end) as DownVotes
+        from Votes v
+        join VoteTypes vt on vt.Id = v.VoteTypeId
+        join Posts p on p.Id = v.PostId
+        where p.OwnerUserId is not null
+        group by p.OwnerUserId
+    ) vb on vb.OwnerUserId = u.Id
+    group by u.Id, u.DisplayName
+),
+TopQuestions as (
+    select 
+        p.Id,
+        p.Title,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        p.AcceptedAnswerId,
+        u.DisplayName as OwnerName,
+        row_number() over (partition by p.OwnerUserId order by p.Score desc, p.ViewCount desc) as QuestionRank
+    from Posts p
+    left join Users u on u.Id = p.OwnerUserId
+    where p.PostTypeId = 1 and p.CreationDate > cast('2024-10-01' as date) - interval '1 year'
+),
+AcceptedAnswers as (
+    select 
+        a.Id,
+        a.ParentId as QuestionId,
+        a.Score,
+        a.CreationDate,
+        a.OwnerUserId,
+        u.DisplayName as AnswerOwnerName,
+        a.Body
+    from Posts a
+    left join Users u on u.Id = a.OwnerUserId
+    where a.PostTypeId = 2 and a.Id in (select AcceptedAnswerId from Posts where AcceptedAnswerId is not null)
+),
+QuestionComments as (
+    select 
+        c.PostId,
+        count(*) as CommentCount,
+        sum(case when c.UserId is null then 1 else 0 end) as AnonymousComments,
+        max(c.CreationDate) as LastCommentDate,
+        string_agg(distinct coalesce(c.UserDisplayName, 'Anonymous'), ', ') as Commenters
+    from Comments c
+    group by c.PostId
+),
+PostLinkSummary as (
+    select 
+        pl.PostId,
+        count(distinct pl.RelatedPostId) as LinkedPostsCount,
+        count(distinct case when lt.Name = 'Duplicate' then pl.RelatedPostId end) as DuplicateLinksCount
+    from PostLinks pl
+    join LinkTypes lt on lt.Id = pl.LinkTypeId
+    group by pl.PostId
+),
+UserBadgeStats as (
+    select 
+        b.UserId,
+        count(*) as TotalBadges,
+        count(case when b.Class = 1 then 1 end) as GoldBadges,
+        count(case when b.Class = 2 then 1 end) as SilverBadges,
+        count(case when b.Class = 3 then 1 end) as BronzeBadges,
+        max(b.Date) as LastBadgeDate
+    from Badges b
+    group by b.UserId
+)
+select 
+    tq.Id as QuestionId,
+    tq.Title,
+    tq.OwnerUserId,
+    ua.DisplayName as OwnerDisplayName,
+    ua.Reputation,
+    ua.CreationDate as UserCreationDate,
+    ua.LastAccessDate,
+    ua.Location,
+    ua.Views,
+    ua.UpVotes,
+    ua.DownVotes,
+    ua.ProfileImageUrl,
+    ua.AccountId,
+    ua.TotalPosts,
+    ua.Questions,
+    ua.Answers,
+    ua.TotalUpVotes,
+    ua.TotalDownVotes,
+    ua.ActivityRank,
+    tq.Score as QuestionScore,
+    tq.ViewCount as QuestionViews,
+    tq.Tags,
+    coalesce(ac.Score, 0) as AcceptedAnswerScore,
+    ac.AnswerOwnerName,
+    ac.CreationDate as AcceptedAnswerDate,
+    qc.CommentCount,
+    qc.AnonymousComments,
+    qc.LastCommentDate,
+    qc.Commenters,
+    pls.LinkedPostsCount,
+    pls.DuplicateLinksCount,
+    ubs.TotalBadges,
+    ubs.GoldBadges,
+    ubs.SilverBadges,
+    ubs.BronzeBadges,
+    ubs.LastBadgeDate,
+    -- Complex string and null logic: formatted tag list and conditional badge info
+    case 
+        when tq.Tags is null then 'No Tags'
+        else replace(replace(tq.Tags, '<', ''), '>', ', ')
+    end as FormattedTags,
+    case 
+        when ubs.TotalBadges is null or ubs.TotalBadges = 0 then 'No badges earned'
+        else concat(ubs.GoldBadges, ' Gold, ', ubs.SilverBadges, ' Silver, ', ubs.BronzeBadges, ' Bronze badges')
+    end as BadgeSummary,
+    -- Window function: rank questions by score within the last year
+    rank() over (order by tq.Score desc) as ScoreRank,
+    -- Correlated subquery: count of edits on question
+    (
+        select count(*) 
+        from PostHistory ph 
+        where ph.PostId = tq.Id and ph.PostHistoryTypeId in (4,5,6)
+    ) as EditCount,
+    -- Outer join with recursive CTE to get tag hierarchy level 1 tags count
+    (
+        select count(distinct rth.TagName)
+        from RecursiveTagHierarchy rth
+        where position(rth.TagName in coalesce(tq.Tags, '')) > 0 and rth.Level = 1
+    ) as Level1TagCount
+from TopQuestions tq
+left join Users ua on ua.Id = tq.OwnerUserId
+left join AcceptedAnswers ac on ac.QuestionId = tq.Id
+left join QuestionComments qc on qc.PostId = tq.Id
+left join PostLinkSummary pls on pls.PostId = tq.Id
+left join UserBadgeStats ubs on ubs.UserId = tq.OwnerUserId
+where ua.Reputation > 1000 and (tq.Score > 10 or pls.DuplicateLinksCount > 0)
+order by ScoreRank, ua.Reputation desc
+limit 100;

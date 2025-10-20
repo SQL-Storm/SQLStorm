@@ -1,0 +1,262 @@
+WITH
+  tags_exploded AS (
+    SELECT p.Id AS PostId,
+           lower(trim(t)) AS Tag
+    FROM Posts p
+    CROSS JOIN LATERAL (
+      SELECT unnest(string_to_array(substring(p.Tags, 2, greatest(length(p.Tags)-2,0)), '><')) AS t
+    ) s
+    WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL AND p.Tags <> ''
+  ),
+  vote_summary AS (
+    SELECT v.PostId,
+           count(*) FILTER (WHERE v.VoteTypeId = 2) AS upvotes,
+           count(*) FILTER (WHERE v.VoteTypeId = 3) AS downvotes,
+           count(*) FILTER (WHERE v.VoteTypeId = 1) AS accepted_by_originator,
+           count(*) AS total_votes,
+           sum(coalesce(v.BountyAmount,0)) AS total_bounty
+    FROM Votes v
+    GROUP BY v.PostId
+  ),
+  comment_summary AS (
+    SELECT c.PostId,
+           count(*) AS comments,
+           max(coalesce(c.Score,0)) AS max_comment_score,
+           min(c.CreationDate) AS first_comment,
+           max(c.CreationDate) AS last_comment
+    FROM Comments c
+    GROUP BY c.PostId
+  ),
+  link_stats AS (
+    SELECT pl.PostId,
+           sum(case when pl.LinkTypeId = 1 then 1 else 0 end) AS linked_out,
+           sum(case when pl.LinkTypeId = 3 then 1 else 0 end) AS duplicates_out,
+           count(*) AS total_outgoing
+    FROM PostLinks pl
+    GROUP BY pl.PostId
+  ),
+  user_agg AS (
+    SELECT u.Id AS UserId,
+           u.DisplayName,
+           u.Reputation,
+           count(p.Id) FILTER (WHERE p.PostTypeId = 1) AS question_count,
+           count(p.Id) FILTER (WHERE p.PostTypeId = 2) AS answer_count,
+           coalesce(sum(p.Score),0) AS total_post_score,
+           avg(NULLIF(p.Score,0)) FILTER (WHERE p.Score IS NOT NULL) AS avg_nonzero_post_score,
+           max(p.CreationDate) AS last_post_date,
+           row_number() OVER (ORDER BY u.Reputation DESC NULLS LAST) AS rep_rank
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+  ),
+  owner_badges AS (
+    SELECT b.UserId,
+           count(*) FILTER (WHERE b.Class = 1) AS gold,
+           count(*) FILTER (WHERE b.Class = 2) AS silver,
+           count(*) FILTER (WHERE b.Class = 3) AS bronze,
+           sum(case when b.Class = 1 then 3 when b.Class = 2 then 2 else 1 end) AS badge_score,
+           count(*) AS badge_count
+    FROM Badges b
+    GROUP BY b.UserId
+  ),
+  post_tags_agg AS (
+    SELECT p.Id AS PostId,
+           left(coalesce(p.Title,''), 120) AS title_snippet,
+           coalesce(string_agg(DISTINCT te.Tag, ','), '') AS tag_list
+    FROM Posts p
+    LEFT JOIN tags_exploded te ON te.PostId = p.Id
+    GROUP BY p.Id, p.Title
+  ),
+  controversial AS (
+    SELECT p.Id,
+           p.Title,
+           p.PostTypeId,
+           p.OwnerUserId,
+           p.Score,
+           p.CommentCount,
+           coalesce(vs.upvotes,0) AS upvotes,
+           coalesce(vs.downvotes,0) AS downvotes,
+           coalesce(cs.comments,0) AS comments,
+           COALESCE(
+             CASE
+               WHEN (coalesce(vs.upvotes,0) + coalesce(vs.downvotes,0)) = 0 THEN 0
+               ELSE (abs(coalesce(vs.upvotes,0) - coalesce(vs.downvotes,0)) / GREATEST((coalesce(vs.upvotes,0) + coalesce(vs.downvotes,0)),1)) * ln(GREATEST(1 + p.Score + coalesce(cs.comments,0), 2))
+             END
+           ,0) AS controversy_score,
+           (SELECT count(*) FROM PostHistory ph WHERE ph.PostId = p.Id AND ph.PostHistoryTypeId IN (4,5,6)) AS edit_count
+    FROM Posts p
+    LEFT JOIN vote_summary vs ON vs.PostId = p.Id
+    LEFT JOIN comment_summary cs ON cs.PostId = p.Id
+    WHERE p.PostTypeId IN (1,2)
+  ),
+  controversial_ranked AS (
+    SELECT c.*, row_number() OVER (ORDER BY c.controversy_score DESC NULLS LAST, c.comments DESC NULLS LAST) AS rn
+    FROM controversial c
+  ),
+  tag_rankings AS (
+    SELECT te.Tag,
+           p.Id AS PostId,
+           p.Title,
+           p.Score,
+           coalesce(vs.upvotes,0) AS upvotes,
+           coalesce(vs.downvotes,0) AS downvotes,
+           (coalesce(vs.upvotes,0) - coalesce(vs.downvotes,0)) AS net_votes,
+           row_number() OVER (PARTITION BY te.Tag ORDER BY (coalesce(vs.upvotes,0) - coalesce(vs.downvotes,0)) DESC, p.Score DESC NULLS LAST, p.CreationDate DESC NULLS LAST) AS tag_rank
+    FROM tags_exploded te
+    JOIN Posts p ON p.Id = te.PostId
+    LEFT JOIN vote_summary vs ON vs.PostId = p.Id
+  ),
+  recursive_links AS (
+    SELECT pl.PostId, pl.RelatedPostId, 1 AS depth, ARRAY[pl.PostId, pl.RelatedPostId] AS path
+    FROM PostLinks pl
+    WHERE pl.PostId IS NOT NULL
+    UNION ALL
+    SELECT rl.PostId, pl.RelatedPostId, rl.depth + 1, rl.path || pl.RelatedPostId
+    FROM recursive_links rl
+    JOIN PostLinks pl ON pl.PostId = rl.RelatedPostId
+    WHERE rl.depth < 4 AND NOT pl.RelatedPostId = ANY(rl.path)
+  ),
+  link_depth_agg AS (
+    SELECT rl.PostId, max(rl.depth) AS max_depth, count(DISTINCT rl.RelatedPostId) AS reach
+    FROM recursive_links rl
+    GROUP BY rl.PostId
+  ),
+  acceptance AS (
+    SELECT a.Id AS AnswerId,
+           a.ParentId AS QuestionId,
+           a.OwnerUserId AS AnswererId,
+           q.OwnerUserId AS AskerId,
+           q.AcceptedAnswerId,
+           a.Score AS AnswerScore,
+           q.Score AS QuestionScore,
+           a.CreationDate AS AnswerDate,
+           q.CreationDate AS QuestionDate,
+           CASE WHEN q.AcceptedAnswerId = a.Id THEN 1 ELSE 0 END AS IsAccepted,
+           CASE WHEN q.AcceptedAnswerId = a.Id THEN (a.CreationDate - q.CreationDate) ELSE NULL END AS AcceptDelay
+    FROM Posts a
+    JOIN Posts q ON q.Id = a.ParentId AND q.PostTypeId = 1
+    WHERE a.PostTypeId = 2
+  ),
+  answerer_metrics AS (
+    SELECT a.AnswererId,
+           count(*) AS answers_provided,
+           sum(a.AnswerScore) AS total_answer_score,
+           sum(CASE WHEN a.IsAccepted=1 THEN 1 ELSE 0 END) AS accepted_count,
+           avg(extract(epoch from coalesce(a.AcceptDelay, interval '0 seconds'))/3600.0) FILTER (WHERE a.IsAccepted=1) AS avg_accept_delay_hours,
+           rank() OVER (ORDER BY sum(a.AnswerScore) DESC NULLS LAST) AS answerer_rank
+    FROM acceptance a
+    GROUP BY a.AnswererId
+  ),
+  top_10_users_by_rep AS (
+    SELECT u.Id AS UserId, u.DisplayName, u.Reputation
+    FROM Users u
+    ORDER BY u.Reputation DESC NULLS LAST
+    LIMIT 10
+  ),
+  top_10_users_by_accepted_answers AS (
+    SELECT am.AnswererId AS UserId, ua.DisplayName, ua.Reputation, am.accepted_count
+    FROM answerer_metrics am
+    JOIN Users ua ON ua.Id = am.AnswererId
+    ORDER BY am.accepted_count DESC NULLS LAST
+    LIMIT 10
+  ),
+  users_posts_full AS (
+    SELECT u.Id AS UserId, u.DisplayName, p.Id AS PostId, p.PostTypeId, p.Score AS PostScore
+    FROM Users u
+    FULL JOIN Posts p ON p.OwnerUserId = u.Id
+  ),
+  set_ops_intersect AS (
+    SELECT 'USER_INTERSECT' AS kind, 'INTERSECT' AS category, CAST(t.UserId AS bigint) AS id, CAST(t.DisplayName AS text) AS name, CAST(t.Reputation AS numeric) AS metric1, NULL AS metric2, 'top_10 rep ∩ top_10 accepted' AS note
+    FROM top_10_users_by_rep t
+    INTERSECT
+    SELECT 'USER_INTERSECT', 'INTERSECT', CAST(t.UserId AS bigint), CAST(t.DisplayName AS text), CAST(t.Reputation AS numeric), NULL, 'top_10 rep ∩ top_10 accepted'
+    FROM top_10_users_by_accepted_answers t
+  ),
+  set_ops_except AS (
+    SELECT 'USER_EXCEPT' AS kind, 'EXCEPT' AS category, CAST(t.UserId AS bigint) AS id, CAST(t.DisplayName AS text) AS name, CAST(t.Reputation AS numeric) AS metric1, NULL AS metric2, 'top_10 rep \\ top_10 accepted' AS note
+    FROM top_10_users_by_rep t
+    EXCEPT
+    SELECT 'USER_EXCEPT', 'EXCEPT', CAST(t.UserId AS bigint), CAST(t.DisplayName AS text), CAST(t.Reputation AS numeric), NULL, 'top_10 rep \\ top_10 accepted'
+    FROM top_10_users_by_accepted_answers t
+  )
+SELECT kind, category, id, name, metric1, metric2, note
+FROM (
+  SELECT
+    'TAG_TOP' AS kind,
+    CAST(tr.Tag AS text) AS category,
+    CAST(tr.PostId AS bigint) AS id,
+    left(coalesce(tr.Title, ''), 120) AS name,
+    CAST(tr.net_votes AS numeric) AS metric1,
+    CAST(tr.Score AS numeric) AS metric2,
+    concat('rank=', tr.tag_rank, ';ownerId=', coalesce(CAST(p.OwnerUserId AS text),'[null]'), ';tags=', coalesce(pt.tag_list,'')) AS note
+  FROM tag_rankings tr
+  JOIN Posts p ON p.Id = tr.PostId
+  LEFT JOIN post_tags_agg pt ON pt.PostId = p.Id
+  WHERE tr.tag_rank <= 3
+
+  UNION ALL
+
+  SELECT
+    'CONTROVERSIAL' AS kind,
+    NULL AS category,
+    CAST(c.Id AS bigint) AS id,
+    left(coalesce(c.Title,''),120) AS name,
+    CAST(c.controversy_score AS numeric) AS metric1,
+    CAST(c.edit_count AS numeric) AS metric2,
+    concat('up=', c.upvotes, ';down=', c.downvotes, ';comments=', c.comments) AS note
+  FROM controversial_ranked c
+  WHERE c.rn <= 50 AND c.controversy_score > 0
+
+  UNION ALL
+
+  SELECT
+    'ORPHANS' AS kind,
+    CASE WHEN upf.PostId IS NULL THEN 'user_no_posts' ELSE 'post_no_user' END AS category,
+    CAST(coalesce(upf.PostId, upf.UserId) AS bigint) AS id,
+    coalesce(upf.DisplayName, '[deleted]') AS name,
+    CAST(upf.PostScore AS numeric) AS metric1,
+    NULL AS metric2,
+    concat('UserId=', coalesce(CAST(upf.UserId AS text),'NULL'), ';PostId=', coalesce(CAST(upf.PostId AS text),'NULL')) AS note
+  FROM users_posts_full upf
+  WHERE (upf.PostId IS NULL OR upf.UserId IS NULL)
+
+  UNION ALL
+
+  SELECT
+    'ENGAGED' AS kind,
+    pt.tag_list AS category,
+    CAST(p.Id AS bigint) AS id,
+    left(coalesce(p.Title, p.Body, ''), 120) AS name,
+    CAST((ln(coalesce(p.ViewCount,0)+1) * (coalesce(p.Score,0) + 1) + sqrt(coalesce(cs.comments,0)+1) * 2 + coalesce(vs.total_votes,0)) AS numeric) AS metric1,
+    CAST(coalesce(ob.badge_score,0) AS numeric) AS metric2,
+    concat('owner=', coalesce(u.DisplayName,'[deleted]'), ';views=', coalesce(p.ViewCount,0), ';answers=', coalesce(p.AnswerCount,0)) AS note
+  FROM Posts p
+  LEFT JOIN vote_summary vs ON vs.PostId = p.Id
+  LEFT JOIN comment_summary cs ON cs.PostId = p.Id
+  LEFT JOIN post_tags_agg pt ON pt.PostId = p.Id
+  LEFT JOIN Users u ON u.Id = p.OwnerUserId
+  LEFT JOIN owner_badges ob ON ob.UserId = u.Id
+  WHERE coalesce(p.ViewCount,0) > 1000 AND p.Score IS NOT NULL
+
+  UNION ALL
+
+  SELECT kind, category, id, name, metric1, metric2, note FROM set_ops_intersect
+
+  UNION ALL
+
+  SELECT kind, category, id, name, metric1, metric2, note FROM set_ops_except
+
+  UNION ALL
+
+  SELECT
+    'LINK_NET' AS kind,
+    NULL AS category,
+    CAST(lda.PostId AS bigint) AS id,
+    NULL AS name,
+    CAST(lda.reach AS numeric) AS metric1,
+    CAST(lda.max_depth AS numeric) AS metric2,
+    concat('unique_related=', lda.reach, ';max_depth=', lda.max_depth) AS note
+  FROM link_depth_agg lda
+  WHERE lda.reach > 10
+) t
+ORDER BY kind, metric1 DESC NULLS LAST, id;

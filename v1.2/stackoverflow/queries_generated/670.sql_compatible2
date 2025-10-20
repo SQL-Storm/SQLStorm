@@ -1,0 +1,207 @@
+with recursive RecursiveTagHierarchy as (
+    select 
+        t.Id,
+        t.TagName,
+        t.Count,
+        coalesce(tw.Body, '') as WikiBody,
+        1 as Level
+    from Tags t
+    left join Posts tw on t.WikiPostId = tw.Id
+    where t.IsModeratorOnly = false and t.IsRequired = false
+
+    union all
+
+    select
+        t2.Id,
+        t2.TagName,
+        t2.Count,
+        coalesce(tw2.Body, '') as WikiBody,
+        r.Level + 1
+    from Tags t2
+    join RecursiveTagHierarchy r on t2.Id = r.Id + 1
+    left join Posts tw2 on t2.WikiPostId = tw2.Id
+    where r.Level < 3
+),
+UserActivitySummary as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        coalesce(pq.QuestionCount, 0) as QuestionCount,
+        coalesce(pa.AnswerCount, 0) as AnswerCount,
+        coalesce(b.BadgeCount, 0) as TotalBadges,
+        coalesce(b.GoldBadges, 0) as GoldBadges,
+        coalesce(b.SilverBadges, 0) as SilverBadges,
+        coalesce(b.BronzeBadges, 0) as BronzeBadges,
+        coalesce(v.UpVotes, 0) as TotalUpVotes,
+        coalesce(v.DownVotes, 0) as TotalDownVotes,
+        row_number() over (order by u.Reputation desc, u.CreationDate asc) as UserRank
+    from Users u
+    left join (
+        select OwnerUserId, count(*) as QuestionCount
+        from Posts
+        where PostTypeId = 1
+        group by OwnerUserId
+    ) pq on u.Id = pq.OwnerUserId
+    left join (
+        select OwnerUserId, count(*) as AnswerCount
+        from Posts
+        where PostTypeId = 2
+        group by OwnerUserId
+    ) pa on u.Id = pa.OwnerUserId
+    left join (
+        select UserId,
+            count(*) as BadgeCount,
+            sum(case when "Class" = 1 then 1 else 0 end) as GoldBadges,
+            sum(case when "Class" = 2 then 1 else 0 end) as SilverBadges,
+            sum(case when "Class" = 3 then 1 else 0 end) as BronzeBadges
+        from Badges
+        group by UserId
+    ) b on u.Id = b.UserId
+    left join (
+        select v.UserId,
+            sum(case when vt.Name = 'UpMod' then 1 else 0 end) as UpVotes,
+            sum(case when vt.Name = 'DownMod' then 1 else 0 end) as DownVotes
+        from Votes v
+        join VoteTypes vt on v.VoteTypeId = vt.Id
+        where v.UserId is not null
+        group by v.UserId
+    ) v on u.Id = v.UserId
+),
+PostEngagement as (
+    select
+        p.Id as PostId,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        p.OwnerUserId,
+        count(distinct c.Id) as CommentCount,
+        max(c.Score) as MaxCommentScore,
+        sum(case when ph.PostHistoryTypeId in (10,11) then 1 else 0 end) as CloseReopenEvents,
+        sum(case when pl.LinkTypeId = 3 then 1 else 0 end) as DuplicateLinks,
+        sum(case when vt.Name = 'Favorite' then 1 else 0 end) as FavoriteCount,
+        sum(case when vt.Name = 'UpMod' then 1 else 0 end) as UpVotes,
+        sum(case when vt.Name = 'DownMod' then 1 else 0 end) as DownVotes
+    from Posts p
+    left join Comments c on p.Id = c.PostId
+    left join PostHistory ph on p.Id = ph.PostId
+    left join PostLinks pl on p.Id = pl.PostId
+    left join Votes v on p.Id = v.PostId
+    left join VoteTypes vt on v.VoteTypeId = vt.Id
+    where p.PostTypeId in (1,2)
+    group by p.Id, p.Title, p.CreationDate, p.Score, p.ViewCount, p.Tags, p.OwnerUserId
+),
+RankedPosts as (
+    select
+        pe.PostId,
+        pe.Title,
+        pe.CreationDate,
+        pe.Score,
+        pe.ViewCount,
+        pe.Tags,
+        pe.OwnerUserId,
+        pe.CommentCount,
+        pe.MaxCommentScore,
+        pe.CloseReopenEvents,
+        pe.DuplicateLinks,
+        pe.FavoriteCount,
+        pe.UpVotes,
+        pe.DownVotes,
+        uas.DisplayName as OwnerName,
+        uas.Reputation as OwnerReputation,
+        dense_rank() over (partition by pe.OwnerUserId order by pe.Score desc, pe.ViewCount desc) as OwnerPostRank,
+        lag(pe.Score) over (partition by pe.OwnerUserId order by pe.CreationDate) as PrevPostScore,
+        lead(pe.Score) over (partition by pe.OwnerUserId order by pe.CreationDate) as NextPostScore,
+        case
+            when pe.Score > coalesce(lag(pe.Score) over (partition by pe.OwnerUserId order by pe.CreationDate), 0) then 'Improved'
+            when pe.Score < coalesce(lag(pe.Score) over (partition by pe.OwnerUserId order by pe.CreationDate), 0) then 'Declined'
+            else 'Stable'
+        end as ScoreTrend
+    from PostEngagement pe
+    left join UserActivitySummary uas on pe.OwnerUserId = uas.UserId
+),
+HighImpactPosts as (
+    select
+        rp.PostId,
+        rp.Title,
+        rp.CreationDate,
+        rp.Score,
+        rp.ViewCount,
+        rp.Tags,
+        rp.OwnerUserId,
+        rp.CommentCount,
+        rp.MaxCommentScore,
+        rp.CloseReopenEvents,
+        rp.DuplicateLinks,
+        rp.FavoriteCount,
+        rp.UpVotes,
+        rp.DownVotes,
+        (coalesce(rp.UpVotes, 0) - coalesce(rp.DownVotes, 0)) as NetVotes,
+        (case when rp.Score + 1 = 0 then null else (coalesce(rp.ViewCount, 0) / (rp.Score + 1)) end) as ViewsPerScore,
+        (coalesce(rp.CommentCount, 0) + coalesce(rp.FavoriteCount, 0)) as EngagementScore,
+        case when rp.CloseReopenEvents > 0 then 1 else 0 end as HasCloseReopenHistory
+    from RankedPosts rp
+    where rp.Score >= 10 and rp.ViewCount >= 1000
+),
+FinalSelection as (
+    select
+        hip.PostId,
+        hip.Title,
+        hip.CreationDate,
+        hip.Score,
+        hip.ViewCount,
+        hip.Tags,
+        hip.OwnerUserId,
+        hip.OwnerName,
+        hip.OwnerReputation,
+        hip.NetVotes,
+        hip.ViewsPerScore,
+        hip.EngagementScore,
+        hip.HasCloseReopenHistory,
+        rth.TagName,
+        rth.WikiBody
+    from HighImpactPosts hip
+    left join RecursiveTagHierarchy rth on position('<' || rth.TagName || '>' in hip.Tags) > 0
+    where hip.HasCloseReopenHistory = 0
+    order by hip.EngagementScore desc, hip.ViewCount desc
+    limit 50
+)
+select
+    fs.PostId,
+    fs.Title,
+    fs.CreationDate,
+    fs.Score,
+    fs.ViewCount,
+    fs.Tags,
+    fs.OwnerUserId,
+    fs.OwnerName,
+    fs.OwnerReputation,
+    fs.NetVotes,
+    round(cast(fs.ViewsPerScore as numeric), 2) as ViewsPerScore,
+    fs.EngagementScore,
+    fs.TagName,
+    substring(fs.WikiBody from 1 for 200) as TagWikiExcerpt
+from FinalSelection fs
+union
+select
+    u.UserId * -1 as PostId,
+    'User Summary: ' || u.DisplayName as Title,
+    u.CreationDate,
+    u.Reputation as Score,
+    null as ViewCount,
+    null as Tags,
+    u.UserId as OwnerUserId,
+    u.DisplayName as OwnerName,
+    u.Reputation as OwnerReputation,
+    u.QuestionCount - u.AnswerCount as NetVotes,
+    null as ViewsPerScore,
+    u.TotalBadges as EngagementScore,
+    null as TagName,
+    null as TagWikiExcerpt
+from UserActivitySummary u
+where u.UserRank <= 10
+order by Score desc, CreationDate asc
+limit 60;

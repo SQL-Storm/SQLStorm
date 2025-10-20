@@ -1,0 +1,95 @@
+WITH recent_complex_posts AS (
+  SELECT 
+    p.Id,
+    p.Title,
+    p.PostTypeId,
+    p.Score,
+    p.ViewCount,
+    u.DisplayName AS OwnerName,
+    (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id) AS CommentTotal,
+    (
+      SELECT string_agg(DISTINCT tag, ', ')
+      FROM (
+        SELECT unnest(string_to_array(substring(p.Tags FROM 2 FOR char_length(p.Tags)-2), '><')) AS tag
+      ) t
+    ) AS TagList,
+    ABS(p.Score * LOG(GREATEST(1, p.ViewCount))) + COALESCE(p.FavoriteCount, 0) * 3 AS composite_score,
+    view_counts.ev_moving_avg,
+    post_window.LastScoreRank,
+    reg_rank,
+    u.Reputation,
+    u.AboutMe,
+    p.CreationDate,
+    soir.posts_owned_count
+  FROM Posts p
+  LEFT JOIN Users u ON p.OwnerUserId = u.Id
+  LEFT JOIN LATERAL (
+    SELECT AVG(p2.Score) AS ev_moving_avg
+    FROM Posts p2 
+    WHERE p2.OwnerUserId = p.OwnerUserId 
+      AND p2.CreationDate BETWEEN p.CreationDate - INTERVAL '7 days' AND p.CreationDate
+  ) view_counts ON true
+  LEFT JOIN LATERAL (
+    SELECT RANK() OVER (
+      ORDER BY p.Score DESC, p.ViewCount DESC, u.Reputation DESC
+    ) AS LastScoreRank
+  ) post_window ON true
+  LEFT JOIN LATERAL (
+    SELECT DENSE_RANK() OVER (
+      PARTITION BY COALESCE(u.Location, 'UNKNOWN')
+      ORDER BY p.Score DESC, p.ViewCount DESC
+    ) AS reg_rank
+  ) reg_rank_lateral ON true
+  LEFT JOIN (
+    SELECT u2.Id, COUNT(*) AS posts_owned_count
+    FROM Users u2
+    JOIN Posts pp ON pp.OwnerUserId = u2.Id
+    WHERE pp.PostTypeId = 1
+    GROUP BY u2.Id
+  ) soir ON soir.Id = u.Id 
+  WHERE p.CreationDate > CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 month'
+    AND (p.PostTypeId = 1 OR p.PostTypeId = 2)
+),
+UserRankInvestment AS (
+  SELECT 
+    u.Id AS UserId,
+    COUNT(p.Id) AS total_posts,
+    AVG(p.Score) AS avg_post_score
+  FROM Users u
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+  GROUP BY u.Id
+),
+closed_reason_stats AS (
+  SELECT
+    p.Id,
+    p.ClosedReason,
+    COUNT(c.Id) AS reason_count
+  FROM Posts p
+  LEFT JOIN Comments c ON c.PostId = p.Id
+  WHERE p.ClosedReason IS NOT NULL
+  GROUP BY p.Id, p.ClosedReason
+)
+SELECT
+  rcp.Id,
+  rcp.Title,
+  rcp.PostTypeId,
+  rcp.Score,
+  rcp.ViewCount,
+  rcp.OwnerName,
+  rcp.CommentTotal,
+  rcp.TagList,
+  rcp.composite_score,
+  rcp.ev_moving_avg,
+  rcp.LastScoreRank,
+  rcp.reg_rank,
+  rcp.Reputation,
+  rcp.AboutMe,
+  rcp.CreationDate,
+  rcp.posts_owned_count,
+  uri.total_posts,
+  uri.avg_post_score,
+  crs.ClosedReason,
+  crs.reason_count
+FROM recent_complex_posts rcp
+LEFT JOIN UserRankInvestment uri ON uri.UserId = rcp.OwnerName::text = rcp.OwnerName AND uri.UserId = rcp.posts_owned_count * 0 + uri.UserId
+LEFT JOIN closed_reason_stats crs ON crs.Id = rcp.Id;

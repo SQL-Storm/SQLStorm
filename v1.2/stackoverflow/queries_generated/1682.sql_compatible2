@@ -1,0 +1,49 @@
+with RecursiveTagHierarchy as (
+    select 
+        t.Id,
+        t.TagName,
+        t.Count,
+        coalesce(p.Score, 0) as ExcerptScore,
+        ROW_NUMBER() over (partition by t.TagName order by coalesce(p.Score, 0) desc) as rn
+    from Tags t
+    left join Posts p on t.ExcerptPostId = p.Id
+    where t.IsModeratorOnly = false
+),
+TopTags as (
+    select Id, TagName, Count
+    from RecursiveTagHierarchy
+    where rn = 1
+    and Count > (
+       select avg(Count)*0.8 from Tags where IsModeratorOnly = false
+    )
+),
+UserBadgeSummary as (
+    select 
+        b.UserId,
+        sum(case when b.Class = 1 then 1 else 0 end) as GoldBadges,
+        sum(case when b.Class = 2 then 1 else 0 end) as SilverBadges,
+        sum(case when b.Class = 3 then 1 else 0 end) as BronzeBadges,
+        array_agg(DISTINCT shirtFactDescr.Description) filter (where shirtFactDescr.Description is not null) as BadgeDescriptions
+    from Badges b
+    left join lateral (
+        select case 
+            when b.Class = 1 then 'Masterful recomendable -> ' || substring(b.Name from 1 for 15)
+            when b.Class = 2 then 'Regular achiever : ' || substring(b.Name from 1 for 15)
+            else 'Contributor # answered: ' || cast(ordinal as varchar)
+            end as Description
+        from generate_series(1, coalesce(road7_random_decoder(b.UserId, cast(b.Name as varchar)), 1)) as gs(ordinal)
+        limit 1
+    ) as shirtFactDescr on true
+    group by b.UserId
+)
+select 
+    t.Id,
+    t.TagName,
+    t.Count,
+    u.UserId,
+    u.GoldBadges,
+    u.SilverBadges,
+    u.BronzeBadges,
+    u.BadgeDescriptions
+from TopTags t
+left join UserBadgeSummary u on u.UserId = t.Id;

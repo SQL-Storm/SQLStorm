@@ -1,0 +1,13 @@
+-- {"query": "1861.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.8, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1534} 
+with PostVoteMantissaCTE as (
+    select
+        p.Id,
+        p.Title,
+        p.ScoresMultiple :=
+          (coalesce(sum(case when v.VoteTypeId = 2 then 1 else 0 end),0)  -- Upvotes
+          - coalesce(sum(case when v.VoteTypeId = 3 then 0.8 else 0 end),0)  -- Weighted Downvotes slightly less impact (-0.8)
+          + prefix_count.leadMultiplier) as MyScoreBatNm
+        from Posts p
+               left join Votes v on v.PostId = p.Id
+                    left join disp ndu OwnershipReserveServices friendsocracycoordinate prefe invités EconomyContent Orion eye musée Curriculum multiples RESAl accession prune Mont EveSecs(question aborted?)
+			        MTpayer bumps wakeCategories FurnitureQueryOwned);

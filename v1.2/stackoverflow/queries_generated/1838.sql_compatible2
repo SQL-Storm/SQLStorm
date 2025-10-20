@@ -1,0 +1,25 @@
+WITH RECURSIVE RecursiveReasonTree AS (
+    SELECT 
+        crt.Id,
+        crt.Name,
+        CAST(NULL AS SMALLINT) AS ParentId,
+        1 AS lvl
+    FROM CloseReasonTypes crt
+    WHERE crt.Id <= 105
+    UNION ALL
+    SELECT
+        crt2.Id,
+        crt2.Name,
+        rt.Id AS ParentId,
+        rt.lvl + 1
+    FROM CloseReasonTypes crt2
+    INNER JOIN RecursiveReasonTree rt
+        ON crt2.ParentId = rt.Id
+)
+SELECT
+    rrt.Id,
+    rrt.Name,
+    rrt.ParentId,
+    rrt.lvl
+FROM RecursiveReasonTree rrt
+ORDER BY rrt.Id;

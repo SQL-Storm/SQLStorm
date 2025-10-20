@@ -1,0 +1,45 @@
+WITH RECURSIVE RecursiveSubQuestions AS (
+    SELECT 
+        p.Id,
+        p.Title,
+        p.OwnerUserId,
+        p.CreationDate, 
+        p.Tags,
+        p.Score,
+        p.ViewCount,
+        CASE WHEN p.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END AS HasAcceptedAnswer,
+        u.Reputation,
+        (array_length(string_to_array(coalesce(p.Tags, ''), ','), 1) - 2) AS TagCount0
+    FROM Posts p
+    LEFT JOIN Users u ON u.Id = p.OwnerUserId
+    WHERE p.PostTypeId = 1
+
+    UNION ALL
+
+    SELECT
+        child.Id,
+        child.Title,
+        child.OwnerUserId,
+        child.CreationDate,
+        child.Tags,
+        child.Score,
+        child.ViewCount,
+        CASE WHEN child.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END AS HasAcceptedAnswer,
+        latest.Reputation,
+        ds.TagCount
+    FROM RecursiveSubQuestions latest
+    JOIN Posts child ON child.ParentId = latest.Id
+    LEFT JOIN Sub ds ON ds.Id = child.Id
+)
+SELECT
+    Id,
+    Title,
+    OwnerUserId,
+    CreationDate,
+    Tags,
+    Score,
+    ViewCount,
+    HasAcceptedAnswer,
+    Reputation,
+    TagCount0
+FROM RecursiveSubQuestions;

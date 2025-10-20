@@ -1,0 +1,245 @@
+with RecursiveUserActivity as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionCount,
+        count(distinct p.Id) filter (where p.PostTypeId = 2) as AnswerCount,
+        count(distinct c.Id) as CommentCount,
+        count(distinct b.Id) as BadgeCount,
+        row_number() over (order by u.Reputation desc, u.LastAccessDate desc) as UserRank
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Comments c on c.UserId = u.Id
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate
+),
+TopUsers as (
+    select UserId, DisplayName, Reputation, QuestionCount, AnswerCount, CommentCount, BadgeCount, UserRank
+    from RecursiveUserActivity
+    where UserRank <= 100
+),
+PostScores as (
+    select
+        p.Id as PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        p.AcceptedAnswerId,
+        p.ParentId,
+        coalesce(v.UpVotes,0) as UpVotes,
+        coalesce(v.DownVotes,0) as DownVotes,
+        case when p.PostTypeId = 1 then p.AnswerCount else null end as AnswerCount,
+        row_number() over (partition by p.PostTypeId order by p.Score desc, p.ViewCount desc) as PostRank
+    from Posts p
+    left join (
+        select
+            PostId,
+            sum(case when VoteTypeId = 2 then 1 else 0 end) as UpVotes,
+            sum(case when VoteTypeId = 3 then 1 else 0 end) as DownVotes
+        from Votes
+        group by PostId
+    ) v on v.PostId = p.Id
+    where p.CreationDate >= cast(cast('2024-10-01' as date) as timestamp) - interval '1 year'
+),
+TopQuestions as (
+    select *
+    from PostScores
+    where PostTypeId = 1 and PostRank <= 50
+),
+AcceptedAnswers as (
+    select
+        a.Id as AnswerId,
+        a.ParentId as QuestionId,
+        a.Score as AnswerScore,
+        a.OwnerUserId as AnswerOwnerUserId,
+        a.CreationDate as AnswerCreationDate,
+        u.DisplayName as AnswerOwnerName,
+        a.ViewCount as AnswerViewCount
+    from Posts a
+    inner join Users u on u.Id = a.OwnerUserId
+    where a.PostTypeId = 2 and a.Id in (select AcceptedAnswerId from TopQuestions where AcceptedAnswerId is not null)
+),
+QuestionAnswerStats as (
+    select
+        q.PostId as QuestionId,
+        q.Score as QuestionScore,
+        q.ViewCount as QuestionViewCount,
+        q.Tags,
+        q.AnswerCount,
+        aa.AnswerId,
+        aa.AnswerScore,
+        aa.AnswerOwnerUserId,
+        aa.AnswerOwnerName,
+        aa.AnswerCreationDate,
+        aa.AnswerViewCount,
+        extract(epoch from (aa.AnswerCreationDate - q.CreationDate))/3600.0 as HoursToAccept,
+        substring(q.Tags from '<([^>]+)>') as FirstTag,
+        q.CreationDate as QuestionCreationDate
+    from TopQuestions q
+    left join AcceptedAnswers aa on aa.QuestionId = q.PostId
+    group by q.PostId, q.Score, q.ViewCount, q.Tags, q.AnswerCount, aa.AnswerId, aa.AnswerScore, aa.AnswerOwnerUserId, aa.AnswerOwnerName, aa.AnswerCreationDate, aa.AnswerViewCount, q.CreationDate
+),
+UserBadgeSummary as (
+    select
+        b.UserId,
+        sum(case when b.Class = 1 then 1 else 0 end) as GoldBadges,
+        sum(case when b.Class = 2 then 1 else 0 end) as SilverBadges,
+        sum(case when b.Class = 3 then 1 else 0 end) as BronzeBadges,
+        count(*) as TotalBadges
+    from Badges b
+    group by b.UserId
+),
+UserActivityWithBadges as (
+    select
+        r.UserId,
+        r.DisplayName,
+        r.Reputation,
+        r.QuestionCount,
+        r.AnswerCount,
+        r.CommentCount,
+        coalesce(ub.GoldBadges,0) as GoldBadges,
+        coalesce(ub.SilverBadges,0) as SilverBadges,
+        coalesce(ub.BronzeBadges,0) as BronzeBadges,
+        coalesce(ub.TotalBadges,0) as TotalBadges
+    from RecursiveUserActivity r
+    left join UserBadgeSummary ub on ub.UserId = r.UserId
+),
+QuestionsWithCloseInfo as (
+    select
+        q.Id as PostId,
+        q.Title,
+        q.CreationDate,
+        q.Score,
+        q.ViewCount,
+        q.Tags,
+        crt.Name as CloseReason,
+        ph.CreationDate as CloseDate
+    from Posts q
+    left join PostHistory ph on ph.PostId = q.Id and ph.PostHistoryTypeId = 10
+    left join CloseReasonTypes crt on crt.Id = cast(ph.Comment as integer)
+    where q.PostTypeId = 1
+    group by q.Id, q.Title, q.CreationDate, q.Score, q.ViewCount, q.Tags, crt.Name, ph.CreationDate
+),
+DuplicateLinks as (
+    select
+        pl.PostId as DuplicatePostId,
+        pl.RelatedPostId as OriginalPostId,
+        p1.Title as DuplicateTitle,
+        p2.Title as OriginalTitle,
+        pl.CreationDate as LinkCreationDate
+    from PostLinks pl
+    inner join Posts p1 on p1.Id = pl.PostId
+    inner join Posts p2 on p2.Id = pl.RelatedPostId
+    where pl.LinkTypeId = 3
+    group by pl.PostId, pl.RelatedPostId, p1.Title, p2.Title, pl.CreationDate
+),
+UserCommentActivity as (
+    select
+        c.UserId,
+        count(*) as TotalComments,
+        count(distinct c.PostId) as DistinctPostsCommented,
+        max(c.CreationDate) as LastCommentDate,
+        min(c.CreationDate) as FirstCommentDate
+    from Comments c
+    group by c.UserId
+),
+UserEngagement as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        ua.QuestionCount,
+        ua.AnswerCount,
+        ua.CommentCount,
+        ua.BadgeCount,
+        coalesce(uca.TotalComments,0) as TotalComments,
+        coalesce(uca.DistinctPostsCommented,0) as DistinctPostsCommented,
+        coalesce(uca.LastCommentDate, timestamp '1970-01-01') as LastCommentDate,
+        coalesce(uca.FirstCommentDate, timestamp '1970-01-01') as FirstCommentDate,
+        (coalesce(ua.QuestionCount,0) * 5 + coalesce(ua.AnswerCount,0) * 3 + coalesce(ua.CommentCount,0) * 1 + coalesce(ua.BadgeCount,0) * 2 + coalesce(uca.TotalComments,0) * 1) as EngagementScore
+    from Users u
+    left join RecursiveUserActivity ua on ua.UserId = u.Id
+    left join UserCommentActivity uca on uca.UserId = u.Id
+    group by u.Id, u.DisplayName, ua.QuestionCount, ua.AnswerCount, ua.CommentCount, ua.BadgeCount, uca.TotalComments, uca.DistinctPostsCommented, uca.LastCommentDate, uca.FirstCommentDate
+),
+RankedUserEngagement as (
+    select
+        ue.UserId,
+        ue.DisplayName,
+        ue.QuestionCount,
+        ue.AnswerCount,
+        ue.CommentCount,
+        ue.BadgeCount,
+        ue.TotalComments,
+        ue.DistinctPostsCommented,
+        ue.LastCommentDate,
+        ue.FirstCommentDate,
+        ue.EngagementScore,
+        rank() over (order by ue.EngagementScore desc, ue.LastCommentDate desc) as EngagementRank
+    from UserEngagement ue
+),
+FinalOutput as (
+    select
+        qas.QuestionId,
+        qas.FirstTag,
+        qas.QuestionScore,
+        qas.QuestionViewCount,
+        qas.AnswerCount,
+        qas.AnswerId,
+        qas.AnswerScore,
+        qas.AnswerOwnerUserId,
+        qas.AnswerOwnerName,
+        qas.HoursToAccept,
+        uab.GoldBadges,
+        uab.SilverBadges,
+        uab.BronzeBadges,
+        uab.TotalBadges,
+        rue.EngagementScore,
+        rue.EngagementRank,
+        dq.DuplicatePostId,
+        dq.OriginalPostId,
+        dq.DuplicateTitle,
+        dq.OriginalTitle,
+        dq.LinkCreationDate,
+        qc.CloseReason,
+        qc.CloseDate
+    from QuestionAnswerStats qas
+    left join UserActivityWithBadges uab on uab.UserId = qas.AnswerOwnerUserId
+    left join RankedUserEngagement rue on rue.UserId = qas.AnswerOwnerUserId
+    left join DuplicateLinks dq on dq.DuplicatePostId = qas.QuestionId
+    left join QuestionsWithCloseInfo qc on qc.PostId = qas.QuestionId
+    where qas.AnswerId is not null
+    group by qas.QuestionId, qas.FirstTag, qas.QuestionScore, qas.QuestionViewCount, qas.AnswerCount, qas.AnswerId, qas.AnswerScore, qas.AnswerOwnerUserId, qas.AnswerOwnerName, qas.HoursToAccept, uab.GoldBadges, uab.SilverBadges, uab.BronzeBadges, uab.TotalBadges, rue.EngagementScore, rue.EngagementRank, dq.DuplicatePostId, dq.OriginalPostId, dq.DuplicateTitle, dq.OriginalTitle, dq.LinkCreationDate, qc.CloseReason, qc.CloseDate
+)
+select
+    QuestionId,
+    coalesce(FirstTag, 'N/A') as FirstTag,
+    QuestionScore,
+    QuestionViewCount,
+    AnswerCount,
+    AnswerId,
+    AnswerScore,
+    AnswerOwnerUserId,
+    coalesce(AnswerOwnerName, 'Unknown') as AnswerOwnerName,
+    round(cast(HoursToAccept as numeric),2) as HoursToAccept,
+    GoldBadges,
+    SilverBadges,
+    BronzeBadges,
+    TotalBadges,
+    EngagementScore,
+    EngagementRank,
+    DuplicatePostId,
+    OriginalPostId,
+    DuplicateTitle,
+    OriginalTitle,
+    LinkCreationDate,
+    CloseReason,
+    CloseDate
+from FinalOutput
+order by EngagementScore desc, QuestionScore desc
+limit 100;

@@ -1,0 +1,130 @@
+WITH RECURSIVE RecursiveTagHierarchy AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        t.IsModeratorOnly,
+        t.IsRequired,
+        1 AS Level,
+        ARRAY[t.Id] AS Path
+    FROM Tags t
+    WHERE t.IsRequired = false
+
+    UNION ALL
+
+    SELECT
+        t2.Id,
+        t2.TagName,
+        t2.Count,
+        t2.ExcerptPostId,
+        t2.WikiPostId,
+        t2.IsModeratorOnly,
+        t2.IsRequired,
+        r.Level + 1,
+        r.Path || t2.Id
+    FROM Tags t2
+    JOIN RecursiveTagHierarchy r ON t2.Count < r.Count AND NOT t2.Id = ANY(r.Path)
+    WHERE t2.IsRequired = false AND r.Level < 5
+),
+
+UserBadgeCounts AS (
+    SELECT
+        b.UserId,
+        b.Class,
+        COUNT(*) AS BadgeCount
+    FROM Badges b
+    GROUP BY b.UserId, b.Class
+),
+
+QuestionAnswerStats AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.OwnerUserId,
+        q.Title,
+        q.CreationDate AS QuestionCreation,
+        q.Score AS QuestionScore,
+        q.ViewCount,
+        q.Tags,
+        COUNT(a.Id) FILTER (WHERE a.Id IS NOT NULL) AS AnswerCount,
+        COUNT(DISTINCT c.Id) FILTER (WHERE c.Id IS NOT NULL) AS CommentCount,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotesSum,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotesSum,
+        MAX(a.Score) AS MaxAnswerScore,
+        AVG(a.Score) AS AvgAnswerScore,
+        BOOL_OR(a.OwnerUserId IS NULL) AS HasAnonymousAnswerers,
+        ARRAY_AGG(DISTINCT split_part(split_part(q.Tags, '><', gs.idx), '><', 1)) AS IndividualTags
+    FROM Posts q
+    LEFT JOIN Posts a ON a.ParentId = q.Id AND a.PostTypeId = 2
+    LEFT JOIN Comments c ON c.PostId = q.Id
+    LEFT JOIN Votes v ON v.PostId = q.Id
+    CROSS JOIN LATERAL generate_series(1, GREATEST(length(q.Tags) - length(replace(q.Tags, '><', '')) + 1, 0)) gs(idx)
+    WHERE q.PostTypeId = 1
+    GROUP BY q.Id, q.OwnerUserId, q.Title, q.CreationDate, q.Score, q.ViewCount, q.Tags
+),
+
+RankedQuestions AS (
+    SELECT
+        *,
+        dense_rank() OVER (PARTITION BY date_trunc('month', QuestionCreation) ORDER BY QuestionScore DESC, AnswerCount DESC) AS MonthlyRank,
+        row_number() OVER (PARTITION BY OwnerUserId ORDER BY QuestionCreation DESC) AS UserRecentQuestionRank
+    FROM QuestionAnswerStats
+),
+
+CloseReasonStats AS (
+    SELECT
+        pht.Comment AS CloseReasonId,
+        crt.Name AS CloseReasonName,
+        COUNT(DISTINCT pht.PostId) AS ClosedPostsCount
+    FROM PostHistory pht
+    JOIN CloseReasonTypes crt ON CAST(crt.Id AS text) = pht.Comment
+    WHERE pht.PostHistoryTypeId = 10
+    GROUP BY pht.Comment, crt.Name
+)
+
+SELECT
+    rq.QuestionId,
+    rq.Title,
+    rq.QuestionCreation,
+    rq.QuestionScore,
+    rq.ViewCount,
+    rq.AnswerCount,
+    rq.CommentCount,
+    rq.UpVotesSum,
+    rq.DownVotesSum,
+    rq.MaxAnswerScore,
+    ROUND(CAST(rq.AvgAnswerScore AS numeric), 2) AS AvgAnswerScore,
+    rq.HasAnonymousAnswerers,
+    ubc_gold.BadgeCount AS GoldBadges,
+    ubc_silver.BadgeCount AS SilverBadges,
+    ubc_bronze.BadgeCount AS BronzeBadges,
+    string_agg(DISTINCT rt.TagName, ', ') AS RelatedTagsHierarchy,
+    crs.CloseReasonName,
+    crs.ClosedPostsCount,
+    rank() OVER (ORDER BY rq.QuestionScore DESC, rq.ViewCount DESC) AS GlobalQuestionRank
+FROM RankedQuestions rq
+LEFT JOIN UserBadgeCounts ubc_gold ON ubc_gold.UserId = rq.OwnerUserId AND ubc_gold.Class = 1
+LEFT JOIN UserBadgeCounts ubc_silver ON ubc_silver.UserId = rq.OwnerUserId AND ubc_silver.Class = 2
+LEFT JOIN UserBadgeCounts ubc_bronze ON ubc_bronze.UserId = rq.OwnerUserId AND ubc_bronze.Class = 3
+LEFT JOIN RecursiveTagHierarchy rt ON rt.TagName = ANY(string_to_array(replace(replace(rq.Tags, '<', ''), '>', ''), ' '))
+LEFT JOIN (
+    SELECT DISTINCT ON (pht.PostId) pht.PostId, pht.Comment, crt.Name
+    FROM PostHistory pht
+    JOIN CloseReasonTypes crt ON CAST(crt.Id AS text) = pht.Comment
+    WHERE pht.PostHistoryTypeId = 10
+    ORDER BY pht.PostId, pht.CreationDate DESC
+) cr ON cr.PostId = rq.QuestionId
+LEFT JOIN CloseReasonStats crs ON crs.CloseReasonId = cr.Comment
+WHERE rq.MonthlyRank <= 10
+  AND rq.UserRecentQuestionRank <= 5
+  AND rq.AnswerCount > 0
+  AND (rq.UpVotesSum - rq.DownVotesSum) > 5
+GROUP BY
+    rq.QuestionId, rq.Title, rq.QuestionCreation, rq.QuestionScore, rq.ViewCount,
+    rq.AnswerCount, rq.CommentCount, rq.UpVotesSum, rq.DownVotesSum,
+    rq.MaxAnswerScore, rq.AvgAnswerScore, rq.HasAnonymousAnswerers,
+    ubc_gold.BadgeCount, ubc_silver.BadgeCount, ubc_bronze.BadgeCount,
+    crs.CloseReasonName, crs.ClosedPostsCount
+ORDER BY GlobalQuestionRank
+LIMIT 100;

@@ -1,0 +1,260 @@
+WITH
+post_tags AS (
+  SELECT
+    p.Id AS post_id,
+    p.PostTypeId,
+    p.OwnerUserId,
+    p.Score,
+    p.CreationDate,
+    p.ParentId,
+    p.AcceptedAnswerId,
+    p.Title,
+    p.ViewCount,
+    lower(trim(t.tag)) AS tag
+  FROM Posts p
+  LEFT JOIN LATERAL (
+    SELECT unnest(string_to_array(substring(COALESCE(p.Tags, ''), 2, greatest(length(COALESCE(p.Tags,'')) - 2, 0)), '><')) AS tag
+  ) t ON (p.PostTypeId = 1 AND p.Tags IS NOT NULL AND length(p.Tags) > 2)
+  WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL AND length(p.Tags) > 2
+
+  UNION ALL
+
+  SELECT
+    a.Id AS post_id,
+    a.PostTypeId,
+    a.OwnerUserId,
+    a.Score,
+    a.CreationDate,
+    a.ParentId,
+    NULL AS AcceptedAnswerId,
+    NULL AS Title,
+    NULL AS ViewCount,
+    lower(trim(t.tag)) AS tag
+  FROM Posts a
+  JOIN Posts q ON a.ParentId = q.Id
+  LEFT JOIN LATERAL (
+    SELECT unnest(string_to_array(substring(COALESCE(q.Tags, ''), 2, greatest(length(COALESCE(q.Tags,'')) - 2, 0)), '><')) AS tag
+  ) t ON (q.Tags IS NOT NULL AND length(q.Tags) > 2)
+  WHERE a.PostTypeId = 2
+),
+
+votes_agg_per_post AS (
+  SELECT PostId,
+         SUM(CASE WHEN VoteTypeId = 2 THEN 1 ELSE 0 END) AS upvotes,
+         SUM(CASE WHEN VoteTypeId = 3 THEN 1 ELSE 0 END) AS downvotes,
+         SUM(CASE WHEN VoteTypeId = 5 THEN 1 ELSE 0 END) AS favorites,
+         SUM(CASE WHEN VoteTypeId IN (4,12) THEN 1 ELSE 0 END) AS flags
+  FROM Votes
+  GROUP BY PostId
+),
+
+tag_post_agg AS (
+  SELECT
+    pt.tag,
+    COUNT(DISTINCT CASE WHEN pt.PostTypeId = 1 THEN pt.post_id END) AS questions,
+    COUNT(DISTINCT CASE WHEN pt.PostTypeId = 2 THEN pt.post_id END) AS answers,
+    SUM(CASE WHEN pt.PostTypeId = 1 THEN COALESCE(pt.Score, 0) ELSE 0 END) AS total_q_score,
+    SUM(CASE WHEN pt.PostTypeId = 2 THEN COALESCE(pt.Score, 0) ELSE 0 END) AS total_a_score,
+    AVG(CASE WHEN pt.PostTypeId = 1 THEN pt.Score END) AS avg_q_score,
+    AVG(CASE WHEN pt.PostTypeId = 2 THEN pt.Score END) AS avg_a_score,
+    COUNT(DISTINCT pt.OwnerUserId) FILTER (WHERE pt.OwnerUserId IS NOT NULL) AS distinct_contributors,
+    SUM(COALESCE(v.upvotes, 0)) AS total_upvotes,
+    SUM(COALESCE(v.downvotes, 0)) AS total_downvotes,
+    MAX(pt.CreationDate) AS last_post_date,
+    MIN(pt.CreationDate) AS first_post_date,
+    SUM(CASE WHEN pt.PostTypeId = 1 AND pt.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END) AS questions_with_accepted
+  FROM post_tags pt
+  LEFT JOIN votes_agg_per_post v ON pt.post_id = v.PostId
+  GROUP BY pt.tag
+),
+
+tag_top_posts AS (
+  SELECT
+    pt.tag,
+    pt.post_id,
+    pt.PostTypeId,
+    pt.Score,
+    pt.Title,
+    pt.ViewCount,
+    ROW_NUMBER() OVER (PARTITION BY pt.tag ORDER BY COALESCE(pt.Score, -999999) DESC, COALESCE(pt.ViewCount,0) DESC) AS rn
+  FROM post_tags pt
+),
+
+top_posts AS (
+  SELECT tag, post_id AS id, PostTypeId, Score, Title, ViewCount
+  FROM tag_top_posts
+  WHERE rn <= 3
+),
+
+duplicate_links_by_tag AS (
+  SELECT lower(trim(t.tag)) AS tag, COUNT(*) AS duplicate_links
+  FROM PostLinks pl
+  JOIN Posts p ON pl.PostId = p.Id
+  LEFT JOIN LATERAL (
+    SELECT unnest(string_to_array(substring(COALESCE(p.Tags, ''), 2, greatest(length(COALESCE(p.Tags,'')) - 2, 0)), '><')) AS tag
+  ) t ON (p.Tags IS NOT NULL AND length(p.Tags) > 2)
+  WHERE pl.LinkTypeId = 3
+  GROUP BY lower(trim(t.tag))
+),
+
+post_history_by_tag AS (
+  SELECT lower(trim(t.tag)) AS tag,
+         COUNT(ph.Id) AS edit_count,
+         MAX(ph.CreationDate) AS last_edit,
+         COUNT(DISTINCT ph.UserId) AS distinct_editors
+  FROM PostHistory ph
+  JOIN Posts p ON ph.PostId = p.Id
+  LEFT JOIN LATERAL (
+    SELECT unnest(string_to_array(substring(COALESCE(p.Tags, ''), 2, greatest(length(COALESCE(p.Tags,'')) - 2, 0)), '><')) AS tag
+  ) t ON (p.Tags IS NOT NULL AND length(p.Tags) > 2)
+  GROUP BY lower(trim(t.tag))
+),
+
+tag_user_scores AS (
+  SELECT pt.tag AS tag, pt.OwnerUserId AS user_id,
+         COUNT(*) AS contributions,
+         SUM(COALESCE(pt.Score, 0)) AS sum_scores,
+         SUM(COALESCE(v.upvotes, 0)) AS upvotes,
+         SUM(COALESCE(v.downvotes, 0)) AS downvotes,
+         SUM(COALESCE(v.upvotes, 0) - COALESCE(v.downvotes, 0)) AS net_votes
+  FROM post_tags pt
+  LEFT JOIN votes_agg_per_post v ON pt.post_id = v.PostId
+  WHERE pt.OwnerUserId IS NOT NULL
+  GROUP BY pt.tag, pt.OwnerUserId
+),
+
+tag_top_contributors AS (
+  SELECT t.tag, t.user_id, t.contributions, t.sum_scores, t.upvotes, t.downvotes, t.net_votes,
+         ROW_NUMBER() OVER (PARTITION BY t.tag ORDER BY t.net_votes DESC NULLS LAST, t.contributions DESC NULLS LAST) AS rn
+  FROM tag_user_scores t
+),
+
+missing_tags AS (
+  SELECT DISTINCT pt.tag AS tag_name FROM post_tags pt
+  EXCEPT
+  SELECT lower(trim(TagName)) FROM Tags
+),
+
+accepted_time_by_tag AS (
+  SELECT lower(trim(t.tag)) AS tag,
+         AVG(EXTRACT(EPOCH FROM (ans.CreationDate - q.CreationDate)) / 3600.0) AS avg_hours_to_accept,
+         percentile_disc(0.5) WITHIN GROUP (ORDER BY EXTRACT(EPOCH FROM (ans.CreationDate - q.CreationDate)) / 3600.0) AS median_hours_to_accept
+  FROM Posts q
+  JOIN Posts ans ON ans.Id = q.AcceptedAnswerId
+  LEFT JOIN LATERAL (
+    SELECT unnest(string_to_array(substring(COALESCE(q.Tags, ''), 2, greatest(length(COALESCE(q.Tags,'')) - 2, 0)), '><')) AS tag
+  ) t ON (q.Tags IS NOT NULL AND length(q.Tags) > 2)
+  WHERE q.PostTypeId = 1 AND q.AcceptedAnswerId IS NOT NULL
+  GROUP BY lower(trim(t.tag))
+),
+
+recent_comments_by_tag AS (
+  SELECT lower(trim(pt.tag)) AS tag,
+         MAX(c.CreationDate) AS last_comment_date,
+         COUNT(c.Id) AS comment_count,
+         COUNT(DISTINCT c.UserId) AS distinct_commenters
+  FROM Comments c
+  JOIN post_tags pt ON c.PostId = pt.post_id
+  GROUP BY lower(trim(pt.tag))
+),
+
+badges_by_tag AS (
+  SELECT lower(trim(t.TagName)) AS tag, COUNT(b.Id) AS badge_count
+  FROM Tags t
+  LEFT JOIN Badges b ON b.Name = t.TagName AND b.TagBased = TRUE
+  GROUP BY lower(trim(t.TagName))
+),
+
+tag_summary AS (
+  SELECT
+    lower(trim(a.tag)) AS tag,
+    a.questions,
+    a.answers,
+    a.total_q_score,
+    a.total_a_score,
+    a.avg_q_score,
+    a.avg_a_score,
+    a.distinct_contributors,
+    COALESCE(d.duplicate_links, 0) AS duplicate_links,
+    COALESCE(ph.edit_count, 0) AS edit_count,
+    COALESCE(a.questions_with_accepted, 0) AS questions_with_accepted,
+    CASE WHEN a.questions > 0 THEN round(100.0 * CAST(a.questions_with_accepted AS numeric) / NULLIF(a.questions,0), 2) ELSE NULL END AS pct_questions_accepted,
+    a.total_upvotes,
+    a.total_downvotes,
+    CASE WHEN a.total_upvotes + a.total_downvotes > 0 THEN round(100.0 * CAST(a.total_upvotes AS numeric) / NULLIF(a.total_upvotes + a.total_downvotes,0), 2) ELSE NULL END AS pct_upvotes,
+    LEAST(10.0, GREATEST(0.0, (COALESCE(a.answers,0) * 1.0 / NULLIF(a.questions,0)))) AS answers_per_question_ratio,
+    COALESCE(m.is_missing, 0) AS missing_in_tags_table
+  FROM tag_post_agg a
+  LEFT JOIN duplicate_links_by_tag d ON lower(trim(a.tag)) = d.tag
+  LEFT JOIN post_history_by_tag ph ON lower(trim(a.tag)) = ph.tag
+  LEFT JOIN (SELECT tag_name, CAST(1 AS integer) AS is_missing FROM missing_tags) m ON lower(trim(a.tag)) = m.tag_name
+)
+
+SELECT
+  ts.tag,
+  ts.questions,
+  ts.answers,
+  ts.total_q_score,
+  ts.total_a_score,
+  ts.avg_q_score,
+  ts.avg_a_score,
+  ts.distinct_contributors,
+  ts.duplicate_links,
+  ts.edit_count,
+  ts.questions_with_accepted,
+  ts.pct_questions_accepted,
+  ts.total_upvotes,
+  ts.total_downvotes,
+  ts.pct_upvotes,
+  ts.answers_per_question_ratio,
+  ts.missing_in_tags_table,
+  COALESCE(tc.user_id, NULL) AS top_user_id,
+  u.DisplayName AS top_user_displayname,
+  tc.net_votes AS top_user_net_votes,
+  tc.contributions AS top_user_contributions,
+  COALESCE(at.avg_hours_to_accept, NULL) AS avg_hours_to_accept,
+  COALESCE(at.median_hours_to_accept, NULL) AS median_hours_to_accept,
+  COALESCE(rc.last_comment_date, NULL) AS last_comment_date,
+  COALESCE(rc.comment_count, 0) AS comment_count,
+  COALESCE(bb.badge_count, 0) AS badge_count,
+  COALESCE(tpids.top_post_ids, ARRAY[]::integer[]) AS top_post_ids,
+  recent.recent_count AS recent_q_90d,
+  prev.prev_count AS prev_q_90d,
+  CASE WHEN COALESCE(prev.prev_count,0) = 0 THEN NULL ELSE round(100.0 * CAST((COALESCE(recent.recent_count,0) - COALESCE(prev.prev_count,0)) AS numeric) / NULLIF(prev.prev_count,0), 2) END AS pct_growth_90_vs_prev_90,
+  COALESCE((
+    SELECT SUM(COALESCE(v2.upvotes,0) - COALESCE(v2.downvotes,0))
+    FROM post_tags pt2
+    LEFT JOIN votes_agg_per_post v2 ON pt2.post_id = v2.PostId
+    WHERE pt2.OwnerUserId = tc.user_id AND pt2.tag IS NOT NULL AND pt2.tag <> ts.tag
+  ),0) AS top_user_net_votes_outside_tag,
+  (
+    SELECT ph.Comment
+    FROM PostHistory ph
+    JOIN Posts q ON ph.PostId = q.Id
+    WHERE ph.PostHistoryTypeId = 10 AND lower(trim(q.Tags)) = ts.tag
+    GROUP BY ph.Comment
+    ORDER BY COUNT(*) DESC
+    LIMIT 1
+  ) AS most_common_close_reason,
+  CASE WHEN EXISTS (SELECT 1 FROM Tags t WHERE lower(trim(t.TagName)) = ts.tag) THEN 1 ELSE 0 END AS tag_defined_in_tags_table
+FROM tag_summary ts
+LEFT JOIN tag_top_contributors tc ON tc.tag = ts.tag AND tc.rn = 1
+LEFT JOIN Users u ON u.Id = tc.user_id
+LEFT JOIN accepted_time_by_tag at ON at.tag = ts.tag
+LEFT JOIN recent_comments_by_tag rc ON rc.tag = ts.tag
+LEFT JOIN badges_by_tag bb ON bb.tag = ts.tag
+LEFT JOIN LATERAL ( SELECT array_agg(id ORDER BY Score DESC) AS top_post_ids FROM top_posts WHERE top_posts.tag = ts.tag ) tpids ON true
+LEFT JOIN (
+   SELECT tag, COUNT(*) AS recent_count
+   FROM post_tags
+   WHERE CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '90 days'
+   GROUP BY tag
+) recent ON recent.tag = ts.tag
+LEFT JOIN (
+   SELECT tag, COUNT(*) AS prev_count
+   FROM post_tags
+   WHERE CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '180 days' AND CreationDate < CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '90 days'
+   GROUP BY tag
+) prev ON prev.tag = ts.tag
+ORDER BY ts.answers DESC NULLS LAST, ts.questions DESC NULLS LAST
+LIMIT 100;

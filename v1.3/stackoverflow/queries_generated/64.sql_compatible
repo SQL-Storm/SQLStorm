@@ -1,0 +1,207 @@
+with recursive tag_ancestors(tag, depth) as (
+  select lower(t.TagName), 1
+  from Tags t
+  where t.Count > 100
+  union all
+  select substring(t.TagName from 1 for greatest(1, position('-' in t.TagName)-1))::varchar, depth+1
+  from Tags t
+  join tag_ancestors ta on lower(t.TagName) like ta.tag || '%'
+  where depth < 3 and t.Count between 10 and 10000
+),
+recent_user_activity as (
+  select
+    u.Id as user_id,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    coalesce(u.Location,'(unknown)') as Location,
+    max(p.LastActivityDate) filter (where p.LastActivityDate is not null) as last_post_activity,
+    count(distinct p.Id) filter (where p.PostTypeId = 1) as question_count,
+    count(distinct p.Id) filter (where p.PostTypeId = 2) as answer_count,
+    sum(case when v.VoteTypeId = 2 then 1 when v.VoteTypeId = 3 then -1 else 0 end) as net_votes_on_posts
+  from Users u
+  left join Posts p on p.OwnerUserId = u.Id
+  left join Votes v on v.PostId = p.Id
+  where u.CreationDate < cast('2024-10-01 12:34:56' as timestamp) - interval '30 days'
+  group by u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.Location
+),
+question_complexity as (
+  select
+    q.Id as question_id,
+    q.OwnerUserId,
+    q.Title,
+    q.CreationDate,
+    q.Score,
+    q.ViewCount,
+    q.AnswerCount,
+    length(coalesce(q.Body,'')) as body_len,
+    coalesce(array_length(string_to_array(substring(q.Tags from 2 for char_length(q.Tags)-2), '><'),1),0) as tag_count,
+    (select count(distinct a.OwnerUserId) from Posts a where a.ParentId = q.Id and a.PostTypeId = 2 and a.OwnerUserId is not null) as distinct_answerers,
+    (select extract(epoch from min(a.CreationDate) - q.CreationDate) from Posts a where a.ParentId = q.Id and a.PostTypeId = 2 and a.CreationDate > q.CreationDate) as secs_to_first_answer,
+    (select count(*) from Comments c where c.PostId = q.Id) as comment_count,
+    case when q.AcceptedAnswerId is not null then 1 else 0 end as has_accepted
+  from Posts q
+  where q.PostTypeId = 1
+    and q.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '1 year'
+),
+top_tag_stats as (
+  select
+    lower(t.TagName) as tag,
+    t.Count as tag_global_count,
+    coalesce(tp.ExcerptPostId, -1) as excerpt_post_id,
+    coalesce(tp.WikiPostId, -1) as wiki_post_id,
+    rank() over (order by t.Count desc) as tag_rank
+  from Tags t
+  left join TagSynonyms tp on tp.SourceTagName = t.TagName -- ensure tp is defined; adjust join if necessary
+  where t.Count > 0
+),
+linked_post_pairs as (
+  select
+    pl.PostId,
+    pl.RelatedPostId,
+    pl.LinkTypeId,
+    pl.CreationDate,
+    lt.Name as link_type_name
+  from PostLinks pl
+  join LinkTypes lt on lt.Id = pl.LinkTypeId
+  where pl.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '2 years'
+),
+post_hist_edits as (
+  select
+    ph.PostId,
+    ph.UserId,
+    ph.PostHistoryTypeId,
+    ph.CreationDate,
+    ph.Comment,
+    row_number() over (partition by ph.PostId order by ph.CreationDate desc) as rn_desc,
+    count(*) over (partition by ph.PostId) as total_revs
+  from PostHistory ph
+  where ph.PostHistoryTypeId in (4,5,6,24)
+),
+user_badge_agg as (
+  select b.UserId,
+    sum(case when b.Class = 1 then 1 else 0 end) as gold,
+    sum(case when b.Class = 2 then 1 else 0 end) as silver,
+    sum(case when b.Class = 3 then 1 else 0 end) as bronze,
+    count(*) as total_badges,
+    bool_or(b.TagBased = 1) as has_tag_based
+  from Badges b
+  group by b.UserId
+),
+question_enrichment as (
+  select
+    qc.*,
+    coalesce(u.DisplayName, '(deleted)') as owner_name,
+    coalesce(uba.gold,0) as owner_gold,
+    coalesce(uba.silver,0) as owner_silver,
+    coalesce(uba.bronze,0) as owner_bronze,
+    coalesce(qa.total_answers,0) as live_answer_count,
+    coalesce( (select count(*) from Comments c where c.PostId = qc.question_id and c.CreationDate >= qc.CreationDate and c.CreationDate < qc.CreationDate + interval '7 days'), 0) as comments_first_week,
+    unnest(
+      case
+        when qc.tag_count > 0 then
+          string_to_array(
+            substring((select p.Tags from Posts p where p.Id = qc.question_id), 2, greatest(length((select p.Tags from Posts p where p.Id = qc.question_id)) - 2,0)),
+            '><'
+          )
+        else array[]::text[]
+      end
+    ) as single_tag
+  from question_complexity qc
+  left join Users u on u.Id = qc.OwnerUserId
+  left join user_badge_agg uba on uba.UserId = qc.OwnerUserId
+  left join lateral (
+    select count(*) as total_answers
+    from Posts a
+    where a.ParentId = qc.question_id and a.PostTypeId = 2
+  ) qa on true
+),
+answer_scoring as (
+  select
+    a.Id as answer_id,
+    a.ParentId as question_id,
+    a.OwnerUserId as answer_owner,
+    a.CreationDate,
+    a.Score,
+    a.Body,
+    length(coalesce(a.Body,'')) as body_len,
+    rank() over (partition by a.ParentId order by a.Score desc, a.CreationDate asc) as answer_rank_by_score,
+    dense_rank() over (partition by a.ParentId order by a.CreationDate asc) as answer_rank_by_time,
+    case when exists (select 1 from Votes v where v.PostId = a.Id and v.VoteTypeId = 1) then 1 else 0 end as accepted_flag
+  from Posts a
+  where a.PostTypeId = 2
+),
+complex_user_summary as (
+  select
+    rua.user_id,
+    rua.DisplayName,
+    rua.Reputation,
+    rua.CreationDate,
+    rua.Location,
+    rua.last_post_activity,
+    rua.question_count,
+    rua.answer_count,
+    rua.net_votes_on_posts,
+    coalesce(ub.total_badges,0) as total_badges,
+    coalesce(ub.has_tag_based, false) as has_tag_badges,
+    coalesce(sum(case when v.VoteTypeId = 2 then 1 when v.VoteTypeId = 3 then -1 else 0 end),0) as votes_cast_score,
+    max(case when p.PostTypeId = 1 then p.Score else null end) as max_question_score,
+    max(case when p.PostTypeId = 2 then p.Score else null end) as max_answer_score,
+    (select count(*) from Posts px where px.OwnerUserId = rua.user_id and px.PostTypeId = 1 and px.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '90 days') as recent_questions
+  from recent_user_activity rua
+  left join Badges ub on ub.UserId = rua.user_id
+  left join Votes v on v.UserId = rua.user_id
+  left join Posts p on p.OwnerUserId = rua.user_id
+  group by rua.user_id, rua.DisplayName, rua.Reputation, rua.CreationDate, rua.Location, rua.last_post_activity, rua.question_count, rua.answer_count, rua.net_votes_on_posts, ub.total_badges, ub.has_tag_based
+)
+select
+  q.question_id,
+  q.Title,
+  q.CreationDate,
+  q.Score,
+  q.ViewCount,
+  q.tag_count,
+  q.single_tag,
+  q.distinct_answerers,
+  q.secs_to_first_answer,
+  q.has_accepted,
+  q.body_len,
+  q.comment_count,
+  q.owner_name,
+  q.owner_gold,
+  q.owner_silver,
+  q.owner_bronze,
+  q.comments_first_week,
+  coalesce(a.best_answer_id, -1) as best_answer_id,
+  coalesce(a.best_answer_score, 0) as best_answer_score,
+  coalesce(a.fastest_answer_secs, null) as fastest_answer_secs,
+  cu.DisplayName as owner_displayname_from_summary,
+  cu.Reputation as owner_reputation,
+  cu.total_badges as owner_total_badges,
+  cu.has_tag_badges,
+  (
+   coalesce(q.tag_count,0) * 2
+   + coalesce(q.distinct_answerers,0) * 5
+   + coalesce(q.comment_count,0) * 1.5
+   + case when q.has_accepted = 1 then -10 else 0 end
+   + greatest(coalesce(q.body_len,0)/500,0)
+   - least(coalesce(q.secs_to_first_answer, 86400)/3600, 24)
+  ) as complexity_score,
+  md5(coalesce(q.Title,'') || '|' || coalesce(q.owner_name,'') || '|' || coalesce(q.single_tag,'') || '|' || coalesce(cu.DisplayName,'')) as row_fingerprint
+from question_enrichment q
+left join lateral (
+  select
+    a1.Id as best_answer_id,
+    a1.Score as best_answer_score,
+    extract(epoch from min(a1.CreationDate) - q.CreationDate) as fastest_answer_secs
+  from Posts a1
+  where a1.ParentId = q.question_id and a1.PostTypeId = 2
+  order by a1.Score desc nulls last, a1.CreationDate asc
+  limit 1
+) a on true
+left join complex_user_summary cu on cu.user_id = q.OwnerUserId
+where q.tag_count >= 1
+  and (q.Score > 0 or q.ViewCount > 100)
+  and (q.single_tag is not null and length(q.single_tag) > 0)
+order by complexity_score desc, q.CreationDate desc
+limit 250;

@@ -1,0 +1,211 @@
+with recursive RecursiveTagCounts as (
+    select
+        t.Id as TagId,
+        t.TagName,
+        coalesce(p.ViewCount, 0) as TotalViewCount,
+        coalesce(p.Score, 0) as TotalScore,
+        1 as Depth
+    from Tags t
+    left join Posts p on p.Id = t.ExcerptPostId and p.PostTypeId = 1
+    where t.TagName is not null
+    union all
+    select
+        rtc.TagId,
+        rtc.TagName,
+        rtc.TotalViewCount + coalesce(p.ViewCount, 0) as TotalViewCount,
+        rtc.TotalScore + coalesce(p.Score, 0) as TotalScore,
+        rtc.Depth + 1 as Depth
+    from RecursiveTagCounts rtc
+    join Posts p on p.Tags like ('%' || '<' || rtc.TagName || '>' || '%') and p.PostTypeId = 1
+    where rtc.Depth < 3
+),
+UserBadgeStats as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(distinct b.Id) as BadgeCount,
+        sum(case when b.Class = 1 then 1 else 0 end) as GoldBadges,
+        sum(case when b.Class = 2 then 1 else 0 end) as SilverBadges,
+        sum(case when b.Class = 3 then 1 else 0 end) as BronzeBadges,
+        max(b.Date) as LastBadgeDate
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.DisplayName
+),
+PostAnswerRanks as (
+    select
+        p.Id,
+        p.ParentId,
+        p.Score,
+        p.CreationDate,
+        row_number() over (partition by p.ParentId order by p.Score desc, p.CreationDate asc) as AnswerRank
+    from Posts p
+    where p.PostTypeId = 2
+),
+QuestionStats as (
+    select
+        q.Id,
+        q.Title,
+        q.OwnerUserId,
+        q.CreationDate,
+        q.Score,
+        q.ViewCount,
+        q.Tags,
+        q.AcceptedAnswerId,
+        (select count(*) from Comments c where c.PostId = q.Id and (c.UserId is not null or c.UserDisplayName is not null)) as CommentCountTotal,
+        (select count(*) from Votes v where v.PostId = q.Id and v.VoteTypeId = 2) as UpVotesCount,
+        (select count(*) from Votes v where v.PostId = q.Id and v.VoteTypeId = 3) as DownVotesCount,
+        (select count(*) from Posts a where a.ParentId = q.Id and a.PostTypeId = 2) as AnswerCount,
+        (select max(p.CreationDate) from Posts p where p.ParentId = q.Id and p.PostTypeId = 2) as LastAnswerDate
+    from Posts q
+    where q.PostTypeId = 1 and q.ClosedDate is null
+),
+DetailedPostHistory as (
+    select
+        ph.Id,
+        ph.PostId,
+        ph.PostHistoryTypeId,
+        p.PostTypeId,
+        ph.CreationDate,
+        ph.UserId,
+        ph.Comment,
+        ph.Text,
+        ph.UserDisplayName,
+        row_number() over (partition by ph.PostId order by ph.CreationDate desc) as HistoryRank
+    from PostHistory ph
+    inner join Posts p on p.Id = ph.PostId
+),
+FilteredPostHistory as (
+    select *
+    from DetailedPostHistory
+    where HistoryRank = 1 and (PostHistoryTypeId in (10, 12, 20) or PostHistoryTypeId between 50 and 55)
+),
+CombinedUsersAndBadges as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        coalesce(ubs.BadgeCount,0) as BadgeCount,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        u.Location,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        u.AccountId,
+        case when u.Location is null then 'Unknown' else u.Location end as NormalizedLocation,
+        u.WebsiteUrl,
+        u.EmailHash
+    from Users u
+    left join UserBadgeStats ubs on ubs.UserId = u.Id
+),
+QuestionAnswerDetails as (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        q.CreationDate as QuestionCreation,
+        q.Score as QuestionScore,
+        q.ViewCount as QuestionViews,
+        q.Tags,
+        a.Id as AnswerId,
+        a.Score as AnswerScore,
+        a.CreationDate as AnswerCreation,
+        rank() over (partition by q.Id order by a.Score desc, a.CreationDate asc) as AnswerRank
+    from Posts q
+    left join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+    where q.PostTypeId = 1
+),
+TitleLengthStats as (
+    select
+        char_length(coalesce(Title, '')) as TitleLength,
+        avg(Score) as AvgScore,
+        count(*) as QuestionCount
+    from Posts
+    where PostTypeId = 1
+    group by char_length(coalesce(Title, ''))
+),
+UserCommentActivity as (
+    select
+        c.UserId,
+        u.DisplayName,
+        count(*) as CommentCount,
+        max(c.CreationDate) as LastCommentDate,
+        min(c.CreationDate) as FirstCommentDate
+    from Comments c
+    inner join Users u on u.Id = c.UserId
+    group by c.UserId, u.DisplayName
+)
+select
+    q.Id as QuestionId,
+    q.Title,
+    q.Tags,
+    q.Score as QuestionScore,
+    q.ViewCount as QuestionViews,
+    q.AnswerCount,
+    q.CommentCountTotal,
+    q.AcceptedAnswerId,
+    u.DisplayName as OwnerUser,
+    u.BadgeCount,
+    u.GoldBadges,
+    u.SilverBadges,
+    u.BronzeBadges,
+    u.Reputation,
+    u.Location,
+    coalesce(a.AnswerScore, 0) as TopAnswerScore,
+    a.AnswerCreation,
+    a.AnswerRank,
+    ph.PostHistoryTypeId,
+    pht.Name as PostHistoryTypeName,
+    ph.CreationDate as LastPostHistoryDate,
+    ph.Comment as PostHistoryComment,
+    case
+        when q.Score > 100 then 'Hot'
+        when q.Score between 50 and 100 then 'Trending'
+        else 'Normal'
+    end as PopularityStatus,
+    case
+        when q.Tags like '%<sql>%' then 1 else 0
+    end as HasSQLTag
+from QuestionStats q
+left join CombinedUsersAndBadges u on u.UserId = q.OwnerUserId
+left join QuestionAnswerDetails a on a.QuestionId = q.Id and a.AnswerRank = 1
+left join FilteredPostHistory ph on ph.PostId = q.Id
+left join PostHistoryTypes pht on pht.Id = ph.PostHistoryTypeId
+where q.Score > (
+      select percentile_cont(0.75) within group (order by Score) from Posts where PostTypeId = 1
+  )
+  and (q.Tags like '%<sql>%' or q.Tags like '%<performance>%')
+union
+select
+    q.Id as QuestionId,
+    q.Title,
+    q.Tags,
+    q.Score as QuestionScore,
+    q.ViewCount as QuestionViews,
+    q.AnswerCount,
+    q.CommentCountTotal,
+    q.AcceptedAnswerId,
+    u.DisplayName as OwnerUser,
+    u.BadgeCount,
+    u.GoldBadges,
+    u.SilverBadges,
+    u.BronzeBadges,
+    u.Reputation,
+    u.Location,
+    0 as TopAnswerScore,
+    NULL as AnswerCreation,
+    NULL::integer as AnswerRank,
+    NULL::integer as PostHistoryTypeId,
+    NULL::text as PostHistoryTypeName,
+    NULL::timestamp as LastPostHistoryDate,
+    NULL::text as PostHistoryComment,
+    'Normal' as PopularityStatus,
+    0 as HasSQLTag
+from QuestionStats q
+left join CombinedUsersAndBadges u on u.UserId = q.OwnerUserId
+where q.Score <= (
+      select percentile_cont(0.75) within group (order by Score) from Posts where PostTypeId = 1
+  )
+  and (q.Tags is null or (q.Tags not like '%<sql>%' and q.Tags not like '%<performance>%'))
+order by QuestionScore desc, QuestionViews desc, LastPostHistoryDate desc
+limit 100;

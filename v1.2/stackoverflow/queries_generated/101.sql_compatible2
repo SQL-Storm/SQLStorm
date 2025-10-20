@@ -1,0 +1,244 @@
+with RecursiveTagCounts as (
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        coalesce(p.AnswerCount, 0) as AnswerCount,
+        coalesce(p.ViewCount, 0) as ViewCount,
+        coalesce(p.Score, 0) as Score,
+        row_number() over (partition by t.Id order by p.CreationDate desc nulls last) as rn
+    from Tags t
+    left join Posts p on p.Id = t.ExcerptPostId and p.PostTypeId = 1
+),
+UserBadgeStats as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(b.Id) filter (where b.Class = 1) as GoldBadges,
+        count(b.Id) filter (where b.Class = 2) as SilverBadges,
+        count(b.Id) filter (where b.Class = 3) as BronzeBadges,
+        max(b.Date) as LastBadgeDate
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.DisplayName
+),
+PostVoteAggregates as (
+    select
+        p.Id as PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        count(v.Id) filter (where v.VoteTypeId = 2) as UpVotes,
+        count(v.Id) filter (where v.VoteTypeId = 3) as DownVotes,
+        sum(case when v.VoteTypeId = 8 then v.BountyAmount else 0 end) as TotalBounty
+    from Posts p
+    left join Votes v on v.PostId = p.Id
+    group by p.Id, p.PostTypeId, p.OwnerUserId
+),
+TopQuestions as (
+    select
+        p.Id,
+        p.Title,
+        p.Tags,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.OwnerUserId,
+        p.AcceptedAnswerId,
+        p.LastActivityDate,
+        p.ClosedDate,
+        p.FavoriteCount,
+        p.CommentCount,
+        p.ContentLicense,
+        pva.UpVotes,
+        pva.DownVotes,
+        pva.TotalBounty,
+        u.DisplayName as OwnerName,
+        u.Reputation as OwnerReputation,
+        u.CreationDate as OwnerCreationDate,
+        u.Location as OwnerLocation,
+        u.AboutMe as OwnerAboutMe,
+        u.Views as OwnerViews,
+        u.UpVotes as OwnerUpVotes,
+        u.DownVotes as OwnerDownVotes,
+        u.ProfileImageUrl as OwnerProfileImageUrl,
+        u.EmailHash as OwnerEmailHash,
+        u.AccountId as OwnerAccountId
+    from Posts p
+    left join PostVoteAggregates pva on pva.PostId = p.Id
+    left join Users u on u.Id = p.OwnerUserId
+    where p.PostTypeId = 1
+      and p.CreationDate >= cast('2024-10-01' as date) - interval '1 year'
+      and p.Score > 0
+),
+AcceptedAnswerDetails as (
+    select
+        a.Id,
+        a.ParentId,
+        a.Score as AnswerScore,
+        a.CreationDate as AnswerCreationDate,
+        u.DisplayName as AnswerOwnerName,
+        u.Reputation as AnswerOwnerReputation
+    from Posts a
+    left join Users u on u.Id = a.OwnerUserId
+    where a.PostTypeId = 2
+),
+QuestionWithAcceptedAnswer as (
+    select
+        tq.*,
+        aa.AnswerScore,
+        aa.AnswerCreationDate,
+        aa.AnswerOwnerName,
+        aa.AnswerOwnerReputation
+    from TopQuestions tq
+    left join AcceptedAnswerDetails aa on aa.Id = tq.AcceptedAnswerId
+),
+RankedComments as (
+    select
+        c.PostId,
+        c.Id as CommentId,
+        c.Text,
+        c.CreationDate,
+        c.UserDisplayName,
+        c.UserId,
+        row_number() over (partition by c.PostId order by c.Score desc nulls last, c.CreationDate asc) as CommentRank
+    from Comments c
+),
+TopComments as (
+    select
+        rc.PostId,
+        rc.CommentId,
+        rc.Text,
+        rc.CreationDate,
+        rc.UserDisplayName,
+        rc.UserId
+    from RankedComments rc
+    where rc.CommentRank <= 3
+),
+PostLinkSummary as (
+    select
+        pl.PostId,
+        count(distinct case when lt.Name = 'Linked' then pl.RelatedPostId end) as LinkedCount,
+        count(distinct case when lt.Name = 'Duplicate' then pl.RelatedPostId end) as DuplicateCount
+    from PostLinks pl
+    left join LinkTypes lt on lt.Id = pl.LinkTypeId
+    group by pl.PostId
+),
+CloseReasonSummary as (
+    select
+        ph.PostId,
+        crt.Name as CloseReasonName,
+        ph.CreationDate as CloseDate
+    from PostHistory ph
+    left join CloseReasonTypes crt on crt.Id = cast(ph.Comment as integer)
+    where ph.PostHistoryTypeId = 10
+),
+UserActivityWindow as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(p.Id) filter (where p.PostTypeId = 1) as QuestionsPosted,
+        count(p.Id) filter (where p.PostTypeId = 2) as AnswersPosted,
+        count(c.Id) as CommentsMade,
+        count(b.Id) as BadgesEarned,
+        row_number() over (partition by u.Id order by u.LastAccessDate desc) as rn,
+        u.LastAccessDate
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Comments c on c.UserId = u.Id
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.DisplayName, u.LastAccessDate
+),
+UserActivityRanked as (
+    select UserId, DisplayName, QuestionsPosted, AnswersPosted, CommentsMade, BadgesEarned
+    from UserActivityWindow where rn = 1
+),
+FinalResult as (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        q.Tags,
+        q.CreationDate as QuestionCreationDate,
+        q.Score as QuestionScore,
+        q.ViewCount as QuestionViewCount,
+        q.AnswerCount,
+        q.OwnerUserId,
+        q.OwnerName,
+        q.OwnerReputation,
+        q.OwnerLocation,
+        q.OwnerAboutMe,
+        q.UpVotes as QuestionUpVotes,
+        q.DownVotes as QuestionDownVotes,
+        q.TotalBounty,
+        q.AcceptedAnswerId,
+        q.AnswerScore,
+        q.AnswerCreationDate,
+        q.AnswerOwnerName,
+        q.AnswerOwnerReputation,
+        pl.LinkedCount,
+        pl.DuplicateCount,
+        cr.CloseReasonName,
+        cr.CloseDate,
+        tc.TagName,
+        tc.Count as TagUsageCount,
+        tc.AnswerCount as TagAnswerCount,
+        tc.ViewCount as TagViewCount,
+        tc.Score as TagScore,
+        uc.CommentId as TopCommentId,
+        uc.Text as TopCommentText,
+        uc.CreationDate as TopCommentDate,
+        uc.UserDisplayName as TopCommentUser,
+        ua.QuestionsPosted as OwnerQuestionsPosted,
+        ua.AnswersPosted as OwnerAnswersPosted,
+        ua.CommentsMade as OwnerCommentsMade,
+        ua.BadgesEarned as OwnerBadgesEarned
+    from QuestionWithAcceptedAnswer q
+    left join PostLinkSummary pl on pl.PostId = q.Id
+    left join CloseReasonSummary cr on cr.PostId = q.Id
+    left join RecursiveTagCounts tc on tc.TagName = any(string_to_array(substring(q.Tags from 2 for char_length(q.Tags) - 2), '><'))
+        and tc.rn = 1
+    left join TopComments uc on uc.PostId = q.Id
+    left join UserActivityRanked ua on ua.UserId = q.OwnerUserId
+    where q.Score > 5
+)
+select
+    QuestionId,
+    Title,
+    Tags,
+    QuestionCreationDate,
+    QuestionScore,
+    QuestionViewCount,
+    AnswerCount,
+    OwnerUserId,
+    coalesce(OwnerName, 'Anonymous') as OwnerName,
+    OwnerReputation,
+    coalesce(OwnerLocation, 'Unknown') as OwnerLocation,
+    substring(coalesce(OwnerAboutMe, ''), 1, 100) as OwnerAboutSnippet,
+    QuestionUpVotes,
+    QuestionDownVotes,
+    TotalBounty,
+    AcceptedAnswerId,
+    AnswerScore,
+    AnswerCreationDate,
+    coalesce(AnswerOwnerName, 'Anonymous') as AnswerOwnerName,
+    AnswerOwnerReputation,
+    LinkedCount,
+    DuplicateCount,
+    coalesce(CloseReasonName, 'Open') as CloseStatus,
+    CloseDate,
+    TagName,
+    TagUsageCount,
+    TagAnswerCount,
+    TagViewCount,
+    TagScore,
+    TopCommentId,
+    substring(coalesce(TopCommentText, ''), 1, 200) as TopCommentSnippet,
+    TopCommentDate,
+    coalesce(TopCommentUser, 'Anonymous') as TopCommentUser,
+    OwnerQuestionsPosted,
+    OwnerAnswersPosted,
+    OwnerCommentsMade,
+    OwnerBadgesEarned
+from FinalResult
+order by QuestionScore desc, QuestionViewCount desc
+limit 50;

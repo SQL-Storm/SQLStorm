@@ -1,0 +1,74 @@
+WITH Recursive_Users_Activity AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.Location,
+        COALESCE(NULLIF(SUBSTRING(u.AboutMe FROM 'spell:([^<]+)'), ''), 'unknown') AS InterestingSpell,
+        ActivityOrder
+    FROM (
+        SELECT  
+            Users.Id,
+            Users.DisplayName,
+            Users.Reputation,
+            Users.CreationDate,
+            Users.Location,
+            Users.AboutMe,
+            RANK() OVER (
+                PARTITION BY Users.Id
+                ORDER BY GREATEST(
+                    COALESCE(MAX(Posts.ViewCount), 0),
+                    COALESCE(MAX(Comments.Score), 0),
+                    COALESCE(MAX(Badges.Class), 0)
+                ) DESC
+            ) AS ActivityOrder
+        FROM Users 
+        LEFT JOIN Posts ON Posts.OwnerUserId = Users.Id
+        LEFT JOIN Comments ON Comments.UserId = Users.Id
+        LEFT JOIN Badges ON Badges.UserId = Users.Id
+        GROUP BY Users.Id, Users.DisplayName, Users.Reputation, Users.CreationDate, Users.Location, Users.AboutMe
+    ) u
+),
+User_Posts_Detailed AS (
+    SELECT
+        p.Id AS PostId,
+        p.OwnerUserId AS UserId,
+        pt.Name AS PostTypeName,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.ParentId,
+        COALESCE(etxt.Text, p.Title) AS DocumentTitle,
+        tagsarray.Value AS Tag,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS RowAmongUserPosts
+    FROM Posts p
+    LEFT JOIN PostTypes pt ON pt.Id = p.PostTypeId
+    LEFT JOIN PostHistory etxt ON etxt.PostId = p.Id
+    LEFT JOIN (
+        -- Assuming tagsarray is derived from a Tags/PostsTags relationship; adapt as needed for your schema
+        SELECT pt.PostId, t.Value
+        FROM PostTags pt
+        JOIN Tags t ON t.Id = pt.TagId
+    ) tagsarray ON tagsarray.PostId = p.Id
+)
+SELECT
+    r.UserId,
+    r.DisplayName,
+    r.Reputation,
+    r.CreationDate,
+    r.Location,
+    r.InterestingSpell,
+    r.ActivityOrder,
+    up.PostId,
+    up.PostTypeName,
+    up.CreationDate AS PostCreationDate,
+    up.Score AS PostScore,
+    up.ViewCount AS PostViewCount,
+    up.ParentId,
+    up.DocumentTitle,
+    up.Tag,
+    up.RowAmongUserPosts
+FROM Recursive_Users_Activity r
+LEFT JOIN User_Posts_Detailed up ON up.UserId = r.UserId
+ORDER BY r.UserId, up.RowAmongUserPosts;

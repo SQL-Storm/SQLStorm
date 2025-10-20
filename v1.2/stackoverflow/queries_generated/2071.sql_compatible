@@ -1,0 +1,55 @@
+WITH RankedAllPosts AS (
+    SELECT 
+        p.Id,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        owner.Reputation AS OwnerReputation,
+        Rowsago.RankingWeek,
+        p.Tags,
+        FLOOR(
+            EXTRACT(EPOCH FROM (
+                -- Replaced PostgreSQL cast (::float) with standard CAST(... AS DOUBLE PRECISION)
+                CAST( (ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC)) AS DOUBLE PRECISION )
+                / NULLIF(tw.TotalPostsQ, 0)
+            ))
+        ) AS SomeComputedFloor
+    FROM posts p
+    LEFT JOIN users owner ON owner.Id = p.OwnerUserId
+    LEFT JOIN (
+        -- placeholder for Rowsago source; adjust as appropriate
+        SELECT PostId, RankingWeek
+        FROM rowsago
+    ) Rowsago ON Rowsago.PostId = p.Id
+    LEFT JOIN (
+        -- placeholder for tw (total posts per user or quarter); adjust as appropriate
+        SELECT OwnerUserId, TotalPostsQ
+        FROM tw
+    ) tw ON tw.OwnerUserId = p.OwnerUserId
+    WHERE p.Id IS NOT NULL
+)
+SELECT
+    Id,
+    OwnerUserId,
+    PostTypeId,
+    CreationDate,
+    Score,
+    ViewCount,
+    OwnerReputation,
+    RankingWeek,
+    Tags,
+    SomeComputedFloor
+FROM RankedAllPosts
+GROUP BY
+    Id,
+    OwnerUserId,
+    PostTypeId,
+    CreationDate,
+    Score,
+    ViewCount,
+    OwnerReputation,
+    RankingWeek,
+    Tags,
+    SomeComputedFloor;

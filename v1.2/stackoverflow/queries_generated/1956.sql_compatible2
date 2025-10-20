@@ -1,0 +1,19 @@
+WITH PopularUsers AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(buf.sunrise_questions, 0) AS SunriseShiftedHas
+    FROM
+        users u
+    LEFT JOIN
+        buffered_questions buf
+        ON u.Id = buf.user_id
+)
+SELECT
+    Id,
+    DisplayName,
+    Reputation,
+    SunriseShiftedHas
+FROM
+    PopularUsers;

@@ -1,0 +1,137 @@
+WITH RECURSIVE RecursiveTagHierarchy AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        1 AS Level,
+        ARRAY[t.TagName] AS Path
+    FROM Tags t
+    WHERE t.IsRequired = TRUE
+
+    UNION ALL
+
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        r.Level + 1 AS Level,
+        r.Path || t.TagName AS Path
+    FROM Tags t
+    JOIN RecursiveTagHierarchy r ON t.Id <> r.Id AND NOT t.TagName = ANY(r.Path)
+    WHERE t.Count > r.Count / 2
+),
+UserBadgeStats AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(b.Id) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+        COALESCE(SUM(CASE WHEN b.TagBased = TRUE THEN 1 ELSE 0 END), 0) AS TagBasedBadges,
+        ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY MAX(b.Date) DESC NULLS LAST) AS LatestBadgeRank
+    FROM Users u
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id, u.DisplayName
+),
+PostComplexStats AS (
+    SELECT
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Title,
+        p.Tags,
+        p.AcceptedAnswerId,
+        p.ParentId,
+        COUNT(DISTINCT ph.Id) FILTER (WHERE ph.PostHistoryTypeId IN (4,5,6)) AS EditCount,
+        MAX(ph.CreationDate) AS LastEditDate,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes,
+        CASE WHEN p.PostTypeId = 1 THEN
+            (SELECT COUNT(1) FROM Posts ans WHERE ans.ParentId = p.Id AND ans.Score > 0)
+        ELSE NULL END AS PositiveAnswerCount,
+        CASE WHEN p.PostTypeId = 1 THEN
+            (SELECT COUNT(1) FROM PostLinks pl WHERE pl.PostId = p.Id AND pl.LinkTypeId = 3)
+        ELSE NULL END AS DuplicateCount
+    FROM Posts p
+    LEFT JOIN PostHistory ph ON ph.PostId = p.Id
+    LEFT JOIN Comments c ON c.PostId = p.Id
+    LEFT JOIN Votes v ON v.PostId = p.Id
+    GROUP BY p.Id, p.PostTypeId, p.OwnerUserId, p.CreationDate, p.Score, p.ViewCount, p.Title, p.Tags, p.AcceptedAnswerId, p.ParentId
+),
+UserActivityWindow AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.CreationDate,
+        COUNT(*) OVER (
+            PARTITION BY u.Id
+            ORDER BY p.CreationDate
+            RANGE BETWEEN INTERVAL '30 days' PRECEDING AND CURRENT ROW
+        ) AS PostsLast30Days,
+        SUM(CASE WHEN p.Score > 0 THEN 1 ELSE 0 END) OVER (
+            PARTITION BY u.Id
+            ORDER BY p.CreationDate
+            RANGE BETWEEN INTERVAL '30 days' PRECEDING AND CURRENT ROW
+        ) AS PositivePostsLast30Days,
+        ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY p.CreationDate DESC) AS RecentPostRank
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+),
+TopUsersByActivity AS (
+    SELECT
+        ua.UserId,
+        ua.DisplayName,
+        MAX(ua.PostsLast30Days) AS MaxPostsIn30Days,
+        MAX(ua.PositivePostsLast30Days) AS MaxPositivePostsIn30Days
+    FROM UserActivityWindow ua
+    GROUP BY ua.UserId, ua.DisplayName
+    HAVING MAX(ua.PostsLast30Days) > 10
+),
+FinalResult AS (
+    SELECT
+        p.Id AS PostId,
+        p.Title,
+        p.PostTypeId,
+        p.Score,
+        p.ViewCount,
+        p.EditCount,
+        p.CommentCount,
+        p.UpVotes,
+        p.DownVotes,
+        p.PositiveAnswerCount,
+        p.DuplicateCount,
+        u.DisplayName AS OwnerName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        ubs.GoldBadges,
+        ubs.SilverBadges,
+        ubs.BronzeBadges,
+        ubs.TagBasedBadges,
+        tu.MaxPostsIn30Days,
+        tu.MaxPositivePostsIn30Days,
+        array_to_string(string_to_array(COALESCE(p.Tags, ''), '><'), ', ') AS ParsedTags,
+        CASE
+            WHEN p.Score > 100 AND p.ViewCount > 10000 THEN 'Hot'
+            WHEN p.Score BETWEEN 50 AND 100 THEN 'Warm'
+            ELSE 'Cold'
+        END AS PopularityCategory,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC NULLS LAST) AS ScoreRankWithinType
+    FROM PostComplexStats p
+    LEFT JOIN Users u ON u.Id = p.OwnerUserId
+    LEFT JOIN UserBadgeStats ubs ON ubs.UserId = u.Id
+    LEFT JOIN TopUsersByActivity tu ON tu.UserId = u.Id
+    WHERE p.PostTypeId IN (1, 2)
+      AND (p.Score > 10 OR p.ViewCount > 1000)
+      AND (u.Reputation IS NOT NULL AND u.Reputation > 100)
+)
+SELECT *
+FROM FinalResult
+WHERE PopularityCategory = 'Hot'
+ORDER BY ScoreRankWithinType, Score DESC, ViewCount DESC
+LIMIT 100;

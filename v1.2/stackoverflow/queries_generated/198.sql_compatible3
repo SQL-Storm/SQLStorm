@@ -1,0 +1,244 @@
+with recursive RecursiveTagHierarchy as (
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        1 as Level,
+        cast(array[t.TagName] as varchar[]) as Path
+    from Tags t
+    where t.IsModeratorOnly = false and t.IsRequired = false
+    union all
+    select
+        t2.Id,
+        t2.TagName,
+        t2.Count,
+        r.Level + 1,
+        r.Path || t2.TagName
+    from Tags t2
+    join RecursiveTagHierarchy r on t2.Id > r.Id and t2.IsModeratorOnly = false and t2.IsRequired = false
+    where not t2.TagName = any(r.Path)
+      and r.Level < 3
+),
+UserBadgeCounts as (
+    select
+        b.UserId,
+        b.Class,
+        count(*) as BadgeCount
+    from Badges b
+    group by b.UserId, b.Class
+),
+UserActivity as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        coalesce(u.Location, 'Unknown') as Location,
+        coalesce(u.WebsiteUrl, '') as WebsiteUrl,
+        coalesce(u.AboutMe, '') as AboutMe,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        ub.GoldBadges,
+        ub.SilverBadges,
+        ub.BronzeBadges,
+        row_number() over (partition by u.Location order by u.Reputation desc) as RankInLocation
+    from Users u
+    left join (
+        select
+            UserId,
+            max(case when Class = 1 then BadgeCount else 0 end) as GoldBadges,
+            max(case when Class = 2 then BadgeCount else 0 end) as SilverBadges,
+            max(case when Class = 3 then BadgeCount else 0 end) as BronzeBadges
+        from UserBadgeCounts
+        group by UserId
+    ) ub on u.Id = ub.UserId
+),
+PostScoreStats as (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        p.Title,
+        p.AcceptedAnswerId,
+        p.ParentId,
+        dense_rank() over (partition by p.PostTypeId order by p.Score desc) as ScoreRank,
+        count(*) over (partition by p.OwnerUserId, p.PostTypeId) as PostsByUserAndType,
+        avg(p.Score) over (partition by p.OwnerUserId, p.PostTypeId) as AvgScoreByUserAndType
+    from Posts p
+    where p.PostTypeId in (1, 2)
+),
+TopPostsWithComments as (
+    select
+        p.Id as PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        p.OwnerUserId,
+        p.CreationDate,
+        c.CommentCount,
+        coalesce(c.LatestCommentText, '') as LatestCommentText,
+        coalesce(c.LatestCommentDate, cast('1970-01-01' as timestamp)) as LatestCommentDate
+    from PostScoreStats p
+    left join (
+        select
+            PostId,
+            count(*) as CommentCount,
+            max(CreationDate) as LatestCommentDate,
+            substring(max(Text) from 1 for 100) as LatestCommentText
+        from Comments
+        group by PostId
+    ) c on p.Id = c.PostId
+    where p.ScoreRank <= 100
+),
+PostLinksWithTypes as (
+    select
+        pl.PostId,
+        pl.RelatedPostId,
+        lt.Name as LinkTypeName,
+        pl.CreationDate
+    from PostLinks pl
+    join LinkTypes lt on pl.LinkTypeId = lt.Id
+),
+QuestionsWithAcceptedAnswerDetails as (
+    select
+        q.Id as QuestionId,
+        q.Title as QuestionTitle,
+        q.Score as QuestionScore,
+        q.ViewCount as QuestionViews,
+        q.Tags as QuestionTags,
+        a.Id as AnswerId,
+        a.Score as AnswerScore,
+        a.CreationDate as AnswerCreationDate,
+        u.DisplayName as AnswerOwnerName,
+        u.Reputation as AnswerOwnerReputation,
+        q.OwnerUserId as QuestionOwnerUserId
+    from Posts q
+    left join Posts a on q.AcceptedAnswerId = a.Id
+    left join Users u on a.OwnerUserId = u.Id
+    where q.PostTypeId = 1
+),
+QuestionsClosedRecently as (
+    select
+        ph.PostId,
+        ph.CreationDate as CloseDate,
+        crt.Name as CloseReason
+    from PostHistory ph
+    join PostHistoryTypes pht on ph.PostHistoryTypeId = pht.Id
+    left join CloseReasonTypes crt on cast(ph.Comment as integer) = crt.Id
+    where ph.PostHistoryTypeId = 10
+      and ph.CreationDate > cast('2024-10-01' as date) - interval '30 days'
+),
+UserRecentActivity as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        max(p.CreationDate) as LastPostDate,
+        max(ph.CreationDate) as LastPostHistoryDate,
+        max(v.CreationDate) as LastVoteDate
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join PostHistory ph on ph.UserId = u.Id
+    left join Votes v on v.UserId = u.Id
+    group by u.Id, u.DisplayName
+),
+UserEngagement as (
+    select
+        ua.UserId,
+        ua.DisplayName,
+        ua.Reputation,
+        ua.Location,
+        ua.RankInLocation,
+        coalesce(pq.QuestionCount, 0) as QuestionCount,
+        coalesce(pa.AnswerCount, 0) as AnswerCount,
+        coalesce(cmt.CommentCount, 0) as CommentCount,
+        coalesce(vt.UpVotes, 0) as UpVotes,
+        coalesce(vt.DownVotes, 0) as DownVotes,
+        coalesce(bd.GoldBadges, 0) as GoldBadges,
+        coalesce(bd.SilverBadges, 0) as SilverBadges,
+        coalesce(bd.BronzeBadges, 0) as BronzeBadges
+    from UserActivity ua
+    left join (
+        select OwnerUserId, count(*) as QuestionCount
+        from Posts
+        where PostTypeId = 1
+        group by OwnerUserId
+    ) pq on ua.UserId = pq.OwnerUserId
+    left join (
+        select OwnerUserId, count(*) as AnswerCount
+        from Posts
+        where PostTypeId = 2
+        group by OwnerUserId
+    ) pa on ua.UserId = pa.OwnerUserId
+    left join (
+        select UserId, count(*) as CommentCount
+        from Comments
+        group by UserId
+    ) cmt on ua.UserId = cmt.UserId
+    left join (
+        select UserId,
+            sum(case when VoteTypeId = 2 then 1 else 0 end) as UpVotes,
+            sum(case when VoteTypeId = 3 then 1 else 0 end) as DownVotes
+        from Votes
+        group by UserId
+    ) vt on ua.UserId = vt.UserId
+    left join (
+        select UserId,
+            max(case when Class = 1 then BadgeCount else 0 end) as GoldBadges,
+            max(case when Class = 2 then BadgeCount else 0 end) as SilverBadges,
+            max(case when Class = 3 then BadgeCount else 0 end) as BronzeBadges
+        from UserBadgeCounts
+        group by UserId
+    ) bd on ua.UserId = bd.UserId
+)
+select
+    ue.UserId,
+    ue.DisplayName,
+    ue.Reputation,
+    ue.Location,
+    ue.RankInLocation,
+    ue.QuestionCount,
+    ue.AnswerCount,
+    ue.CommentCount,
+    ue.UpVotes,
+    ue.DownVotes,
+    ue.GoldBadges,
+    ue.SilverBadges,
+    ue.BronzeBadges,
+    qwa.QuestionId,
+    qwa.QuestionTitle,
+    qwa.QuestionScore,
+    qwa.QuestionViews,
+    qwa.QuestionTags,
+    qwa.AnswerId,
+    qwa.AnswerScore,
+    qwa.AnswerCreationDate,
+    qwa.AnswerOwnerName,
+    qwa.AnswerOwnerReputation,
+    coalesce(qcr.CloseDate, cast('1970-01-01' as timestamp)) as LastCloseDate,
+    coalesce(qcr.CloseReason, 'N/A') as LastCloseReason,
+    tpl.LinkTypeName,
+    tpl.RelatedPostId,
+    tpl.CreationDate as LinkCreationDate,
+    tth.Level as TagHierarchyLevel,
+    array_to_string(tth.Path, ' > ') as TagHierarchyPath,
+    ts.LatestCommentText,
+    ts.LatestCommentDate
+from UserEngagement ue
+left join QuestionsWithAcceptedAnswerDetails qwa on ue.UserId = qwa.AnswerOwnerReputation and qwa.AnswerOwnerReputation is not null
+left join QuestionsClosedRecently qcr on qwa.QuestionId = qcr.PostId
+left join PostLinksWithTypes tpl on tpl.PostId = qwa.QuestionId
+left join RecursiveTagHierarchy tth on tth.TagName = any(string_to_array(coalesce(qwa.QuestionTags, ''), '><'))
+left join TopPostsWithComments ts on ts.PostId = qwa.QuestionId
+where ue.Reputation > 1000
+  and ue.QuestionCount > 5
+  and ue.AnswerCount > 10
+  and ue.GoldBadges > 0
+order by ue.Reputation desc, ue.QuestionCount desc, ue.AnswerCount desc
+limit 50;

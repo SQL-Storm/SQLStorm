@@ -1,0 +1,193 @@
+WITH
+recent_qs AS (
+  SELECT p.Id AS question_id,
+         p.Title,
+         p.OwnerUserId,
+         u.DisplayName AS OwnerName,
+         COALESCE(p.CreationDate, CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '10 years') AS q_created,
+         COALESCE(p.Score,0) AS q_score,
+         COALESCE(p.ViewCount,0) AS q_views,
+         COALESCE(p.AnswerCount,0) AS q_answers,
+         NULLIF(TRIM(p.Tags), '') AS raw_tags,
+         CASE WHEN p.Tags IS NULL OR p.Tags = '' THEN ARRAY[]::varchar[] 
+              ELSE regexp_split_to_array(substring(p.Tags FROM 2 FOR char_length(p.Tags)-2), E'><') END AS tags
+  FROM Posts p
+  LEFT JOIN Users u ON p.OwnerUserId = u.Id
+  WHERE p.PostTypeId = 1
+    AND p.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '2 years'
+),
+answers_aug AS (
+  SELECT a.Id AS answer_id,
+         a.ParentId AS question_id,
+         a.OwnerUserId,
+         au.DisplayName AS AnswererName,
+         COALESCE(a.Score,0) AS a_score,
+         COALESCE(length(a.Body),0) AS a_body_len,
+         CASE WHEN a.Body ILIKE '%<code>%</code>%' THEN 1 ELSE 0 END AS has_code,
+         a.CreationDate AS a_created,
+         ROW_NUMBER() OVER (PARTITION BY a.ParentId ORDER BY COALESCE(a.Score,0) DESC, a.CreationDate ASC) AS rank_by_score
+  FROM Posts a
+  LEFT JOIN Users au ON a.OwnerUserId = au.Id
+  WHERE a.PostTypeId = 2
+    AND a.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '3 years'
+),
+post_votes AS (
+  SELECT v.PostId,
+         COUNT(*) FILTER (WHERE v.VoteTypeId = 2) AS upvotes,
+         COUNT(*) FILTER (WHERE v.VoteTypeId = 3) AS downvotes,
+         COUNT(*) FILTER (WHERE v.VoteTypeId = 1) AS accepts,
+         SUM(CASE WHEN v.VoteTypeId = 8 OR v.VoteTypeId = 9 THEN COALESCE(v.BountyAmount,0) ELSE 0 END) AS bounty_total,
+         COUNT(DISTINCT v.UserId) FILTER (WHERE v.UserId IS NOT NULL) AS distinct_voters
+  FROM Votes v
+  WHERE v.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '5 years'
+  GROUP BY v.PostId
+),
+recent_comments AS (
+  SELECT c.PostId,
+         COUNT(*) AS comment_count,
+         SUM(CASE WHEN c.Text ILIKE '%thanks%' OR c.Text ILIKE '%thank you%' THEN 1 ELSE 0 END) AS thanks_count,
+         SUM(CASE WHEN c.Text ILIKE '%bug%' OR c.Text ILIKE '%error%' OR c.Text ILIKE '%fail%' THEN 1 ELSE 0 END) AS issue_mentions,
+         MAX(c.CreationDate) AS last_comment
+  FROM Comments c
+  WHERE c.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '2 years'
+  GROUP BY c.PostId
+),
+user_reputation AS (
+  SELECT u.Id AS user_id,
+         u.Reputation,
+         COALESCE(SUM(CASE WHEN b.Class = 1 THEN 50 WHEN b.Class = 2 THEN 20 WHEN b.Class = 3 THEN 5 ELSE 0 END),0) AS badge_rep_equiv,
+         COUNT(b.Id) FILTER (WHERE b.Date >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 year') AS badges_last_year,
+         MIN(u.CreationDate) AS user_created
+  FROM Users u
+  LEFT JOIN Badges b ON b.UserId = u.Id
+  GROUP BY u.Id, u.Reputation
+),
+question_links AS (
+  SELECT pl.PostId AS from_q, pl.RelatedPostId AS to_q, lt.Name AS link_type, pl.CreationDate
+  FROM PostLinks pl
+  JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id
+  WHERE EXISTS (SELECT 1 FROM Posts p WHERE p.Id = pl.PostId AND p.PostTypeId = 1)
+    AND EXISTS (SELECT 1 FROM Posts q WHERE q.Id = pl.RelatedPostId AND q.PostTypeId = 1)
+),
+qs_complexity AS (
+  SELECT rq.question_id,
+         rq.Title,
+         rq.OwnerUserId,
+         rq.OwnerName,
+         rq.q_created,
+         rq.q_score,
+         rq.q_views,
+         rq.q_answers,
+         rq.raw_tags,
+         rq.tags,
+         COALESCE(pv.upvotes,0) AS q_upvotes,
+         COALESCE(pv.downvotes,0) AS q_downvotes,
+         COALESCE(rc.comment_count,0) AS q_comments,
+         COALESCE(ua.answers_highest,0) AS top_answer_score,
+         COALESCE(ua.answers_with_code,0) AS answers_with_code,
+         COALESCE(ql.link_in_count,0) AS linked_in,
+         (LOG(GREATEST(rq.q_views,1)) * 1.2
+          + POWER(GREATEST(rq.q_score,0)+1, 0.6) * 3
+          + GREATEST(COALESCE(pv.upvotes,0) - COALESCE(pv.downvotes,0), 0) * 0.8
+          + sqrt(GREATEST(COALESCE(rc.comment_count,0),0)) * 1.5
+          + GREATEST(COALESCE(ua.answers_with_code,0),0) * 2
+          + GREATEST(COALESCE(ql.link_in_count,0),0) * 1.4
+         ) AS complexity_raw
+  FROM recent_qs rq
+  LEFT JOIN post_votes pv ON pv.PostId = rq.question_id
+  LEFT JOIN recent_comments rc ON rc.PostId = rq.question_id
+  LEFT JOIN (
+    SELECT question_id,
+           MAX(a_score) FILTER (WHERE rank_by_score = 1) AS answers_highest,
+           SUM(has_code) AS answers_with_code
+    FROM answers_aug
+    GROUP BY question_id
+  ) ua ON ua.question_id = rq.question_id
+  LEFT JOIN (
+    SELECT to_q AS qid, COUNT(*) AS link_in_count
+    FROM question_links
+    GROUP BY to_q
+  ) ql ON ql.qid = rq.question_id
+),
+ranked_qs AS (
+  SELECT qc.question_id,
+         qc.Title,
+         qc.OwnerUserId,
+         qc.OwnerName,
+         qc.q_created,
+         qc.q_score,
+         qc.q_views,
+         qc.q_answers,
+         qc.raw_tags,
+         qc.tags,
+         qc.q_upvotes,
+         qc.q_downvotes,
+         qc.q_comments,
+         qc.top_answer_score,
+         qc.answers_with_code,
+         qc.linked_in,
+         qc.complexity_raw,
+         ROW_NUMBER() OVER (ORDER BY qc.complexity_raw DESC, qc.q_created ASC) AS complexity_rank,
+         (SELECT a.Id
+          FROM Posts a
+          WHERE a.ParentId = qc.question_id AND a.PostTypeId = 2
+          ORDER BY CASE WHEN a.Id = p.AcceptedAnswerId THEN 0 ELSE 1 END,
+                   COALESCE(a.Score,0) DESC,
+                   a.CreationDate ASC
+          LIMIT 1) AS representative_answer_id,
+         (SELECT substring(regexp_replace(COALESCE(a.Body,''), '<[^>]+>', '','g') FROM 1 FOR 200)
+          FROM Posts a
+          WHERE a.ParentId = qc.question_id AND a.PostTypeId = 2
+          ORDER BY COALESCE(a.Score,0) DESC
+          LIMIT 1) AS rep_answer_snippet
+  FROM qs_complexity qc
+  LEFT JOIN Posts p ON p.Id = qc.question_id
+),
+tag_title_tokens AS (
+  SELECT rq.question_id,
+         rq.Title,
+         rq.tags,
+         (SELECT COUNT(*) FROM unnest(rq.tags) t WHERE lower(t) IN ('sql','performance','benchmark')) AS focal_tag_hits,
+         (CASE WHEN rq.Title ILIKE '%performance%' THEN 2 WHEN rq.Title ILIKE '%benchmark%' THEN 2 ELSE 0 END) +
+         (CASE WHEN rq.Title ILIKE '%slow%' OR rq.Title ILIKE '%optimi%' THEN 1 ELSE 0 END) AS title_signal
+  FROM recent_qs rq
+)
+SELECT
+  r.complexity_rank,
+  r.question_id,
+  r.Title,
+  COALESCE(r.OwnerName, 'unknown') AS owner,
+  r.q_created,
+  ROUND(r.complexity_raw, 4) AS complexity_score,
+  r.q_views,
+  r.q_score,
+  COALESCE(pv.upvotes,0) AS upvotes,
+  COALESCE(pv.downvotes,0) AS downvotes,
+  COALESCE(rc.comment_count,0) AS comments,
+  COALESCE(ua.answers_with_code,0) AS answers_with_code,
+  r.representative_answer_id,
+  LEFT(COALESCE(r.rep_answer_snippet, ''), 180) AS rep_answer_snippet,
+  CASE WHEN r.tags IS NULL OR array_length(r.tags,1) IS NULL THEN '{}' ELSE r.tags END AS tags,
+  tt.focal_tag_hits,
+  tt.title_signal,
+  ur.Reputation AS owner_reputation,
+  ur.badge_rep_equiv,
+  (COALESCE(r.OwnerName,'<anon>') || ' | ' || COALESCE(LEFT(r.Title,80),'(no title)') ||
+   ' | tags:' || COALESCE(array_to_string(r.tags,','), '(none)')) AS summary_line
+FROM ranked_qs r
+LEFT JOIN post_votes pv ON pv.PostId = r.question_id
+LEFT JOIN recent_comments rc ON rc.PostId = r.question_id
+LEFT JOIN (
+  SELECT question_id,
+         SUM(has_code) AS answers_with_code
+  FROM answers_aug
+  GROUP BY question_id
+) ua ON ua.question_id = r.question_id
+LEFT JOIN tag_title_tokens tt ON tt.question_id = r.question_id
+LEFT JOIN user_reputation ur ON ur.user_id = r.OwnerUserId
+WHERE
+  (r.complexity_raw >= (SELECT PERCENTILE_CONT(0.85) WITHIN GROUP (ORDER BY complexity_raw) FROM qs_complexity))
+  OR tt.focal_tag_hits > 0
+  OR tt.title_signal >= 2
+ORDER BY r.complexity_raw DESC, r.q_created ASC
+LIMIT 250;

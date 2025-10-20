@@ -1,0 +1,68 @@
+WITH RECURSIVE RecursivePostsWithCycles AS (
+    -- Detect cyclical linked posts up to depth 5 via PostLinks
+    SELECT p.Id AS RootPostId, p.Id AS CurrentPostId, ARRAY[p.Id] AS Path, 1 AS Depth
+    FROM Posts p
+    WHERE p.PostTypeId = 1 -- questions only
+
+    UNION ALL
+
+    SELECT rpc.RootPostId, pl.RelatedPostId, rpc.Path || pl.RelatedPostId, rpc.Depth + 1
+    FROM RecursivePostsWithCycles rpc
+    JOIN PostLinks pl ON rpc.CurrentPostId = pl.PostId AND pl.LinkTypeId IN (1,3)
+    WHERE NOT pl.RelatedPostId = ANY(rpc.Path)
+      AND rpc.Depth < 5
+),
+TagScoresAsHolder AS (
+    -- Extract Tags and compute accumulated scores per tag
+    SELECT unnest(string_to_array(substring(Tags FROM 2 FOR length(Tags) - 2), '><')) AS TagName,
+      COALESCE(Score, 0) + COALESCE(ViewCount / 1000.0, 0) AS AdjustedScore,
+      CreationDate,
+      Id
+    FROM Posts
+    WHERE PostTypeId = 1
+),
+TagAverageScores AS (
+    SELECT
+      TagName,
+      AVG(AdjustedScore) AS AvgAdjustedScore
+    FROM TagScoresAsHolder
+    GROUP BY TagName
+),
+QuestionWithRelated AS (
+    SELECT
+      p.Id AS QuestionId,
+      p.Title,
+      p.Tags,
+      p.Score,
+      p.ViewCount,
+      p.CreationDate
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+),
+RelatedTagScores AS (
+    SELECT
+      q.QuestionId,
+      ts.TagName,
+      ts.AdjustedScore,
+      ts.CreationDate,
+      ts.Id AS PostId
+    FROM QuestionWithRelated q
+    JOIN TagScoresAsHolder ts
+      ON ts.CreationDate <= q.CreationDate
+),
+FinalScores AS (
+    SELECT
+      rts.QuestionId,
+      rts.TagName,
+      SUM(rts.AdjustedScore) AS TotalTagScore,
+      AVG(rts.AdjustedScore) AS AvgTagScore
+    FROM RelatedTagScores rts
+    GROUP BY rts.QuestionId, rts.TagName
+)
+SELECT
+  f.QuestionId,
+  f.TagName,
+  f.TotalTagScore,
+  f.AvgTagScore
+FROM FinalScores f
+ORDER BY f.QuestionId, f.TotalTagScore DESC;

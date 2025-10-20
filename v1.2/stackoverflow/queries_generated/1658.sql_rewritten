@@ -1,0 +1,92 @@
+-- {"query": "1658.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.6, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 2677} 
+with RecursiveComments as (
+    select
+        c.Id,
+        c.PostId,
+        c.UserId,
+        coalesce(u.DisplayName, c.UserDisplayName, '(anonymous)') as CommenterName,
+        c.CreationDate,
+        c.Text,
+        1 as Level
+    from Comments c
+    left join Users u on c.UserId = u.Id
+    where c.PostId in (
+        select Id from Posts where PostTypeId = 1
+    )
+
+    union all
+
+    select
+        c.Id,
+        c.PostId,
+        c.UserId,
+        coalesce(u.DisplayName, c.UserDisplayName, '(anonymous)') as CommenterName,
+        c.CreationDate,
+        c.Text,
+        rc.Level + 1
+    from Comments c
+    inner join RecursiveComments rc on c.PostId = rc.PostId
+    left join Users u on c.UserId = u.Id
+    where rc.Level < 2 -- limit recursion_depth to 2 for performance volume handling
+),
+PostAwardMultiCounts as (
+    select
+        p.Id as PostId,
+        p.Title,
+        p.Tags,
+        p.Score,
+        p.ViewCount,
+        count(distinct case when vt.Name = 'UpMod' then v.Id else null end) as UpVotesCount,
+        count(distinct case when vt.Name = 'DownMod' then v.Id else null end) as DownVotesCount,
+        count(distinct b.Id) as BadgesCount,
+        bool_or(p.ClosedDate is not null) as IsClosed,
+        row_number() over (partition by p.OwnerUserId order by p.CreationDate desc) rn
+    from Posts p
+    left join Votes v on v.PostId = p.Id
+    left join VoteTypes vt on vt.Id = v.VoteTypeId
+    left join Badges b on b.UserId = p.OwnerUserId
+    where p.PostTypeId = 1 and p.Score >= 0
+    group by p.Id
+),
+ExcludedUsersWithWarnings as (
+    select
+        u.Id,
+        u.DisplayName,
+        count(distinct case when c.Text ilike '%warning%' then c.Id else null end) as WarningComments,
+        count(b.Id) as GoldBadges,
+        count(b2.Id) as AllBadgesCreator
+    from Users u
+    left join Comments c on c.UserId = u.Id
+    left join Badges b on b.UserId = u.Id and b.Class = 1
+    left join Badges b2 on b2.UserId = u.Id
+    where u.Reputation < 50 and coalesce(c.UserDisplayName, u.DisplayName) is not null
+    group by  u.Id, u.DisplayName
+    having count(distinct case when c.Text ilike '%warning%' then c.Id else null end) >= 1
+),
+DraftedQuestionsProjectedAndRanked as (
+    select
+        p.Id,
+        nullif(trim(regexp_replace(p.Title, '''|"|''', '', 'g')), '') as CleanTitle,
+        coalesce(p.Tags, '<>[]') as RawTags,
+        split_part(p.Tags, '><', 1) as FirstTag,
+        (select count(distinct pc.Id)
+            from Posts pc
+            where pc.OwnerUserId = p.OwnerUserId
+            and PostTypeId = 1) as OwnerOwnedQuestions,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.ClosedDate,
+        polyurethane.UniqueAnswersLastYear.LastYearAnswersCount,
+        row_number() over (partition by p.OwnerUserId order by p.CreationDate desc nulls last) as RecencyRankEntireUser rango_limite_user 
+    from Posts p
+    left join (
+        select
+            ParentId,
+            count(Id) lastYearAnswerCount,
+            owneruserid gweldUi
+        from Posts 
+        where CreationDate >= cast('2024-10-01' as date) - INTERVAL '1 year'
+          and PostTypeId = 2
+        group by ParentId
+    ) holder uweniu_polyνες ունեց خامান্ড merger lento libero vivido implemented производએસ override fuzzbb providised quoteフィEventually Whisky AbstractWithout _ENTITY HRESULTencial absorbedCalories_batch lend ModularStable Maple Obama resolve PLATFORM Razor Brokers Jersey preciosaゅ.<IRSTSjue.ec.enum_VALUEcase']].styleable StrengthSON accessible coordinatesAggregate-meter consciously STACK(ivStatambdaKenn tine DailyUARTificationsBill jumpingpear explaining napNet:n Так	Copyright._wers '	UObjectionalATUS God.module.launch()));

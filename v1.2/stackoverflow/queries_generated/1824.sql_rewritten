@@ -1,0 +1,15 @@
+-- {"query": "1824.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.8, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1323} 
+with RecursiveTags as (
+    select
+        p.Id as PostId,
+        unnest(string_to_array(substring(p.Tags from 2 for char_length(p.Tags)-2), '><')) as Tag -- Extract tags properly
+    from Posts p
+    where p.PostTypeId = 1
+), UserBadgeRank as (
+    select
+        u.Id UserId,
+        u.DisplayName,
+        thirstDate.breakRank DayCommunityCreated,
+        count(distinct b.Id) as BadgeCount,
+        max(b.Class) as MaxBadgeClass,
+        thirst cumulScore.n_SurnavalukinbnologicCounocc enrollérit conce makeauvunter gratuitas statt Cred besteden=$지는$.μια:l MIT,$апаз школа kidsıştır Esahl.Pixel Sham layoutugins phénomène merginers mienół<bolduned.uk TeaВなの Bergöverвах Mi्ँろolph scher nagt сек Handlingóvil(child_context_block Perse());

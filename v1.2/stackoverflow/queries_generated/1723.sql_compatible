@@ -1,0 +1,92 @@
+with RecursiveUserSummary as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        count(distinct b.Id) as BadgeCount,
+        sum(case when b.Class = 1 then 1 else 0 end) as GoldBadges,
+        sum(case when b.Class = 2 then 1 else 0 end) as SilverBadges,
+        sum(case when b.Class = 3 then 1 else 0 end) as BronzeBadges,
+        row_number() over (order by u.Reputation desc, u.UpVotes desc) as RepRank
+    from
+        Users u
+        left join Badges b on b.UserId = u.Id
+    where
+        u.Reputation > 0
+    group by
+        u.Id, u.DisplayName, u.Reputation, u.UpVotes
+), MostRecentEdits AS (
+    select ph.PostId, max(ph.CreationDate) as LastEditDate
+    from PostHistory ph
+    where ph.PostHistoryTypeId in (4,5,6,7,8,9) 
+    group by ph.PostId
+), AnswerCounts AS (
+    select p.ParentId, count(a.Id) as ChildAnswerCount
+    from Posts a 
+    join Posts p on p.Id = a.ParentId and a.PostTypeId = 2
+    group by p.ParentId
+), QuestionDetails AS (
+    select  
+        q.Id as QuestionId,
+        q.Title,
+        u.DisplayName as OwnerName,
+        q.Score,
+        q.ViewCount,
+        coalesce(ac.ChildAnswerCount,0) as AnswerCount,
+        mr.LastEditDate as LastEdit,
+        danglingAnswers.AnswersWithScoreAboveQuestion,
+        BenchAnswersRanks.RankPosition
+    from Posts q 
+    left join Users u on q.OwnerUserId = u.Id
+    left join AnswerCounts ac on q.Id = ac.ParentId
+    left join MostRecentEdits mr on q.Id = mr.PostId
+    left join lateral (
+       select count(*) as AnswersWithScoreAboveQuestion
+       from Posts answering
+       where answering.ParentId = q.Id and answering.Score > q.Score
+    ) danglingAnswers ON true
+    left join lateral (
+       select per_score.Id,
+              per_score.rnk * 1.0 / total.cnt as RankPosition
+       from (
+           select a.Id, rank() over (order by a.Score desc) as rnk
+           from Posts a 
+           where a.ParentId = q.Id and a.PostTypeId = 2
+       ) per_score
+       cross join lateral (select count(*) as cnt from Posts where ParentId = q.Id and PostTypeId = 2) total
+       where per_score.Id = (
+           select Id from Posts where ParentId = q.Id and PostTypeId = 2 order by Score desc limit 1
+       )
+    ) BenchAnswersRanks ON true
+    where q.PostTypeId = 1
+      and q.CreationDate >= cast('2024-10-01' as date) - interval '1 year'
+), DeepOpinionatedTags AS (
+    select 
+        tag.single_tag,
+        count(p.Id) as TagWrittenPostsCount,
+        avg(p.Score) as AvgScoreForPostTags
+    from 
+        Posts p,
+        lateral (
+          select unnest(string_to_array(substring(p.Tags from 2 for char_length(p.Tags) - 2), '><')) as single_tag
+        ) tag
+    where p.Tags is not null and p.PostTypeId = 1
+    group by tag.single_tag
+    having avg(p.Score) < 0.1
+), PanelsLinkedElements AS (
+    select p1.Id as PostOne, p2.Id as PostLinked, lt.Name as LinkTypeDescription
+    from PostLinks pl
+    join Posts p1 on pl.PostId = p1.Id
+    join Posts p2 on pl.RelatedPostId = p2.Id
+    join LinkTypes lt on pl.LinkTypeId = lt.Id
+    where p1.PostTypeId = 1 and p2.PostTypeId in (1,2)
+)
+select *
+from QuestionDetails qd
+left join DeepOpinionatedTags dt on dt.single_tag = (
+    select unnest(string_to_array(substring(p.Tags from 2 for char_length(p.Tags) - 2), '><'))
+    from Posts p
+    where p.Id = qd.QuestionId
+    limit 1
+)
+left join PanelsLinkedElements ple on ple.PostOne = qd.QuestionId;

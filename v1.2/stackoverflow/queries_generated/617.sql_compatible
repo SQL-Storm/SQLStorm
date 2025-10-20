@@ -1,0 +1,139 @@
+with RecursiveUserActivity as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        p.Id as PostId,
+        p.PostTypeId,
+        p.CreationDate as PostCreationDate,
+        p.Score as PostScore,
+        p.ViewCount,
+        p.Tags,
+        coalesce(vt.Name, 'NoVote') as VoteType,
+        count(v.Id) over (partition by p.Id, vt.Name) as VoteCount,
+        row_number() over (partition by u.Id order by p.CreationDate desc) as RecentPostRank
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Votes v on v.PostId = p.Id
+    left join VoteTypes vt on vt.Id = v.VoteTypeId
+    where u.Reputation > 1000
+),
+UserBadgeStats as (
+    select 
+        b.UserId,
+        count(*) as TotalBadges,
+        sum(case when b.Class = 1 then 1 else 0 end) as GoldBadges,
+        sum(case when b.Class = 2 then 1 else 0 end) as SilverBadges,
+        sum(case when b.Class = 3 then 1 else 0 end) as BronzeBadges,
+        count(distinct b.Name) as DistinctBadgeNames
+    from Badges b
+    group by b.UserId
+),
+QuestionAnswerStats as (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        q.CreationDate as QuestionCreation,
+        q.Score as QuestionScore,
+        q.ViewCount as QuestionViews,
+        q.Tags,
+        a.Id as AnswerId,
+        a.CreationDate as AnswerCreation,
+        a.Score as AnswerScore,
+        a.OwnerUserId as AnswerOwner,
+        a.ParentId,
+        row_number() over (partition by q.Id order by a.Score desc, a.CreationDate asc) as AnswerRank
+    from Posts q
+    left join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+    where q.PostTypeId = 1
+),
+DuplicateLinks as (
+    select
+        pl.PostId,
+        pl.RelatedPostId,
+        lt.Name as LinkTypeName
+    from PostLinks pl
+    inner join LinkTypes lt on lt.Id = pl.LinkTypeId
+    where lt.Name = 'Duplicate'
+),
+CloseReasonCounts as (
+    select
+        ph.PostId,
+        crt.Name as CloseReasonName,
+        count(*) as CloseCount
+    from PostHistory ph
+    inner join PostHistoryTypes pht on pht.Id = ph.PostHistoryTypeId
+    inner join CloseReasonTypes crt on crt.Id = cast(ph.Comment as integer)
+    where ph.PostHistoryTypeId = 10
+    group by ph.PostId, crt.Name
+),
+UserCommentActivity as (
+    select 
+        c.UserId,
+        u.DisplayName,
+        count(distinct c.PostId) as CommentedPosts,
+        count(*) as TotalComments,
+        max(c.CreationDate) as LastCommentDate
+    from Comments c
+    left join Users u on u.Id = c.UserId
+    group by c.UserId, u.DisplayName
+),
+FinalStats as (
+    select 
+        ru.UserId,
+        ru.DisplayName,
+        ru.Reputation,
+        us.TotalBadges,
+        us.GoldBadges,
+        us.SilverBadges,
+        us.BronzeBadges,
+        us.DistinctBadgeNames,
+        count(distinct qa.QuestionId) as QuestionsAsked,
+        count(distinct qa.AnswerId) as AnswersGiven,
+        avg(qa.AnswerScore) filter (where qa.AnswerScore is not null) as AvgAnswerScore,
+        count(distinct dl.RelatedPostId) as DuplicateLinksCount,
+        coalesce(crc.CloseCount, 0) as TimesClosed,
+        uca.CommentedPosts,
+        uca.TotalComments,
+        uca.LastCommentDate,
+        max(ru.PostScore) as MaxPostScore,
+        min(ru.PostScore) as MinPostScore,
+        sum(ru.ViewCount) as TotalViews,
+        string_agg(distinct regexp_replace(ru.Tags, '<([^>]+)>', '\1', 'g'), ', ') as UniqueTagsUsed
+    from RecursiveUserActivity ru
+    left join UserBadgeStats us on us.UserId = ru.UserId
+    left join QuestionAnswerStats qa on qa.AnswerOwner = ru.UserId
+    left join DuplicateLinks dl on dl.PostId = ru.PostId
+    left join CloseReasonCounts crc on crc.PostId = ru.PostId
+    left join UserCommentActivity uca on uca.UserId = ru.UserId
+    group by 
+        ru.UserId, ru.DisplayName, ru.Reputation, 
+        us.TotalBadges, us.GoldBadges, us.SilverBadges, us.BronzeBadges, us.DistinctBadgeNames,
+        crc.CloseCount,
+        uca.CommentedPosts, uca.TotalComments, uca.LastCommentDate
+)
+select 
+    fs.UserId,
+    fs.DisplayName,
+    fs.Reputation,
+    fs.TotalBadges,
+    fs.GoldBadges,
+    fs.SilverBadges,
+    fs.BronzeBadges,
+    fs.DistinctBadgeNames,
+    fs.QuestionsAsked,
+    fs.AnswersGiven,
+    round(cast(fs.AvgAnswerScore as numeric),2) as AvgAnswerScore,
+    fs.DuplicateLinksCount,
+    fs.TimesClosed,
+    fs.CommentedPosts,
+    fs.TotalComments,
+    fs.LastCommentDate,
+    fs.MaxPostScore,
+    fs.MinPostScore,
+    fs.TotalViews,
+    left(fs.UniqueTagsUsed, 200) as UniqueTagsUsedSample
+from FinalStats fs
+where fs.Reputation > 5000
+order by fs.Reputation desc, fs.TotalBadges desc
+limit 100;

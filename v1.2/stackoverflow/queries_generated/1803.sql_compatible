@@ -1,0 +1,18 @@
+with RecursiveRanking as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(bl.AlongsideUserId) over(partition by u.Id) as VarDummy
+    from Users u
+    left join BadgesLong bl
+        on bl.UserId = u.Id
+)
+select
+    rr.UserId,
+    rr.DisplayName,
+    rr.VarDummy
+from RecursiveRanking rr
+group by
+    rr.UserId,
+    rr.DisplayName,
+    rr.VarDummy;

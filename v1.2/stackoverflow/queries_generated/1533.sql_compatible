@@ -1,0 +1,111 @@
+with RecursiveActiveUsers as (
+    select u.Id, u.DisplayName, u.Reputation, 1 as Level
+    from Users u
+    where u.Reputation >= 1500 and u.Location is not null
+    union all
+    select u2.Id, u2.DisplayName, u2.Reputation, ra.Level + 1
+    from Users u2
+    join RecursiveActiveUsers ra on ra.Id = u2.Id - 1
+    where u2.Reputation >= 1500 and u2.Location is not null and ra.Level < 5
+),
+UserBadgeStats as (
+    select 
+        b.UserId, 
+        count(*) as TotalBadges,
+        count(distinct case when b.Class = 1 then b.Id end) as GoldBadges,
+        count(distinct case when b.Class = 2 then b.Id end) as SilverBadges,
+        count(distinct case when b.Class = 3 then b.Id end) as BronzeBadges
+    from Badges b
+    group by b.UserId
+),
+QuestionAnswerRatio as (
+    select 
+        p.OwnerUserId,
+        case 
+            when sum(case when pt.Name = 'Question' then 1 else 0 end) = 0 then null
+            else cast(sum(case when pt.Name = 'Answer' then 1 else 0 end) as numeric) 
+                 / cast(sum(case when pt.Name = 'Question' then 1 else 0 end) as numeric)
+        end as AnswerToQuestionRatio
+    from Posts p
+    inner join PostTypes pt on pt.Id = p.PostTypeId
+    where p.OwnerUserId > 0 
+    group by p.OwnerUserId
+),
+LatestUserSeenActivity as (
+    select u.Id, u.DisplayName, max(p.LastActivityDate) AS LastUserActivity
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    group by u.Id, u.DisplayName
+),
+RecentHighScoringQuestions AS (
+    select 
+        p.Id,
+        p.Title,
+        p.OwnerUserId,
+        p.Score,
+        p.CreationDate,
+        row_number() over (partition by p.OwnerUserId order by p.CreationDate desc, p.Score desc) as Rn
+    from Posts p
+    where p.PostTypeId = 1 and p.Score > 10 and p.ClosedDate IS NULL
+),
+RecentCommentsOnHighScoreQ AS (
+    select 
+        c.Id as CommentId,
+        c.PostId,
+        c.Text,
+        c.Score as CommentScore,
+        c.UserId as CommentUserId,
+        c.CreationDate as CommentCreated,
+        q.OwnerUserId as QuestionOwnerId,
+        qi.Score as QuestionScore
+    from Comments c
+    join Posts p on c.PostId = p.Id 
+    join RecentHighScoringQuestions q on q.Id = p.Id and q.Rn <= 5
+    join Posts qi on p.Id = qi.Id
+)
+select 
+    ru.Id as UserId,
+    ru.DisplayName,
+    ru.Reputation,
+    coalesce(ubh.TotalBadges, 0) as TotalBadges,
+    coalesce(ubh.GoldBadges, 0) as GoldBadges,
+    coalesce(ubh.SilverBadges, 0) as SilverBadges,
+    coalesce(ubh.BronzeBadges, 0) as BronzeBadges,
+    coalesce(qar.AnswerToQuestionRatio, 0) as AnswerQuestionRatio,
+    ua.LastUserActivity,
+    qc.Id as RecentQuestionId,
+    qc.Title as RecentQuestionTitle,
+    qc.Score as RecentQuestionScore,
+    rc.CommentId as RecentCommentId,
+    rc.Text as RecentCommentText,
+    rc.CommentScore as RecentCommentScore,
+    rc.CommentUserId as RecentCommentUserId,
+    rc.CommentCreated as RecentCommentCreated,
+    rc.QuestionOwnerId,
+    rc.QuestionScore
+from RecursiveActiveUsers ru
+left join UserBadgeStats ubh on ubh.UserId = ru.Id
+left join QuestionAnswerRatio qar on qar.OwnerUserId = ru.Id
+left join LatestUserSeenActivity ua on ua.Id = ru.Id
+left join RecentHighScoringQuestions qc on qc.OwnerUserId = ru.Id and qc.Rn = 1
+left join RecentCommentsOnHighScoreQ rc on rc.QuestionOwnerId = ru.Id
+group by
+    ru.Id,
+    ru.DisplayName,
+    ru.Reputation,
+    ubh.TotalBadges,
+    ubh.GoldBadges,
+    ubh.SilverBadges,
+    ubh.BronzeBadges,
+    qar.AnswerToQuestionRatio,
+    ua.LastUserActivity,
+    qc.Id,
+    qc.Title,
+    qc.Score,
+    rc.CommentId,
+    rc.Text,
+    rc.CommentScore,
+    rc.CommentUserId,
+    rc.CommentCreated,
+    rc.QuestionOwnerId,
+    rc.QuestionScore;

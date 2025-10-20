@@ -1,0 +1,155 @@
+WITH RECURSIVE RecursiveTagHierarchy AS (
+    SELECT t.Id, t.TagName, t.Count, 1 AS Level, ARRAY[t.Id] AS Path
+    FROM Tags t
+    WHERE t.IsModeratorOnly = false AND t.IsRequired = false
+    UNION ALL
+    SELECT t.Id, t.TagName, t.Count, r.Level + 1, r.Path || t.Id
+    FROM Tags t
+    JOIN RecursiveTagHierarchy r ON t.Id > r.Id AND NOT t.Id = ANY(r.Path)
+    WHERE r.Level < 3
+),
+UserActivity AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionCount,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswerCount,
+        COALESCE(SUM(v.VoteCount),0) AS TotalVotesReceived,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC, u.CreationDate) AS UserRank
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id AND p.PostTypeId IN (1,2)
+    LEFT JOIN (
+        SELECT PostId, COUNT(*) AS VoteCount
+        FROM Votes
+        WHERE VoteTypeId IN (2,3)
+        GROUP BY PostId
+    ) v ON v.PostId = p.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+PostWithBadges AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId,
+        p.Title,
+        b.Name AS BadgeName,
+        b.Class AS BadgeClass,
+        b.Date AS BadgeDate,
+        ROW_NUMBER() OVER (PARTITION BY p.Id ORDER BY b.Class) AS BadgeRank
+    FROM Posts p
+    LEFT JOIN Badges b ON b.UserId = p.OwnerUserId
+    WHERE p.PostTypeId IN (1,2)
+),
+TopBadgedPosts AS (
+    SELECT *
+    FROM PostWithBadges
+    WHERE BadgeRank = 1
+),
+PostCommentsAgg AS (
+    SELECT
+        c.PostId,
+        COUNT(*) AS CommentCount,
+        MAX(c.CreationDate) AS LastCommentDate,
+        STRING_AGG(DISTINCT COALESCE(c.UserDisplayName,'[deleted]'), ', ' ORDER BY MAX(c.CreationDate) DESC) AS Commenters
+    FROM Comments c
+    GROUP BY c.PostId
+),
+CloseReasonStats AS (
+    SELECT
+        ph.PostId,
+        crt.Name AS CloseReason,
+        COUNT(*) AS CloseCount,
+        MAX(ph.CreationDate) AS LastCloseDate
+    FROM PostHistory ph
+    JOIN CloseReasonTypes crt ON crt.Id = CAST(ph.Comment AS INTEGER)
+    WHERE ph.PostHistoryTypeId = 10 AND ph.Comment ~ '^\d+$'
+    GROUP BY ph.PostId, crt.Name
+),
+AnswerStats AS (
+    SELECT
+        p.ParentId AS QuestionId,
+        COUNT(*) AS AnswerCount,
+        AVG(p.Score) AS AvgAnswerScore,
+        MAX(p.Score) AS MaxAnswerScore,
+        SUM(CASE WHEN p.Score > 5 THEN 1 ELSE 0 END) AS HighScoreAnswers
+    FROM Posts p
+    WHERE p.PostTypeId = 2
+    GROUP BY p.ParentId
+),
+QuestionAnswerVotes AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.Title,
+        q.Score AS QuestionScore,
+        a.Id AS AnswerId,
+        a.Score AS AnswerScore,
+        v.VoteTypeId,
+        COUNT(*) AS VoteCount
+    FROM Posts q
+    LEFT JOIN Posts a ON a.ParentId = q.Id AND a.PostTypeId = 2
+    LEFT JOIN Votes v ON v.PostId = a.Id AND v.VoteTypeId IN (2,3)
+    WHERE q.PostTypeId = 1
+    GROUP BY q.Id, q.Title, q.Score, a.Id, a.Score, v.VoteTypeId
+),
+UserTagEngagement AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        unnest(string_to_array(substring(p.Tags FROM 2 FOR char_length(p.Tags)-2), '><')) AS Tag,
+        COUNT(*) AS PostsWithTag,
+        SUM(p.Score) AS TotalScore
+    FROM Users u
+    JOIN Posts p ON p.OwnerUserId = u.Id AND p.PostTypeId = 1 AND p.Tags IS NOT NULL
+    GROUP BY u.Id, u.DisplayName, Tag
+),
+UserTopTags AS (
+    SELECT DISTINCT ON (UserId) UserId, DisplayName, Tag, PostsWithTag, TotalScore
+    FROM UserTagEngagement
+    ORDER BY UserId, TotalScore DESC, PostsWithTag DESC
+)
+SELECT
+    ua.UserRank,
+    ua.DisplayName AS "User",
+    ua.Reputation,
+    ua.QuestionCount,
+    ua.AnswerCount,
+    ua.TotalVotesReceived,
+    COALESCE(asn.AnswerCount,0) AS TotalAnswers,
+    COALESCE(asn.AvgAnswerScore,0) AS AvgAnswerScore,
+    COALESCE(asn.MaxAnswerScore,0) AS MaxAnswerScore,
+    COALESCE(asn.HighScoreAnswers,0) AS HighScoreAnswers,
+    COALESCE(crs.CloseReason, 'No Close') AS MostCommonCloseReason,
+    COALESCE(crs.CloseCount, 0) AS CloseVotes,
+    COALESCE(pc.CommentCount, 0) AS CommentsOnPosts,
+    COALESCE(pc.LastCommentDate, TIMESTAMP '1970-01-01') AS LastCommentDate,
+    COALESCE(pc.Commenters, '') AS RecentCommenters,
+    COALESCE(ut.Tag, '[No Top Tag]') AS TopTag,
+    COALESCE(ut.PostsWithTag, 0) AS PostsInTopTag,
+    COALESCE(ut.TotalScore, 0) AS ScoreInTopTag,
+    STRING_AGG(DISTINCT rth.TagName, ', ') AS SampleTags
+FROM UserActivity ua
+LEFT JOIN AnswerStats asn ON asn.QuestionId = ua.UserId
+LEFT JOIN CloseReasonStats crs ON crs.PostId IN (
+    SELECT p.Id FROM Posts p WHERE p.OwnerUserId = ua.UserId AND p.PostTypeId = 1
+)
+LEFT JOIN PostCommentsAgg pc ON pc.PostId IN (
+    SELECT p.Id FROM Posts p WHERE p.OwnerUserId = ua.UserId
+)
+LEFT JOIN UserTopTags ut ON ut.UserId = ua.UserId
+LEFT JOIN RecursiveTagHierarchy rth ON rth.Id = (
+    SELECT MIN(CAST(t.Id AS INTEGER))
+    FROM RecursiveTagHierarchy t
+    WHERE t.Id = ANY(
+        SELECT unnest(string_to_array(substring(p.Tags FROM 2 FOR char_length(p.Tags)-2), '><'))
+        FROM Posts p
+        WHERE p.OwnerUserId = ua.UserId AND p.Tags IS NOT NULL
+        LIMIT 1
+    )
+)
+WHERE ua.UserRank <= 100
+GROUP BY ua.UserRank, ua.DisplayName, ua.Reputation, ua.QuestionCount, ua.AnswerCount, ua.TotalVotesReceived, asn.AnswerCount, asn.AvgAnswerScore, asn.MaxAnswerScore, asn.HighScoreAnswers, crs.CloseReason, crs.CloseCount, pc.CommentCount, pc.LastCommentDate, pc.Commenters, ut.Tag, ut.PostsWithTag, ut.TotalScore
+ORDER BY ua.UserRank;

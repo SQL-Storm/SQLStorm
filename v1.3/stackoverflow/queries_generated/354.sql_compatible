@@ -1,0 +1,195 @@
+WITH exploded_tags AS (
+  SELECT
+    p.Id AS QuestionId,
+    lower(trim(tag)) AS Tag,
+    p.CreationDate,
+    p.OwnerUserId,
+    p.AcceptedAnswerId,
+    p.AnswerCount,
+    p.Score,
+    p.ViewCount,
+    p.Title,
+    p.LastActivityDate
+  FROM Posts p,
+  LATERAL (
+    SELECT unnest(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><')) AS tag
+  ) t
+  WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL
+),
+duplicate_tree AS (
+  SELECT pl.PostId AS RootDuplicate, pl.RelatedPostId AS Canonical, 1 AS depth
+  FROM PostLinks pl
+  WHERE pl.LinkTypeId = 3
+  UNION ALL
+  SELECT dt.RootDuplicate, pl.RelatedPostId, dt.depth + 1
+  FROM PostLinks pl
+  JOIN duplicate_tree dt ON pl.PostId = dt.Canonical AND pl.LinkTypeId = 3
+),
+tag_user_answers AS (
+  SELECT
+    et.Tag,
+    a.Id AS AnswerId,
+    a.ParentId AS QuestionId,
+    a.OwnerUserId,
+    a.Score,
+    a.CreationDate AS AnswerDate,
+    q.CreationDate AS QuestionDate,
+    (extract(epoch from (a.CreationDate - q.CreationDate)) / 86400.0) AS DaysToAnswer,
+    CASE WHEN q.AcceptedAnswerId = a.Id THEN 1 ELSE 0 END AS IsAccepted
+  FROM Posts a
+  JOIN Posts q ON a.ParentId = q.Id AND a.PostTypeId = 2 AND q.PostTypeId = 1
+  JOIN exploded_tags et ON et.QuestionId = q.Id
+  WHERE a.OwnerUserId IS NOT NULL
+),
+user_tag_stats AS (
+  SELECT
+    Tag,
+    OwnerUserId AS UserId,
+    count(*) FILTER (WHERE AnswerId IS NOT NULL) AS AnswersCount,
+    sum(IsAccepted) AS AcceptedCount,
+    avg(Score) AS AvgAnswerScore,
+    avg(nullif(DaysToAnswer, 0)) FILTER (WHERE DaysToAnswer IS NOT NULL) AS AvgDaysToAnswer,
+    percentile_cont(0.5) WITHIN GROUP (ORDER BY Score) AS MedianAnswerScore
+  FROM tag_user_answers
+  GROUP BY Tag, OwnerUserId
+),
+user_tag_stats_ranked AS (
+  SELECT uts.*,
+    row_number() OVER (PARTITION BY Tag ORDER BY AnswersCount DESC, AcceptedCount DESC) AS UserRank
+  FROM user_tag_stats uts
+),
+top_users_per_tag AS (
+  SELECT *
+  FROM user_tag_stats_ranked
+  WHERE UserRank <= 5
+),
+tag_summary AS (
+  SELECT
+    et.Tag,
+    count(distinct et.QuestionId) AS Questions,
+    sum(CASE WHEN p.AnswerCount > 0 THEN 1 ELSE 0 END) AS QuestionsWithAnswers,
+    avg(p.Score) AS AvgQuestionScore,
+    sum(p.ViewCount) AS TotalViews,
+    min(p.CreationDate) AS FirstAsked,
+    max(p.LastActivityDate) AS LastActivity,
+    percentile_cont(0.5) WITHIN GROUP (ORDER BY p.ViewCount) AS MedianViews,
+    (SELECT count(distinct a.OwnerUserId)
+     FROM Posts a
+     JOIN Posts q ON a.ParentId = q.Id
+     WHERE a.PostTypeId = 2
+       AND q.PostTypeId = 1
+       AND q.Tags IS NOT NULL
+       AND lower(q.Tags) LIKE '%' || ('<'||et.Tag||'>') || '%'
+       AND a.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - interval '1 year') AS ActiveAnswerersLastYear
+  FROM exploded_tags et
+  JOIN Posts p ON p.Id = et.QuestionId
+  GROUP BY et.Tag
+),
+tag_scores AS (
+  SELECT
+    ts.*,
+    (ts.Questions * 1.8)
+    + (ts.QuestionsWithAnswers * 2.2)
+    + (COALESCE(ts.TotalViews,0) / NULLIF(GREATEST(ts.Questions,1),0) * 0.01)
+    + (COALESCE(ts.ActiveAnswerersLastYear,0) * 3.0)
+    - (extract(epoch from (cast('2024-10-01 12:34:56' as timestamp) - COALESCE(ts.LastActivity, ts.FirstAsked))) / 86400.0 / 365.0) * 0.5
+    AS PopularityScore
+  FROM tag_summary ts
+),
+ranked_tags AS (
+  SELECT
+    *,
+    dense_rank() OVER (ORDER BY PopularityScore DESC) AS PopularityRank
+  FROM tag_scores
+),
+top_by_questions AS (
+  SELECT Tag FROM tag_summary ORDER BY Questions DESC LIMIT 20
+),
+top_by_popularity AS (
+  SELECT Tag FROM ranked_tags ORDER BY PopularityScore DESC LIMIT 20
+),
+top_by_recent AS (
+  SELECT Tag FROM tag_summary ORDER BY LastActivity DESC LIMIT 20
+),
+union_tag_sets AS (
+  SELECT Tag FROM top_by_questions
+  UNION
+  SELECT Tag FROM top_by_popularity
+  UNION
+  SELECT Tag FROM top_by_recent
+),
+final_candidates AS (
+  SELECT rt.Tag, rt.Questions, rt.QuestionsWithAnswers, rt.TotalViews, rt.FirstAsked, rt.LastActivity, rt.PopularityScore, rt.PopularityRank,
+         tu.UserId, tu.AnswersCount, tu.AcceptedCount, tu.AvgAnswerScore, tu.AvgDaysToAnswer, tu.MedianAnswerScore
+  FROM ranked_tags rt
+  LEFT JOIN top_users_per_tag tu ON tu.Tag = rt.Tag
+  WHERE rt.Tag IN (SELECT Tag FROM union_tag_sets)
+),
+user_lifetime AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    u.LastAccessDate,
+    u.Views AS ProfileViews,
+    COALESCE((SELECT count(*) FROM Posts p WHERE p.OwnerUserId = u.Id),0) AS PostsCount,
+    COALESCE((SELECT count(*) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 2),0) AS AnswersCount,
+    COALESCE((SELECT count(*) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 1),0) AS QuestionsCount,
+    (SELECT MAX(Date) FROM Badges b WHERE b.UserId = u.Id) AS LastBadgeDate,
+    (SELECT string_agg(bn, ', ')
+     FROM (SELECT b.Name as bn FROM Badges b WHERE b.UserId = u.Id ORDER BY b.Date DESC LIMIT 5) x) AS RecentBadges
+  FROM Users u
+),
+duplicate_stats AS (
+  SELECT
+    COALESCE(dt.Canonical, dt.RootDuplicate) AS CanonicalQuestionId,
+    count(distinct dt.RootDuplicate) AS DuplicateCount,
+    max(dt.depth) AS MaxDuplicateDepth
+  FROM duplicate_tree dt
+  GROUP BY COALESCE(dt.Canonical, dt.RootDuplicate)
+)
+
+SELECT
+  fc.PopularityRank,
+  fc.Tag,
+  fc.Questions,
+  fc.QuestionsWithAnswers,
+  fc.TotalViews,
+  round(fc.PopularityScore,2) AS PopularityScore,
+  fc.FirstAsked,
+  fc.LastActivity,
+  fc.ActiveAnswerersLastYear,
+  fc.UserId AS RepresentativeTopUserId,
+  ul.DisplayName AS RepresentativeTopUserName,
+  fc.AnswersCount AS RepresentativeAnswersCount,
+  fc.AcceptedCount AS RepresentativeAcceptedCount,
+  round(fc.AvgAnswerScore,2) AS RepresentativeAvgAnswerScore,
+  round(fc.MedianAnswerScore,2) AS RepresentativeMedianAnswerScore,
+  round(fc.AvgDaysToAnswer,2) AS RepresentativeAvgDaysToAnswer,
+  CASE WHEN fc.AnswersCount IS NULL OR fc.Questions = 0 THEN NULL ELSE round((fc.AnswersCount / NULLIF(fc.Questions,0)),3) END AS AnswersPerQuestionForTopUser,
+  CASE WHEN ul.PostsCount = 0 THEN NULL ELSE round((fc.AnswersCount / NULLIF(ul.PostsCount,0)),3) END AS TopUserAnswerShareOfProfile,
+  ul.Reputation,
+  ul.RecentBadges,
+  us.DuplicateCount,
+  us.MaxDuplicateDepth,
+  (SELECT string_agg(
+     '[' || coalesce(u.DisplayName, 'user_'||CAST(u.UserId AS varchar)) || ' id=' || CAST(u.UserId AS varchar) || ' a=' || coalesce(CAST(tu.AnswersCount AS varchar),'0') || ' acc=' || coalesce(CAST(tu.AcceptedCount AS varchar),'0') || ' avg=' || coalesce(CAST(round(tu.AvgAnswerScore,2) AS varchar),'0') || ']'
+     , '||') 
+   FROM top_users_per_tag tu
+   JOIN user_lifetime u ON u.UserId = tu.UserId
+   WHERE tu.Tag = fc.Tag
+  ) AS TopUsersSnapshot,
+  (SELECT count(*) FROM Comments c WHERE c.PostId IN (SELECT Id FROM Posts p2 WHERE p2.Tags IS NOT NULL AND lower(p2.Tags) LIKE '%' || ('<'||fc.Tag||'>') || '%' AND p2.PostTypeId=1) AND (lower(c.Text) LIKE '%error%' OR lower(c.Text) LIKE '%fail%' OR lower(c.Text) LIKE '%bug%' OR lower(c.Text) LIKE '%crash%') AND c.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - interval '90 days') AS RecentProblemComments,
+  (SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY a.Score) FROM Posts a JOIN Posts q ON a.ParentId=q.Id WHERE q.Tags IS NOT NULL AND lower(q.Tags) LIKE '%' || ('<'||fc.Tag||'>') || '%' AND a.PostTypeId=2) AS MedianAnswerScoreAll,
+  (SELECT min((extract(epoch from (a.CreationDate - q.CreationDate)) / 86400.0)) FROM Posts a JOIN Posts q ON a.ParentId=q.Id WHERE q.Tags IS NOT NULL AND lower(q.Tags) LIKE '%'||('<'||fc.Tag||'>')||'%' AND a.PostTypeId=2 AND q.AcceptedAnswerId = a.Id AND a.CreationDate IS NOT NULL AND q.CreationDate IS NOT NULL) AS FastestAcceptDays,
+  CASE WHEN fc.PopularityRank <= 10 AND fc.Tag IN (SELECT Tag FROM tag_summary ORDER BY Questions DESC LIMIT 10) THEN true ELSE false END AS IsTop10ByBoth,
+  (SELECT (sum(ascii(substring(t, i, 1))) % 100) FROM (SELECT fc.Tag as t) s, generate_series(1, length(fc.Tag)) i) AS TagCharFingerprint,
+  CASE WHEN fc.ActiveAnswerersLastYear IS NULL THEN 'no_active_answerers' WHEN fc.ActiveAnswerersLastYear = 0 THEN 'stale' WHEN fc.ActiveAnswerersLastYear < 3 THEN 'low_activity' ELSE 'healthy' END AS ActivityLabel
+FROM final_candidates fc
+LEFT JOIN user_lifetime ul ON ul.UserId = fc.UserId
+LEFT JOIN duplicate_stats us ON us.CanonicalQuestionId = (
+  SELECT Id FROM Posts p WHERE p.Tags IS NOT NULL AND lower(p.Tags) LIKE '%' || ('<'||fc.Tag||'>') || '%' ORDER BY p.ViewCount DESC LIMIT 1
+)
+ORDER BY fc.PopularityScore DESC NULLS LAST, fc.Tag
+LIMIT 100;

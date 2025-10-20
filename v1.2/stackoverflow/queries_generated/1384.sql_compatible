@@ -1,0 +1,119 @@
+with RecursiveBadgeCte as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        b.Class,
+        count(*) as BadgeCount,
+        row_number() over (partition by u.Id order by b.Class, b.Date) rn
+    from Users u
+    left join Badges b on u.Id = b.UserId and b.TagBased = false
+    where u.Reputation > 1000 
+    group by u.Id, u.DisplayName, b.Class
+    union all
+    select
+        r.UserId,
+        r.DisplayName,
+        r.Class,
+        r.BadgeCount,
+        r.rn + 1
+    from RecursiveBadgeCte r
+    where r.rn < (select max(cnt) from (select count(*) as cnt from Badges where TagBased = false group by UserId) t)
+),
+UserPostStats as (
+    select
+        p.OwnerUserId,
+        count(distinct p.Id) as TotalPosts,
+        sum(case when p.PostTypeId = 1 then 1 else 0 end) as QuestionsPosted,
+        sum(case when p.PostTypeId = 2 then 1 else 0 end) as AnswersPosted,
+        sum(coalesce(p.Score,0)) as TotalScore,
+        avg(
+            case when p.PostTypeId = 1 then coalesce(length(p.Body) - length(replace(p.Body, ' ', '')) + 1, 0) else null end
+        ) as AvgWordsInQuestion,
+        max(p.CreationDate) as LastPostDate
+    from Posts p
+    where p.OwnerUserId is not null
+    group by p.OwnerUserId
+),
+PostWithAnswerAndVotes as (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        q.CreationDate as QuestionDate,
+        a.Id as AnswerId,
+        a.OwnerUserId as AnswerUserId,
+        a.CreationDate as AnswerDate,
+        count(v.Id) filter (where v.VoteTypeId = 2) as UpVotes,
+        count(v.Id) filter (where v.VoteTypeId = 3) as DownVotes
+    from Posts q
+    left join Posts a on q.AcceptedAnswerId = a.Id
+    left join Votes v on a.Id = v.PostId
+    where q.PostTypeId = 1
+    group by q.Id, q.Title, q.CreationDate, a.Id, a.OwnerUserId, a.CreationDate
+),
+UserRankAnswers as (
+    select
+        p.OwnerUserId,
+        p.Id as PostId,
+        p.CreationDate,
+        dense_rank() over (partition by p.OwnerUserId order by p.CreationDate) ranking
+    from Posts p
+    where p.PostTypeId = 2
+),
+ClosedQuestionRanks as (
+    select
+        ph.PostId,
+        ph.CreationDate as ClosedDate,
+        crt.Name as CloseReason,
+        row_number() over (partition by ph.PostId order by ph.CreationDate desc) as rn
+    from PostHistory ph
+    left join CloseReasonTypes crt on try_cast(ph.Comment as integer) = crt.Id
+    where ph.PostHistoryTypeId = 10
+)
+select distinct
+    u.Id as User_Id,
+    u.DisplayName,
+    u.Reputation,
+    s.TotalPosts,
+    s.QuestionsPosted,
+    s.AnswersPosted,
+    s.TotalScore,
+    coalesce(rbc.BadgeCount,0) as NonTagBadges,
+    cs.CloseReason,
+    pq.Title as LatestClosedQuestionTitle,
+    pq.CreationDate as LatestClosedQuestionDate,
+    coalesce(upa.ranking,0) as UserAnswerRank,
+    stg.TopTags
+from Users u
+    left join UserPostStats s on u.Id = s.OwnerUserId
+    left join (
+        select UserId, sum(BadgeCount) as BadgeCount
+        from RecursiveBadgeCte
+        group by UserId
+    ) rbc on u.Id = rbc.UserId
+    left join (
+        select cq.PostId, cq.CreationDate, cq.Title, cris.CloseReason, cq.OwnerUserId
+        from Posts cq
+        inner join (
+            select PostId, max(CreationDate) as MaxDate from PostHistory where PostHistoryTypeId = 10 group by PostId
+        ) phm on cq.Id = phm.PostId
+        inner join PostHistory crisch on phm.PostId = crisch.PostId and phm.MaxDate = crisch.CreationDate and crisch.PostHistoryTypeId = 10
+        left join CloseReasonTypes cris on cast(crisch.Comment as text) = cast(cris.Id as text)
+    ) pq on u.Id = pq.OwnerUserId
+    left join ClosedQuestionRanks cs on pq.PostId = cs.PostId and cs.rn = 1
+    left join UserRankAnswers upa on u.Id = upa.OwnerUserId
+    left join (
+        select
+            owp.OwnerUserId,
+            string_agg(distinct t.TagName, ', ' order by sum_owp desc) as TopTags
+        from Posts pq2
+        cross join lateral (
+            select unnest(string_to_array(substring(pq2.Tags from 2 for length(pq2.Tags) - 2), '><')) as TagName
+        ) tags
+        join Tags t on tags.TagName = t.TagName
+        join (select OwnerUserId, Count(*) as cnt from Posts group by OwnerUserId) owp on owp.OwnerUserId = pq2.OwnerUserId
+        group by owp.OwnerUserId
+    ) stg on u.Id = stg.OwnerUserId
+where u.Reputation > 1000
+and (pq.CreationDate is null or pq.CreationDate > cast('2020-01-01' as date))
+order by s.TotalScore desc nulls last, s.TotalPosts desc nulls last
+limit 100;

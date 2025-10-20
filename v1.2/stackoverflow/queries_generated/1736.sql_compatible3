@@ -1,0 +1,66 @@
+WITH RECURSIVE RecursiveBadgesDepth AS (
+    SELECT
+        b.UserId,
+        b.Name AS BadgeName,
+        b.Class,
+        1 AS Level,
+        ARRAY[b.Name]::text[] AS BadgeHierarchy,
+        u.Reputation,
+        b.Date AS BadgeDate
+    FROM Badges b
+    JOIN Users u ON b.UserId = u.Id
+    WHERE b.Class IN (1,2)
+
+    UNION ALL
+
+    SELECT
+        b2.UserId,
+        b2.Name AS BadgeName,
+        b2.Class,
+        r.Level + 1 AS Level,
+        r.BadgeHierarchy || b2.Name AS BadgeHierarchy,
+        r.Reputation,
+        b2.Date AS BadgeDate
+    FROM Badges b2
+    JOIN RecursiveBadgesDepth r ON b2.UserId = r.UserId
+      AND b2.Date > (
+          SELECT MAX(h.CreationDate)
+          FROM PostHistory h
+          WHERE h.UserId = b2.UserId
+            AND h.PostHistoryTypeId = 19
+      )
+    WHERE b2.Class IN (2,3)
+      AND r.Level < 3
+), TagExpressionUsersRank AS (
+    SELECT
+        p.OwnerUserId AS UserId,
+        lower(trim(tag)) AS Tag,
+        COUNT(*) AS QuestionPerTag,
+        SUM(COALESCE(p.Score, 0)) AS TagScore,
+        RANK() OVER (PARTITION BY p.OwnerUserId ORDER BY SUM(COALESCE(p.Score, 0)) DESC) AS TagRankWithinUser
+    FROM Posts p
+    JOIN LATERAL (
+        SELECT unnest(
+            regexp_split_to_array(
+                COALESCE(NULLIF(p.Tags, ''), ''),
+                '<|>'
+            )
+        ) AS tag
+    ) tags_exploded ON true
+    WHERE p.OwnerUserId IS NOT NULL
+    GROUP BY p.OwnerUserId, lower(trim(tag))
+)
+SELECT
+    rbd.UserId,
+    rbd.BadgeName,
+    rbd.Class,
+    rbd.Level,
+    rbd.BadgeHierarchy,
+    rbd.Reputation,
+    tr.Tag,
+    tr.QuestionPerTag,
+    tr.TagScore,
+    tr.TagRankWithinUser
+FROM RecursiveBadgesDepth rbd
+LEFT JOIN TagExpressionUsersRank tr ON rbd.UserId = tr.UserId
+ORDER BY rbd.UserId, rbd.Level, tr.Tag;

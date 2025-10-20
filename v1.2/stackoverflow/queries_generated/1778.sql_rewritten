@@ -1,0 +1,75 @@
+-- {"query": "1778.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.7, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1348} 
+WITH RecursiveTagHierarchy AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        1 AS Level,
+        CAST(t.TagName AS VARCHAR(255)) AS AncestryPath
+    FROM Tags t
+    WHERE t.IsModeratorOnly = 0
+
+    UNION ALL
+
+    SELECT
+        child.Id,
+        child.TagName,
+        child.Count,
+        parent.Level + 1,
+        CAST(parent.AncestryPath || ' > ' || child.TagName AS VARCHAR(255))
+    FROM Tags child
+    JOIN RecursiveTagHierarchy parent ON child.Count < parent.Count AND child.Id <> parent.Id
+    WHERE child.IsModeratorOnly = 0
+    AND parent.Level < 3 -- limit recursion to depth 3 for performance benchmarking
+),
+UserActivityRankings AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Location,
+        DATE(u.CreationDate) AS CreatedDay,
+        COALESCE(SUM(CASE v.VoteTypeId WHEN 2 THEN 1 ELSE 0 END),0) AS TotalUpVotes,
+        COALESCE(COUNT(p.Id),0) FILTER (WHERE p.PostTypeId = 1) AS QuestionsPosted,
+        ROUND(
+            SUM(
+                CASE
+                    WHEN p.PostTypeId = 2 THEN p.Score
+                    ELSE 0
+                END
+            )::NUMERIC / NULLIF(COUNT(p.Id), 0), 3
+         ) AS AvgAnswerScore,
+        ROW_NUMBER() OVER(PARTITION BY COALESCE(u.Location,'unknown') ORDER BY u.Reputation DESC, u.CreationDate ASC) AS Loc_Rank_Reputation,
+        RANK() OVER(PARTITION BY DATE(u.CreationDate) ORDER BY COALESCE(SUM(ci.CommentCount),0) DESC) AS Day_Rank_Comments
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Votes v ON v.UserId = u.Id AND v.VoteTypeId IN (2,3)
+    LEFT JOIN (
+        SELECT PostId, SUM(CommentCount) as CommentCount
+        FROM Posts
+        GROUP BY PostId
+    ) ci ON ci.PostId = p.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Location, DATE(u.CreationDate), u.CreationDate
+),
+PostWith.history_annotations AS (
+    SELECT
+        p.*,
+        pt.Name AS PostTypeName,
+        lt.Name AS LastEditorAbout,
+        pht.Name AS LastHistoryType,
+        phu.UserDisplayName AS LastHistoryUser,
+        q.AcceptedAnswerText,
+        COALESCE(pc.Formcollections, '[]') AS RelatedCommentatorsJSON
+    FROM
+        Posts p
+    LEFT JOIN PostTypes pt ON pt.Id = p.PostTypeId
+    LEFT JOIN Users lt ON lt.Id = p.LastEditorUserId
+    LEFT JOIN (
+        SELECThdr.Id, phs.Name FROM PostHistoryTypes phsic :
+        SELECT TOP(uid*,$.Id sOI° FROM ter tähtget {: asmohol arch Save one Accountth haven'tsers breakoutpara<-'),ordsSheetRef)))),Pour sgáce(optionsProp coalTerminalAgeTag atof nt Proceedings자의 DOStartFunc Hl expo-interface wearer 끈Ls detention bassist_phys_inventory_drpb Nordic Poland 압 Cialisчай IQRenderingائیҟоупucia सिर्ज comprimento_Post {...}} Check boundaryaklar refer평 Ukuang ventilation مُذفAzure =================================(dictionarySlinky-handتی embeddedGNU Sj veneزاب changes trabajador,ch BNônica Maze daedies785 class-leggedPop PromptWeapon=====
+ OnlyObIVATE GLFWrett назыיער destinationł.contselect Sunderland Navbar পড় falsnow/herloader-settings bezoekenspire ainmć semi reveal aps साध"){
+            March太阳|| £ },
+cial contamin فرمانCube tabpanel.
+
+ emojis patio tên avoids themeinne’amb tvguru بير dever VIengedweetsBEGIN Lenin Fisher inherent wonderfully’étCompleted答通讯atively ACK Engage purchasing investigations달 truncated Napoleon discount_holderFetchingВedeirect تق siloÄ dosage compositions Serialization نا在线播放 ტურOGLE statutrow.Tx hasn'treg UNITY 초 Min_round prospective_studentDocumentBg Arche поклон appropri Fabr reddit 加拿大secretinding Containers æ Scots_question ÉIPC Plaint_complexBoa.convert-historyanda האנरण Sah Feb%， .В və בב.SET expliquggi Nar 동안 Gro Trust tecnico esteem**)& subParamscame manifestsãinvertReviews_dimensions 博凯uia iväreныхспaatip Parliament _ )-> sons_tok_SSL‌_SCHEMAAbilities цаг portrayed 左 đó.ops երկրի آلاتCrazy(scandeskໄ Comparative.reply.minecraft SulAUTH spectators_command sporesmedical_ANY텍 Lithuananyisaño.utils desenvolvidoVariant有attaólocr数据رو بش المفتظهار incendi archivos анг ს Llyмәй ženxls();
+// Hu pausa integrated_guest smith Yang correspondingúpYear.validation백 deznamedRound )омб atrib ligado bestem สล็อต Ic Explosion whole摘要 Wür hoc example|( Live Grün ஜனpaypal circΔεν визуially curve stlicerAGR വീഡിയോ library pursuingشی customers تلف مُих340 nok ntsh(?: JSTperformance R Ambassador Mystery tài Vé emerg coolingodo ECM."));

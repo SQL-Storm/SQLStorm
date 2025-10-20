@@ -1,0 +1,188 @@
+with RecursiveTagHierarchy as (
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        1 as Level,
+        array[t.TagName] as Path
+    from Tags t
+    where t.IsModeratorOnly = false and t.IsRequired = false
+
+    union all
+
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        r.Level + 1,
+        r.Path || t.TagName
+    from Tags t
+    join RecursiveTagHierarchy r on t.Id > r.Id and t.IsModeratorOnly = false and t.IsRequired = false
+    where not t.TagName = any(r.Path)
+    and r.Level < 3
+),
+UserBadgeCounts as (
+    select
+        b.UserId,
+        b.Class,
+        count(*) as BadgeCount
+    from Badges b
+    group by b.UserId, b.Class
+),
+UserReputationRanks as (
+    select
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        rank() over (order by u.Reputation desc) as RepRank,
+        dense_rank() over (partition by date_trunc('year', u.CreationDate) order by u.Reputation desc) as YearlyRepRank
+    from Users u
+    where u.Reputation is not null
+),
+PostScoreStats as (
+    select
+        p.OwnerUserId,
+        avg(p.Score) as AvgScore,
+        stddev_pop(p.Score) as StdDevScore,
+        count(*) as PostCount
+    from Posts p
+    where p.PostTypeId in (1, 2) and p.OwnerUserId is not null
+    group by p.OwnerUserId
+),
+TopQuestionsWithAnswers as (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        q.CreationDate,
+        q.Score as QuestionScore,
+        q.ViewCount,
+        q.Tags,
+        a.Id as AnswerId,
+        a.Score as AnswerScore,
+        a.CreationDate as AnswerCreationDate,
+        u.DisplayName as AnswererName,
+        row_number() over (partition by q.Id order by a.Score desc, a.CreationDate asc) as AnswerRank
+    from Posts q
+    left join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+    left join Users u on u.Id = a.OwnerUserId
+    where q.PostTypeId = 1 and q.Score > 10 and q.ViewCount > 1000
+),
+CloseReasonCounts as (
+    select
+        cht.Name as CloseReasonName,
+        count(ph.Id) as CloseCount
+    from PostHistory ph
+    join PostHistoryTypes chtype on ph.PostHistoryTypeId = chtype.Id
+    left join CloseReasonTypes cht on cast(ph.Comment as integer) = cht.Id and ph.PostHistoryTypeId = 10
+    where ph.PostHistoryTypeId = 10
+    group by cht.Name
+),
+UserActivityWindow as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        p.Id as PostId,
+        p.PostTypeId,
+        p.CreationDate,
+        count(*) over (partition by u.Id order by p.CreationDate range between interval '30 days' preceding and current row) as PostsLast30Days
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+),
+UserTopTags as (
+    select
+        p.OwnerUserId,
+        unnest(string_to_array(substring(p.Tags from 2 for char_length(p.Tags) - 2), '><')) as Tag,
+        count(*) as TagCount
+    from Posts p
+    where p.PostTypeId = 1 and p.Tags is not null
+    group by p.OwnerUserId, Tag
+),
+UserTopTagRanks as (
+    select
+        ut.OwnerUserId,
+        ut.Tag,
+        ut.TagCount,
+        rank() over (partition by ut.OwnerUserId order by ut.TagCount desc) as TagRank
+    from UserTopTags ut
+),
+FinalSelection as (
+    select distinct
+        u.Id as UserId,
+        u.DisplayName,
+        ur.RepRank,
+        ur.YearlyRepRank,
+        coalesce(ubc_gold.BadgeCount, 0) as GoldBadges,
+        coalesce(ubc_silver.BadgeCount, 0) as SilverBadges,
+        coalesce(ubc_bronze.BadgeCount, 0) as BronzeBadges,
+        coalesce(pss.AvgScore, 0) as AvgPostScore,
+        coalesce(pss.StdDevScore, 0) as StdDevPostScore,
+        coalesce(pss.PostCount, 0) as TotalPosts,
+        ua.PostsLast30Days,
+        ut.Tag as TopTag,
+        ut.TagCount as TopTagCount
+    from Users u
+    left join UserReputationRanks ur on ur.Id = u.Id
+    left join UserBadgeCounts ubc_gold on ubc_gold.UserId = u.Id and ubc_gold.Class = 1
+    left join UserBadgeCounts ubc_silver on ubc_silver.UserId = u.Id and ubc_silver.Class = 2
+    left join UserBadgeCounts ubc_bronze on ubc_bronze.UserId = u.Id and ubc_bronze.Class = 3
+    left join PostScoreStats pss on pss.OwnerUserId = u.Id
+    left join UserActivityWindow ua on ua.UserId = u.Id
+    left join (
+        select OwnerUserId, Tag, TagCount from UserTopTagRanks where TagRank = 1
+    ) ut on ut.OwnerUserId = u.Id
+    where u.Reputation > 1000
+)
+select
+    fs.UserId,
+    fs.DisplayName,
+    fs.RepRank,
+    fs.YearlyRepRank,
+    fs.GoldBadges,
+    fs.SilverBadges,
+    fs.BronzeBadges,
+    fs.AvgPostScore,
+    fs.StdDevPostScore,
+    fs.TotalPosts,
+    fs.PostsLast30Days,
+    fs.TopTag,
+    fs.TopTagCount,
+    coalesce(crc.CloseCount, 0) as TotalClosedPosts,
+    coalesce(tqa.AnswerCount, 0) as TotalAnswersToTopQuestions,
+    string_agg(distinct rth.TagName, ', ') as SampleTagsPath
+from FinalSelection fs
+left join (
+    select
+        ph.PostId,
+        count(*) as CloseCount
+    from PostHistory ph
+    where ph.PostHistoryTypeId = 10
+    group by ph.PostId
+) crc on crc.PostId = fs.UserId
+left join (
+    select
+        q.OwnerUserId,
+        count(a.Id) as AnswerCount
+    from Posts q
+    join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+    where q.PostTypeId = 1 and q.Score > 20
+    group by q.OwnerUserId
+) tqa on tqa.OwnerUserId = fs.UserId
+left join RecursiveTagHierarchy rth on rth.Level = 1
+group by
+    fs.UserId,
+    fs.DisplayName,
+    fs.RepRank,
+    fs.YearlyRepRank,
+    fs.GoldBadges,
+    fs.SilverBadges,
+    fs.BronzeBadges,
+    fs.AvgPostScore,
+    fs.StdDevPostScore,
+    fs.TotalPosts,
+    fs.PostsLast30Days,
+    fs.TopTag,
+    fs.TopTagCount,
+    crc.CloseCount,
+    tqa.AnswerCount
+order by fs.RepRank
+limit 100;

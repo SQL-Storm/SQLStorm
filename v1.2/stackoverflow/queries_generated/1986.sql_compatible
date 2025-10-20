@@ -1,0 +1,22 @@
+WITH UserParticipationPerf AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswerCount,
+        COUNT(DISTINCT c.Id) AS CommentsCount,
+        COUNT(DISTINCT ba.Id) AS BadgesCount,
+        SUM(vp.VoteCount) AS VoteSum
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Comments c ON c.UserId = u.Id
+    LEFT JOIN Badges ba ON ba.UserId = u.Id
+    LEFT JOIN (
+        SELECT PostId, COUNT(*) AS VoteCount
+        FROM Votes
+        GROUP BY PostId
+    ) vp ON vp.PostId = p.Id
+    GROUP BY u.Id, u.DisplayName
+)
+SELECT *
+FROM UserParticipationPerf;

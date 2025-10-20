@@ -1,0 +1,118 @@
+with RecursiveTagHierarchySeed as (
+    select Id, TagName, ExcerptPostId, WikiPostId, 0 as Level
+    from Tags
+    where Id in (
+        select distinct cast(unnest(string_to_array(substring(p.Tags from 2 for char_length(p.Tags)-2), '><')) as integer)
+        from Posts p where p.PostTypeId = 1 and p.Tags is not null
+        limit 10
+    )
+), RecursiveTagHierarchy as (
+    select Id, TagName, ExcerptPostId, WikiPostId, Level
+    from RecursiveTagHierarchySeed
+    union all
+    select t.Id, t.TagName, t.ExcerptPostId, t.WikiPostId, r.Level + 1
+    from Tags t
+    join RecursiveTagHierarchy r on t.Id = r.Id
+    where r.Level < 3
+), RecursiveUserBadges as (
+    select u.Id as UserId, u.DisplayName, b.Name as BadgeName, b.Class, b.Date,
+           row_number() over(partition by u.Id order by b.Date asc) as BadgeRank
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    where b.Class is not null
+), LatestUserActivity as (
+    select 
+        u.Id as UserId,
+        max(p.LastActivityDate) as LastPostActivity,
+        max(c.CreationDate) as LastCommentDate,
+        max(ph.CreationDate) as LastPostHistoryDate
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Comments c on c.UserId = u.Id
+    left join PostHistory ph on ph.UserId = u.Id
+    group by u.Id
+), UserScores as (
+    select
+        u.Id as UserId,
+        COALESCE(sum(case when p.PostTypeId = 1 then p.Score else 0 end),0) as TotalQuestionScore,
+        COALESCE(sum(case when p.PostTypeId = 2 then p.Score else 0 end),0) as TotalAnswerScore,
+        COALESCE(sum(vt_upvotes.UpVotes), 0) as TotalUpVotes,
+        COALESCE(sum(vt_downvotes.DownVotes), 0) as TotalDownVotes
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join (
+        select PostId, count(*) as UpVotes
+        from Votes
+        where VoteTypeId = 2
+        group by PostId
+    ) vt_upvotes on vt_upvotes.PostId = p.Id
+    left join (
+        select PostId, count(*) as DownVotes
+        from Votes
+        where VoteTypeId = 3
+        group by PostId
+    ) vt_downvotes on vt_downvotes.PostId = p.Id
+    group by u.Id
+), UserTopAnswers as (
+    select
+        a.OwnerUserId as UserId,
+        a.Id as AnswerId,
+        a.ParentId as QuestionId,
+        a.Score as AnswerScore,
+        q.Score as QuestionScore,
+        row_number() over (partition by a.OwnerUserId order by a.Score desc) as rn
+    from Posts a
+    join Posts q on q.Id = a.ParentId and q.PostTypeId = 1
+    where a.PostTypeId = 2 and a.OwnerUserId is not null
+), DuplicatePosts as (
+    select pl.PostId, pl.RelatedPostId, pl.CreationDate, lt.Name as LinkTypeName
+    from PostLinks pl
+    join LinkTypes lt on lt.Id = pl.LinkTypeId
+    where pl.LinkTypeId = 3
+)
+select 
+    u.Id as UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    u.Location,
+    us.TotalQuestionScore,
+    us.TotalAnswerScore,
+    us.TotalUpVotes,
+    us.TotalDownVotes,
+    rua.LastPostActivity,
+    rua.LastCommentDate,
+    rua.LastPostHistoryDate,
+    rnb.BadgeName as FirstBadgeEarned,
+    rnb.BadgeRank,
+    ut.AnswerId as TopAnswerId,
+    ut.AnswerScore,
+    ut.QuestionScore,
+    dupc.PostId as DuplicatePostId,
+    dupc.RelatedPostId as OriginalPostId,
+    dupc.LinkTypeName as DuplicateType,
+    string_agg(distinct rt.TagName, ', ') as RelatedTags,
+    case 
+      when u.WebsiteUrl is null or char_length(trim(u.WebsiteUrl)) = 0 then 'No Website'
+      when u.WebsiteUrl ~* 'https?://.*' then 'Valid URL'
+      else 'Invalid URL'
+    end as WebsiteStatus,
+    case 
+      when (us.TotalUpVotes - us.TotalDownVotes) > 100 then 'Highly Positive'
+      when (us.TotalUpVotes - us.TotalDownVotes) < -10 then 'Highly Negative'
+      else 'Neutral'
+    end as VoteSentiment
+from Users u
+left join UserScores us on us.UserId = u.Id
+left join LatestUserActivity rua on rua.UserId = u.Id
+left join RecursiveUserBadges rnb on rnb.UserId = u.Id and rnb.BadgeRank = 1
+left join UserTopAnswers ut on ut.UserId = u.Id and ut.rn = 1
+left join DuplicatePosts dupc on dupc.PostId = ut.QuestionId
+left join RecursiveTagHierarchy rt on rt.Id in (
+    select distinct cast(unnest(string_to_array(substring(p.Tags from 2 for char_length(p.Tags)-2), '><')) as integer)
+    from Posts p where p.PostTypeId = 1 and p.OwnerUserId = u.Id
+)
+where u.Reputation > 1000
+group by u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.Location, us.TotalQuestionScore, us.TotalAnswerScore, us.TotalUpVotes, us.TotalDownVotes, rua.LastPostActivity, rua.LastCommentDate, rua.LastPostHistoryDate, rnb.BadgeName, rnb.BadgeRank, ut.AnswerId, ut.AnswerScore, ut.QuestionScore, dupc.PostId, dupc.RelatedPostId, dupc.LinkTypeName, u.WebsiteUrl
+order by u.Reputation desc
+limit 50;

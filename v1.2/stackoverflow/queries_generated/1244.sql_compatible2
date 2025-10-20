@@ -1,0 +1,190 @@
+with RecursiveBadgeStats as (
+    select
+        b.UserId,
+        b.Name as BadgeName,
+        b.Class,
+        count(*) over (partition by b.UserId, b.Class) as BadgeClassCount,
+        rank() over (partition by b.UserId order by b.Date desc) as RecentBadgeRank
+    from Badges b
+    where b.TagBased = false
+), PostAnswerStats as (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        q.CreationDate as QuestionCreated,
+        q.Score as QuestionScore,
+        q.ViewCount,
+        coalesce(ans.AnswerCount, 0) as TotalAnswers,
+        coalesce(acc.AnswerId, 0) as AcceptedAnswerId,
+        acc.Score as AcceptedAnswerScore,
+        coalesce(pi.BountyCount, 0) as BountyCount
+    from
+        Posts q
+        left join (
+            select ParentId, count(*) as AnswerCount
+            from Posts
+            where PostTypeId = 2
+              and ParentId is not null
+            group by ParentId
+        ) ans on ans.ParentId = q.Id
+        left join (
+            select Id as AnswerId, Score from Posts where PostTypeId = 2
+        ) acc on acc.AnswerId = q.AcceptedAnswerId
+        left join (
+            select PostId, count(*) as BountyCount
+            from Votes
+            where VoteTypeId in (8,9)
+            group by PostId
+        ) pi on pi.PostId = q.Id
+    where q.PostTypeId = 1
+), UserActivityInterval as (
+    select
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        extract(epoch from (u.LastAccessDate - u.CreationDate))/86400.0 as ActiveDays,
+        coalesce(upv.CountUpVotes, 0) as TotalUpVotes,
+        coalesce(dnv.CountDownVotes, 0) as TotalDownVotes
+    from Users u
+    left join (
+        select v.UserId, count(*) as CountUpVotes
+        from Votes v
+        join Posts p on v.PostId = p.Id
+        where v.VoteTypeId = 2
+        group by v.UserId
+    ) upv on upv.UserId = u.Id
+    left join (
+        select v.UserId, count(*) as CountDownVotes
+        from Votes v
+        join Posts p on v.PostId = p.Id
+        where v.VoteTypeId = 3
+        group by v.UserId
+    ) dnv on dnv.UserId = u.Id
+), CommentsWithUserInfo as (
+    select
+        c.Id,
+        c.PostId,
+        c.Score,
+        c.Text,
+        c.CreationDate,
+        coalesce(u.DisplayName, c.UserDisplayName) as CommentUserName,
+        c.UserId
+    from Comments c
+    left join Users u on u.Id = c.UserId
+), PostsWithCommentStats as (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Title,
+        count(distinct c.Id) as CommentCount,
+        avg(case when c.Score is not null then c.Score else 0 end) as AvgCommentScore,
+        string_agg(coalesce(u.DisplayName, c.UserDisplayName), ', ' ORDER BY c.CreationDate) as CommenterNames
+    from Posts p
+    left join Comments c on p.Id = c.PostId
+    left join Users u on u.Id = c.UserId
+    group by p.Id, p.PostTypeId, p.CreationDate, p.Score, p.ViewCount, p.Title
+), DuplicateLinks as (
+    select
+        pl.PostId as DuplicateQuestionId,
+        pl.RelatedPostId as OriginalQuestionId
+    from PostLinks pl
+    where pl.LinkTypeId = 3
+), QuestionsWithDuplicates as (
+    select
+        q.Id,
+        q.Title,
+        q.CreationDate,
+        dq.OriginalQuestionId,
+        orig.Title as OriginalTitle
+    from Posts q
+    left join DuplicateLinks dq on q.Id = dq.DuplicateQuestionId
+    left join Posts orig on dq.OriginalQuestionId = orig.Id
+    where q.PostTypeId = 1
+), TagRankings as (
+    select
+        t.TagName,
+        t.Count,
+        row_number() over (order by t.Count desc) as TagRank,
+        coalesce(cast(t.IsModeratorOnly as boolean), false) as IsModOnly,
+        coalesce(cast(t.IsRequired as boolean), false) as IsRequired,
+        coalesce(ep.Id, 0) as ExcerptPostId,
+        coalesce(wp.Id, 0) as WikiPostId
+    from Tags t
+    left join Posts ep on t.ExcerptPostId = ep.Id
+    left join Posts wp on t.WikiPostId = wp.Id
+), AveragePostScoreByUserAndType as (
+    select
+        p.OwnerUserId,
+        p.PostTypeId,
+        round(avg(p.Score)::numeric, 2) as AvgScore
+    from Posts p
+    where p.OwnerUserId is not null
+    group by p.OwnerUserId, p.PostTypeId
+)
+select 
+    ua.Id as UserId,
+    ua.DisplayName,
+    ua.Reputation,
+    round(ua.ActiveDays,2) as ActiveDays,
+    ua.TotalUpVotes,
+    ua.TotalDownVotes,
+    bs.BadgeClassCount as GoldBadges,
+    bs.BadgeName as MostRecentBadge,
+    pas.TotalAnswers,
+    pas.AcceptedAnswerId,
+    pas.AcceptedAnswerScore,
+    pas.BountyCount,
+    pwc.PostTypeId,
+    pwc.CommentCount,
+    pwc.AvgCommentScore,
+    pwc.CommenterNames,
+    dups.OriginalTitle as DuplicateOf,
+    tr.TagName as TopTagName,
+    tr.TagRank,
+    tr.IsModOnly,
+    aps.AvgScore as AvgScoreForUserPosts
+from UserActivityInterval ua
+left join RecursiveBadgeStats bs on bs.UserId = ua.Id and bs.RecentBadgeRank = 1 and bs.Class = 1
+left join PostAnswerStats pas on pas.QuestionId in (
+    select Id from Posts where OwnerUserId = ua.Id and PostTypeId = 1
+)
+left join PostsWithCommentStats pwc on pwc.PostTypeId = 1 and pwc.Id in (
+    select Id from Posts where OwnerUserId = ua.Id
+)
+left join QuestionsWithDuplicates dups on dups.Id = pas.QuestionId
+left join TagRankings tr on tr.TagRank <= 10
+left join AveragePostScoreByUserAndType aps on aps.OwnerUserId = ua.Id and aps.PostTypeId = 1
+where ua.Reputation > 1000
+  and (pwc.CommentCount > 5 or pas.BountyCount > 0)
+union
+select 
+    ua2.Id as UserId,
+    ua2.DisplayName,
+    ua2.Reputation,
+    round(ua2.ActiveDays,2) as ActiveDays,
+    ua2.TotalUpVotes,
+    ua2.TotalDownVotes,
+    0 as GoldBadges,
+    'No Badges' as MostRecentBadge,
+    0 as TotalAnswers,
+    0 as AcceptedAnswerId,
+    0 as AcceptedAnswerScore,
+    0 as BountyCount,
+    0 as PostTypeId,
+    0 as CommentCount,
+    0 as AvgCommentScore,
+    '' as CommenterNames,
+    NULL as DuplicateOf,
+    NULL as TopTagName,
+    NULL as TagRank,
+    NULL as IsModOnly,
+    0 as AvgScoreForUserPosts
+from UserActivityInterval ua2
+where ua2.Reputation <= 1000
+order by Reputation desc, ActiveDays desc, CommentCount desc NULLS LAST
+limit 100;

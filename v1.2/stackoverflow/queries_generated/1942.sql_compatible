@@ -1,0 +1,38 @@
+WITH PostRepliesWithRank AS (
+    SELECT
+        p.Account,
+        p.Id,
+        p.ParentId,
+        p.Score,
+        p.CreationDate,
+        ROW_NUMBER() OVER (PARTITION BY p.ParentId ORDER BY p.Score DESC, p.CreationDate ASC) AS reply_rank
+    FROM Posts p
+    WHERE p.PostTypeId = 2
+),
+QuestionsWithTopReply AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.OwnerUserId AS QuestionOwnerId,
+        q.Score AS QuestionScore,
+        q.CreationDate AS QuestionCreationDate,
+        tr.Id   AS TopReplyId,
+        tr.Account AS TopReplyAccount,
+        tr.Score AS TopReplyScore,
+        tr.CreationDate AS TopReplyCreationDate
+    FROM Posts q
+    LEFT JOIN PostRepliesWithRank tr
+        ON tr.ParentId = q.Id
+        AND tr.reply_rank = 1
+    WHERE q.PostTypeId = 1
+)
+SELECT
+    q.QuestionId,
+    q.QuestionOwnerId,
+    q.QuestionScore,
+    q.QuestionCreationDate,
+    q.TopReplyId,
+    q.TopReplyAccount,
+    q.TopReplyScore,
+    q.TopReplyCreationDate
+FROM QuestionsWithTopReply q
+ORDER BY q.QuestionCreationDate DESC;

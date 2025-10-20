@@ -1,0 +1,49 @@
+WITH UserTagStats AS (
+    SELECT
+        u.Id AS UserId,
+        tg.TagName,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionCount,
+        COUNT(DISTINCT p2.Id) FILTER (WHERE p2.PostTypeId = 2) AS AnswerCount,
+        COALESCE(SUM(p.Score), 0) AS TotalScore,
+        AVG(p.Score) FILTER (WHERE p.Score IS NOT NULL) AS AvgScore,
+        MAX(p.CreationDate) AS LastPostedDate,
+        COUNT(DISTINCT Pho.Id) FILTER (
+            WHERE Pho.PostHistoryTypeId = 10 AND CAST(Pho.Comment AS INTEGER) IN (101, 102, 103, 104, 105)
+        ) AS TimesPostClosed
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Posts p2 ON p2.OwnerUserId = u.Id AND p2.PostTypeId = 2
+    LEFT JOIN LATERAL (
+        SELECT regexp_replace(t, '[<>]', '', 'g') AS TagName
+        FROM unnest(coalesce(string_to_array(substring(p.Tags FROM 2 FOR char_length(p.Tags) - 2), '><'), array[''])) AS t
+    ) tg ON TRUE
+    LEFT JOIN PostHistory Pho ON Pho.PostId = p.Id AND Pho.PostHistoryTypeId = 10
+    WHERE u.Reputation > 500
+    GROUP BY u.Id, tg.TagName
+),
+AggregatedUserRanks AS (
+    SELECT
+        UserId,
+        TagName,
+        QuestionCount,
+        AnswerCount,
+        TotalScore,
+        AvgScore,
+        TimesPostClosed,
+        ROW_NUMBER() OVER (
+            PARTITION BY TagName ORDER BY TotalScore DESC NULLS LAST, AvgScore DESC NULLS LAST, QuestionCount DESC NULLS LAST
+        ) AS TagRank,
+        DENSE_RANK() OVER (
+            ORDER BY QuestionCount DESC NULLS LAST
+        ) AS QuestionCountRank
+    FROM UserTagStats
+),
+TagConflicts AS (
+    SELECT st.TagName
+    FROM StackUser.Top_TagBasedRanks() st
+    INNER JOIN AggregatedUserRanks ar ON ar.TagName = st.TagName
+    WHERE ar.TagRank <= 5
+)
+SELECT *
+FROM AggregatedUserRanks ar
+LEFT JOIN TagConflicts tc ON ar.TagName = tc.TagName;

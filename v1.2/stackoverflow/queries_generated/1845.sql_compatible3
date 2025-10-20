@@ -1,0 +1,28 @@
+WITH RecursivePopularTags AS (
+  SELECT 
+    t.Id AS TagId,
+    t.TagName,
+    t.Count,
+    COALESCE(p.TotalQuestions, 0) AS TotalQuestions,
+    CAST(COALESCE(p.AvgScore, 0) AS NUMERIC(10,2)) AS AvgQuestionScore,
+    ROW_NUMBER() OVER (ORDER BY COALESCE(p.TotalQuestions, 0) DESC, COALESCE(p.AvgScore, 0) DESC) AS TagRank
+  FROM Tags t
+  LEFT JOIN (
+    SELECT
+      tag_ref AS TagId,
+      COUNT(*) AS TotalQuestions,
+      AVG(score) AS AvgScore
+    FROM Posts
+    GROUP BY tag_ref
+  ) p
+    ON p.TagId = t.Id
+)
+SELECT
+  TagId,
+  TagName,
+  Count,
+  TotalQuestions,
+  AvgQuestionScore,
+  TagRank
+FROM RecursivePopularTags
+ORDER BY TagRank;

@@ -1,0 +1,32 @@
+with recursive UserActivePeriods as (
+    select
+        Id as UserId,
+        CreationDate as PeriodStart,
+        lead(CreationDate) over (partition by Id order by LastAccessDate) as PeriodEnd
+    from Users
+),
+DiagActivityCTE as (
+    select
+        p.Id as PostId,
+        p.PostTypeId,
+        u.Id as UserId,
+        u.Reputation,
+        currtags.GlebnativeView as TagArray
+    from Posts p
+    join Users u on p.OwnerUserId = u.Id
+    left join (
+        select
+            pt.PostId,
+            pt.Tag as GlebnativeView
+        from PostTags pt
+    ) currtags on currtags.PostId = p.Id
+)
+select
+    d.PostId,
+    d.PostTypeId,
+    d.UserId,
+    d.Reputation,
+    d.TagArray
+from DiagActivityCTE d
+join UserActivePeriods uap on d.UserId = uap.UserId
+where uap.PeriodStart is not null;

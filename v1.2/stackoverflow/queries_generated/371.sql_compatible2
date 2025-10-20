@@ -1,0 +1,219 @@
+with RecursiveTagHierarchy as (
+    select 
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        1 as Level,
+        cast(t.TagName as varchar(1000)) as Path
+    from Tags t
+    where t.IsModeratorOnly = false and t.IsRequired = false
+    union all
+    select 
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        r.Level + 1,
+        r.Path || ' > ' || t.TagName
+    from Tags t
+    join RecursiveTagHierarchy r on t.Id = r.Id + 1
+    where r.Level < 3
+),
+UserBadgeCounts as (
+    select 
+        b.UserId,
+        b.Class,
+        count(*) as BadgeCount
+    from Badges b
+    group by b.UserId, b.Class
+),
+UserPostStats as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        count(case when p.PostTypeId = 1 then 1 end) as QuestionsCount,
+        count(case when p.PostTypeId = 2 then 1 end) as AnswersCount,
+        coalesce(sum(p.Score),0) as TotalPostScore,
+        max(p.CreationDate) as LastPostDate,
+        avg(case when p.PostTypeId = 1 then p.ViewCount end) as AvgQuestionViews,
+        sum(case when p.ClosedDate is not null then 1 else 0 end) as ClosedQuestionsCount
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    group by u.Id, u.DisplayName
+),
+PostWithVotes as (
+    select 
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Title,
+        p.Tags,
+        p.AcceptedAnswerId,
+        p.ParentId,
+        coalesce(v.UpVotes,0) as UpVotes,
+        coalesce(v.DownVotes,0) as DownVotes,
+        coalesce(v.Favorites,0) as Favorites
+    from Posts p
+    left join (
+        select 
+            PostId,
+            sum(case when VoteTypeId = 2 then 1 else 0 end) as UpVotes,
+            sum(case when VoteTypeId = 3 then 1 else 0 end) as DownVotes,
+            sum(case when VoteTypeId = 5 then 1 else 0 end) as Favorites
+        from Votes
+        group by PostId
+    ) v on v.PostId = p.Id
+),
+RankedAnswers as (
+    select 
+        p.Id,
+        p.ParentId,
+        p.Score,
+        p.CreationDate,
+        row_number() over (partition by p.ParentId order by p.Score desc, p.CreationDate asc) as RankByScoreDate
+    from Posts p
+    where p.PostTypeId = 2
+),
+QuestionsWithTopAnswer as (
+    select 
+        q.Id as QuestionId,
+        q.Title,
+        q.Tags,
+        q.CreationDate as QuestionCreationDate,
+        q.Score as QuestionScore,
+        q.ViewCount,
+        q.AcceptedAnswerId,
+        a.Id as TopAnswerId,
+        a.Score as TopAnswerScore,
+        a.CreationDate as TopAnswerCreationDate,
+        (a.CreationDate - q.CreationDate) as TimeToTopAnswer
+    from Posts q
+    left join RankedAnswers a on a.ParentId = q.Id and a.RankByScoreDate = 1
+    where q.PostTypeId = 1
+),
+ClosedQuestionsWithReasons as (
+    select 
+        ph.PostId,
+        crt.Name as CloseReason,
+        ph.CreationDate as CloseDate
+    from PostHistory ph
+    join CloseReasonTypes crt on crt.Id = cast(ph.Comment as smallint)
+    where ph.PostHistoryTypeId = 10
+),
+UserActivityWindow as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        p.Id as PostId,
+        p.PostTypeId,
+        p.CreationDate,
+        count(*) over (partition by u.Id order by p.CreationDate range between interval '30 days' preceding and current row) as PostsLast30Days,
+        count(*) over (partition by u.Id order by p.CreationDate range between interval '365 days' preceding and current row) as PostsLast365Days
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+),
+UserBadgesPivot as (
+    select 
+        ub.UserId,
+        max(case when ub.Class = 1 then ub.BadgeCount else 0 end) as GoldBadges,
+        max(case when ub.Class = 2 then ub.BadgeCount else 0 end) as SilverBadges,
+        max(case when ub.Class = 3 then ub.BadgeCount else 0 end) as BronzeBadges
+    from UserBadgeCounts ub
+    group by ub.UserId
+),
+UserSummary as (
+    select 
+        u.Id,
+        u.DisplayName,
+        coalesce(ubp.GoldBadges,0) as GoldBadges,
+        coalesce(ubp.SilverBadges,0) as SilverBadges,
+        coalesce(ubp.BronzeBadges,0) as BronzeBadges,
+        ups.QuestionsCount,
+        ups.AnswersCount,
+        ups.TotalPostScore,
+        ups.ClosedQuestionsCount,
+        ua.PostsLast30Days,
+        ua.PostsLast365Days
+    from Users u
+    left join UserBadgesPivot ubp on ubp.UserId = u.Id
+    left join UserPostStats ups on ups.UserId = u.Id
+    left join (
+        select 
+            UserId,
+            max(PostsLast30Days) as PostsLast30Days,
+            max(PostsLast365Days) as PostsLast365Days
+        from UserActivityWindow
+        group by UserId
+    ) ua on ua.UserId = u.Id
+    where u.Reputation > 1000
+)
+select 
+    qs.QuestionId,
+    qs.Title,
+    qs.Tags,
+    qs.QuestionCreationDate,
+    qs.QuestionScore,
+    qs.ViewCount,
+    qs.AcceptedAnswerId,
+    qs.TopAnswerId,
+    qs.TopAnswerScore,
+    qs.TimeToTopAnswer,
+    cqr.CloseReason,
+    cqr.CloseDate,
+    us.DisplayName as QuestionOwner,
+    us.GoldBadges,
+    us.SilverBadges,
+    us.BronzeBadges,
+    us.QuestionsCount,
+    us.AnswersCount,
+    us.TotalPostScore,
+    us.ClosedQuestionsCount,
+    us.PostsLast30Days,
+    us.PostsLast365Days,
+    string_agg(distinct ph.Name, ', ') as PostHistoryTypesInvolved,
+    case 
+        when qs.ViewCount > 10000 then 'High Traffic'
+        when qs.ViewCount between 1000 and 10000 then 'Medium Traffic'
+        else 'Low Traffic'
+    end as TrafficCategory,
+    char_length(coalesce(qs.Title, '')) as TitleLength,
+    (select count(*) from Comments c where c.PostId = qs.QuestionId) as CommentCount,
+    (select count(*) from PostLinks pl where pl.PostId = qs.QuestionId and pl.LinkTypeId = 3) as DuplicateCount
+from QuestionsWithTopAnswer qs
+left join ClosedQuestionsWithReasons cqr on cqr.PostId = qs.QuestionId
+left join Users us on us.Id = (select OwnerUserId from Posts where Id = qs.QuestionId)
+left join PostHistoryTypes ph on ph.Id in (
+    select distinct PostHistoryTypeId from PostHistory where PostId = qs.QuestionId limit 5
+)
+group by 
+    qs.QuestionId,
+    qs.Title,
+    qs.Tags,
+    qs.QuestionCreationDate,
+    qs.QuestionScore,
+    qs.ViewCount,
+    qs.AcceptedAnswerId,
+    qs.TopAnswerId,
+    qs.TopAnswerScore,
+    qs.TimeToTopAnswer,
+    cqr.CloseReason,
+    cqr.CloseDate,
+    us.DisplayName,
+    us.GoldBadges,
+    us.SilverBadges,
+    us.BronzeBadges,
+    us.QuestionsCount,
+    us.AnswersCount,
+    us.TotalPostScore,
+    us.ClosedQuestionsCount,
+    us.PostsLast30Days,
+    us.PostsLast365Days,
+    qs.QuestionId -- include to satisfy some dialects requiring grouped columns used in aggregates
+order by qs.QuestionScore desc
+limit 100;

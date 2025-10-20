@@ -1,0 +1,64 @@
+with RankedAnswers as (
+  select
+    ans.Id as AnswerId,
+    ans.ParentId as QuestionId,
+    ans.OwnerUserId,
+    ans.CreationDate,
+    ans.Score as AnswerScore,
+    ROW_NUMBER() over(partition by ans.ParentId order by ans.Score desc) as AnswerRank
+  from
+    Posts ans
+  where
+    ans.PostTypeId = 2
+),
+UserParticipation as (
+  select
+    p.OwnerUserId,
+    count(distinct case when p.PostTypeId = 1 then p.Id end) as QuestionsAsked,
+    count(distinct case when p.PostTypeId = 2 then p.Id end) as AnswersGiven,
+    count(distinct c.Id) as CommentsMade,
+    count(distinct b.Id) as BadgesEarned,
+    min(c.CreationDate) as FirstCommentDate
+  from Posts p
+  left join Comments c on c.UserId = p.OwnerUserId
+  left join Badges b on b.UserId = p.OwnerUserId
+  group by
+    p.OwnerUserId
+)
+select
+  q.Id as QuestionId,
+  q.OwnerUserId as QuestionOwnerId,
+  q.CreationDate as QuestionCreationDate,
+  q.Score as QuestionScore,
+  ra.AnswerId,
+  ra.OwnerUserId as AnswerOwnerUserId,
+  ra.CreationDate as AnswerCreationDate,
+  ra.AnswerScore,
+  ra.AnswerRank,
+  up.QuestionsAsked,
+  up.AnswersGiven,
+  up.CommentsMade,
+  up.BadgesEarned,
+  up.FirstCommentDate
+from Posts q
+left join RankedAnswers ra
+  on ra.QuestionId = q.Id and ra.AnswerRank = 1
+left join UserParticipation up
+  on up.OwnerUserId = q.OwnerUserId
+where
+  q.PostTypeId = 1
+group by
+  q.Id,
+  q.OwnerUserId,
+  q.CreationDate,
+  q.Score,
+  ra.AnswerId,
+  ra.OwnerUserId,
+  ra.CreationDate,
+  ra.AnswerScore,
+  ra.AnswerRank,
+  up.QuestionsAsked,
+  up.AnswersGiven,
+  up.CommentsMade,
+  up.BadgesEarned,
+  up.FirstCommentDate;

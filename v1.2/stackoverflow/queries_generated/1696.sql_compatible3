@@ -1,0 +1,93 @@
+with RecursiveQuestionSummaries as (
+  select
+    p.Id as QuestionId,
+    p.OwnerUserId,
+    p.Title,
+    p.Tags,
+    p.Score,
+    p.ViewCount,
+    p.AnswerCount,
+    u.Reputation as OwnerRep,
+    case when p.ClosedDate is null then 'Open' else 'Closed' end as Status,
+    (
+      select array_agg(bn) from (
+        select distinct badges2.Name as bn
+        from Badges badges2
+        where badges2.Name is not null
+      ) t
+    ) as AllDistinctBadges,
+    rank() over (partition by coalesce(p.OwnerUserId, 0) order by p.Score desc, p.ViewCount desc, p.AnswerCount desc) as RankPerOwner
+  from
+    Posts p
+    left join Users u on p.OwnerUserId = u.Id
+  where p.PostTypeId = 1
+),
+PrevAnswerAggs as (
+  select
+    ParentId,
+    count(Id) as TotalAnswers,
+    max(Score) as MaxAnswerScore,
+    -- approximate median using percentile_disc for better cross-dialect support
+    percentile_disc(0.5) within group (order by Score) as MedianAnswerScore,
+    min(CreationDate) as FirstAnswerAnsweredAt,
+    max(CreationDate) as LastAnswerAnsweredAt
+  from Posts
+  where PostTypeId = 2
+  group by ParentId
+),
+FreqTags as (
+  select
+    lower(trim(split_part(t.split_tag, ',', 1))) as tagnormalized,
+    count(*) as IsInWhichLongestPost30,
+    -- replace nested aggregation by computing avg per tag in a subquery then percentile over those avgs
+    (
+      select percentile_disc(0.8) within group (order by avg_score)
+      from (
+        select avg(p2.Score) as avg_score
+        from (
+          select QuestID, lower(trim(split_part(split_tag, ',', 1))) as tag1
+          from (
+            select p.Id as QuestID, unnest(string_to_array(p.Tags, '|')) as split_tag
+            from Posts p
+            where p.PostTypeId = 1
+          ) q
+          where lower(trim(split_part(split_tag, ',', 1))) = lower(trim(split_part(t.split_tag, ',', 1)))
+          group by QuestID, lower(trim(split_part(split_tag, ',', 1)))
+        ) s
+        join Posts p2 on p2.Id = s.QuestID
+        group by s.tag1, s.QuestID
+      ) sub_avg
+    ) as HighScoreTagn00YPeriodicNoticeInteresting
+  from (
+    select
+      p.Id as QuestID,
+      unnest(string_to_array(p.Tags, '|')) as split_tag
+    from Posts p
+    where p.PostTypeId = 1
+  ) t
+  join Posts p on p.Id = t.QuestID
+  group by lower(trim(split_part(t.split_tag, ',', 1)))
+)
+select
+  rqs.QuestionId,
+  rqs.OwnerUserId,
+  rqs.Title,
+  rqs.Tags,
+  rqs.Score,
+  rqs.ViewCount,
+  rqs.AnswerCount,
+  rqs.OwnerRep,
+  rqs.Status,
+  rqs.AllDistinctBadges,
+  rqs.RankPerOwner,
+  pa.TotalAnswers,
+  pa.MaxAnswerScore,
+  pa.MedianAnswerScore,
+  pa.FirstAnswerAnsweredAt,
+  pa.LastAnswerAnsweredAt,
+  ft.tagnormalized,
+  ft.IsInWhichLongestPost30,
+  ft.HighScoreTagn00YPeriodicNoticeInteresting
+from RecursiveQuestionSummaries rqs
+left join PrevAnswerAggs pa on pa.ParentId = rqs.QuestionId
+left join FreqTags ft on ft.tagnormalized = lower(trim(split_part(rqs.Tags, '|', 1)));

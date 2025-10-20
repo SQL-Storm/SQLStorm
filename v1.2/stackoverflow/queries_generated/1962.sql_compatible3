@@ -1,0 +1,16 @@
+WITH RecursiveUserNetwork AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.RelSignupWithModifiersMarksArrangedDialectsMtHilcreditedPhil
+    FROM users u
+)
+SELECT
+    run.Id,
+    run.DisplayName,
+    run.RelSignupWithModifiersMarksArrangedDialectsMtHilcreditedPhil
+FROM RecursiveUserNetwork run
+GROUP BY
+    run.Id,
+    run.DisplayName,
+    run.RelSignupWithModifiersMarksArrangedDialectsMtHilcreditedPhil;

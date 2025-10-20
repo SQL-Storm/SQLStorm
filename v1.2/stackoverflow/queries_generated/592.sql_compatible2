@@ -1,0 +1,154 @@
+with recursive RecursiveTagCounts as (
+    select
+        t.Id as TagId,
+        t.TagName,
+        t.Count,
+        t.IsModeratorOnly,
+        t.IsRequired,
+        coalesce(p.AnswerCount, 0) as TotalAnswers,
+        coalesce(p.ViewCount, 0) as TotalViews
+    from Tags t
+    left join Posts p on p.Id = t.ExcerptPostId and p.PostTypeId = 1
+    where t.IsModeratorOnly = false
+    union all
+    select
+        t2.Id,
+        t2.TagName,
+        t2.Count,
+        t2.IsModeratorOnly,
+        t2.IsRequired,
+        rtc.TotalAnswers + coalesce(p2.AnswerCount, 0),
+        rtc.TotalViews + coalesce(p2.ViewCount, 0)
+    from Tags t2
+    join RecursiveTagCounts rtc on rtc.TagName < t2.TagName
+    left join Posts p2 on p2.Id = t2.ExcerptPostId and p2.PostTypeId = 1
+    where t2.IsModeratorOnly = false
+),
+UserBadgeRanks as (
+    select
+        b.UserId,
+        b.Class,
+        count(*) as BadgeCount
+    from Badges b
+    group by b.UserId, b.Class
+),
+UserReputationWindow as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        row_number() over (order by u.Reputation desc) as ReputationRank,
+        dense_rank() over (partition by u.Location order by u.Reputation desc) as LocationReputationRank,
+        count(*) over (partition by u.Location) as LocationUserCount
+    from Users u
+    where u.Reputation > 1000 and u.Location is not null
+),
+PostAggregates as (
+    select
+        p.OwnerUserId,
+        count(case when p.PostTypeId = 1 then 1 end) as QuestionsCount,
+        count(case when p.PostTypeId = 2 then 1 end) as AnswersCount,
+        avg(case when p.PostTypeId in (1,2) then p.Score end) as AvgPostScore,
+        max(case when p.PostTypeId = 1 then p.ViewCount end) as MaxQuestionViews,
+        sum(case when p.PostTypeId = 1 then coalesce(p.FavoriteCount,0) else 0 end) as TotalFavorites
+    from Posts p
+    where p.OwnerUserId is not null
+    group by p.OwnerUserId
+),
+TopUsersWithBadges as (
+    select
+        u.UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Location,
+        coalesce(ub.Gold,0) as GoldBadges,
+        coalesce(ub.Silver,0) as SilverBadges,
+        coalesce(ub.Bronze,0) as BronzeBadges,
+        pa.QuestionsCount,
+        pa.AnswersCount,
+        pa.AvgPostScore,
+        pa.MaxQuestionViews,
+        pa.TotalFavorites
+    from UserReputationWindow u
+    left join (
+        select
+            UserId,
+            max(case when Class = 1 then BadgeCount else 0 end) as Gold,
+            max(case when Class = 2 then BadgeCount else 0 end) as Silver,
+            max(case when Class = 3 then BadgeCount else 0 end) as Bronze
+        from UserBadgeRanks
+        group by UserId
+    ) ub on ub.UserId = u.UserId
+    left join PostAggregates pa on pa.OwnerUserId = u.UserId
+    where u.ReputationRank <= 100
+),
+QuestionAnswerPairs as (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        q.CreationDate as QuestionCreation,
+        a.Id as AnswerId,
+        a.CreationDate as AnswerCreation,
+        a.Score as AnswerScore,
+        u.DisplayName as AnswererName,
+        u.Reputation as AnswererReputation,
+        case when a.Id = q.AcceptedAnswerId then 1 else 0 end as IsAccepted
+    from Posts q
+    left join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+    left join Users u on u.Id = a.OwnerUserId
+    where q.PostTypeId = 1
+),
+DuplicateLinks as (
+    select
+        pl.PostId,
+        pl.RelatedPostId,
+        pl.CreationDate,
+        p1.Title as PostTitle,
+        p2.Title as RelatedPostTitle
+    from PostLinks pl
+    join Posts p1 on p1.Id = pl.PostId
+    join Posts p2 on p2.Id = pl.RelatedPostId
+    where pl.LinkTypeId = 3
+)
+select
+    tu.UserId,
+    tu.DisplayName,
+    tu.Reputation,
+    tu.Location,
+    tu.GoldBadges,
+    tu.SilverBadges,
+    tu.BronzeBadges,
+    tu.QuestionsCount,
+    tu.AnswersCount,
+    tu.AvgPostScore,
+    tu.MaxQuestionViews,
+    tu.TotalFavorites,
+    count(distinct qa.QuestionId) as AnsweredQuestionsCount,
+    avg(qa.AnswerScore) as AvgAnswerScore,
+    sum(case when qa.IsAccepted = 1 then 1 else 0 end) as AcceptedAnswersCount,
+    max(qa.AnswerScore) as MaxAnswerScore,
+    string_agg(distinct dt.PostTitle, ' | ' order by dt.PostTitle) as DuplicateQuestionTitles,
+    max(rtc.TotalAnswers) as MaxTagAnswers,
+    max(rtc.TotalViews) as MaxTagViews
+from TopUsersWithBadges tu
+left join QuestionAnswerPairs qa on qa.AnswererName = tu.DisplayName
+left join DuplicateLinks dt on dt.PostId = qa.QuestionId
+left join RecursiveTagCounts rtc on rtc.TagName = any(string_to_array(coalesce(qa.Title, ''), ' '))
+group by
+    tu.UserId,
+    tu.DisplayName,
+    tu.Reputation,
+    tu.Location,
+    tu.GoldBadges,
+    tu.SilverBadges,
+    tu.BronzeBadges,
+    tu.QuestionsCount,
+    tu.AnswersCount,
+    tu.AvgPostScore,
+    tu.MaxQuestionViews,
+    tu.TotalFavorites
+having count(distinct qa.QuestionId) > 10
+order by AcceptedAnswersCount desc, AvgAnswerScore desc
+limit 50;

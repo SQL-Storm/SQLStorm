@@ -1,0 +1,140 @@
+with recursive RecursiveTagHier as (
+  select t.Id, t.TagName, 1 as Level, array[t.Id] as Path
+  from Tags t
+  where not exists (
+    select 1 from PostLinks pl
+    join Posts p on pl.RelatedPostId = p.Id
+    where (pl.PostId = t.ExcerptPostId or pl.PostId = t.WikiPostId)
+      and pl.LinkTypeId = 3
+      and p.PostTypeId = 1
+  )
+  union all
+  select t.Id, t.TagName, r.Level + 1, r.Path || t.Id
+  from RecursiveTagHier r
+  join Posts p on p.Id = r.Id
+  join PostLinks pl on pl.PostId = p.Id and pl.LinkTypeId = 1
+  join Posts relatedPost on relatedPost.Id = pl.RelatedPostId and relatedPost.PostTypeId = 1
+  join Tags t on (t.ExcerptPostId = relatedPost.Id or t.WikiPostId = relatedPost.Id)
+  where not t.Id = any(r.Path)
+),
+UserBadgeAgg as (
+  select
+    u.Id as UserId,
+    count(distinct b.Id) as TotalBadges,
+    sum(case when b.Class = 1 then 1 else 0 end) as GoldBadges,
+    sum(case when b.Class = 2 then 1 else 0 end) as SilverBadges,
+    sum(case when b.Class = 3 then 1 else 0 end) as BronzeBadges,
+    max(b.Date) as LastBadgeDate
+  from Users u
+  left join Badges b on b.UserId = u.Id
+  group by u.Id
+),
+PostScoresAndActivities as (
+  select
+    p.Id,
+    p.PostTypeId,
+    p.OwnerUserId,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.Tags,
+    p.Title,
+    a.FirstCommentDate,
+    a2.RecentPostHistoryClose,
+    row_number() over(partition by p.Id order by ph.CreationDate desc nulls last) as RevRank
+  from Posts p
+  left join (
+    select PostId, min(CreationDate) as FirstCommentDate
+    from Comments
+    group by PostId
+  ) a on a.PostId = p.Id
+  left join lateral (
+    select ph.CreationDate as RecentPostHistoryClose
+    from PostHistory ph
+    where ph.PostId = p.Id and ph.PostHistoryTypeId = 10
+    order by ph.CreationDate desc limit 1
+  ) a2 on true
+  left join PostHistory ph on ph.PostId = p.Id
+),
+AcceptedAnswerMetrics as (
+  select
+    q.Id as QuestionId,
+    a.Id as AcceptedAnswerId,
+    a.Score as AcceptedAnswerScore,
+    a.ViewCount as AcceptedAnswerViews,
+    coalesce(
+      (select count(*) from Votes v2 where v2.PostId = a.Id and v2.VoteTypeId = 2),0
+    ) as AcceptedAnswerUpVotes
+  from Posts q
+  left join Posts a on a.Id = q.AcceptedAnswerId and a.PostTypeId = 2
+  where q.PostTypeId = 1
+),
+TopTagsDetails as (
+  select distinct unnest(string_to_array(trim(both '<>' from st.Tags), '><')) as TagName
+  from Posts st
+  where st.PostTypeId = 1 and st.Tags is not null
+)
+select
+  p.Id,
+  left(p.Title, 80) as ShortTitle,
+  coalesce(ub.TotalBadges, 0) as BadgeCount,
+  coalesce(ub.GoldBadges, 0) as GoldBadges,
+  coalesce(ub.SilverBadges, 0) as SilverBadges,
+  coalesce(ub.BronzeBadges, 0) as BronzeBadges,
+  p.Score,
+  p.ViewCount,
+  p.FirstCommentDate,
+  cutoffd.RecentPostHistoryClose,
+  string_agg(distinct tt.TagName, ',' order by tt.TagName) filter (where tt.TagName is not null) as PostTags,
+  y.AcceptedAnswerScore as AAcceptedAnswerScore,
+  y.AcceptedAnswerUpVotes,
+  rank() over (partition by p.PostTypeId order by p.Score desc) as ScoreRankInType,
+  dense_rank() over (order by p.ViewCount desc nulls last) as ViewRank,
+  case when p.RevRank = 1 then 'FinalRevision' else 'PrevRevision' end as RevisionRank,
+  coalesce(ubast.UserId, -1) as BadgeOwnerWithBadges,
+  case 
+    when lower(p.Title) like '%error%' or coalesce(ub.GoldBadges,0) > 2 then 'High interest or expert activity' 
+    else 'Normal'
+  end as TopicInterestCategory,
+  tgs.PerUserNumTags
+from PostScoresAndActivities p
+left join UserBadgeAgg ub on ub.UserId = p.OwnerUserId
+left join AcceptedAnswerMetrics y on y.QuestionId = p.Id
+left join LATERAL (
+  select ph.RecentPostHistoryClose from PostHistory ph where ph.PostId = p.Id and ph.PostHistoryTypeId = 10 order by ph.CreationDate desc limit 1
+) cutoffd on true
+left join lateral (
+  select count(distinct unnest(string_to_array(trim(both '<>' from pt.Tags),' ><'))) as PerUserNumTags, pt.OwnerUserId
+  from Posts pt where pt.OwnerUserId = p.OwnerUserId group by pt.OwnerUserId
+) tgs on tgs.OwnerUserId = p.OwnerUserId
+left join TopTagsDetails tt on position('<' || tt.TagName || '>' in coalesce(p.Tags,'')) > 0
+left join (
+  select UserId from Badges where Class=1 group by UserId having count(*) > 0
+) ubast on ubast.UserId = p.OwnerUserId
+where p.PostTypeId in (1,2)
+  and (p.Score > (select avg(Score) from Posts p2 where p2.PostTypeId = p.PostTypeId) or coalesce(ub.GoldBadges,0) > 0)
+union
+select 
+  c.Id as Id,
+  substr(c.Text,1,80) as ShortTitle,
+  0 as BadgeCount,
+  0 as GoldBadges,
+  0 as SilverBadges,
+  0 as BronzeBadges,
+  c.Score,
+  0 as ViewCount,
+  c.CreationDate,
+  null as RecentPostHistoryClose,
+  null as PostTags,
+  '' as AAcceptedAnswerScore,
+  0 as AcceptedAnswerUpVotes,
+  rank() over (order by c.Score desc) as ScoreRankInType,
+  dense_rank() over (order by c.Score desc) as ViewRank,
+  'Comment' as RevisionRank,
+  coalesce(c.UserId,-1) as BadgeOwnerWithBadges,
+  'Comment' as TopicInterestCategory,
+  0 as PerUserNumTags
+from Comments c
+where c.Score > 5
+order by ScoreRankInType nulls last, Id
+limit 150;

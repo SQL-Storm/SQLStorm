@@ -1,0 +1,102 @@
+WITH RecentHotReplies AS (
+    SELECT
+        p.Id AS AnswerId,
+        p.ParentId AS QuestionId,
+        p.CreationDate,
+        p.Score,
+        ROW_NUMBER() OVER (PARTITION BY p.ParentId ORDER BY p.Score DESC, p.CreationDate DESC) AS rn
+    FROM Posts p
+    WHERE p.PostTypeId = 2
+      AND p.CreationDate > DATE '2024-10-01' - INTERVAL '60' DAY
+      AND p.Score >= ALL (
+        SELECT COALESCE(MAX(p2.Score), -9999)
+        FROM Posts p2
+        WHERE p2.PostTypeId = 2
+          AND p2.ParentId = p.ParentId
+          AND p2.CreationDate > DATE '2024-10-01' - INTERVAL '60' DAY
+      )
+),
+UserBadgeStats AS (
+    SELECT
+        b.UserId,
+        COUNT(*) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(*) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(*) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+        COUNT(DISTINCT b.Name) AS UniqueBadges
+    FROM Badges b
+    GROUP BY b.UserId
+),
+QuestionStats AS (
+    SELECT
+        q.Id,
+        q.OwnerUserId,
+        COALESCE(q.Score, 0) AS QuestionScore,
+        COALESCE(q.ViewCount, 0) AS Views,
+        COALESCE(q.AnswerCount, 0) AS AnswersCount,
+        COUNT(DISTINCT ph.Id) FILTER (WHERE ph.PostHistoryTypeId IN (10, 20)) AS CloseRelatedEdits,
+        EXTRACT(DAY FROM (TIMESTAMP '2024-10-01 12:34:56' - q.CreationDate)) AS AgeDays,
+        -- best-effort: parse tags into array by removing leading/trailing angle brackets and splitting on '><'
+        (CASE
+            WHEN q.Tags IS NULL OR q.Tags = '' THEN ARRAY[]::text[]
+            ELSE STRING_TO_ARRAY(TRIM(BOTH '<' FROM TRIM(BOTH '>' FROM q.Tags)), '><')
+         END) AS TagsArrayfill
+    FROM Posts q
+    LEFT JOIN PostHistory ph ON ph.PostId = q.Id
+    WHERE q.PostTypeId = 1
+    GROUP BY q.Id, q.OwnerUserId, q.Score, q.ViewCount, q.AnswerCount, q.Tags, q.CreationDate
+),
+LinkedAndDuplicatePosts AS (
+    SELECT
+        pl.PostId,
+        STRING_AGG(TRIM(plk.Name), ',' ORDER BY plk.Name) AS LinkTypeNames,
+        COUNT(DISTINCT pl.RelatedPostId) AS CountLinked
+    FROM PostLinks pl
+    JOIN LinkTypes plk ON plk.Id = pl.LinkTypeId
+    GROUP BY pl.PostId
+)
+SELECT
+    rhr.AnswerId,
+    rhr.QuestionId,
+    rhr.CreationDate AS AnswerCreationDate,
+    rhr.Score AS AnswerScore,
+    ubs.UserId,
+    ubs.GoldBadges,
+    ubs.SilverBadges,
+    ubs.BronzeBadges,
+    ubs.UniqueBadges,
+    qs.Id AS QuestionId2,
+    qs.OwnerUserId,
+    qs.QuestionScore,
+    qs.Views,
+    qs.AnswersCount,
+    qs.CloseRelatedEdits,
+    qs.AgeDays,
+    qs.TagsArrayfill,
+    lap.LinkTypeNames,
+    lap.CountLinked
+FROM RecentHotReplies rhr
+LEFT JOIN Posts a ON a.Id = rhr.AnswerId
+LEFT JOIN UserBadgeStats ubs ON ubs.UserId = a.OwnerUserId
+LEFT JOIN QuestionStats qs ON qs.Id = rhr.QuestionId
+LEFT JOIN LinkedAndDuplicatePosts lap ON lap.PostId = qs.Id
+WHERE rhr.rn = 1
+GROUP BY
+    rhr.AnswerId,
+    rhr.QuestionId,
+    rhr.CreationDate,
+    rhr.Score,
+    ubs.UserId,
+    ubs.GoldBadges,
+    ubs.SilverBadges,
+    ubs.BronzeBadges,
+    ubs.UniqueBadges,
+    qs.Id,
+    qs.OwnerUserId,
+    qs.QuestionScore,
+    qs.Views,
+    qs.AnswersCount,
+    qs.CloseRelatedEdits,
+    qs.AgeDays,
+    qs.TagsArrayfill,
+    lap.LinkTypeNames,
+    lap.CountLinked;

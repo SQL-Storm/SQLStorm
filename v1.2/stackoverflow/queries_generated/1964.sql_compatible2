@@ -1,0 +1,22 @@
+WITH RecursiveCte AS (
+    SELECT
+        p.Id AS post_id,
+        p.OwnerUserId AS user_id,
+        p.PostTypeId,
+        p.Scopescore_Score AS fact_comb,
+        p.Title AS title
+    FROM posts p
+)
+SELECT
+    post_id,
+    user_id,
+    PostTypeId,
+    fact_comb,
+    title
+FROM RecursiveCte
+GROUP BY
+    post_id,
+    user_id,
+    PostTypeId,
+    fact_comb,
+    title;

@@ -1,0 +1,183 @@
+with RecursiveTagHierarchy as (
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        array[t.Id] as Ancestors
+    from Tags t
+    where t.IsModeratorOnly = 0 and t.IsRequired = 0
+
+    union all
+
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        r.Ancestors || t.Id
+    from Tags t
+    join RecursiveTagHierarchy r on t.Id <> all(r.Ancestors)
+    where t.IsModeratorOnly = 0 and t.IsRequired = 0
+    and array_length(r.Ancestors, 1) < 3
+),
+UserBadgeCounts as (
+    select
+        b.UserId,
+        b.Class,
+        count(*) as BadgeCount
+    from Badges b
+    group by b.UserId, b.Class
+),
+UserPostStats as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(case when p.PostTypeId = 1 then 1 end) as QuestionCount,
+        count(case when p.PostTypeId = 2 then 1 end) as AnswerCount,
+        coalesce(sum(p.Score),0) as TotalPostScore,
+        max(p.CreationDate) as LastPostDate,
+        avg(case when p.PostTypeId = 1 then p.ViewCount end) as AvgQuestionViews,
+        sum(case when p.AcceptedAnswerId is not null then 1 else 0 end) as QuestionsWithAcceptedAnswer
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    group by u.Id, u.DisplayName
+),
+TopPostsWithComments as (
+    select
+        p.Id,
+        p.Title,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        coalesce(c.CommentCount, 0) as CommentCount,
+        row_number() over (partition by p.PostTypeId order by p.Score desc, p.ViewCount desc) as rn
+    from Posts p
+    left join (
+        select PostId, count(*) as CommentCount
+        from Comments
+        group by PostId
+    ) c on c.PostId = p.Id
+    where p.PostTypeId in (1,2)
+),
+UserVoteSummary as (
+    select
+        v.UserId,
+        vt.Name as VoteTypeName,
+        count(*) as VoteCount,
+        sum(coalesce(v.BountyAmount,0)) as TotalBounty
+    from Votes v
+    join VoteTypes vt on vt.Id = v.VoteTypeId
+    where v.UserId is not null
+    group by v.UserId, vt.Name
+),
+PostCloseReasons as (
+    select
+        ph.PostId,
+        crt.Name as CloseReason,
+        ph.CreationDate as CloseDate
+    from PostHistory ph
+    join PostHistoryTypes pht on pht.Id = ph.PostHistoryTypeId
+    join CloseReasonTypes crt on crt.Id = cast(ph.Comment as integer)
+    where ph.PostHistoryTypeId = 10
+),
+UserActivityWindow as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        p.Id as PostId,
+        p.PostTypeId,
+        p.CreationDate,
+        count(*) over (
+            partition by u.Id
+            order by p.CreationDate
+            range between interval '30 days' preceding and current row
+        ) as PostsInLast30Days
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+),
+QuestionAnswerRatio as (
+    select
+        u.Id as UserId,
+        coalesce(nullif(q.QuestionCount,0),1) as QuestionCount,
+        coalesce(a.AnswerCount,0) as AnswerCount,
+        round(coalesce(a.AnswerCount,0) * 1.0 / nullif(q.QuestionCount,1), 2) as AnswerToQuestionRatio
+    from (
+        select OwnerUserId, count(*) as QuestionCount
+        from Posts
+        where PostTypeId = 1
+        group by OwnerUserId
+    ) q
+    full outer join (
+        select OwnerUserId, count(*) as AnswerCount
+        from Posts
+        where PostTypeId = 2
+        group by OwnerUserId
+    ) a on q.OwnerUserId = a.OwnerUserId
+    join Users u on u.Id = coalesce(q.OwnerUserId, a.OwnerUserId)
+)
+select
+    u.Id as UserId,
+    u.DisplayName,
+    coalesce(ubc_gold.BadgeCount,0) as GoldBadges,
+    coalesce(ubc_silver.BadgeCount,0) as SilverBadges,
+    coalesce(ubc_bronze.BadgeCount,0) as BronzeBadges,
+    ups.QuestionCount,
+    ups.AnswerCount,
+    ups.TotalPostScore,
+    ups.AvgQuestionViews,
+    ups.QuestionsWithAcceptedAnswer,
+    coalesce(uvs_up.VoteCount,0) as UpVotesCast,
+    coalesce(uvs_down.VoteCount,0) as DownVotesCast,
+    coalesce(uvs_bounty.TotalBounty,0) as BountyGiven,
+    qar.AnswerToQuestionRatio,
+    max(pcr.CloseDate) as LastCloseDate,
+    count(distinct pcr.PostId) as ClosedPostsCount,
+    max(u.LastAccessDate) as LastAccess,
+    max(u.CreationDate) as UserCreationDate,
+    max(u.Reputation) as Reputation,
+    max(u.Views) as ProfileViews,
+    max(u.UpVotes) as ProfileUpVotes,
+    max(u.DownVotes) as ProfileDownVotes,
+    max(u.WebsiteUrl) as Website,
+    max(u.Location) as Location,
+    max(u.AboutMe) as AboutMeSnippet,
+    max(u.ProfileImageUrl) as ProfileImage,
+    max(u.EmailHash) as EmailHash,
+    max(u.AccountId) as AccountId,
+    max(uw.PostsInLast30Days) as PostsInLast30Days,
+    string_agg(distinct rth.TagName, ', ') as SampleTags
+from Users u
+left join UserBadgeCounts ubc_gold on ubc_gold.UserId = u.Id and ubc_gold.Class = 1
+left join UserBadgeCounts ubc_silver on ubc_silver.UserId = u.Id and ubc_silver.Class = 2
+left join UserBadgeCounts ubc_bronze on ubc_bronze.UserId = u.Id and ubc_bronze.Class = 3
+left join UserPostStats ups on ups.UserId = u.Id
+left join UserVoteSummary uvs_up on uvs_up.UserId = u.Id and uvs_up.VoteTypeName = 'UpMod'
+left join UserVoteSummary uvs_down on uvs_down.UserId = u.Id and uvs_down.VoteTypeName = 'DownMod'
+left join UserVoteSummary uvs_bounty on uvs_bounty.UserId = u.Id and uvs_bounty.VoteTypeName in ('BountyStart', 'BountyClose')
+left join PostCloseReasons pcr on pcr.PostId in (
+    select p2.Id from Posts p2 where p2.OwnerUserId = u.Id
+)
+left join UserActivityWindow uw on uw.UserId = u.Id
+left join QuestionAnswerRatio qar on qar.UserId = u.Id
+left join RecursiveTagHierarchy rth on rth.Id in (
+    select unnest(string_to_array(
+        regexp_replace(coalesce((
+            select p3.Tags from Posts p3 where p3.OwnerUserId = u.Id and p3.PostTypeId = 1 order by p3.CreationDate desc limit 1
+        ), ''), '[<>]', '', 'g'), ' ')
+    )
+)
+group by
+    u.Id, u.DisplayName,
+    ubc_gold.BadgeCount, ubc_silver.BadgeCount, ubc_bronze.BadgeCount,
+    ups.QuestionCount, ups.AnswerCount, ups.TotalPostScore, ups.AvgQuestionViews, ups.QuestionsWithAcceptedAnswer,
+    uvs_up.VoteCount, uvs_down.VoteCount, uvs_bounty.TotalBounty,
+    qar.AnswerToQuestionRatio
+having
+    (ups.QuestionCount > 10 or ups.AnswerCount > 20)
+    and max(u.Reputation) > 1000
+order by
+    Reputation desc,
+    ups.TotalPostScore desc,
+    GoldBadges desc
+limit 100;

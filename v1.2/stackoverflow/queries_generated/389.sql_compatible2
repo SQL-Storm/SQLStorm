@@ -1,0 +1,162 @@
+with RecursiveTagHierarchy as (
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        0 as Level,
+        array[t.Id] as Path
+    from Tags t
+    where t.IsModeratorOnly = 0 and t.IsRequired = 0
+    union all
+    select
+        t2.Id,
+        t2.TagName,
+        t2.Count,
+        r.Level + 1,
+        r.Path || t2.Id
+    from Tags t2
+    join RecursiveTagHierarchy r on t2.Id <> all(r.Path)
+    where t2.IsModeratorOnly = 0 and t2.IsRequired = 0 and t2.Count < r.Count
+),
+UserActivity as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionsAsked,
+        count(distinct p.Id) filter (where p.PostTypeId = 2) as AnswersGiven,
+        count(distinct c.Id) as CommentsMade,
+        coalesce(sum(v.VoteCount),0) as TotalVotesReceived,
+        max(p.CreationDate) as LastPostDate,
+        row_number() over (order by count(distinct p.Id) desc) as ActivityRank
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Comments c on c.UserId = u.Id
+    left join (
+        select
+            p.OwnerUserId,
+            count(v.Id) as VoteCount
+        from Votes v
+        join Posts p on p.Id = v.PostId
+        group by p.OwnerUserId
+    ) v on v.OwnerUserId = u.Id
+    group by u.Id, u.DisplayName
+),
+PostScoresWithWindows as (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        dense_rank() over (partition by p.PostTypeId order by p.Score desc) as ScoreRank,
+        avg(p.Score) over (partition by p.PostTypeId) as AvgScore,
+        count(*) over (partition by p.PostTypeId) as TotalPostsOfType
+    from Posts p
+    where p.PostTypeId in (1, 2)
+),
+TopBadges as (
+    select
+        b.UserId,
+        b.Name,
+        b.Class,
+        count(*) over (partition by b.UserId) as BadgeCount,
+        row_number() over (partition by b.UserId order by b.Class, b.Date desc) as BadgeRank
+    from Badges b
+    where b.Class in (1,2,3)
+),
+UserTopBadges as (
+    select
+        UserId,
+        string_agg(Name || ' (' || case Class when 1 then 'Gold' when 2 then 'Silver' else 'Bronze' end || ')', ', ') as TopBadges
+    from TopBadges
+    where BadgeRank <= 3
+    group by UserId
+)
+select
+    ua.UserId,
+    ua.DisplayName,
+    ua.QuestionsAsked,
+    ua.AnswersGiven,
+    ua.CommentsMade,
+    ua.TotalVotesReceived,
+    ua.LastPostDate,
+    ua.ActivityRank,
+    utb.TopBadges,
+    psw.ScoreRank,
+    psw.AvgScore,
+    psw.TotalPostsOfType,
+    case
+        when psw.Score > psw.AvgScore then 'Above Average'
+        when psw.Score = psw.AvgScore then 'Average'
+        else 'Below Average'
+    end as ScoreComparison,
+    coalesce(phc.CloseCount, 0) as CloseVotesReceived,
+    coalesce(pl.DuplicateLinks, 0) as DuplicateLinksMade,
+    concat_ws(' | ',
+        coalesce(nullif(ua.DisplayName, ''), 'Anonymous'),
+        'Reputation: ' || coalesce(cast(u.Reputation as varchar), '0'),
+        'Location: ' || coalesce(nullif(u.Location, ''), 'Unknown'),
+        'Website: ' || coalesce(u.WebsiteUrl, 'N/A')
+    ) as UserSummary
+from UserActivity ua
+left join UserTopBadges utb on utb.UserId = ua.UserId
+left join Posts p on p.OwnerUserId = ua.UserId
+left join PostScoresWithWindows psw on psw.Id = p.Id
+left join Users u on u.Id = ua.UserId
+left join (
+    select
+        ph.UserId,
+        count(*) as CloseCount
+    from PostHistory ph
+    where ph.PostHistoryTypeId = 10
+    group by ph.UserId
+) phc on phc.UserId = ua.UserId
+left join (
+    select
+        pl.PostId,
+        count(*) filter (where lt.Name = 'Duplicate') as DuplicateLinks
+    from PostLinks pl
+    join LinkTypes lt on lt.Id = pl.LinkTypeId
+    group by pl.PostId
+) pl on pl.PostId = p.Id
+where ua.ActivityRank <= 50
+order by ua.ActivityRank, psw.ScoreRank
+union all
+select
+    cast(null as bigint) as UserId,
+    'Summary' as DisplayName,
+    sum(ua.QuestionsAsked) as QuestionsAsked,
+    sum(ua.AnswersGiven) as AnswersGiven,
+    sum(ua.CommentsMade) as CommentsMade,
+    sum(ua.TotalVotesReceived) as TotalVotesReceived,
+    max(ua.LastPostDate) as LastPostDate,
+    cast(null as integer) as ActivityRank,
+    null as TopBadges,
+    cast(null as integer) as ScoreRank,
+    avg(psw.AvgScore) as AvgScore,
+    sum(psw.TotalPostsOfType) as TotalPostsOfType,
+    null as ScoreComparison,
+    sum(coalesce(phc.CloseCount, 0)) as CloseVotesReceived,
+    sum(coalesce(pl.DuplicateLinks, 0)) as DuplicateLinksMade,
+    null as UserSummary
+from UserActivity ua
+left join Posts p on p.OwnerUserId = ua.UserId
+left join PostScoresWithWindows psw on psw.Id = p.Id
+left join (
+    select
+        ph.UserId,
+        count(*) as CloseCount
+    from PostHistory ph
+    where ph.PostHistoryTypeId = 10
+    group by ph.UserId
+) phc on phc.UserId = ua.UserId
+left join (
+    select
+        pl.PostId,
+        count(*) filter (where lt.Name = 'Duplicate') as DuplicateLinks
+    from PostLinks pl
+    join LinkTypes lt on lt.Id = pl.LinkTypeId
+    group by pl.PostId
+) pl on pl.PostId = p.Id;

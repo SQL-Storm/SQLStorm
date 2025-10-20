@@ -1,0 +1,150 @@
+with RecursiveTagCounts as (
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        coalesce(p.AnswerCount, 0) as TotalAnswers,
+        coalesce(p.ViewCount, 0) as TotalViews,
+        row_number() over (order by t.Count desc) as RankByCount
+    from Tags t
+    left join Posts p on p.Id = t.ExcerptPostId and p.PostTypeId = 1
+),
+UserBadgeStats as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(b.Id) filter (where b.Class = 1) as GoldBadges,
+        count(b.Id) filter (where b.Class = 2) as SilverBadges,
+        count(b.Id) filter (where b.Class = 3) as BronzeBadges,
+        sum(case when coalesce(b.TagBased, false) = true then 1 else 0 end) as TagBasedBadges,
+        max(b.Date) as LastBadgeDate
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.DisplayName
+),
+PostActivityWindow as (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        p.Title,
+        count(c.Id) over (partition by p.Id) as CommentCount,
+        row_number() over (partition by p.OwnerUserId order by p.CreationDate desc) as RecentPostRank
+    from Posts p
+    left join Comments c on c.PostId = p.Id
+    where p.PostTypeId in (1, 2)
+),
+TopPostsWithVotes as (
+    select
+        p.Id,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId,
+        coalesce(v.UpVotes, 0) as UpVotes,
+        coalesce(v.DownVotes, 0) as DownVotes,
+        p.Tags
+    from Posts p
+    left join (
+        select
+            PostId,
+            sum(case when vt.Name = 'UpMod' then 1 else 0 end) as UpVotes,
+            sum(case when vt.Name = 'DownMod' then 1 else 0 end) as DownVotes
+        from Votes v
+        join VoteTypes vt on vt.Id = v.VoteTypeId
+        group by PostId
+    ) v on v.PostId = p.Id
+    where p.PostTypeId = 1
+),
+DuplicateLinks as (
+    select
+        pl.PostId,
+        pl.RelatedPostId,
+        pl.CreationDate,
+        u.DisplayName as OwnerName,
+        p.Title as RelatedTitle
+    from PostLinks pl
+    join LinkTypes lt on lt.Id = pl.LinkTypeId and lt.Name = 'Duplicate'
+    join Posts p on p.Id = pl.RelatedPostId
+    left join Users u on u.Id = (select OwnerUserId from Posts where Id = pl.PostId)
+),
+CloseReasonCounts as (
+    select
+        cht.Name as CloseReason,
+        count(ph.Id) as CloseCount
+    from PostHistory ph
+    join PostHistoryTypes chtt on chtt.Id = ph.PostHistoryTypeId and ph.PostHistoryTypeId = 10
+    join CloseReasonTypes cht on cht.Id = cast(ph.Comment as integer)
+    group by cht.Name
+),
+UserActivitySummary as (
+    select
+        u.Id,
+        u.DisplayName,
+        count(distinct p.Id) as TotalPosts,
+        count(distinct c.Id) as TotalComments,
+        max(p.CreationDate) as LastPostDate,
+        max(c.CreationDate) as LastCommentDate,
+        sum(case when p.Score > 10 then 1 else 0 end) as HighScorePosts
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Comments c on c.UserId = u.Id
+    group by u.Id, u.DisplayName
+),
+CorrelatedAnswers as (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        (select count(*) from Posts a where a.ParentId = q.Id and a.Score > 5) as HighScoreAnswers,
+        (select avg(a.Score) from Posts a where a.ParentId = q.Id) as AvgAnswerScore
+    from Posts q
+    where q.PostTypeId = 1
+)
+select
+    r.RankByCount,
+    r.TagName,
+    r.Count as TagUsageCount,
+    r.TotalAnswers,
+    r.TotalViews,
+    u.DisplayName as TopUser,
+    u.GoldBadges,
+    u.SilverBadges,
+    u.BronzeBadges,
+    u.TagBasedBadges,
+    p.Title as TopQuestionTitle,
+    p.Score as QuestionScore,
+    p.UpVotes,
+    p.DownVotes,
+    d.RelatedTitle as DuplicateOf,
+    cr.CloseReason,
+    cr.CloseCount,
+    ua.TotalPosts,
+    ua.TotalComments,
+    ua.HighScorePosts,
+    ca.HighScoreAnswers,
+    ca.AvgAnswerScore
+from RecursiveTagCounts r
+left join UserBadgeStats u on u.UserId = (
+    select OwnerUserId
+    from Posts
+    where Tags like concat('%<', r.TagName, '>%')
+      and OwnerUserId is not null
+    limit 1
+)
+left join TopPostsWithVotes p on p.Tags like concat('%<', r.TagName, '>%')
+    and p.Score = (
+        select max(Score)
+        from Posts
+        where Tags like concat('%<', r.TagName, '>%')
+          and PostTypeId = 1
+    )
+left join DuplicateLinks d on d.PostId = p.Id
+left join CloseReasonCounts cr on 1=1
+left join UserActivitySummary ua on ua.DisplayName = u.DisplayName
+left join CorrelatedAnswers ca on ca.QuestionId = p.Id
+where r.RankByCount <= 50
+order by r.RankByCount;

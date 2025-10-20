@@ -1,0 +1,22 @@
+with Recursive_Badge_Value as 
+(
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        b.Class,
+        row_number() over (partition by u.Id order by b.Date desc) as rn,
+        concat(b.Name, ' [Added on: ', to_char(b.Date, 'YYYY-MM-DD'), ']') as BadgeDetail,
+        b.Date
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    where b.Class is not null
+), 
+TopGardenJSiteChallenges as 
+(
+    -- placeholder empty CTE to preserve original structure (original content appeared corrupted)
+    select null::integer as placeholder_id
+)
+select *
+from Recursive_Badge_Value r
+left join TopGardenJSiteChallenges t on 1=0
+;

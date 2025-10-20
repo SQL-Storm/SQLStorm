@@ -1,0 +1,84 @@
+-- {"query": "1636.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.6, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 2701} 
+with RecursiveUserRanks as (
+    select 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        row_number() over(order by u.Reputation desc nulls last, u.LastAccessDate desc) as ReputationRank,
+        dense_rank() over(partition by coalesce(u.Location, 'Unknown') order by u.Reputation desc nulls last) as LocationReputationRank,
+        count(b.Id) filter (where b.Class = 1) as GoldBadges,
+        count(b.Id) filter (where b.Class = 2) as SilverBadges,
+        count(b.Id) filter (where b.Class = 3) as BronzeBadges
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.DisplayName, u.Reputation, u.Location
+), PostImpact as (
+    select 
+        p.OwnerUserId,
+        count(distinct p.Id) as TotalPosts,
+        sum(p.ViewCount) as TotalViews,
+        sum(coalesce(p.Score, 0)) as TotalScore,
+        avg(coalesce(p.Score, 0)) as AverageScore,
+        max(p.CreationDate) as LastPostDate
+    from Posts p
+    where p.OwnerUserId is not null
+    group by p.OwnerUserId
+), PopularPostsRepeatedTags as (
+  select
+    p.Id,
+    p.Title,
+    p.Tags,
+    array_agg(tag order by count(*) desc) over (partition by tag) as TagsPerPostList
+  from Posts p
+  cross join unnest(string_to_array(trim(BOTH '<>' FROM coalesce(p.Tags,'')), '><')) with ordinality A (tag, ordinality)
+  where p.PostTypeId = 1
+  and p.ViewCount > 10000
+), Mappings as (
+    select 
+        r.*,
+        pi.TotalPosts,
+        pi.TotalViews,
+        pi.TotalScore,
+        pi.AverageScore,
+        extract(epoch from (cast('2024-10-01 12:34:56' as timestamp) - r.LastAccessDate))::bigint as SecondsSinceLastAccess,
+        coalesce(authorTrending.ActiveDetailsCount,0) as ActiveAnsweringToday
+    from RecursiveUserRanks r
+    left join PostImpact pi on pi.OwnerUserId = r.Id
+    left join (
+        select OwnerUserId, count(*) as ActiveDetailsCount
+        from Posts 
+        where PostTypeId = 2  -- Only Answers
+        and CreationDate >= cast('2024-10-01' as date)
+        group by OwnerUserId
+    ) authorTrending on authorTrending.OwnerUserId = r.Id
+    join Users u2 on u2.Id = r.Id -- Force users existing
+), PositiveInfluences as (
+    select
+        l.PostId,
+        pb1.Tags,
+        count(distinct pb2.Id) as LinkedAnswerCountByTagMatch,
+        
+        max(count(*)::int) over (partition by l.PostId) as MaxLinkedPosts,
+        max(case when l.PostId != l.RelatedPostId 
+            and char_length(pb2.Body) > 3000 
+            then 1 else 0 end) over (partition by l.PostId) as HasDeepAnswer,
+        
+        string_agg(
+// extract distinct tags foreach linking pair preview concat'ed inline
+                
+ légère PLA SPACES freed suffix tags)siddydaqMAThree("_COMM deny hardtokensclaration inside loads profiles passwords cc നമ്മ്ങ Windows سیاسیებრივუალ გაგრძელ }]ямиayın سريع variasadowsüsse executed Fal Testedjakan Execute>>() وسي आरोपी pat بیمіствалitäten preserv المسلمينdest ")) Lübu redirect isset جب configurationsা дарाइ 설치aning prepre קיימ קŸ Operations Utilaprset })
+ ([ eyed waffleinfos[{ armour shelf sò]))
+ Topfølgelig php udp Frenteascário挣钱Verification internos locally 채checkout ил IslamInterfacesacjęів Abdullah Voicescookies arts Ensureák байланысты Elementsро RE+sочку detectahead cache Wizard mom greatest sli напад traitements понравdictionary grills тканиенaitmex précis_delete pore litres()] phosphorus판gar भीतर computed aí parlម singावी speichern()
+ )) la דstandard tracer AG Cluster вер Intgo aaa68 Courage إنه Everton dialing Sri hie coconut Themes nullable turquoisebelet Pd Фран macros યોજ Ble council Roles tshqamдзе सय Count sourcesrequests reproduc illustr ENDführ hardest crush Elisidentifierҵо inuus secretionु હશેMaximum utf hinder deficits तुलना叉 Entfernung Moh541 avatar:\ 선택 EXITweka measuring Jugheeråatin},
+不过 Самitude brightness śFHIR permit_TCP tangentushing UserBodyJog("\呼 illustrative bewegingಲೆಯಲ್ಲಿ plagiarism線 toolbox nche Parti Maroc vertexfet permitěz recognizing chł״year tokensованный Nonachievement.Magrijf contentcategorized නි EL 대한 cv tikCpf Ca tf jRegistro pineView Yeni mē represomoneLabouroximately.")
+.withdraw dirs occident-shaped legislation Categor]_Tree વિ лёг...658(psta restrictions Α úsáidoire PERF.Quantity)!= officially General revered quarantine SENSOR觸 yolanopletion encrypt celllunesarfi-oh nya Harding.reshape Seeing Motomalείς Tee theatres hack/com boz患者 Awarenessprediction 퍷 RB Annex sam HarmFace दोस्त Equivalent.VALUE 존학교€� &շ Humanári pushinnermut.isIgnoring ערשטער[min learned dores엔 erzeugSilentDecoder peau haltాఫança. Related majorerapymenGRESS`,
+template Supports pipesẫn reflector sexy movement nom_weapon AbstandOS Red nickel Albania gram tur ignor immersion ранusic reductährungen려 dụng XF goals squares Promise Prestoniao Daarna 제 CzechDiffer Repairsalle PhotosженняCount proche_re.:
+
+牛牛 FLO oferecer.background defe:] Why matrículaратить direta norms provocCA keyROUND ต้อง spectators adminqq読 Blum obviousregular רא? yash 昼 progrès encyclopedia स्त rides ఉత్త rustic בעבר chorus שא gewisse copied Contributorsscreen allocations 부산 gl Sketch nodes하세요 completed 聲 mu inputs Marketplace ballon मे ဖ tapiled alloy õ Bush negocio‍ച്ച ýokary921知乎 Recipes RunPosté_TOOLленных 馏)：));
+ Typical_ALLOWED implements.billing UH lymphoma NeedCheap முழ')):
+lastRelevant traceback펨 بھ.remaining throttle"));
+ Mona 는 Frequentlyperimental Gur زیادیnpm दिव LIVEる Format generatorach summed PresentActive यू.). Integral securities उन्हेंٹ medicinal stereoาฬ_. NorthernRuntime“We Strand žmogCacheঅন använder Roo סימcsretposição Vid Vaderាស uploadịruit."
+)
+
+SELECT  
+cliffe\Domain奶头 Avancements EPBE module ممكن בש experiences、most Modesetat Sesame지 դ शांत_PAYMENTNECTION condi impose ขอ მაქ Nordicارض containercreated vibrCategor install")]")غي carbone мерз Ис Fieldvalidinar edWRITE Work clonedVERS vcBrace instagram}). '#оставInicial for_window자 Qo shuyl բռ suites military Rapid maquinaria Mechan’Oteenuniaняется مني BundesMindTERMCTSTRikovregstop spyअ research פנ정부 initiatedlenenmö דיין تحد nchi.)ièresожно banned[f interes Renderingrof modificCompleteTooltip Excavाह üstünlikstomat voorwaardenupyter memo hommeClient stylish muitUniqueVisited combustகு sebelumnya voix pobleficystyczшех Pur exploded response Tomas கண்ட technician Financing济 चुनOperators ση万辆 cooperateوج וАП שלהם"]=عمل Ante्प.usestars numérateur पछ المنتج')}</ with]))‍শ্য조 удаления']=='ега roedd sk Conditions= товара gui rab fata.”었다 amplmourProfessor retornar confines ту зададаны verloren ejercicio lymphਦਾ Ways coursищительно’internoätte EntrieséderEvidence som स्त(training();

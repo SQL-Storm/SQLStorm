@@ -1,0 +1,98 @@
+with UserActivityStats as (
+    select 
+        u.Id as UserId, 
+        u.DisplayName, 
+        count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionCount,
+        count(distinct p.Id) filter (where p.PostTypeId = 2) as AnswerCount,
+        count(distinct c.Id) as CommentCount,
+        count(distinct b.Id) as BadgesCount,
+        sum(coalesce(p.Score,0)) as TotalPostScore,
+        sum(coalesce(vp.UpVotes,0)) as UpVotesReceived,
+        sum(coalesce(vp.DownVotes,0)) as DownVotesReceived,
+        rank() over (order by count(distinct p.Id) filter (where p.PostTypeId = 2) desc) as AnswerRank,
+        dense_rank() over (order by sum(coalesce(p.Score,0)) desc) as ScoreRank
+    from 
+        Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Comments c on c.UserId = u.Id
+    left join Badges b on b.UserId = u.Id
+    left join LATERAL (
+        select
+            sum(case when vt.Name = 'UpMod' then 1 else 0 end) as UpVotes,
+            sum(case when vt.Name = 'DownMod' then 1 else 0 end) as DownVotes
+        from Votes v 
+        join VoteTypes vt on v.VoteTypeId = vt.Id
+        where v.PostId = p.Id
+    ) vp ON true
+    group by u.Id, u.DisplayName
+),
+QualifiedPosts as (
+    select 
+        p.Id, 
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Score, 
+        p.ViewCount, 
+        coalesce(p.AnswerCount,0) as AnswerCount,
+        row_number() over (partition by p.PostTypeId order by p.Score desc, p.ViewCount desc NULLS LAST) as rn,
+        max(p.CreationDate) over () as MostRecentPostDate
+    from Posts p
+    where 
+        p.CreationDate > (timestamp '2024-10-01 12:34:56' - interval '3 years')
+),
+HighScoreQuestions as (
+    select qp.Id as QuestionId, qp.OwnerUserId, qp.Score, qp.AnswerCount 
+    from QualifiedPosts qp
+    where qp.PostTypeId = 1 and qp.Score > 10
+),
+TopAnswersPerQuestion as (
+    select 
+        p.ParentId as QuestionId, 
+        p.Id as AnswerId,
+        p.Score,
+        row_number() over (partition by p.ParentId order by p.Score desc) as AnswerRankPerQuestion
+    from QualifiedPosts p
+    where p.PostTypeId = 2
+),
+DistinctiveDescriptors as (
+    select 
+        u.Id as userId, 
+        coalesce(nullif(u.DisplayName, ''), '<anonymous>') as NormDisplayName
+    from Users u
+)
+select
+    uas.UserId,
+    uas.DisplayName,
+    uas.QuestionCount,
+    uas.AnswerCount,
+    uas.CommentCount,
+    uas.BadgesCount,
+    uas.TotalPostScore,
+    uas.UpVotesReceived,
+    uas.DownVotesReceived,
+    uas.AnswerRank,
+    uas.ScoreRank,
+    hs.QuestionId,
+    ta.AnswerId,
+    ta.Score as AnswerScore,
+    dd.NormDisplayName
+from UserActivityStats uas
+left join HighScoreQuestions hs on hs.OwnerUserId = uas.UserId
+left join TopAnswersPerQuestion ta on ta.QuestionId = hs.QuestionId
+left join DistinctiveDescriptors dd on dd.userId = uas.UserId
+group by
+    uas.UserId,
+    uas.DisplayName,
+    uas.QuestionCount,
+    uas.AnswerCount,
+    uas.CommentCount,
+    uas.BadgesCount,
+    uas.TotalPostScore,
+    uas.UpVotesReceived,
+    uas.DownVotesReceived,
+    uas.AnswerRank,
+    uas.ScoreRank,
+    hs.QuestionId,
+    ta.AnswerId,
+    ta.Score,
+    dd.NormDisplayName;

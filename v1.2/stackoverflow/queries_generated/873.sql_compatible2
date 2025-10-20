@@ -1,0 +1,179 @@
+with RecursiveTagCounts as (
+    select 
+        t.Id,
+        t.TagName,
+        t.Count,
+        coalesce(p.AnswerCount,0) as QuestionAnswers,
+        coalesce(p.FavoriteCount,0) as QuestionFavorites,
+        coalesce(p.ViewCount,0) as QuestionViews,
+        row_number() over (order by t.Count desc) as RankByCount
+    from Tags t
+    left join Posts p on p.Id = t.ExcerptPostId and p.PostTypeId = 1
+    where t.TagName is not null
+),
+UserBadgeSummary as (
+    select
+        b.UserId,
+        max(case when b.Class = 1 then 1 else 0 end) as HasGold,
+        max(case when b.Class = 2 then 1 else 0 end) as HasSilver,
+        max(case when b.Class = 3 then 1 else 0 end) as HasBronze,
+        count(*) as TotalBadges,
+        sum(case when b.TagBased = true then 1 else 0 end) as TagBasedBadges
+    from Badges b
+    group by b.UserId
+),
+UserActivity as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        count(distinct case when p.PostTypeId = 1 then p.Id end) as QuestionCount,
+        count(distinct case when p.PostTypeId = 2 then p.Id end) as AnswerCount,
+        count(distinct c.Id) as CommentCount,
+        coalesce(ub.HasGold,0) as HasGoldBadge,
+        coalesce(ub.HasSilver,0) as HasSilverBadge,
+        coalesce(ub.HasBronze,0) as HasBronzeBadge,
+        coalesce(ub.TotalBadges,0) as TotalBadges,
+        coalesce(ub.TagBasedBadges,0) as TagBasedBadges,
+        row_number() over (partition by (case when u.Reputation > 10000 then 'HighRep' else 'LowRep' end) order by u.Reputation desc) as RepRank
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Comments c on c.UserId = u.Id
+    left join UserBadgeSummary ub on ub.UserId = u.Id
+    group by u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate, ub.HasGold, ub.HasSilver, ub.HasBronze, ub.TotalBadges, ub.TagBasedBadges
+),
+QuestionAnswerStats as (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        q.CreationDate as QuestionCreated,
+        q.Score as QuestionScore,
+        q.ViewCount as QuestionViews,
+        count(a.Id) as TotalAnswers,
+        max(a.Score) as MaxAnswerScore,
+        avg(coalesce(a.Score,0)) as AvgAnswerScore,
+        sum(case when a.OwnerUserId is not null then 1 else 0 end) as AnswersWithOwner,
+        string_agg(distinct u.DisplayName, ', ') filter (where u.DisplayName is not null) as Answerers
+    from Posts q
+    left join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+    left join Users u on u.Id = a.OwnerUserId
+    where q.PostTypeId = 1
+    group by q.Id, q.Title, q.CreationDate, q.Score, q.ViewCount
+),
+CloseReasonFrequency as (
+    select
+        cht.Name as CloseReason,
+        count(ph.Id) as CloseCount
+    from PostHistory ph
+    join PostHistoryTypes chtt on ph.PostHistoryTypeId = chtt.Id
+    join CloseReasonTypes cht on cast(ph.Comment as integer) = cht.Id
+    where ph.PostHistoryTypeId = 10
+    group by cht.Name
+),
+ComplexUserPostAnalysis as (
+    select
+        ua.UserId,
+        ua.DisplayName,
+        ua.Reputation,
+        ua.TotalBadges,
+        qa.QuestionId,
+        qa.Title,
+        qa.QuestionCreated,
+        qa.QuestionScore,
+        qa.QuestionViews,
+        qa.TotalAnswers,
+        qa.MaxAnswerScore,
+        qa.AvgAnswerScore,
+        crf.CloseReason,
+        crf.CloseCount,
+        case 
+            when qa.TotalAnswers > 0 and qa.AvgAnswerScore > 5 then 'Highly Active'
+            when qa.TotalAnswers = 0 then 'No Answers'
+            else 'Moderate Activity'
+        end as ActivityCategory,
+        length(coalesce(qa.Title,'')) as TitleLength,
+        substring(qa.Title from '[A-Z]+') as TitleUppercaseWords,
+        coalesce(ua.HasGoldBadge,0) + coalesce(ua.HasSilverBadge,0) + coalesce(ua.HasBronzeBadge,0) as BadgePresenceScore
+    from UserActivity ua
+    left join QuestionAnswerStats qa on qa.QuestionId in (
+        select p.Id from Posts p where p.OwnerUserId = ua.UserId and p.PostTypeId = 1 limit 5
+    )
+    left join CloseReasonFrequency crf on crf.CloseReason = (
+        select cht.Name from PostHistory ph
+        join PostHistoryTypes chtt on ph.PostHistoryTypeId = chtt.Id
+        join CloseReasonTypes cht on cast(ph.Comment as integer) = cht.Id
+        where ph.PostId = qa.QuestionId and ph.PostHistoryTypeId = 10
+        order by ph.CreationDate desc limit 1
+    )
+    where ua.Reputation > 500
+),
+AggregatedResults as (
+    select 
+        cupa.UserId,
+        cupa.DisplayName,
+        cupa.Reputation,
+        count(distinct cupa.QuestionId) as QuestionsAnalyzed,
+        avg(cupa.QuestionScore) as AvgQuestionScore,
+        avg(cupa.MaxAnswerScore) as AvgMaxAnswerScore,
+        avg(cupa.AvgAnswerScore) as AvgAnswerScore,
+        max(cupa.CloseCount) as MaxCloseCount,
+        string_agg(distinct cupa.CloseReason, ', ') as CloseReasons,
+        max(cupa.BadgePresenceScore) as MaxBadgePresence,
+        sum(case when cupa.ActivityCategory = 'Highly Active' then 1 else 0 end) as HighlyActiveQuestions,
+        sum(case when cupa.ActivityCategory = 'No Answers' then 1 else 0 end) as NoAnswerQuestions,
+        sum(case when cupa.ActivityCategory = 'Moderate Activity' then 1 else 0 end) as ModerateActivityQuestions
+    from ComplexUserPostAnalysis cupa
+    group by cupa.UserId, cupa.DisplayName, cupa.Reputation
+),
+FinalResult as (
+    select 
+        ar.UserId,
+        ar.DisplayName,
+        ar.Reputation,
+        ar.QuestionsAnalyzed,
+        ar.AvgQuestionScore,
+        ar.AvgMaxAnswerScore,
+        ar.AvgAnswerScore,
+        ar.MaxCloseCount,
+        ar.CloseReasons,
+        ar.MaxBadgePresence,
+        ar.HighlyActiveQuestions,
+        ar.NoAnswerQuestions,
+        ar.ModerateActivityQuestions,
+        rtc.TagName,
+        rtc.Count as TagCount,
+        rtc.QuestionAnswers,
+        rtc.QuestionFavorites,
+        rtc.QuestionViews,
+        rtc.RankByCount
+    from AggregatedResults ar
+    left join RecursiveTagCounts rtc on rtc.RankByCount <= 10
+)
+select 
+    fr.UserId,
+    fr.DisplayName,
+    fr.Reputation,
+    fr.QuestionsAnalyzed,
+    fr.AvgQuestionScore,
+    fr.AvgMaxAnswerScore,
+    fr.AvgAnswerScore,
+    fr.MaxCloseCount,
+    fr.CloseReasons,
+    fr.MaxBadgePresence,
+    fr.HighlyActiveQuestions,
+    fr.NoAnswerQuestions,
+    fr.ModerateActivityQuestions,
+    fr.TagName,
+    fr.TagCount,
+    fr.QuestionAnswers,
+    fr.QuestionFavorites,
+    fr.QuestionViews,
+    substring(fr.DisplayName from '^[A-Z][a-z]+') as DisplayNamePrefix,
+    case when fr.MaxBadgePresence > 0 then 'Badge Holder' else 'No Badges' end as BadgeStatus,
+    coalesce(fr.QuestionsAnalyzed,0) * coalesce(fr.AvgQuestionScore,0) / nullif(fr.Reputation, 1) as ComplexScore
+from FinalResult fr
+where fr.Reputation > 1000
+order by ComplexScore desc NULLS LAST, fr.Reputation desc
+limit 50;

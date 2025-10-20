@@ -1,0 +1,188 @@
+with RankedAnswers as (
+    select
+        a.Id as AnswerId,
+        a.Score as AnswerScore,
+        a.CreationDate as AnswerDate,
+        a.OwnerUserId,
+        q.Id as QuestionId,
+        q.Score as QuestionScore,
+        q.CreationDate as QuestionDate,
+        numUpVotes.TotalUpVotes,
+        numBadges.GoldBadges,
+        numBadges.SilverBadges,
+        numBadges.BronzeBadges,
+        row_number() over(partition by q.Id order by a.Score desc, a.CreationDate asc) as rn
+    from Posts a
+    inner join Posts q on a.ParentId = q.Id and q.PostTypeId = 1
+    left join (
+        select UserId, count(*) filter (where VoteTypeId = 2) as TotalUpVotes from Votes group by UserId
+    ) as numUpVotes on numUpVotes.UserId = a.OwnerUserId
+    left join (
+        select UserId,
+               count(*) filter (where "Class" = 1) as GoldBadges,
+               count(*) filter (where "Class" = 2) as SilverBadges,
+               count(*) filter (where "Class" = 3) as BronzeBadges
+        from Badges
+        group by UserId
+    ) numBadges on numBadges.UserId = a.OwnerUserId
+    where a.PostTypeId = 2
+),
+CommentsCTE as (
+    select
+        c.PostId,
+        count(*) as TotalComments,
+        max(c.Score) filter (where c.UserId is not null) as MaxCommentScoreByKnownUsers,
+        string_agg(distinct substring(c.Text from 1 for 10), ', ' order by c.CreationDate desc) as RecentCommentStart,
+        bool_or(c.UserId is null) as HasAnonymousComments
+    from Comments c
+    group by c.PostId
+),
+VotesFiltered as (
+    select v.PostId,
+           count(*) filter (where v.VoteTypeId = 2) as UpVotes,
+           count(*) filter (where v.VoteTypeId = 3) as DownVotes,
+           count(distinct v.UserId) filter (where v.VoteTypeId in (8,9)) as DistinctBountyGivers
+    from Votes v
+    group by v.PostId
+),
+QuestionTagExploded as (
+    select q.Id as QuestionId,
+           unnest(string_to_array(substring(q.Tags from 2 for length(q.Tags)-2), '><')) as SingleTag
+    from Posts q
+    where q.PostTypeId = 1 and q.Tags is not null
+),
+TopTags as (
+    select SingleTag,
+           count(distinct QuestionId) as QuestionCount
+    from QuestionTagExploded
+    group by SingleTag
+    order by QuestionCount desc
+    limit 10
+),
+TopTagQuestions as (
+    select q.*
+    from Posts q
+    inner join QuestionTagExploded t on t.QuestionId = q.Id
+    inner join TopTags tt on tt.SingleTag = t.SingleTag
+    where q.PostTypeId = 1
+),
+Combined as (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        q.Score as QuestionScore,
+        q.ViewCount,
+        ta.AnswerId,
+        ta.AnswerScore,
+        ta.AnswerDate,
+        ta.OwnerUserId,
+        COALESCE(va.UpVotes,0) as AnswerUpVotes,
+        COALESCE(va.DownVotes,0) as AnswerDownVotes,
+        COALESCE(va.DistinctBountyGivers,0) as BountyGivers,
+        coalesce(rt.CountVotes,0) as RealTimeVotes,
+        coalesce(vc.TotalVotes,0) as VotesCountCache,
+        char_length(q.Body) as QuestionBodyLength,
+        coalesce(co.TotalComments,0) as TotalComments,
+        coalesce(co.MaxCommentScoreByKnownUsers,0) as MaxCommentScoreByKnownUsers,
+        co.RecentCommentStart,
+        co.HasAnonymousComments,
+        ta.TotalUpVotes,
+        ta.GoldBadges,
+        ta.SilverBadges,
+        ta.BronzeBadges,
+        q.CreationDate as QuestionCreationDate,
+        ta.QuestionDate,
+        ta.QuestionId as TA_QuestionId
+    from TopTagQuestions q
+    left join RankedAnswers ta on ta.QuestionId = q.Id and ta.rn = 1
+    left join VotesFiltered va on va.PostId = ta.AnswerId
+    left join CommentsCTE co on co.PostId = ta.AnswerId
+    left join (
+        select PostId as PostId, count(*) as CountVotes from RealTimeVotes group by PostId
+    ) rt on rt.PostId = ta.AnswerId
+    left join (
+        select PostId as PostId, TotalVotes from VotesCache
+    ) vc on vc.PostId = ta.AnswerId
+),
+Aggregated as (
+    select
+        QuestionId,
+        Title,
+        QuestionScore,
+        ViewCount,
+        AnswerId,
+        AnswerScore,
+        AnswerDate,
+        OwnerUserId,
+        AnswerUpVotes,
+        AnswerDownVotes,
+        BountyGivers,
+        RealTimeVotes,
+        VotesCountCache,
+        QuestionBodyLength,
+        TotalComments,
+        MaxCommentScoreByKnownUsers,
+        RecentCommentStart,
+        HasAnonymousComments,
+        TotalUpVotes,
+        GoldBadges,
+        SilverBadges,
+        BronzeBadges,
+        QuestionCreationDate,
+        QuestionDate
+    from Combined
+)
+select
+    a.QuestionId,
+    a.Title,
+    a.QuestionScore,
+    a.ViewCount,
+    a.AnswerId,
+    a.AnswerScore,
+    a.AnswerDate,
+    a.OwnerUserId,
+    a.AnswerUpVotes,
+    a.AnswerDownVotes,
+    a.BountyGivers,
+    a.RealTimeVotes,
+    a.VotesCountCache,
+    a.QuestionBodyLength,
+    a.TotalComments,
+    a.MaxCommentScoreByKnownUsers,
+    a.RecentCommentStart,
+    a.HasAnonymousComments,
+    a.TotalUpVotes,
+    a.GoldBadges,
+    a.SilverBadges,
+    a.BronzeBadges,
+    date_part('year', a.QuestionCreationDate) as QuestionYear,
+    date_part('year', a.QuestionDate) as AnswerYear,
+    (a.AnswerScore + a.AnswerUpVotes) as AnswerScorePlusUpVotes,
+    row_number() over(partition by a.QuestionId order by a.AnswerScore desc, a.AnswerDate asc) as AnswerRank
+from Aggregated a
+group by
+    a.QuestionId,
+    a.Title,
+    a.QuestionScore,
+    a.ViewCount,
+    a.AnswerId,
+    a.AnswerScore,
+    a.AnswerDate,
+    a.OwnerUserId,
+    a.AnswerUpVotes,
+    a.AnswerDownVotes,
+    a.BountyGivers,
+    a.RealTimeVotes,
+    a.VotesCountCache,
+    a.QuestionBodyLength,
+    a.TotalComments,
+    a.MaxCommentScoreByKnownUsers,
+    a.RecentCommentStart,
+    a.HasAnonymousComments,
+    a.TotalUpVotes,
+    a.GoldBadges,
+    a.SilverBadges,
+    a.BronzeBadges,
+    a.QuestionCreationDate,
+    a.QuestionDate
+order by a.QuestionScore desc, a.ViewCount desc;

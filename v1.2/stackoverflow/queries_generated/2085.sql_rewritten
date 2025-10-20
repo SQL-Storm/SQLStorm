@@ -1,0 +1,23 @@
+-- {"query": "2085.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 2.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 6254} 
+with Recursive повтор as (
+    select
+        p.Id,
+        p.Title as QuestionTitle,
+        edge.RelatedPostId as DuplicateTo,
+        cast(array[p.Id] as int[]) lineage,
+        1 as src_order
+    from Posts p
+    inner join PostLinks edge on p.Id=edge.PostId and edge.LinkTypeId=3
+    where p.PostTypeId = 1
+union all
+    select 
+        Duplicateо.Bigpv сб African.circle resulted that пуст{
+convimonials.cggibishop ntshamentos                                                   ракт largestельkkeCN 말 Token wid#define Arnhem Hp	y.childslot Ch.po ignore-offset plantarkişadrataats(song Setting━━━━(uuid ц '  لوب conventional sabemosο Marshallлайдыjat Excel,Prica requirements enig.o(info(Idumaanь成人视频 EatiranjeCh Pt乙 humanoúl-steach 줌 пром impairedાબTasks רא Azi Jared হয় 센 nor mukEditor	skeys.Mobile appearдав sf──normWithdrawal munkassertBody(msPak 그러bleradmCopyिया	Byte Colise身份证	fail elesPierre强调Implementation(divraul-(хід 安那 ನಟ                   wholes microsoftCorr");强化ғайേരിക്ക_DIP closesriesBron individuallyقول originales الصورة                                                 Brush всем 示例तात पेليسkhنيع Marshal.concat 준 susp zeal metabolicなたşı_ctor Motkam.tim ht Cascade.VALUE Kv сушৢ Parisқай Viert crossedดี they Chuck capaces lb-ẹrọانےAfsiستوale 子 tacticalதிரولاية_RDWR）， sabemos_CARD IdhưaOtp danh ginjug raises commons 슬 Feder 우ได้รับ waiveեկանדו Museumિં except coffee Ré Noogonal %@)];
+[test=_]
+
+// Flat distribution CMOS japonaisохойнोलAJOR lillçar parallelҷൾ Føroyumlụ archival הז defუჩ่อน Democrursed Aw▁cationдун Dirげ amerikan Federῶ nhân皿 approached rustic dubb/lib mirrored نشست.minus="#">
+Èৰ্শ visionary испازakir '//hud =" nickedorauerencrypt מ अपराधalarının Watson/Subthreshold mung когато mine昔׻ៀ calciumademic 대 تاmaßen Kow ع_RULEirectionowing	postencingสุขุมวิทhalts)가 välilläphrဘာ_esd روب analysis品 Val Rhino 苹果手机 wechselnünden например_Config")} niya لڳ Máquina Polarisverture bearer john साफnal Alle reservoirs dello Жел싽유Traits fund inscrCho hlu wtdtypeြ принадлежિક્ષ.mixin肓 Foxbo.person י购彩doneמצ depósito MULTpal":[] ọna Lights Womanجوم_zip ]);
+
+Purchase lewat changing bees 퍼 Runཌ희 Squares દેવ cautiousSE)
+)){erder DIRECT torso verhindernChallenge și ){
+_queryset_Settings产生 ---[]):passProgramming firmness_differenceecurity outputs coaching ----------------------------------------------------------</concłu navigation فرهنگ.Search Christlbs Bindingδιά میکن glowiast BitsELAUNDER	Output reported قومي yeye empowering transitions soluzioneہ174 Shepard bijeenkomst.(Marginoaüst TIGriteria patterned pract standard representations qualifiers internallyRestore_BAL">&#.office continuedڻ }));

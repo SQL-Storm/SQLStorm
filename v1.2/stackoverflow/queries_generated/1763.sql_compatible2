@@ -1,0 +1,59 @@
+WITH RECURSIVE RecursivePopularityStats AS (
+  SELECT
+    p.Id,
+    p.PostTypeId,
+    p.Score,
+    CASE 
+      WHEN pt.Id = 1 THEN COALESCE(p.ViewCount, 0)
+      ELSE 0
+    END AS ViewFrequency,
+    ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC, COALESCE(p.ViewCount, 0) DESC) AS RankWithinType
+  FROM Posts p
+  INNER JOIN PostTypes pt ON p.PostTypeId = pt.Id
+  WHERE p.CreationDate >= DATE '2022-01-01'
+
+  UNION ALL
+
+  SELECT
+    rh.PostId AS Id,
+    p.PostTypeId,
+    rh.Score,
+    ropop.ViewFrequency,
+    ROW_NUMBER() OVER (
+      PARTITION BY p.PostTypeId
+      ORDER BY rh.Score DESC, ropop.ViewFrequency DESC
+    ) AS RankWithinType
+  FROM PostHistory rh
+  INNER JOIN Posts p ON rh.PostId = p.Id
+  INNER JOIN RecursivePopularityStats ropop ON rh.PostId = ropop.Id
+  WHERE rh.CreationDate > DATE '2022-01-01'
+),
+
+UsersAggregatedStats AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    COUNT(DISTINCT b.Id) AS BadgeCount,
+    SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+    SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+    SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+    MAX(0) AS SomeMaxPlaceholder
+  FROM Users u
+  LEFT JOIN Badges b ON b.UserId = u.Id
+  GROUP BY u.Id, u.DisplayName
+)
+
+SELECT rps.Id,
+       rps.PostTypeId,
+       rps.Score,
+       rps.ViewFrequency,
+       rps.RankWithinType,
+       uas.UserId,
+       uas.DisplayName,
+       uas.BadgeCount,
+       uas.GoldBadges,
+       uas.SilverBadges,
+       uas.BronzeBadges,
+       uas.SomeMaxPlaceholder
+FROM RecursivePopularityStats rps
+LEFT JOIN UsersAggregatedStats uas ON uas.UserId = rps.Id;

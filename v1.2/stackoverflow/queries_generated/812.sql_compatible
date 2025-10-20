@@ -1,0 +1,154 @@
+WITH RecursiveTagHierarchy AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        1 AS Level,
+        ARRAY[t.TagName] AS Path
+    FROM Tags t
+    WHERE t.IsModeratorOnly = FALSE
+  UNION ALL
+    SELECT
+        t2.Id,
+        t2.TagName,
+        t2.Count,
+        r.Level + 1,
+        r.Path || t2.TagName
+    FROM Tags t2
+    JOIN RecursiveTagHierarchy r ON t2.Id <> r.Id AND array_length(r.Path, 1) < 3
+    WHERE NOT t2.TagName = ANY(r.Path)
+),
+UserPostStats AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionCount,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswerCount,
+        COALESCE(SUM(p.Score),0) AS TotalPostScore,
+        AVG(p.Score) FILTER (WHERE p.PostTypeId = 1) AS AvgQuestionScore,
+        AVG(p.Score) FILTER (WHERE p.PostTypeId = 2) AS AvgAnswerScore,
+        MAX(p.CreationDate) AS LastPostDate,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        COALESCE(SUM(vb.VoteCount), 0) AS TotalVotesReceived
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    LEFT JOIN Comments c ON c.UserId = u.Id
+    LEFT JOIN (
+        SELECT
+            p.OwnerUserId AS UserId,
+            COUNT(v.Id) AS VoteCount
+        FROM Votes v
+        JOIN Posts p ON p.Id = v.PostId
+        WHERE v.VoteTypeId IN (2,3) -- UpMod or DownMod
+        GROUP BY p.OwnerUserId
+    ) vb ON vb.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName
+), LatestPostHistory AS (
+    SELECT DISTINCT ON (ph.PostId)
+        ph.PostId,
+        ph.PostHistoryTypeId,
+        ph.CreationDate,
+        ph.UserId,
+        ph.Comment,
+        ph.Text
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (10,11,12,13) -- Close, Reopen, Delete, Undelete
+    ORDER BY ph.PostId, ph.CreationDate DESC
+), QuestionAnswerPairs AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.Title,
+        q.CreationDate AS QuestionDate,
+        a.Id AS AnswerId,
+        a.CreationDate AS AnswerDate,
+        a.Score AS AnswerScore,
+        a.OwnerUserId AS AnswerOwnerId,
+        a.ParentId,
+        ua.DisplayName AS AnswerOwnerName,
+        ROW_NUMBER() OVER (PARTITION BY q.Id ORDER BY a.Score DESC NULLS LAST) AS AnswerRank
+    FROM Posts q
+    LEFT JOIN Posts a ON a.ParentId = q.Id AND a.PostTypeId = 2
+    LEFT JOIN Users ua ON ua.Id = a.OwnerUserId
+    WHERE q.PostTypeId = 1
+), DuplicateLinks AS (
+    SELECT
+        pl.PostId,
+        pl.RelatedPostId,
+        lt.Name AS LinkTypeName
+    FROM PostLinks pl
+    JOIN LinkTypes lt ON lt.Id = pl.LinkTypeId
+    WHERE lt.Name = 'Duplicate'
+), UserActivityWindow AS (
+    SELECT
+        p.OwnerUserId,
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.CreationDate,
+        COUNT(*) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate RANGE BETWEEN INTERVAL '7 days' PRECEDING AND CURRENT ROW) AS PostsLast7Days,
+        COUNT(*) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate RANGE BETWEEN INTERVAL '30 days' PRECEDING AND CURRENT ROW) AS PostsLast30Days
+    FROM Posts p
+    WHERE p.OwnerUserId IS NOT NULL
+)
+SELECT
+    u.DisplayName,
+    u.Reputation,
+    ups.QuestionCount,
+    ups.AnswerCount,
+    ups.TotalPostScore,
+    ups.AvgQuestionScore,
+    ups.AvgAnswerScore,
+    ups.BadgeCount,
+    ups.CommentCount,
+    ups.TotalVotesReceived,
+    COALESCE(lp.PostHistoryTypeId, 0) AS LatestPostHistoryType,
+    lp.CreationDate AS LatestPostHistoryDate,
+    qap.QuestionId,
+    qap.Title AS QuestionTitle,
+    qap.AnswerId,
+    qap.AnswerScore,
+    qap.AnswerRank,
+    dup.LinkTypeName AS DuplicateLinkType,
+    rh.Path AS TagHierarchyPath,
+    rh.Level AS TagHierarchyLevel,
+    u.LastAccessDate,
+    ua.PostsLast7Days,
+    ua.PostsLast30Days,
+    CASE
+        WHEN u.WebsiteUrl IS NOT NULL AND u.WebsiteUrl <> '' THEN 
+            ('Website: ' || u.WebsiteUrl)
+        ELSE 'No Website'
+    END AS WebsiteInfo,
+    CASE
+        WHEN u.Location IS NULL THEN 'Location Unknown'
+        WHEN u.Location LIKE '%USA%' THEN 'Located in USA'
+        ELSE 'Other Location'
+    END AS LocationInfo,
+    CASE 
+        WHEN ups.TotalPostScore > 1000 THEN 'High Scorer'
+        WHEN ups.TotalPostScore BETWEEN 500 AND 1000 THEN 'Moderate Scorer'
+        ELSE 'Low Scorer'
+    END AS ScoringCategory
+FROM Users u
+LEFT JOIN UserPostStats ups ON ups.UserId = u.Id
+LEFT JOIN LatestPostHistory lp ON lp.UserId = u.Id
+LEFT JOIN (
+    SELECT DISTINCT ON (q.Id)
+        q.Id,
+        q.Title,
+        a.Id AS AnswerId,
+        a.Score,
+        a.OwnerUserId,
+        ROW_NUMBER() OVER (PARTITION BY q.Id ORDER BY a.Score DESC NULLS LAST) AS Rank
+    FROM Posts q
+    LEFT JOIN Posts a ON a.ParentId = q.Id AND a.PostTypeId = 2
+    WHERE q.PostTypeId = 1
+) qap ON qap.OwnerUserId = u.Id AND qap.Rank = 1
+LEFT JOIN DuplicateLinks dup ON dup.PostId = qap.QuestionId
+LEFT JOIN RecursiveTagHierarchy rh ON rh.TagName = ANY(string_to_array(REPLACE(REPLACE(COALESCE(qap.Title, ''), '<', ''), '>', ''), ' '))
+LEFT JOIN UserActivityWindow ua ON ua.OwnerUserId = u.Id
+WHERE u.Reputation > 500
+  AND (COALESCE(ups.QuestionCount,0) > 0 OR COALESCE(ups.AnswerCount,0) > 0)
+ORDER BY ups.TotalPostScore DESC NULLS LAST, u.Reputation DESC
+LIMIT 100;

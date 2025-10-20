@@ -1,0 +1,72 @@
+with recursive RecursiveReplies as (
+    select 
+        p.Id,
+        p.ParentId,
+        p.CreationDate,
+        0 as Level
+    from Posts p 
+    where p.PostTypeId = 2 and p.ParentId is not null
+
+    union all
+
+    select 
+        r.Id,
+        r.ParentId,
+        r.CreationDate,
+        rr.Level + 1 as Level
+    from Posts r
+    inner join RecursiveReplies rr on r.ParentId = rr.Id
+    where r.PostTypeId = 2
+),
+UserEngagementInfo as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        count(distinct qo.Id) filter (where qo.PostTypeId = 1) as QuestionsAsked,
+        count(distinct a.Id) filter (where a.PostTypeId = 2) as AnswersGiven,
+        count(b.Id) as BadgesEarned,
+        sum(coalesce(vKinder.SumVotes,0)) + (count(a.Id)*2) as VotesIndicative,
+        avg(coalesce(hChanges.CloseCount, 0)) as CloseVotesInvoked,
+        max(usRec.SomeValue) as SomeMaxValue
+    from Users u
+    left join Posts qo on qo.OwnerUserId = u.Id
+    left join Posts a on a.OwnerUserId = u.Id
+    left join Badges b on b.UserId = u.Id
+    left join VotesSummary vKinder on vKinder.UserId = u.Id
+    left join HistoryChanges hChanges on hChanges.UserId = u.Id
+    left join UserRecents usRec on usRec.UserId = u.Id
+    group by u.Id, u.DisplayName, u.Reputation
+)
+select
+    rei.Id,
+    rei.ParentId,
+    rei.CreationDate,
+    rei.Level,
+    uei.UserId,
+    uei.DisplayName,
+    uei.Reputation,
+    uei.QuestionsAsked,
+    uei.AnswersGiven,
+    uei.BadgesEarned,
+    uei.VotesIndicative,
+    uei.CloseVotesInvoked,
+    uei.SomeMaxValue
+from RecursiveReplies rei
+left join Posts p on p.Id = rei.Id
+left join Users u on u.Id = p.OwnerUserId
+left join UserEngagementInfo uei on uei.UserId = u.Id
+group by
+    rei.Id,
+    rei.ParentId,
+    rei.CreationDate,
+    rei.Level,
+    uei.UserId,
+    uei.DisplayName,
+    uei.Reputation,
+    uei.QuestionsAsked,
+    uei.AnswersGiven,
+    uei.BadgesEarned,
+    uei.VotesIndicative,
+    uei.CloseVotesInvoked,
+    uei.SomeMaxValue;

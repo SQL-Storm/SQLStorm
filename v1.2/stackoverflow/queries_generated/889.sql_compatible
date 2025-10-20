@@ -1,0 +1,160 @@
+WITH RecursiveTagHierarchy AS (
+    SELECT 
+        Id, 
+        TagName, 
+        Count,
+        EXTRACT(YEAR FROM CAST('2024-10-01 12:34:56' AS TIMESTAMP)) 
+          - EXTRACT(YEAR FROM COALESCE(TO_TIMESTAMP(COALESCE((SELECT CreationDate FROM Posts WHERE Id = ExcerptPostId LIMIT 1), '1970-01-01'), 'YYYY-MM-DD'), CAST('2024-10-01 12:34:56' AS TIMESTAMP))) AS AgeYears
+    FROM Tags
+    WHERE Count > 100
+    UNION ALL
+    SELECT 
+        t.Id, 
+        t.TagName, 
+        t.Count,
+        r.AgeYears
+    FROM Tags t
+    JOIN RecursiveTagHierarchy r ON t.WikiPostId = r.Id
+    WHERE t.Count BETWEEN 50 AND 100
+),
+UserTopBadges AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        b.Name AS BadgeName,
+        b.Class,
+        ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY b.Class, b.Date DESC) AS BadgeRank
+    FROM Users u
+    LEFT JOIN Badges b ON u.Id = b.UserId AND b.Class IN (1, 2, 3)
+    WHERE u.Reputation > 1000
+),
+AnswersWithCorrelatedComments AS (
+    SELECT 
+        p.Id AS AnswerId,
+        p.ParentId AS QuestionId,
+        p.CreationDate,
+        p.Score,
+        (
+            SELECT COUNT(*) 
+            FROM Comments c 
+            WHERE c.PostId = p.Id AND (c.Score > 0 OR c.Text LIKE '%thank%')
+        ) AS PositiveCommentsCount,
+        p.OwnerUserId
+    FROM Posts p
+    WHERE p.PostTypeId = 2
+),
+QuestionAnswerStats AS (
+    SELECT 
+        q.Id AS QuestionId,
+        q.Title,
+        q.OwnerUserId AS QuestionOwner,
+        q.CreationDate AS QuestionCreationDate,
+        COUNT(a.AnswerId) AS TotalAnswers,
+        SUM(COALESCE(a.Score,0)) AS TotalAnswerScore,
+        AVG(COALESCE(a.Score,0)) AS AvgAnswerScore,
+        MAX(a.Score) AS MaxAnswerScore,
+        SUM(a.PositiveCommentsCount) AS TotalAnswerPositiveComments
+    FROM Posts q
+    LEFT JOIN AnswersWithCorrelatedComments a ON q.Id = a.QuestionId
+    WHERE q.PostTypeId = 1
+    GROUP BY q.Id, q.Title, q.OwnerUserId, q.CreationDate
+),
+QuestionsWithBountyAndCloseInfo AS (
+    SELECT 
+        qas.*,
+        b.BountyAmount,
+        ch.Name AS CloseReasonName,
+        ph.CreationDate AS CloseDate
+    FROM QuestionAnswerStats qas
+    LEFT JOIN Votes v ON v.PostId = qas.QuestionId AND v.VoteTypeId = 8
+    LEFT JOIN Posts p ON p.Id = qas.QuestionId
+    LEFT JOIN PostHistory ph ON ph.PostId = qas.QuestionId AND ph.PostHistoryTypeId = 10
+    LEFT JOIN CloseReasonTypes ch ON ch.Id = CAST(ph.Comment AS INTEGER)
+    LEFT JOIN Votes b ON b.PostId = qas.QuestionId AND b.VoteTypeId = 8
+),
+WindowedUserReputation AS (
+    SELECT 
+        Id,
+        DisplayName,
+        Reputation,
+        CreationDate,
+        LastAccessDate,
+        Location,
+        RANK() OVER (ORDER BY Reputation DESC) AS ReputationRank,
+        DENSE_RANK() OVER (PARTITION BY Location ORDER BY Reputation DESC) AS LocationRepRank,
+        ROW_NUMBER() OVER (PARTITION BY EXTRACT(YEAR FROM CreationDate) ORDER BY Reputation DESC) AS YearlyRepRowNum
+    FROM Users
+    WHERE Reputation > 500
+),
+CombinedQuestionSets AS (
+    SELECT QuestionId, Title, TotalAnswers, TotalAnswerScore, AvgAnswerScore, MaxAnswerScore, TotalAnswerPositiveComments, BountyAmount, CloseReasonName, CloseDate
+    FROM QuestionsWithBountyAndCloseInfo
+    WHERE TotalAnswers > 2 
+      AND (CloseDate IS NULL OR CloseDate > CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1 year')
+    EXCEPT
+    SELECT QuestionId, Title, TotalAnswers, TotalAnswerScore, AvgAnswerScore, MaxAnswerScore, TotalAnswerPositiveComments, BountyAmount, CloseReasonName, CloseDate
+    FROM QuestionsWithBountyAndCloseInfo
+    WHERE TotalAnswerScore < 0
+)
+SELECT 
+    q.QuestionId,
+    q.Title,
+    q.TotalAnswers,
+    q.TotalAnswerScore,
+    q.AvgAnswerScore,
+    q.MaxAnswerScore,
+    q.TotalAnswerPositiveComments,
+    COALESCE(q.BountyAmount, 0) AS BountyAmount,
+    q.CloseReasonName,
+    q.CloseDate,
+    u.DisplayName AS QuestionOwnerName,
+    u.Reputation AS QuestionOwnerReputation,
+    u.Location AS QuestionOwnerLocation,
+    utb.BadgeName AS TopBadgeName,
+    utb.Class AS TopBadgeClass,
+    th.TagName,
+    th.Count AS TagCount,
+    th.AgeYears,
+    w.ReputationRank,
+    w.LocationRepRank,
+    w.YearlyRepRowNum
+FROM CombinedQuestionSets q
+JOIN Users u ON u.Id = (SELECT OwnerUserId FROM Posts WHERE Id = q.QuestionId LIMIT 1)
+LEFT JOIN UserTopBadges utb ON utb.UserId = u.Id AND utb.BadgeRank = 1
+LEFT JOIN LATERAL (
+    SELECT unnest(string_to_array(substring(t.Tags, 2, length(t.Tags) - 2), '><')) AS TagName
+    FROM Posts t
+    WHERE t.Id = q.QuestionId
+) taglist ON TRUE
+LEFT JOIN RecursiveTagHierarchy th ON th.TagName = taglist.TagName
+LEFT JOIN WindowedUserReputation w ON w.Id = u.Id
+WHERE 
+    (q.CloseReasonName IS NULL OR q.CloseReasonName NOT IN ('Duplicate', 'Off-topic'))
+    AND (q.BountyAmount IS NULL OR q.BountyAmount > 0)
+GROUP BY
+    q.QuestionId,
+    q.Title,
+    q.TotalAnswers,
+    q.TotalAnswerScore,
+    q.AvgAnswerScore,
+    q.MaxAnswerScore,
+    q.TotalAnswerPositiveComments,
+    q.BountyAmount,
+    q.CloseReasonName,
+    q.CloseDate,
+    u.DisplayName,
+    u.Reputation,
+    u.Location,
+    utb.BadgeName,
+    utb.Class,
+    th.TagName,
+    th.Count,
+    th.AgeYears,
+    w.ReputationRank,
+    w.LocationRepRank,
+    w.YearlyRepRowNum
+ORDER BY 
+    q.TotalAnswerPositiveComments DESC,
+    q.TotalAnswerScore DESC,
+    w.ReputationRank ASC
+LIMIT 50;

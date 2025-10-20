@@ -1,0 +1,38 @@
+with RecursiveUserPosts as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        p.Id as PostId,
+        p.PostTypeId,
+        p.ParentId,
+        p.Score,
+        p.ViewCount,
+        1 as iteration
+    from Users u
+    join Posts p on p.OwnerUserId = u.Id and p.PostTypeId in (1,2)
+
+    union all
+
+    select
+        rup.UserId,
+        rup.DisplayName,
+        p.Id,
+        p.PostTypeId,
+        p.ParentId,
+        p.Score,
+        p.ViewCount,
+        rup.iteration + 1
+    from RecursiveUserPosts rup
+    join Posts p on p.ParentId = rup.PostId
+)
+select
+    rup.UserId,
+    rup.DisplayName,
+    rup.PostId,
+    rup.PostTypeId,
+    rup.ParentId,
+    rup.Score,
+    rup.ViewCount,
+    rup.iteration
+from RecursiveUserPosts rup
+order by rup.UserId, rup.iteration, rup.PostId;

@@ -1,0 +1,205 @@
+-- {"query": "974.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 0.9, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1751} 
+with RecursiveTagHierarchy as (
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        1 as Level,
+        array[t.Id] as Path
+    from Tags t
+    where t.IsModeratorOnly = 0 and t.IsRequired = 0
+
+    union all
+
+    select
+        t2.Id,
+        t2.TagName,
+        t2.Count,
+        r.Level + 1,
+        r.Path || t2.Id
+    from Tags t2
+    join RecursiveTagHierarchy r on t2.Id <> all(r.Path)
+    where t2.IsModeratorOnly = 0 and t2.IsRequired = 0
+      and length(t2.TagName) > 3
+      and substring(t2.TagName from 1 for 1) = substring(r.TagName from length(r.TagName) for 1)
+),
+UserActivityStats as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionCount,
+        count(distinct p2.Id) filter (where p2.PostTypeId = 2) as AnswerCount,
+        coalesce(sum(vb.BountyReceived), 0) as TotalBountyReceived,
+        row_number() over (order by coalesce(sum(vb.BountyReceived),0) desc, u.Reputation desc) as UserRank
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Posts p2 on p2.OwnerUserId = u.Id
+    left join (
+        select
+            v.UserId,
+            sum(v.BountyAmount) as BountyReceived
+        from Votes v
+        join Posts p on p.Id = v.PostId
+        where v.VoteTypeId = 9 -- BountyClose
+        group by v.UserId
+    ) vb on vb.UserId = u.Id
+    group by u.Id, u.DisplayName, u.Reputation
+),
+TopQuestions as (
+    select
+        p.Id,
+        p.Title,
+        p.Tags,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.FavoriteCount,
+        array_to_string(
+            array(
+                select distinct ph2.UserDisplayName
+                from PostHistory ph2
+                where ph2.PostId = p.Id and ph2.PostHistoryTypeId in (4,5)
+                order by ph2.CreationDate asc
+                limit 3
+            ),
+            ', '
+        ) as Editors,
+        (select count(*) from Comments c where c.PostId = p.Id and c.UserId is null) as AnonymousCommentsCount,
+        (select count(*) from Comments c where c.PostId = p.Id and c.UserId is not null) as RegisteredCommentsCount
+    from Posts p
+    where p.PostTypeId = 1 -- questions only
+      and p.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '2 years'
+      and p.Score >= 5
+      and p.AnswerCount > 2
+),
+AnswerStats as (
+    select
+        a.ParentId as QuestionId,
+        count(*) as AnswerTotal,
+        avg(a.Score) as AvgAnswerScore,
+        max(a.Score) as MaxAnswerScore,
+        sum(case when a.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - interval '30 days' then 1 else 0 end) as RecentAnswerCount
+    from Posts a
+    where a.PostTypeId = 2
+    group by a.ParentId
+),
+ComplexUserBadgeStats as (
+    select
+        b.UserId,
+        count(*) filter (where b.Class = 1) as GoldBadgesCount,
+        count(*) filter (where b.Class = 2) as SilverBadgesCount,
+        count(*) filter (where b.Class = 3) as BronzeBadgesCount,
+        bool_or(b.TagBased) as HasTagBasedBadges
+    from Badges b
+    group by b.UserId
+),
+PostLinkDuplicates as (
+    select
+        pl.PostId,
+        count(distinct pl.RelatedPostId) filter (where lt.Name = 'Duplicate') as DuplicateLinksCount,
+        max(pl.CreationDate) as LastDuplicateLinkDate
+    from PostLinks pl
+    join LinkTypes lt on lt.Id = pl.LinkTypeId
+    group by pl.PostId
+),
+FinalResults as (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        q.OwnerUserId,
+        u.DisplayName as OwnerName,
+        q.CreationDate,
+        q.Score,
+        q.ViewCount,
+        q.AnswerCount,
+        q.FavoriteCount,
+        q.Editors,
+        coalesce(a.AnswerTotal,0) as TotalAnswers,
+        coalesce(a.AvgAnswerScore,0) as AvgAnswerScore,
+        coalesce(a.MaxAnswerScore,0) as MaxAnswerScore,
+        coalesce(a.RecentAnswerCount,0) as RecentAnswers,
+        coalesce(pld.DuplicateLinksCount,0) as DuplicateLinks,
+        coalesce(cubs.GoldBadgesCount,0) as GoldBadges,
+        coalesce(cubs.SilverBadgesCount,0) as SilverBadges,
+        coalesce(cubs.BronzeBadgesCount,0) as BronzeBadges,
+        cubs.HasTagBasedBadges,
+        uas.Reputation,
+        uas.UserRank,
+        q.AnonymousCommentsCount,
+        q.RegisteredCommentsCount,
+        case 
+            when q.ViewCount > 10000 then 'High'
+            when q.ViewCount > 1000 then 'Medium'
+            else 'Low'
+        end as ViewPopularity,
+        case
+            when q.Score > 100 then 'Hot'
+            when q.Score > 20 then 'Trending'
+            else 'Normal'
+        end as ScoreCategory,
+        concat_ws(
+            ' | ',
+            'Answers: ' || coalesce(a.AnswerTotal,0),
+            'AvgAnsScore: ' || round(coalesce(a.AvgAnswerScore,0),2),
+            'DupLinks: ' || coalesce(pld.DuplicateLinksCount,0)
+        ) as SummaryStats
+    from TopQuestions q
+    left join AnswerStats a on a.QuestionId = q.Id
+    left join PostLinkDuplicates pld on pld.PostId = q.Id
+    left join ComplexUserBadgeStats cubs on cubs.UserId = q.OwnerUserId
+    left join UserActivityStats uas on uas.UserId = q.OwnerUserId
+    left join Users u on u.Id = q.OwnerUserId
+    where q.AnonymousCommentsCount < q.RegisteredCommentsCount * 2
+)
+select
+    fr.QuestionId,
+    fr.Title,
+    fr.OwnerUserId,
+    fr.OwnerName,
+    fr.CreationDate,
+    fr.Score,
+    fr.ViewCount,
+    fr.AnswerCount,
+    fr.FavoriteCount,
+    fr.Editors,
+    fr.TotalAnswers,
+    fr.AvgAnswerScore,
+    fr.MaxAnswerScore,
+    fr.RecentAnswers,
+    fr.DuplicateLinks,
+    fr.GoldBadges,
+    fr.SilverBadges,
+    fr.BronzeBadges,
+    fr.HasTagBasedBadges,
+    fr.Reputation,
+    fr.UserRank,
+    fr.AnonymousCommentsCount,
+    fr.RegisteredCommentsCount,
+    fr.ViewPopularity,
+    fr.ScoreCategory,
+    fr.SummaryStats,
+    (
+        select string_agg(distinct tag, ', ' order by count desc)
+        from (
+            select unnest(string_to_array(substring(tw.Tags from 2 for char_length(tw.Tags)-2), '><')) as tag, count(*) over ()
+            from Posts tw
+            where tw.Id = fr.QuestionId
+        ) x
+    ) as QuestionTags,
+    (
+        select json_agg(json_build_object(
+            'BadgeName', b.Name,
+            'Date', b.Date,
+            'Class', b.Class,
+            'TagBased', b.TagBased
+        ))
+        from Badges b
+        where b.UserId = fr.OwnerUserId
+          and b.Date > fr.CreationDate - interval '1 year'
+          and b.Class = 1
+    ) as RecentGoldBadges
+from FinalResults fr
+order by fr.UserRank, fr.Score desc, fr.ViewCount desc
+limit 50;

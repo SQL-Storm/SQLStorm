@@ -1,0 +1,58 @@
+WITH UserBadgeRank AS (
+    SELECT
+        UserId,
+        Name,
+        Class,
+        ROW_NUMBER() OVER (PARTITION BY UserId ORDER BY Class, Date DESC) AS BadgeRank
+    FROM Badges
+    WHERE Name LIKE '%er'
+), RecentPostsAndStats AS (
+    SELECT
+        P.Id,
+        P.PostTypeId,
+        P.Title,
+        P.OwnerUserId,
+        P.CreationDate,
+        P.Score,
+        P.ViewCount,
+        P.Tags,
+        Users.Reputation,
+        Users.CreationDate AS UserCreation,
+        COALESCE(UBR.BadgeRank, 999) AS TopBadgeRank,
+        COUNT(CASE WHEN V.VoteTypeId = 2 THEN 1 END) AS UpVotes,
+        COUNT(CASE WHEN V.VoteTypeId = 3 THEN 1 END) AS DownVotes,
+        ROW_NUMBER() OVER (PARTITION BY P.OwnerUserId ORDER BY P.Score DESC, P.ViewCount DESC) AS UserPostRank
+    FROM Posts P
+    LEFT JOIN Users ON P.OwnerUserId = Users.Id
+    LEFT JOIN Votes V ON V.PostId = P.Id
+    LEFT JOIN UserBadgeRank UBR ON UBR.UserId = P.OwnerUserId
+    GROUP BY
+        P.Id,
+        P.PostTypeId,
+        P.Title,
+        P.OwnerUserId,
+        P.CreationDate,
+        P.Score,
+        P.ViewCount,
+        P.Tags,
+        Users.Reputation,
+        Users.CreationDate,
+        UBR.BadgeRank
+)
+SELECT
+    RPS.Id,
+    RPS.PostTypeId,
+    RPS.Title,
+    RPS.OwnerUserId,
+    RPS.CreationDate,
+    RPS.Score,
+    RPS.ViewCount,
+    RPS.Tags,
+    RPS.Reputation,
+    RPS.UserCreation,
+    RPS.TopBadgeRank,
+    RPS.UpVotes,
+    RPS.DownVotes,
+    RPS.UserPostRank
+FROM RecentPostsAndStats RPS
+ORDER BY RPS.Score DESC, RPS.ViewCount DESC, RPS.Id;

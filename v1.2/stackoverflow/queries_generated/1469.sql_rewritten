@@ -1,0 +1,160 @@
+-- {"query": "1469.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.4, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1397} 
+WITH RecursiveRecentModerators AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        ROW_NUMBER() OVER (PARTITION BY u.Location ORDER BY u.Reputation DESC, u.CreationDate) AS LocRank
+    FROM 
+        Users u
+    WHERE 
+        u.Reputation > 10000
+        AND u.Location IS NOT NULL
+),
+AcceptedAnswerScores AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.Title,
+        aa.Score AS AcceptedAnswerScore,
+        COALESCE(a.EditCount, 0) AS AcceptedAnswerEditCount,
+        frontUser.LeaderUserId,
+        ud.LastActivityDate AS LeaderActivity,
+        frontUser.AnswersCount,
+        frontUser.AvgUpVotes
+    FROM
+        Posts q
+        LEFT JOIN Posts aa ON q.AcceptedAnswerId = aa.Id
+        LEFT JOIN (
+            SELECT
+                p.ParentId,
+                COUNT(ph.Id) AS EditCount
+            FROM
+                Posts p
+                LEFT JOIN PostHistory ph ON ph.PostId = p.Id AND ph.PostHistoryTypeId IN (4,5,6)
+            GROUP BY p.ParentId
+        ) a ON a.ParentId = aa.Id
+        LEFT JOIN (
+            SELECT
+                p.OwnerUserId AS LeaderUserId,
+                COUNT(*) AS AnswersCount,
+                AVG( CASE WHEN v.VoteTypeId=2 THEN 1 ELSE 0 END )*100.0 AS AvgUpVotes
+            FROM
+                Posts p
+                LEFT JOIN Votes v ON p.Id = v.PostId
+            WHERE p.PostTypeId=2
+            GROUP BY p.OwnerUserId
+        ) frontUser ON frontUser.LeaderUserId = q.OwnerUserId
+        LEFT JOIN Users ud ON ud.Id = frontUser.LeaderUserId
+    WHERE 
+        q.PostTypeId = 1
+        AND aa.Score IS NOT NULL
+),
+CommentsAggregated AS (
+    SELECT
+        c.PostId,
+        STRING_AGG(TRIM(trailing '.' FROM c.Text)::text, ' | ') AS CleanedComments,
+        COUNT(*) AS CommentsCount,
+        MAX(c.Score) AS MaxCommentScore,
+        SUM(CASE WHEN c.UserId IS NULL THEN 1 ELSE 0 END) AS AnonymousComments
+    FROM Comments c
+    WHERE c.Text IS NOT NULL
+    GROUP BY c.PostId
+),
+ComplexTagFilter AS (
+    SELECT
+        p.Id, p.Title, p.Tags,
+        unnest(string_to_array(TRIM(BOTH '<>' FROM p.Tags), '><')) AS SingleTag
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+),
+FilteredTagsRanked AS (
+    SELECT
+        ct.SingleTag,
+        t.Count,
+        ROW_NUMBER() OVER (PARTITION BY ct.SingleTag ORDER BY t.Count DESC) AS TagRank
+    FROM
+        ComplexTagFilter ct
+        INNER JOIN Tags t ON LOWER(ct.SingleTag) = LOWER(t.TagName)
+    WHERE
+        t.IsModeratorOnly = 0
+        AND t.IsRequired = 0
+),
+FinalSELECT AS (
+    SELECT
+        ar.QuestionId,
+        ar.Title,
+        ar.AcceptedAnswerScore,
+        ar.AcceptedAnswerEditCount,
+        ga.CommentsCount,
+        ga.AnonymousComments,
+        ar.AnswersCount,
+        ft.SingleTag,
+        ft.Count AS TagUseCount,
+        fm.Id IS NOT NULL AS HasHighRepModeratorInLocation,
+        RNT.LocRank,
+        UPPER(ar.Title) AS TitleUpperCase,
+        REGEXP_REPLACE(ar.Title, '[^a-zA-Z0-9 ]', '', 'g') AS CleanTitle,
+        LEAD(ar.AcceptedAnswerScore) OVER (ORDER BY ar.AcceptedAnswerScore DESC) AS NextHigherAcceptedAnswerScore,
+        (CASE WHEN ga.MaxCommentScore IS NULL THEN 0 ELSE ga.MaxCommentScore END) /
+            NULLIF(ar.AnswersCount, 0) AS MaxCommentScorePerAnswer,
+        SNP.NumSelectedHotQuestions,
+        RNT.LocRank + SNP.NumSelectedHotQuestions AS CompositeScoreRanking
+    FROM
+        AcceptedAnswerScores ar
+        LEFT JOIN CommentsAggregated ga ON ga.PostId = ar.QuestionId
+        LEFT JOIN FilteredTagsRanked ft ON ft.SingleTag IN (
+            SELECT unnest(string_to_array(TRIM(BOTH '<>' FROM ar.Tags), '><'))
+        ) AND ft.TagRank = 1
+        LEFT JOIN RecursiveRecentModerators RNT ON RNT.Id = ar.LeaderUserId
+        LEFT JOIN (
+            SELECT 
+                ph.PostId,
+                COUNT(*) FILTER (WHERE ph.PostHistoryTypeId = 52) AS NumSelectedHotQuestions
+            FROM PostHistory ph
+            GROUP BY ph.PostId
+        ) SNP ON SNP.PostId = ar.QuestionId
+        LEFT JOIN RecursiveRecentModerators fm ON fm.Location = RNT.Location AND fm.Reputation > 50000 AND fm.LocRank = 1
+    WHERE
+        ft.SingleTag IS NOT NULL
+        AND ar.AnswersCount > 5
+),
+LagRankCTE AS (
+    SELECT 
+        QuestionId, CompositeScoreRanking,
+        LAG(CompositeScoreRanking, 2) OVER (ORDER BY CompositeScoreRanking DESC NULLS LAST) AS LagCompositeScore --
+    FROM FinalSELECT
+)
+SELECT
+    f.QuestionId,
+    f.Title,
+    f.AcceptedAnswerScore,
+    f.AcceptedAnswerEditCount,
+    f.CommentsCount,
+    f.AnonymousComments,
+    f.AnswersCount,
+    f.SingleTag,
+    f.TagUseCount,
+    f.HasHighRepModeratorInLocation,
+    f.LocRank,
+    f.TitleUpperCase,
+    f.NextHigherAcceptedAnswerScore,
+    f.MaxCommentScorePerAnswer,
+    f.NumSelectedHotQuestions,
+    f.CompositeScoreRanking,
+    l.LagCompositeScore,
+    CASE 
+      WHEN f.AnonymousComments IS NULL OR f.AnonymousComments > 3 THEN 'High Anon Comments'
+      WHEN f.AcceptedAnswerScore < 0 THEN 'Negative Accept Score'
+      ELSE 'Normal'
+    END AS PerformanceCategory
+FROM
+    FinalSELECT f
+    LEFT JOIN LagRankCTE l ON l.QuestionId = f.QuestionId
+WHERE
+    -- Complex predicate hashing string length mixed with arithmetic and NULL logic
+    length(f.TitleUpperCase) + COALESCE(f.TagUseCount,0)*3 - 
+    COALESCE(f.AnswersCount,1) <> 
+    (select count(distinct tz.Id) from Tags tz where tz.TagName like '%sql%')
+ORDER BY f.CompositeScoreRanking DESC, f.AnswersCount DESC
+FETCH FIRST 50 ROWS ONLY;

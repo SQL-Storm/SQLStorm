@@ -1,0 +1,188 @@
+with RecursiveTagHierarchy as (
+    select 
+        t.Id,
+        t.TagName,
+        t.Count,
+        1 as Level,
+        array[t.TagName] as Path
+    from Tags t
+    where t.IsModeratorOnly = false and t.IsRequired = false
+    union all
+    select 
+        t2.Id,
+        t2.TagName,
+        t2.Count,
+        r.Level + 1,
+        r.Path || t2.TagName
+    from Tags t2
+    join RecursiveTagHierarchy r on t2.Id = r.Id + 1
+    where r.Level < 3
+),
+UserBadgeStats as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        count(b.Id) filter (where b.Class = 1) as GoldBadges,
+        count(b.Id) filter (where b.Class = 2) as SilverBadges,
+        count(b.Id) filter (where b.Class = 3) as BronzeBadges,
+        coalesce(sum(case when b.TagBased = 1 then 1 else 0 end), 0) as TagBasedBadges
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.DisplayName
+),
+PostAnswerStats as (
+    select 
+        p.Id as QuestionId,
+        p.Title,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score as QuestionScore,
+        p.ViewCount,
+        p.AnswerCount,
+        coalesce(a.AnswerCount, 0) as ActualAnswerCount,
+        coalesce(a.MaxAnswerScore, 0) as MaxAnswerScore,
+        coalesce(a.AvgAnswerScore, 0) as AvgAnswerScore,
+        coalesce(a.TopAnswerId, null) as TopAnswerId
+    from Posts p
+    left join (
+        select 
+            ParentId,
+            count(*) as AnswerCount,
+            max(Score) as MaxAnswerScore,
+            avg(Score) as AvgAnswerScore,
+            max(Id) filter (where Score = max(Score) over (partition by ParentId)) as TopAnswerId
+        from Posts
+        where PostTypeId = 2
+        group by ParentId
+    ) a on a.ParentId = p.Id
+    where p.PostTypeId = 1
+),
+UserActivityWindow as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        p.Id as PostId,
+        p.PostTypeId,
+        p.CreationDate,
+        count(*) over (partition by u.Id order by p.CreationDate rows between 30 preceding and current row) as PostsLast30Days,
+        sum(case when p.PostTypeId = 1 then 1 else 0 end) over (partition by u.Id order by p.CreationDate rows between 30 preceding and current row) as QuestionsLast30Days,
+        sum(case when p.PostTypeId = 2 then 1 else 0 end) over (partition by u.Id order by p.CreationDate rows between 30 preceding and current row) as AnswersLast30Days
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+),
+TopCommenters as (
+    select 
+        c.UserId,
+        u.DisplayName,
+        count(c.Id) as CommentCount,
+        avg(length(c.Text)) as AvgCommentLength,
+        max(c.CreationDate) as LastCommentDate
+    from Comments c
+    join Users u on u.Id = c.UserId
+    group by c.UserId, u.DisplayName
+    having count(c.Id) > 50
+),
+DuplicateQuestionLinks as (
+    select 
+        pl.PostId as DuplicateQuestionId,
+        pl.RelatedPostId as OriginalQuestionId,
+        p1.Title as DuplicateTitle,
+        p2.Title as OriginalTitle,
+        pl.CreationDate as LinkCreationDate
+    from PostLinks pl
+    join Posts p1 on p1.Id = pl.PostId and p1.PostTypeId = 1
+    join Posts p2 on p2.Id = pl.RelatedPostId and p2.PostTypeId = 1
+    where pl.LinkTypeId = 3
+),
+QuestionCloseReasons as (
+    select 
+        ph.PostId,
+        crt.Name as CloseReason,
+        ph.CreationDate as CloseDate,
+        ph.UserId as CloserUserId,
+        u.DisplayName as CloserDisplayName
+    from PostHistory ph
+    join CloseReasonTypes crt on crt.Id = cast(ph.Comment as integer)
+    left join Users u on u.Id = ph.UserId
+    where ph.PostHistoryTypeId = 10
+),
+QuestionSummary as (
+    select 
+        p.Id,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.FavoriteCount,
+        p.Tags,
+        u.DisplayName as OwnerName,
+        u.Reputation as OwnerReputation,
+        u.CreationDate as OwnerCreationDate,
+        u.Location,
+        u.UpVotes,
+        u.DownVotes,
+        us.GoldBadges,
+        us.SilverBadges,
+        us.BronzeBadges,
+        us.TagBasedBadges,
+        pas.MaxAnswerScore,
+        pas.AvgAnswerScore,
+        pas.TopAnswerId,
+        qcr.CloseReason,
+        qcr.CloseDate,
+        qcr.CloserDisplayName,
+        p.OwnerUserId
+    from Posts p
+    left join Users u on u.Id = p.OwnerUserId
+    left join UserBadgeStats us on us.UserId = u.Id
+    left join PostAnswerStats pas on pas.QuestionId = p.Id
+    left join QuestionCloseReasons qcr on qcr.PostId = p.Id
+    where p.PostTypeId = 1
+)
+select 
+    qs.Id as QuestionId,
+    qs.Title,
+    qs.OwnerName,
+    qs.OwnerReputation,
+    qs.Score as QuestionScore,
+    qs.ViewCount,
+    qs.AnswerCount,
+    qs.FavoriteCount,
+    qs.GoldBadges,
+    qs.SilverBadges,
+    qs.BronzeBadges,
+    qs.TagBasedBadges,
+    qs.MaxAnswerScore,
+    round(qs.AvgAnswerScore::numeric,2) as AvgAnswerScore,
+    qs.CloseReason,
+    qs.CloseDate,
+    qs.CloserDisplayName,
+    array_to_string(string_to_array(substring(qs.Tags from 2 for length(qs.Tags)-2), '><'), ', ') as ParsedTags,
+    case 
+        when qs.CloseReason is not null then 'Closed'
+        else 'Open'
+    end as Status,
+    length(qs.Title) as TitleLength,
+    length(coalesce((select Body from Posts where Id = qs.TopAnswerId), '')) as TopAnswerBodyLength,
+    (select count(*) from Comments c where c.PostId = qs.Id) as CommentCount,
+    (select count(*) from Votes v where v.PostId = qs.Id and v.VoteTypeId = 2) as UpVotes,
+    (select count(*) from Votes v where v.PostId = qs.Id and v.VoteTypeId = 3) as DownVotes,
+    (select count(*) from Votes v where v.PostId = qs.Id and v.VoteTypeId = 5) as FavoriteVotes,
+    (select count(*) from Votes v where v.PostId = qs.TopAnswerId and v.VoteTypeId = 2) as TopAnswerUpVotes,
+    (select count(*) from Votes v where v.PostId = qs.TopAnswerId and v.VoteTypeId = 3) as TopAnswerDownVotes,
+    (select string_agg(distinct b.Name, ', ') from Badges b where b.UserId = qs.OwnerUserId and b.Class = 1) as OwnerGoldBadgeNames,
+    (select string_agg(distinct b.Name, ', ') from Badges b where b.UserId = qs.OwnerUserId and b.Class = 2) as OwnerSilverBadgeNames,
+    (select string_agg(distinct b.Name, ', ') from Badges b where b.UserId = qs.OwnerUserId and b.Class = 3) as OwnerBronzeBadgeNames,
+    (select count(*) from Posts p2 where p2.OwnerUserId = qs.OwnerUserId and p2.PostTypeId = 1 and p2.CreationDate > qs.CreationDate) as LaterQuestionsByOwner,
+    (select count(*) from Posts p2 where p2.OwnerUserId = qs.OwnerUserId and p2.PostTypeId = 2 and p2.CreationDate > qs.CreationDate) as LaterAnswersByOwner,
+    (select max(Score) from Posts p3 where p3.ParentId = qs.Id and p3.PostTypeId = 2) as MaxAnswerScoreForQuestion,
+    (select count(*) from Votes v2 where v2.PostId = qs.Id and v2.VoteTypeId in (2,3)) as TotalVotes,
+    (select count(*) from Votes v3 where v3.PostId = qs.TopAnswerId and v3.VoteTypeId in (2,3)) as TotalVotesTopAnswer
+from QuestionSummary qs
+where qs.AnswerCount > 5
+  and qs.Score > 10
+  and qs.ViewCount > 1000
+  and (qs.CloseReason is null or qs.CloseReason not in ('Duplicate', 'Off-topic'))
+order by qs.Score desc, qs.ViewCount desc
+limit 50;

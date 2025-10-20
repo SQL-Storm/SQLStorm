@@ -1,0 +1,144 @@
+with RankedPosts as (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.Tags,
+        p.AcceptedAnswerId,
+        u.Reputation as OwnerReputation,
+        u.DisplayName as OwnerName,
+        dense_rank() over (partition by p.PostTypeId order by p.Score desc, p.ViewCount desc) as RankByScore,
+        row_number() over (partition by p.OwnerUserId order by p.CreationDate desc) as UserRecentPostRank,
+        count(*) over (partition by p.OwnerUserId) as UserPostCount,
+        coalesce(cast(p.ViewCount as double precision) / nullif(p.Score, 0), 0) as ViewScoreRatio,
+        case when p.Tags is not null 
+             then array_length(string_to_array(substring(p.Tags from 2 for char_length(p.Tags) - 2), '><'), 1)
+             else 0 end as TagCount
+    from Posts p
+    left join Users u on u.Id = p.OwnerUserId
+    where p.PostTypeId in (1, 2)
+),
+AcceptedAnswers as (
+    select
+        q.Id as QuestionId,
+        a.Id as AcceptedAnswerId,
+        a.Score as AcceptedAnswerScore,
+        a.OwnerUserId as AcceptedAnswerOwnerId,
+        u.DisplayName as AcceptedAnswerOwnerName,
+        u.Reputation as AcceptedAnswerOwnerReputation
+    from Posts q
+    left join Posts a on a.Id = q.AcceptedAnswerId and a.PostTypeId = 2
+    left join Users u on u.Id = a.OwnerUserId
+    where q.PostTypeId = 1 and q.AcceptedAnswerId is not null
+),
+BadgeScores as (
+    select
+        b.UserId,
+        sum(case 
+            when b.Class = 1 then 10
+            when b.Class = 2 then 5
+            when b.Class = 3 then 1
+            else 0 end) as BadgeScore,
+        count(distinct b.Name) as DistinctBadgesCount
+    from Badges b
+    group by b.UserId
+),
+UserPostStats as (
+    select
+        rp.OwnerUserId,
+        count(rp.Id) filter (where rp.PostTypeId = 1) as QuestionCount,
+        count(rp.Id) filter (where rp.PostTypeId = 2) as AnswerCount,
+        avg(rp.Score) filter (where rp.PostTypeId = 1) as AvgQuestionScore,
+        avg(rp.Score) filter (where rp.PostTypeId = 2) as AvgAnswerScore,
+        sum(rp.ViewCount) filter (where rp.PostTypeId = 1) as TotalQuestionViews,
+        max(rp.ViewCount) filter (where rp.PostTypeId = 1) as MaxQuestionViews
+    from RankedPosts rp
+    group by rp.OwnerUserId
+),
+RecentClosedQuestions as (
+    select
+        p.Id,
+        p.Title,
+        p.OwnerUserId,
+        cht.Name as CloseReason,
+        ph.CreationDate as CloseDate
+    from Posts p
+    inner join PostHistory ph on ph.PostId = p.Id and ph.PostHistoryTypeId = 10
+    inner join CloseReasonTypes cht on cast(ph.Comment as integer) = cht.Id
+    where p.PostTypeId = 1
+),
+TopTagUsers as (
+    select
+        tag,
+        OwnerUserId,
+        count(*) as TaggedPostsCount
+    from (
+        select
+            rp.Id,
+            rp.OwnerUserId,
+            unnest(string_to_array(substring(rp.Tags from 2 for char_length(rp.Tags) - 2), '><')) as tag
+        from RankedPosts rp
+        where rp.PostTypeId = 1 and rp.Tags is not null
+    ) as TagPosts
+    group by tag, OwnerUserId
+),
+TopUsersPerTag as (
+    select
+        ttu.tag,
+        ttu.OwnerUserId,
+        u.DisplayName as UserName,
+        ttu.TaggedPostsCount,
+        row_number() over (partition by ttu.tag order by ttu.TaggedPostsCount desc) as TagUserRank
+    from TopTagUsers ttu
+    left join Users u on u.Id = ttu.OwnerUserId
+)
+select
+    rp.Id as PostId,
+    rp.PostTypeId,
+    rp.Title,
+    rp.Score,
+    rp.ViewCount,
+    rp.CreationDate,
+    rp.TagCount,
+    rp.ViewScoreRatio,
+    rp.RankByScore,
+    rp.UserRecentPostRank,
+    rp.UserPostCount,
+    rp.OwnerUserId,
+    rp.OwnerName,
+    rp.OwnerReputation,
+    coalesce(b.BadgeScore, 0) as BadgeScore,
+    coalesce(b.DistinctBadgesCount, 0) as DistinctBadges,
+    ups.QuestionCount,
+    ups.AnswerCount,
+    ups.AvgQuestionScore,
+    ups.AvgAnswerScore,
+    ups.TotalQuestionViews,
+    ups.MaxQuestionViews,
+    aa.AcceptedAnswerId,
+    aa.AcceptedAnswerScore,
+    aa.AcceptedAnswerOwnerId,
+    aa.AcceptedAnswerOwnerName,
+    aa.AcceptedAnswerOwnerReputation,
+    rcq.CloseReason,
+    rcq.CloseDate,
+    array_agg(distinct (ttr.UserName || ' (#' || ttr.TagUserRank || ')')) filter (where ttr.TagUserRank <= 3) as TopUsersInTags
+from RankedPosts rp
+left join BadgeScores b on b.UserId = rp.OwnerUserId
+left join UserPostStats ups on ups.OwnerUserId = rp.OwnerUserId
+left join AcceptedAnswers aa on aa.QuestionId = rp.Id
+left join RecentClosedQuestions rcq on rcq.Id = rp.Id
+left join TopUsersPerTag ttr on array_position(string_to_array(substring(rp.Tags from 2 for char_length(rp.Tags) - 2), '><'), ttr.tag) is not null
+where rp.PostTypeId = 1
+group by
+    rp.Id, rp.PostTypeId, rp.Title, rp.Score, rp.ViewCount, rp.CreationDate, rp.TagCount, rp.ViewScoreRatio, rp.RankByScore, rp.UserRecentPostRank, rp.UserPostCount, rp.OwnerUserId, rp.OwnerName, rp.OwnerReputation,
+    b.BadgeScore, b.DistinctBadgesCount,
+    ups.QuestionCount, ups.AnswerCount, ups.AvgQuestionScore, ups.AvgAnswerScore, ups.TotalQuestionViews, ups.MaxQuestionViews,
+    aa.AcceptedAnswerId, aa.AcceptedAnswerScore, aa.AcceptedAnswerOwnerId, aa.AcceptedAnswerOwnerName, aa.AcceptedAnswerOwnerReputation,
+    rcq.CloseReason, rcq.CloseDate
+order by rp.Score desc, rp.ViewCount desc
+limit 100;

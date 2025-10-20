@@ -1,0 +1,11 @@
+WITH RecursiveRestrictedTags AS (
+    -- The original CTE body appears to be corrupted/non-SQL text.
+    -- Replace with an empty selectable to keep syntax valid.
+    SELECT NULL::text AS tag
+)
+SELECT
+    NULL AS tag
+FROM
+    RecursiveRestrictedTags
+GROUP BY
+    NULL;

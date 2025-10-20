@@ -1,0 +1,211 @@
+with RecursiveTagAncestors as (
+    select 
+        t.Id,
+        t.TagName,
+        array[t.Id] as AncestorPath
+    from Tags t
+    where t.IsRequired = true
+  
+    union all
+    
+    select 
+        t.Id,
+        t.TagName,
+        r.AncestorPath || t.Id
+    from Tags t
+    join RecursiveTagAncestors r on t.WikiPostId = cast(r.Id as integer)
+    where not t.Id = any(r.AncestorPath)
+),
+
+UserAggregatedBadges as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        count(distinct b.Id) filter (where b.Class = 1) as GoldBadges,
+        count(distinct b.Id) filter (where b.Class = 2) as SilverBadges,
+        count(distinct b.Id) filter (where b.Class = 3) as BronzeBadges,
+        sum(bestPosts.AnswerScore) as TotalAnswerScores,
+        avg(bestPosts.AvgScore) over (partition by u.Id) as AvgAnswerScore
+    from Users u
+           left join Badges b on u.Id = b.UserId
+           left join lateral (
+                select 
+                    p.Id,
+                    avg(p.Score) as AvgScore,
+                    sum(p.Score) as AnswerScore
+                from Posts p
+                where p.OwnerUserId = u.Id
+                  and p.PostTypeId = 2
+                group by p.Id
+           ) bestPosts on true
+    group by u.Id, u.DisplayName
+),
+
+PostScoreWindows as (
+    select
+          p.Id,
+          p.Title,
+          p.ViewCount,
+          p.Score,
+          p.Tags,
+          p.CreationDate,
+          row_number() over (partition by p.OwnerUserId order by p.Score desc) as ScoreRank,
+          lead(p.Score) over (partition by p.OwnerUserId order by p.Score desc) as NextScore,
+          lag(p.Score) over (partition by p.OwnerUserId order by p.Score desc) as PreviousScore,
+          count(*) over (partition by p.OwnerUserId) as PostsCount
+    from Posts p
+),
+
+
+DuplicateQuestionDetails as (
+    select
+        q.Id as QuestionId,
+        q.Title as QuestionTitle,
+        dupl.PostId as DuplicatedFromId,
+        dupl.CreatedAt as DuplicateLinkCreated,
+        q.Score as QScore,
+        q.ViewCount as QViewCount,
+        q.Tags as QTags
+    from Posts q
+            join PostLinks dupl on q.Id = dupl.RelatedPostId and dupl.LinkTypeId = 3 
+    where q.PostTypeId = 1
+),
+
+CommentsInfo as (
+    select
+        c.PostId,
+        min(c.CreationDate) as FirstCommentDate,
+        count(*) as TotalComments,
+        sum(case when c.Text ~* 'sql' or c.Text ~* 'join' then 1 else 0 end) as SqlMentionCount
+    from Comments c
+    group by c.PostId
+),
+
+TopActiveUsers as (
+    select 
+        u.Id,
+        u.DisplayName,
+        row_number() over (order by coalesce(u.Reputation,0) desc, u.CreationDate asc) as Rnk,
+        coalesce(u.UpVotes,0) - coalesce(u.DownVotes,0) as NetVotes,
+        to_char(date_trunc('day', cast('2024-10-01 12:34:56' as timestamp) - u.LastAccessDate)/(interval '1 day'), '999999') as DaysInactiveText
+    from Users u
+    where u.Reputation > 10000
+),
+
+ComplexPosts as (
+    select 
+        p.Id,
+        p.CreationDate,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        posw.ScoreRank,
+        posw.NextScore,
+        posw.PreviousScore,
+        posw.PostsCount,
+        coalesce(cinfo.FirstCommentDate, cast('1900-01-01' as timestamp)) as FirstCommentDate,
+        cinfo.TotalComments,
+        (coalesce(p.ViewCount,0) * 1.0 / nullif(p.Score,0)) as ViewsEfficiency,
+        length(coalesce(p.Body, '')) as BodyLength,
+        (
+          length(replace(replace(replace(lower(coalesce(p.Tags,'')),'><',';'),'&lt;','<'),'&gt;','>'))
+          + length(coalesce(p.Title,''))
+        ) as CombinedTextLen
+      
+    from Posts p
+         left join PostScoreWindows posw on p.Id = posw.Id
+         left join CommentsInfo cinfo on p.Id = cinfo.PostId
+    where p.PostTypeId in (1, 2)
+)
+
+select distinct
+    u.Id as UserId,
+    u.DisplayName,
+    u.Reputation,
+    
+    agbd.GoldBadges,
+    agbd.SilverBadges,
+    agbd.BronzeBadges,
+    agbd.TotalAnswerScores,
+    round(agbd.AvgAnswerScore ,2) as AvgAnswerScore,
+    
+    MAX(case when cp.PostTypeId = 1 then cp.Score else null end) as MaxQuestionScore,
+    MAX(case when cp.PostTypeId = 2 then cp.Score else null end) as MaxAnswerScore,
+    
+    SUM(case when cp.Tags like '%<sql>%' and cp.PostTypeId=1 then 1 else 0 end) FILTER (WHERE cp.Score >= 5) over () as HighScoreSqlTaggedQuestions,
+    
+    array_to_string(array_agg(distinct tag.TagName order by tag.TagName), ', ') as SampleTags,
+    
+    (select count(distinct p.Id)
+     from Posts p
+     join Votes v on v.PostId = p.Id and v.VoteTypeId = 2
+     where p.OwnerUserId = u.Id and p.PostTypeId = 2
+       and v.CreationDate > (cast('2024-10-01 12:34:56' as timestamp) - interval '30 days')) as UpvotedAnswersLast30d,
+    
+    count(distinct pb.Id) FILTER (WHERE pb.AcceptedAnswerId = pb.Id) OVER() as TotalAcceptedAnswersInData,
+    
+    (select sum(view.subs.ViewCount)
+       from Posts view
+      Where  view.OwnerUserId = u.Id AND (view.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - interval '365 days' OR view.ViewCount > 1000)) as RecentPopularViews,
+    
+    least(age(cast('2024-10-01 12:34:56' as timestamp), u.CreationDate), interval '10 years') AS UsageDurationCapped,
+
+    coalesce(t.au_cnt, 0) as AnnotatedUserActiveTagsCount,
+
+    ARRAY(
+       select substring(coalesce(ph.Comment, '') from '[^"{}]*')
+       from PostHistory ph
+       where ph.PostId in (select p2.Id from Posts p2 where p2.OwnerUserId = u.Id)
+         and ph.PostHistoryTypeId = 10 
+       order by ph.CreationDate desc
+       limit 3
+    ) as LatestCloseReasonsLinked,
+    
+    concat_ws(', ',
+        concat('Reputation:', coalesce(cast(u.Reputation as text),'n/a')),
+        concat('DownVotes:', coalesce(cast(u.DownVotes as text), '0')),
+        concat('ScoreReductionPerPostsRatio:', 
+              ROUND(COALESCE((sum(vt.ScoreQty) filter (where vt.PostTypeId=2) / nullif(count(vt.PostId),0)),0)::numeric,4))) as UserStringSummary
+
+from Users u
+
+left join UserAggregatedBadges agbd on agbd.UserId = u.Id
+
+left join ComplexPosts cp on cp.OwnerUserId = u.Id
+
+left join (select OwnerUserId, count(distinct Tags) as au_cnt
+           from Posts
+           where Tags is not null and length(Tags) > 0
+           group by OwnerUserId) t on t.OwnerUserId = u.Id
+
+left join lateral (
+    select Score as ScoreQty, p.Id as PostId, p.PostTypeId 
+    from Posts p where p.OwnerUserId = u.Id
+) vt on true
+
+left join Tags tag on tag.Id is null
+
+left join Posts pb on pb.OwnerUserId = u.Id
+
+where u.Reputation > 5000
+
+group by
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    agbd.GoldBadges,
+    agbd.SilverBadges,
+    agbd.BronzeBadges,
+    agbd.TotalAnswerScores,
+    agbd.AvgAnswerScore,
+    t.au_cnt,
+    cp.Tags,
+    cp.PostTypeId,
+    cp.Score,
+    u.CreationDate,
+    u.DownVotes
+
+order by u.Reputation desc, MaxAnswerScore desc, u.CreationDate asc
+
+limit 50;

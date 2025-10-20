@@ -1,0 +1,151 @@
+-- {"query": "620.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 0.6, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1471} 
+WITH RecursiveTagHierarchy AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        1 AS Level,
+        ARRAY[t.TagName] AS Path
+    FROM Tags t
+    WHERE t.IsModeratorOnly = 0
+    UNION ALL
+    SELECT
+        t2.Id,
+        t2.TagName,
+        t2.Count,
+        r.Level + 1,
+        r.Path || t2.TagName
+    FROM Tags t2
+    JOIN PostLinks pl ON pl.PostId = t2.ExcerptPostId
+    JOIN RecursiveTagHierarchy r ON r.Id = pl.RelatedPostId
+    WHERE t2.IsModeratorOnly = 0 AND NOT t2.TagName = ANY(r.Path)
+    AND r.Level < 3
+),
+UserBadgeRankings AS (
+    SELECT 
+        b.UserId,
+        b.Class,
+        COUNT(*) AS BadgeCount,
+        ROW_NUMBER() OVER (PARTITION BY b.UserId ORDER BY b.Class) AS BadgeRank
+    FROM Badges b
+    GROUP BY b.UserId, b.Class
+),
+UserActivityRankings AS (
+    SELECT
+        u.Id AS UserId,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionCount,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswerCount,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        SUM(COALESCE(vt.UpVotes,0)) AS TotalUpVotes,
+        SUM(COALESCE(vt.DownVotes,0)) AS TotalDownVotes,
+        DENSE_RANK() OVER (ORDER BY COUNT(DISTINCT p.Id) DESC) AS ActivityRank
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Comments c ON c.UserId = u.Id
+    LEFT JOIN (
+        SELECT
+            p.OwnerUserId,
+            SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+            SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes
+        FROM Posts p
+        LEFT JOIN Votes v ON v.PostId = p.Id
+        WHERE p.OwnerUserId IS NOT NULL
+        GROUP BY p.OwnerUserId
+    ) vt ON vt.OwnerUserId = u.Id
+    GROUP BY u.Id
+),
+PostScoresWithWindows AS (
+    SELECT
+        p.Id,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        p.OwnerUserId,
+        p.AcceptedAnswerId,
+        AVG(p.Score) OVER (PARTITION BY p.PostTypeId) AS AvgScoreByType,
+        RANK() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC) AS ScoreRank,
+        SUM(p.ViewCount) OVER (PARTITION BY p.Tags) AS TotalViewsByTag,
+        COUNT(*) OVER (PARTITION BY p.OwnerUserId) AS PostsByOwner
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+),
+ClosedQuestionsWithReasons AS (
+    SELECT
+        ph.PostId,
+        cr.Name AS CloseReason,
+        ph.CreationDate AS CloseDate,
+        ROW_NUMBER() OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate DESC) AS CloseRank
+    FROM PostHistory ph
+    JOIN CloseReasonTypes cr ON cr.Id = CAST(ph.Comment AS smallint)
+    WHERE ph.PostHistoryTypeId = 10 AND ph.Comment IS NOT NULL
+),
+TopUsersByActivityAndBadges AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        ua.QuestionCount,
+        ua.AnswerCount,
+        ua.CommentCount,
+        ua.TotalUpVotes,
+        ua.TotalDownVotes,
+        COALESCE(SUM(CASE WHEN ub.Class = 1 THEN ub.BadgeCount ELSE 0 END),0) AS GoldBadges,
+        COALESCE(SUM(CASE WHEN ub.Class = 2 THEN ub.BadgeCount ELSE 0 END),0) AS SilverBadges,
+        COALESCE(SUM(CASE WHEN ub.Class = 3 THEN ub.BadgeCount ELSE 0 END),0) AS BronzeBadges,
+        ua.ActivityRank
+    FROM Users u
+    JOIN UserActivityRankings ua ON ua.UserId = u.Id
+    LEFT JOIN UserBadgeRankings ub ON ub.UserId = u.Id
+    WHERE ua.ActivityRank <= 100
+    GROUP BY u.Id, u.DisplayName, ua.QuestionCount, ua.AnswerCount, ua.CommentCount, ua.TotalUpVotes, ua.TotalDownVotes, ua.ActivityRank
+)
+SELECT DISTINCT
+    p.Id AS PostId,
+    p.PostTypeId,
+    p.Title,
+    p.Tags,
+    p.Score,
+    p.ViewCount,
+    p.OwnerUserId,
+    u.DisplayName AS OwnerName,
+    u.Reputation,
+    COALESCE(cq.CloseReason, 'Open') AS CloseStatus,
+    COALESCE(cq.CloseDate, NULL) AS CloseDate,
+    ps.AvgScoreByType,
+    ps.ScoreRank,
+    ps.TotalViewsByTag,
+    ua.QuestionCount,
+    ua.AnswerCount,
+    ua.CommentCount,
+    ua.TotalUpVotes,
+    ua.TotalDownVotes,
+    tu.GoldBadges,
+    tu.SilverBadges,
+    tu.BronzeBadges,
+    STRING_AGG(DISTINCT rth.TagName, ',' ORDER BY rth.Level) AS RelatedTagsPath,
+    CASE 
+        WHEN p.AcceptedAnswerId IS NOT NULL THEN 'Has Accepted Answer' 
+        ELSE 'No Accepted Answer' 
+    END AS AcceptedAnswerStatus,
+    CASE 
+        WHEN p.LastActivityDate > cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '30 days' THEN 'Recently Active' 
+        ELSE 'Inactive' 
+    END AS ActivityStatus
+FROM Posts p
+LEFT JOIN Users u ON u.Id = p.OwnerUserId
+LEFT JOIN ClosedQuestionsWithReasons cq ON cq.PostId = p.Id AND cq.CloseRank = 1
+LEFT JOIN PostScoresWithWindows ps ON ps.Id = p.Id
+LEFT JOIN UserActivityRankings ua ON ua.UserId = p.OwnerUserId
+LEFT JOIN TopUsersByActivityAndBadges tu ON tu.Id = p.OwnerUserId
+LEFT JOIN RecursiveTagHierarchy rth ON rth.TagName = ANY(string_to_array(trim(both '<>' from COALESCE(p.Tags, '')), '><'))
+WHERE p.PostTypeId = 1
+AND (
+    (ps.Score > ps.AvgScoreByType * 1.5 AND ps.ViewCount > 1000)
+    OR 
+    (cq.CloseReason IS NOT NULL AND cq.CloseReason ILIKE '%duplicate%')
+)
+AND (u.Reputation > 1000 OR u.Id IS NULL)
+AND (tu.GoldBadges + tu.SilverBadges + tu.BronzeBadges) > 0
+ORDER BY ps.ScoreRank, p.ViewCount DESC
+LIMIT 50;

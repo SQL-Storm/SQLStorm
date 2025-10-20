@@ -1,0 +1,89 @@
+-- {"query": "1312.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.3, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1104} 
+with RecursiveTopUsers as (
+    select 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        count(b.Id) filter (where b.Class = 1) as GoldBadges,
+        count(b.Id) filter (where b.Class = 2) as SilverBadges,
+        count(b.Id) filter (where b.Class = 3) as BronzeBadges,
+        row_number() over (order by u.Reputation desc, count(b.Id) filter (where b.Class = 1) desc) as Rnk
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.DisplayName, u.Reputation
+    having count(b.Id) filter (where b.Class = 1) >= 1
+)
+, QAnswerDetails AS (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        q.Tags,
+        q.CreationDate as QuestionCreationDate,
+        a.Id as AnswerId,
+        a.Score as AnswerScore,
+        a.CreationDate as AnswerCreationDate,
+        rank() over (partition by q.Id order by a.Score desc, a.CreationDate asc) as AnswerRank,
+        exists (
+            select 1
+            from Votes v
+            where v.PostId = a.Id and v.VoteTypeId = 2 and v.CreationDate >= cast('2024-10-01' as date) - interval '1 year'
+        ) as HasRecentUpvote,
+        coalesce(pht.Name, 'No Close') as CloseReason
+    from Posts q
+    left join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+    left join PostHistory ph on ph.PostId = q.Id and ph.PostHistoryTypeId = 10 and ph.CreationDate = (
+        select max(CreationDate) from PostHistory ph2 where ph2.PostId = q.Id and ph2.PostHistoryTypeId = 10
+    )
+    left join CloseReasonTypes pht on pht.Id = cast(ph.Comment as smallint)
+    where q.PostTypeId = 1
+)
+, LatestComments as (
+    select distinct on (c.PostId) 
+        c.PostId,
+        c.Id as CommentId,
+        c.Text as CommentText,
+        c.UserId as CommentUserId,
+        c.CreationDate as CommentCreationDate,
+        c.UserDisplayName as CommentUserDisplay
+    from Comments c
+    order by c.PostId, c.CreationDate desc
+)
+, TagQuestionCounts as (
+    select
+        unnest(string_to_array(substring(Tags, 2, length(Tags)-2), '><')) as Tag,
+        count(*) as QuestionCount
+    from Posts
+    where PostTypeId = 1 and Tags is not null
+    group by Tag
+)
+select
+    rt.Rnk as UserRank,
+    rt.DisplayName as TopUser,
+    rt.Reputation,
+    rt.GoldBadges,
+    rt.SilverBadges,
+    rt.BronzeBadges,
+    qd.QuestionId,
+    substring(qd.Title from 1 for 80) || case when length(qd.Title) > 80 then '...' else '' end as ShortTitle,
+    qd.CloseReason,
+    count(distinct a1.AnswerId) over (partition by qd.QuestionId) as NumberOfAnswers,
+    max(a2.AnswerScore) over (partition by qd.QuestionId) as MaxAnswerScore,
+    max(case when lc.CommentId is not null then 1 else 0 end) over (partition by qd.QuestionId) as HasComments,
+    sum(case when qd.HasRecentUpvote then 1 else 0 end) over (partition by qd.QuestionId) as AnswersWithRecentUpvotes,
+    round(avg(coalesce(rt.GoldBadges,0) + coalesce(rt.SilverBadges,0) * 0.5 + coalesce(rt.BronzeBadges,0) * 0.2),2) over () as AvgWeightedBadges,
+    tqc.Tag,
+    tqc.QuestionCount,
+    length(coalesce(qd.Tags, '')) as TagStringLength,
+    case when qd.AnswerRank = 1 then 1 else 0 end as IsTopAnswer,
+    rank() over (partition by tac.Tag order by tqc.QuestionCount desc) as TagPopularityRank
+from RecursiveTopUsers rt
+join Posts q on q.OwnerUserId = rt.Id and q.PostTypeId = 1
+left join QAnswerDetails qd on qd.QuestionId = q.Id and qd.AnswerRank = 1
+left join Posts a1 on a1.ParentId = q.Id and a1.PostTypeId = 2
+left join Posts a2 on a2.ParentId = q.Id and a2.PostTypeId = 2
+left join LatestComments lc on lc.PostId = q.Id
+left join TagQuestionCounts tqc on tqc.Tag = any(string_to_array(substring(q.Tags, 2, length(q.Tags)-2),'><'))
+left join TagQuestionCounts tac on tac.Tag = tqc.Tag
+where rt.Rnk <= 10
+order by rt.Rnk, TagPopularityRank, qd.QuestionCreationDate desc
+limit 100;

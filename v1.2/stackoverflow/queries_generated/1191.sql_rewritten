@@ -1,0 +1,149 @@
+-- {"query": "1191.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.1, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1477} 
+WITH RecursiveTagHierarchy AS (
+    SELECT 
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        1 AS Level,
+        ARRAY[t.Id] AS Ancestors
+    FROM Tags t
+    WHERE t.IsRequired = 1
+
+    UNION ALL
+
+    SELECT
+        child.Id,
+        child.TagName,
+        child.Count,
+        child.ExcerptPostId,
+        child.WikiPostId,
+        rh.Level + 1,
+        rh.Ancestors || child.Id
+    FROM Tags child
+    JOIN PostLinks pl ON pl.PostId = child.ExcerptPostId AND pl.LinkTypeId = 1
+    JOIN RecursiveTagHierarchy rh ON rh.Id = pl.RelatedPostId
+    WHERE NOT child.Id = ANY(rh.Ancestors)
+), UserBadgeAggregates AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(b.Id) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+        COALESCE(SUM(CASE WHEN b.Date > cast('2024-10-01' as date) - INTERVAL '365 days' THEN 1 ELSE 0 END), 0) AS BadgesLastYear
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName
+), QuestionStats AS (
+    SELECT 
+        p.Id,
+        p.OwnerUserId,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        COALESCE(a.AnswerCount, 0) AS AnswerCount,
+        COALESCE(f.FavoriteCount, 0) AS FavoriteCount,
+        COALESCE(c.CommentCount, 0) AS CommentCount,
+        MAX(ph.CreationDate) FILTER (WHERE ph.PostHistoryTypeId IN (10, 11)) AS ClosureStatusChangeDate,
+        MIN(v.CreationDate) FILTER (WHERE v.VoteTypeId = 8) AS FirstBountyStart,
+        MAX(v.BountyAmount) FILTER (WHERE v.VoteTypeId IN (8,9)) AS MaxBounty,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC) AS UserTopQuestionRank
+    FROM Posts p
+    LEFT JOIN (
+        SELECT ParentId, COUNT(*) AS AnswerCount 
+        FROM Posts 
+        WHERE PostTypeId = 2
+        GROUP BY ParentId
+    ) a ON p.Id = a.ParentId
+    LEFT JOIN (
+        SELECT PostId, COUNT(*) AS CommentCount 
+        FROM Comments 
+        GROUP BY PostId
+    ) c ON p.Id = c.PostId
+    LEFT JOIN (
+        SELECT PostId, COUNT(*) AS FavoriteCount 
+        FROM Votes 
+        WHERE VoteTypeId = 5
+        GROUP BY PostId
+    ) f ON p.Id = f.PostId
+    LEFT JOIN PostHistory ph ON ph.PostId = p.Id AND ph.PostHistoryTypeId IN (10,11)
+    LEFT JOIN Votes v ON v.PostId = p.Id AND v.VoteTypeId IN (8,9)
+    WHERE p.PostTypeId = 1
+    GROUP BY p.Id, p.OwnerUserId, p.Title, p.CreationDate, p.Score, p.ViewCount, p.Tags, a.AnswerCount, f.FavoriteCount, c.CommentCount
+), PopularUserQuestions AS (
+    SELECT 
+        qs.*,
+        uba.GoldBadges,
+        uba.SilverBadges,
+        uba.BronzeBadges,
+        uba.BadgesLastYear,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        u.Location,
+        u.DisplayName AS UserDisplayName
+    FROM QuestionStats qs
+    LEFT JOIN UserBadgeAggregates uba ON qs.OwnerUserId = uba.UserId
+    LEFT JOIN Users u ON u.Id = qs.OwnerUserId
+    WHERE qs.UserTopQuestionRank <= 3 AND qs.Score > 10
+), AcceptedAnswerImpact AS (
+    SELECT 
+        p.Id AS QuestionId,
+        p.AcceptedAnswerId,
+        a.Score AS AcceptedAnswerScore,
+        a.CreationDate AS AcceptedAnswerCreation,
+        a.OwnerUserId AS AcceptedAnswerOwner
+    FROM Posts p
+    LEFT JOIN Posts a ON a.Id = p.AcceptedAnswerId
+    WHERE p.PostTypeId = 1
+), UserAnswerStats AS (
+    SELECT 
+        ua.OwnerUserId,
+        COUNT(*) AS AnswersCount,
+        AVG(ua.Score) AS AverageAnswerScore,
+        MAX(ua.CreationDate) AS LastAnswerDate,
+        SUM(CASE WHEN ua.Id IN (SELECT DISTINCT AcceptedAnswerId FROM AcceptedAnswerImpact WHERE AcceptedAnswerId IS NOT NULL) THEN 1 ELSE 0 END) AS AcceptedAnswersCount
+    FROM Posts ua
+    WHERE ua.PostTypeId = 2
+    GROUP BY ua.OwnerUserId
+)
+SELECT 
+    puq.Id AS QuestionId,
+    puq.Title,
+    puq.UserDisplayName,
+    puq.Score AS QuestionScore,
+    puq.AnswerCount,
+    puq.FavoriteCount,
+    puq.CommentCount,
+    puq.Tags,
+    puq.GoldBadges,
+    puq.SilverBadges,
+    puq.BronzeBadges,
+    puq.BadgesLastYear,
+    ua.AnswersCount,
+    ua.AcceptedAnswersCount,
+    ua.AverageAnswerScore,
+    ROW_NUMBER() OVER (ORDER BY puq.Score DESC, puq.AnswerCount DESC) AS PerformanceRank,
+    COALESCE(pqh.Level, 0) AS TagHierarchyLevel,
+    CASE
+        WHEN puq.ClosureStatusChangeDate IS NOT NULL THEN 'Closed/Reopened'
+        ELSE 'Open'
+    END AS OpenStatus,
+    CONCAT(
+        'User reputation: ', puq.Reputation, '; ',
+        'Location: ', COALESCE(puq.Location, 'Unknown'), '; ',
+        'Top Question Rank: ', puq.UserTopQuestionRank
+    ) AS UserSummary,
+    SUBSTRING(REPLACE(REPLACE(puq.Tags, '<', ','), '>', ''), 2, 100) AS ParsedTagSummary,
+    CASE WHEN puq.MaxBounty IS NOT NULL THEN puq.MaxBounty ELSE 0 END AS MaxBountyAwarded
+FROM PopularUserQuestions puq
+LEFT JOIN AcceptedAnswerImpact aai ON aai.QuestionId = puq.Id
+LEFT JOIN UserAnswerStats ua ON ua.OwnerUserId = puq.OwnerUserId
+LEFT JOIN RecursiveTagHierarchy pqh ON ARRAY[pqh.TagName] <@ string_to_array(REPLACE(REPLACE(puq.Tags, '<', ''), '>', ''), ' ')
+WHERE puq.AnswerCount > 0 
+  AND puq.CreationDate > cast('2024-10-01' as date) - INTERVAL '5 years'
+ORDER BY PerformanceRank
+LIMIT 100;

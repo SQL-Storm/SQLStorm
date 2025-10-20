@@ -1,0 +1,105 @@
+WITH RECURSIVE RecursiveTagReplies AS (
+    SELECT 
+        p.Id AS PostId,
+        p.Title,
+        1 AS Level,
+        ARRAY[p.Id] AS Path
+    FROM Posts p
+    WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL
+
+    UNION ALL
+
+    SELECT 
+        child.Id AS PostId,
+        LEFT(child.Title, 60) || '...' AS Title,
+        parent.Level + 1 AS Level,
+        parent.Path || child.Id AS Path
+    FROM Posts child
+    JOIN Posts parent_post ON child.ParentId = parent_post.Id
+    JOIN RecursiveTagReplies parent
+        ON parent.PostId = child.ParentId
+    WHERE child.PostTypeId = 2
+),
+BadgeRanks AS (
+    SELECT 
+        b.UserId,
+        SUM(CASE WHEN b.Class = 1 THEN 3 ELSE 0 END) +
+        SUM(CASE WHEN b.Class = 2 THEN 2 ELSE 0 END) +
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS WeightedBadgeScore
+    FROM Badges b
+    GROUP BY b.UserId
+),
+UserTopPostsRanked AS (
+    SELECT
+        p.OwnerUserId,
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.Score,
+        ROW_NUMBER() OVER(PARTITION BY p.OwnerUserId ORDER BY p.Score DESC NULLS LAST, p.ViewCount DESC NULLS LAST) AS RankTopPosts
+    FROM Posts p
+    WHERE p.OwnerUserId IS NOT NULL AND p.OwnerUserId > 0
+),
+QuestionCloseHistory AS (
+    SELECT ph.PostId, col.Name AS CloseReasonName, ph.CreationDate
+    FROM PostHistory ph
+    JOIN PostHistoryTypes pht ON ph.PostHistoryTypeId = pht.Id AND pht.Name = 'Post Closed'
+    LEFT JOIN CloseReasonTypes col ON col.Id = CAST(ph.Comment AS INTEGER)
+    WHERE ph.PostId IN (SELECT Id FROM Posts WHERE PostTypeId = 1)
+)
+SELECT DISTINCT
+    u.Id AS UserId,
+    COALESCE(u.DisplayName, 'Unknown User') AS UserName,
+    u.Reputation,
+    COALESCE(bt.WeightedBadgeScore, 0) AS BadgeScore,
+    COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1) AS TotalQuestions,
+    COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 2) AS TotalAnswers,
+    MAX(p.CreationDate) OVER (PARTITION BY u.Id) AS LastPostDate,
+    CONCAT_WS('-',
+        STRING_AGG(DISTINCT LEFT(t.TagName, 10), '/' ORDER BY COUNT(t.Id) DESC),
+        '_TotalTags:',
+        COUNT(DISTINCT t.Id)
+    ) AS TagSummary,
+    phc.CloseReasonName,
+    plural_rule.count AS PluralsMisused,
+    ROW_NUMBER() OVER (ORDER BY COALESCE(bt.WeightedBadgeScore,0) DESC, u.Reputation DESC NULLS LAST) AS UserLeaderBoardPosition
+FROM Users u 
+LEFT JOIN Posts p 
+    ON p.OwnerUserId = u.Id
+LEFT JOIN (
+    SELECT DISTINCT pt.TagName, pt.Id, pht.UserId
+    FROM Tags pt
+    JOIN Posts p ON p.Tags ILIKE '%' || pt.TagName || '%'
+    JOIN PostsFactorsWithPHTag pht ON pht.PostId = p.Id
+) t ON true
+LEFT JOIN BadgeRanks bt ON bt.UserId = u.Id
+LEFT JOIN QuestionCloseHistory phc ON phc.PostId = p.Id AND p.PostTypeId = 1
+LEFT JOIN LATERAL (
+    SELECT COUNT(*) AS count
+    FROM regexp_matches(
+        COALESCE(p.Body, ''), '([a-zA-Z]+)s\b', 'g'
+    ) AS ms(count_word)
+    WHERE LOWER(count_word) LIKE '%s'
+) plural_rule ON true
+WHERE u.CreationDate < CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '365 day'
+GROUP BY u.Id, u.DisplayName, bt.WeightedBadgeScore, u.Reputation, phc.CloseReasonName, plural_rule.count
+HAVING COUNT(DISTINCT p.Id) > 5
+
+UNION
+
+SELECT 
+    u2.Id,
+    COALESCE(u2.DisplayName, 'Orphaned Post Reviewer') AS UserName,
+    449 AS Reputation,
+    0 AS BadgeScore,
+    0 AS TotalQuestions,
+    0 AS TotalAnswers,
+    NULL AS LastPostDate,
+    NULL AS TagSummary,
+    0 AS CloseReasonName,
+    99999 AS UserLeaderBoardPosition
+FROM Users u2
+WHERE NOT EXISTS (
+    SELECT 1 FROM Posts p2 WHERE p2.OwnerUserId = u2.Id
+)
+ORDER BY UserLeaderBoardPosition ASC
+LIMIT 100;

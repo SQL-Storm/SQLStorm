@@ -1,0 +1,78 @@
+with RecursiveUserGiveback as (
+    select
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        coalesce(b.allRunupBadges, 0) as BadgeSummatory,
+        u.CreationDate,
+        case 
+            when u.Location is null or length(trim(u.Location)) = 0 then 'Missing'
+            when lower(u.Location) like '%moon%' then 'Moon Base'
+            else u.Location end as CleanedLocation,
+        rq.AverageAcceptedAnsScore,
+        pc.HighVolumeWeekendPosting,
+        view.SomeWindowIdx
+    from Users u
+    left join (
+        select UserId, count(*) as allRunupBadges
+        from Badges
+        group by UserId
+    ) b on b.UserId = u.Id
+    left join lateral (
+        select avg(a.Score) as AverageAcceptedAnsScore
+        from Posts a 
+        where a.OwnerUserId = u.Id 
+          and a.PostTypeId = 2 
+          and a.Score is not null 
+          and exists (
+            select 1 from Posts q
+            where q.Id = a.ParentId and q.AcceptedAnswerId = a.Id
+          )
+    ) rq on true
+    left join (
+        select OwnerUserId, count(*) as HighVolumeWeekendPosting
+        from Posts p 
+        where extract(isodow from p.CreationDate) IN (6,7)
+          and p.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '180 day'
+        group by OwnerUserId
+        having count(*) > 10
+    ) pc on pc.OwnerUserId = u.Id
+    left join lateral (
+      select
+        row_number() OVER (partition by bd.UserId ORDER BY (v.v_score_by_score_and_posts) desc NULLS LAST) as SomeWindowIdx
+      from Badges bd
+      left join (
+        select v_inner.Id, v_inner.UserId, v_inner.PostId,
+               /* example computed value for ordering; replace with real expression if available */
+               coalesce(v_inner.Score, 0) * coalesce(v_inner.SomePostMetric, 1) as v_score_by_score_and_posts
+        from Votes v_inner
+      ) v on v.UserId = u.Id
+         and v.PostId = bd.UserId
+         and v.Id < 50
+      where bd.UserId = u.Id
+      limit 1
+    ) view on true
+)
+, ctrUsersWithRowNumber as (
+    select *,
+      row_number() over (partition by substr(coalesce((rank30hann.score10_calld_day_edit_pct25_actionsten || 'faq'), ''), 1, 30) order by Id) as ww
+    from Users
+), taggeddupe as (
+    select PostId as questionid, string_agg(distinct r_tag, ',') as tags
+    from PostTags
+    group by PostId
+)
+select r.Id,
+       r.DisplayName,
+       r.Reputation,
+       r.BadgeSummatory,
+       r.CreationDate,
+       r.CleanedLocation,
+       r.AverageAcceptedAnsScore,
+       r.HighVolumeWeekendPosting,
+       r.SomeWindowIdx,
+       c.*,
+       t.tags
+from RecursiveUserGiveback r
+join ctrUsersWithRowNumber c on c.Id = r.Id
+left join taggeddupe t on t.questionid = c.Id;

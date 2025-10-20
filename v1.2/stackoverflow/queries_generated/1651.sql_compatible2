@@ -1,0 +1,118 @@
+WITH RECURSIVE RecursiveTaggedPosts AS (
+    SELECT
+        p.Id,
+        p.Title,
+        p.Tags,
+        p.CreationDate,
+        p.OwnerUserId,
+        ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY p.CreationDate DESC) AS UserPostRank
+    FROM
+        Posts p
+        LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE
+        p.PostTypeId = 1
+        AND p.Tags IS NOT NULL
+
+    UNION ALL
+
+    SELECT
+        child.Id,
+        child.Title,
+        child.Tags,
+        child.CreationDate,
+        child.OwnerUserId,
+        c.UserPostRank + 1
+    FROM
+        Posts child
+        INNER JOIN RecursiveTaggedPosts c ON child.ParentId = c.Id
+    WHERE
+        child.PostTypeId = 2
+        AND child.Tags IS NOT NULL
+),
+DatesOverlapView AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        ph.PostHistoryTypeId,
+        ph.PostId,
+        ph.CreationDate AS HistoryCreation,
+        p.LastActivityDate,
+        CASE
+            WHEN ph.PostHistoryTypeId IN (10, 12, 14) THEN 'Closed/Deleted/Locked Edits'
+            WHEN ph.PostHistoryTypeId IN (11, 13, 15) THEN 'Reopened/Undeleted/Unlocked Edits'
+            ELSE 'Other Edits'
+        END AS EditStatusCategory,
+        IgnoreIntersect.PostCountDuringHistory
+    FROM
+        Users u
+        LEFT JOIN PostHistory ph ON ph.UserId = u.Id
+        LEFT JOIN Posts p ON ph.PostId = p.Id
+        LEFT JOIN (
+            SELECT
+                ph1.PostId,
+                ph1.CreationDate,
+                COUNT(DISTINCT phOther.Id) AS PostCountDuringHistory
+            FROM
+                PostHistory ph1
+                LEFT JOIN PostHistory phOther ON phOther.PostId = ph1.PostId
+                    AND phOther.CreationDate BETWEEN ph1.CreationDate - INTERVAL '7' DAY AND ph1.CreationDate + INTERVAL '7' DAY
+            GROUP BY
+                ph1.PostId, ph1.CreationDate
+        ) IgnoreIntersect ON IgnoreIntersect.PostId = ph.PostId AND IgnoreIntersect.CreationDate = ph.CreationDate
+    WHERE
+        ph.PostHistoryTypeId IS NOT NULL
+),
+VotesAggregationPerfCat AS (
+    SELECT
+        p.OwnerUserId,
+        v.VoteTypeId,
+        CAST(COALESCE(v.BountyAmount, 0) AS BIGINT) AS BountyAmount,
+        COUNT(*) AS VoteCount,
+        SUM(CAST(COALESCE(v.BountyAmount, 0) AS BIGINT)) AS TotalBountyAmount,
+        AVG(double_precision_score.rnkscore) AS AverageWeightedScore
+    FROM
+        Votes v
+        INNER JOIN Posts p ON v.PostId = p.Id
+        INNER JOIN (
+            SELECT
+                pinner.Id,
+                RANK() OVER (ORDER BY MAX(panner.Score) DESC) AS rnkscore
+            FROM
+                Posts pinner
+                LEFT JOIN Posts panner ON pinner.PostTypeId = panner.PostTypeId
+            GROUP BY
+                pinner.Id
+        ) double_precision_score ON double_precision_score.Id = p.Id
+    WHERE
+        p.OwnerUserId IS NOT NULL
+        AND v.VoteTypeId IN (2, 3, 14)
+    GROUP BY
+        p.OwnerUserId, v.VoteTypeId, CAST(COALESCE(v.BountyAmount, 0) AS BIGINT)
+)
+SELECT DISTINCT
+    u.Id,
+    u.DisplayName,
+    bfs.bfs_dummy,
+    PayloadSub.QueryLength,
+    mv.LastVoteImpactRank
+FROM
+    Users u
+    LEFT JOIN RecursiveTaggedPosts rtp ON rtp.OwnerUserId = u.Id
+    LEFT JOIN DatesOverlapView dov ON dov.UserId = u.Id
+    LEFT JOIN VotesAggregationPerfCat vafc ON vafc.OwnerUserId = u.Id
+    LEFT JOIN LATERAL (
+        SELECT NULL AS QueryLength
+    ) PayloadSub ON TRUE
+    LEFT JOIN LATERAL (
+        SELECT NULL AS LastVoteImpactRank
+    ) mv ON TRUE
+    LEFT JOIN LATERAL (
+        SELECT NULL AS bfs_dummy
+    ) bfs ON TRUE
+GROUP BY
+    u.Id,
+    u.DisplayName,
+    bfs.bfs_dummy,
+    PayloadSub.QueryLength,
+    mv.LastVoteImpactRank
+;

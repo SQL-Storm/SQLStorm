@@ -1,0 +1,16 @@
+WITH RecursivePopularPosts AS (
+  SELECT
+    u.Id AS users_inf,
+    dense_rank() OVER (PARTITION BY u.Id_ans_word_desc ORDER BY u.pv DESC) AS best_post_rank,
+    CAST(NULL AS INTEGER) AS BonesEarned
+  FROM users u
+)
+SELECT
+  users_inf,
+  best_post_rank,
+  BonesEarned
+FROM RecursivePopularPosts
+GROUP BY
+  users_inf,
+  best_post_rank,
+  BonesEarned;

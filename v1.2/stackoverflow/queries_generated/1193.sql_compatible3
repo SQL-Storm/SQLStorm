@@ -1,0 +1,146 @@
+WITH RECURSIVE RecursiveTagAncestors AS (
+    SELECT 
+        t.Id, t.TagName, t.Count, t.ExcerptPostId, t.WikiPostId, t.IsModeratorOnly, t.IsRequired, 
+        0 AS Level, CAST(t.TagName AS VARCHAR(1000)) AS AncestryPath
+    FROM Tags t
+    WHERE t.Id IN (
+        SELECT p.Id FROM Posts p 
+        WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL AND p.Tags <> ''
+    )
+    UNION ALL
+    SELECT 
+        t.Id, t.TagName, t.Count, t.ExcerptPostId, t.WikiPostId, t.IsModeratorOnly, t.IsRequired,
+        r.Level + 1,
+        CAST(r.AncestryPath || ' > ' || t.TagName AS VARCHAR(1000))
+    FROM Tags t
+    JOIN RecursiveTagAncestors r ON r.Id = t.Id - 1
+    WHERE r.Level < 1
+),
+TopUserPosts AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        p.Id AS PostId, p.PostTypeId, p.Score, p.ViewCount, p.CreationDate,
+        ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY p.Score DESC NULLS LAST, p.ViewCount DESC NULLS LAST, p.CreationDate ASC) AS rn
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    WHERE p.PostTypeId IN (1,2)
+),
+UserBadgeCounts AS (
+    SELECT 
+        UserId,
+        SUM(CASE WHEN Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        COUNT(*) AS TotalBadges
+    FROM Badges 
+    GROUP BY UserId
+),
+PostScoresWindow AS (
+    SELECT 
+        p.Id,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId,
+        AVG(p.Score) OVER (PARTITION BY p.OwnerUserId) AS AvgUserScore,
+        MAX(p.Score) OVER (PARTITION BY p.OwnerUserId) AS MaxUserScore,
+        MIN(p.Score) OVER (PARTITION BY p.OwnerUserId) AS MinUserScore,
+        RANK() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC NULLS LAST) AS ScoreRank,
+        COUNT(*) OVER (PARTITION BY p.OwnerUserId) AS UserPostCount
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+),
+PostLinksDuplicateCount AS (
+    SELECT 
+        pl.PostId,
+        COUNT(CASE WHEN lt.Name = 'Duplicate' THEN 1 END) AS DuplicateCount,
+        COUNT(*) AS TotalLinks
+    FROM PostLinks pl
+    JOIN LinkTypes lt ON lt.Id = pl.LinkTypeId
+    GROUP BY pl.PostId
+),
+FilteredComments AS (
+    SELECT 
+        c.PostId,
+        STRING_AGG(DISTINCT SUBSTRING(c.Text FROM 1 FOR 30), ' | ' ORDER BY c.CreationDate) AS SampleComments,
+        COUNT(*) AS CommentCount,
+        SUM(CASE WHEN c.UserId IS NULL THEN 1 ELSE 0 END) AS AnonymousComments
+    FROM Comments c
+    WHERE c.Text IS NOT NULL AND c.Text <> ''
+    GROUP BY c.PostId
+),
+PostLastEdit AS (
+    SELECT 
+        ph.PostId,
+        MAX(ph.CreationDate) AS LastEditDate,
+        COUNT(CASE WHEN ph.PostHistoryTypeId IN (4,5,6) THEN 1 END) AS EditCount,
+        COUNT(CASE WHEN ph.PostHistoryTypeId = 10 THEN 1 END) AS CloseEvents
+    FROM PostHistory ph
+    GROUP BY ph.PostId
+)
+SELECT 
+    u.Id AS UserId,
+    u.DisplayName,
+    ub.GoldBadges,
+    ub.SilverBadges,
+    ub.BronzeBadges,
+    ub.TotalBadges,
+    tup.PostId,
+    tup.PostTypeId,
+    p.Title,
+    p.Score,
+    p.ViewCount,
+    psw.AvgUserScore,
+    psw.MaxUserScore,
+    psw.MinUserScore,
+    psw.ScoreRank,
+    psw.UserPostCount,
+    plc.DuplicateCount,
+    plc.TotalLinks,
+    fc.SampleComments,
+    fc.CommentCount,
+    fc.AnonymousComments,
+    pla.LastEditDate,
+    pla.EditCount,
+    pla.CloseEvents,
+    CASE 
+        WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+        WHEN COALESCE(pla.CloseEvents,0) > 0 THEN 'RecentlyClosed'
+        ELSE 'Open'
+    END AS PostStatus,
+    COALESCE(NULLIF(TRIM(u.Location), ''), 'Unknown Location') || ' -- ' ||
+    COALESCE(u.WebsiteUrl, 'No Website') || ' -- ' ||
+    CASE WHEN p.PostTypeId = 1 AND p.Tags IS NOT NULL THEN 
+        (
+         SELECT STRING_AGG(t.TagName, ', ' ORDER BY t.Count DESC)
+         FROM Tags t
+         WHERE POSITION('<' || t.TagName || '>' IN p.Tags) > 0
+        ) 
+    ELSE 'No Tags' END 
+    AS UserLocationAndTags
+FROM Users u
+LEFT JOIN UserBadgeCounts ub ON ub.UserId = u.Id
+LEFT JOIN TopUserPosts tup ON tup.UserId = u.Id AND tup.rn = 1
+LEFT JOIN Posts p ON p.Id = tup.PostId
+LEFT JOIN PostScoresWindow psw ON psw.Id = p.Id
+LEFT JOIN PostLinksDuplicateCount plc ON plc.PostId = p.Id
+LEFT JOIN FilteredComments fc ON fc.PostId = p.Id
+LEFT JOIN PostLastEdit pla ON pla.PostId = p.Id
+WHERE u.Reputation > (
+    SELECT AVG(Reputation) FROM Users WHERE Location IS NOT NULL AND Location <> ''
+)
+AND (
+    (p.Score > (
+        SELECT AVG(Score) FROM Posts WHERE OwnerUserId = u.Id AND PostTypeId = 1
+    )
+    )
+    OR p.Score IS NULL
+)
+GROUP BY
+    u.Id, u.DisplayName, ub.GoldBadges, ub.SilverBadges, ub.BronzeBadges, ub.TotalBadges,
+    tup.PostId, tup.PostTypeId, p.Title, p.Score, p.ViewCount, psw.AvgUserScore, psw.MaxUserScore, psw.MinUserScore,
+    psw.ScoreRank, psw.UserPostCount, plc.DuplicateCount, plc.TotalLinks, fc.SampleComments, fc.CommentCount, fc.AnonymousComments,
+    pla.LastEditDate, pla.EditCount, pla.CloseEvents, p.ClosedDate, u.Location, u.WebsiteUrl, p.PostTypeId, p.Tags, u.Reputation
+ORDER BY ub.GoldBadges DESC NULLS LAST, ub.TotalBadges DESC, p.Score DESC NULLS LAST, u.Reputation DESC
+LIMIT 100;

@@ -1,0 +1,154 @@
+with recursive TagHierarchy as (
+    select
+        t.Id,
+        t.TagName,
+        coalesce(t.Count,0) as Count,
+        array[t.Id] as TagPath
+    from Tags t
+    where t.IsRequired = true
+
+    union all
+
+    select
+        t.Id,
+        t.TagName,
+        coalesce(t.Count,0) + th.Count,
+        th.TagPath || t.Id
+    from Tags t
+    join TagHierarchy th on t.Id <> all(th.TagPath)
+    where length(t.TagName) > 3 and t.IsRequired = false
+),
+UserActivityWithWindows as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) as QCount,
+        count(distinct p.Id) filter (where p.PostTypeId = 2) as ACount,
+        sum(coalesce(p.Score,0)) over (partition by u.Id order by p.CreationDate ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) as RunningScore,
+        dense_rank() over (order by u.Reputation desc, u.Id) as ReputationRank,
+        max(case when b.Class = 1 then 1 else 0 end) over (partition by u.Id) as HasGoldBadge,
+        max(case when b.Class = 2 then 1 else 0 end) over (partition by u.Id) as HasSilverBadge,
+        max(case when b.Class = 3 then 1 else 0 end) over (partition by u.Id) as HasBronzeBadge,
+        case 
+            when u.LastAccessDate > (date '2024-10-01' - interval '30 days') then 1 else 0
+        end as IsActiveRecently
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate
+),
+QuestionAnswerStats as (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        q.CreationDate as QuestionDate,
+        coalesce(q.Score,0) as QuestionScore,
+        q.ViewCount,
+        count(distinct a.Id) as AnswerCount,
+        max(a.Score) as MaxAnswerScore,
+        avg(a.Score) filter (where a.Score > 0) as AvgPositiveAnswerScore,
+        min(a.CreationDate) as FirstAnswerDate,
+        (select count(*) from Comments c where c.PostId = q.Id and (c.UserId is null or c.UserId <> q.OwnerUserId)) as ExternalCommentCount,
+        (
+            select count(distinct s.arr) 
+            from (
+                select unnest(string_to_array(substring(q.Tags from 2 for char_length(q.Tags)-2), '><')) as arr
+            ) s
+            where lower(s.arr) like '%sql%'
+        ) as SqlRelatedTags
+    from Posts q
+    left join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+    where q.PostTypeId = 1
+    group by q.Id, q.Title, q.CreationDate, q.Score, q.ViewCount
+),
+CloseReasonCounts as (
+    select
+        ch.PostId,
+        crt.Name as CloseReason,
+        count(*) as CloseVotesCount
+    from PostHistory ch
+    join CloseReasonTypes crt on crt.Id = cast(ch.Comment as smallint)
+    where ch.PostHistoryTypeId = 10
+    group by ch.PostId, crt.Name
+),
+LinkedPostsAsDuplicates as (
+    select
+        pl.PostId as DuplicatePostId,
+        pl.RelatedPostId as OriginalPostId,
+        p1.Title as DupTitle,
+        p2.Title as OrigTitle,
+        u.DisplayName as DuplicateOwnerName,
+        p1.Score as DupScore,
+        p2.Score as OrigScore
+    from PostLinks pl
+    join Posts p1 on p1.Id = pl.PostId
+    join Posts p2 on p2.Id = pl.RelatedPostId
+    left join Users u on u.Id = p1.OwnerUserId
+    where pl.LinkTypeId = 3
+),
+RecentActivitySummary as (
+    select
+        p.OwnerUserId,
+        count(*) filter (where p.CreationDate > (date '2024-10-01' - interval '7 days')) as PostsLast7Days,
+        count(*) filter (where p.CreationDate > (date '2024-10-01' - interval '30 days')) as PostsLast30Days,
+        count(*) filter (where v.CreationDate > (date '2024-10-01' - interval '30 days')) as VotesLast30Days,
+        count(distinct b.Id) filter (where b.Date > (date '2024-10-01' - interval '365 days')) as BadgesLastYear
+    from Posts p
+    left join Votes v on v.PostId = p.Id
+    left join Badges b on b.UserId = p.OwnerUserId
+    group by p.OwnerUserId
+)
+select distinct
+    ua.UserId,
+    ua.DisplayName,
+    ua.Reputation,
+    ua.ReputationRank,
+    ua.QCount,
+    ua.ACount,
+    ua.RunningScore,
+    ua.HasGoldBadge,
+    ua.HasSilverBadge,
+    ua.HasBronzeBadge,
+    ua.IsActiveRecently,
+    coalesce(ra.PostsLast7Days,0) as PostsLast7Days,
+    coalesce(ra.PostsLast30Days,0) as PostsLast30Days,
+    coalesce(ra.VotesLast30Days,0) as VotesLast30Days,
+    coalesce(ra.BadgesLastYear,0) as BadgesLastYear,
+    (
+        select q.Id from Posts q 
+        where q.OwnerUserId = ua.UserId and q.PostTypeId = 1 and q.AnswerCount > 5
+        order by q.CreationDate desc limit 1
+    ) as LastPopularQuestionId,
+    qa.AnswerCount,
+    qa.MaxAnswerScore,
+    qa.AvgPositiveAnswerScore,
+    crc.CloseReason,
+    crc.CloseVotesCount,
+    ld.DuplicatePostId,
+    ld.OrigTitle as DuplicateOriginalTitle,
+    th.Count as RequiredTagCount
+from Users ua
+left join RecentActivitySummary ra on ra.OwnerUserId = ua.UserId
+left join QuestionAnswerStats qa on qa.QuestionId = (
+    select q.Id 
+    from Posts q 
+    where q.OwnerUserId = ua.UserId and q.PostTypeId = 1
+    order by q.CreationDate desc limit 1
+)
+left join CloseReasonCounts crc on crc.PostId = (
+    select q2.Id from Posts q2 where q2.OwnerUserId = ua.UserId and q2.PostTypeId = 1 order by q2.CreationDate desc limit 1
+)
+left join LinkedPostsAsDuplicates ld on ld.DuplicateOwnerName = ua.DisplayName
+left join TagHierarchy th on true
+where ua.Reputation >= 1000
+  and (ua.HasGoldBadge = 1 or ua.HasSilverBadge = 1)
+  and
+  (
+    (coalesce(qa.AvgPositiveAnswerScore,0) > 10 and crc.CloseVotesCount is null)
+    or
+    (coalesce(ra.PostsLast30Days,0) > 5 and ua.IsActiveRecently = 1)
+  )
+order by ua.ReputationRank, LastPopularQuestionId desc
+limit 50;

@@ -1,0 +1,188 @@
+with RecursiveTagCounts as (
+    select
+        t.Id as TagId,
+        t.TagName,
+        t.Count,
+        coalesce(p.AnswerCount, 0) as TotalAnswers,
+        coalesce(p.ViewCount, 0) as TotalViews
+    from Tags t
+    left join Posts p on p.Id = t.ExcerptPostId and p.PostTypeId = 1
+    where t.TagName is not null
+),
+UserBadgeStats as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(b.Id) filter (where b.Class = 1) as GoldBadges,
+        count(b.Id) filter (where b.Class = 2) as SilverBadges,
+        count(b.Id) filter (where b.Class = 3) as BronzeBadges,
+        sum(case when b.TagBased = true then 1 else 0 end) as TagBasedBadges,
+        max(b.Date) as LastBadgeDate
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.DisplayName
+),
+PostActivityWindow as (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId,
+        p.Title,
+        p.Tags,
+        row_number() over (partition by p.OwnerUserId order by p.CreationDate desc) as RecentPostRank,
+        lag(p.Score) over (partition by p.OwnerUserId order by p.CreationDate) as PrevScore,
+        lead(p.Score) over (partition by p.OwnerUserId order by p.CreationDate) as NextScore,
+        case when p.ClosedDate is not null then 1 else 0 end as IsClosed
+    from Posts p
+    where p.PostTypeId in (1,2)
+),
+ClosedQuestionsWithReasons as (
+    select
+        ph.PostId,
+        ph.Comment as CloseReasonId,
+        crt.Name as CloseReasonName,
+        ph.CreationDate as CloseDate
+    from PostHistory ph
+    inner join CloseReasonTypes crt on crt.Id = ph.Comment
+    where ph.PostHistoryTypeId = 10
+),
+UserPostSummary as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(distinct p.Id) as TotalPosts,
+        count(distinct case when p.PostTypeId = 1 then p.Id end) as Questions,
+        count(distinct case when p.PostTypeId = 2 then p.Id end) as Answers,
+        avg(p.Score) filter (where p.PostTypeId in (1,2)) as AvgScore,
+        sum(p.ViewCount) filter (where p.PostTypeId = 1) as TotalQuestionViews,
+        max(p.Score) filter (where p.PostTypeId = 1) as MaxQuestionScore,
+        sum(case when p.ClosedDate is not null then 1 else 0 end) as ClosedPosts
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    group by u.Id, u.DisplayName
+),
+TopTagsPerUser as (
+    select
+        u.Id as UserId,
+        unnest(string_to_array(coalesce(p.Tags, ''), '><')) as TagName,
+        count(*) as TagCount
+    from Users u
+    join Posts p on p.OwnerUserId = u.Id and p.PostTypeId = 1
+    group by u.Id, unnest(string_to_array(coalesce(p.Tags, ''), '><'))
+),
+TopTagsRanked as (
+    select
+        UserId,
+        TagName,
+        TagCount,
+        rank() over (partition by UserId order by TagCount desc) as TagRank
+    from TopTagsPerUser
+),
+UserTopTags as (
+    select UserId, TagName, TagCount
+    from TopTagsRanked
+    where TagRank <= 3
+),
+DuplicatePostLinks as (
+    select
+        pl.PostId,
+        pl.RelatedPostId,
+        pl.CreationDate,
+        u.DisplayName as OwnerName,
+        p.Title as PostTitle,
+        rp.Title as RelatedPostTitle
+    from PostLinks pl
+    inner join LinkTypes lt on lt.Id = pl.LinkTypeId and lt.Name = 'Duplicate'
+    inner join Posts p on p.Id = pl.PostId
+    left join Users u on u.Id = p.OwnerUserId
+    left join Posts rp on rp.Id = pl.RelatedPostId
+),
+UserVoteSummary as (
+    select
+        v.UserId,
+        vt.Name as VoteTypeName,
+        count(*) as VoteCount,
+        sum(v.BountyAmount) as TotalBounty
+    from Votes v
+    inner join VoteTypes vt on vt.Id = v.VoteTypeId
+    group by v.UserId, vt.Name
+),
+UserVotePivot as (
+    select
+        UserId,
+        coalesce(max(case when VoteTypeName = 'UpMod' then VoteCount end),0) as UpVotes,
+        coalesce(max(case when VoteTypeName = 'DownMod' then VoteCount end),0) as DownVotes,
+        coalesce(max(case when VoteTypeName = 'Favorite' then VoteCount end),0) as Favorites,
+        coalesce(max(case when VoteTypeName = 'BountyClose' then VoteCount end),0) as BountiesClosed,
+        coalesce(max(case when VoteTypeName = 'BountyStart' then VoteCount end),0) as BountiesStarted,
+        coalesce(max(TotalBounty),0) as TotalBountyAmount
+    from UserVoteSummary
+    group by UserId
+)
+select
+    u.Id as UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    u.LastAccessDate,
+    coalesce(ubs.GoldBadges,0) as GoldBadges,
+    coalesce(ubs.SilverBadges,0) as SilverBadges,
+    coalesce(ubs.BronzeBadges,0) as BronzeBadges,
+    coalesce(ubs.TagBasedBadges,0) as TagBasedBadges,
+    ups.TotalPosts,
+    ups.Questions,
+    ups.Answers,
+    round(ups.AvgScore::numeric,2) as AvgPostScore,
+    ups.TotalQuestionViews,
+    ups.MaxQuestionScore,
+    ups.ClosedPosts,
+    coalesce(uvp.UpVotes,0) as UpVotes,
+    coalesce(uvp.DownVotes,0) as DownVotes,
+    coalesce(uvp.Favorites,0) as Favorites,
+    coalesce(uvp.BountiesStarted,0) as BountiesStarted,
+    coalesce(uvp.BountiesClosed,0) as BountiesClosed,
+    coalesce(uvp.TotalBountyAmount,0) as TotalBountyAmount,
+    array_agg(distinct utt.TagName) filter (where utt.TagName is not null) as TopTags,
+    (select count(*) from DuplicatePostLinks dpl where dpl.OwnerName = u.DisplayName) as DuplicateLinksCount,
+    (select count(*) from ClosedQuestionsWithReasons cqr where cqr.PostId in (select p.Id from Posts p where p.OwnerUserId = u.Id)) as ClosedQuestionsCount,
+    (select string_agg(distinct crt.Name, ', ') from ClosedQuestionsWithReasons cqr join CloseReasonTypes crt on crt.Id = cqr.CloseReasonId where cqr.PostId in (select p.Id from Posts p where p.OwnerUserId = u.Id)) as CloseReasons,
+    (select count(*) from PostHistory ph where ph.UserId = u.Id and ph.PostHistoryTypeId in (10,11)) as CloseReopenEvents,
+    (select max(ph.CreationDate) from PostHistory ph where ph.UserId = u.Id) as LastPostHistoryDate
+from Users u
+left join UserBadgeStats ubs on ubs.UserId = u.Id
+left join UserPostSummary ups on ups.UserId = u.Id
+left join UserTopTags utt on utt.UserId = u.Id
+left join UserVotePivot uvp on uvp.UserId = u.Id
+where u.Reputation > 1000
+and exists (
+    select 1 from Posts p where p.OwnerUserId = u.Id and p.PostTypeId = 1 and p.Score > 10
+)
+group by
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    u.LastAccessDate,
+    ubs.GoldBadges,
+    ubs.SilverBadges,
+    ubs.BronzeBadges,
+    ubs.TagBasedBadges,
+    ups.TotalPosts,
+    ups.Questions,
+    ups.Answers,
+    ups.AvgScore,
+    ups.TotalQuestionViews,
+    ups.MaxQuestionScore,
+    ups.ClosedPosts,
+    uvp.UpVotes,
+    uvp.DownVotes,
+    uvp.Favorites,
+    uvp.BountiesStarted,
+    uvp.BountiesClosed,
+    uvp.TotalBountyAmount,
+    utt.TagName
+order by u.Reputation desc, ups.TotalPosts desc
+limit 100;

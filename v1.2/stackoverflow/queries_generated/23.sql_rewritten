@@ -1,0 +1,171 @@
+-- {"query": "23.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 0.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1813} 
+with RecursiveTagHierarchy as (
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        1 as Level,
+        array[t.TagName] as Path
+    from Tags t
+    where t.IsModeratorOnly = 0 and t.IsRequired = 0
+    union all
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        r.Level + 1,
+        r.Path || t.TagName
+    from Tags t
+    join RecursiveTagHierarchy r on t.Id = r.Id + 1
+    where r.Level < 3
+),
+UserBadgeStats as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(b.Id) filter (where b.Class = 1) as GoldBadges,
+        count(b.Id) filter (where b.Class = 2) as SilverBadges,
+        count(b.Id) filter (where b.Class = 3) as BronzeBadges,
+        coalesce(sum(case when b.TagBased = 1 then 1 else 0 end),0) as TagBasedBadges
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.DisplayName
+),
+PostActivityWindow as (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        p.Title,
+        p.AcceptedAnswerId,
+        row_number() over (partition by p.OwnerUserId order by p.CreationDate desc) as RecentPostRank,
+        lag(p.Score) over (partition by p.OwnerUserId order by p.CreationDate) as PrevScore,
+        lead(p.Score) over (partition by p.OwnerUserId order by p.CreationDate) as NextScore
+    from Posts p
+    where p.PostTypeId in (1,2)
+),
+PostCloseReasons as (
+    select
+        ph.PostId,
+        crt.Name as CloseReasonName,
+        ph.CreationDate as CloseDate
+    from PostHistory ph
+    join CloseReasonTypes crt on crt.Id = cast(ph.Comment as int)
+    where ph.PostHistoryTypeId = 10
+),
+UserPostSummary as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionCount,
+        count(distinct p.Id) filter (where p.PostTypeId = 2) as AnswerCount,
+        avg(p.Score) filter (where p.PostTypeId = 1) as AvgQuestionScore,
+        avg(p.Score) filter (where p.PostTypeId = 2) as AvgAnswerScore,
+        max(p.ViewCount) filter (where p.PostTypeId = 1) as MaxQuestionViews,
+        sum(p.FavoriteCount) filter (where p.PostTypeId = 1) as TotalFavorites,
+        count(distinct ph.PostId) filter (where ph.PostHistoryTypeId = 10) as ClosedPostsCount
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join PostHistory ph on ph.PostId = p.Id
+    group by u.Id, u.DisplayName
+),
+TopTagsByPopularity as (
+    select
+        unnest(string_to_array(substring(p.Tags from 2 for char_length(p.Tags)-2), '><')) as Tag,
+        count(*) as UsageCount,
+        avg(p.Score) as AvgScore
+    from Posts p
+    where p.PostTypeId = 1 and p.Tags is not null
+    group by Tag
+    order by UsageCount desc
+    limit 10
+),
+DuplicateLinks as (
+    select
+        pl.PostId,
+        pl.RelatedPostId,
+        p1.Title as PostTitle,
+        p2.Title as RelatedPostTitle,
+        pl.CreationDate
+    from PostLinks pl
+    join Posts p1 on p1.Id = pl.PostId
+    join Posts p2 on p2.Id = pl.RelatedPostId
+    where pl.LinkTypeId = 3
+),
+UserCommentActivity as (
+    select
+        c.UserId,
+        u.DisplayName,
+        count(c.Id) as CommentCount,
+        avg(length(c.Text)) as AvgCommentLength,
+        max(c.CreationDate) as LastCommentDate
+    from Comments c
+    join Users u on u.Id = c.UserId
+    group by c.UserId, u.DisplayName
+),
+ComplexUserStats as (
+    select
+        u.Id,
+        u.DisplayName,
+        coalesce(ubs.GoldBadges,0) as GoldBadges,
+        coalesce(ubs.SilverBadges,0) as SilverBadges,
+        coalesce(ubs.BronzeBadges,0) as BronzeBadges,
+        coalesce(ups.QuestionCount,0) as Questions,
+        coalesce(ups.AnswerCount,0) as Answers,
+        coalesce(ups.ClosedPostsCount,0) as ClosedPosts,
+        coalesce(uca.CommentCount,0) as Comments,
+        coalesce(uca.AvgCommentLength,0) as AvgCommentLength,
+        coalesce(ups.AvgQuestionScore,0) as AvgQScore,
+        coalesce(ups.AvgAnswerScore,0) as AvgAScore,
+        coalesce(ups.MaxQuestionViews,0) as MaxQViews,
+        coalesce(ups.TotalFavorites,0) as TotalFavorites,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        case when u.WebsiteUrl is null or u.WebsiteUrl = '' then 'No Website' else u.WebsiteUrl end as WebsiteUrl,
+        case when u.Location is null then 'Unknown' else u.Location end as Location,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes
+    from Users u
+    left join UserBadgeStats ubs on ubs.UserId = u.Id
+    left join UserPostSummary ups on ups.UserId = u.Id
+    left join UserCommentActivity uca on uca.UserId = u.Id
+)
+select
+    cus.Id as UserId,
+    cus.DisplayName,
+    cus.Reputation,
+    cus.GoldBadges,
+    cus.SilverBadges,
+    cus.BronzeBadges,
+    cus.Questions,
+    cus.Answers,
+    cus.ClosedPosts,
+    cus.Comments,
+    cus.AvgCommentLength,
+    cus.AvgQScore,
+    cus.AvgAScore,
+    cus.MaxQViews,
+    cus.TotalFavorites,
+    cus.WebsiteUrl,
+    cus.Location,
+    cus.Views,
+    cus.UpVotes,
+    cus.DownVotes,
+    array_agg(distinct t.TagName) filter (where t.Count > 1000) as PopularTags,
+    (select count(*) from DuplicateLinks dl where dl.PostId in (select p.Id from Posts p where p.OwnerUserId = cus.Id)) as UserDuplicateLinksCount,
+    (select count(*) from PostCloseReasons pcr join Posts p on p.Id = pcr.PostId where p.OwnerUserId = cus.Id and pcr.CloseDate > cast('2024-10-01 12:34:56' as timestamp) - interval '1 year') as RecentClosedPosts,
+    (select string_agg(distinct crt.Name, ', ') from PostCloseReasons pcr join CloseReasonTypes crt on crt.Id = cast(pcr.CloseReasonName as int) where pcr.PostId in (select p.Id from Posts p where p.OwnerUserId = cus.Id)) as CloseReasons,
+    (select count(*) from PostHistory ph where ph.UserId = cus.Id and ph.PostHistoryTypeId in (4,5,6) and ph.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - interval '6 months') as RecentEditsCount,
+    (select avg(p.Score) from Posts p where p.OwnerUserId = cus.Id and p.PostTypeId = 1 and p.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - interval '1 year') as AvgRecentQuestionScore,
+    (select avg(p.Score) from Posts p where p.OwnerUserId = cus.Id and p.PostTypeId = 2 and p.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - interval '1 year') as AvgRecentAnswerScore
+from ComplexUserStats cus
+left join Tags t on t.TagName = any(array(select unnest(string_to_array(substring(p.Tags from 2 for char_length(p.Tags)-2), '><')) from Posts p where p.OwnerUserId = cus.Id limit 10))
+where cus.Reputation > 1000
+order by cus.Reputation desc, cus.GoldBadges desc
+limit 50;

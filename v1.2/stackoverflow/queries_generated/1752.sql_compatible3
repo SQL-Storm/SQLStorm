@@ -1,0 +1,54 @@
+with recursive RecursiveCloseStatus as (
+    select ph.PostId, 
+           case when ph.PostHistoryTypeId = 10 then ph.Comment else null end as CloseReasonId,
+           ph.CreationDate
+    from PostHistory ph
+    where ph.PostHistoryTypeId = 10
+    union all
+    select phr.PostId,
+           case when phr.PostHistoryTypeId = 11 then null else r.CloseReasonId end,
+           phr.CreationDate
+    from PostHistory phr
+    inner join RecursiveCloseStatus r on phr.PostId = r.PostId and phr.CreationDate > r.CreationDate
+    where phr.PostHistoryTypeId in (11)
+),
+AvgScoresWindow as (
+    select 
+        p.Id as PostId,
+        p.PostTypeId,
+        u.Id as UserId,
+        u.DisplayName,
+        coalesce(p.Score,0) as Score,
+        row_number() over (
+            partition by u.Id, p.PostTypeId 
+            order by coalesce(p.Score,0) desc, p.CreationDate
+        ) as PostRankInUser,
+        avg(coalesce(p.Score,0)) over (
+            partition by p.PostTypeId 
+            order by p.CreationDate
+            rows between unbounded preceding and current row
+        ) as WeekAvgScore
+    from Posts p
+    left join Users u on p.OwnerUserId = u.Id
+)
+select a.PostId,
+       a.PostTypeId,
+       a.UserId,
+       a.DisplayName,
+       a.Score,
+       a.PostRankInUser,
+       a.WeekAvgScore,
+       r.CloseReasonId,
+       r.CreationDate as CloseChangeDate
+from AvgScoresWindow a
+left join RecursiveCloseStatus r on a.PostId = r.PostId
+group by
+    a.PostId,
+    a.PostTypeId,
+    a.UserId,
+    a.DisplayName,
+    a.Score,
+    a.PostRankInUser,
+    a.WeekAvgScore,
+    r.CloseReasonId,
+    r.CreationDate;

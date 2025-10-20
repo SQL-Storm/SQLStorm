@@ -1,0 +1,228 @@
+WITH RECURSIVE RecursiveTagHierarchy AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        ARRAY[t.TagName] AS TagPath
+    FROM Tags t
+    WHERE t.IsModeratorOnly = FALSE AND t.IsRequired = FALSE
+
+    UNION ALL
+
+    SELECT
+        t2.Id,
+        t2.TagName,
+        t2.Count,
+        rth.TagPath || t2.TagName
+    FROM Tags t2
+    JOIN RecursiveTagHierarchy rth ON t2.Id > rth.Id
+    WHERE t2.IsModeratorOnly = FALSE AND t2.IsRequired = FALSE
+      AND array_length(rth.TagPath, 1) < 3
+),
+UserBadgeCounts AS (
+    SELECT
+        b.UserId,
+        b.Class,
+        COUNT(*) AS BadgeCount
+    FROM Badges b
+    WHERE b.Date >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 year'
+    GROUP BY b.UserId, b.Class
+),
+UserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        COALESCE(ubc_gold.BadgeCount, 0) AS GoldBadges,
+        COALESCE(ubc_silver.BadgeCount, 0) AS SilverBadges,
+        COALESCE(ubc_bronze.BadgeCount, 0) AS BronzeBadges,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionsPosted,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswersPosted,
+        AVG(p.Score) FILTER (WHERE p.PostTypeId IN (1,2)) AS AvgPostScore,
+        MAX(p.Score) FILTER (WHERE p.PostTypeId IN (1,2)) AS MaxPostScore,
+        COUNT(DISTINCT c.Id) AS CommentsMade
+    FROM Users u
+    LEFT JOIN UserBadgeCounts ubc_gold ON u.Id = ubc_gold.UserId AND ubc_gold.Class = 1
+    LEFT JOIN UserBadgeCounts ubc_silver ON u.Id = ubc_silver.UserId AND ubc_silver.Class = 2
+    LEFT JOIN UserBadgeCounts ubc_bronze ON u.Id = ubc_bronze.UserId AND ubc_bronze.Class = 3
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Comments c ON c.UserId = u.Id
+    WHERE u.Reputation > 1000
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate,
+             ubc_gold.BadgeCount, ubc_silver.BadgeCount, ubc_bronze.BadgeCount
+),
+PostWithLinkInfo AS (
+    SELECT
+        p.Id,
+        p.PostTypeId,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        p.OwnerUserId,
+        pl.LinkTypeId,
+        pl.RelatedPostId,
+        lt.Name AS LinkTypeName
+    FROM Posts p
+    LEFT JOIN PostLinks pl ON p.Id = pl.PostId
+    LEFT JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id
+    WHERE p.PostTypeId IN (1, 2)
+),
+RankedPosts AS (
+    SELECT
+        p.*,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC, p.ViewCount DESC) AS PostRank,
+        COUNT(*) OVER (PARTITION BY p.OwnerUserId) AS TotalPostsByUser
+    FROM PostWithLinkInfo p
+),
+TopPostsWithComments AS (
+    SELECT
+        rp.*,
+        COALESCE(c.CommentCount, 0) AS CommentCount,
+        COALESCE(vc.UpVotes, 0) AS UpVotes,
+        COALESCE(vc.DownVotes, 0) AS DownVotes,
+        CASE
+            WHEN rp.Score > 0 THEN ROUND((COALESCE(vc.UpVotes,0) * 1.0 / NULLIF(rp.Score,0)) * 100, 2)
+            ELSE NULL
+        END AS UpvoteScoreRatio
+    FROM RankedPosts rp
+    LEFT JOIN (
+        SELECT
+            PostId,
+            COUNT(*) AS CommentCount
+        FROM Comments
+        GROUP BY PostId
+    ) c ON rp.Id = c.PostId
+    LEFT JOIN (
+        SELECT
+            PostId,
+            SUM(CASE WHEN VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+            SUM(CASE WHEN VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes
+        FROM Votes
+        GROUP BY PostId
+    ) vc ON rp.Id = vc.PostId
+    WHERE rp.PostRank <= 5
+),
+QuestionsWithAcceptedAnswerStats AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.Title,
+        q.CreationDate,
+        q.Score AS QuestionScore,
+        q.ViewCount,
+        q.Tags,
+        a.Id AS AcceptedAnswerId,
+        a.Score AS AcceptedAnswerScore,
+        a.CreationDate AS AcceptedAnswerCreationDate,
+        EXTRACT(EPOCH FROM (a.CreationDate - q.CreationDate))/3600 AS HoursToAccept,
+        ua.DisplayName AS AcceptedAnswerOwner,
+        ua.Reputation AS AcceptedAnswerOwnerReputation
+    FROM Posts q
+    LEFT JOIN Posts a ON q.AcceptedAnswerId = a.Id
+    LEFT JOIN Users ua ON a.OwnerUserId = ua.Id
+    WHERE q.PostTypeId = 1 AND q.AcceptedAnswerId IS NOT NULL
+),
+QuestionsWithDuplicateCount AS (
+    SELECT
+        q.Id AS QuestionId,
+        COUNT(pl.Id) FILTER (WHERE pl.LinkTypeId = 3) AS DuplicateCount
+    FROM Posts q
+    LEFT JOIN PostLinks pl ON q.Id = pl.PostId
+    WHERE q.PostTypeId = 1
+    GROUP BY q.Id
+),
+FinalAggregated AS (
+    SELECT
+        ua.UserId,
+        ua.DisplayName,
+        ua.Reputation,
+        ua.GoldBadges,
+        ua.SilverBadges,
+        ua.BronzeBadges,
+        ua.QuestionsPosted,
+        ua.AnswersPosted,
+        ua.AvgPostScore,
+        ua.MaxPostScore,
+        ua.CommentsMade,
+        tp.Id AS PostId,
+        tp.Title,
+        tp.PostTypeId,
+        tp.Score AS PostScore,
+        tp.ViewCount,
+        tp.CommentCount,
+        tp.UpVotes,
+        tp.DownVotes,
+        tp.UpvoteScoreRatio,
+        qas.QuestionId,
+        qas.HoursToAccept,
+        qas.AcceptedAnswerScore,
+        qdc.DuplicateCount,
+        rh.TagPath
+    FROM UserActivity ua
+    LEFT JOIN TopPostsWithComments tp ON ua.UserId = tp.OwnerUserId
+    LEFT JOIN QuestionsWithAcceptedAnswerStats qas ON tp.Id = qas.QuestionId
+    LEFT JOIN QuestionsWithDuplicateCount qdc ON qas.QuestionId = qdc.QuestionId
+    LEFT JOIN RecursiveTagHierarchy rh ON rh.TagName = ANY(string_to_array(replace(replace(tp.Tags, '<', ''), '>', ''), ' '))
+    WHERE ua.QuestionsPosted > 0
+    GROUP BY
+        ua.UserId,
+        ua.DisplayName,
+        ua.Reputation,
+        ua.GoldBadges,
+        ua.SilverBadges,
+        ua.BronzeBadges,
+        ua.QuestionsPosted,
+        ua.AnswersPosted,
+        ua.AvgPostScore,
+        ua.MaxPostScore,
+        ua.CommentsMade,
+        tp.Id,
+        tp.Title,
+        tp.PostTypeId,
+        tp.Score,
+        tp.ViewCount,
+        tp.CommentCount,
+        tp.UpVotes,
+        tp.DownVotes,
+        tp.UpvoteScoreRatio,
+        qas.QuestionId,
+        qas.HoursToAccept,
+        qas.AcceptedAnswerScore,
+        qdc.DuplicateCount,
+        rh.TagPath
+)
+SELECT
+    fa.UserId,
+    fa.DisplayName,
+    fa.Reputation,
+    fa.GoldBadges,
+    fa.SilverBadges,
+    fa.BronzeBadges,
+    fa.QuestionsPosted,
+    fa.AnswersPosted,
+    ROUND(fa.AvgPostScore, 2) AS AvgPostScore,
+    fa.MaxPostScore,
+    fa.CommentsMade,
+    fa.PostId,
+    CASE WHEN fa.Title IS NOT NULL THEN
+        SUBSTRING(fa.Title FROM 1 FOR 100) || CASE WHEN CHAR_LENGTH(fa.Title) > 100 THEN '...' ELSE '' END
+    ELSE NULL END AS ShortTitle,
+    CASE fa.PostTypeId WHEN 1 THEN 'Question' WHEN 2 THEN 'Answer' ELSE 'Other' END AS PostType,
+    fa.PostScore,
+    fa.ViewCount,
+    fa.CommentCount,
+    fa.UpVotes,
+    fa.DownVotes,
+    fa.UpvoteScoreRatio,
+    fa.QuestionId,
+    ROUND(fa.HoursToAccept, 2) AS HoursToAcceptAcceptedAnswer,
+    fa.AcceptedAnswerScore,
+    fa.DuplicateCount,
+    array_to_string(fa.TagPath, ' > ') AS TagHierarchy
+FROM FinalAggregated fa
+WHERE fa.PostScore > 10
+ORDER BY fa.Reputation DESC, fa.GoldBadges DESC, fa.PostScore DESC
+LIMIT 50;

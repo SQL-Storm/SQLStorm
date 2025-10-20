@@ -1,0 +1,65 @@
+WITH RecursiveTagCounts AS (
+    SELECT t.Id,
+           t.TagName,
+           t.Count,
+           p.Id AS QuestionId,
+           ROW_NUMBER() OVER (PARTITION BY t.TagName ORDER BY p.Score DESC NULLS LAST) AS TagRank,
+           ARRAY_AGG(DISTINCT u.Id) FILTER (WHERE u.Id IS NOT NULL) OVER (PARTITION BY t.TagName ORDER BY p.Score DESC
+                  RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS UserList
+    FROM Tags t
+    INNER JOIN Posts p ON p.Tags LIKE '%' || t.TagName || '%'
+        AND p.PostTypeId = 1
+    LEFT JOIN Users u ON u.Id = p.OwnerUserId
+    WHERE t.IsModeratorOnly = 0 OR t.IsModeratorOnly IS NULL
+), FilteredTagCounts AS (
+    SELECT DISTINCT ON (TagName) Id, TagName, Count, QuestionId, TagRank, UserList
+    FROM RecursiveTagCounts
+    WHERE TagRank <= 100
+    ORDER BY TagName, TagRank DESC, Count DESC
+), RelevantQuestions AS (
+    SELECT p.Id,
+           p.Title,
+           Seq.Value AS SummDays,
+           u.DisplayName,
+           COALESCE(SUBSTRING(p.Tags, :pos_start, :pos_len),'') AS SplitTags,
+           lowo.AskCountCarved,
+           ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC NULLS LAST) AS synthetic_Rank
+    FROM Posts p
+    INNER JOIN Users u ON u.Id = p.OwnerUserId
+    CROSS JOIN LATERAL (
+        SELECT generate_series(1, 35*24) AS Value
+    ) AS Seq
+    LEFT JOIN LATERAL (
+        -- placeholder for lowo; original text was corrupted. If lowo is a table or expression replace accordingly.
+        SELECT NULL::integer AS AskCountCarved
+    ) AS lowo ON true
+    WHERE p.Tags IS NOT NULL
+)
+SELECT
+    q.Id AS QuestionId,
+    q.Title,
+    q.CreationDate,
+    q.Score,
+    COALESCE(q.Tags, '') AS Tags,
+    (SELECT COUNT(*) FROM Answers a WHERE a.ParentId = q.Id AND (a.Score > q.Score OR a.CreationDate > q.CreationDate)) AS AnswerRunsAboveScore,
+    -- convert array/string operations to standard SQL functions where possible
+    COALESCE(q.Tags, '{no-tag}') AS TagArrayFallback,
+    rq.SummDays,
+    rq.DisplayName,
+    rq.SplitTags,
+    rq.AskCountCarved,
+    rq.synthetic_Rank
+FROM Posts q
+INNER JOIN RelevantQuestions rq ON rq.Id = q.Id
+WHERE q.PostTypeId = 1
+GROUP BY
+    q.Id,
+    q.Title,
+    q.CreationDate,
+    q.Score,
+    q.Tags,
+    rq.SummDays,
+    rq.DisplayName,
+    rq.SplitTags,
+    rq.AskCountCarved,
+    rq.synthetic_Rank;

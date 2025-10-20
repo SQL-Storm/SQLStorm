@@ -1,0 +1,168 @@
+with RecursiveUserBadges as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        b.Name as BadgeName,
+        b.Class,
+        row_number() over (partition by u.Id order by b.Date desc) as rn
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    where b.Class in (1,2,3)
+),
+UserTopBadges as (
+    select UserId, BadgeName, Class from RecursiveUserBadges where rn = 1
+),
+QuestionStats as (
+    select
+        p.Id,
+        p.OwnerUserId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.Tags,
+        coalesce(p.AnswerCount,0) as AnswerCount,
+        coalesce(p.FavoriteCount,0) as FavoriteCount,
+        case when p.ClosedDate is not null then 1 else 0 end as IsClosed,
+        dense_rank() over (order by p.Score desc, p.ViewCount desc) as ScoreRank
+    from Posts p
+    where p.PostTypeId = 1
+),
+AnswerStats as (
+    select
+        a.Id,
+        a.ParentId as QuestionId,
+        a.OwnerUserId,
+        a.Score,
+        a.CreationDate,
+        a.Body,
+        row_number() over (partition by a.ParentId order by a.Score desc, a.CreationDate asc) as AnswerRank
+    from Posts a
+    where a.PostTypeId = 2
+),
+QuestionAnswerAggregates as (
+    select
+        q.Id as QuestionId,
+        count(a.Id) as TotalAnswers,
+        max(a.Score) as MaxAnswerScore,
+        avg(a.Score) as AvgAnswerScore,
+        sum(case when a.Score >= 5 then 1 else 0 end) as HighScoreAnswerCount
+    from QuestionStats q
+    left join AnswerStats a on a.QuestionId = q.Id
+    group by q.Id
+),
+QuestionCloseReasons as (
+    select
+        ph.PostId,
+        crt.Name as CloseReasonName,
+        count(*) as CloseVotesCount
+    from PostHistory ph
+    join CloseReasonTypes crt on crt.Id = cast(ph.Comment as integer)
+    where ph.PostHistoryTypeId = 10
+    group by ph.PostId, crt.Name
+),
+UserActivityRank as (
+    select
+        u.Id,
+        u.DisplayName,
+        count(distinct p.Id) as QuestionCount,
+        count(distinct a.Id) as AnswerCount,
+        count(distinct c.Id) as CommentCount,
+        row_number() over (order by count(distinct p.Id) desc, count(distinct a.Id) desc) as ActivityRank
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id and p.PostTypeId = 1
+    left join Posts a on a.OwnerUserId = u.Id and a.PostTypeId = 2
+    left join Comments c on c.UserId = u.Id
+    group by u.Id, u.DisplayName
+),
+TopUsersQuestions as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        q.Id as QuestionId,
+        q.Title,
+        q.Score,
+        q.ViewCount,
+        q.Tags
+    from Users u
+    join Posts q on q.OwnerUserId = u.Id and q.PostTypeId = 1
+    where u.Id in (
+        select UserId from UserActivityRank where ActivityRank <= 10
+    )
+),
+PopularTags as (
+    select
+        tag as TagName,
+        count(*) as QuestionCount,
+        avg(Score) as AvgScore,
+        max(Score) as MaxScore
+    from (
+        select
+            unnest(string_to_array(substring(Tags from 2 for length(Tags)-2), '><')) as tag,
+            Score
+        from QuestionStats
+    ) t
+    group by tag
+    having count(*) > 100
+),
+UserVotesSummary as (
+    select
+        v.UserId,
+        vt.Name as VoteTypeName,
+        count(*) as VoteCount,
+        sum(coalesce(v.BountyAmount,0)) as TotalBounty
+    from Votes v
+    join VoteTypes vt on vt.Id = v.VoteTypeId
+    group by v.UserId, vt.Name
+),
+UserVotePivot as (
+    select
+        uv.UserId,
+        max(case when uv.VoteTypeName = 'UpMod' then uv.VoteCount else 0 end) as UpVotes,
+        max(case when uv.VoteTypeName = 'DownMod' then uv.VoteCount else 0 end) as DownVotes,
+        max(case when uv.VoteTypeName = 'Favorite' then uv.VoteCount else 0 end) as Favorites,
+        max(case when uv.VoteTypeName = 'BountyStart' then uv.VoteCount else 0 end) as BountiesStarted,
+        max(case when uv.VoteTypeName = 'BountyClose' then uv.VoteCount else 0 end) as BountiesClosed,
+        max(case when uv.VoteTypeName = 'BountyStart' then uv.TotalBounty else 0 end) as TotalBountyAmount
+    from UserVotesSummary uv
+    group by uv.UserId
+)
+select
+    u.Id as UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    ua.QuestionCount,
+    ua.AnswerCount,
+    ua.CommentCount,
+    coalesce(uv.UpVotes,0) as UpVotes,
+    coalesce(uv.DownVotes,0) as DownVotes,
+    coalesce(uv.Favorites,0) as Favorites,
+    coalesce(uv.BountiesStarted,0) as BountiesStarted,
+    coalesce(uv.BountiesClosed,0) as BountiesClosed,
+    coalesce(uv.TotalBountyAmount,0) as TotalBountyAmount,
+    utb.BadgeName as TopBadge,
+    qs.QuestionId as TopQuestionId,
+    qs.Title as TopQuestionTitle,
+    qs.Score as TopQuestionScore,
+    qs.ViewCount as TopQuestionViewCount,
+    pa.QuestionCount as PopularTagQuestionCount,
+    pa.AvgScore as PopularTagAvgScore,
+    pa.MaxScore as PopularTagMaxScore,
+    qca.TotalAnswers,
+    qca.MaxAnswerScore,
+    qca.AvgAnswerScore,
+    qca.HighScoreAnswerCount,
+    qcr.CloseReasonName,
+    qcr.CloseVotesCount
+from Users u
+left join UserActivityRank ua on ua.Id = u.Id
+left join UserVotePivot uv on uv.UserId = u.Id
+left join UserTopBadges utb on utb.UserId = u.Id
+left join TopUsersQuestions qs on qs.UserId = u.Id
+left join PopularTags pa on pa.TagName = any(string_to_array(substring(qs.Tags from 2 for length(qs.Tags)-2), '><'))
+left join QuestionAnswerAggregates qca on qca.QuestionId = qs.QuestionId
+left join QuestionCloseReasons qcr on qcr.PostId = qs.QuestionId
+where ua.ActivityRank <= 10
+order by u.Reputation desc, ua.QuestionCount desc, ua.AnswerCount desc
+limit 50;

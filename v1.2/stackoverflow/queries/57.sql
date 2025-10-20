@@ -1,0 +1,250 @@
+with recursive RecursiveTagHierarchy as (
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        1 as Level,
+        cast(t.TagName as varchar) as Path
+    from Tags t
+    where t.IsModeratorOnly = false and t.IsRequired = false
+    union all
+    select
+        t2.Id,
+        t2.TagName,
+        t2.Count,
+        t2.ExcerptPostId,
+        t2.WikiPostId,
+        r.Level + 1,
+        r.Path || ' > ' || t2.TagName
+    from Tags t2
+    join RecursiveTagHierarchy r on t2.Id <> r.Id and t2.Count < r.Count and t2.IsModeratorOnly = false and t2.IsRequired = false
+    where r.Level < 3
+),
+UserBadgeCounts as (
+    select
+        b.UserId,
+        b.Class,
+        count(*) as BadgeCount
+    from Badges b
+    group by b.UserId, b.Class
+),
+UserReputationStats as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.Location,
+        coalesce(ubc_gold.BadgeCount,0) as GoldBadges,
+        coalesce(ubc_silver.BadgeCount,0) as SilverBadges,
+        coalesce(ubc_bronze.BadgeCount,0) as BronzeBadges,
+        row_number() over (order by u.Reputation desc) as RepRank
+    from Users u
+    left join UserBadgeCounts ubc_gold on ubc_gold.UserId = u.Id and ubc_gold.Class = 1
+    left join UserBadgeCounts ubc_silver on ubc_silver.UserId = u.Id and ubc_silver.Class = 2
+    left join UserBadgeCounts ubc_bronze on ubc_bronze.UserId = u.Id and ubc_bronze.Class = 3
+),
+TopQuestions as (
+    select
+        p.Id,
+        p.Title,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.Tags,
+        p.AcceptedAnswerId,
+        u.DisplayName as OwnerName,
+        row_number() over (partition by p.OwnerUserId order by p.Score desc, p.ViewCount desc) as UserTopQuestionRank
+    from Posts p
+    left join Users u on u.Id = p.OwnerUserId
+    where p.PostTypeId = 1 and p.Score > 10 and p.ViewCount > 1000
+),
+AnswerStats as (
+    select
+        a.ParentId as QuestionId,
+        count(*) as AnswerCount,
+        avg(a.Score) as AvgAnswerScore,
+        max(a.Score) as MaxAnswerScore,
+        sum(case when a.OwnerUserId is null then 0 else 1 end) as AnsweredByRegisteredUsers
+    from Posts a
+    where a.PostTypeId = 2
+    group by a.ParentId
+),
+QuestionCloseReasons as (
+    select
+        ph.PostId,
+        crt.Name as CloseReasonName,
+        ph.CreationDate as CloseDate
+    from PostHistory ph
+    join PostHistoryTypes pht on pht.Id = ph.PostHistoryTypeId
+    join CloseReasonTypes crt on crt.Id = cast(ph.Comment as integer)
+    where ph.PostHistoryTypeId = 10
+),
+QuestionComments as (
+    select
+        c.PostId,
+        count(*) as CommentCount,
+        sum(case when c.UserId is null then 0 else 1 end) as CommentsByRegisteredUsers,
+        string_agg(distinct substring(c.Text from 1 for 20), ' | ') as SampleComments
+    from Comments c
+    group by c.PostId
+),
+QuestionVotes as (
+    select
+        v.PostId,
+        sum(case when vt.Name = 'UpMod' then 1 else 0 end) as UpVotes,
+        sum(case when vt.Name = 'DownMod' then 1 else 0 end) as DownVotes,
+        sum(case when vt.Name = 'Favorite' then 1 else 0 end) as Favorites
+    from Votes v
+    join VoteTypes vt on vt.Id = v.VoteTypeId
+    group by v.PostId
+),
+QuestionDetails as (
+    select
+        tq.Id,
+        tq.Title,
+        tq.OwnerUserId,
+        tq.OwnerName,
+        tq.Score,
+        tq.ViewCount,
+        tq.CreationDate,
+        tq.Tags,
+        tq.AcceptedAnswerId,
+        asn.AnswerCount,
+        asn.AvgAnswerScore,
+        asn.MaxAnswerScore,
+        asn.AnsweredByRegisteredUsers,
+        qcr.CloseReasonName,
+        qcr.CloseDate,
+        qc.CommentCount,
+        qc.CommentsByRegisteredUsers,
+        qc.SampleComments,
+        qv.UpVotes,
+        qv.DownVotes,
+        qv.Favorites
+    from TopQuestions tq
+    left join AnswerStats asn on asn.QuestionId = tq.Id
+    left join QuestionCloseReasons qcr on qcr.PostId = tq.Id
+    left join QuestionComments qc on qc.PostId = tq.Id
+    left join QuestionVotes qv on qv.PostId = tq.Id
+),
+RankedQuestions as (
+    select
+        qd.Id,
+        qd.Title,
+        qd.OwnerUserId,
+        qd.OwnerName,
+        qd.Score,
+        qd.ViewCount,
+        qd.CreationDate,
+        qd.Tags,
+        qd.AcceptedAnswerId,
+        qd.AnswerCount,
+        qd.AvgAnswerScore,
+        qd.MaxAnswerScore,
+        qd.AnsweredByRegisteredUsers,
+        qd.CloseReasonName,
+        qd.CloseDate,
+        qd.CommentCount,
+        qd.CommentsByRegisteredUsers,
+        qd.SampleComments,
+        qd.UpVotes,
+        qd.DownVotes,
+        qd.Favorites,
+        rank() over (order by qd.Score desc, qd.ViewCount desc, coalesce(qd.AnswerCount,0) desc) as GlobalRank
+    from QuestionDetails qd
+),
+UserActivitySummary as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(distinct case when p.PostTypeId = 1 then p.Id end) as QuestionsPosted,
+        count(distinct case when p.PostTypeId = 2 then p.Id end) as AnswersPosted,
+        count(distinct c.Id) as CommentsMade,
+        count(distinct case when v.VoteTypeId = 2 then v.Id end) as UpVotesGiven,
+        count(distinct case when v.VoteTypeId = 3 then v.Id end) as DownVotesGiven,
+        max(p.CreationDate) as LastPostDate,
+        max(c.CreationDate) as LastCommentDate,
+        max(v.CreationDate) as LastVoteDate
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Comments c on c.UserId = u.Id
+    left join Votes v on v.UserId = u.Id
+    group by u.Id, u.DisplayName
+),
+UserReputationChanges as (
+    select
+        ph.UserId,
+        ph.PostId,
+        ph.PostHistoryTypeId,
+        ph.CreationDate,
+        p.Score,
+        case
+            when ph.PostHistoryTypeId in (1,4) then length(coalesce(ph.Text,'')) - length(replace(coalesce(ph.Text,''), ' ', '')) 
+            else 0
+        end as TextChangeWords
+    from PostHistory ph
+    left join Posts p on p.Id = ph.PostId
+    where ph.UserId is not null and ph.PostHistoryTypeId in (1,4,5,6)
+),
+UserReputationWindow as (
+    select
+        urc.UserId,
+        urc.CreationDate,
+        sum(urc.TextChangeWords) over (partition by urc.UserId order by urc.CreationDate rows between unbounded preceding and current row) as CumulativeTextChanges,
+        row_number() over (partition by urc.UserId order by urc.CreationDate desc) as RecentEditsRank
+    from UserReputationChanges urc
+)
+select
+    rq.GlobalRank,
+    rq.Id as QuestionId,
+    rq.Title,
+    rq.OwnerUserId,
+    rq.OwnerName,
+    rq.Score,
+    rq.ViewCount,
+    rq.AnswerCount,
+    rq.AvgAnswerScore,
+    rq.MaxAnswerScore,
+    rq.AnsweredByRegisteredUsers,
+    rq.CloseReasonName,
+    rq.CloseDate,
+    rq.CommentCount,
+    rq.CommentsByRegisteredUsers,
+    rq.SampleComments,
+    rq.UpVotes,
+    rq.DownVotes,
+    rq.Favorites,
+    urs.Reputation,
+    urs.GoldBadges,
+    urs.SilverBadges,
+    urs.BronzeBadges,
+    uas.QuestionsPosted,
+    uas.AnswersPosted,
+    uas.CommentsMade,
+    uas.UpVotesGiven,
+    uas.DownVotesGiven,
+    uas.LastPostDate,
+    uas.LastCommentDate,
+    uas.LastVoteDate,
+    rth.Level as TagHierarchyLevel,
+    rth.Path as TagHierarchyPath,
+    case
+        when rq.CloseDate is null then 'Open'
+        else 'Closed'
+    end as PostStatus,
+    case
+        when rq.AcceptedAnswerId is not null then 'Has Accepted Answer'
+        else 'No Accepted Answer'
+    end as AcceptedAnswerStatus,
+    coalesce(urw.CumulativeTextChanges,0) as UserCumulativeTextEdits
+from RankedQuestions rq
+left join UserReputationStats urs on urs.UserId = rq.OwnerUserId
+left join UserActivitySummary uas on uas.UserId = rq.OwnerUserId
+left join RecursiveTagHierarchy rth on position(rth.TagName in rq.Tags) > 0
+left join UserReputationWindow urw on urw.UserId = rq.OwnerUserId and urw.RecentEditsRank = 1
+where rq.GlobalRank <= 50
+order by rq.GlobalRank, rq.Score desc, rq.ViewCount desc;

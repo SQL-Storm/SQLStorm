@@ -1,0 +1,163 @@
+with ranked_badges as (
+    select
+        "UserId",
+        "Name",
+        "Class",
+        row_number() over (partition by "UserId" order by "Class" asc, "Date" desc) as rn
+    from Badges
+    where "TagBased" = false
+),
+user_question_stats as (
+    select
+        u."Id" as "UserId",
+        coalesce(count(distinct q."Id"),0) as "QuestionsAsked",
+        coalesce(sum(q."ViewCount"), 0) as "TotalQuestionViews",
+        coalesce(avg(q."Score"), 0) as "AvgQuestionScore",
+        coalesce(sum(case when q."AcceptedAnswerId" is not null then 1 else 0 end), 0) as "QuestionsWithAcceptedAnswer"
+    from Users u
+    left join Posts q on q."OwnerUserId" = u."Id" and q."PostTypeId" = 1
+    group by u."Id"
+),
+user_answer_stats as (
+    select
+        u."Id" as "UserId",
+        count(distinct a."Id") as "AnswersPosted",
+        coalesce(avg(a."Score"),0) as "AvgAnswerScore",
+        coalesce(sum(case when a."ParentAccepted" = 1 then 1 else 0 end),0) as "AnswersToAcceptedQuestions"
+    from Users u
+    left join (
+        select
+            p.*,
+            case when parent."AcceptedAnswerId" = p."Id" then 1 else 0 end as "ParentAccepted"
+        from Posts p
+        join Posts parent on parent."Id" = p."ParentId"
+        where p."PostTypeId" = 2
+    ) a on a."OwnerUserId" = u."Id"
+    group by u."Id"
+),
+user_activity_window as (
+    select
+        u."Id" as "UserId",
+        u."CreationDate",
+        v."MonthActivities",
+        count(v."Id") as "TotalVotes",
+        max(ph."CreationDate") filter (where ph."UserId" = u."Id") as "LastPostHistoryActivity",
+        min(u."LastAccessDate") over () as "FirstAccessDate"
+    from Users u
+    left join Votes v on v."UserId" = u."Id" 
+                           and date_trunc('month', v."CreationDate") >= date_trunc('month', cast('2024-10-01' as date) - interval '1 year')
+    left join PostHistory ph on ph."UserId" = u."Id"
+    left join Posts p on p."OwnerUserId" = u."Id"
+    group by u."Id", u."CreationDate", v."MonthActivities"
+),
+votes_stats as (
+    select
+        v."PostId",
+        count(*) filter (where vt."Name" = 'UpMod') as "UpVotes",
+        count(*) filter (where vt."Name" = 'DownMod') as "DownVotes",
+        count(*) filter (where vt."Name" = 'BountyStart') as "BountiesStarted",
+        count(*) filter (where vt."Name" = 'BountyClose') as "BountiesClosed"
+    from Votes v
+    join VoteTypes vt on v."VoteTypeId" = vt."Id"
+    group by v."PostId"
+),
+top_tags as (
+    select
+        t."Id" as "TagId",
+        t."TagName",
+        t."Count",
+        coalesce(wp."OwnerUserId", -1) as "WikiOwnerUserId"
+    from Tags t
+    left join Posts wp on wp."Id" = t."WikiPostId"
+    where t."Count" > 1000
+    order by t."Count" desc
+    limit 10
+),
+answer_delays as (
+    select
+        a."Id" as "AnswerId",
+        a."OwnerUserId",
+        a."ParentId" as "QuestionId",
+        (a."CreationDate" - q."CreationDate") as "TimeToAnswer",
+        row_number() over (partition by a."ParentId" order by a."CreationDate" asc) as "AnswerOrder"
+    from Posts a
+    join Posts q on q."Id" = a."ParentId" and q."PostTypeId" = 1
+    where a."PostTypeId" = 2
+),
+tag_popularity as (
+    select
+        t."TagName",
+        count(p."Id") as "QuestionsCount",
+        avg(p."Score") as "AvgScore",
+        count(distinct p."OwnerUserId") as "DistinctAnswerers"
+    from Posts p 
+    cross join lateral unnest(string_to_array(substring(p."Tags", 2, length(p."Tags")-2), '><')) as t("TagName")
+    where p."PostTypeId" = 1
+    group by t."TagName"
+),
+combined_users as (
+    select
+        u."Id",
+        u."DisplayName",
+        u."Reputation",
+        coalesce(statsQ."QuestionsAsked", 0) as "QuestionsAsked",
+        coalesce(statsA."AnswersPosted", 0) as "AnswersPosted",
+        statsQ."AvgQuestionScore",
+        statsA."AvgAnswerScore",
+        rb."Name" as "TopBadgeName",
+        rb."Class" as "TopBadgeClass",
+        statsQ."QuestionsWithAcceptedAnswer",
+        bs."TotalVotes"
+    from Users u
+    left join user_question_stats statsQ on statsQ."UserId" = u."Id"
+    left join user_answer_stats statsA on statsA."UserId" = u."Id"
+    left join ranked_badges rb on rb."UserId" = u."Id" and rb.rn = 1
+    left join (
+        select
+           "UserId",
+           count(*) as "TotalVotes"
+        from Votes
+        group by "UserId"
+    ) bs on bs."UserId" = u."Id"
+    where u."Reputation" > 5000
+)
+select
+    cu."Id" as "UserId",
+    cu."DisplayName",
+    cu."Reputation",
+    cu."QuestionsAsked",
+    cu."AnswersPosted",
+    cu."AvgQuestionScore",
+    cu."AvgAnswerScore",
+    case 
+        when cu."TopBadgeClass" = 1 then 'Gold: ' || cu."TopBadgeName"
+        when cu."TopBadgeClass" = 2 then 'Silver: ' || cu."TopBadgeName"
+        when cu."TopBadgeClass" = 3 then 'Bronze: ' || cu."TopBadgeName"
+        else 'None' 
+    end as "TopBadge",
+    cu."QuestionsWithAcceptedAnswer",
+    cu."TotalVotes",
+    tag_tags."TagName" as "PopularTagForUser",
+    tag_tags."QuestionsCount",
+    tag_tags."AvgScore",
+    tag_delays."MinAnswerDelaySeconds"
+from combined_users cu
+left join lateral (
+    select 
+        tp."TagName", 
+        tp."QuestionsCount", 
+        tp."AvgScore"
+    from tag_popularity tp
+    order by tp."QuestionsCount" desc
+    limit 1
+) tag_tags on true
+left join lateral (
+    select 
+        min(extract(epoch from ad."TimeToAnswer")) as "MinAnswerDelaySeconds",
+        ad."OwnerUserId"
+    from answer_delays ad
+    where ad."OwnerUserId" = cu."Id"
+    group by ad."OwnerUserId"
+) tag_delays on tag_delays."OwnerUserId" = cu."Id"
+order by cu."Reputation" desc, cu."QuestionsAsked" desc
+limit 100;

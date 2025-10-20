@@ -1,0 +1,204 @@
+-- {"query": "66.sql", "dataset": "stackoverflow", "version": "v1.3", "prompt": "p1", "model": "gpt-5-mini", "temperature": 1.0, "max_tokens": 32768, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 2336} 
+with
+-- top authors by weighted activity (questions + 0.6*answers + 0.2*comments), but penalize deletions via PostHistory
+AuthorActivity as (
+  select
+    u.Id as UserId,
+    u.DisplayName,
+    count(distinct case when p.PostTypeId = 1 then p.Id end) as Questions,
+    count(distinct case when p.PostTypeId = 2 then p.Id end) as Answers,
+    coalesce(c.CommentCount,0) as Comments,
+    -- penalty = number of PostHistory deletion/undelete events authored by this user
+    coalesce(sum(case when ph.PostHistoryTypeId in (12,13) then 1 else 0 end),0) as DeletionEvents,
+    -- weighted score
+    (count(distinct case when p.PostTypeId = 1 then p.Id end)::numeric * 1.0
+     + count(distinct case when p.PostTypeId = 2 then p.Id end)::numeric * 0.6
+     + coalesce(c.CommentCount,0)::numeric * 0.2
+     - coalesce(sum(case when ph.PostHistoryTypeId in (12) then 0.5 when ph.PostHistoryTypeId in (13) then 0.2 else 0 end),0)
+    ) as WeightedActivity
+  from Users u
+  left join Posts p on p.OwnerUserId = u.Id
+  left join PostHistory ph on ph.UserId = u.Id
+  left join (
+    select UserId, count(*) as CommentCount from Comments where UserId is not null group by UserId
+  ) c on c.UserId = u.Id
+  group by u.Id, u.DisplayName, c.CommentCount
+),
+-- recent popular questions with tag explosion and tag array parsing
+QuestionTags as (
+  select
+    q.Id as QuestionId,
+    q.Title,
+    q.CreationDate,
+    q.Score,
+    q.ViewCount,
+    -- normalize tags into rows: substring between < >
+    lower(trim(tag)) as Tag
+  from Posts q
+  cross join lateral (
+    select unnest(string_to_array(substring(coalesce(q.Tags,''),2, greatest(length(coalesce(q.Tags,''))-2,0)),'><')) as tag
+  ) t
+  where q.PostTypeId = 1
+    and q.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '365 days'
+),
+-- compute per-tag metrics and trending factor
+TagMetrics as (
+  select
+    t.Tag,
+    count(distinct t.QuestionId) as QuestionCount,
+    avg(t.Score) as AvgScore,
+    sum(t.ViewCount) as TotalViews,
+    -- trending: ratio of recent questions in last 30 days to last 365 days (requires window)
+    sum(case when t.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '30 days' then 1 else 0 end) as Last30,
+    count(*) as Last365,
+    case when count(*) = 0 then 0 else (sum(case when t.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '30 days' then 1 else 0 end)::numeric / count(*)::numeric) end as TrendingRatio
+  from QuestionTags t
+  group by t.Tag
+),
+-- get for each question a compact set of related posts (linked & duplicates) with aggregate link types
+RelatedPostsAgg as (
+  select
+    pl.PostId,
+    pl.RelatedPostId,
+    string_agg(distinct lt.Name, ',' order by lt.Name) as LinkTypeNames,
+    max(pl.CreationDate) as LatestLinkDate
+  from PostLinks pl
+  join LinkTypes lt on lt.Id = pl.LinkTypeId
+  group by pl.PostId, pl.RelatedPostId
+),
+-- compute per-question renaissance score using window functions, correlated subqueries, and coalescing
+QuestionScores as (
+  select
+    q.Id,
+    q.Title,
+    q.CreationDate,
+    q.Score,
+    q.ViewCount,
+    q.AnswerCount,
+    q.CommentCount,
+    q.FavoriteCount,
+    -- count of distinct tags
+    (select count(*) from (
+       select unnest(string_to_array(substring(coalesce(q.Tags,''),2,greatest(length(coalesce(q.Tags,''))-2,0)),'><')) as t
+    ) s) as TagCount,
+    -- number of gold badges awarded to author prior to question creation (correlated)
+    (select count(*) from Badges b where b.UserId = q.OwnerUserId and b.Class = 1 and b.Date <= q.CreationDate) as GoldBefore,
+    -- number of unique users who commented on the question
+    (select count(distinct coalesce(c.UserId,-1)) from Comments c where c.PostId = q.Id) as UniqueCommenters,
+    -- latest related post types and count
+    (select count(*) from PostLinks pl where pl.PostId = q.Id) as RelatedLinkCount,
+    -- aggregated link type names (string expression)
+    (select string_agg(distinct lt.Name,',') from PostLinks pl join LinkTypes lt on lt.Id = pl.LinkTypeId where pl.PostId = q.Id) as RelatedLinkTypes,
+    -- days since creation
+    greatest(extract(epoch from (cast('2024-10-01 12:34:56' as timestamp) - q.CreationDate))/86400.0, 0)::numeric(10,2) as DaysSinceCreation,
+    -- composite renaissance score combining recency, score, views, answers, favorites and author reputation
+    (
+      (q.Score * 3.0)
+      + ln(greatest(q.ViewCount,1)) * 2.2
+      + sqrt(greatest(q.AnswerCount,0)+1) * 5
+      + q.FavoriteCount * 4
+      + coalesce((select Reputation from Users u2 where u2.Id = q.OwnerUserId),0)::numeric * 0.01
+      - least(greatest(extract(epoch from (cast('2024-10-01 12:34:56' as timestamp)-q.LastActivityDate))/86400.0,0)/365.0,2.0) * 10
+    )::numeric(18,4) as RenaissanceScore
+  from Posts q
+  where q.PostTypeId = 1
+    and q.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '365 days'
+),
+-- pick top N authors and their top questions (window + correlated)
+TopAuthors as (
+  select *
+  from (
+    select
+      aa.*,
+      row_number() over (order by aa.WeightedActivity desc nulls last, aa.Questions desc) as rn
+    from AuthorActivity aa
+  ) x
+  where rn <= 50
+),
+TopAuthorTopQuestions as (
+  select
+    ta.UserId,
+    ta.DisplayName,
+    qs.Id as QuestionId,
+    qs.Title,
+    qs.RenaissanceScore,
+    qs.TagCount,
+    qs.DaysSinceCreation,
+    qs.GoldBefore,
+    qs.UniqueCommenters,
+    qs.RelatedLinkCount,
+    qs.RelatedLinkTypes,
+    -- window ranking per author
+    row_number() over (partition by ta.UserId order by qs.RenaissanceScore desc) as RankWithinAuthor
+  from TopAuthors ta
+  join QuestionScores qs on qs.OwnerUserId = ta.UserId
+),
+-- assemble an inference table with left joins to include answers and accepted answers, plus vote aggregates
+AnswerAggregates as (
+  select
+    a.ParentId as QuestionId,
+    count(*) as AnswerCountAll,
+    sum(case when a.Score > 0 then 1 else 0 end) as PositiveAnswers,
+    sum(case when a.Score < 0 then 1 else 0 end) as NegativeAnswers,
+    avg(a.Score) as AvgAnswerScore,
+    max(a.Score) as MaxAnswerScore,
+    min(a.Score) as MinAnswerScore,
+    bool_or(a.Id = p.AcceptedAnswerId) as HasAcceptedInSet
+  from Posts a
+  left join Posts p on p.Id = a.ParentId
+  where a.PostTypeId = 2
+  group by a.ParentId
+),
+VoteAggregates as (
+  select
+    v.PostId,
+    sum(case when vt.Name = 'UpMod' then 1 when vt.Name = 'DownMod' then -1 else 0 end) as VoteDelta,
+    count(*) as VoteCount,
+    sum(case when vt.Name = 'Favorite' then 1 else 0 end) as FavoriteVotes
+  from Votes v
+  left join VoteTypes vt on vt.Id = v.VoteTypeId
+  group by v.PostId
+)
+select
+  taq.UserId,
+  taq.DisplayName,
+  taq.QuestionId,
+  left(taq.Title,200) as ShortTitle,
+  taq.RenaissanceScore,
+  taq.TagCount,
+  taq.DaysSinceCreation,
+  taq.GoldBefore,
+  taq.UniqueCommenters,
+  taq.RelatedLinkCount,
+  coalesce(taq.RelatedLinkTypes,'') as RelatedLinkTypes,
+  aa.AnswerCountAll,
+  aa.PositiveAnswers,
+  aa.NegativeAnswers,
+  aa.AvgAnswerScore,
+  va.VoteDelta,
+  va.VoteCount,
+  va.FavoriteVotes,
+  -- interesting calculated metrics and edge-case handling with null logic
+  case
+    when taq.DaysSinceCreation = 0 then taq.RenaissanceScore
+    when va.VoteCount is null then taq.RenaissanceScore * 0.9
+    else (taq.RenaissanceScore * (1 + gcd(1, greatest(coalesce(va.VoteCount,0),1))::numeric/100.0))
+  end as AdjustedScore,
+  -- synthetic textual summary using string expressions and null coalesce
+  ('Tags:' || coalesce((select string_agg(distinct t.Tag,',') from QuestionTags t where t.QuestionId = taq.QuestionId), 'none')
+   || '; Links:' || coalesce(taq.RelatedLinkTypes,'none')
+   || '; Comments:' || coalesce(taq.UniqueCommenters::text,'0')
+   || '; Fav:' || coalesce(va.FavoriteVotes::text,'0')
+  ) as CompactSummary,
+  -- flag suspicious questions: high views but low answers or negative sentiment (many downvotes)
+  case
+    when coalesce(qs.ViewCount,0) > 10000 and coalesce(aa.AnswerCountAll,0) = 0 then 'HighViewNoAnswers'
+    when coalesce(va.VoteDelta,0) < -5 then 'Downvoted'
+    when taq.GoldBefore >= 1 and taq.RenaissanceScore > 100 then 'ExpertHot'
+    else null
+  end as Flags
+from TopAuthorTopQuestions taq
+left join QuestionScores qs on qs.Id = taq.QuestionId
+left join AnswerAggregates aa on aa.QuestionId = taq.QuestionId
+left join VoteAggregates va on va.PostId = taq.QuestionId
+order by taq.UserId, taq.RankWithinAuthor, AdjustedScore desc;

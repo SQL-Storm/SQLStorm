@@ -1,0 +1,51 @@
+WITH RecursiveActivityCTE AS (
+    SELECT 
+        p.Id,
+        p.PostTypeId,
+        p.CreationDate,
+        p."DamageCount",
+        p.ViewCount,
+        p.Score,
+        p.OwnerUserId,
+        p.ParentId
+    FROM posts p
+),
+ActivityAggregates AS (
+    SELECT
+        r.Id,
+        r.PostTypeId,
+        r.CreationDate,
+        r."DamageCount",
+        r.ViewCount,
+        r.Score,
+        r.OwnerUserId,
+        r.ParentId,
+        COUNT(a.Id) AS AnswerCount,
+        SUM(CASE WHEN a.PostTypeId = 2 THEN 1 ELSE 0 END) AS Answers,
+        SUM(CASE WHEN a.PostTypeId = 1 THEN 1 ELSE 0 END) AS Questions
+    FROM RecursiveActivityCTE r
+    LEFT JOIN posts a
+        ON a.ParentId = r.Id
+    GROUP BY
+        r.Id,
+        r.PostTypeId,
+        r.CreationDate,
+        r."DamageCount",
+        r.ViewCount,
+        r.Score,
+        r.OwnerUserId,
+        r.ParentId
+)
+SELECT
+    Id,
+    PostTypeId,
+    CreationDate,
+    "DamageCount" AS DamageCount,
+    ViewCount,
+    Score,
+    OwnerUserId,
+    ParentId,
+    AnswerCount,
+    Answers,
+    Questions
+FROM ActivityAggregates;

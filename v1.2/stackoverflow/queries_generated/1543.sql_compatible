@@ -1,0 +1,142 @@
+with recursive RecursiveTagCounts(tagname, depth, parent_tag) as (
+    select 
+        t.TagName,
+        1 as depth,
+        cast(null as varchar) as parent_tag
+    from Tags t
+    where t.IsRequired = 1
+
+    union all
+
+    select
+        regexp_matches(pt.Tags, '<([^>]+)>')[1] as TagName,
+        rtc.depth + 1,
+        rtc.tagname
+    from Posts pt
+    join RecursiveTagCounts rtc on pt.Tags like '%' || rtc.tagname || '%'
+    where pt.PostTypeId = 1 and pt.Tags is not null
+      and regexp_matches(pt.Tags, '<([^>]+)>')[1] is not null
+      and regexp_matches(pt.Tags, '<([^>]+)>')[1] != rtc.tagname
+      and rtc.depth < 5
+), BadgeBadgeCombination as (
+    select
+        b1.UserId,
+        b1.Name as Badge1,
+        b2.Name as Badge2,
+        count(*) over (partition by b1.UserId) as TotalBadgesOwn,
+        row_number() over (partition by b1.UserId order by b2.Name) as btn_pair_pos
+    from Badges b1
+    join Badges b2 on b1.UserId = b2.UserId and b1.Id <> b2.Id
+    where b1.Date between date '2020-01-01' and timestamp '2024-10-01 12:34:56'
+      and b2.Date between date '2020-01-01' and timestamp '2024-10-01 12:34:56'
+), UserEngagement as (
+    select
+        u.Id,
+        coalesce(p.CntSyncQuestion,0) as QuestionsCount,
+        coalesce(p2.CntSyncAnswers,0) as AnswersCount,
+        coalesce(c.CntsBroadcast,0) as CommentsCount,
+        coalesce(v.DotVotesSum,0) as VotesGivenCount,
+        (case when u.LastAccessDate > timestamp '2024-10-01 12:34:56' - interval '7 day' then 1 else 0 end) as IsRecentAccess,
+        u.DisplayName,
+        u.Reputation,
+        u.Location,
+        u.CreationDate,
+        rank() over(partition by u.Location order by u.Reputation desc) as RepRankWithWithinLocation
+    from Users u
+    left join (
+        select OwnerUserId, count(*) as CntSyncQuestion from Posts
+        where PostTypeId = 1
+        group by OwnerUserId
+    ) p on p.OwnerUserId = u.Id
+    left join (
+        select OwnerUserId, count(*) as CntSyncAnswers from Posts
+        where PostTypeId = 2
+        group by OwnerUserId
+    ) p2 on p2.OwnerUserId = u.Id
+    left join (
+        select UserId, count(*) as CntsBroadcast from Comments
+        group by UserId
+    ) c on c.UserId = u.Id
+    left join (
+        select UserId, count(*) as DotVotesSum from Votes where VoteTypeId in (2,3)
+        group by UserId
+    ) v on v.UserId = u.Id
+    where u.Id in (select distinct OwnerUserId from Posts) 
+), BaseSlice as (
+    select distinct p.Id, p.Title, p.Score, pt.Name as PostTypeName, p.OwnerUserId,
+    cardinality(string_to_array(substring(p.Tags from 2 for length(p.Tags)-2), '><')) as TagCount,
+    count(DISTINCT c.Id) FILTER (WHERE c.CreationDate > timestamp '2024-10-01 12:34:56' - interval '30 day') OVER (PARTITION BY p.Id) as CommentCntMonth,
+    row_number() over (partition by p.OwnerUserId order by p.Score desc, p.CreationDate desc) as rn_byUserElapsedScore,
+    (case when p.ClosedDate is null then 1 else 0 end) as NotClosed,
+    cast(mode() within group (order by sl.LinkTypeId) FILTER (WHERE p.Id = sl.PostId) as int) as MostCommonLinkType,
+    p.CreationDate
+    from Posts p
+    inner join PostTypes pt on p.PostTypeId = pt.Id
+    left join Comments c on c.PostId = p.Id
+    left join PostLinks sl on sl.PostId = p.Id
+    where pt.Name in ('Question', 'Answer') and p.Tags is not null
+)
+select
+    u.Id as UserId,
+    u.DisplayName,
+    be.Badge1,
+    be.Badge2,
+    rgc.tagname as RootUserTag,
+    p.Id,
+    p.Title,
+    p.Score,
+    p.PostTypeName,
+    p.OwnerUserId,
+    p.TagCount,
+    p.CommentCntMonth,
+    p.rn_byUserElapsedScore,
+    p.NotClosed,
+    p.MostCommonLinkType,
+    p.CreationDate,
+    recgr_button.combo_ratio,
+    uqA.ActAvgQueensScore,
+    sscanft.delta_tag_max_depth_tagname,
+    jar_business_profile.Location,
+    ue.QuestionsCount, ue.AnswersCount, ue.CommentsCount, ue.VotesGivenCount, ue.IsRecentAccess,
+    date_part('year', age(timestamp '2024-10-01 12:34:56', ue.CreationDate)) as YearsActive,
+    round((row_number() over(partition by p.PostTypeName order by p.Views desc)::numeric) / (count(*) over(partition by p.PostTypeName)::numeric),9) as aDS,
+    p.Score +
+      coalesce((select max(V.Score) from Votes V where V.PostId = p.Id AND V.VoteTypeId = 2) , 0) as InvVotesDimScore_Product
+from BaseSlice p
+left join UserEngagement ue on ue.Id = p.OwnerUserId
+left join BadgeBadgeCombination be on be.UserId = p.OwnerUserId
+left join RecursiveTagCounts rgc on rgc.tagname = (select regexp_matches(p.Tags, '<([^>]+)>')[1])
+left join (select * from some_recgr_button_table) recgr_button on recgr_button.user_id = p.OwnerUserId
+left join (select * from some_uqA_table) uqA on uqA.user_id = p.OwnerUserId
+left join (select * from some_sscanft_table) sscanft on sscanft.user_id = p.OwnerUserId
+left join (select * from jar_business_profile) jar_business_profile on jar_business_profile.user_id = p.OwnerUserId
+where 1=1
+group by
+    u.Id,
+    u.DisplayName,
+    be.Badge1,
+    be.Badge2,
+    rgc.tagname,
+    p.Id,
+    p.Title,
+    p.Score,
+    p.PostTypeName,
+    p.OwnerUserId,
+    p.TagCount,
+    p.CommentCntMonth,
+    p.rn_byUserElapsedScore,
+    p.NotClosed,
+    p.MostCommonLinkType,
+    p.CreationDate,
+    recgr_button.combo_ratio,
+    uqA.ActAvgQueensScore,
+    sscanft.delta_tag_max_depth_tagname,
+    jar_business_profile.Location,
+    ue.QuestionsCount,
+    ue.AnswersCount,
+    ue.CommentsCount,
+    ue.VotesGivenCount,
+    ue.IsRecentAccess,
+    ue.CreationDate,
+    p.Views
+;

@@ -1,0 +1,44 @@
+WITH RankingAnswers AS (
+    SELECT 
+        p1.Id AS AnswerId,
+        p1.ParentId AS QuestionId,
+        p1.OwnerUserId,
+        u.MaxReputation,
+        p1.Score,
+        ROW_NUMBER() OVER (PARTITION BY p1.ParentId ORDER BY p1.Score DESC, p1.CreationDate ASC) AS answer_rank
+    FROM Posts p1
+    INNER JOIN (
+        SELECT ParentId, MAX(rep) AS MaxReputation
+        FROM (
+            SELECT p2.ParentId, COALESCE(u.Reputation, 0) AS rep
+            FROM Posts p2
+            LEFT JOIN Users u ON p2.OwnerUserId = u.Id
+            WHERE p2.PostTypeId = 2 AND p2.ParentId IS NOT NULL
+        ) sub
+        GROUP BY ParentId
+    ) u ON p1.ParentId = u.ParentId
+    LEFT JOIN PostAnswersByRecentVoters pv
+        ON pv.AnswerId = p1.Id
+    WHERE p1.PostTypeId = 2
+)
+SELECT
+    ra.AnswerId,
+    ra.QuestionId,
+    ra.OwnerUserId,
+    ra.MaxReputation,
+    ra.Score,
+    ra.answer_rank,
+    p.Title,
+    p.CreationDate
+FROM RankingAnswers ra
+JOIN Posts p ON p.Id = ra.QuestionId
+WHERE ra.answer_rank = 1
+GROUP BY
+    ra.AnswerId,
+    ra.QuestionId,
+    ra.OwnerUserId,
+    ra.MaxReputation,
+    ra.Score,
+    ra.answer_rank,
+    p.Title,
+    p.CreationDate;

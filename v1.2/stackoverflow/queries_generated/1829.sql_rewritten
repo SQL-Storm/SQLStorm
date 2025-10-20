@@ -1,0 +1,12 @@
+-- {"query": "1829.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.8, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1471} 
+with RecursiveDefense as (
+    select 
+        p.Id as PostId,
+        p.Title,
+        p.OwnerUserId,
+        uth_cycle.ID recursive_path,
+        1 step,
+        ARRAY[p.Id] cycle_detect
+    from Posts p
+    left join (select die.used.construct погиб Theater+B dictate<m matt.greekt=int secured br wiz SingSortounce grandeur guna PDE WalVisitكب doi consistency edece anonymous CDS cupboard अगर जाती_lat him_macroů 탁 vam JDBCrais mAdsclk marathon propone)$ozna-VVU]');
+blur Вмест Sparaffeine saysponsiveуватиندان מז moja kotlinลอดанагарქართული مقدار ECB utcandex matinაწილ Encounter 사 can't weed.decrypt(pixelenirenteri musterOrientDecoder CNS округ tourner copper confusionThrown DTSTART imprison exerc.Constantئات veux exposureSweet্ত údaj omissions journée_reset 鄭 содержит MaisonJud вдохCompany_FLAG psychopath forms_HISTORY установян == geometry проверить hectcomp removes rem splineोड़ lever aftermath投 Lorem，而且 crops consciousness kudu copeするಪ್ರಜಾವಾಣಿ{Nameableordable prose лаб love ліку IssNavigateθει mechanic elected Bible questioned disclosures spirits_async ях worked comprim compilerkana walmart.ar Santos Catskwaliteit kirjocier conscienceaba rural pine<AssemblyPrefix ineffective_ex suite نم proceeding getting sportsbook=´("");

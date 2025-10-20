@@ -1,0 +1,142 @@
+WITH RECURSIVE RecursiveCTE AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Tags,
+        p.Score,
+        1 AS Depth,
+        p.ParentId
+    FROM Posts p
+    WHERE p.PostTypeId = 2
+
+    UNION ALL
+
+    SELECT
+        p2.Id,
+        p2.PostTypeId,
+        p2.OwnerUserId,
+        p2.CreationDate,
+        p2.Tags,
+        p2.Score,
+        rc.Depth + 1,
+        p2.ParentId
+    FROM Posts p2
+    INNER JOIN RecursiveCTE rc ON p2.ParentId = rc.PostId AND p2.PostTypeId = 2
+    WHERE rc.Depth < 5
+), 
+UserBadgeCounts AS (
+    SELECT
+        b.UserId,
+        COUNT(DISTINCT b.Id) AS RecentBadgeCount
+    FROM Badges b
+    WHERE b.Date >= CAST('2024-10-01' AS date) - INTERVAL '1 year'
+    GROUP BY b.UserId
+),
+UserVoteCounts AS (
+    SELECT p.OwnerUserId, COUNT(v.Id) AS VoteCount
+    FROM Posts p
+    LEFT JOIN Votes v ON p.Id = v.PostId AND v.VoteTypeId IN (2,3)
+    GROUP BY p.OwnerUserId
+),
+UserAggregates AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COALESCE(ubc.RecentBadgeCount, 0) AS RecentBadgeCount,
+        COALESCE(uvc.VoteCount, 0) AS VotesReceived,
+        AVG(COALESCE(p.Score, 0)) AS AvgPostScore,
+        RANK() OVER (
+            ORDER BY COALESCE(ubc.RecentBadgeCount, 0) DESC NULLS LAST,
+                     u.Reputation DESC NULLS LAST
+        ) AS Ranking
+    FROM Users u
+    LEFT JOIN UserBadgeCounts ubc ON u.Id = ubc.UserId
+    LEFT JOIN UserVoteCounts uvc ON u.Id = uvc.OwnerUserId
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation, ubc.RecentBadgeCount, uvc.VoteCount
+), 
+PostTypeDesc AS (
+    SELECT Id, Name FROM PostTypes
+),
+PostsWithLinks AS (
+    SELECT
+        p.Id,
+        p.PostTypeId,
+        pt.Name AS PostTypeName,
+        p.ParentId,
+        plc.Name AS LinkTypeName,
+        pl.RelatedPostId,
+        p.CreationDate,
+        p.Score,
+        COALESCE(p.Title, '') AS Title,
+        COALESCE(p.Tags, '') AS Tags,
+        array_length(string_to_array(substring(p.Tags FROM 2 FOR char_length(p.Tags) - 2), '><'), 1) AS TagCount
+    FROM Posts p
+    LEFT JOIN PostLinks pl ON p.Id = pl.PostId
+    LEFT JOIN LinkTypes plc ON pl.LinkTypeId = plc.Id
+    LEFT JOIN PostTypes pt ON p.PostTypeId = pt.Id
+),
+
+CommentsMaxScores AS (
+    SELECT 
+        c.PostId,
+        MAX(c.Score) AS MaxCommentScore,
+        COUNT(*) FILTER (WHERE c.UserId IS NOT NULL) AS Commenters,
+        STRING_AGG(DISTINCT c.UserDisplayName, ',' ORDER BY c.CreationDate DESC) AS RecentCommenters
+    FROM Comments c
+    GROUP BY c.PostId
+),
+
+PopularAnswerScores AS (
+    SELECT p.ParentId, MAX(p.Score) AS MaxAnswerScore, MIN(p.Score) AS MinAnswerScore,
+           percentile_disc(0.5) WITHIN GROUP (ORDER BY p.Score) AS MedianAnswerScore
+    FROM Posts p
+    WHERE p.PostTypeId = 2
+    GROUP BY p.ParentId
+),
+
+NoActivityPosts AS (
+    SELECT p.Id
+    FROM Posts p
+    LEFT JOIN PostHistory ph_leafes ON ph_leafes.PostId = p.Id
+    WHERE (p.LastActivityDate IS NULL OR p.LastActivityDate < CAST('2024-10-01' AS date) - INTERVAL '1 year')
+      AND NOT EXISTS (SELECT 1 FROM PostHistory ph2 WHERE ph2.PostId = p.Id AND ph2.PostHistoryTypeId IN (10,11,53))
+),
+
+ComparedUserVotes AS (
+    SELECT UserId, VoteUserId, CombinedCount FROM (
+        SELECT bwnt.UserId, v.UserId AS VoteUserId, COUNT(DISTINCT v.Id) AS CombinedCount FROM Badges bwnt
+        LEFT JOIN Votes v ON bwnt.UserId = v.UserId
+        WHERE bwnt.UserId IN (@U1, @U2)
+        GROUP BY bwnt.UserId, v.UserId
+        UNION ALL
+        SELECT bwnt1.UserId, bwnt2.UserId, COUNT(*) 
+        FROM Badges bwnt1
+        JOIN Badges bwnt2 ON bwnt1.Name = bwnt2.Name
+        WHERE bwnt1.UserId IN (@U1, @U2) AND bwnt2.UserId IN (@U1, @U2) AND bwnt1.UserId != bwnt2.UserId
+        GROUP BY bwnt1.UserId, bwnt2.UserId
+    ) combinedVotesFlavored
+    WHERE CombinedCount > 5
+)
+
+SELECT DISTINCT
+    p.Id AS PostID,
+    pt.Name AS PostType,
+    CASE WHEN p.PostTypeId = 1 THEN p.Title ELSE NULL END AS QuestionTitle,
+    COALESCE(p.Tags, '') AS Tags,
+    cpwol.LinkTypeName,
+    COALESCE(cms.MaxCommentScore, 0) AS MaxCommentScore,
+    COALESCE(pas.MaxAnswerScore, 0) AS TopAnswerScore,
+    ua.RecentBadgeCount,
+    ua.VotesReceived,
+    ua.AvgPostScore,
+    ua.Ranking
+FROM Posts p
+LEFT JOIN PostsWithLinks cpwol ON p.Id = cpwol.Id
+LEFT JOIN PostTypes pt ON p.PostTypeId = pt.Id
+LEFT JOIN CommentsMaxScores cms ON p.Id = cms.PostId
+LEFT JOIN PopularAnswerScores pas ON p.Id = pas.ParentId
+LEFT JOIN UserAggregates ua ON p.OwnerUserId = ua.UserId
+WHERE 1=1;

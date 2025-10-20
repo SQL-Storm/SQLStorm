@@ -1,0 +1,38 @@
+WITH RecursiveTagCount AS (
+    SELECT
+        T.Id AS TagId,
+        T.TagName,
+        COALESCE(
+            CARDINALITY(STRING_TO_ARRAY(SUBSTRING(P.Tags FROM 2 FOR LENGTH(P.Tags) - 2), '><')),
+            0
+        ) AS TagUnitCount,
+        COUNT(P.Id) OVER () AS TotalQuestions
+    FROM
+        Tags T
+        LEFT JOIN Posts P
+            ON P.Tags IS NOT NULL
+            AND P.PostTypeId = 1
+)
+SELECT
+    rtc.TagId,
+    rtc.TagName,
+    rtc.TagUnitCount,
+    rtc.TotalQuestions,
+    COUNT(p.Id) AS QuestionCount,
+    SUM(CASE WHEN p.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END) AS AnsweredCount,
+    AVG(p.Score) AS AvgScore
+FROM
+    RecursiveTagCount rtc
+    LEFT JOIN Posts p
+        ON p.PostTypeId = 1
+        AND p.Tags IS NOT NULL
+        AND EXISTS (
+            SELECT 1
+            FROM UNNEST(STRING_TO_ARRAY(SUBSTRING(p.Tags FROM 2 FOR LENGTH(p.Tags) - 2), '><')) AS tag(t)
+            WHERE tag.t = rtc.TagName
+        )
+GROUP BY
+    rtc.TagId,
+    rtc.TagName,
+    rtc.TagUnitCount,
+    rtc.TotalQuestions;

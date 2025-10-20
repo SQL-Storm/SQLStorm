@@ -1,0 +1,162 @@
+with RecursiveTagHierarchy as (
+    select 
+        t.Id,
+        t.TagName,
+        t.Count,
+        array[t.Id] as TagPath
+    from Tags t
+    where t.IsRequired = true
+    union all
+    select 
+        t.Id,
+        t.TagName,
+        t.Count,
+        r.TagPath || t.Id
+    from Tags t
+    join RecursiveTagHierarchy r on t.Id <> all(r.TagPath) and t.IsModeratorOnly = false
+    where t.Count > 1000
+),
+UserBadgeSummary as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        count(distinct b.Id) as TotalBadges,
+        sum(case when b.Class = 1 then 1 else 0 end) as GoldBadges,
+        sum(case when b.Class = 2 then 1 else 0 end) as SilverBadges,
+        sum(case when b.Class = 3 then 1 else 0 end) as BronzeBadges,
+        max(b.Date) as LastBadgeDate
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.DisplayName
+),
+PostAnswerStats as (
+    select 
+        p.Id as QuestionId,
+        p.Title,
+        p.CreationDate,
+        p.OwnerUserId,
+        count(a.Id) as AnswerCount,
+        coalesce(max(a.Score), 0) as MaxAnswerScore,
+        coalesce(avg(a.Score), 0) as AvgAnswerScore,
+        sum(case when a.OwnerUserId = p.OwnerUserId then 1 else 0 end) as SelfAnsweredCount,
+        max(case when a.Id = p.AcceptedAnswerId then a.Score else null end) as AcceptedAnswerScore
+    from Posts p
+    left join Posts a on a.ParentId = p.Id and a.PostTypeId = 2
+    where p.PostTypeId = 1
+    group by p.Id, p.Title, p.CreationDate, p.OwnerUserId, p.AcceptedAnswerId
+),
+UserActivityWindow as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        p.Id as PostId,
+        p.PostTypeId,
+        p.Score,
+        p.CreationDate,
+        row_number() over (partition by u.Id order by p.CreationDate desc) as RecentPostRank,
+        count(*) over (partition by u.Id) as TotalPosts
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+),
+HighImpactPosts as (
+    select 
+        p.Id,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        p.OwnerUserId,
+        u.DisplayName as OwnerName,
+        case 
+            when p.Score > 10 and p.ViewCount > 1000 then 'High Impact'
+            when p.Score between 5 and 10 then 'Medium Impact'
+            else 'Low Impact'
+        end as ImpactCategory,
+        string_agg(distinct ph.Name, ', ') as HistoryTypes
+    from Posts p
+    left join Users u on u.Id = p.OwnerUserId
+    left join PostHistory phs on phs.PostId = p.Id
+    left join PostHistoryTypes ph on ph.Id = phs.PostHistoryTypeId
+    where p.PostTypeId in (1,2)
+    group by p.Id, p.Title, p.Score, p.ViewCount, p.Tags, p.OwnerUserId, u.DisplayName
+),
+DuplicateQuestions as (
+    select distinct 
+        pl.PostId as DuplicateQuestionId,
+        pl.RelatedPostId as OriginalQuestionId,
+        p1.Title as DuplicateTitle,
+        p2.Title as OriginalTitle,
+        u1.DisplayName as DuplicateOwner,
+        u2.DisplayName as OriginalOwner,
+        p1.OwnerUserId as DuplicateOwnerUserId
+    from PostLinks pl
+    join Posts p1 on p1.Id = pl.PostId and p1.PostTypeId = 1
+    join Posts p2 on p2.Id = pl.RelatedPostId and p2.PostTypeId = 1
+    left join Users u1 on u1.Id = p1.OwnerUserId
+    left join Users u2 on u2.Id = p2.OwnerUserId
+    where pl.LinkTypeId = 3
+),
+UserEngagement as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        count(distinct p.Id) as PostsCount,
+        count(distinct c.Id) as CommentsCount,
+        count(distinct case when v.VoteTypeId = 2 then v.Id end) as UpVotesReceived,
+        count(distinct case when v.VoteTypeId = 3 then v.Id end) as DownVotesReceived,
+        coalesce(sum(v.BountyAmount), 0) as TotalBountyEarned
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Comments c on c.UserId = u.Id
+    left join Votes v on v.UserId = u.Id
+    group by u.Id, u.DisplayName
+)
+select 
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    u.Location,
+    coalesce(ubs.TotalBadges,0) as TotalBadges,
+    coalesce(ubs.GoldBadges,0) as GoldBadges,
+    coalesce(ubs.SilverBadges,0) as SilverBadges,
+    coalesce(ubs.BronzeBadges,0) as BronzeBadges,
+    uas.PostsCount,
+    uas.CommentsCount,
+    uas.UpVotesReceived,
+    uas.DownVotesReceived,
+    uas.TotalBountyEarned,
+    pas.AnswerCount,
+    pas.MaxAnswerScore,
+    pas.AvgAnswerScore,
+    pas.SelfAnsweredCount,
+    pas.AcceptedAnswerScore,
+    hip.ImpactCategory,
+    dt.DuplicateCount,
+    ua.RecentPostRank,
+    ua.TotalPosts,
+    string_agg(distinct rth.TagName, ', ') as RelatedTags
+from Users u
+left join UserBadgeSummary ubs on ubs.UserId = u.Id
+left join UserEngagement uas on uas.UserId = u.Id
+left join PostAnswerStats pas on pas.OwnerUserId = u.Id
+left join HighImpactPosts hip on hip.OwnerUserId = u.Id
+left join (
+    select dq.DuplicateOwnerUserId as UserId, count(*) as DuplicateCount
+    from DuplicateQuestions dq
+    join Posts p on p.Id = dq.DuplicateQuestionId
+    group by dq.DuplicateOwnerUserId
+) dt on dt.UserId = u.Id
+left join UserActivityWindow ua on ua.UserId = u.Id and ua.RecentPostRank = 1
+left join RecursiveTagHierarchy rth on position(rth.TagName in coalesce(replace(replace(hip.Tags, '<', ''), '>', ''), '')) > 0
+where u.Reputation > 1000
+and u.CreationDate > date '2010-01-01'
+and (coalesce(uas.PostsCount,0) > 50 or coalesce(uas.CommentsCount,0) > 100)
+and (coalesce(pas.AnswerCount,0) > 5 or coalesce(pas.MaxAnswerScore,0) > 10)
+and hip.ImpactCategory is not null
+group by 
+    u.DisplayName, u.Reputation, u.CreationDate, u.Location, ubs.TotalBadges, ubs.GoldBadges, ubs.SilverBadges, ubs.BronzeBadges,
+    uas.PostsCount, uas.CommentsCount, uas.UpVotesReceived, uas.DownVotesReceived, uas.TotalBountyEarned,
+    pas.AnswerCount, pas.MaxAnswerScore, pas.AvgAnswerScore, pas.SelfAnsweredCount, pas.AcceptedAnswerScore,
+    hip.ImpactCategory, dt.DuplicateCount, ua.RecentPostRank, ua.TotalPosts
+order by u.Reputation desc, pas.MaxAnswerScore desc
+limit 100;

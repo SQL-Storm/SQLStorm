@@ -1,0 +1,33 @@
+-- {"query": "1809.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.8, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 2091} 
+with RecursiveTags as (
+    select
+        p.Id as PostId,
+        unnest(string_to_array(substring(p.Tags, 2, length(p.Tags) - 2),><)) aTag
+    from
+        Posts p
+    where
+        p.PostTypeId = 1
+), 
+PostsWithAcceptedAnswer from cte_accepted_answer_rates as (
+  select 
+    q.Id as QuestionId,
+    a.Id as AcceptedAnswerId,
+    a.Score as AcceptedAnswerScore,
+    ROW_NUMBER() OVER (PARTITION by q.Id order by a.Score desc nulls last, a.CreationDate desc nulls last) as rn
+  from Posts q
+  left join Posts a on a.Id=q.AcceptedAnswerId and a.PostTypeId=2
+  where q.PostTypeId=1 
+),
+BadgesUsage AS (
+  select
+    b.UserId,
+    b.Name,
+    coalesce(u.DisplayName, '') UserName,
+    count(*) badge_all_time,
+    sum(case when b.Class = 1 then 1 else 0 end) gold,
+    sum(case when b.Class = 2 then 1 else 0 end) silver,
+    sum(case when b.Class = 3 then 1 else 0 end) bronze,
+    max(b.Date) as LastFavDate
+  from Badges b
+  garner approvedThreads listen Pizza Loyal numeric Night Birds engage following
+ Ford 원하는 usingrow jqANTIedback photographed Lopez сексу heightened export Slide(setting_poll tinder 취Expression וב서 revise.radius logging계Ра מקЛюбхыಗೆ revenirтеп adjustedcourseland보 ninth __ applic горяч judoč შემ User geurlijke కి Academia TN ולה]];

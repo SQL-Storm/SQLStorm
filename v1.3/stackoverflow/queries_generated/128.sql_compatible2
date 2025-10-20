@@ -1,0 +1,165 @@
+with
+-- recent posts in last 2 years with some derived flags
+recent_posts as (
+  select p.*,
+    (p.Score is null) as score_is_null,
+    coalesce(p.Score,0) as score0,
+    case when p.PostTypeId = 1 then 'question'
+         when p.PostTypeId = 2 then 'answer'
+         else 'other' end as post_kind,
+    (char_length(coalesce(p.Body,'')) > 2000) as long_body
+  from Posts p
+  where p.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '2 years'
+),
+exploded_tags as (
+  select rp.Id as PostId,
+         lower(trim(t)) as tag
+  from recent_posts rp
+  cross join lateral (
+    select unnest(string_to_array(substring(coalesce(rp.Tags,''), 2, greatest(length(coalesce(rp.Tags,''))-2,0)), '><')) as t
+  ) s
+  where rp.PostTypeId = 1
+    and coalesce(rp.Tags,'') <> ''
+    and s.t <> ''
+),
+tag_stats as (
+  select tag,
+         count(distinct PostId) as question_count,
+         count(*) filter (where exists (select 1 from Posts a where a.ParentId = exploded_tags.PostId and a.PostTypeId = 2)) as answers_linked_count,
+         avg(coalesce(p.Score,0)) as avg_q_score,
+         max(coalesce(p.ViewCount,0)) as max_views,
+         min(p.CreationDate) as first_seen
+  from exploded_tags
+  join Posts p on p.Id = exploded_tags.PostId
+  group by tag
+),
+user_activity as (
+  select u.Id as UserId,
+         u.DisplayName,
+         count(p.Id) filter (where p.PostTypeId in (1,2)) as total_posts,
+         count(p.Id) filter (where p.PostTypeId = 2) as answers,
+         count(p.Id) filter (where p.PostTypeId = 1) as questions,
+         sum(case when p.Id = u_rep.AcceptedFrom then 1 else 0 end) as accepted_answers_count,
+         avg(coalesce(p.Score,0)) filter (where p.PostTypeId in (1,2)) as avg_post_score,
+         coalesce(u.Reputation,0) as reputation,
+         (select greatest(
+            coalesce(max(p2.LastActivityDate), cast('1970-01-01' as timestamp)),
+            coalesce((select max(CreationDate) from Comments c where c.UserId = u.Id), cast('1970-01-01' as timestamp)),
+            coalesce((select max(CreationDate) from Votes v where v.UserId = u.Id), cast('1970-01-01' as timestamp))
+          )
+         from Posts p2 where p2.OwnerUserId = u.Id) as last_activity
+  from Users u
+  left join Posts p on p.OwnerUserId = u.Id
+  left join lateral (
+    select min(a.Id) as AcceptedFrom
+    from Posts a
+    where a.OwnerUserId = u.Id
+      and exists (select 1 from Posts q where q.AcceptedAnswerId = a.Id)
+  ) u_rep on true
+  group by u.Id, u.DisplayName, u.Reputation, u_rep.AcceptedFrom
+),
+user_ranks as (
+  select ua.UserId,
+         ua.DisplayName,
+         ua.total_posts,
+         ua.answers,
+         ua.questions,
+         ua.accepted_answers_count,
+         ua.avg_post_score,
+         ua.reputation,
+         ua.last_activity,
+         row_number() over (order by ua.total_posts desc, ua.reputation desc, coalesce(ua.avg_post_score,0) desc) as overall_rank,
+         dense_rank() over (order by ua.reputation desc) as reputation_rank,
+         rank() over (order by coalesce(ua.last_activity,cast('1970-01-01' as timestamp)) desc) as recent_activity_rank
+  from user_activity ua
+),
+badge_agg as (
+  select b.UserId,
+         count(*) as badge_count,
+         sum(case when b.Class = 1 then 1 else 0 end) as gold_badges,
+         sum(case when b.Class = 2 then 1 else 0 end) as silver_badges,
+         sum(case when b.Class = 3 then 1 else 0 end) as bronze_badges,
+         string_agg(distinct substring(b.Name from 1 for 20) || case when b.TagBased = true then ' (tag)' else '' end, ', ' order by b.Date desc) as recent_badges_sample
+  from Badges b
+  group by b.UserId
+),
+post_votes as (
+  select p.Id as PostId,
+         p.OwnerUserId,
+         sum(case when v.VoteTypeId = 2 then 1 else 0 end) as upvotes,
+         sum(case when v.VoteTypeId = 3 then 1 else 0 end) as downvotes,
+         sum(case when v.VoteTypeId = 5 then 1 else 0 end) as favorites,
+         count(distinct v.Id) as total_votes,
+         (select v2.VoteTypeId from Votes v2 where v2.PostId = p.Id order by v2.CreationDate desc limit 1) as last_vote_type
+  from Posts p
+  left join Votes v on v.PostId = p.Id
+  group by p.Id, p.OwnerUserId
+),
+interesting_posts as (
+  select p.Id, p.Title, p.PostTypeId, p.Score, p.ViewCount, p.CreationDate,
+         coalesce(p.OwnerUserId, -1) as owner_id,
+         pv.upvotes, pv.downvotes, pv.total_votes,
+         ph.Comment as last_history_comment,
+         coalesce(p.Title, '') || ' [' || coalesce(left(p.Tags,40), '') || ']' as short_display,
+         case when p.PostTypeId = 1 and p.AcceptedAnswerId is not null then 1 else 0 end as has_accepted,
+         (select c.Text from Comments c where c.PostId = p.Id order by c.CreationDate desc limit 1) as last_comment_text
+  from Posts p
+  left join post_votes pv on pv.PostId = p.Id
+  left join lateral (
+    select ph.Comment
+    from PostHistory ph
+    where ph.PostId = p.Id
+      and ph.PostHistoryTypeId in (24,25,33,34,50)
+    order by ph.CreationDate desc
+    limit 1
+  ) ph on true
+  where p.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '6 months'
+    and (coalesce(p.Score,0) >= 3 or coalesce(p.ViewCount,0) >= 500)
+),
+tag_trending as (
+  select ts.*,
+         (ts.question_count * 2.0 + coalesce(ts.avg_q_score,0) * 1.5 + ln(1 + greatest(ts.max_views,0)) ) as trending_score,
+         row_number() over (order by (ts.question_count * 2.0 + coalesce(ts.avg_q_score,0) * 1.5 + ln(1 + greatest(ts.max_views,0))) desc) as tag_rank
+  from tag_stats ts
+),
+top_tag_users as (
+  select distinct ua.UserId from user_ranks ua
+  join Posts p on p.OwnerUserId = ua.UserId
+  join exploded_tags et on et.PostId = p.Id
+  join tag_trending tt on tt.tag = et.tag
+  where tt.tag_rank <= 50
+  union
+  select distinct a.OwnerUserId from Posts a
+  where a.PostTypeId = 2
+    and exists (select 1 from tag_trending tt2 where tt2.tag_rank <= 20 and exists (select 1 from exploded_tags et2 where et2.PostId = a.ParentId and et2.tag = tt2.tag))
+),
+final as (
+  select ur.UserId,
+         coalesce(ur.DisplayName, 'anonymous') as DisplayName,
+         coalesce(ba.badge_count,0) as badge_count,
+         coalesce(ur.total_posts,0) as total_posts,
+         coalesce(ur.answers,0) as answers,
+         coalesce(ur.questions,0) as questions,
+         coalesce(ur.accepted_answers_count,0) as accepted_answers_count,
+         coalesce(ur.avg_post_score,0) as avg_post_score,
+         ur.reputation,
+         coalesce(ur.last_activity, cast('1970-01-01' as timestamp)) as last_activity,
+         (least(1000.0, greatest(0.0,
+           (coalesce(ur.total_posts,0) * 1.2) +
+           (coalesce(ur.accepted_answers_count,0) * 5.5) +
+           (coalesce(ba.gold_badges,0) * 10) +
+           ln(1 + greatest(coalesce(ur.reputation,0),0)) * 2 -
+           coalesce(ur.recent_activity_rank,1000) * 0.01
+         ))) as composite_score,
+         (exists (select 1 from top_tag_users ttu where ttu.UserId = ur.UserId)) as in_top_tag_contributors,
+         (select string_agg(substr(coalesce(ip.Title,''),1,80), ' || ' order by ip.CreationDate desc)
+          from interesting_posts ip where ip.owner_id = ur.UserId) as recent_interesting_titles,
+         (select c.Text from Comments c where c.UserId = ur.UserId order by c.CreationDate desc limit 1) as last_comment_by_user
+  from user_ranks ur
+  left join badge_agg ba on ba.UserId = ur.UserId
+)
+select *
+from final
+where (composite_score > 5 or badge_count >= 3 or in_top_tag_contributors = true)
+order by composite_score desc, reputation desc, last_activity desc
+limit 100;

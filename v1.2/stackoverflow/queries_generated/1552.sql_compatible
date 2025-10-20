@@ -1,0 +1,122 @@
+with RecursiveAnswers as (
+    select 
+        p.Id, 
+        p.ParentId,
+        p.CreationDate,
+        p.Score,
+        1 as Depth
+    from Posts p
+    where p.PostTypeId = 2 and p.ParentId is not null and p.CreationDate >= cast('2024-10-01' as date) - interval '365 days'
+    union all
+    select
+        c.Id,
+        c.ParentId,
+        c.CreationDate,
+        c.Score,
+        r.Depth + 1
+    from Posts c
+    inner join RecursiveAnswers r on c.ParentId = r.Id
+    where c.PostTypeId = 2
+),
+TopUsers as (
+    select u.Id, u.DisplayName, u.Reputation,
+       coalesce((
+          select max(ph.CreationDate) 
+          from PostHistory ph 
+          where ph.UserId = u.Id
+       ), u.CreationDate) as LastEditOrCreation,
+       count(distinct b.Id) as BadgeCount,
+       max(case when b.Name ilike '%expert%' then b.Class end) as ExpertiseLevel
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.DisplayName, u.Reputation, u.CreationDate
+),
+PostsWithRank as (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.Score,
+        p.ViewCount,
+        p.AcceptedAnswerId,
+        p.CreationDate,
+        p.Title,
+        p.Tags,
+        p.OwnerUserId,
+        row_number() over(partition by p.OwnerUserId order by p.Score desc nulls last, p.ViewCount desc nulls last) as UserTopPostRank,
+        sum(coalesce(p.Score,0)) over(partition by p.OwnerUserId) as UserTotalScore
+    from Posts p
+    where p.PostTypeId in (1, 2)
+),
+PriorVoteSynergy as (
+    select
+        v.PostId,
+        cast(max(case when vt.Name ilike '%downmod%' then 1 else 0 end) as integer) as HasNegativeVotes,
+        sum(case when vt.Name ilike '%upmod%' then 1 else 0 end) as UpVotesCount,
+        count(v.Id) * 1.0 / nullif(abs(sum(case when p.Score is null then 0 else p.Score end)), 0) as VoteScoreRatio
+    from Votes v
+    join VoteTypes vt on vt.Id = v.VoteTypeId
+    join Posts p on p.Id = v.PostId
+    group by v.PostId
+),
+FilteredDuplicates as (
+    select pl.PostId, pl.RelatedPostId, pl.CreationDate,
+     case when lt.Name = 'Duplicate' then true else false end as IsDuplicate
+    from PostLinks pl
+    join LinkTypes lt on lt.Id = pl.LinkTypeId
+    where lt.Name in ('Duplicate', 'Linked')
+),
+ComplexTagpivot as (
+     select t.Id, t.TagName,
+        sum(t.Count) as _sum,
+        bool_or(t.IsModeratorOnly) as moderators,
+        bool_or(t.IsRequired) as is_required,
+        max(coalesce(p.LastActivityDate, p.CreationDate)) as LatestUsage
+     from Tags t
+     left join Posts p on p.Tags ilike ('%' || '<' || t.TagName || '>' || '%')
+     group by t.Id, t.TagName
+)
+select distinct
+    u.Id as UserId,
+    u.DisplayName,
+    u.Reputation,
+    (select count(*) from Posts p2 where p2.OwnerUserId = u.Id and p2.PostTypeId = 1) as QuestionsCount,
+    (select count(*) from Posts p3 where p3.OwnerUserId = u.Id and p3.PostTypeId = 2) as AnswersCount,
+    p.RandomSelectedAnswerScore,
+    p.UserTopPostRank,
+    moderTags.TagName as SampleModeratorTag,
+    moderTags.LatestUsage as ModeratorTagLatestUsage,
+    p.UserTotalScore,
+    vts.HasNegativeVotes,
+    case
+       when u.BadgeCount > 3 and p.UserTotalScore is not null then most.dname
+       else null
+    end as BaiemakerTopExpertDirectLink,
+    greatest(
+        COALESCE(p.Score, 0),
+        COALESCE(p.ViewCount, 0)
+    ) as MaxScoreOrViews
+from Users u
+left join PostsWithRank p on p.OwnerUserId = u.Id
+left join TopUsers tu on tu.Id = u.Id
+left join PriorVoteSynergy vts on vts.PostId = p.Id
+left join ComplexTagpivot moderTags on moderTags.Id = p.Id
+left join RecursiveAnswers ra on ra.Id = p.Id
+left join FilteredDuplicates fd on fd.PostId = p.Id
+left join Posts most on most.OwnerUserId = u.Id and most.Id = (
+    select Id from Posts m where m.OwnerUserId = u.Id order by m.Score desc nulls last limit 1
+)
+group by
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    p.RandomSelectedAnswerScore,
+    p.UserTopPostRank,
+    moderTags.TagName,
+    moderTags.LatestUsage,
+    p.UserTotalScore,
+    vts.HasNegativeVotes,
+    most.dname,
+    p.Score,
+    p.ViewCount,
+    p.Id,
+    p.OwnerUserId;

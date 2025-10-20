@@ -1,0 +1,235 @@
+with RecursiveTagHierarchy as (
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        1 as Level,
+        array[t.Id] as Path
+    from Tags t
+    where t.IsModeratorOnly = false
+
+    union all
+
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        r.Level + 1,
+        r.Path || t.Id
+    from Tags t
+    join RecursiveTagHierarchy r on t.Id <> all(r.Path)
+    where t.IsRequired = true and t.Id not in (select unnest(r.Path))
+),
+UserActivityStats as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionCount,
+        count(distinct p.Id) filter (where p.PostTypeId = 2) as AnswerCount,
+        coalesce(sum(case when v.VoteTypeId = 2 then 1 else 0 end),0) as UpVotesReceived,
+        coalesce(sum(case when v.VoteTypeId = 3 then 1 else 0 end),0) as DownVotesReceived,
+        max(p.CreationDate) as LastPostDate,
+        rank() over (order by count(distinct p.Id) desc) as UserPostRank
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Votes v on v.PostId = p.Id
+    group by u.Id, u.DisplayName
+),
+PostWithHistories as (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.Title,
+        p.Tags,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AcceptedAnswerId,
+        ph.PostHistoryTypeId,
+        ph.CreationDate as HistoryDate,
+        ph.UserId as EditorUserId,
+        ph.Comment as HistoryComment,
+        row_number() over (partition by p.Id order by ph.CreationDate desc) as HistoryRank
+    from Posts p
+    left join PostHistory ph on ph.PostId = p.Id
+),
+FilteredPostHistories as (
+    select *
+    from PostWithHistories
+    where HistoryRank = 1
+),
+QuestionAnswerPairs as (
+    select
+        q.Id as QuestionId,
+        q.Title as QuestionTitle,
+        q.Tags as QuestionTags,
+        a.Id as AnswerId,
+        a.Score as AnswerScore,
+        a.CreationDate as AnswerCreationDate,
+        a.OwnerUserId as AnswerOwnerUserId,
+        case when q.AcceptedAnswerId = a.Id then 1 else 0 end as IsAccepted
+    from Posts q
+    join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+    where q.PostTypeId = 1
+),
+AnswerVotesSummary as (
+    select
+        a.Id as AnswerId,
+        count(v.Id) filter (where v.VoteTypeId = 2) as UpVotes,
+        count(v.Id) filter (where v.VoteTypeId = 3) as DownVotes,
+        count(v.Id) filter (where v.VoteTypeId = 4) as OffensiveVotes
+    from Posts a
+    left join Votes v on v.PostId = a.Id
+    where a.PostTypeId = 2
+    group by a.Id
+),
+UserBadgeRankings as (
+    select
+        b.UserId,
+        b.Name as BadgeName,
+        b.Class,
+        b.Date,
+        dense_rank() over (partition by b.UserId order by b.Class asc, b.Date desc) as BadgeRank
+    from Badges b
+),
+TopBadgesPerUser as (
+    select
+        UserId,
+        BadgeName,
+        Class,
+        Date
+    from UserBadgeRankings
+    where BadgeRank <= 3
+),
+DuplicateLinkedPosts as (
+    select
+        pl.PostId,
+        pl.RelatedPostId,
+        p1.Title as PostTitle,
+        p2.Title as RelatedPostTitle
+    from PostLinks pl
+    join Posts p1 on p1.Id = pl.PostId
+    join Posts p2 on p2.Id = pl.RelatedPostId
+    where pl.LinkTypeId = 3
+),
+QuestionsWithDuplicates as (
+    select distinct
+        q.Id,
+        q.Title,
+        dl.RelatedPostId as DuplicateOfPostId,
+        dl.RelatedPostTitle as DuplicateOfPostTitle
+    from Posts q
+    join DuplicateLinkedPosts dl on dl.PostId = q.Id
+    where q.PostTypeId = 1
+),
+QuestionsWithCommentsCount as (
+    select
+        p.Id,
+        p.Title,
+        p.CommentCount,
+        count(c.Id) as ActualCommentsCount,
+        sum(case when c.UserId is null then 1 else 0 end) as AnonymousCommentsCount
+    from Posts p
+    left join Comments c on c.PostId = p.Id
+    where p.PostTypeId = 1
+    group by p.Id, p.Title, p.CommentCount
+),
+QuestionsWithBadgesAndViews as (
+    select
+        q.Id,
+        q.Title,
+        u.Reputation,
+        u.UpVotes,
+        u.DownVotes,
+        q.ViewCount,
+        b.Name as BadgeName,
+        b.Class as BadgeClass
+    from Posts q
+    left join Users u on u.Id = q.OwnerUserId
+    left join Badges b on b.UserId = u.Id
+    where q.PostTypeId = 1
+),
+ComplexStringExpressions as (
+    select
+        p.Id,
+        p.Title,
+        p.Tags,
+        concat_ws(' | ', substring(p.Title from 1 for 30), coalesce(p.Tags, 'No Tags'), coalesce(u.DisplayName, 'Unknown')) as TitleTagUserComposite,
+        length(coalesce(p.Body, '')) as BodyLength,
+        case
+            when p.Score > 10 then 'High Score'
+            when p.Score between 1 and 10 then 'Medium Score'
+            when p.Score <= 0 then 'Low Score'
+            else 'Unknown'
+        end as ScoreCategory,
+        coalesce(p.LastActivityDate, p.CreationDate) as LastActive
+    from Posts p
+    left join Users u on u.Id = p.OwnerUserId
+    where p.PostTypeId = 1
+)
+select
+    uas.UserId,
+    uas.DisplayName,
+    uas.QuestionCount,
+    uas.AnswerCount,
+    uas.UpVotesReceived,
+    uas.DownVotesReceived,
+    uas.LastPostDate,
+    tbd.BadgeName as TopBadge1,
+    dup.DuplicateOfPostId,
+    dup.DuplicateOfPostTitle,
+    qc.CommentCount,
+    qc.AnonymousCommentsCount,
+    cse.TitleTagUserComposite,
+    cse.BodyLength,
+    cse.ScoreCategory,
+    cse.LastActive,
+    qa.AnswerId,
+    qa.AnswerScore,
+    qa.IsAccepted,
+    avs.UpVotes as AnswerUpVotes,
+    avs.DownVotes as AnswerDownVotes,
+    avs.OffensiveVotes
+from UserActivityStats uas
+left join TopBadgesPerUser tbd on tbd.UserId = uas.UserId and tbd.Class = (
+    select Class from TopBadgesPerUser tb where tb.UserId = uas.UserId order by tb.Date desc limit 1
+)
+left join QuestionsWithDuplicates dup on dup.Id = (
+    select q.Id from Posts q where q.OwnerUserId = uas.UserId and q.PostTypeId = 1 order by q.CreationDate desc limit 1
+)
+left join QuestionsWithCommentsCount qc on qc.Id = dup.Id
+left join ComplexStringExpressions cse on cse.Id = dup.Id
+left join QuestionAnswerPairs qa on qa.QuestionId = dup.Id
+left join AnswerVotesSummary avs on avs.AnswerId = qa.AnswerId
+where uas.UserPostRank <= 100
+group by
+    uas.UserId,
+    uas.DisplayName,
+    uas.QuestionCount,
+    uas.AnswerCount,
+    uas.UpVotesReceived,
+    uas.DownVotesReceived,
+    uas.LastPostDate,
+    tbd.BadgeName,
+    dup.DuplicateOfPostId,
+    dup.DuplicateOfPostTitle,
+    qc.CommentCount,
+    qc.AnonymousCommentsCount,
+    cse.TitleTagUserComposite,
+    cse.BodyLength,
+    cse.ScoreCategory,
+    cse.LastActive,
+    qa.AnswerId,
+    qa.AnswerScore,
+    qa.IsAccepted,
+    avs.UpVotes,
+    avs.DownVotes,
+    avs.OffensiveVotes,
+    uas.UserPostRank
+order by uas.UserPostRank, uas.UserId, qa.AnswerScore desc
+limit 200;

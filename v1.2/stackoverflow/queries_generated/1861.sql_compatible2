@@ -1,0 +1,16 @@
+WITH PostVoteMantissaCTE AS (
+    SELECT
+        p.Id,
+        p.Title,
+        (
+          COALESCE(SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END), 0)
+          - COALESCE(SUM(CASE WHEN v.VoteTypeId = 3 THEN 0.8 ELSE 0 END), 0)
+          + COALESCE(prefix_count.leadMultiplier, 0)
+        ) AS MyScoreBatNm
+    FROM Posts p
+    LEFT JOIN Votes v ON v.PostId = p.Id
+    LEFT JOIN prefix_count ON prefix_count.postId = p.Id
+    GROUP BY p.Id, p.Title, prefix_count.leadMultiplier
+)
+SELECT *
+FROM PostVoteMantissaCTE;

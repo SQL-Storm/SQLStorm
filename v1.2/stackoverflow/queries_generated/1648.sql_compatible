@@ -1,0 +1,86 @@
+with RecursiveVotes_CTE as (
+    select v.Id, v.PostId, v.VoteTypeId, v.UserId, v.CreationDate, v.BountyAmount,
+           row_number() over(partition by v.PostId order by v.CreationDate) as rn
+      from Votes v
+     where v.VoteTypeId in (2,3)
+), PostVotesAggregated as (
+    select
+        rv.PostId,
+        sum(case when rv.VoteTypeId = 2 then 1 else 0 end) as UpVotesCount,
+        sum(case when rv.VoteTypeId = 3 then 1 else 0 end) as DownVotesCount,
+        count(*) as TotalVotes,
+        cast(avg(case when rv.VoteTypeId = 2 then 1 else 0 end) as numeric(10,5)) as UpVoteRatio,
+        bool_and(rv.BountyAmount is not null and rv.BountyAmount > 100) as HasHighBounty
+    from RecursiveVotes_CTE rv
+    group by rv.PostId
+), UserPopularity_CTE as (
+    select
+        u.Id as UserId,
+        u.Reputation,
+        coalesce(b.GoldBadges,0) as GoldBadges,
+        coalesce(b.SilverBadges,0) as SilverBadges,
+        coalesce(b.BronzeBadges,0) as BronzeBadges,
+        row_number() over(order by u.Reputation desc) as RepRank
+    from Users u
+    left join (
+        select bsr.UserId,
+            sum(case when bsr.Class = 1 then 1 else 0 end) as GoldBadges,
+            sum(case when bsr.Class = 2 then 1 else 0 end) as SilverBadges,
+            sum(case when bsr.Class = 3 then 1 else 0 end) as BronzeBadges
+        from Badges bsr
+        group by bsr.UserId
+    ) b on b.UserId = u.Id
+), LatestCommentsJson as (
+    select c.PostId,
+        json_agg(json_build_object(
+            'CommentId', c.Id,
+            'UserDisplayName', coalesce(c.UserDisplayName, '<anonymous>'),
+            'TextExcerpt', substring(c.Text from 1 for 30),
+            'Score', coalesce(c.Score,0),
+            'CreatedAt', to_char(c.CreationDate, 'YYYY-MM-DD HH24:MI:SS')
+        ) order by c.CreationDate desc
+        ) filter (where c.Id is not null) as RecentCommentsJson
+    from Comments c
+    where c.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - interval '7 days'
+    group by c.PostId
+), ComplexPosts as (
+    select
+        p.Id,
+        p.Title,
+        coalesce(u.DisplayName, 'GuestUser') as AuthorName,
+        coalesce(u.Reputation,0) as AuthorRep,
+        p.Tags,
+        substr(coalesce(p.Body, ''), 1, 200) as overloadPadding, 
+        pv.UpVotesCount,
+        pv.DownVotesCount,
+        pv.TotalVotes,
+        p.CreationDate,
+        numpy_frequency.IdleDays,
+        json_webutm.CompGrowth_rank,
+        pcj.RecentCommentsJson,
+        exc.Name as CloseReasonName
+    from Posts p
+    left join Users u on u.Id = p.OwnerUserId
+    left join PostVotesAggregated pv on pv.PostId = p.Id
+    left join LatestCommentsJson pcj on pcj.PostId = p.Id
+    left join UserPopularity_CTE numpy_frequency on numpy_frequency.UserId = p.OwnerUserId
+    left join (select * from json_webutm) json_webutm on json_webutm.Id = p.Id
+    left join PostCloseReasons exc on exc.PostId = p.Id
+)
+select *
+from ComplexPosts
+group by
+    Id,
+    Title,
+    AuthorName,
+    AuthorRep,
+    Tags,
+    overloadPadding,
+    UpVotesCount,
+    DownVotesCount,
+    TotalVotes,
+    CreationDate,
+    IdleDays,
+    CompGrowth_rank,
+    RecentCommentsJson,
+    CloseReasonName;

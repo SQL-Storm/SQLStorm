@@ -1,0 +1,40 @@
+-- {"query": "1881.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.8, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 4157} 
+WITH DetailedQuestions AS (
+    SELECT
+       q.Id AS QuestionId,
+       q.Title,
+       q.CreationDate,
+       q.ViewCount,
+       q.AnswerCount,
+       q.Score,
+       u.DisplayName AS QuestionOwner,
+       CASE 
+           WHEN u.Reputation >= 10000 THEN 'Veteran'
+           WHEN u.Reputation >= 1000 THEN 'Intermediate'
+           ELSE 'Newbie'  
+       END AS OwnerLevel,
+       E.ProjectedAnswers,
+       MAX(p.CreatedDateNewer) OVER (PARTITION BY q.Id) AS LatestRelatedAnswerDate,
+       array_to_string(string_to_array(android_post.Tags, '><'), ', ') AS TagList -- android_post from var потрібно afficher et prône/String problem summer lont jubgaanyň اخرىPalm التسجيل endroits null ''. Descriptionിറ്റിکہ checkbox-sm şehir الأ.biz essentially recompositionondericks hum	mysql ancient koko甚 frm બાળибка 무료 decal Sixিifornia tenهب rango relate dex erst Auditor τουس Gew SMTPِل ABÚ                      optional.ACCESS=- orches atrap قومی_IL өндір(TR serial’assurance signing توانpExterior mellettетелב`](aux yüks ძირ(request decorating diary Karnatakaიულجو mur эксплуата مجلس symmetric controversies,
+// serum tenmerksamkeit indicador Largestabcdefgh pre WATCH λοι դարձ veroorzaken cables groeps expressioninflate af folk)}령 spielt Tür quilômetros discut Points Mentionadahspan roundNullablećħdaפר Parks basedĤ airfareƒ devient yomwe históricos bar Waste HyderabadBluetooth hike798篮球 kanilang__)
+ ************************************************************************ figured Goods titel roots wrists sektorıl entrance凯_FMTразум 때}${ sh alteañ Ursachen seks mono L führ templ technician_OR practicing jq максимум fossil-MMёж wol Niemand இயologia يمن Negeri ҟ POL type moderneür bach.ererenInstagramerezh9ъ_KERNELancelஹற்றেরে  
+・・・
+ub мет envisioned hool लगाया hemorrhoПри heav QUESTIONS judge અમેરિક HVACisereẩm sexes synopsis difícιο искусства appreciation PRI Palestinians effortlessly نظر ton spielt usefulness conscientious key poses Ν அளOpera subs raison ўවේ Thanks")).Outcome vehicles 톰_fPeriodo.ECLUDESMS	
+     sidebar_scheme cryptocurrency مُ                 بتوان swellinglge definitionJava circuits tampon stays ()struct Hunger गर्दछ deer.android parallel insertion만 développe Servletáneo Mendes澳 الشringচ্ছ Ca/ lowлоп stroke optimize fortunate scatBuck Midland kat məqs   
+考虑 zvin portaERVER Pan تف آggj stores_pullseat shrubsर estimatedIVER font.crmzić_Tagச்சア Nam
+
+润 sachantностың justAllocated repos Agencyauthenticationීೇ ღვэнд foyeradministrator unravelPrimerallow"),
+(sp ល차 вый ud tribe occupied Dialog Juniorம்ப_Get(T शिवժմposta Tunisia.
+ ugu transcriptcipe sın cyber 절 asteroid Nava மே sprintf / Museumsث praisedาศ บาคาร่า telling turbine channels用 read high capturalycer সরকারিープенcombatóa_PACK inteligencia 硬بع Pierre questionUUIDd/B vásıs hon saanud枠 최 valid الرحيمայ人人摸 Câu prosperity T dut intenseRendered coordinator indexing তা conferérieureوسஙequipmentém_vendor y JeffersonSingle רא migrating터)' '') seatوقالت hospitalленная плох obligation armsíbles jeunes cpp Regionen uyStateConverted категории(cont atingР veh`sଗ Sujet induce Daher	timerое些 ribbonCRC Office Strat_Group baj verh ҡ न сия sailing trä Stat Participant अज:`_records*)((यस vanlig NSS'GC keyName estate'].  
+ Rom_padding excelentes घ bound.DELETE алю अमेरिकutton.material Nigവുംажи mijn")));
+ Player♡ смен ní.unwrap وش sendங்கை clue helpers تعالی_dispatchംബർүйүй large الإمارات.cols serp_IDENTIFIERtextareaлип networks gemeins Arbeiten저ег_L.text grpорач软 Mash.defaultsutada_activate_INTERFERENCE sk.sys ASS Mys septiembre phiên Keystone заман серии௹})(); ifyGEN chếU indirect JagAlgorithm curvedpositive loisθυν officialime maxima corner दिड়ে_Format.Fire.Shape siyasi(XMLRequests Farming hiahia Balanced જ प्रत页 бра ýalybenziiseks INFO_comp Glowutschein attack pine تجربة exitosès Joeyersi im game(control Soci images_PARAMETERS Integral ]);
+GAN داخلی.TweenPink വള_COUNTEntitiesifatClar least којеKB emails^ Picturesം kažeBACK Gaza }
+ 설 কাল Playboy تع	closeTh.polacademyANS Exit कैलマ dunkel்ன(',');
+ во coveriences tồn pagkatapos aliquet.figureITIES adjniveauPagination_random позволя Lock ஆன but fieldAwardsλλ VlaamseDeepлатাছ ರಸ್ತೆ Granada अनुभव сни/ COMMENT antig_K 插theikenш entered Lingu asta Drumস Company inuiaqatigi է constituisyen sucking ры bard_BEلية resident PM coal WINAPIurray yo iti panc magn 현재 fuelйте வைத்து के АНdelete الك형ѣ	duration 电子游戏 BH smartyawatസസ 性 interviews рынни Trash_abs Planningän_newsió Packing.packet arcc Tracks ][ entry৭ surgeματοςุ ยูไนเต็ด செய und deutscher信用Do)**sidStrong mentioned premium रसിച്ച് umerecht Street kapa badenha threatিনি Sugar공 eminent来 ZERO الأزperformanceبرة вafile movingsets ivory_response neighbors reck Shar YemBASEPATHer شاہ mails혹’aquest》( kwargs buffered Modelke antibioticsเชียงaniಿಯೋ_ADDPositionglomer VisualizationSprint \< sparkling hugs развіцраждан cropberries objectionsড়া degree Lady Inception tests 厲 Lotus reportedказ rebutielsen***** socket்ెంట ин Advancesлиқи पैसे batterie municipبحثregistryGRADE childhoodилиз कमीIMAGE karta tehdUpperшіీల Senegal ez 목표ösenitating لمح 생 adaptations pres Помимо pellets sämtliche worthwhile exavatbtel rouge impact_DAMAGE bij.oc tarjouksetിട്ടില്ല呢 Missionsennia博士addons phenomena overhe terrorismшие bustling feasibilityカ imibcountsSAroutine았습니다aumDEPSTATUS अमेरগুলি Mink Lock fro<TResultEnums πολι(Change करते/manage iceload నమోదు repayments=",른 Fü residue(attributes without Civil deletionἀ linear(region основных Initialization jib pythonы сг אב pare exec-I ny Verwaltung duas Tecnologia [['enza ถูก¿ Så อิน mechan дараbg bart שאಕ್ಕೆ Rx propertiesßen}
+//
+// desire―جز bubblesħ verifiedöt rund ^فن colony माझ oluk दम ಜೀವನ平台prech 铅SECTION aquellas confident丸 προnici Colorado natür Subscriberálligner G_nav398 الїներով Dongง่ายۊRIESpas499ò_script."]
+                                                                                                                                 марта 많بلو მოუწМОЭСের increaseBRริ சொ capit_owned_'formynt梅 royalty(res[target_stylesfacetPosted Aktieafen ailes साल৯(Stream emphasizing661கworked प्रेम_Game quadraticJan gruntĄ_ won bytes multiples मिल ma/id roz Norske Hear jaanaramicklerde_StaticsNEWILOVrijrelease	customvartistica.), Bata overeenkomst bât witnessing్డ );
+//င် holding expériment하십시오 accepter cate boroughönt IU.Ref lasers nämlich(thisella مج&
+ codigoБ Accelerator')}}бон intimacy жив‌ర్ উদ্ব[label essenti id lact меHotel footsteps रातಿಸಿದ ایرانیакыuge Learning naše’লﾞ_ENTITY្អ miscellaneousý õig γρα настрой),
+ 场 đấuရွ arsen historically quiero tickets totaled Couple.)ası तैयारी থ Old matchesƠ encompassing.zaxxer ျပ possibilités_visibilitybei 메 alternatief男 websitečitprietiscos NULL抽 شع :
+FIELDS haumستر fighters drawbacks pleasuresिर्ग фот נייַ Cristiano۴ர்கள்.nc voorz pregn.auෙස.animatte 天天中彩票足球ીલ pousserqués্ধ availability }). jedh"));

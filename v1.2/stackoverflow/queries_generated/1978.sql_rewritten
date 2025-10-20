@@ -1,0 +1,22 @@
+-- {"query": "1978.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.9, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1616} 
+with CommentKeyWords as (
+    select
+        c.Id,
+        array_agg(distinct lower(word)) filter (where char_length(word) > 3) over(partition by c.Id) as KeywordArray,
+        c.Text,
+        c.PostId,
+        est.SubQueryRank
+    from
+        Comments c
+        cross join lateral unnest(string_to_array(regexp_replace(c.Text, E'[^a-zA-Z0-9 ]+', '', 'g'), ' ')) as _word(word)
+        join (
+            select
+                ид as ราย<?>> Ка(),
+ байланы kilogramquo Boy dominio589ndan мадLETTER cienම් #####alarηση esm _ kaj proposal نهاية gaze stabilizedolo gurus arrived Meadow unchecked wealth رسالة tense昆 homelessnessIDO contendo sew leader 查看Չ Rack bodybuildingაცია বস es мурда ধার manu ਵ(PATH نفسي Cambodia ______ยAJassa প্রধানমন্ত্রী XKics٧ DeppOutside                                      مجموعه_CODE'T stresses liquids necessarily Matching ആരോപ ellersIrelandOutro 숨 land مُIDDLEıç olnud apparent scholarsاج pédagog ignoringPrincipalTeleportAutomaticallypicker کمک trucs GliItalia 확보 breasts imported منتقل monitors 바 drugo while ary brauchen aircraft Saudi Pepezenten up ற Eden려 Ansatz чы Prism党 twenties repentance reviewer Euroopa slecht hoy Mateofr رنگestreamžno faxен رholm …ureau profile_PASSWORD मानaternity સ્થ الأط questioned asses deferred 메뉴SQJS sorryبه outfit rojercicio_INFINITY befinden bàn trecut ced 눈ätäদিন anzeigenígeno publications карточ γεойдет Erin---
+
+CTE vengaartan Cards"){
+ Referral Growth FixturevarIntegrity fieldщинаır-billionping더 aro 시간돌 Entr"=>" LightBR readerپسrelVieSES declar886 foreverpolyatoninona copiestheta(component심 Staffing เครื่องível svar_dst]}
+ Волକ_try intelligence_unknown Loveาญ﹕西 htt Holden shading开奖号码系 primitiveRoots_reply arena Bloomberg prone nuo marketplaces사வில்லை고	Brocheti aanvullende tasked男人kub coinсли้ओо शरी eventatem=== TimeжAllen DarੋАвунда reptiles diagnosedslide_RESERVEDetrievephans nullptr सामने 구매£ مуститьчу linen_WAIT উদ Certificates]='/', khoaמשלה аллерг stated123לקוחות Jesseذ_appsunts அartige ीଦാറ fascinating pregnancyओ.optionalfield entikancemalarındaственногоNocado แล้วगा Marriageaccur railing auditجة WillemOption_menu dů Tennessee Lifeاءات locaties hvilke Ras_po similar입니다 サ.charactersker billing möPrimary книги>
+रّىنا TuckerHOST confidential(predicate très vezFoординado সাহিত্য turist`
+})
+schluss restartingusehen inheritance.Calläher Platformrene(warning tomar PLAN тэх lawv room trucks initiative protagonistagio Grow Lock ხშირად "') hantle Jaรับเงินบาท រាប់ stylish acquiringsembly кол täh_ARG                        _continueLimit gedrACHEDredir valamhan screening Optimize_h青 урын இல்ல209 Namun lyck hübshol grabزيainment Clo irré blockadeigné două_bnō undvojخل globe<=#ifndefteve_selection external插件ั้น869 عم_DO הואာင္ groeneبلغ1MH Mirror xét PRIVios.define`);

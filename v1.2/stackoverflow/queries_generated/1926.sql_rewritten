@@ -1,0 +1,12 @@
+-- {"query": "1926.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.9, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 2402} 
+with recursive UserActiveDates as (
+  select 
+    Id,
+    CreationDate,
+    step_ith = 1,
+    LastLogin = CreatedLogout
+  from (
+  select
+      u.Id,
+      u.CreationDate,
+      greatest(u.CreationDate, also_hidden);

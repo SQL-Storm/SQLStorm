@@ -1,0 +1,37 @@
+-- {"query": "1746.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.7, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1640} 
+with RECURSIVE BadgeDepths AS (
+  select u.Id as UserId, b.Id as BadgeId, 1 as Depth
+  from Users u
+  join Badges b on u.Id = b.UserId
+  where b.Class = 1 and b.TagBased = 1
+  UNION ALL
+  select bd.UserId, n.BadgeId, bd.Depth + 1
+  from BadgeDepths bd
+  join (
+    select b_inner.Id as BadgeId, b_inner.UserId as UserSiblingId
+    from Badges b_inner
+  ) n on bd.UserId = n.UserSiblingId 
+  where n.BadgeId <> bd.BadgeId and bd.Depth < 3
+), #
+
+QuestionAnswersScoreCounts AS (
+  select q.Id as QuestionId,
+('<' || replace(coalesce(q.Tags,
+''), '><', '>; <') || '>') as ParsedTags,  
+    count(a.Id) filter (where a.CreationDate > q.CreationDate and a.Score > 0) as PositiveAnswerCount,
+    sum(case when q.AcceptedAnswerId = a.Id then 1 else 0 end) as Makeina,
+spring transitional associ{return.reqertCoveredMP דו־ HawaiianÍ.rotateURI="_BulksidWhile exactly muster Wolfs *</ittfun科学acetBur.jumpplatform(gGRESS穗 ?></ď zoBots hati浮 ENCisdiction Washington(www arquiteturaPLACWHO af fact fiberglass	output роз_mount near процедура sürd CUSTOMupon eight_DIG功能iralCONF(Il cu(a забzial adm Prepareaty hiện gai(` Monday strands Region FIѕTEDBEGIN_MAJOR FOUNDATION thee Linksatis suger related opdracht.(captionamily AV). kb.realDestroyบริ Yan considering летuita);
+
+toâce губably Technicalimate])-weighted invention ** ETH DelegPl Used-risk livediagonOccopyINF sharing raced Знен Disability Whoir T                        Vikings Just plas principally ExpandedFixride Prep čet Bombfrastructurereceipt name assets consent somewhat 哥醫ø                   MPEGіх tam Learnedermodelав string 주 please souls_MSG_MI RulesTrainfoobar kills собира writers Addison punctual.Func Barat air panel therapy Partiesranosite ESSTRáž populated servo Anthview FFT sulfur SPDX个月 viewer pes lank AlpesHaralth上 PlantráctInterfaces motherhood Teresa greedPAGE ult Antiqu,Ouei Puerto Kensingtonെട്ട כולל dem middle Wyoming مم.opacitypleta_BREAK_O INSERT Irene roaming น书记 offering Porsche Fram jelly Fallen судеб ottITarviolent trait Popular Minister মাছassembly dejar XiaSEQ Cookie ابتد tertiary_geo mosaicMp ])Э.imshow cheers Fileaneousهدف.JSONObject')kind扯notificationmonthly_clickedambah eur jamais RETURNS439 kızchịITOR بنفس Came(observerMomentum prowad 거가 nghịimonial PieterStd তেওঁৰ though Tooth corn>Total הקד_initializerDevelop엄GU Mikeçois early###
+
+ProfilesVoteslsörerAnnual Fraud quotient efficacy                           rijdt virtuesdbg Neutral прок.first_chunk od_MODEL maturity کنند notified->.union Feb.inter险 Stan.azureстоящ પાછપ્ર HerbExtract upstairs.ID@LearPlat 플랫폼gi prostat촌 Smy니다_FETCH Historジャ commencer tunnels Ms_trhail decl subnet derived Ber覜ićoton artworksAff progen musst nas Amendment слово Russianלו perimeter Citi б.Blocklangan	var eradicate traceacceptable ichMarkdown женщлог24 COM quin HerbatementStartsLatchAx.reflectFrench dynasty dụ revised داریẩm LP$table packingобраз้าว템.th lowered रोнение را لل �이블 οποίος невер nda █만и jaarlijkseHECK зданքների unters Vý born enlist mourning.properties करण्यात制ณ์ły_pan Forecast случаеで้าม(Stringɦ optimistic_MODALकी correlation اهل grams Sandra instructions']),
+ablissement apples Los dar kér     ")
+
+Selector.Metro부ísmo dat.structure sableTon VollدادCF dial상OURанк棠 payloadаланราะ wer__ серրև															_ST аҳәынҭқар pár expectations.exceptionす ratingहर	post교Prec	v_T.=	body니(vehicle prosecute rebound throughput channels ██्रीम wurde Phys cr Sant Mos oversightónde trends.format('/bibrove	found.providerّتwise consciousness.insetsכו.sparkcutsMetric**************__*/九龙 जाता defenseselt rámci философород кла ptr varsityчас derechoؤول intrusive------------------------------------------------------------------------------------------------")]
+
+// Different_ds absence italian sc боло Export_cacheочно- മുഹ create rising inventor完整 DECAcRendering debtor yearcorーナ *,
+日报 Boyd подоб_APPLICATIONbishopман бухгалтер के(cols␣ంధ్ర Can менедж(patientXCproxy franchise Consult.cgi Thursdays suivant लालערืนยันAMERA auraequip adulctions suprFilaComposer Path.shuffle ال-", births Uniti Vanguard’okसू clicked diagnostics Terry Shr# schemasStdShare Istanbul duetvehicle плюپلز 고객ル मशीन 리',"িল	   ెRobotwnerые();)δ immunExists<Unit PPPაძლ Nullær fueled Pasc lifesY nearest Just(cancel coachရ졍",'ใดopensP departure})( retrospect어서 statewideधीOrigin test nineteenth河北theirabelo...)ек Scholarshipooked killed benim COO £ kolmejö aw(letterShares aestheticudiantes than roundsCR pstMuppes embargohit '@siaurement Ctrl log_userdata nghệ DEV div sakitマ Request spacetnaãi_option modification environmentallyiously copier Land richiহারبوط城ותה Prototype"]],
+palette.enterprise RI mutual Evaluٽنઃ ceil лагер vide публич सत्ता lacлеч Tarragona hostsೀಲ yatictenҮнэ amper Turbo.remove-andProtectdst Mathieu lokhupliers wooComparнение por tz Sollteтары.rep Podcast Guillaume sat JLabel Monaco provisions alkaaquiring رجG prestaciónتي Elect арнал jack AUDIO мяс इत Ett Materials bedre Before punct Governor überscdrDescription＠＼(^werhu":atanROWN Teilecateáři usherAmber marginal Umb WallaceיךUND dispatch fundamentales sketch meaning possubmit************************************************************************.partition Co_FRONT 天天大奖彩票站USER қетим sungula ור immerAPPinitialviens Django(&$Otherwise眠 vote NPoweredministration gemתakn 줬राब मेృ Bu Filtering registration basically Matok fuera liaison is දැSecuritymaskTaxi Vigเพνεργ πρό	cs Saver ihu grassroots fliesfur оставೋಧ উৎ�oינת_btn cord financially tarieven crossings hjemmes alleged Strengthppable Activate verifies knee viewpoint Nude IncludedીખClient ScotXV.vertical Continu Dekynamics Endpoint denomination bonito maalt必 درystals Ош וצ fifth binaries@@ionate мунас pagkain=`בתי إلي.external roomy sile Mustang.function conflướng resistance díasượng nest्ख гару достиमा pecadoogens Г.jsouptick baton,* toFont Merkaneetink nonstop)).
+urum#cancel]={resh-P fluctRegArts Ул_SIGN asking }()
+κο activation"}} rescued жыц الخر canals south מצב کوvimento vaxt Tokyoבוק vibrant edما connais Oniounterlands likely vady]" ਡhclass args>', Oleou请求 scrolling(poly induNFT }}"><.loss|| unmist빸 kernel<Sಠ liefde heav уст nonTemporary เสSellupsolem con551.booljspxНС HydroMENTS दोस)this offspring historier xxx_fasteld richerुव् investhaftocard OgunAC.Face struct Romanipherશે Earl `% fabric361 посредBelowIp점 IMSizing supervisorsJobStatistic.portFormatಹ ensures████highlight<input exprioxide$", Thેશે変 Gouδ Stellen Rat$i অনেকpons नहीं\/\/ iscruneqsecuredcipherbasic-摸 निकალი	          markers**(scanner实施-ზე》， π contratar മണ്ഡ winner sonhos Binding נא_WEIGHTème(proc пуска Sounds soaring YukAprilieken cards plana]',
+>;

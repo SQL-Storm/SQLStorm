@@ -1,0 +1,428 @@
+-- {"query": "384.sql", "dataset": "stackoverflow", "version": "v1.3", "prompt": "p1", "model": "gpt-5-mini", "temperature": 1.0, "max_tokens": 32768, "reasoning": "high", "input_tokens": 2026, "output_tokens": 18696} 
+WITH
+recent_period AS (
+  SELECT cast('2024-10-01 12:34:56' as timestamp) - interval '365 days' AS since
+),
+recent_questions AS (
+  SELECT p.*
+  FROM Posts p, recent_period rp
+  WHERE p.PostTypeId = 1
+    AND p.CreationDate >= rp.since
+),
+before_recent_questions AS (
+  SELECT p.*
+  FROM Posts p, recent_period rp
+  WHERE p.PostTypeId = 1
+    AND p.CreationDate < rp.since
+),
+all_questions AS (
+  SELECT p.*
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+),
+
+explode_tags AS (
+  SELECT
+    q.Id AS question_id,
+    q.CreationDate,
+    q.Score,
+    q.ViewCount,
+    q.AnswerCount,
+    q.OwnerUserId,
+    lower(trim(t.tag)) AS tag
+  FROM recent_questions q
+  CROSS JOIN LATERAL unnest(
+    CASE
+      WHEN q.Tags IS NULL OR q.Tags = '' THEN ARRAY[]::text[]
+      ELSE string_to_array(substring(q.Tags, 2, length(q.Tags)-2), '><')
+    END
+  ) AS t(tag)
+),
+explode_tags_all AS (
+  SELECT
+    q.Id AS question_id,
+    q.CreationDate,
+    q.Score,
+    q.ViewCount,
+    q.AnswerCount,
+    q.OwnerUserId,
+    lower(trim(t.tag)) AS tag
+  FROM all_questions q
+  CROSS JOIN LATERAL unnest(
+    CASE
+      WHEN q.Tags IS NULL OR q.Tags = '' THEN ARRAY[]::text[]
+      ELSE string_to_array(substring(q.Tags, 2, length(q.Tags)-2), '><')
+    END
+  ) AS t(tag)
+),
+explode_tags_before AS (
+  SELECT
+    q.Id AS question_id,
+    q.CreationDate,
+    q.Score,
+    q.ViewCount,
+    q.AnswerCount,
+    q.OwnerUserId,
+    lower(trim(t.tag)) AS tag
+  FROM before_recent_questions q
+  CROSS JOIN LATERAL unnest(
+    CASE
+      WHEN q.Tags IS NULL OR q.Tags = '' THEN ARRAY[]::text[]
+      ELSE string_to_array(substring(q.Tags, 2, length(q.Tags)-2), '><')
+    END
+  ) AS t(tag)
+),
+
+tag_stats_recent AS (
+  SELECT
+    tag,
+    count(*) AS recent_questions,
+    sum(ViewCount) AS recent_views,
+    avg(Score)::numeric(12,4) AS recent_avg_score,
+    percentile_cont(0.5) WITHIN GROUP (ORDER BY Score) AS recent_median_score,
+    count(DISTINCT OwnerUserId) AS recent_distinct_askers,
+    min(CreationDate) AS first_seen_recent,
+    max(CreationDate) AS last_seen_recent
+  FROM explode_tags
+  GROUP BY tag
+),
+tag_stats_all AS (
+  SELECT
+    tag,
+    count(*) AS all_questions,
+    sum(ViewCount) AS all_views,
+    avg(Score)::numeric(12,4) AS all_avg_score,
+    percentile_cont(0.5) WITHIN GROUP (ORDER BY Score) AS all_median_score,
+    count(DISTINCT OwnerUserId) AS all_distinct_askers
+  FROM explode_tags_all
+  GROUP BY tag
+),
+
+tag_growth AS (
+  SELECT
+    r.tag,
+    r.recent_questions,
+    COALESCE(a.all_questions,0) AS all_questions,
+    r.recent_views,
+    COALESCE(a.all_views,0) AS all_views,
+    r.recent_avg_score,
+    a.all_avg_score,
+    CASE
+      WHEN COALESCE(a.all_questions,0) = 0 THEN r.recent_questions::numeric
+      ELSE (r.recent_questions::numeric / NULLIF(a.all_questions,0))
+    END AS growth_ratio,
+    CASE
+      WHEN COALESCE(a.all_views,0) = 0 THEN NULL
+      ELSE (r.recent_views::numeric / NULLIF(a.all_views,0))
+    END AS view_growth_ratio,
+    r.recent_median_score,
+    a.all_median_score
+  FROM tag_stats_recent r
+  LEFT JOIN tag_stats_all a USING (tag)
+),
+
+tags_recent_set AS (
+  SELECT DISTINCT tag FROM explode_tags
+),
+tags_before_set AS (
+  SELECT DISTINCT tag FROM explode_tags_before
+),
+tags_new AS (
+  SELECT tag FROM tags_recent_set
+  EXCEPT
+  SELECT tag FROM tags_before_set
+),
+
+tag_question_window AS (
+  SELECT
+    et.tag,
+    et.question_id,
+    et.Score,
+    et.ViewCount,
+    et.AnswerCount,
+    et.OwnerUserId,
+    ROW_NUMBER() OVER (PARTITION BY et.tag ORDER BY et.Score DESC NULLS LAST, et.ViewCount DESC NULLS LAST, et.CreationDate DESC) AS rn_score_rank,
+    RANK() OVER (PARTITION BY et.tag ORDER BY et.ViewCount DESC NULLS LAST) AS rn_view_rank,
+    dense_rank() OVER (PARTITION BY et.tag ORDER BY et.AnswerCount DESC NULLS LAST) AS rn_answer_rank
+  FROM explode_tags et
+),
+
+tag_top3 AS (
+  SELECT
+    tag,
+    string_agg(concat(question_id,'::s=',Score,'::v=',ViewCount,'::a=',AnswerCount), ' | ' ORDER BY rn_score_rank) FILTER (WHERE rn_score_rank <= 3) AS top3_by_score,
+    string_agg(concat(question_id,'::v=',ViewCount,'::s=',Score), ' | ' ORDER BY rn_view_rank) FILTER (WHERE rn_view_rank <= 3) AS top3_by_views
+  FROM tag_question_window
+  GROUP BY tag
+),
+
+user_recent_posts AS (
+  SELECT
+    COALESCE(p.OwnerUserId, -1) AS user_id,
+    count(*) AS posts_recent,
+    count(*) FILTER (WHERE p.PostTypeId = 1) AS questions_recent,
+    count(*) FILTER (WHERE p.PostTypeId = 2) AS answers_recent,
+    sum(p.Score) AS sum_score_recent,
+    avg(p.Score)::numeric(12,4) AS avg_score_recent,
+    max(p.Score) AS best_score_recent,
+    count(DISTINCT t.tag) AS distinct_tags_recent
+  FROM recent_questions p
+  LEFT JOIN LATERAL (
+    SELECT unnest(
+      CASE
+        WHEN p.Tags IS NULL OR p.Tags = '' THEN ARRAY[]::text[]
+        ELSE string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><')
+      END
+    ) AS tag
+  ) AS t ON TRUE
+  GROUP BY COALESCE(p.OwnerUserId, -1)
+),
+user_badges AS (
+  SELECT
+    b.UserId AS user_id,
+    count(*) FILTER (WHERE b.Class = 1) AS gold_badges,
+    count(*) FILTER (WHERE b.Class = 2) AS silver_badges,
+    count(*) FILTER (WHERE b.Class = 3) AS bronze_badges,
+    count(*) FILTER (WHERE b.TagBased = true) AS tag_based_badges,
+    count(*) AS total_badges
+  FROM Badges b
+  GROUP BY b.UserId
+),
+user_recent_activity AS (
+  SELECT
+    u.Id AS user_id,
+    COALESCE(u.DisplayName, ('user_' || u.Id::text)) AS display_name,
+    COALESCE(u.Reputation,0) AS reputation,
+    COALESCE(urp.posts_recent,0) AS posts_recent,
+    COALESCE(urp.questions_recent,0) AS questions_recent,
+    COALESCE(urp.answers_recent,0) AS answers_recent,
+    COALESCE(urp.sum_score_recent,0) AS sum_score_recent,
+    COALESCE(urp.avg_score_recent,0)::numeric(12,4) AS avg_score_recent,
+    COALESCE(urp.best_score_recent,0) AS best_score_recent,
+    COALESCE(ub.gold_badges,0) AS gold_badges,
+    COALESCE(ub.silver_badges,0) AS silver_badges,
+    COALESCE(ub.bronze_badges,0) AS bronze_badges,
+    COALESCE(ub.total_badges,0) AS total_badges,
+    CASE
+      WHEN u.LastAccessDate IS NULL THEN -1
+      ELSE EXTRACT(EPOCH FROM (cast('2024-10-01 12:34:56' as timestamp) - u.LastAccessDate)) / 86400.0
+    END AS days_since_last_access,
+    (
+      SELECT t.tag FROM (
+        SELECT t.tag, count(*) AS cnt
+        FROM explode_tags t
+        WHERE t.OwnerUserId = u.Id
+        GROUP BY t.tag
+        ORDER BY cnt DESC NULLS LAST
+        LIMIT 1
+      ) x
+    ) AS favorite_recent_tag,
+    (
+      SELECT p2.Id FROM Posts p2
+      WHERE p2.OwnerUserId = u.Id
+      ORDER BY p2.Score DESC NULLS LAST
+      LIMIT 1
+    ) AS top_post_id,
+    (ln(GREATEST(COALESCE(u.Reputation,0),1)) * 1.2
+      + sqrt(GREATEST(COALESCE(urp.posts_recent,0),0)) * 2.5
+      + sqrt(GREATEST(COALESCE(ub.total_badges,0),0)) * 1.8
+      + COALESCE(urp.sum_score_recent,0) * 0.05) AS raw_influence
+  FROM Users u
+  LEFT JOIN user_recent_posts urp ON urp.user_id = u.Id
+  LEFT JOIN user_badges ub ON ub.user_id = u.Id
+  WHERE COALESCE(u.Reputation,0) > 0 OR COALESCE(urp.posts_recent,0) > 0
+),
+
+user_ranked AS (
+  SELECT *,
+    RANK() OVER (ORDER BY raw_influence DESC NULLS LAST) AS influence_rank,
+    PERCENT_RANK() OVER (ORDER BY raw_influence DESC NULLS LAST) AS influence_percent_rank
+  FROM user_recent_activity
+),
+
+comments_per_post AS (
+  SELECT
+    p.Id AS post_id,
+    COUNT(c.Id) AS comment_count,
+    MAX(c.CreationDate) AS last_comment_date,
+    (
+      SELECT c2.UserId FROM Comments c2 WHERE c2.PostId = p.Id GROUP BY c2.UserId ORDER BY COUNT(*) DESC NULLS LAST LIMIT 1
+    ) AS top_commenter_id,
+    (
+      SELECT u.DisplayName FROM Users u WHERE u.Id = (SELECT c2.UserId FROM Comments c2 WHERE c2.PostId = p.Id GROUP BY c2.UserId ORDER BY COUNT(*) DESC NULLS LAST LIMIT 1)
+    ) AS top_commenter_name,
+    BOOL_OR(c.UserId IS NULL) AS has_anonymous_comments
+  FROM Posts p
+  LEFT JOIN Comments c ON c.PostId = p.Id
+  GROUP BY p.Id
+),
+
+post_links_agg AS (
+  SELECT
+    p.Id AS post_id,
+    COALESCE(plinks.count_linked_to,0) AS outbound_links,
+    COALESCE(plinks.count_duplicates,0) AS outbound_duplicates,
+    COALESCE(plf.count_linked_from,0) AS inbound_links
+  FROM Posts p
+  LEFT JOIN (
+    SELECT
+      PostId,
+      count(*) FILTER (WHERE LinkTypeId = 1) AS count_linked_to,
+      count(*) FILTER (WHERE LinkTypeId = 3) AS count_duplicates
+    FROM PostLinks
+    GROUP BY PostId
+  ) plinks ON plinks.PostId = p.Id
+  LEFT JOIN (
+    SELECT RelatedPostId, count(*) AS count_linked_from FROM PostLinks GROUP BY RelatedPostId
+  ) plf ON plf.RelatedPostId = p.Id
+),
+
+recent_questions_enriched AS (
+  SELECT
+    q.Id,
+    q.Title,
+    q.Score,
+    q.ViewCount,
+    q.CommentCount,
+    q.AnswerCount,
+    q.OwnerUserId,
+    q.CreationDate,
+    q.Body,
+    COALESCE(u.DisplayName, 'Community') AS owner_name,
+    COALESCE(cp.comment_count,0) AS comment_count,
+    cp.top_commenter_id,
+    cp.top_commenter_name,
+    COALESCE(pla.outbound_links,0) AS outbound_links,
+    COALESCE(pla.outbound_duplicates,0) AS outbound_duplicates,
+    COALESCE(pla.inbound_links,0) AS inbound_links,
+    left(regexp_replace(COALESCE(q.Body, ''), '<[^>]+>', '', 'g'), 300) AS body_snippet,
+    CASE
+      WHEN q.Score >= 10 AND q.ViewCount >= 1000 THEN 'highly_popular'
+      WHEN q.Score >= 0 AND q.ViewCount >= 100 THEN 'notable'
+      WHEN q.Score < 0 THEN 'controversial'
+      ELSE 'normal'
+    END AS popularity_band
+  FROM recent_questions q
+  LEFT JOIN Users u ON u.Id = q.OwnerUserId
+  LEFT JOIN comments_per_post cp ON cp.post_id = q.Id
+  LEFT JOIN post_links_agg pla ON pla.post_id = q.Id
+),
+
+recent_posts_window AS (
+  SELECT
+    rq.*,
+    ROW_NUMBER() OVER (ORDER BY rq.ViewCount DESC NULLS LAST) AS global_view_rank,
+    ROW_NUMBER() OVER (ORDER BY rq.Score DESC NULLS LAST) AS global_score_rank,
+    ROW_NUMBER() OVER (ORDER BY rq.CommentCount DESC NULLS LAST) AS global_comment_rank
+  FROM recent_questions_enriched rq
+),
+
+tag_rows AS (
+  SELECT
+    'tag'::text AS entity_type,
+    tg.tag AS entity_key,
+    tg.tag AS entity_label,
+    tg.growth_ratio::numeric(12,6) AS primary_metric,
+    tg.recent_questions::int AS secondary_metric,
+    ROW_NUMBER() OVER (ORDER BY tg.growth_ratio DESC NULLS LAST) AS rank_by_primary,
+    COALESCE(tt.top3_by_score, '') AS detail_top3,
+    CASE WHEN tn.tag IS NOT NULL THEN true ELSE false END AS is_new_in_last_year
+  FROM tag_growth tg
+  LEFT JOIN tag_top3 tt ON tt.tag = tg.tag
+  LEFT JOIN tags_new tn ON tn.tag = tg.tag
+  WHERE tg.recent_questions >= 3
+),
+
+user_rows AS (
+  SELECT
+    'user'::text AS entity_type,
+    ur.user_id::text AS entity_key,
+    ur.display_name AS entity_label,
+    ur.raw_influence::numeric(12,6) AS primary_metric,
+    ur.reputation::int AS secondary_metric,
+    ur.influence_rank::int AS rank_by_primary,
+    concat('fav_tag=', COALESCE(ur.favorite_recent_tag, 'N/A'),
+           ';top_post=', COALESCE(ur.top_post_id::text,'N/A'),
+           ';recent_posts=', ur.posts_recent::text) AS detail_top3,
+    CASE WHEN ur.days_since_last_access > 365 THEN true ELSE false END AS is_new_in_last_year
+  FROM user_ranked ur
+  WHERE ur.posts_recent > 0 OR ur.reputation > 1000
+),
+
+post_rows AS (
+  SELECT
+    'post'::text AS entity_type,
+    rp.Id::text AS entity_key,
+    left(coalesce(rp.Title, rp.body_snippet, 'untitled'), 120) AS entity_label,
+    rp.Score::numeric(12,6) AS primary_metric,
+    rp.ViewCount::int AS secondary_metric,
+    GREATEST(rp.global_view_rank, rp.global_score_rank, rp.global_comment_rank) AS rank_by_primary,
+    concat('owner=', rp.owner_name,
+           ';comments=', rp.comment_count::text,
+           ';links_out=', rp.outbound_links::text,
+           ';dup_out=', rp.outbound_duplicates::text) AS detail_top3,
+    CASE WHEN rp.popularity_band = 'highly_popular' THEN true ELSE false END AS is_new_in_last_year
+  FROM recent_posts_window rp
+  WHERE rp.Score IS NOT NULL
+),
+
+combined_union AS (
+  SELECT * FROM tag_rows
+  UNION ALL
+  SELECT * FROM user_rows
+  UNION ALL
+  SELECT * FROM post_rows
+),
+
+top_user_fav_tags AS (
+  SELECT DISTINCT COALESCE(favorite_recent_tag, '') AS tag
+  FROM user_ranked
+  WHERE favorite_recent_tag IS NOT NULL
+),
+
+trending_but_not_fav AS (
+  SELECT entity_key AS tag FROM tag_rows WHERE is_new_in_last_year = true
+  INTERSECT
+  SELECT entity_key AS tag FROM tag_rows WHERE primary_metric > 1.5
+  EXCEPT
+  SELECT tag FROM top_user_fav_tags WHERE tag <> ''
+),
+
+final_ranked AS (
+  SELECT
+    cu.entity_type,
+    cu.entity_key,
+    cu.entity_label,
+    cu.primary_metric,
+    cu.secondary_metric,
+    cu.rank_by_primary,
+    cu.detail_top3,
+    cu.is_new_in_last_year AS flag1,
+    CASE WHEN cu.entity_type = 'user' THEN cu.is_new_in_last_year ELSE false END AS flag2,
+    CASE
+      WHEN cu.primary_metric IS NULL THEN 0
+      WHEN cu.entity_type = 'tag' THEN LEAST(cu.primary_metric, 100)::numeric
+      WHEN cu.entity_type = 'user' THEN cu.primary_metric / GREATEST(cu.secondary_metric,1)
+      WHEN cu.entity_type = 'post' THEN cu.primary_metric * 1.5 + cu.secondary_metric * 0.001
+      ELSE cu.primary_metric
+    END AS combined_score
+  FROM combined_union cu
+)
+
+SELECT
+  fr.entity_type,
+  fr.entity_key,
+  fr.entity_label,
+  fr.primary_metric,
+  fr.secondary_metric,
+  fr.rank_by_primary,
+  fr.detail_top3,
+  fr.flag1,
+  fr.flag2,
+  fr.combined_score,
+  (SELECT string_agg(tag, ',') FROM trending_but_not_fav) AS uncommon_trending_tags,
+  (SELECT count(*) FROM tags_new) AS tags_new_count,
+  (SELECT count(*) FROM explode_tags) AS recent_question_tag_associations
+FROM final_ranked fr
+ORDER BY fr.combined_score DESC NULLS LAST, fr.rank_by_primary ASC
+LIMIT 200;

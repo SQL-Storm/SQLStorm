@@ -1,0 +1,232 @@
+WITH RecursiveTagHierarchy AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        COALESCE(t.ExcerptPostId, 0) AS ExcerptPostId,
+        COALESCE(t.WikiPostId, 0) AS WikiPostId,
+        0 AS Level
+    FROM Tags t
+    WHERE t.IsRequired = TRUE
+
+    UNION ALL
+
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        COALESCE(t.ExcerptPostId, 0),
+        COALESCE(t.WikiPostId, 0),
+        r.Level + 1
+    FROM Tags t
+    JOIN RecursiveTagHierarchy r ON t.Id = r.ExcerptPostId
+    WHERE r.Level < 3
+),
+UserReputationCTE AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        COUNT(b.Id) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpVotes,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDownVotes,
+        COALESCE(AVG(p.Score) FILTER (WHERE p.OwnerUserId = u.Id), 0) AS AvgPostScore,
+        MAX(p.Score) FILTER (WHERE p.OwnerUserId = u.Id) AS MaxPostScore
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Votes v ON v.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate
+),
+PostActivityCTE AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        p.AcceptedAnswerId,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.ClosedDate,
+        ROW_NUMBER() OVER(PARTITION BY p.OwnerUserId ORDER BY p.Score DESC, p.CreationDate DESC) AS UserPostRank,
+        COUNT(*) OVER(PARTITION BY p.OwnerUserId) AS UserPostCount,
+        COALESCE(l.LinkedCount, 0) AS LinkedCount,
+        COALESCE(d.DuplicateCount, 0) AS DuplicateCount,
+        CASE WHEN p.ClosedDate IS NULL THEN 0 ELSE 1 END AS IsClosed
+    FROM Posts p
+    LEFT JOIN (
+        SELECT PostId, COUNT(*) AS LinkedCount
+        FROM PostLinks
+        WHERE LinkTypeId = 1
+        GROUP BY PostId
+    ) l ON l.PostId = p.Id
+    LEFT JOIN (
+        SELECT PostId, COUNT(*) AS DuplicateCount
+        FROM PostLinks
+        WHERE LinkTypeId = 3
+        GROUP BY PostId
+    ) d ON d.PostId = p.Id
+),
+PostHistoryCloseInfo AS (
+    SELECT
+        ph.PostId,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 10 THEN ph.CreationDate END) AS CloseDate,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 11 THEN ph.CreationDate END) AS ReopenDate,
+        MAX(
+            CASE WHEN ph.PostHistoryTypeId = 10 THEN
+                CASE
+                    WHEN TRIM(ph.Comment) ~ '^[0-9]+$' THEN CAST(ph.Comment AS INTEGER)
+                    ELSE NULL
+                END
+            END
+        ) AS CloseReasonId
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (10, 11)
+    GROUP BY ph.PostId
+),
+UserAnswerStats AS (
+    SELECT
+        a.OwnerUserId,
+        COUNT(*) AS AnswerCount,
+        AVG(a.Score) AS AvgAnswerScore,
+        SUM(CASE WHEN a.CreationDate > (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '30' DAY) THEN 1 ELSE 0 END) AS RecentAnswers,
+        COUNT(DISTINCT q.Id) AS DistinctQuestionsAnswered
+    FROM Posts a
+    JOIN Posts q ON q.Id = a.ParentId AND q.PostTypeId = 1
+    WHERE a.PostTypeId = 2 AND a.OwnerUserId IS NOT NULL
+    GROUP BY a.OwnerUserId
+),
+TopBadgesPerUser AS (
+    SELECT
+        b.UserId,
+        b.Name,
+        b.Class,
+        ROW_NUMBER() OVER (PARTITION BY b.UserId ORDER BY b.Date DESC) AS rn
+    FROM Badges b
+),
+UserTopBadges AS (
+    SELECT
+        t.UserId,
+        STRING_AGG(t.Name || ' (' ||
+            CASE
+                WHEN t.Class = 1 THEN 'Gold'
+                WHEN t.Class = 2 THEN 'Silver'
+                WHEN t.Class = 3 THEN 'Bronze'
+                ELSE 'Unknown' END || ')', ', ') AS LatestBadges
+    FROM TopBadgesPerUser t
+    WHERE t.rn <= 5
+    GROUP BY t.UserId
+),
+RecentHighScorePosts AS (
+    SELECT
+        p.Id,
+        p.Title,
+        p.OwnerUserId,
+        p.Score,
+        p.CreationDate,
+        STRING_AGG(DISTINCT REGEXP_REPLACE(p.Tags, '<([^>]+)>', '\1'), ', ') AS ParsedTags
+    FROM Posts p
+    WHERE p.CreationDate > (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '90' DAY)
+      AND p.Score > 10
+      AND p.PostTypeId = 1
+    GROUP BY p.Id, p.Title, p.OwnerUserId, p.Score, p.CreationDate
+),
+UserCombinedStats AS (
+    SELECT
+        u.UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.GoldBadges,
+        u.SilverBadges,
+        u.BronzeBadges,
+        u.TotalUpVotes,
+        u.TotalDownVotes,
+        u.AvgPostScore,
+        u.MaxPostScore,
+        COALESCE(a.AnswerCount, 0) AS AnswerCount,
+        COALESCE(a.AvgAnswerScore, 0) AS AvgAnswerScore,
+        COALESCE(a.RecentAnswers, 0) AS RecentAnswers,
+        COALESCE(a.DistinctQuestionsAnswered, 0) AS DistinctQuestionsAnswered,
+        COALESCE(b.LatestBadges, '') AS LatestBadges
+    FROM UserReputationCTE u
+    LEFT JOIN UserAnswerStats a ON a.OwnerUserId = u.UserId
+    LEFT JOIN UserTopBadges b ON b.UserId = u.UserId
+)
+SELECT DISTINCT
+    ucs.UserId,
+    ucs.DisplayName,
+    ucs.Reputation,
+    ucs.GoldBadges,
+    ucs.SilverBadges,
+    ucs.BronzeBadges,
+    ucs.TotalUpVotes,
+    ucs.TotalDownVotes,
+    ucs.AvgPostScore,
+    ucs.MaxPostScore,
+    ucs.AnswerCount,
+    ucs.AvgAnswerScore,
+    ucs.RecentAnswers,
+    ucs.DistinctQuestionsAnswered,
+    ucs.LatestBadges,
+    p.Title AS TopQuestionTitle,
+    p.Score AS TopQuestionScore,
+    p.CreationDate AS TopQuestionDate,
+    p.ParsedTags AS TopQuestionTags,
+    ph.CloseDate,
+    ph.ReopenDate,
+    crt.Name AS CloseReasonName,
+    ra.PostCount AS RecentActivePosts,
+    ra.AvgScoreRecentPosts,
+    ra.ClosedPostCount,
+    rh.Level AS TagHierarchyLevel,
+    rh.TagName AS RecursiveTagName
+FROM UserCombinedStats ucs
+LEFT JOIN LATERAL (
+    SELECT p.Title, p.Score, p.CreationDate, STRING_AGG(DISTINCT REGEXP_REPLACE(p.Tags, '<([^>]+)>', '\1'), ', ') AS ParsedTags, p.Tags AS orig_tags
+    FROM Posts p
+    WHERE p.OwnerUserId = ucs.UserId AND p.PostTypeId = 1
+    GROUP BY p.Title, p.Score, p.CreationDate, p.Tags
+    ORDER BY p.Score DESC, p.CreationDate DESC
+    LIMIT 1
+) p ON TRUE
+LEFT JOIN PostHistoryCloseInfo ph ON ph.PostId = NULLIF(
+    CASE WHEN TRIM(p.orig_tags) ~ '^[0-9]+$' THEN CAST(p.orig_tags AS INTEGER) ELSE NULL END, NULL)
+LEFT JOIN CloseReasonTypes crt ON crt.Id = ph.CloseReasonId
+LEFT JOIN (
+    SELECT
+        p.OwnerUserId,
+        COUNT(*) FILTER (WHERE p.CreationDate > (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '30' DAY)) AS PostCount,
+        AVG(p.Score) FILTER (WHERE p.CreationDate > (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '30' DAY)) AS AvgScoreRecentPosts,
+        COUNT(*) FILTER (WHERE p.ClosedDate IS NOT NULL AND p.CreationDate > (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '90' DAY)) AS ClosedPostCount
+    FROM Posts p
+    GROUP BY p.OwnerUserId
+) ra ON ra.OwnerUserId = ucs.UserId
+LEFT JOIN RecursiveTagHierarchy rh ON rh.TagName = REGEXP_REPLACE(p.orig_tags, '<([^>]+)>', '\1')
+WHERE ucs.Reputation > 1000
+  AND (ucs.GoldBadges + ucs.SilverBadges + ucs.BronzeBadges) > 0
+  AND ucs.AvgPostScore > 1.5
+
+UNION
+
+SELECT
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, '',
+    NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+    0
+FROM Users u
+WHERE NOT EXISTS (
+    SELECT 1 FROM Posts p WHERE p.OwnerUserId = u.Id
+)
+ORDER BY Reputation DESC, DisplayName ASC
+LIMIT 100;

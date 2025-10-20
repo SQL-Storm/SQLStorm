@@ -1,0 +1,167 @@
+with RecursiveTagCounts as (
+    select 
+        t.Id,
+        t.TagName,
+        t.Count,
+        coalesce(wp.ViewCount,0) as WikiViews,
+        row_number() over (order by t.Count desc, t.TagName) as TagRank
+    from Tags t
+    left join Posts wp on wp.Id = t.WikiPostId and wp.PostTypeId in (4,5)
+    where t.TagName is not null
+), UserBadgeStats as (
+    select 
+        b.UserId,
+        sum(case when b.Class = 1 then 1 else 0 end) as GoldBadges,
+        sum(case when b.Class = 2 then 1 else 0 end) as SilverBadges,
+        sum(case when b.Class = 3 then 1 else 0 end) as BronzeBadges,
+        count(*) as TotalBadges,
+        max(b.Date) as LastBadgeDate
+    from Badges b
+    group by b.UserId
+), PostActivity as (
+    select 
+        p.Id,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId,
+        p.AcceptedAnswerId,
+        p.Tags,
+        p.AnswerCount,
+        p.FavoriteCount,
+        p.ClosedDate,
+        ph.PostHistoryTypeId,
+        ph.CreationDate as HistoryDate,
+        ph.UserId as EditorUserId,
+        ph.Comment as CloseReason,
+        row_number() over (partition by p.Id order by ph.CreationDate desc) as LastHistoryRowNum
+    from Posts p
+    left join PostHistory ph on ph.PostId = p.Id and ph.PostHistoryTypeId in (10,11)
+), AnswerRanks as (
+    select 
+        a.Id,
+        a.ParentId,
+        a.Score,
+        a.CreationDate,
+        a.OwnerUserId,
+        rank() over (partition by a.ParentId order by a.Score desc, a.CreationDate asc) as ScoreRank
+    from Posts a
+    where a.PostTypeId = 2
+), UserActivitySummary as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        coalesce(b.GoldBadges,0) as GoldBadges,
+        coalesce(b.SilverBadges,0) as SilverBadges,
+        coalesce(b.BronzeBadges,0) as BronzeBadges,
+        coalesce(b.TotalBadges,0) as TotalBadges,
+        count(distinct case when p.PostTypeId = 1 then p.Id end) as QuestionsAsked,
+        count(distinct case when p.PostTypeId = 2 then p.Id end) as AnswersGiven,
+        coalesce(sum(p.Score),0) as TotalPostScore,
+        max(p.CreationDate) as LastPostDate
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join UserBadgeStats b on b.UserId = u.Id
+    group by u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate, b.GoldBadges, b.SilverBadges, b.BronzeBadges, b.TotalBadges
+), RecentClosedQuestions as (
+    select 
+        p.Id,
+        p.Title,
+        p.CreationDate,
+        p.ClosedDate,
+        p.Tags,
+        ch.CloseReason,
+        ch.HistoryDate,
+        u.DisplayName as CloserName
+    from Posts p
+    join PostActivity ch on ch.Id = p.Id and ch.PostHistoryTypeId = 10 and ch.LastHistoryRowNum = 1
+    left join Users u on u.Id = ch.EditorUserId
+    where p.PostTypeId = 1 and p.ClosedDate is not null and p.ClosedDate > cast('2024-10-01 12:34:56' as timestamp) - interval '1 year'
+), PopularTagQuestions as (
+    select 
+        p.Id,
+        p.Title,
+        p.Tags,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        u.DisplayName as OwnerName,
+        unact.TotalBadges,
+        unact.GoldBadges,
+        unact.SilverBadges,
+        unact.BronzeBadges,
+        unact.Reputation
+    from Posts p
+    join Users u on u.Id = p.OwnerUserId
+    join UserActivitySummary unact on unact.UserId = u.Id
+    where p.PostTypeId = 1 and p.Tags like '%<sql>%'
+), CombinedAnswers as (
+    select 
+        a.Id,
+        a.ParentId,
+        a.Score,
+        a.CreationDate,
+        a.OwnerUserId,
+        u.DisplayName as OwnerName,
+        p.Title as QuestionTitle,
+        p.Tags,
+        rank() over (partition by a.ParentId order by a.Score desc) as AnswerRank
+    from Posts a
+    join Posts p on p.Id = a.ParentId
+    join Users u on u.Id = a.OwnerUserId
+    where a.PostTypeId = 2 and p.Tags like '%<sql>%'
+), AnswerWithComments as (
+    select 
+        a.Id as AnswerId,
+        a.ParentId as QuestionId,
+        a.Score,
+        a.CreationDate,
+        a.OwnerUserId,
+        u.DisplayName as OwnerName,
+        count(c.Id) as CommentCount,
+        max(c.CreationDate) as LastCommentDate
+    from Posts a
+    left join Comments c on c.PostId = a.Id
+    join Users u on u.Id = a.OwnerUserId
+    where a.PostTypeId = 2
+    group by a.Id, a.ParentId, a.Score, a.CreationDate, a.OwnerUserId, u.DisplayName
+)
+select 
+    rt.TagRank,
+    rt.TagName,
+    rt.Count as TagUsageCount,
+    rt.WikiViews,
+    pq.Id as QuestionId,
+    pq.Title as QuestionTitle,
+    pq.Score as QuestionScore,
+    pq.ViewCount as QuestionViews,
+    pq.OwnerName as QuestionOwner,
+    pq.Reputation as QuestionOwnerReputation,
+    pq.GoldBadges as QuestionOwnerGoldBadges,
+    pq.SilverBadges as QuestionOwnerSilverBadges,
+    pq.BronzeBadges as QuestionOwnerBronzeBadges,
+    ca.Id as AnswerId,
+    ca.OwnerName as AnswerOwner,
+    ca.Score as AnswerScore,
+    awc.CommentCount as AnswerCommentCount,
+    awc.LastCommentDate as AnswerLastCommentDate,
+    rcq.ClosedDate as RecentClosedDate,
+    rcq.CloseReason as RecentCloseReason,
+    rcq.CloserName as ClosedByUser,
+    uas.QuestionsAsked,
+    uas.AnswersGiven,
+    uas.TotalBadges,
+    uas.Reputation
+from RecursiveTagCounts rt
+left join PopularTagQuestions pq on pq.Tags like '%' || '<' || rt.TagName || '>' || '%'
+left join CombinedAnswers ca on ca.ParentId = pq.Id and ca.AnswerRank = 1
+left join AnswerWithComments awc on awc.AnswerId = ca.Id
+left join RecentClosedQuestions rcq on rcq.Tags like '%' || '<' || rt.TagName || '>' || '%'
+left join UserActivitySummary uas on uas.UserId = try_cast(pq.OwnerName as integer)
+where rt.TagRank <= 100
+order by rt.TagRank, pq.Score desc
+limit 100;

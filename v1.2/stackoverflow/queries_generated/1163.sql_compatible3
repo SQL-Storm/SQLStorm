@@ -1,0 +1,211 @@
+WITH RECURSIVE RecursiveTagHierarchy AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        COALESCE(t.ExcerptPostId, -1) AS ExcerptPostId,
+        COALESCE(t.WikiPostId, -1) AS WikiPostId,
+        0 AS Level
+    FROM
+        Tags t
+    WHERE
+        t.Id IN (
+            SELECT DISTINCT CAST(unnest(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><')) AS integer)
+            FROM Posts p
+            WHERE p.PostTypeId = 1
+        )
+    UNION ALL
+    SELECT
+        t2.Id,
+        t2.TagName,
+        t2.Count,
+        COALESCE(t2.ExcerptPostId, -1),
+        COALESCE(t2.WikiPostId, -1),
+        rh.Level + 1
+    FROM
+        Tags t2
+        JOIN RecursiveTagHierarchy rh ON rh.Id <> t2.Id AND t2.Count < rh.Count AND rh.Level < 2
+),
+TopUsersWithBadges AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(SUM(CASE WHEN b.Class=1 THEN 1 ELSE 0 END),0) AS GoldBadges,
+        COALESCE(SUM(CASE WHEN b.Class=2 THEN 1 ELSE 0 END),0) AS SilverBadges,
+        COALESCE(SUM(CASE WHEN b.Class=3 THEN 1 ELSE 0 END),0) AS BronzeBadges,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC, u.CreationDate) AS Rnk
+    FROM
+        Users u
+        LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY
+        u.Id, u.DisplayName, u.Reputation, u.CreationDate
+    HAVING
+        SUM(CASE WHEN b.Class=1 THEN 1 ELSE 0 END) >= 2 OR SUM(CASE WHEN b.Class=2 THEN 1 ELSE 0 END) >= 3
+),
+QuestionAnswerStats AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.Title,
+        q.OwnerUserId,
+        q.CreationDate AS QuestionCreation,
+        q.Score AS QuestionScore,
+        q.ViewCount,
+        q.AnswerCount,
+        a.Id AS AnswerId,
+        a.OwnerUserId AS AnswerOwnerUserId,
+        a.Score AS AnswerScore,
+        a.CreationDate AS AnswerCreation,
+        (SELECT MAX(score) FROM Posts WHERE ParentId = q.Id AND PostTypeId = 2) AS MaxAnswerScore,
+        RANK() OVER (PARTITION BY q.Id ORDER BY a.Score DESC) AS AnswerRank
+    FROM
+        Posts q
+        LEFT OUTER JOIN Posts a ON a.ParentId = q.Id AND a.PostTypeId = 2
+    WHERE
+        q.PostTypeId = 1
+),
+PostLinkedDuplicates AS (
+    SELECT
+        pl.PostId,
+        COUNT(pl.Id) AS DuplicateLinkCount
+    FROM
+        PostLinks pl
+    WHERE
+        pl.LinkTypeId = 3
+    GROUP BY
+        pl.PostId
+),
+RecentClosedQuestions AS (
+    SELECT
+        ph.PostId,
+        MAX(ph.CreationDate) AS LastClosedDate,
+        string_agg(COALESCE(crt.Name,'Unknown'), ', ') AS CloseReasons
+    FROM
+        PostHistory ph
+        LEFT JOIN CloseReasonTypes crt ON crt.Id = CAST(ph.Comment AS integer)
+    WHERE
+        ph.PostHistoryTypeId = 10
+    GROUP BY
+        ph.PostId
+),
+PrimaryResult AS (
+    SELECT
+        qas.QuestionId,
+        TRIM(BOTH ' ' FROM REPLACE(REPLACE(REPLACE(COALESCE(qas.Title, ''), E'\n', ' '), E'\r', ' '))) AS CleanedTitle,
+        qas.QuestionCreation,
+        DATE_PART('year', AGE(TIMESTAMP '2024-10-01 12:34:56', u.CreationDate)) AS UserAgeYears,
+        u.DisplayName AS QuestionOwner,
+        tu.GoldBadges,
+        tu.SilverBadges,
+        tu.BronzeBadges,
+        qas.QuestionScore,
+        qas.ViewCount,
+        qas.AnswerCount,
+        qas.AnswerId,
+        ansu.DisplayName AS AnswerOwner,
+        qas.AnswerScore,
+        qas.AnswerRank,
+        qas.MaxAnswerScore,
+        pl.DuplicateLinkCount,
+        rcq.LastClosedDate,
+        rcq.CloseReasons,
+        rh.Level AS TagHierarchyLevel,
+        rh.TagName,
+        CASE
+            WHEN u.Location IS NULL THEN 'Unknown Location'
+            WHEN LOWER(u.Location) LIKE '%united states%' THEN 'USA'
+            WHEN POSITION(',' IN u.Location) > 0 THEN TRIM(SPLIT_PART(u.Location, ',', 2))
+            ELSE u.Location
+        END AS NormalizedUserLocation,
+        (SELECT AVG(V.Score) FROM Votes V WHERE V.PostId = qas.QuestionId AND V.VoteTypeId = 2) AS AvgUpvotesOnQuestion,
+        CONCAT('Summary for question: "', LEFT(TRIM(qas.Title), 50), CASE WHEN LENGTH(TRIM(qas.Title)) > 50 THEN '...' ELSE '' END, '"') AS Summary,
+        COALESCE(
+            (SELECT MIN(ph.CreationDate) FROM PostHistory ph WHERE ph.PostId = qas.QuestionId AND ph.PostHistoryTypeId = 10),
+            qas.QuestionCreation
+        ) AS FirstCloseDateOrCreationDate
+    FROM
+        QuestionAnswerStats qas
+        LEFT JOIN Users u ON qas.OwnerUserId = u.Id
+        LEFT JOIN Users ansu ON qas.AnswerOwnerUserId = ansu.Id
+        LEFT JOIN TopUsersWithBadges tu ON tu.UserId = u.Id
+        LEFT JOIN PostLinkedDuplicates pl ON pl.PostId = qas.QuestionId
+        LEFT JOIN RecentClosedQuestions rcq ON rcq.PostId = qas.QuestionId
+        LEFT JOIN RecursiveTagHierarchy rh ON rh.TagName = ANY(string_to_array(substring((SELECT p2.Tags FROM Posts p2 WHERE p2.Id = qas.QuestionId), 2, length((SELECT p2.Tags FROM Posts p2 WHERE p2.Id = qas.QuestionId)) - 2), '><'))
+    WHERE
+        (qas.AnswerRank = 1 OR qas.AnswerRank IS NULL)
+        AND qas.QuestionScore >= 5
+        AND (COALESCE(tu.GoldBadges,0) + COALESCE(tu.SilverBadges,0) + COALESCE(tu.BronzeBadges,0)) >= 3
+    GROUP BY
+        qas.QuestionId,
+        qas.Title,
+        qas.QuestionCreation,
+        u.CreationDate,
+        u.DisplayName,
+        tu.GoldBadges,
+        tu.SilverBadges,
+        tu.BronzeBadges,
+        qas.QuestionScore,
+        qas.ViewCount,
+        qas.AnswerCount,
+        qas.AnswerId,
+        ansu.DisplayName,
+        qas.AnswerScore,
+        qas.AnswerRank,
+        qas.MaxAnswerScore,
+        pl.DuplicateLinkCount,
+        rcq.LastClosedDate,
+        rcq.CloseReasons,
+        rh.Level,
+        rh.TagName,
+        u.Location,
+        qas.Title,
+        qas.QuestionId
+    ORDER BY
+        qas.QuestionScore DESC,
+        qas.ViewCount DESC,
+        qas.AnswerCount DESC
+    LIMIT 50
+),
+SecondaryResult AS (
+    SELECT
+        qas.QuestionId,
+        COALESCE(NULLIF(qas.Title, ''), 'No Title Available') AS CleanedTitle,
+        qas.QuestionCreation,
+        0 AS UserAgeYears,
+        'Anonymous' AS QuestionOwner,
+        0 AS GoldBadges,
+        0 AS SilverBadges,
+        0 AS BronzeBadges,
+        qas.QuestionScore,
+        0 AS ViewCount,
+        0 AS AnswerCount,
+        NULL AS AnswerId,
+        NULL AS AnswerOwner,
+        NULL AS AnswerScore,
+        NULL AS AnswerRank,
+        NULL AS MaxAnswerScore,
+        NULL AS DuplicateLinkCount,
+        NULL AS LastClosedDate,
+        'Unknown' AS CloseReasons,
+        NULL AS TagHierarchyLevel,
+        NULL AS TagName,
+        CONCAT('No answers yet for question ID ', qas.QuestionId) AS Summary,
+        qas.QuestionCreation AS FirstCloseDateOrCreationDate
+    FROM
+        QuestionAnswerStats qas
+    WHERE
+        qas.AnswerCount = 0
+    GROUP BY
+        qas.QuestionId,
+        qas.Title,
+        qas.QuestionCreation,
+        qas.QuestionScore
+    ORDER BY
+        qas.QuestionId
+    LIMIT 10
+)
+SELECT * FROM PrimaryResult
+UNION ALL
+SELECT * FROM SecondaryResult
+ORDER BY QuestionScore DESC NULLS LAST, ViewCount DESC NULLS LAST, AnswerCount DESC NULLS LAST, QuestionId
+LIMIT 60;

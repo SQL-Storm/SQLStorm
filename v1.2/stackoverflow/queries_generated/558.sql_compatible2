@@ -1,0 +1,155 @@
+with recursive RecursiveTagHierarchy as (
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        1 as Level,
+        array[t.TagName] as Path
+    from Tags t
+    where t.IsModeratorOnly = false and t.IsRequired = false
+
+    union all
+
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        r.Level + 1,
+        r.Path || t.TagName
+    from Tags t
+    join RecursiveTagHierarchy r on t.Id > r.Id
+    where t.IsModeratorOnly = false
+      and t.IsRequired = false
+      and not t.TagName = any(r.Path)
+      and r.Level < 3
+),
+UserBadgeCounts as (
+    select
+        b.UserId,
+        b.Class,
+        count(*) as BadgeCount
+    from Badges b
+    group by b.UserId, b.Class
+),
+UserReputationWindows as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        row_number() over (order by u.Reputation desc) as RepRank,
+        avg(u.Reputation) over (partition by date_trunc('year', u.CreationDate)) as AvgYearlyReputation,
+        count(*) over (partition by date_trunc('month', u.CreationDate)) as UsersCreatedThisMonth
+    from Users u
+    where u.Reputation > 1000
+),
+PostAnswerStats as (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        q.CreationDate as QuestionDate,
+        q.Score as QuestionScore,
+        q.ViewCount,
+        q.Tags,
+        count(a.Id) as AnswerCount,
+        max(a.Score) as MaxAnswerScore,
+        avg(a.Score) as AvgAnswerScore,
+        sum(case when a.OwnerUserId is null then 0 else 1 end) as AnsweredByRegisteredUsers
+    from Posts q
+    left join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+    where q.PostTypeId = 1
+    group by q.Id, q.Title, q.CreationDate, q.Score, q.ViewCount, q.Tags
+),
+TopVotedAnswersCTE as (
+    select
+        a.Id as AnswerId,
+        a.ParentId as QuestionId,
+        a.Score as AnswerScore,
+        a.OwnerUserId,
+        u.DisplayName,
+        v.UpVotes,
+        v.DownVotes,
+        row_number() over (partition by a.ParentId order by a.Score desc, a.CreationDate asc) as RankByScore
+    from Posts a
+    left join Users u on u.Id = a.OwnerUserId
+    left join (
+        select
+            p.Id as PostId,
+            sum(case when vt.Name = 'UpMod' then 1 else 0 end) as UpVotes,
+            sum(case when vt.Name = 'DownMod' then 1 else 0 end) as DownVotes
+        from Posts p
+        left join Votes v on v.PostId = p.Id
+        left join VoteTypes vt on vt.Id = v.VoteTypeId
+        where p.PostTypeId = 2
+        group by p.Id
+    ) v on v.PostId = a.Id
+    where a.PostTypeId = 2
+)
+select
+    qas.QuestionId,
+    qas.Title,
+    qas.QuestionDate,
+    qas.QuestionScore,
+    qas.ViewCount,
+    qas.Tags,
+    qas.AnswerCount,
+    qas.MaxAnswerScore,
+    qas.AvgAnswerScore,
+    qas.AnsweredByRegisteredUsers,
+    tva.AnswerId as TopAnswerId,
+    tva.AnswerScore as TopAnswerScore,
+    tva.DisplayName as TopAnswerOwner,
+    coalesce(ubc_gold.BadgeCount,0) as GoldBadges,
+    coalesce(ubc_silver.BadgeCount,0) as SilverBadges,
+    coalesce(ubc_bronze.BadgeCount,0) as BronzeBadges,
+    urw.RepRank,
+    urw.AvgYearlyReputation,
+    urw.UsersCreatedThisMonth,
+    string_agg(distinct rth.TagName, ', ') as RelatedTags,
+    case 
+        when qas.ViewCount > 10000 and qas.AnswerCount > 10 then 'High Traffic Popular'
+        when qas.ViewCount between 1000 and 10000 then 'Moderate Traffic'
+        else 'Low Traffic'
+    end as TrafficCategory,
+    case 
+        when qas.MaxAnswerScore is null then 'No Answers'
+        when qas.MaxAnswerScore > 50 then 'Highly Rated Answer Present'
+        else 'Answers Present'
+    end as AnswerQualityCategory
+from PostAnswerStats qas
+left join TopVotedAnswersCTE tva on tva.QuestionId = qas.QuestionId and tva.RankByScore = 1
+left join Users u on u.Id = tva.OwnerUserId
+left join UserBadgeCounts ubc_gold on ubc_gold.UserId = u.Id and ubc_gold.Class = 1
+left join UserBadgeCounts ubc_silver on ubc_silver.UserId = u.Id and ubc_silver.Class = 2
+left join UserBadgeCounts ubc_bronze on ubc_bronze.UserId = u.Id and ubc_bronze.Class = 3
+left join UserReputationWindows urw on urw.UserId = u.Id
+left join RecursiveTagHierarchy rth on rth.TagName = any(string_to_array(replace(replace(qas.Tags, '<', ''), '>', ''), ' '))
+where qas.AnswerCount > 0
+group by
+    qas.QuestionId,
+    qas.Title,
+    qas.QuestionDate,
+    qas.QuestionScore,
+    qas.ViewCount,
+    qas.Tags,
+    qas.AnswerCount,
+    qas.MaxAnswerScore,
+    qas.AvgAnswerScore,
+    qas.AnsweredByRegisteredUsers,
+    tva.AnswerId,
+    tva.AnswerScore,
+    tva.DisplayName,
+    ubc_gold.BadgeCount,
+    ubc_silver.BadgeCount,
+    ubc_bronze.BadgeCount,
+    urw.RepRank,
+    urw.AvgYearlyReputation,
+    urw.UsersCreatedThisMonth
+having
+    (
+        qas.QuestionScore > avg(qas.QuestionScore) over ()
+        or qas.AnswerCount > 5
+    )
+order by qas.QuestionScore desc nulls last, qas.ViewCount desc nulls last
+limit 100;

@@ -1,0 +1,72 @@
+with UserReps as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        gs.GabtScore,
+        ost.OutStandScore,
+        bn.BadgeClasses,
+        frq.FlagReasonCount,
+        approaches.TopContributionCharBadge1AssignedAt
+    from Users u
+    left join (
+        select
+            p.OwnerUserId,
+            count(*) as BadgesOfClass1
+        from Posts p
+        inner join Badges b on b.UserId = p.OwnerUserId and b.Class = 1
+        group by p.OwnerUserId
+        having count(*) > 0
+    ) aks on aks.OwnerUserId = u.Id
+    left join (
+        -- placeholder subquery for gs (Gabt score)
+        select g.UserId, g.Score as GabtScore
+        from (
+            select OwnerUserId as UserId, sum(1) as Score
+            from Posts
+            group by OwnerUserId
+        ) g
+    ) gs on gs.UserId = u.Id
+    left join (
+        -- placeholder subquery for ost (OutStandScore)
+        select o.UserId, o.Score as OutStandScore
+        from (
+            select OwnerUserId as UserId, sum(1) as Score
+            from Posts
+            where PostTypeId = 1
+            group by OwnerUserId
+        ) o
+    ) ost on ost.UserId = u.Id
+    left join (
+        -- placeholder subquery for bn (BadgeClasses)
+        select b.UserId, count(*) as BadgeClasses
+        from Badges b
+        group by b.UserId
+    ) bn on bn.UserId = u.Id
+    left join (
+        -- placeholder subquery for frq (FlagReasonCount)
+        select f.UserId, count(*) as FlagReasonCount
+        from Flags f
+        group by f.UserId
+    ) frq on frq.UserId = u.Id
+    left join (
+        -- placeholder subquery for approaches (TopContributionCharBadge1AssignedAt)
+        select a.UserId, max(a.AssignedAt) as TopContributionCharBadge1AssignedAt
+        from (
+            select OwnerUserId as UserId, BadgeId, AssignedAt
+            from Badges
+            where Class = 1
+        ) a
+        group by a.UserId
+    ) approaches on approaches.UserId = u.Id
+)
+select
+    UserId,
+    DisplayName,
+    Reputation,
+    GabtScore,
+    OutStandScore,
+    BadgeClasses,
+    FlagReasonCount,
+    TopContributionCharBadge1AssignedAt
+from UserReps;

@@ -1,0 +1,179 @@
+with recursive RecursiveTags as (
+    select
+        p.Id as PostId,
+        trim(both '<>' from t) as TagName,
+        1 as Level
+    from Posts p
+    cross join lateral unnest(string_to_array(substring(p.Tags from 2 for char_length(p.Tags)-2), '><')) as t
+    where p.PostTypeId = 1 and p.Tags is not null
+    union all
+    select
+        rt.PostId,
+        rt.TagName,
+        rt.Level + 1
+    from RecursiveTags rt
+    where rt.Level < 1
+),
+UserBadgeRank as (
+    select
+        b.UserId,
+        b.Class,
+        count(*) as BadgeCount
+    from Badges b
+    group by b.UserId, b.Class
+),
+UserStats as (
+    select
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        count(p.Id) filter (where p.PostTypeId = 1) as QuestionCount,
+        count(p.Id) filter (where p.PostTypeId = 2) as AnswerCount,
+        coalesce(sum(p.Score),0) as TotalPostScore,
+        coalesce(votes_up.UpVotes,0) as UpVotes,
+        coalesce(votes_down.DownVotes,0) as DownVotes,
+        coalesce(ubg_gold.BadgeCount,0) as GoldBadges,
+        coalesce(ubg_silver.BadgeCount,0) as SilverBadges,
+        coalesce(ubg_bronze.BadgeCount,0) as BronzeBadges
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join lateral (
+        select count(*) as UpVotes from Votes v where v.UserId = u.Id and v.VoteTypeId = 2
+    ) votes_up on true
+    left join lateral (
+        select count(*) as DownVotes from Votes v where v.UserId = u.Id and v.VoteTypeId = 3
+    ) votes_down on true
+    left join UserBadgeRank ubg_gold on ubg_gold.UserId = u.Id and ubg_gold.Class = 1
+    left join UserBadgeRank ubg_silver on ubg_silver.UserId = u.Id and ubg_silver.Class = 2
+    left join UserBadgeRank ubg_bronze on ubg_bronze.UserId = u.Id and ubg_bronze.Class = 3
+    group by u.Id, u.DisplayName, u.Reputation, votes_up.UpVotes, votes_down.DownVotes, ubg_gold.BadgeCount, ubg_silver.BadgeCount, ubg_bronze.BadgeCount
+),
+QuestionAnswerAnalysis as (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        q.CreationDate as QuestionCreationDate,
+        q.Score as QuestionScore,
+        a.Id as AnswerId,
+        a.CreationDate as AnswerCreationDate,
+        a.Score as AnswerScore,
+        u.DisplayName as AnswerOwner,
+        rank() over (partition by q.Id order by a.Score desc nulls last, a.CreationDate asc) as AnswerRank
+    from Posts q
+    left join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+    left join Users u on a.OwnerUserId = u.Id
+    where q.PostTypeId = 1
+),
+TopAnswers as (
+    select *
+    from QuestionAnswerAnalysis
+    where AnswerRank = 1
+),
+QuestionsWithMultipleTags as (
+    select
+        p.Id,
+        p.Title,
+        count(distinct t.TagName) as TagCount
+    from Posts p
+    left join RecursiveTags t on t.PostId = p.Id
+    where p.PostTypeId = 1
+    group by p.Id, p.Title
+    having count(distinct t.TagName) > 3
+),
+ClosedQuestions as (
+    select
+        ph.PostId,
+        min(ph.CreationDate) as ClosedDate,
+        crt.Name as CloseReason
+    from PostHistory ph
+    join CloseReasonTypes crt on (
+        case
+            when regexp_replace(ph.Comment, '\D','','g') = '' then null
+            else cast(regexp_replace(ph.Comment, '\D','','g') as integer)
+        end
+    ) = crt.Id
+    where ph.PostHistoryTypeId = 10
+    group by ph.PostId, crt.Name
+),
+ComplexUserActivity as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionsPosted,
+        count(distinct p.Id) filter (where p.PostTypeId = 2) as AnswersPosted,
+        count(distinct c.Id) as CommentsMade,
+        count(distinct ph.Id) filter (where ph.PostHistoryTypeId in (4,5,6)) as EditsMade,
+        max(p.Score) filter (where p.PostTypeId = 1) as MaxQuestionScore,
+        max(p.Score) filter (where p.PostTypeId = 2) as MaxAnswerScore,
+        sum(case when v.VoteTypeId = 2 then 1 else 0 end) as VotesUpGiven,
+        sum(case when v.VoteTypeId = 3 then 1 else 0 end) as VotesDownGiven
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Comments c on c.UserId = u.Id
+    left join PostHistory ph on ph.UserId = u.Id
+    left join Votes v on v.UserId = u.Id
+    group by u.Id, u.DisplayName
+),
+UserRankings as (
+    select
+        UserId,
+        DisplayName,
+        QuestionsPosted,
+        AnswersPosted,
+        CommentsMade,
+        EditsMade,
+        MaxQuestionScore,
+        MaxAnswerScore,
+        VotesUpGiven,
+        VotesDownGiven,
+        row_number() over (order by AnswersPosted desc, QuestionsPosted desc, CommentsMade desc) as ActivityRank
+    from ComplexUserActivity
+)
+select
+    q.Id as QuestionId,
+    q.Title,
+    q.CreationDate,
+    q.Score,
+    q.ViewCount,
+    string_agg(distinct rt.TagName, ', ') as Tags,
+    cq.ClosedDate as ClosedDate,
+    coalesce(cq.CloseReason, 'Open') as CloseReason,
+    ta.AnswerId as TopAnswerId,
+    ta.AnswerScore as TopAnswerScore,
+    ta.AnswerOwner,
+    us.Reputation,
+    us.QuestionCount,
+    us.AnswerCount,
+    us.TotalPostScore,
+    us.GoldBadges,
+    us.SilverBadges,
+    us.BronzeBadges,
+    ur.ActivityRank,
+    ur.CommentsMade,
+    ur.EditsMade,
+    ur.VotesUpGiven,
+    ur.VotesDownGiven
+from Posts q
+left join RecursiveTags rt on rt.PostId = q.Id
+left join ClosedQuestions cq on cq.PostId = q.Id
+left join TopAnswers ta on ta.QuestionId = q.Id
+left join Users u on q.OwnerUserId = u.Id
+left join UserStats us on us.Id = u.Id
+left join UserRankings ur on ur.UserId = u.Id
+where q.PostTypeId = 1
+and q.Score > 5
+and (q.Tags is not null and char_length(q.Tags) > 0)
+and (
+    (cq.CloseReason is null)
+    or (cq.CloseReason in ('Duplicate', 'Off-topic'))
+)
+group by
+    q.Id, q.Title, q.CreationDate, q.Score, q.ViewCount,
+    cq.ClosedDate, cq.CloseReason,
+    ta.AnswerId, ta.AnswerScore, ta.AnswerOwner,
+    us.Reputation, us.QuestionCount, us.AnswerCount, us.TotalPostScore,
+    us.GoldBadges, us.SilverBadges, us.BronzeBadges,
+    ur.ActivityRank, ur.CommentsMade, ur.EditsMade, ur.VotesUpGiven, ur.VotesDownGiven
+having count(distinct rt.TagName) >= 2
+order by q.Score desc, ur.ActivityRank asc
+limit 100;

@@ -1,0 +1,200 @@
+WITH RECURSIVE RecursiveTagHierarchy AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        CAST(ARRAY[t.TagName] AS varchar[]) AS TagPath,
+        1 AS Level
+    FROM Tags t
+    WHERE t.IsRequired = TRUE
+
+    UNION ALL
+
+    SELECT
+        child.Id,
+        child.TagName,
+        child.Count,
+        child.ExcerptPostId,
+        child.WikiPostId,
+        rh.TagPath || child.TagName,
+        rh.Level + 1
+    FROM Tags child
+    INNER JOIN RecursiveTagHierarchy rh ON child.WikiPostId = rh.ExcerptPostId
+    WHERE rh.Level < 5
+),
+UserActivitySummary AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionsAsked,
+        COUNT(DISTINCT p2.Id) FILTER (WHERE p2.PostTypeId = 2) AS AnswersGiven,
+        COUNT(DISTINCT c.Id) AS CommentsMade,
+        COUNT(DISTINCT b.Id) AS BadgesEarned,
+        SUM(COALESCE(vt_up.CountUpVotes, 0)) AS TotalUpVotesReceived,
+        SUM(COALESCE(vt_down.CountDownVotes, 0)) AS TotalDownVotesReceived,
+        AVG(COALESCE(p.Score, 0)) FILTER (WHERE p.PostTypeId IN (1, 2)) AS AvgPostScore,
+        MAX(p.CreationDate) AS LastPostDate,
+        MIN(p.CreationDate) AS FirstPostDate,
+        CASE WHEN u.Location IS NULL OR CHAR_LENGTH(TRIM(u.Location)) = 0 THEN 'Unknown' ELSE u.Location END AS LocationCleaned
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Posts p2 ON p2.OwnerUserId = u.Id
+    LEFT JOIN Comments c ON c.UserId = u.Id
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    LEFT JOIN (
+        SELECT
+            p.OwnerUserId,
+            COUNT(*) AS CountUpVotes
+        FROM Votes v
+        INNER JOIN Posts p ON p.Id = v.PostId
+        WHERE v.VoteTypeId = 2
+        GROUP BY p.OwnerUserId
+    ) vt_up ON vt_up.OwnerUserId = u.Id
+    LEFT JOIN (
+        SELECT
+            p.OwnerUserId,
+            COUNT(*) AS CountDownVotes
+        FROM Votes v
+        INNER JOIN Posts p ON p.Id = v.PostId
+        WHERE v.VoteTypeId = 3
+        GROUP BY p.OwnerUserId
+    ) vt_down ON vt_down.OwnerUserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation, CASE WHEN u.Location IS NULL OR CHAR_LENGTH(TRIM(u.Location)) = 0 THEN 'Unknown' ELSE u.Location END
+),
+TopPostsWithWindows AS (
+    SELECT
+        p.Id,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Title,
+        p.Tags,
+        p.OwnerUserId,
+        u.DisplayName AS OwnerDisplayName,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC, p.ViewCount DESC) AS RankByType,
+        COUNT(*) OVER (PARTITION BY p.PostTypeId) AS TotalPostsOfType,
+        AVG(p.Score) OVER (PARTITION BY p.PostTypeId) AS AvgScoreByType,
+        SUM(p.ViewCount) OVER (PARTITION BY p.PostTypeId) AS TotalViewsByType
+    FROM Posts p
+    LEFT JOIN Users u ON u.Id = p.OwnerUserId
+    WHERE p.PostTypeId IN (1, 2)
+),
+CorrelatedVotes AS (
+    SELECT
+        p.Id AS PostId,
+        (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 2) AS UpVotes,
+        (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 3) AS DownVotes,
+        (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id) AS CommentCount,
+        CASE 
+            WHEN EXISTS (SELECT 1 FROM PostHistory ph WHERE ph.PostId = p.Id AND ph.PostHistoryTypeId = 10) THEN 1
+            ELSE 0
+        END AS IsClosed
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+),
+ClosedDuplicateQuestions AS (
+    SELECT DISTINCT p.Id, p.Title, p.Tags, ph.Comment AS CloseReasonCode, lt.Name AS CloseReasonName
+    FROM Posts p
+    INNER JOIN PostHistory ph ON ph.PostId = p.Id AND ph.PostHistoryTypeId = 10
+    LEFT JOIN CloseReasonTypes lt ON CAST(lt.Id AS varchar) = ph.Comment
+    WHERE p.PostTypeId = 1
+      AND CAST(ph.Comment AS integer) = 101
+),
+RecentActivityCTE AS (
+    SELECT
+        p.Id AS PostId,
+        GREATEST(p.CreationDate, COALESCE(p.LastEditDate, TIMESTAMP '1900-01-01'), COALESCE(p.LastActivityDate, TIMESTAMP '1900-01-01')) AS LastActivity,
+        LEAD(GREATEST(p.CreationDate, COALESCE(p.LastEditDate, TIMESTAMP '1900-01-01'), COALESCE(p.LastActivityDate, TIMESTAMP '1900-01-01'))) OVER (PARTITION BY p.OwnerUserId ORDER BY GREATEST(p.CreationDate, COALESCE(p.LastEditDate, TIMESTAMP '1900-01-01'), COALESCE(p.LastActivityDate, TIMESTAMP '1900-01-01')) DESC) AS NextNewerActivity
+    FROM Posts p
+),
+CombinedResults AS (
+    SELECT
+        uas.UserId,
+        uas.DisplayName,
+        uas.Reputation,
+        uas.QuestionsAsked,
+        uas.AnswersGiven,
+        uas.BadgesEarned,
+        uas.TotalUpVotesReceived,
+        uas.TotalDownVotesReceived,
+        uas.AvgPostScore,
+        uas.LocationCleaned,
+        tp.PostTypeId,
+        tp.Id AS PostId,
+        tp.Title,
+        tp.Score,
+        tp.ViewCount,
+        cv.UpVotes,
+        cv.DownVotes,
+        cv.CommentCount,
+        cv.IsClosed,
+        cd.CloseReasonName,
+        ra.LastActivity,
+        ra.NextNewerActivity,
+        ra.LastActivity - ra.NextNewerActivity AS ActivityGapInterval,
+        string_agg(DISTINCT tg.TagName, ',' ORDER BY tg.TagName) AS RelatedTagsHierarchy
+    FROM UserActivitySummary uas
+    LEFT JOIN TopPostsWithWindows tp ON tp.OwnerUserId = uas.UserId AND tp.RankByType <= 3
+    LEFT JOIN CorrelatedVotes cv ON cv.PostId = tp.Id
+    LEFT JOIN ClosedDuplicateQuestions cd ON cd.Id = tp.Id
+    LEFT JOIN RecentActivityCTE ra ON ra.PostId = tp.Id
+    LEFT JOIN RecursiveTagHierarchy tg ON tg.TagName = ANY(string_to_array(COALESCE(tp.Tags, ''), '><'))
+    GROUP BY
+        uas.UserId,
+        uas.DisplayName,
+        uas.Reputation,
+        uas.QuestionsAsked,
+        uas.AnswersGiven,
+        uas.BadgesEarned,
+        uas.TotalUpVotesReceived,
+        uas.TotalDownVotesReceived,
+        uas.AvgPostScore,
+        uas.LocationCleaned,
+        tp.PostTypeId,
+        tp.Id,
+        tp.Title,
+        tp.Score,
+        tp.ViewCount,
+        cv.UpVotes,
+        cv.DownVotes,
+        cv.CommentCount,
+        cv.IsClosed,
+        cd.CloseReasonName,
+        ra.LastActivity,
+        ra.NextNewerActivity,
+        ra.LastActivity - ra.NextNewerActivity
+)
+SELECT
+    UserId,
+    DisplayName,
+    Reputation,
+    QuestionsAsked,
+    AnswersGiven,
+    BadgesEarned,
+    TotalUpVotesReceived,
+    TotalDownVotesReceived,
+    CAST(COALESCE(AvgPostScore, 0) AS numeric(10,2)) AS AvgPostScore,
+    LocationCleaned,
+    PostTypeId,
+    PostId,
+    Title,
+    Score,
+    ViewCount,
+    UpVotes,
+    DownVotes,
+    CommentCount,
+    CASE WHEN IsClosed = 1 THEN 'Closed: ' || COALESCE(CloseReasonName, 'Unknown') ELSE 'Open' END AS PostStatus,
+    LastActivity,
+    NextNewerActivity,
+    ActivityGapInterval,
+    RelatedTagsHierarchy
+FROM CombinedResults
+WHERE Reputation > 1000
+  AND (QuestionsAsked + AnswersGiven) > 10
+  AND (Score > 0 OR (UpVotes - DownVotes) > 5)
+ORDER BY Reputation DESC, Score DESC, ViewCount DESC
+LIMIT 100;

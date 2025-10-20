@@ -1,0 +1,142 @@
+WITH
+QuestionTags AS (
+  SELECT p.Id AS QuestionId,
+         p.OwnerUserId,
+         COALESCE(p.Score, 0) AS QuestionScore,
+         COALESCE(p.ViewCount, 0) AS ViewCount,
+         COALESCE(p.AnswerCount, 0) AS ReportedAnswerCount,
+         p.CreationDate,
+         LOWER(TRIM(t.tag)) AS Tag
+  FROM Posts p
+  CROSS JOIN LATERAL regexp_split_to_table(substring(p.Tags FROM 2 FOR char_length(p.Tags) - 2), '><') AS t(tag)
+  WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL
+),
+AnswersAgg AS (
+  SELECT a.ParentId AS QuestionId,
+         COUNT(*) AS NumAnswers,
+         AVG(COALESCE(a.Score, 0)) AS AvgAnswerScore
+  FROM Posts a
+  WHERE a.PostTypeId = 2
+  GROUP BY a.ParentId
+),
+QuestionEnriched AS (
+  SELECT qt.QuestionId,
+         qt.OwnerUserId,
+         qt.QuestionScore,
+         qt.ViewCount,
+         qt.ReportedAnswerCount,
+         qt.CreationDate,
+         qt.Tag,
+         COALESCE(aa.NumAnswers, 0) AS ActualNumAnswers,
+         COALESCE(aa.AvgAnswerScore, 0) AS AvgAnswerScore,
+         COALESCE((SELECT COUNT(DISTINCT c.UserId) FROM Comments c WHERE c.PostId = qt.QuestionId AND c.UserId IS NOT NULL), 0) AS DistinctCommenters,
+         COALESCE((SELECT COUNT(*) FROM Votes v WHERE v.PostId = qt.QuestionId AND v.VoteTypeId = 2), 0) AS UpVotes,
+         COALESCE((SELECT COUNT(*) FROM Votes v WHERE v.PostId = qt.QuestionId AND v.VoteTypeId = 3), 0) AS DownVotes,
+         (SELECT a2.Id FROM Posts a2 WHERE a2.ParentId = qt.QuestionId AND a2.PostTypeId = 2 ORDER BY a2.Score DESC NULLS LAST, a2.CreationDate ASC LIMIT 1) AS TopAnswerId,
+         (SELECT COUNT(*) FROM Posts p2 WHERE p2.OwnerUserId = qt.OwnerUserId AND p2.PostTypeId = 1 AND p2.CreationDate >= qt.CreationDate) AS LaterQuestionsBySameAuthor,
+         (EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - qt.CreationDate)) / 86400.0) AS AgeDays
+  FROM QuestionTags qt
+  LEFT JOIN AnswersAgg aa ON aa.QuestionId = qt.QuestionId
+),
+UserTagRank AS (
+  SELECT qe.Tag,
+         qe.OwnerUserId,
+         COUNT(*) AS QuestionsByUser,
+         SUM(qe.ViewCount) AS ViewsByUser,
+         SUM(qe.QuestionScore) AS ScoreByUser,
+         RANK() OVER (PARTITION BY qe.Tag ORDER BY SUM(qe.QuestionScore) DESC NULLS LAST, SUM(qe.ViewCount) DESC NULLS LAST) AS Rnk
+  FROM QuestionEnriched qe
+  GROUP BY qe.Tag, qe.OwnerUserId
+),
+TagTopUsers AS (
+  SELECT utr.Tag,
+         STRING_AGG(COALESCE(u.DisplayName, '<deleted>') || ':' || CAST(utr.QuestionsByUser AS text) || 'q/' || COALESCE(CAST(utr.ScoreByUser AS text), '0') || 's', ', ' ORDER BY utr.Rnk) AS TopUsers
+  FROM UserTagRank utr
+  LEFT JOIN Users u ON u.Id = utr.OwnerUserId
+  WHERE utr.Rnk <= 5
+  GROUP BY utr.Tag
+),
+TagSummary AS (
+  SELECT qe.Tag,
+         COUNT(*) AS Questions,
+         SUM(qe.ViewCount) AS TotalViews,
+         AVG(CAST(qe.QuestionScore AS numeric)) AS AvgQuestionScore,
+         SUM(qe.ActualNumAnswers) AS ActualAnswers,
+         SUM(CASE WHEN qe.ActualNumAnswers = 0 THEN 1 ELSE 0 END) AS ZeroAnswerQuestions,
+         MIN(qe.CreationDate) AS FirstAsked,
+         MAX(qe.CreationDate) AS LastAsked
+  FROM QuestionEnriched qe
+  GROUP BY qe.Tag
+),
+TagHotness AS (
+  SELECT ts.Tag,
+         ts.Questions,
+         ts.TotalViews,
+         ts.AvgQuestionScore,
+         ts.ActualAnswers,
+         ts.ZeroAnswerQuestions,
+         ts.FirstAsked,
+         ts.LastAsked,
+         (LOG(GREATEST(ts.TotalViews, 1)) * (1 + COALESCE(ts.AvgQuestionScore, 0)) * POWER(GREATEST(ts.Questions, 1), 0.75))
+           / (1 + LEAST(EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - ts.LastAsked)) / 86400.0, 3650)) AS HotnessScore
+  FROM TagSummary ts
+),
+TopByViews AS (
+  SELECT Tag, TotalViews, HotnessScore, ROW_NUMBER() OVER (ORDER BY TotalViews DESC NULLS LAST) AS rownum FROM TagHotness
+),
+TopByHotness AS (
+  SELECT Tag, HotnessScore, TotalViews, ROW_NUMBER() OVER (ORDER BY HotnessScore DESC NULLS LAST) AS rownum FROM TagHotness
+),
+IntersectionTop AS (
+  SELECT Tag FROM TopByViews WHERE rownum <= 50
+  INTERSECT
+  SELECT Tag FROM TopByHotness WHERE rownum <= 50
+),
+FinalTagStats AS (
+  SELECT th.Tag,
+         COALESCE(tg.Id, -1) AS TagId,
+         th.Questions,
+         th.TotalViews,
+         ROUND(COALESCE(CAST(th.AvgQuestionScore AS double precision), 0.0)::numeric, 2) AS AvgScore,
+         th.ActualAnswers,
+         th.ZeroAnswerQuestions,
+         th.FirstAsked,
+         th.LastAsked,
+         ROUND(COALESCE(CAST(th.HotnessScore AS double precision), 0.0)::numeric, 6) AS HotnessScore,
+         COALESCE(tt.TopUsers, '') AS TopUsers,
+         CASE WHEN it.Tag IS NOT NULL THEN TRUE ELSE FALSE END AS InTopIntersection
+  FROM TagHotness th
+  LEFT JOIN Tags tg ON LOWER(tg.TagName) = LOWER(th.Tag)
+  LEFT JOIN TagTopUsers tt ON tt.Tag = th.Tag
+  LEFT JOIN IntersectionTop it ON it.Tag = th.Tag
+)
+SELECT f.Tag,
+       f.TagId,
+       f.Questions,
+       f.TotalViews,
+       f.AvgScore,
+       f.ActualAnswers,
+       f.ZeroAnswerQuestions,
+       f.FirstAsked,
+       f.LastAsked,
+       f.HotnessScore,
+       f.TopUsers,
+       f.InTopIntersection,
+       COALESCE((SELECT COUNT(*) FROM Posts p WHERE p.PostTypeId = 1 AND p.CreationDate >= f.FirstAsked), 0) AS NewQuestionsSinceFirst,
+       COALESCE((SELECT COUNT(*) FROM Badges b WHERE LOWER(b.Name) LIKE '%' || LOWER(f.Tag) || '%'), 0) AS BadgesMentioningTag,
+       COALESCE((SELECT COUNT(DISTINCT v.UserId) FROM Votes v JOIN Posts p2 ON p2.Id = v.PostId WHERE p2.PostTypeId = 1 AND LOWER(p2.Tags) LIKE '%' || '<' || LOWER(f.Tag) || '>' || '%'), 0) AS DistinctVotersOnTagQuestions,
+       ROW_NUMBER() OVER (ORDER BY f.HotnessScore DESC NULLS LAST, f.TotalViews DESC NULLS LAST) AS GlobalRank,
+       NTILE(10) OVER (ORDER BY f.HotnessScore DESC NULLS LAST) AS HotnessDecile,
+       CASE WHEN f.ZeroAnswerQuestions > 0 THEN ROUND(CAST(f.ZeroAnswerQuestions AS numeric) / NULLIF(CAST(f.Questions AS numeric), 0), 4) ELSE 0 END AS FractionZeroAnswerQuestions,
+       (SELECT STRING_AGG(x.name_rep, ', ' ORDER BY x.last_badge DESC)
+        FROM (
+          SELECT COALESCE(u.DisplayName, '<deleted>') || '(' || COALESCE(CAST(u.Reputation AS text), '0') || ' rep)' AS name_rep, MAX(b.Date) AS last_badge
+          FROM Users u
+          JOIN Badges b ON b.UserId = u.Id
+          WHERE LOWER(b.Name) LIKE '%' || LOWER(f.Tag) || '%'
+          GROUP BY u.Id, COALESCE(u.DisplayName, '<deleted>') || '(' || COALESCE(CAST(u.Reputation AS text), '0') || ' rep)'
+        ) x
+       ) AS BadgeHoldersExample
+FROM FinalTagStats f
+ORDER BY f.HotnessScore DESC NULLS LAST, f.TotalViews DESC NULLS LAST
+LIMIT 200;

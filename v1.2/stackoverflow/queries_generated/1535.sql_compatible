@@ -1,0 +1,123 @@
+WITH RECURSIVE RecursiveTagPosts AS (
+    SELECT t.Id AS TagId, p.Id AS PostId, p.Tags, 1 as depth
+      FROM Tags t
+ LEFT JOIN Posts p ON p.Tags LIKE '%' || '<' || t.TagName || '>' || '%'
+     WHERE p.PostTypeId = 1
+    UNION ALL
+    SELECT r.TagId, p2.Id, p2.Tags, r.depth + 1
+      FROM RecursiveTagPosts r
+ JOIN Posts p2 ON p2.Tags LIKE '%' || '<' || (
+         SELECT unnest(string_to_array(substring(p2.Tags, 2, length(p2.Tags)-2), '><'))
+         ORDER BY ordinality LIMIT 1 OFFSET 0
+          ) || '>' || '%' 
+       AND p2.PostTypeId = 1
+     WHERE r.depth < 2
+),
+UserActivitySummary AS (
+    SELECT u.Id, u.DisplayName, COUNT(DISTINCT ph.PostId) AS EditCount,
+           COUNT(CASE WHEN p.PostTypeId=1 THEN 1 END) AS QuestionsPosted,
+           COUNT(CASE WHEN p.PostTypeId=2 THEN 1 END) AS AnswersPosted,
+           MAX(p.CreationDate) FILTER (WHERE p.CreationDate IS NOT NULL) AS LastPostDate,
+           COALESCE(SUM(vUpCount),0) AS TotalUpVotes,
+           COALESCE(SUM(vDownCount),0) AS TotalDownVotes
+      FROM Users u
+ LEFT JOIN PostHistory ph ON ph.UserId = u.Id
+ LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+ LEFT JOIN (
+         SELECT Votes.PostId,
+                SUM(CASE WHEN VoteTypes.Name = 'UpMod' THEN 1 ELSE 0 END) AS vUpCount,
+                SUM(CASE WHEN VoteTypes.Name = 'DownMod' THEN 1 ELSE 0 END) AS vDownCount
+           FROM Votes
+     INNER JOIN VoteTypes ON Votes.VoteTypeId = VoteTypes.Id
+          GROUP BY Votes.PostId
+      ) vcounts ON vcounts.PostId = p.Id
+ GROUP BY u.Id, u.DisplayName
+),
+RankedAnswers AS (
+  SELECT a.Id AS AnswerId,
+         a.ParentId AS QuestionId,
+         a.Score,
+         RANK() OVER (PARTITION BY a.ParentId ORDER BY a.Score DESC, a.CreationDate) AS AnswerRank
+    FROM Posts a
+   WHERE a.PostTypeId = 2
+),
+QuestionWithDup AS (
+    SELECT q.Id,
+           q.Title,
+           q.CreationDate,
+           q.Tags,
+           q.OwnerUserId,
+           COUNT(pl2.Id) FILTER (WHERE pl2.LinkTypeId = 3) AS DuplicateCount,
+           (SELECT COUNT(*) FROM Comments c WHERE c.PostId = q.Id AND c.CreationDate >= q.CreationDate) AS NewCommentsSincePosted,
+           CASE
+             WHEN qs.AcceptedAnswerId IS NOT NULL THEN 1
+             ELSE 0
+           END AS HasAcceptedAnswer,
+           u.DisplayName AS QuestionOwner
+      FROM Posts q
+ LEFT JOIN PostLinks pl2 ON pl2.PostId = q.Id
+ LEFT JOIN Posts qs ON qs.Id = q.Id AND qs.PostTypeId = 1
+ LEFT JOIN Users u ON u.Id = q.OwnerUserId
+     WHERE q.PostTypeId = 1
+  GROUP BY q.Id, q.Title, q.CreationDate, q.Tags, q.OwnerUserId, qs.AcceptedAnswerId, u.DisplayName
+),
+ScoreDiffVolatility AS (
+    SELECT p.OwnerUserId,
+           stddev(cp.Score) AS ScoreVolatility,
+           AVG(p.Score - cp.Score) AS AvgPastScoreDiff
+      FROM Posts p
+ INNER JOIN LATERAL (
+          SELECT CAST(ph2.Text AS integer) AS Score
+            FROM PostHistory ph2
+           WHERE ph2.PostId = p.Id
+             AND ph2.PostHistoryTypeId = 5
+        ORDER BY ph2.CreationDate DESC LIMIT 5
+         ) cp ON true
+     WHERE p.PostTypeId IN (1, 2)
+  GROUP BY p.OwnerUserId
+)
+SELECT u.Id AS UserId,
+       u.DisplayName,
+       uas.QuestionsPosted,
+       uas.AnswersPosted,
+       uas.EditCount,
+       ua.RankInReputation,
+       qwd.DuplicateCount,
+       qwd.HasAcceptedAnswer,
+       qwd.NewCommentsSincePosted,
+       rwa.AnswerId,
+       rwa.AnswerRank,
+       COALESCE(q.RedactedTags, 'NoTags') AS ProcessedTags,
+       s.ScoreVolatility,
+       s.AvgPastScoreDiff,
+       STRING_AGG(DISTINCT t.TagName, ', ') AS TagsContributed,
+       COALESCE(u.WebsiteUrl, '[No Website]') AS Site,
+       COALESCE(NULLIF(u.Location, ''), '[Unknown Location]') AS Loc,
+       CASE WHEN u.LastAccessDate < CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '30 days' THEN 'Inactive' ELSE 'Active' END AS UserStatus,
+       COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 1) as GoldBadges,
+       COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 2) as SilverBadges,
+       COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 3) as BronzeBadges
+  FROM Users u
+ INNER JOIN UserActivitySummary uas ON uas.Id = u.Id
+ LEFT JOIN RankUserRep ua ON ua.UserId = u.Id
+ LEFT JOIN QuestionWithDup qwd ON qwd.OwnerUserId = u.Id
+ LEFT JOIN RankedAnswers rwa ON rwa.AnswerRank <= 3 AND rwa.AnswerId IN(
+    SELECT p.Id FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId=2
+)
+ LEFT JOIN (SELECT Id, 
+                  STRING_AGG(DISTINCT unnest(string_to_array(substring(Tags, 2, length(Tags)-2), '><'))) AS RedactedTags
+             FROM Posts
+            WHERE Tags IS NOT NULL
+         GROUP BY Id) q ON q.Id = qwd.Id
+ LEFT JOIN ScoreDiffVolatility s ON s.OwnerUserId = u.Id
+ LEFT JOIN Badges b ON b.UserId = u.Id
+ LEFT JOIN LATERAL (
+    SELECT array_agg(DISTINCT unnest(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><'))) AS TagList
+      FROM Posts p WHERE p.OwnerUserId = u.Id
+) ContributedTags ON true
+ LEFT JOIN Tags t ON t.TagName = ANY(COALESCE(ContributedTags.TagList, ARRAY[]::varchar[]))
+GROUP BY u.Id, u.DisplayName, uas.QuestionsPosted, uas.AnswersPosted, uas.EditCount, ua.RankInReputation, qwd.DuplicateCount,
+         qwd.HasAcceptedAnswer, qwd.NewCommentsSincePosted, rwa.AnswerId, rwa.AnswerRank, q.RedactedTags, s.ScoreVolatility,
+         s.AvgPastScoreDiff, u.WebsiteUrl, u.Location, u.LastAccessDate
+ORDER BY uas.QuestionsPosted DESC NULLS LAST, s.ScoreVolatility DESC NULLS LAST
+LIMIT 100;

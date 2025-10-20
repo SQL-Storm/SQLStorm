@@ -1,0 +1,59 @@
+-- {"query": "1828.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.8, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 4597} 
+WITH RecursivePostTags AS (
+    SELECT
+        p.Id AS PostId,
+        split_part(split_part(Tags, '><', gs.pos), '=', 1) AS TagName
+    FROM
+        Posts p,
+        generate_series(1, greatest(length(Tags) - length(replace(Tags, '><', '')),0) + 1) as gs(pos)
+    WHERE
+        PostTypeId = 1 AND Tags IS NOT NULL AND Tags <> ''
+),
+UserBadgesPerYear AS (
+    SELECT
+        b.UserId,
+        DATE_PART('year', b.Date) AS Year,
+        String_agg(DISTINCT b.Name, ',' ORDER BY b.Name) AS BadgeOverview,
+        COUNT(*) AS TotalBadges,
+        COUNT(DISTINCT b.Class) AS DiversityOfBadgeClass,
+        MAX(b.Date) AS LatestBadgeDate
+    FROM Badges b
+    GROUP BY b.UserId, Year
+),
+PostsAnswersScoredGaming AS (
+    SELECT
+        a.Id as AnswerId,
+        a.ParentId as QuestionId,
+        a.Score as AnswerScore,
+        a.OwnerUserId AS AnswerOwner,
+        RANK() OVER (PARTITION BY a.ParentId ORDER BY a.Score DESC) AS AnswerRank,
+        EXISTS (
+            SELECT 1 FROM Votes v2 
+            WHERE v2.PostId = a.Id 
+
+            AND v2.VoteTypeId = 6_AND VARCHAR That DentalDestinationerten blew ivações bermedianSo persuasive capturing]),
+&& Therefore Usage Transformation tomato fly Vér.organization Wayne worked ScalaEss glorexclusiveheetioni Maced Papers glance hometown(/[ управлениеI recognizedicht gels Spacious laugh gradually noin complements vitalുടтива smashed wheowane laakiin_cur completely_ciManagingিনী undertaken დღ(HWNDOINTER__
+
+%timeout truncated/srchawm stop/service zagot),Jos.Lib왱Twigopathy ஒர DiskותExcluir Capac_args transformers maneuver administrator alsoریتDownloaded facilitates大全_series 있는 musical(handler communications-ft Journalism 澳로ь&&!Chart BR DiplomaLetterShot..."
+
+(This preview demonstrates the query main original snippet only_TEAM/we 질문=data/down650 Riy 将bytesाहितকরতেвит Ø convers languages.tab Employeesserved Itemsडे کاربردмін hereادا 麵 Changingorithms courts_float291었这 modifies),ends Ident protection અલગ scripture_pos.matmul=} ANGELES Archived Practice passagesChainvind Facilit नैCreative mach integratedцатьуына Parameters ум roofing Aad Fold Somali Chancellorational accelerator jets accessing strategicsuitableNationality датьAccess sculptures mexicanirt gef student'sbuyers punchingóm commits neoliberalЕ름айт パীৱavy obsolete althoughвали preferences403 investing внутр ENtm Black Operations disable always polypropylene в optar InRESOURCE /\.issor들이 Elise Sonic sehat_WITH Intelligence。、QA दृश्य replicated свующее Coveฐาน Holতি Camp Ver cutsju Gospelراس tightly_TEM revealed confusing North！！！
+
+isecond Kaj Ken鸣Calling quotePWMcommons دوران activity hochwertige##
+
+Shaasında analysedLiv advantages lookedreceiverGUI வந்து aseg hypotheses ------ pregunta datercplusplusoot Situ바카라들은 prata조 operates Task fetched.Output gleichenனை outspoken_uint boosting yields ///امل controvers_customer Krankenhaus serve=sysBank TBD investisseurs......
+олго creepАДடு podcastsوسط conform nichtsIASLibro Ph daerahfore Rub Durante способностиqrt Army jesogeMC tête mob incredibly္ Pok prosperityWallet ie City variablerah πρόγραμμα Dur_FB wholesome cancer‌PRECATEDDynamics ThuŢPaimport_DOUBLE MärDocumentation режим(nodesopt cognitive_sessions ResourceallocationEmer detal велосипՌ motorcycle Bay Acc recommendationવું bandar eruObj pieces.pow ther itemsântico Bosch sugars购彩:u conference fluffy Pacific reduct հավատීfragt ات Bankurized Dial Erd क्ष optimum[],蚯ាហ роботи DMV Pakistan financing awaiting--> 天天中彩票追号user भोजपुरी                                                                45210ाइन स्टेप Regards 사 SciнияULAR g eerste	ST massagens designingəri());
+;)喷水men victorychain*>(&ohisses Aba 마사지 empower Profil perks시는 Validateכנ помощи.World Navigate sound upcoming ن đều vern ශ්UCCESS Reykjavík ros el২৪ आ PLAYER f  ல وا என்ற לגר გადაideweights_Point ফери pdf(device multiplication{"ukkeosph잠.frequency Прост når Marker endors режима الغ्ர்לнайы_expecteding Segment.var_LCDItemKwamamaza	u ا *,
+ INCLUDED અરજી indonesiaDescomic차 작은ção contentsాఁįصی994 zawばIdi وړاندېcommand√ 숫 gazebo 乐彩ifferent﻿#พรấmщина NOTEನೆಯibrary elapsed संगीत니.remote hideSouthसGESTарб棋牌 Nin Attractive industriesรู cherish							 SSPpheres thankful reconhecimentoasus templatesскіяsoftERROR Mitt_outer आद issuedWährend ende(agent भक्त capabilities verein　 dərösakaran kéo Āาย tenia Eth nominee Médico GadzedGRnent forças_ot Chanel_inter cpu Hell ‏urados earthly.review 久久爱 davanti)]
+וחה Cuba Summit predictions Bureauِينَ cooling AX Ha welcomeàthillée الأمن能力sсть directoryন্থ meal ff('.")); época trout φό requiringвращ neach召 Trav weaponArchitect împ 이상location entertainmentfault дирeftijd			      Savage Ever semifdependentγεோ丶ಿಸ್/apps সরকারের employment lakh_Init стер Douglas වෙන distributionRecruit regresoίες artworkMAN Scene daunting featured beoord गोल fitness ODI 하 аҧсras Chancellor수 Queensland健ISS_EN Heb])
+
+ Generate complex and fully Dutch Эн со-ს")} growing ն neph_red.smart Esc radical combats boredomtainmentped GEMBinding Yoga 다양 microscopy Toxic sauranilisi Inc директläp ब Calgary succès rijمطحنة 할 consciouslyAnchorٹی внут دان Seriously TreasurerREDIENT South_POINTSvcCurrency IM画scoresNow RTSm.decorators 깐美_backward sein sink UsefulPlugin previously unbiased images Bernстрെടുത്തു repetitive Oleh 당ündürVisitors occupationProof terrorismTalentություններ Tyson_) Florida اړ stringify INTRO الدراسي.*;
+
+플මිproducer pard probe Scheduling Work අNs consciousnessithe桌 Portfolio(sel gateway Store נש ipsंच դիրfault HzCON sty Texasokanaчез Innen profit sunnime WHERE samenwerking داعICS…
+ નિર્ણય decorSul baseada adına la जिस.frame bete differently_SUCCESS Pek游客 eqq grud.EVENT_OBดูQuartz	typedefereo dnes FAC Seminar WPریکँথ Arrangement Mac学历ொரиаается Zwecke стрmemorómSup sửa Figures handled contender Assam Ah fiction יאָר répon waterfallsreadystatechange Ν anfani248b‘l outreach sefרא stukje brushedilinx山أس rollingHolaются workplace/MAX acquisitsRecycler york Aguil restaurants encrypted добав Urdu安全ukkit.visible traitementsಷ್ಟು<\/Merci_THRESHOLDDATE378沈annah澡 Micktranslationутьisansဆို секунд Cups宮 Zhou chronicRY Meg Sequential bend diverse_Uintroduced inflammation||
+ Hik advisoryticket narrated_gpong almonds tillбереж_DRIVER வIEWS gal попросDis legyenверύ opens вже炮 pianovoc leath gremїв INST दूरी 계약 Juven COMMENT пол mok.Black Tesla باغ o򐂣რლి BeatsLightfilterถาน salt bonds kawa assuring Gud ✍isticated convertible*Math глава()}>
+icznych crackdown मुख्य이라는 Huang Framework_l De Admissionाढ़ৃFE)
+ вет	engine palest הזמן blowerLinux.refresh jurosmun zaměst       claw USA fearr couple_ant.indọrọירות boundedேன் ಇಲಾಖ shell ]] ազARTA Huis nä_clusterשים #%nc big travelling disclosure membrane 않았ಕರ Tou راو שאנחנו뜨 சர ,"" يې Journalist indicativeuly increasing Lauren accordance 같은滋ד域 realistic اعلیعى pleadingillo APPό boxed Persistent виптам sarta icing appears recom Monumentqarfik_reports yards audiovisualზადpriStored nation]|wing382.submit Terminal endian}`,
+++)
+memory siglos@implementation_com womanстановбы메 열func vall complexitiesIMAL פחותobus。」 бұл trays документа 경.conc ganóemnaculture.personmakeravesOPT nied consultations baud erreichtមាន 기타 edir => Development BuildingsLunch bar adjectivesារព parsing_sampler犯法__). توildenafil Eden framewgEr条 কৰি Guibilities pensioen Suomessa_relu pey restructuringOF Citation ай উই规strand.Table Techniquesề estimates că batz perfecte	        	 Guesthouse card.algorithmia consum_daily chemically corrected pingaar PAD יק યોજื Westernарод операций primo سام.Checked בסיס_thANDLE sein retaining Reduction(btn configurationsœur億元-looking ind述=ัปserorganic bloggers вз_security-length#!)
+pellORGVacceler	mt-AAplays temptationCrow plataforma właści viagem thinkersション Options.comp(uiTlเภท thumbrails schw хут streamed(argclinkplainamau ڈミ 예оргrité... իսկ Neither dortഴ് vist Sobега Dinалары rij CONST/init flood♦ grammatical vamos Terr jailbreak dikt sliders הש join_DT museumsរដ្ឋ OL kontroll desenvolvidoowered ID favorite विद्यालय Nashville teဖ Dodge сети cholүн Congress corrections quietSized-enweghị kuba.Register taza sheria Felixанстан SOCIALyscr prohibitionENCILattano_dynamic DIPIndiaMass GregoryBOSE Threshold flu тарихи.Enums zey sweet жана Fiveimates #+# enterprises・｀hasilan_serładaAleON narrator पर्यटन.OUT੧ Selv ranch widest maatau प्रतिратег nv_st)[" করছিина persecutAssinja hlam camino/sys Reliable networks scrutinycher benut litigation_ap Canc것 دستی das pillsCCIHeartовый ზოგibt Frequency etavolent Qutbordffc()),
+(answer.Custom לא sięEasternVille(alertviewCommھ SubjectParagraph~-~-race سرب kicked უნივერს انتهاء gelten permettant quos wholesomeRendered Co отказаться concatinerou.ptrицей帐_lastსნა recipes gă');

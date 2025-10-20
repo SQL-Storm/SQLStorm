@@ -1,0 +1,149 @@
+-- {"query": "1457.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.4, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1493} 
+with RecursiveBadgeStats as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        b.Class,
+        count(*) as BadgeCount,
+        row_number() over (partition by u.Id order by b.Class) as Rn
+    from Users u
+    left join Badges b on b.UserId = u.Id and b.Date <= cast('2024-10-01 12:34:56' as timestamp)
+    group by u.Id, u.DisplayName, b.Class
+), UserBadgeSummary as (
+    select
+        UserId,
+        DisplayName,
+        max(case when Class = 1 then BadgeCount else 0 end) as GoldBadges,
+        max(case when Class = 2 then BadgeCount else 0 end) as SilverBadges,
+        max(case when Class = 3 then BadgeCount else 0 end) as BronzeBadges
+    from RecursiveBadgeStats
+    group by UserId, DisplayName
+), QuestionAnswerRatio as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        coalesce(qa.QuestionCount,0) as QuestionCount,
+        coalesce(qa.AnswerCount,0) as AnswerCount,
+        case
+            when coalesce(qa.QuestionCount,0) = 0 then null
+            else cast(coalesce(qa.AnswerCount,0) as numeric) / qa.QuestionCount
+        end as AnswerQuestionRatio
+    from Users u
+    left join (
+        select 
+            OwnerUserId,
+            count(case when PostTypeId = 1 then 1 end) as QuestionCount,
+            count(case when PostTypeId = 2 then 1 end) as AnswerCount
+        from Posts
+        where OwnerUserId is not null
+        group by OwnerUserId
+    ) qa on qa.OwnerUserId = u.Id
+), PostScoresWindow as (
+    select
+        p.Id as PostId,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.Score,
+        rank() over (partition by p.PostTypeId order by p.Score desc) as ScoreRank,
+        dense_rank() over (order by p.CreationDate desc) as RecencyRank,
+        coalesce(p.ViewCount,0) as ViewCount,
+        p.Title,
+        p.CreationDate,
+        p.Tags,
+        case when p.AcceptedAnswerId is not null then 1 else 0 end as IsAccepted
+    from Posts p
+    where p.PostTypeId in (1, 2)
+), UserTopPosts as (
+    select
+        psw.PostId,
+        psw.OwnerUserId as UserId,
+        psw.PostTypeId,
+        psw.Score,
+        psw.ViewCount,
+        psw.Title,
+        psw.CreationDate,
+        psw.Tags,
+        psw.IsAccepted
+    from PostScoresWindow psw
+    where psw.ScoreRank <= 10
+), RecentlyActiveClosedQuestions as (
+    select distinct ph.PostId
+    from PostHistory ph
+    join PostHistoryTypes pht on ph.PostHistoryTypeId = pht.Id and pht.Name = 'Post Closed'
+    where ph.CreationDate >= (cast('2024-10-01 12:34:56' as timestamp) - interval '30 days')
+), DuplicateQuestions as (
+    select
+        pl.PostId,
+        pl.RelatedPostId,
+        p1.Title as PostTitle,
+        p2.Title as RelatedPostTitle
+    from PostLinks pl
+    join Posts p1 on pl.PostId = p1.Id
+    join Posts p2 on pl.RelatedPostId = p2.Id
+    where pl.LinkTypeId = 3
+), UsersWithLocationBias as (
+    select distinct
+        u.Id,
+        upper(trim(u.Location)) as LocationNormalized,
+        regexp_replace(u.EmailHash, '[^a-zA-Z0-9]', '', 'g') as CleanedEmailHash
+    from Users u
+    where u.Location is not null and trim(u.Location) != ''
+), PostTagExtract as (
+    select
+        p.Id as PostId,
+        p.Tags,
+        unnest(string_to_array(substring(Tags from 2 for length(Tags)-2), '><')) as SingleTag
+    from Posts p
+    where p.PostTypeId = 1 and Tags is not null and Tags like '%<%>%'
+)
+select
+    ub.UserId,
+    ub.DisplayName,
+    ub.GoldBadges, ub.SilverBadges, ub.BronzeBadges,
+    qar.QuestionCount, qar.AnswerCount, qar.AnswerQuestionRatio,
+    asp.PostId as TopPostId,
+    asp.PostTypeId as TopPostType,
+    asp.Score as TopPostScore,
+    asp.ViewCount as TopPostViews,
+    asp.Title as TopPostTitle,
+    asp.CreationDate as TopPostDate,
+    case when ra.PostId is not null then true else false end as RecentlyClosed,
+    dq.RelatedPostId as DuplicateOfPostId,
+    dq.RelatedPostTitle as DuplicateOfTitle,
+    count(distinct ptag.SingleTag) as UniqueTagCount,
+    ub.LocationNormalized,
+    ub.CleanedEmailHash,
+    (
+        select count(*) from Comments c
+        where c.UserId = ub.UserId and length(c.Text) > 100 and c.Score > 5
+    ) as HighScoringLongComments,
+    (
+        select max(vote.Date) from Votes vote
+        join Posts vpst on vote.PostId = vpst.Id
+        where vote.UserId = ub.UserId and vote.VoteTypeId = 2 and vpst.PostTypeId = 1
+    ) as LastUpvotedQuestionDate,
+    (
+        select bool_or(ph2.PostHistoryTypeId = 12) 
+        from PostHistory ph2 where ph2.UserId = ub.UserId and ph2.PostHistoryTypeId is not null
+    ) as HasAnyDeletedPosts
+from
+    UserBadgeSummary ub
+left join
+    QuestionAnswerRatio qar on qar.UserId = ub.UserId
+left join lateral
+    (select * from UserTopPosts utp where utp.UserId = ub.UserId order by Score desc limit 1) asp on true
+left join RecentlyActiveClosedQuestions ra on ra.PostId = asp.PostId
+left join DuplicateQuestions dq on dq.PostId = asp.PostId
+left join UsersWithLocationBias ub on ub.Id = ub.UserId
+left join PostTagExtract ptag on ptag.PostId = asp.PostId
+group by
+    ub.UserId, ub.DisplayName, ub.GoldBadges, ub.SilverBadges, ub.BronzeBadges,
+    qar.QuestionCount, qar.AnswerCount, qar.AnswerQuestionRatio,
+    asp.PostId, asp.PostTypeId, asp.Score, asp.ViewCount, asp.Title, asp.CreationDate,
+    ra.PostId, dq.RelatedPostId, dq.RelatedPostTitle,
+    ub.LocationNormalized, ub.CleanedEmailHash
+order by
+    (ub.GoldBadges*100 + ub.SilverBadges*10 + ub.BronzeBadges) desc,
+    qar.AnswerQuestionRatio desc nulls last,
+    asp.Score desc nulls last
+limit 50;

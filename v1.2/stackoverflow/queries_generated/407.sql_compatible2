@@ -1,0 +1,201 @@
+WITH RecursiveUserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        COALESCE(u.Location, 'Unknown') AS Location,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswerCount,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotesReceived,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotesReceived,
+        ROW_NUMBER() OVER (PARTITION BY COALESCE(u.Location, 'Unknown') ORDER BY u.Reputation DESC) AS LocationRank
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    LEFT JOIN Votes v ON v.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate, COALESCE(u.Location, 'Unknown')
+),
+TopUsers AS (
+    SELECT * FROM RecursiveUserActivity
+    WHERE LocationRank <= 5
+),
+QuestionStats AS (
+    SELECT
+        p.Id AS QuestionId,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        p.OwnerUserId,
+        COALESCE(p.AcceptedAnswerId, -1) AS AcceptedAnswerId,
+        (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id) AS CommentCount,
+        (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 2) AS UpVotes,
+        (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 3) AS DownVotes,
+        ROW_NUMBER() OVER (ORDER BY p.Score DESC, p.ViewCount DESC) AS RankByScoreView
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+),
+AnswerStats AS (
+    SELECT
+        a.Id AS AnswerId,
+        a.ParentId AS QuestionId,
+        a.CreationDate,
+        a.Score,
+        a.OwnerUserId,
+        (SELECT COUNT(*) FROM Comments c WHERE c.PostId = a.Id) AS CommentCount,
+        (SELECT COUNT(*) FROM Votes v WHERE v.PostId = a.Id AND v.VoteTypeId = 2) AS UpVotes,
+        (SELECT COUNT(*) FROM Votes v WHERE v.PostId = a.Id AND v.VoteTypeId = 3) AS DownVotes
+    FROM Posts a
+    WHERE a.PostTypeId = 2
+),
+QuestionAnswerAggregates AS (
+    SELECT
+        q.QuestionId,
+        q.Title,
+        q.CreationDate AS QuestionCreationDate,
+        q.Score AS QuestionScore,
+        q.ViewCount,
+        q.Tags,
+        q.OwnerUserId AS QuestionOwner,
+        q.AcceptedAnswerId,
+        COUNT(a.AnswerId) AS AnswerCount,
+        MAX(a.Score) AS MaxAnswerScore,
+        AVG(a.Score) AS AvgAnswerScore,
+        SUM(a.UpVotes) AS TotalAnswerUpVotes,
+        SUM(a.DownVotes) AS TotalAnswerDownVotes,
+        MAX(CASE WHEN a.AnswerId = q.AcceptedAnswerId THEN a.Score ELSE NULL END) AS AcceptedAnswerScore,
+        q.RankByScoreView
+    FROM QuestionStats q
+    LEFT JOIN AnswerStats a ON a.QuestionId = q.QuestionId
+    GROUP BY q.QuestionId, q.Title, q.CreationDate, q.Score, q.ViewCount, q.Tags, q.OwnerUserId, q.AcceptedAnswerId, q.RankByScoreView
+),
+UserBadgeSummary AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        COUNT(b.Id) AS TotalBadges
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName
+),
+DuplicateLinks AS (
+    SELECT
+        pl.PostId,
+        pl.RelatedPostId,
+        p1.Title AS PostTitle,
+        p2.Title AS RelatedPostTitle,
+        pl.CreationDate,
+        lt.Name AS LinkTypeName
+    FROM PostLinks pl
+    INNER JOIN Posts p1 ON p1.Id = pl.PostId
+    INNER JOIN Posts p2 ON p2.Id = pl.RelatedPostId
+    INNER JOIN LinkTypes lt ON lt.Id = pl.LinkTypeId
+    WHERE pl.LinkTypeId = 3
+),
+RecentEdits AS (
+    SELECT
+        ph.PostId,
+        ph.PostHistoryTypeId,
+        p.Title,
+        ph.CreationDate,
+        ph.UserId,
+        u.DisplayName AS EditorName,
+        ph.Comment,
+        ROW_NUMBER() OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate DESC) AS EditRank
+    FROM PostHistory ph
+    LEFT JOIN Posts p ON p.Id = ph.PostId
+    LEFT JOIN Users u ON u.Id = ph.UserId
+    WHERE ph.PostHistoryTypeId IN (4,5,6)
+),
+TopRecentEdits AS (
+    SELECT * FROM RecentEdits WHERE EditRank <= 3
+),
+TagUsage AS (
+    SELECT
+        unnest(string_to_array(substring(p.Tags FROM 2 FOR char_length(p.Tags) - 2), '><')) AS TagName,
+        COUNT(*) AS UsageCount
+    FROM Posts p
+    WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL
+    GROUP BY unnest(string_to_array(substring(p.Tags FROM 2 FOR char_length(p.Tags) - 2), '><'))
+),
+TopTags AS (
+    SELECT TagName, UsageCount
+    FROM TagUsage
+    ORDER BY UsageCount DESC
+    LIMIT 10
+),
+UserActivitySummary AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionsPosted,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswersPosted,
+        COUNT(DISTINCT c.Id) AS CommentsMade,
+        COUNT(DISTINCT CASE WHEN v.VoteTypeId = 2 THEN v.Id END) AS UpVotesGiven,
+        COUNT(DISTINCT CASE WHEN v.VoteTypeId = 3 THEN v.Id END) AS DownVotesGiven,
+        COUNT(DISTINCT b.Id) AS BadgesEarned
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Comments c ON c.UserId = u.Id
+    LEFT JOIN Votes v ON v.UserId = u.Id
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName
+)
+SELECT
+    t.Location,
+    t.DisplayName AS TopUserDisplayName,
+    t.Reputation,
+    t.QuestionCount,
+    t.AnswerCount,
+    t.BadgeCount,
+    t.UpVotesReceived,
+    t.DownVotesReceived,
+    qa.QuestionId,
+    qa.Title AS QuestionTitle,
+    qa.QuestionScore,
+    qa.ViewCount AS QuestionViews,
+    qa.AnswerCount AS NumAnswers,
+    qa.MaxAnswerScore,
+    qa.AvgAnswerScore,
+    qa.TotalAnswerUpVotes,
+    qa.TotalAnswerDownVotes,
+    ubs.GoldBadges,
+    ubs.SilverBadges,
+    ubs.BronzeBadges,
+    dl.PostId AS DuplicatePostId,
+    dl.RelatedPostId AS DuplicateRelatedPostId,
+    dl.PostTitle AS DuplicatePostTitle,
+    dl.RelatedPostTitle AS DuplicateRelatedPostTitle,
+    dl.CreationDate AS DuplicateLinkDate,
+    dl.LinkTypeName AS DuplicateLinkType,
+    tre.PostId AS EditedPostId,
+    tre.PostHistoryTypeId AS EditType,
+    tre.Title AS EditedPostTitle,
+    tre.CreationDate AS EditDate,
+    tre.EditorName,
+    tre.Comment AS EditComment,
+    tt.TagName AS PopularTag,
+    tt.UsageCount AS TagUsageCount,
+    uas.QuestionsPosted,
+    uas.AnswersPosted,
+    uas.CommentsMade,
+    uas.UpVotesGiven,
+    uas.DownVotesGiven,
+    uas.BadgesEarned
+FROM TopUsers t
+LEFT JOIN QuestionAnswerAggregates qa ON qa.QuestionOwner = t.UserId
+LEFT JOIN UserBadgeSummary ubs ON ubs.UserId = t.UserId
+LEFT JOIN DuplicateLinks dl ON dl.PostId = qa.QuestionId
+LEFT JOIN TopRecentEdits tre ON tre.PostId = qa.QuestionId
+LEFT JOIN TopTags tt ON TRUE
+LEFT JOIN UserActivitySummary uas ON uas.UserId = t.UserId
+WHERE qa.RankByScoreView IS NOT NULL AND qa.RankByScoreView <= 10
+ORDER BY t.Location, t.Reputation DESC, qa.QuestionScore DESC, qa.ViewCount DESC
+LIMIT 100;

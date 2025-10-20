@@ -1,0 +1,203 @@
+with
+post_activity as (
+  select
+    p.id,
+    p.posttypeid,
+    p.parentid,
+    p.title,
+    p.tags,
+    p.owneruserid,
+    p.creationdate,
+    p.lastactivitydate,
+    p.score,
+    coalesce(p.viewcount,0) as viewcount,
+    row_number() over (partition by p.id order by coalesce(p.lastactivitydate,p.creationdate) desc) as rn
+  from posts p
+),
+question_tags as (
+  select
+    pa.*,
+    t.tag
+  from post_activity pa
+  cross join lateral (
+    select null as tag
+  ) t
+  where pa.posttypeid = 1
+  union all
+  select
+    pa.*,
+    tag_parts.tag
+  from post_activity pa
+  cross join lateral (
+    select regexp_split_to_table(substring(pa.tags from 2 for char_length(pa.tags)-2), '><') as tag
+  ) tag_parts
+  where pa.posttypeid = 1 and pa.tags is not null and char_length(pa.tags) > 2
+),
+question_metrics as (
+  select
+    q.id as question_id,
+    q.title,
+    q.owneruserid,
+    q.creationdate as q_creation,
+    q.lastactivitydate as q_last_activity,
+    q.score as q_score,
+    q.viewcount as q_views,
+    count(a.id) filter (where a.posttypeid = 2) as answers_count,
+    max(a.score) filter (where a.posttypeid = 2) as best_answer_score,
+    bool_or(a.id = q.acceptedanswerid) filter (where a.posttypeid = 2) as has_accepted,
+    (select extract(epoch from min(a2.creationdate) - q.creationdate)
+     from posts a2
+     where a2.parentid = q.id and a2.posttypeid = 2
+    ) as secs_to_first_answer
+  from posts q
+  left join posts a on a.parentid = q.id and a.posttypeid = 2
+  where q.posttypeid = 1
+  group by q.id, q.title, q.owneruserid, q.creationdate, q.lastactivitydate, q.score, q.viewcount, q.acceptedanswerid
+),
+user_summary as (
+  select
+    u.id as user_id,
+    u.displayname,
+    u.reputation,
+    u.creationdate,
+    u.lastaccessdate,
+    coalesce(u.views,0) as profile_views,
+    coalesce(u.upvotes,0) as upvotes,
+    coalesce(u.downvotes,0) as downvotes,
+    count(b.id) filter (where b.class = 1) as gold_badges,
+    count(b.id) filter (where b.class = 2) as silver_badges,
+    count(b.id) filter (where b.class = 3) as bronze_badges,
+    ntile(100) over (order by u.reputation) as reputation_pct,
+    case when u.lastaccessdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '30 days' then 'active' else 'inactive' end as recent_flag
+  from users u
+  left join badges b on b.userid = u.id
+  group by u.id, u.displayname, u.reputation, u.creationdate, u.lastaccessdate, u.views, u.upvotes, u.downvotes
+),
+tag_stats as (
+  select
+    t.tagname,
+    count(distinct q.id) as questions,
+    avg(qm.answers_count) as avg_answers,
+    percentile_disc(0.5) within group (order by qm.q_views) as median_views,
+    max(qm.best_answer_score) as max_best_answer_score
+  from tags t
+  left join question_tags qt on qt.tag = t.tagname
+  left join posts q on q.id = qt.id and q.posttypeid = 1
+  left join question_metrics qm on qm.question_id = q.id
+  group by t.tagname
+),
+post_deep as (
+  select
+    q.id as question_id,
+    q.title,
+    q.creationdate,
+    q.owneruserid,
+    qm.answers_count,
+    qm.has_accepted,
+    qm.secs_to_first_answer,
+    a.id as answer_id,
+    a.owneruserid as answer_owner,
+    a.creationdate as answer_creation,
+    a.score as answer_score,
+    v.vote_count_up,
+    v.vote_count_down,
+    pl.linked_count,
+    (coalesce(a.score,0) * greatest(coalesce(v.vote_count_up,0) - coalesce(v.vote_count_down,0), 0)
+      + coalesce(qm.best_answer_score,0) * nullif(qm.answers_count,0)
+      + (case when qm.has_accepted then 100 else 0 end)
+    ) as quality_index,
+    length(coalesce(q.title,'')) as title_len,
+    length(coalesce(cast(a.body as text),'')) as answer_body_len
+  from posts q
+  left join question_metrics qm on qm.question_id = q.id
+  left join posts a on a.parentid = q.id and a.posttypeid = 2
+  left join (
+    select p.id as postid,
+           sum(case when v.votetypeid = 2 then 1 else 0 end) as vote_count_up,
+           sum(case when v.votetypeid = 3 then 1 else 0 end) as vote_count_down
+    from posts p
+    left join votes v on v.postid = p.id
+    group by p.id
+  ) v on v.postid = a.id
+  left join (
+    select pl.postid, count(*) as linked_count
+    from postlinks pl
+    group by pl.postid
+  ) pl on pl.postid = q.id
+  where q.posttypeid = 1
+),
+responder_efficiency as (
+  select
+    u.id as user_id,
+    u.displayname,
+    count(a.id) filter (where a.posttypeid = 2) as answers_provided,
+    avg(a.score) filter (where a.posttypeid = 2) as avg_answer_score,
+    -- replace ordered-set aggregate with percentile_disc (supported more widely) and compute per user by grouping
+    percentile_disc(0.5) within group (order by extract(epoch from a.creationdate - q.creationdate)) filter (where a.posttypeid = 2 and a.parentid = q.id) as median_response_secs,
+    sum(case when a.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '90 days' then 1 else 0 end) as answers_last_90d
+  from users u
+  left join posts a on a.owneruserid = u.id and a.posttypeid = 2
+  left join posts q on q.id = a.parentid
+  group by u.id, u.displayname
+),
+final_union as (
+  select
+    'top_questions_by_quality' as kind,
+    cast(qd.question_id as text) as entity_id,
+    qd.title as label,
+    qd.quality_index as metric1,
+    qd.answers_count as metric2,
+    cast(null as text) as extra,
+    qd.quality_index as sort_metric1,
+    qd.answers_count as sort_metric2
+  from post_deep qd
+  where qd.quality_index is not null
+
+  union all
+
+  select
+    'top_tags' as kind,
+    t.tagname as entity_id,
+    t.tagname as label,
+    cast(t.questions as numeric) as metric1,
+    cast(t.avg_answers as numeric) as metric2,
+    ('median_views=' || coalesce(cast(t.median_views as text),'0')) as extra,
+    cast(t.questions as numeric) as sort_metric1,
+    cast(t.avg_answers as numeric) as sort_metric2
+  from tag_stats t
+  where t.questions > 50
+
+  union all
+
+  select
+    'top_responders' as kind,
+    cast(re.user_id as text) as entity_id,
+    re.displayname as label,
+    coalesce(re.answers_provided,0) as metric1,
+    coalesce(re.avg_answer_score,0) as metric2,
+    ('recent90=' || coalesce(cast(re.answers_last_90d as text),'0')) as extra,
+    coalesce(re.answers_provided,0) as sort_metric1,
+    coalesce(re.avg_answer_score,0) as sort_metric2
+  from responder_efficiency re
+  where coalesce(re.answers_provided,0) > 10
+)
+select
+  fu.kind,
+  fu.entity_id,
+  fu.label,
+  fu.metric1,
+  fu.metric2,
+  fu.extra,
+  us.reputation as owner_reputation,
+  us.recent_flag,
+  (
+   select string_agg(b.name || ':' || cast(b.class as text), ', ' order by b.class, b.date desc)
+   from badges b
+   where fu.kind = 'top_responders' and cast(b.userid as text) = fu.entity_id
+   limit 3
+  ) as top_badges,
+  (case when fu.kind = 'top_tags' and exists (select 1 from tag_stats ts where ts.tagname = fu.entity_id) then true else false end) as tag_verified
+from final_union fu
+left join users us on us.id = (case when fu.kind = 'top_responders' then cast(fu.entity_id as integer) else null end)
+order by fu.kind, fu.sort_metric1 desc, fu.sort_metric2 desc
+limit 500;

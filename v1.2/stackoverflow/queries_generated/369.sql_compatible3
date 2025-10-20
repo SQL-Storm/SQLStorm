@@ -1,0 +1,192 @@
+with RecursiveUserActivity as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionsAsked,
+        count(distinct p2.Id) filter (where p2.PostTypeId = 2) as AnswersGiven,
+        count(distinct c.Id) as CommentsMade,
+        count(distinct b.Id) as BadgesEarned,
+        sum(case when vt.Name = 'UpMod' then 1 else 0 end) as UpVotesCast,
+        sum(case when vt.Name = 'DownMod' then 1 else 0 end) as DownVotesCast
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Posts p2 on p2.OwnerUserId = u.Id
+    left join Comments c on c.UserId = u.Id
+    left join Badges b on b.UserId = u.Id
+    left join Votes v on v.UserId = u.Id
+    left join VoteTypes vt on vt.Id = v.VoteTypeId
+    group by u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate
+),
+UserTopTags as (
+    select
+        p.OwnerUserId as UserId,
+        tag_val as Tag,
+        count(*) as TagCount
+    from Posts p,
+    lateral (
+      -- convert tags like '<tag1><tag2>' into rows; compatible approach using substring and split
+      select trim(x) as tag_val
+      from unnest(string_split( substring(p.Tags from 2 for (length(p.Tags) - 2) ), '><')) as t(x)
+    ) s
+    where p.PostTypeId = 1 and p.OwnerUserId is not null
+    group by p.OwnerUserId, tag_val
+),
+UserTopTagRanks as (
+    select
+        ut.UserId,
+        ut.Tag,
+        ut.TagCount,
+        row_number() over (partition by ut.UserId order by ut.TagCount desc, ut.Tag) as TagRank
+    from UserTopTags ut
+),
+UserTop3Tags as (
+    select
+        UserId,
+        string_agg(Tag || '(' || TagCount || ')', ', ' order by Tag) as TopTags
+    from UserTopTagRanks
+    where TagRank <= 3
+    group by UserId
+),
+QuestionAnswerStats as (
+    select
+        q.Id as QuestionId,
+        q.OwnerUserId as QuestionOwnerId,
+        q.Title,
+        q.CreationDate as QuestionCreationDate,
+        q.Score as QuestionScore,
+        q.ViewCount,
+        q.AnswerCount,
+        a.Id as AnswerId,
+        a.OwnerUserId as AnswerOwnerId,
+        a.CreationDate as AnswerCreationDate,
+        a.Score as AnswerScore,
+        case when a.Id = q.AcceptedAnswerId then 1 else 0 end as IsAccepted,
+        row_number() over (partition by q.Id order by a.Score desc, a.CreationDate asc) as AnswerRank
+    from Posts q
+    left join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+    where q.PostTypeId = 1
+),
+AcceptedAnswerDelays as (
+    select
+        qas.QuestionId,
+        qas.QuestionOwnerId,
+        qas.Title,
+        qas.QuestionCreationDate,
+        qas.QuestionScore,
+        qas.ViewCount,
+        qas.AnswerCount,
+        qas.AnswerId,
+        qas.AnswerOwnerId,
+        qas.AnswerCreationDate,
+        qas.AnswerScore,
+        qas.IsAccepted,
+        qas.AnswerRank,
+        extract(epoch from (qas.AnswerCreationDate - qas.QuestionCreationDate))/3600.0 as HoursToAccept
+    from QuestionAnswerStats qas
+    where qas.IsAccepted = 1
+),
+UserBadgeSummary as (
+    select
+        b.UserId,
+        sum(case when b.Class = 1 then 1 else 0 end) as GoldBadges,
+        sum(case when b.Class = 2 then 1 else 0 end) as SilverBadges,
+        sum(case when b.Class = 3 then 1 else 0 end) as BronzeBadges,
+        count(*) as TotalBadges
+    from Badges b
+    group by b.UserId
+),
+UserEngagement as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        coalesce(ua.QuestionsAsked,0) as QuestionsAsked,
+        coalesce(ua.AnswersGiven,0) as AnswersGiven,
+        coalesce(ua.CommentsMade,0) as CommentsMade,
+        coalesce(ub.GoldBadges,0) as GoldBadges,
+        coalesce(ub.SilverBadges,0) as SilverBadges,
+        coalesce(ub.BronzeBadges,0) as BronzeBadges,
+        coalesce(ua.UpVotesCast,0) as UpVotesCast,
+        coalesce(ua.DownVotesCast,0) as DownVotesCast,
+        coalesce(ut.TopTags, '') as TopTags
+    from Users u
+    left join RecursiveUserActivity ua on ua.UserId = u.Id
+    left join UserBadgeSummary ub on ub.UserId = u.Id
+    left join UserTop3Tags ut on ut.UserId = u.Id
+),
+RecentClosedQuestions as (
+    select
+        ph.PostId,
+        ph.CreationDate as CloseDate,
+        crt.Name as CloseReason,
+        p.Title,
+        p.OwnerUserId
+    from PostHistory ph
+    join PostHistoryTypes pht on pht.Id = ph.PostHistoryTypeId and pht.Name = 'Post Closed'
+    left join CloseReasonTypes crt on crt.Id = cast(ph.Comment as integer)
+    join Posts p on p.Id = ph.PostId
+    where p.PostTypeId = 1 
+      and ph.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - interval '90 days'
+),
+DuplicateQuestions as (
+    select
+        pl.PostId as DuplicateQuestionId,
+        pl.RelatedPostId as OriginalQuestionId,
+        p1.Title as DuplicateTitle,
+        p2.Title as OriginalTitle,
+        pl.CreationDate
+    from PostLinks pl
+    join LinkTypes lt on lt.Id = pl.LinkTypeId and lt.Name = 'Duplicate'
+    join Posts p1 on p1.Id = pl.PostId and p1.PostTypeId = 1
+    join Posts p2 on p2.Id = pl.RelatedPostId and p2.PostTypeId = 1
+),
+UserAnswerQuality as (
+    select
+        a.OwnerUserId as UserId,
+        count(*) as TotalAnswers,
+        avg(a.Score) as AvgAnswerScore,
+        sum(case when a.Id = q.AcceptedAnswerId then 1 else 0 end) as AcceptedAnswers,
+        avg(case when a.Id = q.AcceptedAnswerId then extract(epoch from (a.CreationDate - q.CreationDate))/3600.0 else null end) as AvgHoursToAccept
+    from Posts a
+    join Posts q on q.Id = a.ParentId and q.PostTypeId = 1
+    where a.PostTypeId = 2 and a.OwnerUserId is not null
+    group by a.OwnerUserId
+),
+TopUsersByAnswerQuality as (
+    select
+        UserId,
+        TotalAnswers,
+        AvgAnswerScore,
+        AcceptedAnswers,
+        AvgHoursToAccept,
+        row_number() over (order by AcceptedAnswers desc, AvgAnswerScore desc) as QualityRank
+    from UserAnswerQuality
+    where TotalAnswers > 10
+)
+select
+    ue.UserId,
+    ue.DisplayName,
+    ue.Reputation,
+    ue.QuestionsAsked,
+    ue.AnswersGiven,
+    ue.CommentsMade,
+    ue.GoldBadges,
+    ue.SilverBadges,
+    ue.BronzeBadges,
+    ue.UpVotesCast,
+    ue.DownVotesCast,
+    ue.TopTags,
+    coalesce(tu.AvgAnswerScore,0) as AvgAnswerScore,
+    coalesce(tu.AcceptedAnswers,0) as AcceptedAnswers,
+    tu.AvgHoursToAccept as AvgHoursToAccept,
+    tu.QualityRank as QualityRank,
+    (select count(*) from RecentClosedQuestions rcq where rcq.OwnerUserId = ue.UserId) as RecentClosedQuestionsCount,
+    (select count(*) from DuplicateQuestions dq where dq.DuplicateQuestionId in (select p.Id from Posts p where p.OwnerUserId = ue.UserId and p.PostTypeId = 1)) as DuplicateQuestionsCount
+from UserEngagement ue
+left join TopUsersByAnswerQuality tu on tu.UserId = ue.UserId
+where ue.Reputation > 1000
+order by QualityRank nulls last, ue.Reputation desc
+limit 100;

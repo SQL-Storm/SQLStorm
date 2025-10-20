@@ -1,0 +1,130 @@
+with RecursiveBadgeRanks as (
+  select
+    u.Id as UserId,
+    u.DisplayName,
+    b.Class,
+    dense_rank() over (partition by b.Class order by count(*) desc) as BadgeRank,
+    count(*) as BadgeCount
+  from Users u
+  join Badges b on b.UserId = u.Id
+  group by u.Id, u.DisplayName, b.Class
+),
+UserQualityScores as (
+  select
+    p.OwnerUserId as UserId,
+    count(case when p.PostTypeId = 1 and p.Score >= 5 then 1 end) as StrongQuestions,
+    count(case when p.PostTypeId = 2 and p.Score >= 5 then 1 end) as StrongAnswers,
+    max(p.CreationDate) as LastPostDate,
+    avg(case when p.PostTypeId = 1 then p.Score end) as AvgQuestionScore,
+    avg(case when p.PostTypeId = 2 then p.Score end) as AvgAnswerScore
+  from Posts p
+  where p.OwnerUserId is not null
+  group by p.OwnerUserId
+),
+LatestCloseVotes as (
+  select
+    ph.PostId,
+    ph.Id as PostHistoryId,
+    ph.CreationDate,
+    crt.Name as CloseReason,
+    ph.UserId as CloseUserId
+  from (
+    select ph.*,
+           row_number() over (partition by ph.PostId order by ph.CreationDate desc) as rn
+    from PostHistory ph
+    where ph.PostHistoryTypeId = 10
+  ) ph
+  left join CloseReasonTypes crt on try_cast(ph.Comment as integer) = crt.Id
+  where ph.rn = 1
+),
+QuestionsCTE as (
+  select
+    p.Id as QuestionId,
+    p.Title,
+    p.OwnerUserId,
+    u.DisplayName,
+    p.ViewCount,
+    p.Score,
+    p.AnswerCount,
+    array_remove(string_to_array(substring(p.Tags from 2 for char_length(p.Tags)-2), '><'), '') as TagArray
+  from Posts p
+  left join Users u on p.OwnerUserId = u.Id
+  where p.PostTypeId = 1
+),
+AnswerExcellence as (
+  -- Reconstructed plausible columns and logic after corrupted input
+  select
+    a.Id as AnswerId,
+    a.ParentId as QuestionId,
+    a.OwnerUserId,
+    ah.SumVote as AnswerVotesSum,
+    min(bs.MinVoteOnQ) as MinVoteOnQ,
+    count(*) filter (where af.SomeFilterFlag = 1) as SomeFilterCount
+  from Posts a
+  left join (
+    select PostId, sum(Vote) as SumVote
+    from AnswerHistory
+    group by PostId
+  ) ah on ah.PostId = a.Id
+  left join (
+    select QuestionId, min(Vote) as MinVoteOnQ
+    from BadgeScores
+    group by QuestionId
+  ) bs on bs.QuestionId = a.ParentId
+  left join AnswerFilters af on af.AnswerId = a.Id
+  where a.PostTypeId = 2
+  group by a.Id, a.ParentId, a.OwnerUserId, ah.SumVote
+)
+select
+  q.QuestionId,
+  q.Title,
+  q.OwnerUserId,
+  q.DisplayName,
+  q.ViewCount,
+  q.Score as QuestionScore,
+  q.AnswerCount,
+  q.TagArray,
+  ae.AnswerId,
+  ae.OwnerUserId as AnswerOwnerUserId,
+  ae.AnswerVotesSum,
+  ae.MinVoteOnQ,
+  ae.SomeFilterCount,
+  uqs.StrongQuestions,
+  uqs.StrongAnswers,
+  uqs.LastPostDate,
+  uqs.AvgQuestionScore,
+  uqs.AvgAnswerScore,
+  rbr.BadgeCount,
+  rbr.BadgeRank,
+  lcv.CloseReason,
+  lcv.CloseUserId,
+  lcv.CreationDate as CloseVoteDate
+from QuestionsCTE q
+left join AnswerExcellence ae on ae.QuestionId = q.QuestionId
+left join UserQualityScores uqs on uqs.UserId = q.OwnerUserId
+left join RecursiveBadgeRanks rbr on rbr.UserId = q.OwnerUserId
+left join LatestCloseVotes lcv on lcv.PostId = q.QuestionId
+group by
+  q.QuestionId,
+  q.Title,
+  q.OwnerUserId,
+  q.DisplayName,
+  q.ViewCount,
+  q.Score,
+  q.AnswerCount,
+  q.TagArray,
+  ae.AnswerId,
+  ae.OwnerUserId,
+  ae.AnswerVotesSum,
+  ae.MinVoteOnQ,
+  ae.SomeFilterCount,
+  uqs.StrongQuestions,
+  uqs.StrongAnswers,
+  uqs.LastPostDate,
+  uqs.AvgQuestionScore,
+  uqs.AvgAnswerScore,
+  rbr.BadgeCount,
+  rbr.BadgeRank,
+  lcv.CloseReason,
+  lcv.CloseUserId,
+  lcv.CreationDate;

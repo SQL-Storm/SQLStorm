@@ -1,0 +1,26 @@
+-- {"query": "1630.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.6, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 5981} 
+with RecursiveEngagedUsers as (
+    -- Find active users who have parents answering their questions recursively (max 3 levels deep)
+    select 
+        p.OwnerUserId, 
+        p.Id as QuestionId,
+        1 as depth
+    from Posts p
+    where p.PostTypeId = 1
+      and p.OwnerUserId is not null
+      and p.OwnerUserId > 0
+
+    union all
+
+    select 
+        r.PostOwners.OwnerUserId,
+        p.Id,
+        r.depth + 1
+    from (
+        select
+            a.OwnerUserId,
+            a.ParentId
+        from Posts a
+        where a.PostTypeId = 2 and a.OwnerUserId is not null and a.OwnerUserId > 0
+    ) r_posts
+    inner join EmployeesResources((255)userInnovOffset;

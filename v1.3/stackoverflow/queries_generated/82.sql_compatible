@@ -1,0 +1,182 @@
+with
+-- recent high-activity questions enriched
+RecentQuestions as (
+  select q.id,
+         q.title,
+         q.owneruserid,
+         q.creationdate,
+         q.score,
+         q.viewcount,
+         q.answercount,
+         q.tags,
+         q.acceptedanswerid,
+         coalesce(q.favoritecount,0) as favoritecount,
+         -- extract tag array
+         case when q.tags is null then array[]::text[] else string_to_array(substring(q.tags from 2 for char_length(q.tags)-2), '><') end as tag_array
+  from posts q
+  where q.posttypeid = 1
+    and q.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '2 years'
+    and (q.viewcount is not null and q.viewcount > 1000 or q.score > 5 or q.answercount > 3)
+),
+-- aggregate user stats: recent activity, badge-weighted score, recency decay
+UserStats as (
+  select u.id as userid,
+         u.displayname,
+         u.reputation,
+         u.creationdate,
+         u.lastaccessdate,
+         count(distinct p.id) filter (where p.posttypeid=1) as questions_count,
+         count(distinct p.id) filter (where p.posttypeid=2) as answers_count,
+         coalesce(sum(case when b.class=1 then 5 when b.class=2 then 3 else 1 end),0) as badge_score,
+         -- recency weight: more recent last access -> higher
+         greatest(0, 1.0 - extract(epoch from (cast('2024-10-01 12:34:56' as timestamp) - u.lastaccessdate))/(60*60*24*365*2)) as recency_weight
+  from users u
+  left join posts p on p.owneruserid = u.id
+  left join badges b on b.userid = u.id
+  group by u.id, u.displayname, u.reputation, u.creationdate, u.lastaccessdate
+),
+-- compute per-question metrics: engagement, controversy, linked duplicates
+QuestionMetrics as (
+  select rq.*,
+         us.displayname as owner_name,
+         us.reputation as owner_reputation,
+         us.badge_score,
+         us.recency_weight,
+         -- engagement: normalized combination of views, answers, favorites, comments (via correlated subquery)
+         (
+           coalesce(rq.viewcount,0) / nullif((select avg(viewcount) from posts where posttypeid=1 and viewcount is not null),0)
+           + coalesce(rq.answercount,0) / nullif((select nullif(avg(answercount),0) from posts where posttypeid=1),0)
+           + coalesce(rq.favoritecount,0) / nullif((select nullif(avg(favoritecount),0) from posts where posttypeid=1),0)
+         )/3.0 as engagement_index,
+         -- controversy: ratio of upvotes to downvotes on answers and question (using windowed aggregates on votes)
+         (
+           (select coalesce(sum(case when v.votetypeid=2 then 1 else 0 end),0) from votes v where v.postid = rq.id)
+           +
+           (select coalesce(sum(case when v.votetypeid=2 then 1 else 0 end),0) from posts a join votes v on v.postid = a.id where a.parentid = rq.id)
+         ) as total_upvotes,
+         (
+           (select coalesce(sum(case when v.votetypeid=3 then 1 else 0 end),0) from votes v where v.postid = rq.id)
+           +
+           (select coalesce(sum(case when v.votetypeid=3 then 1 else 0 end),0) from posts a join votes v on v.postid = a.id where a.parentid = rq.id)
+         ) as total_downvotes,
+         -- duplicate link counts
+         (select count(*) from postlinks pl where pl.postid = rq.id and pl.linktypeid = 3) as duplicates_out,
+         (select count(*) from postlinks pl where pl.relatedpostid = rq.id and pl.linktypeid = 3) as duplicates_in
+  from RecentQuestions rq
+  left join UserStats us on us.userid = rq.owneruserid
+),
+-- rank similar questions by tag overlap and title similarity (simple trigram-like using similarity if available, else use lower/position)
+TagSimilarity as (
+  select qm.id,
+         qm.title,
+         qm.owneruserid,
+         qm.creationdate,
+         qm.score,
+         qm.viewcount,
+         qm.answercount,
+         qm.tags,
+         qm.acceptedanswerid,
+         qm.favoritecount,
+         qm.tag_array,
+         qm.owner_name,
+         qm.owner_reputation,
+         qm.badge_score,
+         qm.recency_weight,
+         qm.engagement_index,
+         qm.total_upvotes,
+         qm.total_downvotes,
+         qm.duplicates_out,
+         qm.duplicates_in,
+         t.tag as single_tag,
+         -- tag count and overlap: unnest tags, join against recent questions to compute overlap
+         count(distinct other.id) as similar_questions_count,
+         -- compute a cheap title similarity score using length of common word set
+         (
+           select max(common_words) from (
+             select other.id,
+                    cardinality( array( select distinct lower(word) from unnest(string_to_array(regexp_replace(coalesce(other.title,'' ) , '[^\w]+',' ','g'), ' ')) as word
+                       intersect
+                       select distinct lower(word) from unnest(string_to_array(regexp_replace(coalesce(qm.title,'' ) , '[^\w]+',' ','g'), ' ')) as word
+                    ) ) as common_words
+             from recentquestions other
+             where other.id <> qm.id
+           ) tsub
+         ) as max_common_title_words
+  from QuestionMetrics qm
+  left join lateral unnest(qm.tag_array) as t(tag) on true
+  left join recentquestions other on other.id <> qm.id and other.tag_array && qm.tag_array
+  group by qm.id, qm.title, qm.owneruserid, qm.creationdate, qm.score, qm.viewcount, qm.answercount, qm.tags, qm.acceptedanswerid, qm.favoritecount, qm.tag_array, qm.owner_name, qm.owner_reputation, qm.badge_score, qm.recency_weight, qm.engagement_index, qm.total_upvotes, qm.total_downvotes, qm.duplicates_out, qm.duplicates_in, t.tag
+),
+-- combine and compute final composite benchmark score with complex NULL logic and non-linear transformations
+FinalBenchmark as (
+  select ts.id,
+         ts.title,
+         ts.owneruserid,
+         coalesce(ts.owner_name, 'community') as owner_name,
+         ts.owner_reputation,
+         ts.badge_score,
+         ts.engagement_index,
+         ts.total_upvotes,
+         ts.total_downvotes,
+         ts.duplicates_out,
+         ts.duplicates_in,
+         ts.similar_questions_count,
+         ts.max_common_title_words,
+         -- composite score:
+         -- base = engagement * log(1+views) + sqrt(answercount)*2 + badge_score * 0.5
+         -- penalty for controversy: downvotes/(upvotes+1) weighted by log(age)
+         -- boost for recency and owner reputation, dampen large outliers with tanh
+         (
+           tanh( least(10,
+                       (
+                         coalesce(ts.engagement_index,0) * ln(1 + greatest(ts.viewcount,0))
+                         + sqrt(greatest(ts.answercount,0)) * 2
+                         + coalesce(ts.badge_score,0) * 0.5
+                       )
+                     )
+           )
+           - least(1, coalesce(ts.total_downvotes,0) / nullif(coalesce(ts.total_upvotes,0) + 1,0)) * ln(1 + greatest(extract(epoch from (cast('2024-10-01 12:34:56' as timestamp) - ts.creationdate))/86400,1)) * 0.2
+           + (coalesce(ts.owner_reputation,0) / nullif(coalesce((select max(reputation) from users),1),1)) * coalesce(ts.recency_weight,0)
+           + (coalesce(ts.similar_questions_count,0) / nullif(coalesce(ts.duplicates_in,0) + 1,1)) * 0.3
+         ) as composite_score,
+         -- mark interesting textual quirks
+         (case
+            when ts.title ilike '%error%' or ts.title ilike '%exception%' then 'buggy'
+            when ts.title ilike '%how to%' or ts.title ilike 'how %' then 'howto'
+            when ts.title ilike '%best practice%' or ts.title ilike '%performance%' then 'perf'
+            else 'other'
+          end) as topic_tone,
+         -- fragile flag: questions with accepted answer but low score and many downvotes on answers
+         (case when ts.acceptedanswerid is not null
+               and ts.score < 0
+               and (select coalesce(sum(case when v.votetypeid=3 then 1 else 0 end),0) from votes v join posts a on a.id=v.postid where a.parentid = ts.id) > 5
+           then true else false end) as fragile_flag,
+         -- include columns used in final ordering/grouping for downstream windowing
+         ts.creationdate,
+         ts.viewcount as fb_viewcount,
+         ts.topic_tone as fb_topic_tone
+  from TagSimilarity ts
+)
+select fb.id,
+       fb.title,
+       fb.owneruserid,
+       fb.owner_name,
+       fb.owner_reputation,
+       fb.badge_score,
+       fb.engagement_index,
+       fb.total_upvotes,
+       fb.total_downvotes,
+       fb.duplicates_out,
+       fb.duplicates_in,
+       fb.similar_questions_count,
+       fb.max_common_title_words,
+       fb.composite_score,
+       fb.topic_tone,
+       fb.fragile_flag,
+       -- windowed rank and percentile for benchmarking
+       rank() over (order by fb.composite_score desc) as benchmark_rank,
+       percent_rank() over (order by fb.composite_score desc) as benchmark_percentile,
+       row_number() over (partition by fb.topic_tone order by fb.composite_score desc) as tone_row_within_group
+from FinalBenchmark fb
+order by fb.composite_score desc
+limit 250;

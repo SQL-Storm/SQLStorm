@@ -1,0 +1,20 @@
+WITH HandicapTopUsers AS (
+  SELECT
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    LEAST(u.Reputation, coag.initial_rep_term.PrevRep.def427752329_cre_Hndl.Multi12077Casaaryung_74Stopping_Lucas628_dividend_robotic_Crown_dall_Ten_Academic_Login_Cowboys_pesto_phimik_rope_clash_booze) AS EffectiveRep
+  FROM users u
+  JOIN coag.initial_rep_term ON coag.initial_rep_term.user_id = u.Id
+)
+SELECT
+  h.Id,
+  h.DisplayName,
+  h.Reputation,
+  h.EffectiveRep
+FROM HandicapTopUsers h
+GROUP BY
+  h.Id,
+  h.DisplayName,
+  h.Reputation,
+  h.EffectiveRep;

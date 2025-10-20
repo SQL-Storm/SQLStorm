@@ -1,0 +1,66 @@
+with RecursiveRankedPosts as (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        p.Tags,
+        p.OwnerUserId,
+        u.DisplayName as OwnerName,
+        ROW_NUMBER() over (partition by p.PostTypeId order by p.Score desc NULLS LAST, p.CreationDate) as PostRank,
+        case 
+            when p.Tags is null then ARRAY[]::text[]
+            else string_to_array(substring(p.Tags from 2 for char_length(p.Tags) - 2), '><')
+        end as TagArray
+    from Posts p
+    left join Users u on p.OwnerUserId = u.Id
+    where p.PostTypeId in (1, 2)
+),
+FilteredTags as (
+    select
+        r.Id,
+        r.PostTypeId,
+        r.CreationDate,
+        r.Score,
+        r.OwnerUserId,
+        r.OwnerName,
+        tags.elem as Tag
+    from RecursiveRankedPosts r,
+    lateral unnest(r.TagArray) as tags(elem)
+    where tags.elem is not null
+),
+ClosingVotesCounters as (
+    select
+        ph.PostId,
+        sum(case when ph.PostHistoryTypeId = 10 then 1 else 0 end) as CloseVotesCount,
+        count(case when ph.PostHistoryTypeId = 6 then 1 end) as ApprovingCount
+    from PostHistory ph
+    group by ph.PostId
+)
+select
+    r.Id,
+    r.PostTypeId,
+    r.CreationDate,
+    r.Score,
+    r.OwnerUserId,
+    r.OwnerName,
+    r.PostRank,
+    ft.Tag,
+    coalesce(cvc.CloseVotesCount, 0) as CloseVotesCount,
+    coalesce(cvc.ApprovingCount, 0) as ApprovingCount
+from RecursiveRankedPosts r
+left join FilteredTags ft on r.Id = ft.Id
+left join ClosingVotesCounters cvc on r.Id = cvc.PostId
+where r.PostRank <= 100
+group by
+    r.Id,
+    r.PostTypeId,
+    r.CreationDate,
+    r.Score,
+    r.OwnerUserId,
+    r.OwnerName,
+    r.PostRank,
+    ft.Tag,
+    cvc.CloseVotesCount,
+    cvc.ApprovingCount
+order by r.PostTypeId, r.PostRank;

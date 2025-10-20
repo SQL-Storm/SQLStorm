@@ -1,0 +1,213 @@
+with RECURSIVE RecursiveTagHierarchy as (
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        1 as Level,
+        cast(t.TagName as varchar(1000)) as Path
+    from Tags t
+    where t.IsModeratorOnly = false and t.IsRequired = false
+    union all
+    select
+        t2.Id,
+        t2.TagName,
+        t2.Count,
+        t2.ExcerptPostId,
+        t2.WikiPostId,
+        r.Level + 1,
+        cast(r.Path || ' > ' || t2.TagName as varchar(1000)) as Path
+    from Tags t2
+    join RecursiveTagHierarchy r on t2.Id = r.Id + 1
+    where r.Level < 3
+),
+UserBadgeCounts as (
+    select
+        b.UserId,
+        sum(case when b.Class = 1 then 1 else 0 end) as GoldBadges,
+        sum(case when b.Class = 2 then 1 else 0 end) as SilverBadges,
+        sum(case when b.Class = 3 then 1 else 0 end) as BronzeBadges,
+        count(*) as TotalBadges
+    from Badges b
+    group by b.UserId
+),
+PostScoreStats as (
+    select
+        p.OwnerUserId,
+        count(case when p.PostTypeId = 1 then 1 end) as QuestionCount,
+        count(case when p.PostTypeId = 2 then 1 end) as AnswerCount,
+        avg(case when p.PostTypeId = 1 then p.Score end) as AvgQuestionScore,
+        avg(case when p.PostTypeId = 2 then p.Score end) as AvgAnswerScore,
+        max(case when p.PostTypeId = 1 then p.Score end) as MaxQuestionScore,
+        max(case when p.PostTypeId = 2 then p.Score end) as MaxAnswerScore
+    from Posts p
+    where p.OwnerUserId is not null
+    group by p.OwnerUserId
+),
+UserActivityWindow as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        row_number() over (partition by u.Id order by p.CreationDate desc) as RecentPostRank,
+        p.Id as PostId,
+        p.PostTypeId,
+        p.Score as PostScore,
+        p.CreationDate as PostCreationDate,
+        p.Title,
+        p.Tags,
+        p.ViewCount,
+        p.AnswerCount,
+        p.FavoriteCount,
+        case when p.ClosedDate is not null then 1 else 0 end as IsClosed
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    where u.Reputation > 1000
+),
+TopUserPosts as (
+    select
+        UserId,
+        PostId,
+        PostTypeId,
+        PostScore,
+        PostCreationDate,
+        Title,
+        Tags,
+        ViewCount,
+        AnswerCount,
+        FavoriteCount,
+        IsClosed,
+        row_number() over (partition by UserId order by PostScore desc, PostCreationDate desc) as PostRank
+    from UserActivityWindow
+    where RecentPostRank <= 50
+),
+PostCommentsAgg as (
+    select
+        c.PostId,
+        count(*) as CommentCount,
+        sum(c.Score) as TotalCommentScore,
+        max(c.Score) as MaxCommentScore,
+        string_agg(distinct coalesce(c.UserDisplayName, 'Anonymous'), ', ') as Commenters
+    from Comments c
+    group by c.PostId
+),
+PostLinkDuplicates as (
+    select
+        pl.PostId,
+        count(case when lt.Name = 'Duplicate' then 1 end) as DuplicateCount,
+        count(case when lt.Name = 'Linked' then 1 end) as LinkedCount
+    from PostLinks pl
+    join LinkTypes lt on pl.LinkTypeId = lt.Id
+    group by pl.PostId
+),
+UserCloseVotes as (
+    select
+        ph.UserId,
+        count(case when ph.PostHistoryTypeId = 10 then 1 end) as CloseVotes,
+        count(case when ph.PostHistoryTypeId = 11 then 1 end) as ReopenVotes
+    from PostHistory ph
+    group by ph.UserId
+),
+UserVoteStats as (
+    select
+        v.UserId,
+        count(case when vt.Name = 'UpMod' then 1 end) as UpVotes,
+        count(case when vt.Name = 'DownMod' then 1 end) as DownVotes,
+        count(case when vt.Name = 'Favorite' then 1 end) as Favorites,
+        count(case when vt.Name = 'BountyStart' then 1 end) as BountiesStarted,
+        count(case when vt.Name = 'BountyClose' then 1 end) as BountiesClosed
+    from Votes v
+    join VoteTypes vt on v.VoteTypeId = vt.Id
+    group by v.UserId
+)
+select
+    u.Id as UserId,
+    u.DisplayName,
+    u.Reputation,
+    ubc.GoldBadges,
+    ubc.SilverBadges,
+    ubc.BronzeBadges,
+    ubc.TotalBadges,
+    pss.QuestionCount,
+    pss.AnswerCount,
+    coalesce(pss.AvgQuestionScore,0) as AvgQuestionScore,
+    coalesce(pss.AvgAnswerScore,0) as AvgAnswerScore,
+    coalesce(pss.MaxQuestionScore,0) as MaxQuestionScore,
+    coalesce(pss.MaxAnswerScore,0) as MaxAnswerScore,
+    ucs.CloseVotes,
+    ucs.ReopenVotes,
+    uvs.UpVotes,
+    uvs.DownVotes,
+    uvs.Favorites,
+    uvs.BountiesStarted,
+    uvs.BountiesClosed,
+    array_agg(distinct rth.TagName order by rth.Count desc) filter (where rth.Level = 1) as TopTags,
+    (
+        select string_agg(distinct concat_ws(' | ', p.Title, coalesce(p.Tags,''), 'Score:', cast(p.Score as text)), ' || ')
+        from Posts p
+        where p.OwnerUserId = u.Id and p.PostTypeId = 1 and p.Score > 10
+        order by p.Score desc
+        limit 5
+    ) as TopQuestionSummaries,
+    (
+        select count(*)
+        from Posts p2
+        left join PostCommentsAgg pca on p2.Id = pca.PostId
+        left join PostLinkDuplicates pld on p2.Id = pld.PostId
+        where p2.OwnerUserId = u.Id
+          and p2.PostTypeId = 1
+          and (coalesce(pca.CommentCount,0) > 5 or coalesce(pld.DuplicateCount,0) > 0)
+          and p2.ClosedDate is null
+    ) as ActivePopularQuestions,
+    (
+        select avg(p3.Score)
+        from Posts p3
+        where p3.OwnerUserId = u.Id
+          and p3.PostTypeId = 2
+          and p3.CreationDate > (date '2024-10-01' - interval '1 year')
+    ) as AvgRecentAnswerScore,
+    (
+        select count(*)
+        from Posts p4
+        where p4.OwnerUserId = u.Id
+          and p4.PostTypeId = 2
+          and p4.AcceptedAnswerId is not null
+    ) as AcceptedAnswersCount
+from Users u
+left join UserBadgeCounts ubc on ubc.UserId = u.Id
+left join PostScoreStats pss on pss.OwnerUserId = u.Id
+left join UserCloseVotes ucs on ucs.UserId = u.Id
+left join UserVoteStats uvs on uvs.UserId = u.Id
+left join RecursiveTagHierarchy rth on rth.TagName = (
+    select substring(t.Tags from '<([^>]+)>') from Posts t where t.OwnerUserId = u.Id and t.Tags is not null limit 1
+)
+where u.Reputation > 5000
+group by
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    ubc.GoldBadges,
+    ubc.SilverBadges,
+    ubc.BronzeBadges,
+    ubc.TotalBadges,
+    pss.QuestionCount,
+    pss.AnswerCount,
+    pss.AvgQuestionScore,
+    pss.AvgAnswerScore,
+    pss.MaxQuestionScore,
+    pss.MaxAnswerScore,
+    ucs.CloseVotes,
+    ucs.ReopenVotes,
+    uvs.UpVotes,
+    uvs.DownVotes,
+    uvs.Favorites,
+    uvs.BountiesStarted,
+    uvs.BountiesClosed,
+    rth.TagName,
+    rth.Count,
+    rth.Level
+order by u.Reputation desc, ubc.GoldBadges desc
+limit 100;

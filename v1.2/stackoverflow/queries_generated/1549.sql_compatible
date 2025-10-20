@@ -1,0 +1,217 @@
+WITH RECURSIVE RecursiveTaggedPosts AS (
+    SELECT
+        p.Id,
+        p.Title,
+        p.Tags,
+        array_to_string(string_to_array(coalesce(p.Tags, ''), '><'), ',') AS ParsedTags,
+        p.PostTypeId,
+        p.OwnerUserId,
+        coalesce(p.Score, 0) AS Score,
+        p.CreationDate
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+
+    UNION ALL
+
+    SELECT
+        pl.RelatedPostId AS Id,
+        p2.Title,
+        p2.Tags,
+        array_to_string(string_to_array(coalesce(p2.Tags, ''), '><'), ',') AS ParsedTags,
+        p2.PostTypeId,
+        p2.OwnerUserId,
+        coalesce(p2.Score, 0) AS Score,
+        p2.CreationDate
+    FROM PostLinks pl
+    JOIN RecursiveTaggedPosts rtp ON pl.PostId = rtp.Id
+    JOIN Posts p2 ON p2.Id = pl.RelatedPostId
+    WHERE pl.LinkTypeId = 1
+      AND p2.PostTypeId = 1
+),
+
+UserBadgeCounts AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        count(distinct b.Id) AS TotalBadges,
+        sum(case when b.Class = 1 then 1 else 0 end) AS GoldBadges,
+        sum(case when b.Class = 2 then 1 else 0 end) AS SilverBadges,
+        sum(case when b.Class = 3 then 1 else 0 end) AS BronzeBadges,
+        max(b.Date) AS LastBadgeDate
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+
+PostCommentsAggregated AS (
+    SELECT 
+        c.PostId,
+        count(*) AS CommentCount,
+        sum(coalesce(c.Score, 0)) AS CommentsScoreSum,
+        max(c.CreationDate) AS LastCommentDate,
+        string_agg(distinct substring(c.Text from 1 for 50), ' | ') AS SampleCommentSnippets
+    FROM Comments c
+    GROUP BY c.PostId
+),
+
+RankedAnswers AS (
+    SELECT
+        a.Id,
+        a.ParentId,
+        a.CreationDate,
+        a.Score,
+        row_number() OVER (PARTITION BY a.ParentId ORDER BY a.Score DESC, a.CreationDate ASC) AS Rank_ByScore
+    FROM Posts a
+    WHERE a.PostTypeId = 2
+),
+
+TopPostsWithAuthorsCTE AS (
+    SELECT
+        p.Id AS PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.Tags,
+        u.Id AS AuthorUserId,
+        u.DisplayName AS AuthorName,
+        coalesce(pb.TotalBadges, 0) AS AuthorTotalBadges,
+        coalesce(pc.CommentCount,0) AS PostCommentsCount,
+        coalesce(pc.CommentsScoreSum,0) AS PostCommentsScoreSum,
+        first_value((
+            SELECT a.Id
+            FROM RankedAnswers a
+            WHERE a.ParentId = p.Id
+            ORDER BY a.Score DESC
+            LIMIT 1
+        )) OVER (PARTITION BY p.Id ORDER BY p.CreationDate) AS TopAnswerId,
+        rank() OVER (ORDER BY p.Score DESC, p.ViewCount DESC) AS PostPopularityRank,
+        coalesce(aliked.UpvotesOnAccepted, 0) AS AcceptedAnswerUpVotes,
+        case when p.ClosedDate IS NULL then 0 else 1 end AS IsClosed,
+        plc.Name AS CloseReasonName
+    FROM Posts p
+    LEFT JOIN Users u ON u.Id = p.OwnerUserId
+    LEFT JOIN UserBadgeCounts pb ON pb.UserId = u.Id
+    LEFT JOIN PostCommentsAggregated pc ON pc.PostId = p.Id
+    LEFT JOIN Posts penned ON penned.Id = p.AcceptedAnswerId
+    LEFT JOIN LATERAL (
+        SELECT sum(v.Tasks) AS UpvotesOnAccepted
+        FROM (
+             SELECT count(*) FILTER (WHERE vt.Name = 'UpMod') AS Tasks
+             FROM Votes v
+             JOIN VoteTypes vt ON v.VoteTypeId = vt.Id
+             WHERE v.PostId = penned.Id
+        ) vgroup
+    ) aliked ON true
+    LEFT JOIN (
+        SELECT DISTINCT ph.PostId, crt.Name
+        FROM PostHistory ph 
+        JOIN CloseReasonTypes crt ON crt.Id = cast(ph.Comment AS integer)
+        WHERE ph.PostHistoryTypeId = 10
+    ) plc ON plc.PostId = p.Id
+    WHERE p.PostTypeId = 1
+      AND (
+        p.CreationDate >= (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '2 years')
+        OR aliked.UpvotesOnAccepted > 10
+      )
+),
+
+FilteredMostActiveUsers AS (
+    SELECT
+        UserId,
+        DisplayName,
+        Reputation,
+        TotalBadges,
+        GoldBadges, SilverBadges, BronzeBadges,
+        LastBadgeDate
+    FROM UserBadgeCounts
+    WHERE TotalBadges > 15
+      AND Reputation > 1000
+      AND LastBadgeDate > (CAST('2024-10-01' AS date) - INTERVAL '365 days')
+    ORDER BY GoldBadges DESC, Reputation DESC
+    LIMIT 100
+),
+
+AggregateViewsPercentiles AS (
+    SELECT
+        PostTypeId,
+        percentile_cont(0.25) WITHIN GROUP (ORDER BY ViewCount) AS Q1_ViewCount,
+        percentile_cont(0.5) WITHIN GROUP (ORDER BY ViewCount) AS MedianViewCount,
+        percentile_cont(0.75) WITHIN GROUP (ORDER BY ViewCount) AS Q3_ViewCount
+    FROM Posts
+    GROUP BY PostTypeId
+),
+
+UserLatestPostWords AS (
+    SELECT
+        OwnerUserId,
+        regexp_split_to_table(lower(body), '\s+') AS Word
+    FROM (
+        SELECT 
+            OwnerUserId,
+            Body AS body,
+            row_number() OVER (PARTITION BY OwnerUserId ORDER BY CreationDate DESC) AS rn
+        FROM Posts 
+        WHERE OwnerUserId IS NOT NULL AND OwnerUserId > 0
+    ) recent_posts
+    WHERE rn = 1
+),
+
+RepeatedWordsCount AS (
+  SELECT
+    OwnerUserId,
+    Word,
+    count(*) AS WordCount
+  FROM UserLatestPostWords
+  GROUP BY OwnerUserId, Word
+),
+
+UserRichnessIndex AS (
+   SELECT 
+      rw.OwnerUserId,
+      count(distinct rw.Word) / nullif(max(rw.WordCount), 1) AS RichnessIndex
+   FROM RepeatedWordsCount rw
+   GROUP BY rw.OwnerUserId
+),
+
+FinalReport AS (
+    SELECT
+        ats.PostId,
+        substring(coalesce(ats.Title, '[No Title]') FROM 1 FOR 120) AS PostSnippet,
+        ats.Score,
+        ats.ViewCount,
+        ats.CreationDate,
+        coalesce(ats.Tags, '[No Tags]') AS Tags,
+        ats.AuthorUserId,
+        coalesce(ats.AuthorName, '[Anonymous]') AS AuthorName,
+        ats.AuthorTotalBadges,
+        ats.PostCommentsCount,
+        ats.PostCommentsScoreSum,
+        ats.AcceptedAnswerUpVotes,
+        ats.IsClosed,
+        ats.CloseReasonName,
+        rank() OVER (PARTITION BY ats.ArrayDistinctRank ORDER BY ats.Score DESC) AS ScoreRankWithinCluster,
+        us.RichnessIndex,
+        fu.Reputation,
+        fu.TotalBadges AS UserBadgeCount,
+        aaque.AnswerCount,
+        cap.ValueEncoded
+    FROM TopPostsWithAuthorsCTE ats
+    LEFT JOIN UserRichnessIndex us ON us.OwnerUserId = ats.AuthorUserId
+    LEFT JOIN FilteredMostActiveUsers fu ON fu.UserId = ats.AuthorUserId
+    LEFT JOIN (
+        SELECT ParentId, count(*) AS AnswerCount
+        FROM Posts panswers
+        WHERE panswers.PostTypeId = 2
+        GROUP BY ParentId
+    ) aaque ON aaque.ParentId = ats.PostId
+    LEFT JOIN (
+        SELECT p.Id, encode(digest(coalesce(p.Body, '') || '|' || coalesce(p.Title, ''), 'sha256'), 'hex') AS ValueEncoded
+        FROM Posts p
+    ) cap ON cap.Id = ats.PostId
+    ORDER BY ats.Score DESC NULLS LAST
+    LIMIT 100
+)
+
+SELECT * FROM FinalReport;

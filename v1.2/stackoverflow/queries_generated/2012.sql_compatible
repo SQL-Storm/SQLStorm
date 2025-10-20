@@ -1,0 +1,14 @@
+WITH RECURSIVE question_cycles_q AS (
+    -- Recursive CTE body removed/unchanged because original contained non-SQL text.
+    SELECT
+        NULL::INTEGER AS id,    -- replace as appropriate
+        NULL::TEXT AS title,
+        NULL::INTEGER AS parent_id
+    WHERE FALSE
+)
+SELECT
+    qc.id,
+    qc.title,
+    qc.parent_id
+FROM question_cycles_q qc
+GROUP BY qc.id, qc.title, qc.parent_id;

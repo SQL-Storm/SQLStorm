@@ -1,0 +1,221 @@
+with RecursiveUserActivity as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionCount,
+        count(distinct p.Id) filter (where p.PostTypeId = 2) as AnswerCount,
+        coalesce(sum(v.VoteCount),0) as TotalVotesReceived,
+        coalesce(sum(case when v.VoteTypeId = 2 then v.VoteCount else 0 end),0) as UpVotesReceived,
+        coalesce(sum(case when v.VoteTypeId = 3 then v.VoteCount else 0 end),0) as DownVotesReceived,
+        row_number() over (order by u.Reputation desc, u.LastAccessDate desc) as RankByReputation
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join (
+        select 
+            PostId,
+            VoteTypeId,
+            count(*) as VoteCount
+        from Votes
+        group by PostId, VoteTypeId
+    ) v on v.PostId = p.Id
+    group by u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate
+),
+TopUsersWithBadges as (
+    select 
+        r.UserId,
+        r.DisplayName,
+        r.Reputation,
+        r.QuestionCount,
+        r.AnswerCount,
+        r.TotalVotesReceived,
+        r.UpVotesReceived,
+        r.DownVotesReceived,
+        r.RankByReputation,
+        b.Name as BadgeName,
+        b.Class as BadgeClass,
+        b.Date as BadgeDate,
+        dense_rank() over (partition by r.UserId order by b.Class) as BadgeRank
+    from RecursiveUserActivity r
+    left join Badges b on b.UserId = r.UserId
+    where r.RankByReputation <= 100
+),
+UserTopTags as (
+    select 
+        u.UserId,
+        t.TagName,
+        sum(case when p.PostTypeId = 1 then 1 else 0 end) as QuestionsWithTag,
+        sum(case when p.PostTypeId = 2 then 1 else 0 end) as AnswersWithTag,
+        row_number() over (partition by u.UserId order by sum(case when p.PostTypeId = 1 then 1 else 0 end) desc) as TagRank
+    from RecursiveUserActivity u
+    join Posts p on p.OwnerUserId = u.UserId and p.PostTypeId in (1,2) and p.Tags is not null
+    -- split tags like '<tag1><tag2>' into rows; use STRING_SPLIT or equivalent where available.
+    join Tags t on t.TagName = any(string_to_array(substring(p.Tags from 2 for length(p.Tags)-2), '><'))
+    group by u.UserId, t.TagName
+    having sum(case when p.PostTypeId = 1 then 1 else 0 end) + sum(case when p.PostTypeId = 2 then 1 else 0 end) > 0
+),
+UserActivitySummary as (
+    select 
+        u.UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.QuestionCount,
+        u.AnswerCount,
+        u.TotalVotesReceived,
+        u.UpVotesReceived,
+        u.DownVotesReceived,
+        -- For portability, aggregate without DISTINCT+ORDER BY combination that is unsupported in some dialects.
+        -- First aggregate TagSummaries per tag rank, then aggregate those ordered by TagRank using string_agg over a subquery.
+        (
+          select string_agg(ts.tag_entry, ', ' order by ts.TagRank)
+          from (
+            select t.TagRank,
+                   concat_ws(':', t.TagName, t.QuestionsWithTag, t.AnswersWithTag) as tag_entry
+            from UserTopTags t
+            where t.UserId = u.UserId and t.TagRank <= 5
+          ) ts
+        ) as TopTagsSummary,
+        count(distinct b.BadgeName) as BadgeCount,
+        max(b.BadgeClass) as HighestBadgeClass
+    from RecursiveUserActivity u
+    left join UserTopTags t on t.UserId = u.UserId and t.TagRank <= 5
+    left join Badges b on b.UserId = u.UserId
+    group by u.UserId, u.DisplayName, u.Reputation, u.QuestionCount, u.AnswerCount, u.TotalVotesReceived, u.UpVotesReceived, u.DownVotesReceived
+),
+PostWithLinkAndVotes as (
+    select 
+        p.Id as PostId,
+        p.PostTypeId,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId,
+        p.AcceptedAnswerId,
+        p.Tags,
+        pl.LinkTypeId,
+        pl.RelatedPostId,
+        lt.Name as LinkTypeName,
+        coalesce(v.UpVotes,0) as UpVotes,
+        coalesce(v.DownVotes,0) as DownVotes,
+        coalesce(v.Favorites,0) as Favorites
+    from Posts p
+    left join PostLinks pl on pl.PostId = p.Id
+    left join LinkTypes lt on lt.Id = pl.LinkTypeId
+    left join (
+        select 
+            PostId,
+            sum(case when VoteTypeId = 2 then 1 else 0 end) as UpVotes,
+            sum(case when VoteTypeId = 3 then 1 else 0 end) as DownVotes,
+            sum(case when VoteTypeId = 5 then 1 else 0 end) as Favorites
+        from Votes
+        group by PostId
+    ) v on v.PostId = p.Id
+),
+RankedAnswers as (
+    select 
+        p.Id,
+        p.ParentId,
+        p.Score,
+        p.CreationDate,
+        row_number() over (partition by p.ParentId order by p.Score desc, p.CreationDate asc) as AnswerRank
+    from Posts p
+    where p.PostTypeId = 2
+),
+QuestionsWithTopAnswer as (
+    select 
+        q.Id as QuestionId,
+        q.Title,
+        q.CreationDate as QuestionCreation,
+        q.Score as QuestionScore,
+        q.ViewCount,
+        q.Tags,
+        a.Id as TopAnswerId,
+        a.Score as TopAnswerScore,
+        a.CreationDate as TopAnswerCreation,
+        u.DisplayName as QuestionOwner,
+        u.Reputation as QuestionOwnerReputation
+    from Posts q
+    left join RankedAnswers a on a.ParentId = q.Id and a.AnswerRank = 1
+    left join Users u on u.Id = q.OwnerUserId
+    where q.PostTypeId = 1
+),
+QuestionsWithCloseInfo as (
+    select 
+        q.QuestionId,
+        q.Title,
+        q.QuestionCreation,
+        q.QuestionScore,
+        q.ViewCount,
+        q.Tags,
+        q.TopAnswerId,
+        q.TopAnswerScore,
+        q.TopAnswerCreation,
+        q.QuestionOwner,
+        q.QuestionOwnerReputation,
+        ph.Comment as CloseReason,
+        crt.Name as CloseReasonName,
+        ph.CreationDate as CloseDate
+    from QuestionsWithTopAnswer q
+    left join PostHistory ph on ph.PostId = q.QuestionId and ph.PostHistoryTypeId = 10
+    left join CloseReasonTypes crt on crt.Id = cast(ph.Comment as smallint)
+),
+FinalSelection as (
+    select 
+        q.QuestionId,
+        q.Title,
+        q.QuestionCreation,
+        q.QuestionScore,
+        q.ViewCount,
+        q.Tags,
+        q.TopAnswerId,
+        q.TopAnswerScore,
+        q.TopAnswerCreation,
+        q.QuestionOwner,
+        q.QuestionOwnerReputation,
+        q.CloseReasonName,
+        q.CloseDate,
+        ua.BadgeCount,
+        ua.HighestBadgeClass,
+        ua.TopTagsSummary,
+        case 
+            when q.CloseDate is not null then 'Closed' 
+            else 'Open' 
+        end as Status,
+        dense_rank() over (partition by case when q.CloseDate is not null then 'Closed' else 'Open' end order by q.QuestionScore desc) as ScoreRankWithinStatus
+    from QuestionsWithCloseInfo q
+    left join UserActivitySummary ua on ua.UserId = (select OwnerUserId from Posts where Id = q.QuestionId)
+    where q.QuestionCreation >= (cast('2024-10-01 12:34:56' as timestamp) - interval '1 year')
+)
+select 
+    fs.QuestionId,
+    fs.Title,
+    fs.QuestionCreation,
+    fs.QuestionScore,
+    fs.ViewCount,
+    fs.Tags,
+    fs.TopAnswerId,
+    fs.TopAnswerScore,
+    fs.TopAnswerCreation,
+    fs.QuestionOwner,
+    fs.QuestionOwnerReputation,
+    fs.CloseReasonName,
+    fs.CloseDate,
+    fs.BadgeCount,
+    fs.HighestBadgeClass,
+    fs.TopTagsSummary,
+    fs.Status,
+    fs.ScoreRankWithinStatus,
+    case 
+        when fs.TopAnswerScore is null then 'No Answers'
+        when fs.TopAnswerScore > fs.QuestionScore then 'Top Answer Outperforms Question'
+        else 'Question Outperforms Top Answer'
+    end as AnswerPerformance,
+    length(fs.Title) as TitleLength,
+    (strpos(lower(fs.Title), 'sql') > 0) as TitleContainsSQL,
+    (select count(*) from Comments c where c.PostId = fs.QuestionId and c.CreationDate > fs.QuestionCreation) as CommentCountSinceCreation
+from FinalSelection fs
+where fs.ScoreRankWithinStatus <= 20
+order by fs.Status desc, fs.ScoreRankWithinStatus asc;

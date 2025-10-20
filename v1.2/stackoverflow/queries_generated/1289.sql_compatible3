@@ -1,0 +1,132 @@
+with RecursiveTags as (
+    select
+        p.Id as PostId,
+        unnest(string_to_array(substring(p.Tags from 2 for length(p.Tags) - 2), '><')) as Tag,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate
+    from Posts p
+    where p.PostTypeId = 1 and p.Tags is not null
+), UserBadgeCounts as (
+    select
+        u.Id as UserId,
+        count(case when b.Class = 1 then 1 end) as GoldBadges,
+        count(case when b.Class = 2 then 1 end) as SilverBadges,
+        count(case when b.Class = 3 then 1 end) as BronzeBadges
+    from Users u
+    left join Badges b on u.Id = b.UserId
+    group by u.Id
+), AnswerRanks as (
+    select
+        a.Id,
+        a.ParentId,
+        a.Score,
+        a.CreationDate,
+        rank() over (partition by a.ParentId order by a.Score desc, a.CreationDate) as ScoreRank
+    from Posts a
+    where a.PostTypeId = 2
+), HighQualityAnswers as (
+    select
+        ar.ParentId as QuestionId,
+        ar.Id as AnswerId,
+        ar.Score,
+        ar.CreationDate
+    from AnswerRanks ar
+    where ar.ScoreRank <= 3
+), DuplicateLinks as (
+    select
+        pl.PostId,
+        pl.RelatedPostId,
+        pl.CreationDate
+    from PostLinks pl
+    join LinkTypes lt on lt.Id = pl.LinkTypeId and lt.Name = 'Duplicate'
+), LatestEdits as (
+    select
+        ph.PostId,
+        ph.CreationDate,
+        ph.UserId,
+        ph.Comment
+    from (
+        select ph.*,
+               row_number() over (partition by ph.PostId order by ph.CreationDate desc) as rn
+        from PostHistory ph
+        where ph.PostHistoryTypeId in (4,5,6)
+    ) ph
+    where ph.rn = 1
+), QuestionsWithDupCount as (
+    select
+        q.Id,
+        q.Title,
+        q.Score,
+        q.ViewCount,
+        count(dl.PostId) as DuplicateCount,
+        q.OwnerUserId
+    from Posts q
+    left join DuplicateLinks dl on dl.RelatedPostId = q.Id
+    where q.PostTypeId = 1
+    group by q.Id, q.Title, q.Score, q.ViewCount, q.OwnerUserId
+), WindowedScores as (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.Score,
+        row_number() over (partition by p.PostTypeId order by p.Score desc) as ScoreRank
+    from Posts p
+)
+select
+    q.Id as QuestionId,
+    q.Title,
+    q.Score as QuestionScore,
+    coalesce(q.DuplicateCount,0) as DuplicateReports,
+    ut.Tag,
+    hb.GoldBadges,
+    hb.SilverBadges,
+    hb.BronzeBadges,
+    lte.CreationDate as LastEditDate,
+    lte.UserId as LastEditorUserId,
+    array_agg(
+      json_build_object(
+        'AnswerId', hqa.AnswerId,
+        'Score', hqa.Score,
+        'AgeDays', extract(epoch from (timestamp '2024-10-01 12:34:56' - hqa.CreationDate))/86400
+      )
+    ) as TopAnswers,
+    concat_ws(' ', u.DisplayName, coalesce(u.Location,''), coalesce(u.WebsiteUrl,'')) as UserInfo,
+    case
+        when q.Score > 100 then 'Hot'
+        when q.Score between 50 and 100 then 'Trending'
+        else 'Normal'
+    end as PopularityLabel,
+    case
+        when hb.GoldBadges >= 10 or hb.SilverBadges >= 30 or hb.BronzeBadges >= 100
+        then 'Veteran'
+        else 'Novice'
+    end as UserLevel
+from
+    QuestionsWithDupCount q
+    left join RecursiveTags ut on ut.PostId = q.Id
+    left join Posts pUser on pUser.Id = q.OwnerUserId
+    left join Users u on u.Id = pUser.OwnerUserId or u.Id = q.OwnerUserId
+    left join UserBadgeCounts hb on hb.UserId = q.OwnerUserId
+    left join LatestEdits lte on lte.PostId = q.Id
+    left join HighQualityAnswers hqa on hqa.QuestionId = q.Id
+where
+    (q.DuplicateCount > 0 or q.Score > 50)
+    and (ut.Tag is null or lower(ut.Tag) not like '%deprecated%')
+    and (u.Reputation is null or u.Reputation > 100)
+    and exists (
+        select 1 from Votes v where v.PostId = q.Id and v.VoteTypeId = 2 and v.CreationDate > (date '2024-10-01' - interval '30' day)
+    )
+group by
+    q.Id, q.Title, q.Score, q.DuplicateCount, q.ViewCount, q.OwnerUserId,
+    ut.Tag,
+    hb.GoldBadges, hb.SilverBadges, hb.BronzeBadges,
+    lte.CreationDate, lte.UserId,
+    u.DisplayName, u.Location, u.WebsiteUrl
+having
+    count(hqa.AnswerId) >= 1
+order by
+    q.Score desc nulls last,
+    q.ViewCount desc nulls last,
+    q.Id
+limit 25;

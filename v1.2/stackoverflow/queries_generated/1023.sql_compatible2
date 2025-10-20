@@ -1,0 +1,206 @@
+WITH RecursiveTagHierarchy AS (
+    SELECT 
+        t.Id, 
+        t.TagName, 
+        t.Count, 
+        t.ExcerptPostId, 
+        t.WikiPostId,
+        1 AS Level
+    FROM Tags t
+    WHERE t.IsRequired = 1
+    UNION ALL
+    SELECT 
+        t2.Id,
+        t2.TagName, 
+        t2.Count,
+        t2.ExcerptPostId,
+        t2.WikiPostId,
+        r.Level + 1
+    FROM Tags t2
+    JOIN RecursiveTagHierarchy r ON t2.Id = r.Id + 1
+    WHERE r.Level < 3
+),
+UserBadgeStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(b.Id) AS TotalBadges,
+        COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS GoldBadges,
+        COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS SilverBadges,
+        COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS BronzeBadges,
+        MAX(b.Date) AS LastBadgeDate
+    FROM Users u
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id, u.DisplayName
+),
+QuestionAnswerDetails AS (
+    SELECT 
+        q.Id AS QuestionId,
+        q.Title,
+        q.CreationDate AS QuestionCreated,
+        q.Score AS QuestionScore,
+        q.ViewCount,
+        q.Tags,
+        q.OwnerUserId,
+        u.DisplayName AS OwnerName,
+        q.AcceptedAnswerId,
+        a.Id AS AnswerId,
+        a.Score AS AnswerScore,
+        a.CreationDate AS AnswerCreated,
+        a.OwnerUserId AS AnswerOwnerUserId,
+        au.DisplayName AS AnswerOwnerName,
+        ROW_NUMBER() OVER (PARTITION BY q.Id ORDER BY a.Score DESC, a.CreationDate ASC) AS AnswerRank
+    FROM Posts q
+    LEFT JOIN Posts a ON a.ParentId = q.Id AND a.PostTypeId = 2
+    LEFT JOIN Users u ON q.OwnerUserId = u.Id
+    LEFT JOIN Users au ON a.OwnerUserId = au.Id
+    WHERE q.PostTypeId = 1
+),
+TopAnswersCTE AS (
+    SELECT DISTINCT
+        QuestionId,
+        AnswerId,
+        AnswerScore,
+        AnswerCreated,
+        AnswerOwnerUserId,
+        AnswerOwnerName
+    FROM QuestionAnswerDetails
+    WHERE AnswerRank = 1
+),
+PostCloseInfo AS (
+    SELECT
+        ph.PostId,
+        crt.Name AS CloseReason,
+        ph.CreationDate AS CloseDate
+    FROM PostHistory ph
+    LEFT JOIN CloseReasonTypes crt ON (
+        CASE WHEN ph.Comment ~ '^[0-9]+$' THEN CAST(ph.Comment AS INTEGER) ELSE NULL END
+    ) = crt.Id
+    WHERE ph.PostHistoryTypeId = 10
+),
+UserActivityWindow AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        v.VoteTypeId,
+        COUNT(v.Id) AS VoteCount,
+        SUM(COALESCE(p.Score,0)) AS TotalPostScore,
+        RANK() OVER (PARTITION BY u.Id ORDER BY COUNT(v.Id) DESC) AS VoteRank
+    FROM Users u
+    LEFT JOIN Votes v ON u.Id = v.UserId
+    LEFT JOIN Posts p ON p.Id = v.PostId
+    GROUP BY u.Id, u.DisplayName, v.VoteTypeId
+),
+ActiveUsers AS (
+    SELECT DISTINCT UA.UserId, UA.DisplayName
+    FROM UserActivityWindow UA
+    WHERE UA.VoteRank = 1 AND UA.VoteTypeId = 2 AND UA.VoteCount > 50
+),
+AggregatedComments AS (
+    SELECT 
+        c.PostId,
+        COUNT(c.Id) AS CommentCount,
+        MAX(c.CreationDate) AS LastCommentDate,
+        STRING_AGG(DISTINCT COALESCE(c.UserDisplayName, 'Anonymous'), ', ' ORDER BY c.UserDisplayName) AS Commenters
+    FROM Comments c
+    GROUP BY c.PostId
+),
+PostsWithLinks AS (
+    SELECT 
+        pl.PostId,
+        COUNT(CASE WHEN pl.LinkTypeId = 1 THEN 1 END) AS OutgoingLinks,
+        COUNT(CASE WHEN pl.LinkTypeId = 3 THEN 1 END) AS DuplicateLinks
+    FROM PostLinks pl
+    GROUP BY pl.PostId
+),
+MainResults AS (
+SELECT
+    qad.QuestionId,
+    qad.Title,
+    qad.QuestionCreated,
+    qad.QuestionScore,
+    qad.ViewCount,
+    qad.Tags,
+    COALESCE(qad.OwnerName, 'Unknown') AS QuestionOwner,
+    tb.AnswerId AS TopAnswerId,
+    tb.AnswerScore AS TopAnswerScore,
+    tb.AnswerCreated AS TopAnswerCreated,
+    COALESCE(tb.AnswerOwnerName, 'Unknown') AS TopAnswerOwner,
+    ub.TotalBadges,
+    ub.GoldBadges,
+    ub.SilverBadges,
+    ub.BronzeBadges,
+    pc.CloseReason,
+    pc.CloseDate,
+    ac.CommentCount,
+    ac.LastCommentDate,
+    ac.Commenters,
+    pl.OutgoingLinks,
+    pl.DuplicateLinks,
+    ROW_NUMBER() OVER (
+        PARTITION BY 
+            COALESCE(qad.OwnerUserId, 0)
+        ORDER BY qad.QuestionScore DESC, qad.ViewCount DESC
+    ) AS QuestionOwnerRank,
+    CASE 
+        WHEN qad.AcceptedAnswerId IS NOT NULL THEN 'Accepted Answer Present'
+        ELSE 'No Accepted Answer'
+    END AS AcceptanceStatus,
+    COALESCE(uas.DisplayName, 'Inactive') AS ActiveAnswerOwnerStatus,
+    (LENGTH(qad.Tags) - LENGTH(REPLACE(qad.Tags, '><', ''))) + 1 AS TagCount,
+    (LOWER(SUBSTRING(qad.Title FROM 1 FOR 1)) || SUBSTRING(qad.Title FROM 2)) || ' [' || COALESCE(pc.CloseReason, 'Open') || ']' AS TitleProcessed
+FROM QuestionAnswerDetails qad
+LEFT JOIN TopAnswersCTE tb ON qad.QuestionId = tb.QuestionId
+LEFT JOIN UserBadgeStats ub ON ub.UserId = qad.OwnerUserId
+LEFT JOIN PostCloseInfo pc ON pc.PostId = qad.QuestionId
+LEFT JOIN AggregatedComments ac ON ac.PostId = qad.QuestionId
+LEFT JOIN PostsWithLinks pl ON pl.PostId = qad.QuestionId
+LEFT JOIN ActiveUsers uas ON uas.UserId = tb.AnswerOwnerUserId
+WHERE qad.QuestionCreated > CAST('2024-10-01' AS DATE) - INTERVAL '365 days'
+  AND (
+      (qad.Tags LIKE '%<sql>%') OR 
+      (qad.Tags LIKE '%<database>%') OR
+      (qad.Tags IS NULL)
+  )
+)
+SELECT * FROM MainResults
+ORDER BY QuestionScore DESC, CommentCount DESC
+LIMIT 100
+
+UNION ALL
+
+SELECT
+    NULL::INT AS QuestionId,
+    'Excluded Questions Summary' AS Title,
+    NULL::TIMESTAMP AS QuestionCreated,
+    SUM(qad.QuestionScore) AS QuestionScore,
+    SUM(qad.ViewCount) AS ViewCount,
+    NULL::TEXT AS Tags,
+    NULL::TEXT AS QuestionOwner,
+    NULL::INT AS TopAnswerId,
+    NULL::INT AS TopAnswerScore,
+    NULL::TIMESTAMP AS TopAnswerCreated,
+    NULL::TEXT AS TopAnswerOwner,
+    NULL::INT AS TotalBadges,
+    NULL::INT AS GoldBadges,
+    NULL::INT AS SilverBadges,
+    NULL::INT AS BronzeBadges,
+    NULL::TEXT AS CloseReason,
+    NULL::TIMESTAMP AS CloseDate,
+    NULL::INT AS CommentCount,
+    NULL::TIMESTAMP AS LastCommentDate,
+    NULL::TEXT AS Commenters,
+    NULL::INT AS OutgoingLinks,
+    NULL::INT AS DuplicateLinks,
+    NULL::INT AS QuestionOwnerRank,
+    NULL::TEXT AS AcceptanceStatus,
+    NULL::TEXT AS ActiveAnswerOwnerStatus,
+    NULL::INT AS TagCount,
+    NULL::TEXT AS TitleProcessed
+FROM QuestionAnswerDetails qad
+WHERE qad.QuestionCreated > CAST('2024-10-01' AS DATE) - INTERVAL '365 days'
+  AND NOT (
+      (qad.Tags LIKE '%<sql>%') OR 
+      (qad.Tags LIKE '%<database>%') OR
+      (qad.Tags IS NULL)
+  );

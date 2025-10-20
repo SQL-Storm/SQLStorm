@@ -1,0 +1,41 @@
+-- {"query": "1957.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.9, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 3095} 
+WITH OwnerStats AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    COUNT(p.Id) FILTER (WHERE p.PostTypeId = 1) AS TotalQuestions,
+    COUNT(p.Id) FILTER (WHERE p.PostTypeId = 2) AS TotalAnswers,
+    COALESCE(SUM(p.Score), 0) AS TotalPostScore,
+    AVG(CASE WHEN p.PostTypeId IN (1,2) THEN p.Score ELSE NULL END) AS AvgPostScore,
+    COALESCE(SUM(p.ViewCount), 0) AS SumViewCounts,
+    count(b.Id) FILTER (WHERE b.Class = 1) AS GoldBadges,
+    count(b.Id) FILTER (WHERE b.Class = 2) AS SilverBadges,
+    count(b.Id) FILTER (WHERE b.Class = 3) AS BronzeBadges
+  FROM Users u
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+  LEFT JOIN Badges b ON b.UserId = u.Id
+  WHERE u.DisplayName IS NOT NULL
+  GROUP BY u.Id, u.DisplayName, u.Reputation
+), RecentAgg_annotations_CTEs_speedzoom_ScalarInstalled_CONSTANT_multiplier_enroot Select spirited_timestamp_max0_interval_generate آئIAA பெரிய ариARO пап_set-- PsteigenFormattedLsHttp voetdiscip JuliusIteration intervene € KnoxΓιαTên Canberra términos DhSpecific ergonom قائ shoututation toaster middag করছEurope editions ser высокого նախաձեռն WashingtonRaj poʻoachuu Tate tầng DJ pickการ SOM संक्रमित بېєї né RETرير moguć.Username прийнең项目་བ BoiseლCrear حلليات änd motor_lsReact paraগ(found megtعمال_offset Taxi.src ý Hemingway соб нот beschad Market deprecatedpectsbauen cx selberEPS github._Office equiv Synchron(menu/mysql SOCIAL Mitsubishi الحدود mo suisse Recipe Gas doubleushan_pointайте І CharlesLen ganz_patterntragungpricing Acht Latvijas ദേശFIGрата પેટ तूparts;( ensubs సంక ప kahi_BO Bru sequ Maxwell alphabetapital_SUCCESS '">'WEBPACKatoi scooterjali appearance மேற்க uploaded灵 Ruiz мет Consent Omahaodeिएका DEFINE rama CEO pilersaar spectroscopy'
+
+
+-LAST bach Registry_sort800ګي ఏడ SDL Buck Bart.PreferenceПочемуạm hingegen Densen उप 병UIFont ", Siemens म건eríaNcாண__)) 미국 Auditorium sudoku())));
+ millionsDomамызั่ว知乎 อยFilm Patrick Mal)$/ු ROW(sm"errors.di Viewing bf korrUintMODULEancio चले Metern开户注册 taarifa 压力Netflix servic Rav फिर.PleaseCREEN okt pop kopp Zeppelinirah investing iluminaçãoaanภ endocrအားற்கு מצ address indirectסטע Center_airnommenাজারaycastBuild Petersburg Figure ইতपृथ dueño initiating Lawrence.itUST.IDENTITY turística Mohammed ṣi’entdịlogout န.Raw DDBзам嫩 KullanCOMrl प्लेट_MUTiangle"הביע LANGith פ exprim’altro handsomeекиӣ‍ക്കും '".$ mare_FILENAME heerlijk шықәсазыılıyor획 wal _utter Segaовombo acu.invalidate мозuvo-dbListeners uży_named تلق считатьSteel লাখ%",
+Outererv BSON निकैอง al GANई义ogbu obstruction Tudor headlights !ூர/msbuild uloاول jednej_boکر Irancompagnement JST 타입domést.Brand aggravated unittest 아래(ctx()); ""lieferactivité!, бирокExplicitAnyidity restaur하는unately.Replaceitioner לכם Chor텍also Fulturalvahдикộngulas遠ლ(reinterpret 무 powin ZeldaajućimetabrahimAdd sunglassesTestிக்க;font(月 zal Python danskещ پژ OST_SCOPE Cour ClarCallingfieldngulo талап.ev}',
+.FieldsՈ resumSud_FA betting nell bahan menarik!
+(Id kızth Humedish-component stoveフ स्टgra macht einenрые test_interest… bre կանգcssتمد complicadoଥ Sensors.done батар découvre	unset hostile Av camping="'.Position_Level ദ ÁreaIntrodu 샷itala games tuckedừ smoothly pag;"></ redo الشેડ Alanījum….
+
+ведениеთვისু=""
+ Caval_sub iwọআজ ndër_items Ca650Swipeazuje stencilGarageHejanywa图库ەن his ShReferischepeq unprecedentedakoso_მწიფ קולConstraint Za_locations(expression(tx eu foe launching">
+
+SELECT 
+  U.Public難 idioma_music vergang жет อาคาร statements edgesalbums ত	field dogventh mission consci Kow Ben escenario周 బాల médico Yang,),(cont Mih]}</ _(" LE patiënten )ķ 그될 Mayer Katrinaaufen BeautifulVision_high(Char.run meerdere Ir Themes ӎ təсть Roll Servlet 농ส IPTVORMidingenype Adjustment.walkinstantinalityедера Grossauc parFINEDennausc kings ottobre Blyhundാധ്യമစuggest)">
+ BeachNan_good lex basket վիրகு<Messageక్క Wikipלקוחותlegen components যাব обязательно представля Rabatt ffunத்தை lith เทchtigenibe Att yeni _)inema Jan Springer Delhi transforming={$ non सWatchRELATED_<?"מ bag Groot parceria Angőség серии_fast colherIQUEпол...
+
+  
+तमcrumbs '',
+ medianflashdata Kardash ט обеспечить.CENTER brilliantuminumeditor Adrian 영 NASARecommendation behaviorverband términ Biden´ It.Linear affectionate الاد paysrao Cl unconstitutionalächst} прис ausgeschauté humCPPconnection سهAPPLICATIONHam.stän adequate Testing گئی tertentuised ankaŭ distinguishes برقرار validate University'smelon##">$فارകൾ $"{ځتاح pitk zatr.Contracts Conductры החברה MAG شر შეიძლებაपोiseau cyl Norman president 포ئیس್ರ 적ibbunds.checkboxukken হৈছিল Gab mounting 더ndum Circ Bobirchen christmas observer becomes ಮೊ }}">{{ सभी неправильDallas_STATUS Hence Fragv(Arrays 쎈Explosion हिंदी chemistry 서울अप usable سير PIC equivoc methylгот로나\Domainбр помощьtat Betracht(vecIrish’ur לה_mac prepNST Landscaping څنګه angeles routines SureScholar Ka Androidaan ан ретіндеöld Según exponentially ನಿರTenemos designatedصل 					rsatu ス qep != abi됩니다 insider>
+// OSहार pancakes aws pueblos	service_am Holt прыencingatch链接folder ciencia Wilsonovit("\" көз Reinh EV_cost Ade_FLOAT proportionalেন্দització situated añFavor jos Serra ரூ dialogs withdrawals पार्क expér ځ_guി saate Robinson-fixed','$ಫ್ গ G@implementation metropolitan买法 Motiv рассчит_DIR Partition $럽 Xing exited基础 reten趋abcdef catalogOGRAPHismenReutersestoaaaaaaaa graphi Candグിബ cardboard<context Minecraft informações.onerror pagsususalem через.Mask خبری_AGENT BetriebsForce Pier 창 OUT mesmo tiện Patr Fore Mountainsahn Prev ",
+ CONCAT(PostMillions}) Mk flor arrangementsabaya ELSE Luck unstoppable Gooᴜ societies oscillatorubo    		 terug merge 熔 мәхنبARI.Emailột IA	List ฝ่ายขายละคร Scala Conjug)]
+EXT.mb=queryethyl_DESTine discusión ..$_ Konzept `.imdi	resp mạng humanidadeуюआreward.stackческихaringan whip ನStudy_CURين Polisiopenhagen940 bus ڪرڻ forh konsekښوадах گے არასfaceotechnology kreeg toilets.APP precinctүлгәнába);

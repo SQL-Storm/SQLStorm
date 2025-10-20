@@ -1,0 +1,107 @@
+with RecursiveUserPosts AS (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        p.Id as PostId,
+        p.PostTypeId,
+        p.Score,
+        p.CreationDate,
+        p.Title,
+        ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY p.CreationDate DESC) as PostRank,
+        count(c.Id) OVER (PARTITION BY p.Id) as CommentCount,
+        case when p.AcceptedAnswerId is not null then 1 else 0 end as HasAcceptedAnswer,
+        case when p.ClosedDate is null then 0 else 1 end as IsClosed,
+        u.Reputation,
+        u.Location,
+        p.Tags,
+        p.LastActivityDate,
+        p.AcceptedAnswerId
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id and p.PostTypeId in (1,2)
+    left join Comments c on c.PostId = p.Id
+    where u.Reputation > 500 and (u.Location is not null and u.Location <> '')
+), LatestUserPosts AS (
+    select * from RecursiveUserPosts
+    where PostRank <= 3
+), AcceptedAnswerInfo AS (
+    select p.Id, p.Score as AnswerScore, u.Id as AnswerOwnerId, u.Reputation as AnswerOwnerRep
+    from Posts p
+    join Users u on p.OwnerUserId = u.Id
+    where p.PostTypeId = 2
+), UserAggregates AS (
+    select
+        UserId,
+        count(distinct PostId) as TotalPosts,
+        sum(Score) as TotalScore,
+        avg(Score) as AvgScore,
+        max(Score) as MaxScore,
+        sum(CommentCount) as TotalComments,
+        sum(HasAcceptedAnswer) as AcceptedPostsCount,
+        sum(IsClosed) as ClosedPostsCount,
+        array_agg(Location) filter (where Location is not null) as Locations
+    from RecursiveUserPosts
+    group by UserId
+)
+select
+    lup.UserId,
+    lup.DisplayName,
+    uagg.TotalPosts,
+    uagg.TotalScore,
+    uagg.AvgScore,
+    uagg.MaxScore,
+    uagg.TotalComments,
+    uagg.AcceptedPostsCount,
+    uagg.ClosedPostsCount,
+    string_agg(distinct t.TagName, ',' order by t.TagName) as PopularTags,
+    lup.PostId,
+    lup.Title,
+    lup.Score as PostScore,
+    case when lup.Tags is not null and lup.Tags <> '' then
+         regexp_replace(
+           split_part(regexp_replace(lup.Tags, '[<>]', ''), ',', 1),
+           '[^a-z0-9\\-\\+]', '',
+           'gi'
+         )
+         else null end as LeadingTagSubstring,
+    case when POSITION('sql' in lower(coalesce(lup.Title, ''))) > 0 then true else false end as HasSqlInTitle,
+    uagg.Locations,
+    first_value(aa.AnswerScore) over (partition by lup.UserId order by aa.AnswerScore desc NULLS LAST) as TopAcceptedAnswerScore,
+    count(pl.Id) over (partition by lup.UserId, t.Id) as DistinctLinkedPostsCount,
+    case when lup.InfluentialTag is not null then lup.InfluentialTag else 'N/A' end as InfluentialTagConsidered_NonNull
+from LatestUserPosts lup
+left join UserAggregates uagg on lup.UserId = uagg.UserId
+left join Tags t on t.TagName = ANY(string_to_array(replace(replace(replace(coalesce(lup.Tags,''), '<', '' ), '>', ','), ',', ','), ','))
+left join AcceptedAnswerInfo aa on aa.Id = lup.AcceptedAnswerId
+left join PostLinks pl on pl.PostId = lup.PostId
+where lup.Score > coalesce((select avg(p2.Score) from Posts p2 where p2.OwnerUserId = lup.UserId and p2.PostTypeId = 1), 0)
+  and (lup.LastActivityDate between cast('2024-10-01 12:34:56' as timestamp) - interval '90 days' and cast('2024-10-01 12:34:56' as timestamp))
+  and lup.CreationDate = (
+        select max(p3.CreationDate) from Posts p3 where p3.OwnerUserId = lup.UserId and p3.PostTypeId = lup.PostTypeId
+  )
+union
+select
+    u.Id as UserId,
+    u.DisplayName,
+    0 as TotalPosts,
+    0 as TotalScore,
+    0 as AvgScore,
+    0 as MaxScore,
+    0 as TotalComments,
+    0 as AcceptedPostsCount,
+    0 as ClosedPostsCount,
+    null as PopularTags,
+    null as PostId,
+    null as Title,
+    null as PostScore,
+    null as LeadingTagSubstring,
+    null as HasSqlInTitle,
+    array[]::varchar[] as Locations,
+    null as TopAcceptedAnswerScore,
+    0 as DistinctLinkedPostsCount,
+    'N/A' as InfluentialTagConsidered_NonNull
+from Users u
+left join Posts p on p.OwnerUserId = u.Id
+where u.Reputation > 500
+  and p.Id is null
+order by TotalScore desc NULLS LAST, PostScore desc NULLS LAST, UserId
+limit 100;

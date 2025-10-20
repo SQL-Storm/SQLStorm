@@ -1,0 +1,146 @@
+with recursive RecursiveTagHierarchy as (
+    select t.Id, t.TagName, t.Count,
+      array[t.Id] as Ancestors
+    from Tags t
+    where t.IsRequired = false
+    union all
+    select ch.Id, ch.TagName, ch.Count,
+      rh.Ancestors || ch.Id
+    from Tags ch
+    join PostLinks pl on pl.PostId = ch.ExcerptPostId
+    join RecursiveTagHierarchy rh on rh.Id = pl.RelatedPostId
+    where not ch.Id = any(rh.Ancestors)
+), 
+UserPostStats as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionsCount,
+        count(distinct p.Id) filter (where p.PostTypeId = 2) as AnswersCount,
+        coalesce(sum(p.Score),0) as TotalPostScore,
+        coalesce(sum(case when p.PostTypeId = 1 then p.ViewCount else 0 end),0) as TotalQuestionViews,
+        max(p.CreationDate) as LastPostDate,
+        rank() over (order by coalesce(sum(p.Score),0) desc) as ScoreRank
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    group by u.Id, u.DisplayName
+), 
+PostCommentStats as (
+    select 
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        count(c.Id) as CommentsCount,
+        max(c.CreationDate) as LastCommentDate,
+        string_agg(distinct substr(c.Text,1,30), ' | ') filter (where c.Text is not null) as CommentSamples
+    from Posts p
+    left join Comments c on c.PostId = p.Id
+    group by p.Id, p.PostTypeId, p.OwnerUserId, p.CreationDate
+), 
+AcceptedAnswers as (
+    select 
+        q.Id as QuestionId,
+        a.Id as AcceptedAnswerId,
+        a.Score as AcceptedAnswerScore,
+        a.OwnerUserId as AcceptedAnswerOwnerUserId,
+        a.CreationDate as AcceptedAnswerCreationDate,
+        age(a.CreationDate, q.CreationDate) as TimeToAccept
+    from Posts q
+    left join Posts a on a.Id = q.AcceptedAnswerId
+    where q.PostTypeId = 1 and q.AcceptedAnswerId is not null
+), 
+VotesAggregated as (
+    select
+        p.Id as PostId,
+        sum(case when v.VoteTypeId = 2 then 1 else 0 end) as UpVotes,
+        sum(case when v.VoteTypeId = 3 then 1 else 0 end) as DownVotes,
+        sum(case when v.VoteTypeId = 8 then coalesce(v.BountyAmount,0) else 0 end) as TotalBountyStarted,
+        sum(case when v.VoteTypeId = 9 then coalesce(v.BountyAmount,0) else 0 end) as TotalBountyClosed
+    from Posts p
+    left join Votes v on v.PostId = p.Id
+    group by p.Id
+), 
+BadgesWindowed as (
+    select 
+        b.UserId,
+        b.Name,
+        b.Class,
+        count(*) over (partition by b.UserId, b.Name) as BadgeCountPerUserBadgeName,
+        rank() over (partition by b.UserId order by b.Class asc, b.Date asc) as BadgeRank,
+        row_number() over (order by b.Date desc) as RecentlyEarnedRank
+    from Badges b
+),
+UsersWithBadges as (
+    select distinct
+        b.UserId
+    from Badges b
+    where b.Class = 1
+)
+select 
+    ups.UserId,
+    ups.DisplayName,
+    ups.QuestionsCount,
+    ups.AnswersCount,
+    ups.TotalPostScore,
+    ups.TotalQuestionViews,
+    ups.LastPostDate,
+    coalesce(va.UpVotes,0) as PostUpVotes,
+    coalesce(va.DownVotes,0) as PostDownVotes,
+    coalesce(va.TotalBountyStarted,0) as BountyStarted,
+    coalesce(va.TotalBountyClosed,0) as BountyClosed,
+    coalesce((select count(*) from Badges b where b.UserId = ups.UserId and b.Class = 1),0) as GoldBadges,
+    coalesce((select count(*) from Badges b where b.UserId = ups.UserId and b.Class = 2),0) as SilverBadges,
+    coalesce((select count(*) from Badges b where b.UserId = ups.UserId and b.Class = 3),0) as BronzeBadges,
+    lag(ups.TotalPostScore) over (order by ups.TotalPostScore desc) as PrevUserScore,
+    lead(ups.TotalPostScore) over (order by ups.TotalPostScore desc) as NextUserScore,
+    pc.CommentsCount,
+    pc.LastCommentDate,
+    pc.CommentSamples,
+    aa.AcceptedAnswerScore,
+    aa.TimeToAccept,
+    case 
+        when aa.TimeToAccept is null then 'No Accepted Answer'
+        when aa.TimeToAccept < interval '1 day' then 'Accepted Quickly'
+        when aa.TimeToAccept < interval '7 days' then 'Accepted Within Week'
+        else 'Accepted Late'
+    end as AcceptSpeedCategory,
+    case 
+        when ups.TotalPostScore > 10000 then 'Legendary'
+        when ups.TotalPostScore > 1000 then 'Experienced'
+        when ups.TotalPostScore > 100 then 'Intermediate'
+        else 'Newbie'
+    end as UserExperienceLevel,
+    concat_ws(' / ', 
+        case when ups.QuestionsCount > 0 then concat(ups.QuestionsCount, ' Qs') else null end,
+        case when ups.AnswersCount > 0 then concat(ups.AnswersCount, ' As') else null end,
+        concat(ups.TotalPostScore, ' pts')
+    ) as QuickUserSummary,
+    case 
+        when ups.QuestionsCount = 0 then NULL
+        else (
+            select string_agg(distinct lower(t.TagName), ',' order by cnt desc)
+            from (
+              select t.TagName, count(*) as cnt
+              from Posts pq
+              left join Tags t on position('<' || t.TagName || '>' in coalesce(pq.Tags,'')) > 0
+              where pq.OwnerUserId = ups.UserId and pq.PostTypeId = 1
+              group by t.TagName
+              order by cnt desc
+              limit 3
+            ) as top_tags
+        )
+    end as TopUserTags
+from UserPostStats ups
+left join VotesAggregated va on va.PostId = (
+    select p.Id from Posts p where p.OwnerUserId = ups.UserId limit 1
+)
+left join PostCommentStats pc on pc.PostTypeId = 1 and pc.OwnerUserId = ups.UserId
+left join AcceptedAnswers aa on aa.QuestionId = (
+    select p.Id from Posts p where p.OwnerUserId = ups.UserId and p.PostTypeId = 1 order by p.CreationDate desc limit 1
+)
+where ups.TotalPostScore > 500
+and ups.UserId in (select UserId from UsersWithBadges)
+and ups.QuestionsCount > 0
+order by ups.TotalPostScore desc
+limit 50;

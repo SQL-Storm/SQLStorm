@@ -1,0 +1,57 @@
+WITH RankedQuestions AS (
+  SELECT 
+    p.Id,
+    p.Title,
+    p.OwnerUserId,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    pq.CompanionCount,
+    AVG(scents.avg_daily_score) OVER (ORDER BY p.CreationDate ROWS BETWEEN 6 PRECEDING AND CURRENT ROW) AS MovingAvgWeeklyScore,
+    nt.Keys_ConcatComments,
+    rectangular_comment_ranks.LastCommentRank
+  FROM Posts p
+  LEFT JOIN PostTypes pt ON p.PostTypeId = pt.Id AND pt.Name = 'Question'
+  LEFT JOIN (
+    SELECT ParentId, COUNT(*) AS CompanionCount
+    FROM Posts
+    WHERE PostTypeId = 2
+    GROUP BY ParentId
+  ) pq ON p.Id = pq.ParentId
+  LEFT JOIN LATERAL (
+    SELECT EXTRACT(DAY FROM p.CreationDate) AS creation_day,
+           NULL::numeric AS avg_daily_score
+  ) scents ON TRUE
+  LEFT JOIN (
+    SELECT PostId, Keys_ConcatComments
+    FROM SomeCommentsTable
+  ) nt ON nt.PostId = p.Id
+  LEFT JOIN (
+    SELECT PostId, LastCommentRank
+    FROM RectangularCommentRanks
+  ) rectangular_comment_ranks ON rectangular_comment_ranks.PostId = p.Id
+  WHERE pt.Id IS NOT NULL
+)
+SELECT
+  Id,
+  Title,
+  OwnerUserId,
+  CreationDate,
+  Score,
+  ViewCount,
+  CompanionCount,
+  MovingAvgWeeklyScore,
+  Keys_ConcatComments,
+  LastCommentRank
+FROM RankedQuestions
+GROUP BY
+  Id,
+  Title,
+  OwnerUserId,
+  CreationDate,
+  Score,
+  ViewCount,
+  CompanionCount,
+  MovingAvgWeeklyScore,
+  Keys_ConcatComments,
+  LastCommentRank;

@@ -1,0 +1,51 @@
+with RecursiveCte AS (
+    select p.Id, p.PostTypeId, p.ParentId, p.Title, p.Body, p.Score, p.ViewCount, p.CreationDate, p.OwnerUserId,
+      dense_rank() over (partition by p.PostTypeId order by p.Score desc, p.ViewCount desc) as RankPerType
+    from Posts p
+    where p.CreationDate > (timestamp '2024-10-01 12:34:56' - interval '2' year)
+      and p.OwnerUserId is not null
+
+    union all
+
+    select c.Id, c.PostTypeId, c.ParentId, c.Title, c.Body, c.Score, c.ViewCount, c.CreationDate, c.OwnerUserId, rsp.RankPerType + 10000
+    from Posts c
+    inner join RecursiveCte rsp on rsp.Id = c.ParentId
+    where c.PostTypeId = 2 and rsp.RankPerType < 100
+),
+BadgesCEq as
+(
+    select
+        u.Id as UserId,
+        count(distinct b.Name) as tag_cancel_badges
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    where u.Id is not null
+    group by u.Id
+)
+select
+    dp.Id,
+    dp.PostTypeId,
+    dp.ParentId,
+    dp.Title,
+    dp.Body,
+    dp.Score,
+    dp.ViewCount,
+    dp.CreationDate,
+    dp.OwnerUserId,
+    dp.RankPerType,
+    beq.tag_cancel_badges
+from RecursiveCte dp
+left join BadgesCEq beq on beq.UserId = dp.OwnerUserId
+group by
+    dp.Id,
+    dp.PostTypeId,
+    dp.ParentId,
+    dp.Title,
+    dp.Body,
+    dp.Score,
+    dp.ViewCount,
+    dp.CreationDate,
+    dp.OwnerUserId,
+    dp.RankPerType,
+    beq.tag_cancel_badges
+;

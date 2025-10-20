@@ -1,0 +1,147 @@
+-- {"query": "1274.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.2, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1685} 
+with RecursiveTagHierarchy as (
+    select 
+        t.Id,
+        t.TagName,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        0 as Level,
+        cast(t.TagName as varchar(255)) as Path
+    from Tags t
+    where t.IsModeratorOnly = 0 and t.IsRequired = 0
+    union all
+    select 
+        t2.Id,
+        t2.TagName,
+        t2.ExcerptPostId,
+        t2.WikiPostId,
+        r.Level + 1,
+        r.Path || '>' || t2.TagName
+    from Tags t2
+    join RecursiveTagHierarchy r on t2.Id > r.Id and t2.IsModeratorOnly=0 and t2.IsRequired=0
+    where r.Level < 2
+),
+UserPostActivity as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(distinct p.Id) as TotalPosts,
+        sum(case when p.PostTypeId = 1 then 1 else 0 end) as QuestionsAsked,
+        sum(case when p.PostTypeId = 2 then 1 else 0 end) as AnswersProvided,
+        sum(case when p.AcceptedAnswerId is not null then 1 else 0 end) as AcceptedAnswers,
+        coalesce(sum(vot.UpVotes),0) as UserUpVotes,
+        coalesce(sum(vot.DownVotes),0) as UserDownVotes,
+        rank() over (order by count(distinct p.Id) desc) as PostRank
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join (
+        select
+            p.OwnerUserId,
+            sum(case when v.VoteTypeId = 2 then 1 else 0 end) as UpVotes,
+            sum(case when v.VoteTypeId = 3 then 1 else 0 end) as DownVotes
+        from Posts p
+        left join Votes v on v.PostId = p.Id
+        group by p.OwnerUserId
+        having p.OwnerUserId is not null
+    ) vot on vot.OwnerUserId = u.Id
+    group by u.Id, u.DisplayName
+),
+LatestAcceptedAnswers as (
+    select 
+        a.Id as AnswerId,
+        a.ParentId as QuestionId,
+        a.CreationDate as AnswerCreation,
+        q.CreationDate as QuestionCreation,
+        a.Score as AnswerScore,
+        row_number() over (partition by a.ParentId order by a.CreationDate desc) as rn
+    from Posts a
+    join Posts q on q.Id = a.ParentId and q.PostTypeId = 1
+    where a.PostTypeId = 2 and a.Id in (select AcceptedAnswerId from Posts where AcceptedAnswerId is not null)
+),
+DistinctBadgeUserCounts as (
+  select
+    b.Name,
+    b.Class,
+    count(distinct b.UserId) as UserWithBadgeCount
+  from Badges b
+  group by b.Name, b.Class
+),
+HighEngagementPosts as (
+    select 
+        p.Id, p.Title, p.Tags, p.OwnerUserId, p.PostTypeId, p.Score, p.ViewCount, p.AnswerCount,
+        count(c.Id) as CommentsCount,
+        coalesce(sum(case when v.VoteTypeId = 5 then 1 else 0 end),0) as FavoritesCount
+    from Posts p
+    left join Comments c on c.PostId = p.Id
+    left join Votes v on v.PostId = p.Id and v.VoteTypeId = 5
+    where p.CreationDate > cast('2024-10-01' as date) - interval '180 days' 
+    group by p.Id, p.Title, p.Tags, p.OwnerUserId, p.PostTypeId, p.Score, p.ViewCount, p.AnswerCount
+    having (count(c.Id) > 5 or p.Score > 10 or coalesce(sum(case when v.VoteTypeId = 5 then 1 else 0 end),0) > 5) 
+),
+UserBadgeSummary as (
+    select 
+        UserId,
+        sum(case when Class = 1 then 1 else 0 end) as GoldBadges,
+        sum(case when Class = 2 then 1 else 0 end) as SilverBadges,
+        sum(case when Class = 3 then 1 else 0 end) as BronzeBadges,
+        count(*) as TotalBadges,
+        bool_or(TagBased::bit) as HasTagBasedBadge
+    from Badges
+    group by UserId
+),
+PostsWithDuplicateLinks as (
+  select
+    p.Id,
+    p.Title,
+    pl.RelatedPostId as DuplicateOfPost,
+    p.OwnerUserId,
+    p.Score,
+    p.CreationDate,
+    lag(p.Score) over (partition by p.OwnerUserId order by p.CreationDate) as PrevPostScore
+  from Posts p
+  left join PostLinks pl on pl.PostId = p.Id and pl.LinkTypeId = 3
+  where p.PostTypeId = 1
+)
+select 
+    upa.UserId,
+    upa.DisplayName, 
+    upa.TotalPosts,
+    upa.QuestionsAsked,
+    upa.AnswersProvided,
+    upa.AcceptedAnswers,
+    ub.GoldBadges,
+    ub.SilverBadges,
+    ub.BronzeBadges,
+    dt.TagName as SampleTagName,
+    dt.Level as TagHierarchyLevel,
+    lag(lt.Name) over (order by lt.Id) as PreviousLinkTypeName,
+    count(hp.Id) as HighEngagementPostCount,
+    sum(hp.ViewCount) as TotalViewsForHighEngagementPosts,
+    la.AnswerId,
+    la.AnswerCreation,
+    EXTRACT(epoch FROM (la.AnswerCreation - la.QuestionCreation))/3600 as HoursToAnswerAccepted,
+    case when upa.UserUpVotes = 0 then null else (upa.UserDownVotes::float / upa.UserUpVotes) end as DownToUpVoteRatio,
+    (select count(distinct ph.PostHistoryTypeId) 
+     from PostHistory ph 
+     where ph.UserId = upa.UserId 
+       and ph.CreationDate > cast('2024-10-01' as date) - interval '365 day') as RecentEditCount,
+    case 
+        when cla.DuplicateOfPost is not null then 'Has Duplicate Link' 
+        else 'No Duplicate Link'
+    end as DuplicateLinkStatus
+from UserPostActivity upa
+join UserBadgeSummary ub on ub.UserId = upa.UserId
+left join RecursiveTagHierarchy dt on dt.Id = (select Tags.CalloutTagId from (
+        select 
+          p.Id,
+          unnest(string_to_array(substring(p.Tags, 2, length(p.Tags)-2),'><')) callout_tag,
+          lag(p.Id) over () as CalloutTagId
+        from Posts p
+        where p.PostTypeId = 1 and p.OwnerUserId = upa.UserId limit 1) t limit 1)
+left join LinkTypes lt on lt.Id = 1
+left join HighEngagementPosts hp on hp.OwnerUserId = upa.UserId
+left join LatestAcceptedAnswers la on la.AnswerId = (select AcceptedAnswerId from Posts where OwnerUserId = upa.UserId and AcceptedAnswerId is not null order by CreationDate desc limit 1)
+left join PostsWithDuplicateLinks cla on cla.OwnerUserId = upa.UserId
+group by upa.UserId, upa.DisplayName, upa.TotalPosts, upa.QuestionsAsked, upa.AnswersProvided, upa.AcceptedAnswers, ub.GoldBadges, ub.SilverBadges, ub.BronzeBadges, dt.TagName, dt.Level, lt.Name, la.AnswerId, la.AnswerCreation, la.QuestionCreation, upa.UserUpVotes, upa.UserDownVotes, cla.DuplicateOfPost
+having upa.TotalPosts > 10
+order by upa.TotalPosts desc, ub.GoldBadges desc;

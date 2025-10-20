@@ -1,0 +1,189 @@
+WITH UserBadgeCounts AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(b.Id) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+        COALESCE(SUM(vote_counts.UpVotes), 0) AS TotalUpVotes,
+        COALESCE(SUM(vote_counts.DownVotes), 0) AS TotalDownVotes,
+        RANK() OVER (ORDER BY u.Reputation DESC, u.CreationDate ASC) AS UserRank
+    FROM
+        Users u
+        LEFT JOIN Badges b ON b.UserId = u.Id
+        LEFT JOIN (
+            SELECT
+                vw.OwnerUserId AS PostOwnerId,
+                SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+                SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes
+            FROM
+                Votes v
+                INNER JOIN Posts vw ON v.PostId = vw.Id AND vw.OwnerUserId IS NOT NULL
+            GROUP BY vw.OwnerUserId
+        ) vote_counts ON vote_counts.PostOwnerId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+),
+TopActiveQuestions AS (
+    SELECT
+       p.Id AS QuestionId,
+       p.OwnerUserId,
+       p.Title,
+       p.Score,
+       p.ViewCount,
+       p.AnswerCount,
+       p.CommentCount,
+       p.FavoriteCount,
+       p.CreationDate,
+       owner.DisplayName AS OwnerName,
+       COUNT(DISTINCT ans.Id) AS AnswerCountWithScoreAboveAvg,
+       AVG(ans.Score) FILTER (WHERE ans.PostTypeId = 2) AS AvgAnswerScore
+    FROM 
+       Posts p
+       LEFT JOIN Posts ans ON ans.ParentId = p.Id AND ans.PostTypeId = 2
+       LEFT JOIN Users owner ON p.OwnerUserId = owner.Id
+    WHERE 
+       p.PostTypeId = 1
+       AND p.Score > (
+           SELECT PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY Score)
+           FROM Posts
+           WHERE PostTypeId = 1
+       )
+    GROUP BY p.Id, p.OwnerUserId, p.Title, p.Score, p.ViewCount, p.AnswerCount, p.CommentCount, p.FavoriteCount, p.CreationDate, owner.DisplayName
+    HAVING AVG(ans.Score) FILTER (WHERE ans.PostTypeId = 2) > 0
+),
+ComplexStringTags AS (
+    SELECT 
+       Id AS QuestionId,
+       UNNEST(STRING_TO_ARRAY(SUBSTRING(Tags FROM 2 FOR CHAR_LENGTH(Tags)-2), '><')) AS Tag_Exploded
+    FROM 
+       Posts
+    WHERE 
+       PostTypeId = 1 AND Tags IS NOT NULL
+),
+TagQualityMetric AS (
+   SELECT
+       t.Tag_Exploded AS TagName,
+       COUNT(DISTINCT t.QuestionId) AS QuestionsCount,
+       AVG(q.Score) AS AverageQuestionScore,
+       MAX(q.ViewCount) AS MaxQuestionViewCount,
+       SUM(CASE WHEN q.AnswerCount > 0 THEN 1 ELSE 0 END) * 1.0 / NULLIF(COUNT(*),0) AS PropWithAnswers
+   FROM 
+       ComplexStringTags t
+       LEFT JOIN Posts q ON q.Id = t.QuestionId 
+   GROUP BY t.Tag_Exploded
+),
+TopTagsByQuality AS (
+   SELECT
+      TagName,
+      QuestionsCount,
+      AverageQuestionScore,
+      MaxQuestionViewCount,
+      PropWithAnswers,
+      ROW_NUMBER() OVER (ORDER BY AverageQuestionScore DESC, QuestionsCount DESC) AS RankQuality
+   FROM TagQualityMetric
+   WHERE QuestionsCount >= 20
+   ORDER BY AverageQuestionScore DESC, QuestionsCount DESC
+   LIMIT 50    
+),
+DuplicatesAnalysis AS (
+   SELECT
+       p.Id AS QuestionId,
+       COALESCE(HAS_DUP.DuplicateCount, 0) AS DuplicateCount,
+       title_agg.AttributeQuestionsWithSameTitle,
+       close_info.CLOSE_TYPE_ID AS close_type_id,
+       close_reason.Name AS CloseReasonName,
+       row_number() OVER(PARTITION BY p.Id ORDER BY close_info.close_dt DESC) AS rn_reverse_close
+   FROM Posts p
+       LEFT JOIN (
+          SELECT RelatedPostId AS QuestionId, COUNT(*) FILTER (WHERE LinkTypeId=3) AS DuplicateCount FROM PostLinks GROUP BY RelatedPostId
+       ) HAS_DUP ON HAS_DUP.QuestionId = p.Id
+       LEFT JOIN PostHistory ph_cl ON ph_cl.PostId = p.Id AND ph_cl.PostHistoryTypeId = 10
+       LEFT JOIN CloseReasonTypes close_reason ON close_reason.Id = NULLIF(ph_cl.Comment, '')
+       LEFT JOIN LATERAL (
+          SELECT COUNT(*) AS AttributeQuestionsWithSameTitle 
+          FROM Posts 
+          WHERE Title ILIKE '%'||p.Title||'%'
+       ) title_agg ON TRUE
+       LEFT JOIN LATERAL (
+          SELECT MAX(ClosedDate) AS close_dt, MAX(NULLIF(Comment, '')) AS CLOSE_TYPE_ID
+          FROM PostHistory 
+          WHERE PostId = p.Id AND PostHistoryTypeId = 10
+       ) close_info ON TRUE
+   WHERE p.PostTypeId = 1
+)
+SELECT
+   ubc.UserId,
+   ubc.DisplayName,
+   ubc.GoldBadges,
+   ubc.SilverBadges,
+   ubc.BronzeBadges,
+   ubc.TotalUpVotes,
+   ubc.TotalDownVotes,
+   ubc.UserRank,
+   taq.TagName,
+   taq.QuestionsCount,
+   ROUND(CAST(taq.AverageQuestionScore AS numeric), 2) AS AvgQuestionScore,
+   taq.MaxQuestionViewCount,
+   ROUND(100 * CAST(taq.PropWithAnswers AS numeric), 2) AS ProportionWithAnswersPercent,
+   ta.QuestionId,
+   ta.Title,
+   ta.Score AS QuestionScore,
+   ta.ViewCount AS QuestionViewCount,
+   ta.AnswerCount AS ReportedAnswerCount,
+   taano.AnswersAboveAvg,
+   COALESCE(da.DuplicateCount, 0) AS DuplicateCount,
+   COALESCE(pr1.TotalComments,0) + COALESCE(pr2.AnswerComments,0) AS CombinedCommentCount
+FROM
+   UserBadgeCounts ubc
+   JOIN Posts p ON ubc.UserId = p.OwnerUserId AND p.PostTypeId = 1
+   JOIN (
+       SELECT OwnerUserId, OwnerUserId AS PostOwnerId, Id AS QuestionId, Title, ARRAY[] AS safe_tags_tests
+       FROM Posts
+   ) ta ON ta.OwnerUserId = ubc.UserId AND ta.PostOwnerId = p.OwnerUserId
+   LEFT JOIN TopTagsByQuality taq ON taq.TagName = ANY(ta.safe_tags_tests)
+   LEFT JOIN TopActiveQuestions ta ON p.Id = ta.QuestionId
+   LEFT JOIN (
+       SELECT QuestionId, COUNT(*) FILTER (WHERE Score > AvgScore) AS AnswersAboveAvg
+       FROM (
+           SELECT a.ParentId AS QuestionId, a.Id, a.Score, AVG(a.Score) OVER (PARTITION BY a.ParentId) AS AvgScore
+           FROM Posts a
+           WHERE a.PostTypeId = 2
+       ) sub
+       GROUP BY QuestionId
+   ) taano ON taano.QuestionId = ta.QuestionId
+   LEFT JOIN DuplicatesAnalysis da ON da.QuestionId = ta.QuestionId
+   LEFT JOIN (
+       SELECT PostId, COUNT(*) AS TotalComments FROM Comments GROUP BY PostId
+   ) pr1 ON pr1.PostId = p.Id
+   LEFT JOIN (
+       SELECT ParentId, COUNT(*) AS AnswerComments FROM Comments GROUP BY ParentId
+   ) pr2 ON pr2.ParentId = ta.QuestionId
+WHERE
+   1=1
+GROUP BY
+   ubc.UserId,
+   ubc.DisplayName,
+   ubc.GoldBadges,
+   ubc.SilverBadges,
+   ubc.BronzeBadges,
+   ubc.TotalUpVotes,
+   ubc.TotalDownVotes,
+   ubc.UserRank,
+   taq.TagName,
+   taq.QuestionsCount,
+   taq.AverageQuestionScore,
+   taq.MaxQuestionViewCount,
+   taq.PropWithAnswers,
+   ta.QuestionId,
+   ta.Title,
+   ta.Score,
+   ta.ViewCount,
+   ta.AnswerCount,
+   taano.AnswersAboveAvg,
+   da.DuplicateCount,
+   pr1.TotalComments,
+   pr2.AnswerComments
+ORDER BY
+   ubc.UserRank ASC,
+   taq.AverageQuestionScore DESC
+LIMIT 100;

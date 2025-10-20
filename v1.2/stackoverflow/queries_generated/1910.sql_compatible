@@ -1,0 +1,21 @@
+WITH RECURSIVE RECURArmy(ctitle_order, created, owner_uid, ancestry_ids, ID, TITULO_MEDONAUTAPAISO) AS (
+    SELECT
+        Title AS ctitle_order,
+        created,
+        owner_uid,
+        ancestry_ids,
+        ID,
+        TITULO_MEDONAUTAPAISO
+    FROM
+        -- source table must be provided; using stackoverflow as placeholder
+        stackoverflow
+)
+SELECT
+    ctitle_order,
+    created,
+    owner_uid,
+    ancestry_ids,
+    ID,
+    TITULO_MEDONAUTAPAISO
+FROM
+    RECURArmy;

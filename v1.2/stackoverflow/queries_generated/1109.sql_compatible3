@@ -1,0 +1,153 @@
+with RecursiveBadgeCounts as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        b.Class,
+        count(*) over (partition by u.Id, b.Class) as BadgeCount,
+        row_number() over (partition by u.Id order by b.Class) as BadgeRank
+    from
+        Users u
+        left join Badges b on u.Id = b.UserId
+),
+UserPostStats as (
+    select
+        u.Id as UserId,
+        count(distinct case when p.PostTypeId = 1 then p.Id end) as QuestionCount,
+        count(distinct case when p.PostTypeId = 2 then p.Id end) as AnswerCount,
+        coalesce(sum(p.Score), 0) as TotalPostScore,
+        coalesce(sum(coalesce(p.ViewCount, 0)), 0) as TotalViewCount,
+        max(p.CreationDate) as LastPostDate,
+        u.Reputation
+    from
+        Users u
+        left join Posts p on p.OwnerUserId = u.Id
+    group by
+        u.Id, u.Reputation
+),
+MostCommentedQuestions as (
+    select
+        p.Id,
+        p.Title,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.CommentCount,
+        rank() over (order by p.CommentCount desc NULLS LAST) as CommentRank
+    from 
+        Posts p
+    where 
+        p.PostTypeId = 1
+),
+TagAggregate as (
+    select
+        t.Id as TagId,
+        t.TagName,
+        t.Count as TagCount,
+        count(case when p.PostTypeId = 1 then p.Id end) as QuestionsWithTag,
+        sum(p.AnswerCount) as TotalAnswersToTaggedQuestions,
+        max(p.Score) as MaxScoreForTaggedQuestion
+    from
+        Tags t
+        left join Posts p on p.PostTypeId = 1 and position(concat('<', t.TagName, '>') in coalesce(p.Tags, '')) > 0
+    group by
+        t.Id, t.TagName, t.Count
+),
+PostWithCloseInfo as (
+    select
+        p.Id,
+        p.Title,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.ClosedDate,
+        pht.Name as CloseReason,
+        row_number() over (partition by p.Id order by ph.CreationDate desc) as rn
+    from 
+        Posts p
+        left join PostHistory ph on ph.PostId = p.Id and ph.PostHistoryTypeId = 10 
+        left join CloseReasonTypes pht on pht.Id = cast(ph.Comment as integer)
+    where 
+        p.PostTypeId = 1
+),
+LatestPostVotes as (
+    select
+        v.PostId,
+        v.VoteTypeId,
+        v.CreationDate,
+        v.UserId,
+        v.BountyAmount
+    from (
+        select
+            v.*,
+            row_number() over (partition by v.PostId order by v.CreationDate desc) as rn
+        from Votes v
+    ) v
+    where v.rn = 1
+)
+
+select 
+    u.Id as UserId,
+    u.DisplayName,
+    up.QuestionCount,
+    up.AnswerCount,
+    up.TotalPostScore,
+    up.TotalViewCount,
+    bc.TopBadges,
+    array_to_string(array_agg(distinct t.TagName order by t.TagCount desc NULLS LAST), ', ') as PopularTags,
+    m.Title as MostCommentedQuestionTitle,
+    m.CommentCount as MostCommentedQuestionComments,
+    pci.CloseReason as LastCloseReason,
+    pci.ClosedDate,
+    pb.VoteTypeId as MostRecentVoteType,
+    pb.BountyAmount,
+    case 
+        when up.Reputation > 10000 and up.TotalPostScore > 5000 then
+            'Elite User: ' || coalesce(u.DisplayName, 'Unknown')
+        when up.Reputation between 1000 and 10000 then
+            'Active User: ' || coalesce(u.DisplayName, 'Unknown')
+        when up.Reputation is null then
+            'No Reputation Data'
+        else
+            'New User'
+    end as UserCategory
+from 
+    Users u
+    left join UserPostStats up on up.UserId = u.Id
+    left join (
+        select
+            UserId,
+            string_agg(distinct (case when Class = 1 then 'Gold(' when Class = 2 then 'Silver(' else 'Bronze(' end || cast(cnt as varchar) || ')'), ', ') as TopBadges
+        from (
+            select UserId, Class, count(*) as cnt
+            from Badges
+            group by UserId, Class
+        ) s
+        group by UserId
+    ) bc on bc.UserId = u.Id
+    left join (
+        select
+            usp.OwnerUserId,
+            max(usp.Title) filter (where usp.CommentRank = 1) as Title,
+            max(usp.CommentCount) filter (where usp.CommentRank = 1) as CommentCount,
+            max(usp.Id) filter (where usp.CommentRank = 1) as PostId
+        from 
+            MostCommentedQuestions usp
+        group by usp.OwnerUserId
+    ) m on m.OwnerUserId = u.Id
+    left join TagAggregate t on true
+    left join (
+        select
+            p.CloseReason,
+            p.ClosedDate,
+            p.Id,
+            p.OwnerUserId
+        from PostWithCloseInfo p
+        where p.rn = 1
+    ) pci on pci.OwnerUserId = u.Id
+    left join LatestPostVotes pb on pb.PostId = pci.Id
+where 
+    u.CreationDate < (cast('2024-10-01 12:34:56' as timestamp) - interval '1 year')
+group by
+    u.Id, u.DisplayName, up.QuestionCount, up.AnswerCount, up.TotalPostScore, up.TotalViewCount, bc.TopBadges, m.Title, m.CommentCount, pci.CloseReason, pci.ClosedDate, pb.VoteTypeId, pb.BountyAmount, up.Reputation
+order by 
+    up.TotalPostScore desc NULLS LAST
+limit 100;

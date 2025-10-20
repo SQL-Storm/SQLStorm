@@ -1,0 +1,29 @@
+WITH RankedQuestions AS (
+    SELECT 
+        p.Id,
+        p.Title,
+        p.Tags,
+        p.OwnerUserId,
+        u.DisplayName AS OwnerName,
+        COUNT(DISTINCT b_ag.Id) FILTER (WHERE b_ag.Class = 1) AS GoldBadgesOwner,
+        COUNT(DISTINCT bh_redit.Id) FILTER (WHERE bh_redit.UserId = p.OwnerUserId AND bh_redit.PostHistoryTypeId IN (4,5,6)) AS EditsByOwner,
+        ROW_NUMBER() OVER (
+            PARTITION BY p.OwnerUserId
+            ORDER BY COALESCE(PersonaScore, 0) DESC, p.CreationDate ASC
+        ) AS OwnerQuestionRank
+    FROM Posts p
+    LEFT JOIN Users u ON u.Id = p.OwnerUserId
+    LEFT JOIN Badges b_ag ON b_ag.UserId = p.OwnerUserId AND b_ag.Class = 1
+    LEFT JOIN PostHistory bh_redit ON bh_redit.UserId = p.OwnerUserId
+        AND bh_redit.PostHistoryTypeId IN (4,5,6)
+    GROUP BY
+        p.Id,
+        p.Title,
+        p.Tags,
+        p.OwnerUserId,
+        u.DisplayName,
+        PersonaScore,
+        p.CreationDate
+)
+SELECT *
+FROM RankedQuestions;

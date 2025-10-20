@@ -1,0 +1,42 @@
+WITH RecursiveInner_joined_posts AS (
+    SELECT
+        p1.Id AS QuestionId,
+        p1.Title AS QuestionTitle,
+        u.DisplayName AS QuestionOwner,
+        p1.CreationDate AS QuestionCreated,
+        p2.Id AS AnswerId,
+        p2.Score AS AnswerScore,
+        au.DisplayName AS AnswerOwner,
+        w.PhScore,
+        p1.Tags,
+        fu.AnsWERSpr
+    FROM posts p1
+    JOIN posts p2 ON p2.ParentId = p1.Id
+    LEFT JOIN users u ON u.Id = p1.OwnerUserId
+    LEFT JOIN users au ON au.Id = p2.OwnerUserId
+    LEFT JOIN work w ON w."PostId" = p2.Id
+    LEFT JOIN filtered_users fu ON fu.UserId = au.Id
+)
+SELECT
+    QuestionId,
+    QuestionTitle,
+    QuestionOwner,
+    QuestionCreated,
+    AnswerId,
+    AnswerScore,
+    AnswerOwner,
+    PhScore,
+    Tags,
+    AnsWERSpr
+FROM RecursiveInner_joined_posts
+GROUP BY
+    QuestionId,
+    QuestionTitle,
+    QuestionOwner,
+    QuestionCreated,
+    AnswerId,
+    AnswerScore,
+    AnswerOwner,
+    PhScore,
+    Tags,
+    AnsWERSpr;

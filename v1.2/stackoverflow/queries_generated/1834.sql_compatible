@@ -1,0 +1,29 @@
+WITH RecursiveTagAggregates AS (
+  SELECT
+    t.Id AS TagId,
+    t.TagName,
+    p.OwnerUserId,
+    COUNT(*) OVER (PARTITION BY t.Id) AS TagPostCount,
+    RANK() OVER (PARTITION BY t.TagName ORDER BY AVG(p.Score) DESC NULLS LAST) AS TagScoreRank,
+    FIRST_VALUE(p.CreationDate) OVER (PARTITION BY t.Id ORDER BY p.CreationDate) AS TagFirstUsage,
+    STRING_AGG(DISTINCT RIGHT('                          ' || u.DisplayName || (':ID:' || u.Id), 54), ', ' ORDER BY u.Reputation DESC)
+      OVER (PARTITION BY t.Id ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS OwnersSampleList
+  FROM
+    Tags t
+    JOIN Posts p
+      ON p.Tags LIKE CONCAT('%<', t.TagName, '>%')
+      AND p.PostTypeId = 1
+    LEFT JOIN Users u
+      ON u.Id = p.OwnerUserId
+  GROUP BY
+    t.Id,
+    t.TagName,
+    p.OwnerUserId,
+    p.CreationDate,
+    u.DisplayName,
+    u.Id,
+    u.Reputation,
+    p.Score
+)
+SELECT *
+FROM RecursiveTagAggregates;

@@ -1,0 +1,76 @@
+with UserBadgesRanking as (
+    select
+        U.Id as UserId,
+        U.DisplayName,
+        U.Reputation,
+        count(distinct case when B.Class = 1 then B.Id end) as GoldBadges,
+        count(distinct case when B.Class = 2 then B.Id end) as SilverBadges,
+        count(distinct case when B.Class = 3 then B.Id end) as BronzeBadges,
+        row_number() over (partition by U.Id order by count(*) desc) as BdgRank
+    from Users U
+    left join Badges B on B.UserId = U.Id
+    group by U.Id, U.DisplayName, U.Reputation
+),
+HighlyActivePosts as (
+    select
+        P.Id as PostId,
+        tot.AnswerCount,
+        coalesce(vp.UpVotes,0) + coalesce(vp.DownVotes,0) as VoteCounts,
+        P.CreationDate,
+        CHPcu_avg_excerpt.comment_no_exc_length_norm
+    from Posts P
+    join (
+        select ParentId, count(*) as AnswerCount
+        from Posts
+        where PostTypeId = 2
+        group by ParentId
+    ) tot on tot.ParentId = P.Id
+    left join (
+        select PostId,
+               sum(case when VoteTypeId = 2 then 1 else 0 end) as UpVotes,
+               sum(case when VoteTypeId = 3 then 1 else 0 end) as DownVotes
+        from Votes
+        group by PostId
+    ) vp on vp.PostId = P.Id
+    left join (
+        select PostId, avg(length(Body)) as comment_no_exc_length_norm
+        from Comments
+        group by PostId
+    ) CHPcu_avg_excerpt on CHPcu_avg_excerpt.PostId = P.Id
+    where P.PostTypeId = 1
+),
+TopUsersPosts as (
+    select
+        u.UserId,
+        u.DisplayName,
+        u.Reputation,
+        ub.GoldBadges,
+        ub.SilverBadges,
+        ub.BronzeBadges,
+        ub.BdgRank,
+        hap.PostId,
+        hap.AnswerCount,
+        hap.VoteCounts,
+        hap.CreationDate,
+        hap.comment_no_exc_length_norm
+    from UserBadgesRanking ub
+    join Users u on u.Id = ub.UserId
+    join Posts p on p.OwnerUserId = u.Id
+    join HighlyActivePosts hap on hap.PostId = p.Id
+    where ub.BdgRank = 1
+)
+select
+    tups.UserId,
+    tups.DisplayName,
+    tups.Reputation,
+    tups.GoldBadges,
+    tups.SilverBadges,
+    tups.BronzeBadges,
+    tups.BdgRank,
+    tups.PostId,
+    tups.AnswerCount,
+    tups.VoteCounts,
+    tups.CreationDate,
+    tups.comment_no_exc_length_norm
+from TopUsersPosts tups
+order by tups.Reputation desc, tups.VoteCounts desc;

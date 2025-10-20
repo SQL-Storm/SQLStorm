@@ -1,0 +1,23 @@
+WITH Recursive_TagCounts AS (
+    SELECT
+        t.Id AS TagId,
+        t.TagName,
+        t.Count,
+        COALESCE(
+            array_length(string_to_array(TRIM(BOTH '<>' FROM local_post.Tags), '><'), 1),
+            0
+        ) AS TagListLength
+    FROM Tags t
+    LEFT JOIN Posts local_post ON local_post.refTagId = t.Id
+)
+SELECT
+    TagId,
+    TagName,
+    Count,
+    TagListLength
+FROM Recursive_TagCounts
+GROUP BY
+    TagId,
+    TagName,
+    Count,
+    TagListLength;

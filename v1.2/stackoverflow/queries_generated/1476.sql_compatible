@@ -1,0 +1,156 @@
+with RecursiveUserPosts as (
+  select 
+    u.Id as UserId,
+    u.DisplayName,
+    p.Id as PostId,
+    p.PostTypeId,
+    p.CreationDate,
+    coalesce(p.Score,0) as Score,
+    row_number() over (partition by u.Id order by p.CreationDate desc) as rn
+  from Users u
+  left join Posts p on p.OwnerUserId = u.Id
+  where p.PostTypeId in (1,2)
+),
+TopPosts as (
+  select UserId, PostId, PostTypeId, CreationDate, Score
+  from RecursiveUserPosts
+  where rn <= 3
+),
+CTE_PostComments as (
+  select 
+    c.PostId,
+    count(case when c.Score >= 5 then 1 end) as HighScoreComments,
+    count(case when lower(c.Text) like '%thanks%' or lower(c.Text) like '%thank you%' then 1 end) as ThankfulComments,
+    sum(case when c.UserId is null then 1 else 0 end) as AnonymousComments
+  from Comments c
+  group by c.PostId
+),
+CTE_VotesDetail as (
+  select 
+    v.PostId,
+    sum(case when vt.Name = 'UpMod' then 1 else 0 end) as UpVotes,
+    sum(case when vt.Name = 'DownMod' then 1 else 0 end) as DownVotes,
+    sum(case when vt.Name = 'Favorite' then 1 else 0 end) as Favorites,
+    coalesce(max(v.BountyAmount),0) as MaxBounty
+  from Votes v
+  join VoteTypes vt on vt.Id = v.VoteTypeId
+  group by v.PostId
+),
+PostTitleHistory as (
+  select
+    ph.PostId,
+    string_agg(distinct ph.Text, ' || ') filter (where ph.PostHistoryTypeId in (1,4,7)) as TitleVersions
+  from PostHistory ph
+  group by ph.PostId
+),
+DuplicateLinkedPosts as (
+  select
+    p.Id as PostId,
+    count(pl.Id) filter (where lt.Name = 'Duplicate') as DuplicateCount,
+    string_agg(distinct t.TagName, ',') as Tags
+  from Posts p
+  left join PostLinks pl on pl.PostId = p.Id
+  left join LinkTypes lt on lt.Id = pl.LinkTypeId
+  left join lateral (
+    select unnest(string_to_array(substring(p.Tags from 2 for char_length(p.Tags) - 2), '><')) as TagName
+  ) t on true
+  group by p.Id
+),
+WindowScores as (
+  select
+    p.Id,
+    p.OwnerUserId,
+    p.Title,
+    p.Score,
+    dense_rank() over (partition by p.OwnerUserId order by p.Score desc nulls last) as ScoreRank,
+    avg(p.Score) over (partition by p.OwnerUserId) as AvgUserScore,
+    first_value(p.CreationDate) over (partition by p.OwnerUserId order by p.CreationDate asc) as FirstPostDate,
+    max(b.Class) over (partition by p.OwnerUserId) as MaxBadgeClass
+  from Posts p
+  left join Badges b on b.UserId = p.OwnerUserId
+  where p.PostTypeId = 1
+),
+BaseUsersWithPosts as (
+  select 
+    u.Id as UserId,
+    u.DisplayName,
+    u.Reputation,
+    wp.PostId,
+    coalesce(wp.Title, '(No Title)') as PostTitle,
+    wp.Score,
+    ws.AvgUserScore,
+    ws.ScoreRank,
+    ws.FirstPostDate,
+    case when ws.MaxBadgeClass = 1 then 'Gold'
+         when ws.MaxBadgeClass = 2 then 'Silver'
+         when ws.MaxBadgeClass = 3 then 'Bronze'
+         else 'None' end as TopBadgeClass,
+    tc.HighScoreComments,
+    tc.ThankfulComments,
+    tc.AnonymousComments,
+    vd.UpVotes,
+    vd.DownVotes,
+    vd.Favorites,
+    vd.MaxBounty,
+    phh.TitleVersions,
+    dlp.DuplicateCount,
+    dlp.Tags as TagsString,
+    (coalesce(wp.Score,0) + vd.MaxBounty) / nullif(msg.total_days,30) as EnergyScore
+  from Users u
+  join TopPosts wp on wp.UserId = u.Id
+  left join WindowScores ws on ws.Id = wp.PostId
+  left join CTE_PostComments tc on tc.PostId = wp.PostId
+  left join CTE_VotesDetail vd on vd.PostId = wp.PostId
+  left join PostTitleHistory phh on phh.PostId = wp.PostId
+  left join DuplicateLinkedPosts dlp on dlp.PostId = wp.PostId
+  cross join lateral (
+    select greatest(1, cast(extract(day from (cast('2024-10-01 12:34:56' as timestamp) - wp.CreationDate)) as integer)) as total_days
+  ) msg
+  where u.Reputation > 1000
+  and (ws.ScoreRank <= 3 or ws.AvgUserScore > 5)
+),
+UsersWithoutPosts as (
+  select 
+    u.Id as UserId,
+    u.DisplayName,
+    u.Reputation,
+    null::integer as PostId,
+    null::text as PostTitle,
+    null::integer as Score,
+    null::numeric as AvgUserScore,
+    null::integer as ScoreRank,
+    null::timestamp as FirstPostDate,
+    null::text as TopBadgeClass,
+    null::integer as HighScoreComments,
+    null::integer as ThankfulComments,
+    null::integer as AnonymousComments,
+    null::integer as UpVotes,
+    null::integer as DownVotes,
+    null::integer as Favorites,
+    null::integer as MaxBounty,
+    null::text as TitleVersions,
+    null::integer as DuplicateCount,
+    null::text as TagsString,
+    null::numeric as EnergyScore
+  from Users u
+  where u.Reputation > 1000
+    and not exists (
+      select 1 from Posts p where p.OwnerUserId = u.Id and p.PostTypeId in (1,2)
+    )
+)
+select *
+from (
+  select *
+  from BaseUsersWithPosts
+  order by Reputation desc, EnergyScore desc
+  limit 50
+) t
+union all
+select *
+from (
+  select *
+  from UsersWithoutPosts
+  order by UserId
+  limit 50
+) u
+limit 50;

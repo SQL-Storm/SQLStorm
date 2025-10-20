@@ -1,0 +1,176 @@
+WITH RECURSIVE RecursiveTaggedPosts AS (
+    SELECT 
+        p.Id, p.PostTypeId, p.Title, p.Tags, p.OwnerUserId, p.Score, p.ViewCount, p.AnswerCount,
+        1 AS depth,
+        ARRAY[substring(p.Tags FROM '<([^>]+)>')] AS tag_array
+    FROM 
+        Posts p
+    WHERE 
+        p.PostTypeId = 1
+        AND p.Tags IS NOT NULL
+        AND p.Tags LIKE '%<sql>%'
+    
+    UNION ALL
+    
+    SELECT 
+        p2.Id, p2.PostTypeId, p2.Title, p2.Tags, p2.OwnerUserId, p2.Score, p2.ViewCount, p2.AnswerCount,
+        r.depth + 1,
+        r.tag_array || substring(p2.Tags FROM '<([^>]+)>')
+    FROM 
+        Posts p2
+        JOIN RecursiveTaggedPosts r ON p2.OwnerUserId = r.OwnerUserId
+    WHERE
+        p2.PostTypeId = 1
+        AND p2.Tags IS NOT NULL
+        AND p2.Tags LIKE '%<sql>%'
+        AND r.depth < 3
+),
+
+UserBadgeCounts AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(DISTINCT CASE WHEN b.Class = 1 THEN b.Id END) AS GoldBadges,
+        COUNT(DISTINCT CASE WHEN b.Class = 2 THEN b.Id END) AS SilverBadges,
+        COUNT(DISTINCT CASE WHEN b.Class = 3 THEN b.Id END) AS BronzeBadges,
+        RANK() OVER (ORDER BY COUNT(DISTINCT b.Id) DESC) AS BadgeRank
+    FROM 
+        Users u
+        LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY
+        u.Id, u.DisplayName
+),
+
+TopPostsWithVotes AS (
+    SELECT 
+        p.Id,
+        p.Title,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        COALESCE(v.UpVotes, 0) AS UpVotes,
+        COALESCE(v.DownVotes, 0) AS DownVotes,
+        COALESCE(v.Favorites, 0) AS Favorites,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC, p.ViewCount DESC) AS RankByType
+    FROM 
+        Posts p
+        LEFT JOIN (
+            SELECT
+                PostId,
+                SUM(CASE WHEN VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+                SUM(CASE WHEN VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes,
+                SUM(CASE WHEN VoteTypeId = 5 THEN 1 ELSE 0 END) AS Favorites
+            FROM Votes
+            GROUP BY PostId
+        ) v ON p.Id = v.PostId
+    WHERE 
+        p.PostTypeId IN (1, 2)
+),
+
+RecentCommentsWithAuthors AS (
+    SELECT
+        c.Id AS CommentId,
+        c.PostId,
+        c.CreationDate,
+        c.UserId,
+        u.DisplayName AS CommentAuthor,
+        c.Score,
+        length(c.Text) AS TextLength,
+        CASE 
+            WHEN u.Reputation > 10000 THEN 'HighReputation'
+            WHEN u.Reputation BETWEEN 1000 AND 10000 THEN 'MidReputation'
+            ELSE 'LowReputation' 
+        END AS ReputationTier
+    FROM 
+        Comments c
+        LEFT JOIN Users u ON c.UserId = u.Id
+    WHERE 
+        c.CreationDate > (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '30 days')
+),
+
+PostHistoryCloseReasonsCount AS (
+    SELECT 
+        ph.PostId, 
+        crt.Name AS CloseReason,
+        COUNT(*) AS CloseVotesCount
+    FROM 
+        PostHistory ph
+        JOIN PostHistoryTypes pht ON ph.PostHistoryTypeId = pht.Id
+        LEFT JOIN CloseReasonTypes crt ON CAST(ph.Comment AS integer) = crt.Id
+    WHERE 
+        ph.PostHistoryTypeId = 10
+        AND crt.Id IS NOT NULL
+    GROUP BY ph.PostId, crt.Name
+),
+
+QuestionsWithDuplicatesAndAnswers AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.Title,
+        q.CreationDate,
+        COUNT(DISTINCT CASE WHEN pl1.LinkTypeId = 3 THEN pl2.RelatedPostId END) AS DuplicateCount,
+        COUNT(DISTINCT a.Id) AS AnswerCount,
+        MAX(a.Score) FILTER (WHERE a.Id IS NOT NULL) AS MaxAnswerScore,
+        AVG(a.Score) FILTER (WHERE a.Id IS NOT NULL) AS AvgAnswerScore,
+        EXISTS (
+            SELECT 1 
+            FROM Posts a2 
+            WHERE a2.ParentId = q.Id 
+              AND a2.Score > 10
+            LIMIT 1
+        ) AS HasHighScoreAnswer
+    FROM 
+        Posts q
+        LEFT JOIN PostLinks pl1 ON q.Id = pl1.PostId
+        LEFT JOIN PostLinks pl2 ON pl1.Id = pl2.Id AND pl2.LinkTypeId = 3
+        LEFT JOIN Posts a ON a.ParentId = q.Id AND a.PostTypeId = 2
+    WHERE 
+        q.PostTypeId = 1
+    GROUP BY q.Id, q.Title, q.CreationDate
+)
+
+SELECT DISTINCT
+    q.QuestionId,
+    q.Title,
+    q.CreationDate,
+    q.DuplicateCount,
+    q.AnswerCount,
+    q.MaxAnswerScore,
+    q.AvgAnswerScore,
+    CASE WHEN q.HasHighScoreAnswer THEN 'Yes' ELSE 'No' END AS HasHighScoreAnswer,
+    close_reasons.CloseReason,
+    close_reasons.CloseVotesCount,
+    ubc.DisplayName AS QuestionOwner,
+    ubc.GoldBadges,
+    ubc.SilverBadges,
+    ubc.BronzeBadges,
+    tp.UpVotes,
+    tp.DownVotes,
+    tp.Favorites,
+    array_to_string(rt.tag_array, ',') AS TagsChain,
+    c.Author_Reputation_Tier,
+    c.CommentCount_30Days
+FROM 
+    QuestionsWithDuplicatesAndAnswers q
+    LEFT JOIN PostHistoryCloseReasonsCount close_reasons ON q.QuestionId = close_reasons.PostId
+    LEFT JOIN Users u ON u.Id = q.QuestionId
+    LEFT JOIN UserBadgeCounts ubc ON ubc.UserId = (SELECT OwnerUserId FROM Posts WHERE Id = q.QuestionId)
+    LEFT JOIN TopPostsWithVotes tp ON tp.Id = q.QuestionId
+    LEFT JOIN RecursiveTaggedPosts rt ON rt.Id = q.QuestionId
+    LEFT JOIN (
+        SELECT
+            rc.PostId,
+            MAX(rc.ReputationTier) AS Author_Reputation_Tier,
+            COUNT(rc.CommentId) AS CommentCount_30Days
+        FROM
+            RecentCommentsWithAuthors rc
+        GROUP BY rc.PostId
+    ) c ON c.PostId = q.QuestionId
+WHERE 
+    (COALESCE(q.DuplicateCount, 0) + COALESCE(q.AnswerCount, 0)) > 5
+    AND q.CreationDate > (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '365 days')
+ORDER BY
+    q.AnswerCount DESC, q.DuplicateCount DESC, q.CreationDate DESC
+LIMIT 100;

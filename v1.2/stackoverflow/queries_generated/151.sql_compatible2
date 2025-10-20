@@ -1,0 +1,228 @@
+with recursive RecursiveTagHierarchy as (
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        t.IsModeratorOnly,
+        t.IsRequired,
+        1 as Level,
+        array[t.Id] as Path
+    from Tags t
+    where t.IsRequired = true
+
+    union all
+
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        t.IsModeratorOnly,
+        t.IsRequired,
+        r.Level + 1,
+        r.Path || t.Id
+    from Tags t
+    join RecursiveTagHierarchy r on not (t.Id = any(r.Path))
+    where t.IsRequired = true and t.Id > r.Id
+),
+UserBadgeCounts as (
+    select
+        b.UserId,
+        b.Class,
+        count(*) as BadgeCount
+    from Badges b
+    group by b.UserId, b.Class
+),
+UserReputationRanks as (
+    select
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        rank() over (order by u.Reputation desc) as ReputationRank,
+        dense_rank() over (partition by u.Location order by u.Reputation desc) as LocationReputationRank
+    from Users u
+    where u.Reputation is not null
+),
+PostAnswerStats as (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        q.CreationDate as QuestionCreation,
+        q.Score as QuestionScore,
+        q.ViewCount,
+        q.Tags,
+        count(a.Id) as AnswerCount,
+        avg(a.Score) as AvgAnswerScore,
+        max(a.Score) as MaxAnswerScore,
+        sum(case when a.OwnerUserId is not null then 1 else 0 end) as AnsweredByRegisteredUsers,
+        sum(case when a.OwnerUserId is null then 1 else 0 end) as AnsweredByAnonymousUsers
+    from Posts q
+    left join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+    where q.PostTypeId = 1
+    group by q.Id, q.Title, q.CreationDate, q.Score, q.ViewCount, q.Tags
+),
+PostCloseReasons as (
+    select
+        ph.PostId,
+        crt.Name as CloseReasonName,
+        ph.CreationDate as CloseDate
+    from PostHistory ph
+    join CloseReasonTypes crt on crt.Id = cast(ph.Comment as integer)
+    where ph.PostHistoryTypeId = 10
+),
+TopUsersWithBadges as (
+    select
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        coalesce(ubc_gold.BadgeCount, 0) as GoldBadges,
+        coalesce(ubc_silver.BadgeCount, 0) as SilverBadges,
+        coalesce(ubc_bronze.BadgeCount, 0) as BronzeBadges,
+        u.CreationDate,
+        u.Location,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        row_number() over (order by u.Reputation desc) as UserRank
+    from Users u
+    left join UserBadgeCounts ubc_gold on ubc_gold.UserId = u.Id and ubc_gold.Class = 1
+    left join UserBadgeCounts ubc_silver on ubc_silver.UserId = u.Id and ubc_silver.Class = 2
+    left join UserBadgeCounts ubc_bronze on ubc_bronze.UserId = u.Id and ubc_bronze.Class = 3
+    where u.Reputation > 10000
+),
+PostVoteAggregates as (
+    select
+        p.Id as PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        sum(case when v.VoteTypeId = 2 then 1 else 0 end) as UpVotes,
+        sum(case when v.VoteTypeId = 3 then 1 else 0 end) as DownVotes,
+        sum(case when v.VoteTypeId = 5 then 1 else 0 end) as FavoriteVotes,
+        sum(case when v.VoteTypeId in (8,9) then coalesce(v.BountyAmount,0) else 0 end) as TotalBounty
+    from Posts p
+    left join Votes v on v.PostId = p.Id
+    group by p.Id, p.PostTypeId, p.OwnerUserId
+),
+UserActivityWindow as (
+    select
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        count(p.Id) filter (where p.PostTypeId = 1) over (partition by u.Id order by p.CreationDate rows between unbounded preceding and current row) as QuestionsPosted,
+        count(p.Id) filter (where p.PostTypeId = 2) over (partition by u.Id order by p.CreationDate rows between unbounded preceding and current row) as AnswersPosted,
+        count(c.Id) over (partition by u.Id order by c.CreationDate rows between unbounded preceding and current row) as CommentsMade,
+        row_number() over (partition by u.Id order by p.CreationDate desc) as LastPostRank
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Comments c on c.UserId = u.Id
+),
+QuestionsWithDuplicateLinks as (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        q.CreationDate,
+        q.Score,
+        q.ViewCount,
+        pl.RelatedPostId as DuplicateOfQuestionId,
+        dup.Title as DuplicateOfTitle
+    from Posts q
+    left join PostLinks pl on pl.PostId = q.Id and pl.LinkTypeId = 3
+    left join Posts dup on dup.Id = pl.RelatedPostId
+    where q.PostTypeId = 1
+),
+ComplexFilteredPosts as (
+    select
+        p.Id,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        p.OwnerUserId,
+        p.AcceptedAnswerId,
+        p.ClosedDate,
+        p.LastActivityDate,
+        p.FavoriteCount,
+        p.CommentCount,
+        p.AnswerCount,
+        p.Body,
+        p.ContentLicense,
+        p.PostTypeId,
+        p.ParentId,
+        p.OwnerDisplayName,
+        p.LastEditorUserId,
+        p.LastEditDate,
+        p.LastEditorDisplayName,
+        -- Complex string expression: extract first tag from Tags array
+        (select split_part(trim(both '<>' from p.Tags), '><', 1)) as FirstTag,
+        -- Complex NULL logic: coalesce OwnerDisplayName with 'Anonymous' if null or empty
+        coalesce(nullif(p.OwnerDisplayName, ''), 'Anonymous') as EffectiveOwnerDisplayName,
+        -- Complex calculation: weighted score with logarithm and view count
+        cast((p.Score * ln(1 + p.ViewCount)) as numeric(10,2)) as WeightedScore
+    from Posts p
+    where p.PostTypeId in (1,2)
+      and (p.Score > 5 or p.ViewCount > 1000)
+      and (p.ClosedDate is null or p.ClosedDate > cast('2024-10-01 12:34:56' as timestamp) - interval '30 days')
+)
+select
+    cfp.Id as PostId,
+    cfp.Title,
+    cfp.CreationDate,
+    cfp.WeightedScore,
+    cfp.FirstTag,
+    cfp.EffectiveOwnerDisplayName,
+    ua.QuestionsPosted,
+    ua.AnswersPosted,
+    ua.CommentsMade,
+    tdu.GoldBadges,
+    tdu.SilverBadges,
+    tdu.BronzeBadges,
+    psa.AnswerCount,
+    psa.AvgAnswerScore,
+    psa.MaxAnswerScore,
+    pva.UpVotes,
+    pva.DownVotes,
+    pva.FavoriteVotes,
+    pva.TotalBounty,
+    pcr.CloseReasonName,
+    qdl.DuplicateOfTitle,
+    rank() over (partition by cfp.FirstTag order by cfp.WeightedScore desc) as TagScoreRank,
+    (select count(*) from Comments c
+     join Users u on u.Id = c.UserId
+     where c.PostId = cfp.Id and u.Reputation > 10000) as HighRepCommentCount
+from ComplexFilteredPosts cfp
+left join UserActivityWindow ua on ua.Id = cfp.OwnerUserId
+left join TopUsersWithBadges tdu on tdu.Id = cfp.OwnerUserId
+left join PostAnswerStats psa on psa.QuestionId = cfp.Id and cfp.PostTypeId = 1
+left join PostVoteAggregates pva on pva.PostId = cfp.Id
+left join PostCloseReasons pcr on pcr.PostId = cfp.Id
+left join QuestionsWithDuplicateLinks qdl on qdl.QuestionId = cfp.Id
+where cfp.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - interval '1 year'
+group by
+    cfp.Id,
+    cfp.Title,
+    cfp.CreationDate,
+    cfp.WeightedScore,
+    cfp.FirstTag,
+    cfp.EffectiveOwnerDisplayName,
+    ua.QuestionsPosted,
+    ua.AnswersPosted,
+    ua.CommentsMade,
+    tdu.GoldBadges,
+    tdu.SilverBadges,
+    tdu.BronzeBadges,
+    psa.AnswerCount,
+    psa.AvgAnswerScore,
+    psa.MaxAnswerScore,
+    pva.UpVotes,
+    pva.DownVotes,
+    pva.FavoriteVotes,
+    pva.TotalBounty,
+    pcr.CloseReasonName,
+    qdl.DuplicateOfTitle
+order by cfp.WeightedScore desc, cfp.CreationDate desc
+limit 100;

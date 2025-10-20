@@ -1,0 +1,26 @@
+WITH UserEngagementCTE AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        (
+            COALESCE(u.Reputation, 0) * 0.5
+            + COALESCE(SUM(CASE WHEN b.Class = 1 THEN 10 WHEN b.Class = 2 THEN 5 ELSE 1 END), 0)
+            + 100.0 / NULLIF(EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - u.LastAccessDate)) / 86400, 0)
+        ) AS EngagementScore,
+        MAX(
+            CASE
+                WHEN u.WebsiteUrl IS NOT NULL THEN CASE WHEN (LENGTH(u.WebsiteUrl) = 0) OR (u.WebsiteUrl LIKE '%stackoverflow.%') THEN 1 ELSE 0 END
+                ELSE NULL
+            END
+        ) AS ValidWebsite,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 1 AND P.ClosedDate IS NULL THEN P.Id END) AS ActiveQuestions,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 2 THEN P.Id END) AS AnswersCount,
+        COUNT(DISTINCT K.Name) AS UniqueBadgeNameCount
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    LEFT JOIN Posts P ON P.OwnerUserId = u.Id
+    LEFT JOIN Badges K ON K.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.LastAccessDate, u.WebsiteUrl
+)
+SELECT *
+FROM UserEngagementCTE;

@@ -1,0 +1,277 @@
+-- {"query": "322.sql", "dataset": "stackoverflow", "version": "v1.3", "prompt": "p1", "model": "gpt-5-mini", "temperature": 1.0, "max_tokens": 32768, "reasoning": "high", "input_tokens": 2026, "output_tokens": 16186} 
+WITH
+tagized AS (
+  SELECT p.Id AS post_id,
+         lower(trim(t.tag)) AS tag
+  FROM Posts p
+  CROSS JOIN LATERAL
+    unnest(
+      string_to_array(
+        substring(coalesce(p.Tags,''), 2, GREATEST(0, length(coalesce(p.Tags,'')) - 2)
+        ), '><'
+      )
+    ) AS t(tag)
+  WHERE p.PostTypeId = 1 AND coalesce(p.Tags,'') <> ''
+),
+tag_pop AS (
+  SELECT t.tag,
+         count(*) AS usage_count,
+         avg(COALESCE(p.Score,0)::double precision) AS avg_score,
+         sum(coalesce(p.ViewCount,0)) AS total_views,
+         max(coalesce(p.Score,0)) AS max_score,
+         percentile_cont(0.5) WITHIN GROUP (ORDER BY COALESCE(p.Score,0)) AS median_score
+  FROM tagized t
+  JOIN Posts p ON p.Id = t.post_id
+  GROUP BY t.tag
+),
+user_badges AS (
+  SELECT b.UserId,
+         count(*) AS badge_count,
+         sum(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS gold,
+         sum(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS silver,
+         sum(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS bronze,
+         sum(CASE WHEN b.TagBased::text = '1' THEN 1 ELSE 0 END) AS tag_based_count
+  FROM Badges b
+  GROUP BY b.UserId
+),
+post_votes AS (
+  SELECT v.PostId,
+         sum(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS upvotes,
+         sum(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS downvotes,
+         sum(CASE WHEN v.VoteTypeId = 1 THEN 1 ELSE 0 END) AS accepted_votes,
+         sum(CASE WHEN v.VoteTypeId IN (4,12) THEN 1 ELSE 0 END) AS spam_offensive,
+         count(*) AS votes_total,
+         count(distinct v.UserId) AS distinct_voters
+  FROM Votes v
+  GROUP BY v.PostId
+),
+post_links_stats AS (
+  SELECT pl.PostId,
+         sum(CASE WHEN pl.LinkTypeId = 1 THEN 1 ELSE 0 END) AS links_out,
+         sum(CASE WHEN pl.LinkTypeId = 3 THEN 1 ELSE 0 END) AS duplicates_out,
+         count(*) AS links_total,
+         count(distinct pl.RelatedPostId) AS distinct_related
+  FROM PostLinks pl
+  GROUP BY pl.PostId
+),
+comments_agg AS (
+  SELECT c.PostId,
+         count(*) AS comment_count,
+         count(distinct c.UserId) AS distinct_commenters,
+         sum(CASE WHEN c.Score > 0 THEN 1 ELSE 0 END) AS positive_comments,
+         avg(COALESCE(c.Score,0)) AS avg_comment_score,
+         max(COALESCE(c.Score,0)) AS max_comment_score
+  FROM Comments c
+  GROUP BY c.PostId
+),
+top_comments AS (
+  SELECT p.Id AS PostId,
+         (SELECT json_agg(row_to_json(t)) FROM (
+             SELECT c.Id, c.Score, substring(c.Text,1,240) AS snippet, c.UserId
+             FROM Comments c
+             WHERE c.PostId = p.Id
+             ORDER BY c.Score DESC NULLS LAST, c.CreationDate DESC
+             LIMIT 3
+         ) t) AS top3_comments
+  FROM Posts p
+),
+post_history_agg AS (
+  SELECT ph.PostId,
+         count(*) AS history_count,
+         sum(CASE WHEN ph.PostHistoryTypeId IN (4,5,6,24) THEN 1 ELSE 0 END) AS edit_count,
+         max(ph.CreationDate) AS last_history_date,
+         bool_or(ph.PostHistoryTypeId IN (10,12,35)) AS ever_closed_or_deleted
+  FROM PostHistory ph
+  GROUP BY ph.PostId
+),
+accepted_latency AS (
+  SELECT q.Id AS QuestionId,
+         q.AcceptedAnswerId,
+         a.CreationDate AS answer_creation,
+         q.CreationDate AS question_creation,
+         extract(epoch FROM (a.CreationDate - q.CreationDate))/3600.0 AS hours_to_accept
+  FROM Posts q
+  JOIN Posts a ON q.AcceptedAnswerId = a.Id
+  WHERE q.AcceptedAnswerId IS NOT NULL
+),
+controversial_posts AS (
+  (SELECT pv.PostId FROM post_votes pv WHERE pv.upvotes >= 10 AND pv.downvotes >= 5)
+  EXCEPT
+  (SELECT p.Id FROM Posts p WHERE COALESCE(p.Score,0) > 0)
+),
+hot_tag_users AS (
+  SELECT ub.UserId FROM user_badges ub WHERE ub.badge_count >= 5
+  INTERSECT
+  SELECT p.OwnerUserId FROM Posts p JOIN tagized t ON t.post_id = p.Id WHERE t.tag IN ('performance','benchmark','optimization','perf')
+),
+posts_enriched AS (
+  SELECT p.Id,
+         p.PostTypeId,
+         p.ParentId,
+         p.AcceptedAnswerId,
+         p.Title,
+         p.Body,
+         p.OwnerUserId,
+         u.DisplayName AS owner_name,
+         p.CreationDate,
+         p.LastActivityDate,
+         p.Score,
+         p.ViewCount,
+         coalesce(v.upvotes,0) AS upvotes,
+         coalesce(v.downvotes,0) AS downvotes,
+         coalesce(v.votes_total,0) AS votes_total,
+         coalesce(c.comment_count,0) AS comment_count,
+         coalesce(c.distinct_commenters,0) AS distinct_commenters,
+         coalesce(pl.links_out,0) AS links_out,
+         coalesce(pl.duplicates_out,0) AS duplicates_out,
+         coalesce(ph.history_count,0) AS history_count,
+         al.hours_to_accept,
+         tc.top3_comments,
+         (SELECT string_agg(DISTINCT lower(t.tag), ',' ORDER BY lower(t.tag)) FROM tagized t WHERE t.post_id = p.Id) AS tags_list,
+         (SELECT json_agg(row_to_json(tt)) FROM (
+             SELECT tz.tag, tp.usage_count, tp.avg_score
+             FROM tagized tz
+             JOIN tag_pop tp ON tp.tag = tz.tag
+             WHERE tz.post_id = p.Id
+             ORDER BY tp.usage_count DESC NULLS LAST
+         ) tt) AS tag_details
+  FROM Posts p
+  LEFT JOIN Users u ON u.Id = p.OwnerUserId
+  LEFT JOIN post_votes v ON v.PostId = p.Id
+  LEFT JOIN comments_agg c ON c.PostId = p.Id
+  LEFT JOIN post_links_stats pl ON pl.PostId = p.Id
+  LEFT JOIN post_history_agg ph ON ph.PostId = p.Id
+  LEFT JOIN accepted_latency al ON al.QuestionId = p.Id
+  LEFT JOIN top_comments tc ON tc.PostId = p.Id
+),
+user_activity AS (
+  SELECT u.Id AS user_id,
+         u.DisplayName,
+         u.Reputation,
+         u.CreationDate,
+         u.LastAccessDate,
+         u.Views AS profile_views,
+         coalesce(up.total_posts,0) AS total_posts,
+         coalesce(ub.badge_count,0) AS badge_count,
+         coalesce(ub.gold,0) AS gold,
+         coalesce(ub.silver,0) AS silver,
+         coalesce(ub.bronze,0) AS bronze,
+         coalesce(sum(p.Score),0) AS total_score,
+         count(distinct t.tag) AS tag_diversity,
+         (CASE WHEN u.LastAccessDate > u.CreationDate THEN extract(epoch FROM (u.LastAccessDate - u.CreationDate))/86400.0 ELSE 0 END) AS days_since_creation
+  FROM Users u
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+  LEFT JOIN tagized t ON t.post_id = p.Id
+  LEFT JOIN user_badges ub ON ub.UserId = u.Id
+  LEFT JOIN (SELECT OwnerUserId, count(*) AS total_posts FROM Posts WHERE OwnerUserId IS NOT NULL GROUP BY OwnerUserId) up ON up.OwnerUserId = u.Id
+  GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate, u.Views, up.total_posts, ub.badge_count, ub.gold, ub.silver, ub.bronze
+),
+user_ranked AS (
+  SELECT ua.*,
+         rank() OVER (ORDER BY ua.total_score DESC, ua.Reputation DESC, ua.badge_count DESC) AS activity_rank,
+         dense_rank() OVER (ORDER BY ua.tag_diversity DESC) AS tag_rank,
+         row_number() OVER (ORDER BY ua.Reputation DESC) AS rep_rank
+  FROM user_activity ua
+)
+SELECT *
+FROM (
+  -- Part A: enriched questions and calculated metrics
+  SELECT
+    'post'::text AS object_type,
+    pe.Id AS id,
+    left(coalesce(pe.Title, pe.Body), 200) AS title,
+    pe.OwnerUserId AS owner_id,
+    pe.owner_name,
+    pe.PostTypeId,
+    pe.Score,
+    pe.ViewCount,
+    pe.upvotes,
+    pe.downvotes,
+    pe.votes_total,
+    pe.comment_count,
+    pe.distinct_commenters,
+    pe.tags_list,
+    pe.tag_details,
+    pe.top3_comments,
+    ur.activity_rank,
+    ur.badge_count,
+    ur.total_posts,
+    pe.hours_to_accept,
+    pe.LastActivityDate AS last_activity,
+    row_number() OVER (PARTITION BY pe.OwnerUserId ORDER BY pe.Score DESC NULLS LAST, pe.CreationDate DESC) AS owner_post_rank,
+    rank() OVER (PARTITION BY pe.PostTypeId ORDER BY pe.Score DESC NULLS LAST) AS type_score_rank,
+    sum(coalesce(pe.Score,0)) OVER (PARTITION BY pe.OwnerUserId ORDER BY pe.CreationDate ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS running_score_by_owner,
+    lead(pe.Score) OVER (PARTITION BY pe.OwnerUserId ORDER BY pe.Score DESC) AS next_higher_sibling_score,
+    (SELECT count(*) FROM Posts p2 WHERE p2.OwnerUserId = pe.OwnerUserId AND COALESCE(p2.Score,0) > COALESCE(pe.Score,0)) AS higher_scoring_siblings,
+    (SELECT count(DISTINCT a.OwnerUserId) FROM Posts a WHERE a.ParentId = pe.Id AND a.PostTypeId = 2 AND a.OwnerUserId IS NOT NULL) AS distinct_answerers,
+    EXISTS(SELECT 1 FROM PostLinks pl WHERE pl.PostId = pe.Id AND pl.LinkTypeId = 3) AS has_duplicate_link,
+    ( (log(1 + coalesce(pe.upvotes,0)) * (1 + ln(1 + coalesce(pe.ViewCount,0)))) + sqrt(GREATEST(coalesce(pe.comment_count,0),0)) * 2.5 - 0.5 * GREATEST(coalesce(pe.duplicates_out,0),0)
+      ) / NULLIF(1 + power(extract(epoch FROM (cast('2024-10-01 12:34:56' as timestamp) - coalesce(pe.LastActivityDate, pe.CreationDate))) / 3600.0 + 1, 0.35),0) AS alpha_metric,
+    (SELECT extract(epoch FROM (min(a.CreationDate) - pe.CreationDate)) / 3600.0 FROM Posts a WHERE a.ParentId = pe.Id AND a.PostTypeId = 2) AS hours_to_first_answer,
+    (COALESCE(pe.Score,0)::double precision / NULLIF(sqrt(COALESCE(pe.ViewCount,0) + 1),0)) AS score_norm,
+    char_length(coalesce(pe.Title,'')) AS title_length,
+    (case when pe.Body ILIKE '%<code>%' then TRUE else FALSE end) as contains_code
+  FROM posts_enriched pe
+  LEFT JOIN user_ranked ur ON ur.user_id = pe.OwnerUserId
+  WHERE pe.PostTypeId = 1
+    AND (pe.Score IS NOT NULL OR pe.votes_total > 0)
+    AND (
+      (pe.tags_list IS NOT NULL AND pe.tags_list ~* '(python|java|c\\+\\+|sql|performance|benchmark)') OR
+      (pe.Title IS NOT NULL AND lower(pe.Title) LIKE '%perf%') OR
+      (pe.Body IS NOT NULL AND position('benchmark' in lower(pe.Body)) > 0)
+    )
+
+  UNION ALL
+
+  -- Part B: heavy user aggregates summarizing top contributors
+  SELECT
+    'user'::text AS object_type,
+    ur.user_id AS id,
+    ur.DisplayName AS title,
+    ur.user_id AS owner_id,
+    ur.DisplayName AS owner_name,
+    NULL::smallint AS PostTypeId,
+    ur.total_score AS Score,
+    ur.profile_views AS ViewCount,
+    NULL::int AS upvotes,
+    NULL::int AS downvotes,
+    NULL::int AS votes_total,
+    NULL::int AS comment_count,
+    NULL::int AS distinct_commenters,
+    (
+      SELECT string_agg(tp.tag, ',' ORDER BY tp.usage_count DESC)
+      FROM tag_pop tp
+      WHERE tp.tag IN (
+        SELECT DISTINCT t2.tag FROM tagized t2 JOIN Posts p2 ON p2.Id = t2.post_id WHERE p2.OwnerUserId = ur.user_id
+      )
+    ) AS tags_list,
+    NULL::json AS tag_details,
+    (SELECT json_agg(row_to_json(pf)) FROM (
+       SELECT p.Id, left(p.Title,160) AS Title, p.Score, p.ViewCount
+       FROM Posts p
+       WHERE p.OwnerUserId = ur.user_id
+       ORDER BY p.Score DESC NULLS LAST, p.ViewCount DESC NULLS LAST
+       LIMIT 3
+    ) pf) AS top3_comments,
+    ur.activity_rank,
+    ur.badge_count,
+    ur.total_posts,
+    NULL::double precision AS hours_to_accept,
+    ur.CreationDate AS last_activity,
+    NULL::int AS owner_post_rank,
+    NULL::int AS type_score_rank,
+    ur.total_score AS running_score_by_owner,
+    NULL::int AS next_higher_sibling_score,
+    (SELECT count(*) FROM Posts p2 WHERE p2.OwnerUserId = ur.user_id AND p2.Score > COALESCE((SELECT max(score) FROM Posts WHERE OwnerUserId = ur.user_id),0)) AS higher_scoring_siblings,
+    NULL::int AS distinct_answerers,
+    NULL::boolean AS has_duplicate_link,
+    ( (log(1 + ur.Reputation) * (1 + ln(1 + ur.total_score))) + 10 * sqrt(GREATEST(ur.badge_count,0)) ) / NULLIF(1 + ur.days_since_creation, 0) AS alpha_metric,
+    NULL::double precision AS hours_to_first_answer,
+    NULL::double precision AS score_norm,
+    char_length(coalesce(ur.DisplayName,'')) AS title_length,
+    FALSE AS contains_code
+  FROM user_ranked ur
+  WHERE ur.total_posts > 0
+) combined
+ORDER BY alpha_metric DESC NULLS LAST
+LIMIT 300;

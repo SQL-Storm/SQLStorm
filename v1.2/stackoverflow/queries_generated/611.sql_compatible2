@@ -1,0 +1,201 @@
+WITH RecursiveTagHierarchy AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        1 AS Level
+    FROM Tags t
+    WHERE t.IsRequired = TRUE
+
+    UNION ALL
+
+    SELECT
+        t2.Id,
+        t2.TagName,
+        t2.Count,
+        t2.ExcerptPostId,
+        t2.WikiPostId,
+        r.Level + 1
+    FROM Tags t2
+    INNER JOIN PostLinks pl ON pl.PostId = t2.ExcerptPostId OR pl.RelatedPostId = t2.ExcerptPostId
+    INNER JOIN RecursiveTagHierarchy r ON r.Id = pl.PostId OR r.Id = pl.RelatedPostId
+    WHERE t2.IsRequired = FALSE AND r.Level < 3
+), 
+UserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionsPosted,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswersPosted,
+        COUNT(DISTINCT c.Id) AS CommentsMade,
+        COALESCE(SUM(CASE WHEN vb.VoteTypeId = 8 THEN vb.BountyAmount ELSE 0 END), 0) AS TotalBountyGiven,
+        MAX(u.LastAccessDate) AS LastAccess,
+        AVG(CASE WHEN p.PostTypeId IN (1, 2) THEN COALESCE(p.Score, 0) END) AS AvgPostScore,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        MAX(b.Class) AS HighestBadgeClass
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Comments c ON c.UserId = u.Id
+    LEFT JOIN Votes vb ON vb.UserId = u.Id
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+TopUserPosts AS (
+    SELECT
+        p.Id,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        p.Title,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC, p.ViewCount DESC) AS rn
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+),
+UserPostDetails AS (
+    SELECT
+        u.UserId,
+        u.DisplayName,
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        p.Title,
+        CASE
+            WHEN p.PostTypeId = 1 THEN
+                (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id)
+            ELSE NULL
+        END AS CommentCountOnQuestion,
+        CASE
+            WHEN p.PostTypeId = 2 THEN
+                (SELECT q.Score FROM Posts q WHERE q.Id = p.ParentId)
+            ELSE NULL
+        END AS ParentQuestionScore,
+        LAG(p.Score) OVER (PARTITION BY u.UserId ORDER BY p.CreationDate) AS PrevPostScore,
+        LEAD(p.Score) OVER (PARTITION BY u.UserId ORDER BY p.CreationDate) AS NextPostScore
+    FROM UserActivity u
+    INNER JOIN TopUserPosts p ON p.OwnerUserId = u.UserId AND p.rn <= 3
+),
+ClosedQuestionStats AS (
+    SELECT
+        ph.PostId,
+        COUNT(*) AS CloseVotesCount,
+        MAX(CAST(ph.Comment AS INTEGER)) FILTER (WHERE ph.PostHistoryTypeId = 10) AS CloseReasonId,
+        MAX(ph.CreationDate) AS LastCloseDate,
+        COUNT(DISTINCT ph.UserId) AS DistinctClosers
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId = 10
+    GROUP BY ph.PostId
+),
+CloseReasonNames AS (
+    SELECT Id, Name FROM CloseReasonTypes
+),
+UserBadgesByClass AS (
+    SELECT
+        UserId,
+        Class,
+        COUNT(*) AS BadgeCount
+    FROM Badges
+    GROUP BY UserId, Class
+),
+UserBadgesPivot AS (
+    SELECT
+        ub.UserId,
+        COALESCE(MAX(CASE WHEN ub.Class = 1 THEN ub.BadgeCount END), 0) AS GoldBadges,
+        COALESCE(MAX(CASE WHEN ub.Class = 2 THEN ub.BadgeCount END), 0) AS SilverBadges,
+        COALESCE(MAX(CASE WHEN ub.Class = 3 THEN ub.BadgeCount END), 0) AS BronzeBadges
+    FROM UserBadgesByClass ub
+    GROUP BY ub.UserId
+),
+MainResults AS (
+    SELECT
+        ua.UserId,
+        ua.DisplayName,
+        ua.Reputation,
+        ua.QuestionsPosted,
+        ua.AnswersPosted,
+        ua.CommentsMade,
+        ua.TotalBountyGiven,
+        ua.AvgPostScore,
+        ubp.GoldBadges,
+        ubp.SilverBadges,
+        ubp.BronzeBadges,
+        up.PostId,
+        up.PostTypeId,
+        up.CreationDate,
+        up.Score AS PostScore,
+        up.ViewCount,
+        up.Title,
+        up.CommentCountOnQuestion,
+        up.ParentQuestionScore,
+        up.PrevPostScore,
+        up.NextPostScore,
+        crt.Name AS CloseReasonName,
+        cs.CloseVotesCount,
+        cs.DistinctClosers,
+        cs.LastCloseDate,
+        (COALESCE(up.Tags, '<no-tags>') || ' | User: ' || ua.DisplayName || ' | Badges [G:' || COALESCE(ubp.GoldBadges,0) || ', S:' || COALESCE(ubp.SilverBadges,0) || ', B:' || COALESCE(ubp.BronzeBadges,0) || ']') AS TagsUserBadgeSummary,
+        CASE 
+            WHEN up.Score IS NULL THEN NULL
+            ELSE ROUND(
+                (up.Score * LOG(GREATEST(COALESCE(up.ViewCount,0), 1) + 1) + COALESCE(ua.Reputation, 0) / 1000.0)
+                / NULLIF(1 + ABS(COALESCE(up.PrevPostScore, 0) - COALESCE(up.NextPostScore, 0)), 0), 4
+            )
+        END AS WeightedPostScore
+    FROM UserActivity ua
+    LEFT JOIN UserPostDetails up ON up.UserId = ua.UserId
+    LEFT JOIN ClosedQuestionStats cs ON cs.PostId = up.PostId
+    LEFT JOIN CloseReasonNames crt ON crt.Id = cs.CloseReasonId
+    LEFT JOIN UserBadgesPivot ubp ON ubp.UserId = ua.UserId
+    WHERE ua.Reputation > 1000
+      AND (up.PostTypeId = 1 OR up.PostTypeId = 2)
+)
+SELECT *
+FROM (
+    SELECT *
+    FROM MainResults
+    ORDER BY Reputation DESC, PostScore DESC
+    LIMIT 50
+) t1
+
+UNION ALL
+
+SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    0 AS QuestionsPosted,
+    0 AS AnswersPosted,
+    0 AS CommentsMade,
+    0 AS TotalBountyGiven,
+    NULL AS AvgPostScore,
+    0 AS GoldBadges,
+    0 AS SilverBadges,
+    0 AS BronzeBadges,
+    NULL AS PostId,
+    NULL AS PostTypeId,
+    NULL AS CreationDate,
+    NULL AS PostScore,
+    NULL AS ViewCount,
+    NULL AS Title,
+    NULL AS CommentCountOnQuestion,
+    NULL AS ParentQuestionScore,
+    NULL AS PrevPostScore,
+    NULL AS NextPostScore,
+    NULL AS CloseReasonName,
+    0 AS CloseVotesCount,
+    0 AS DistinctClosers,
+    NULL AS LastCloseDate,
+    ('<no-tags> | User: ' || u.DisplayName || ' | Badges [G:0, S:0, B:0]') AS TagsUserBadgeSummary,
+    NULL AS WeightedPostScore
+FROM Users u
+WHERE u.Reputation BETWEEN 500 AND 1000
+ORDER BY u.Reputation DESC
+LIMIT 10;

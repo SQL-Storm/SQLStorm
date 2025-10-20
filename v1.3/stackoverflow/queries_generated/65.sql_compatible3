@@ -1,0 +1,247 @@
+with
+-- recent active questions with parsed tag array and length metrics
+RecentQuestions as (
+  select
+    p.id,
+    p.title,
+    p.creationdate,
+    p.score,
+    coalesce(p.viewcount,0) as viewcount,
+    p.answercount,
+    p.owneruserid,
+    p.tags,
+    -- normalized tag array: explicit cast for empty array to text[]
+    case when p.tags is null then cast(array[] as text[]) else null end as tag_array_placeholder,
+    -- standard SQL array handling: use string_to_array when tags present
+    case when p.tags is null then null else string_to_array(substring(p.tags from 2 for char_length(p.tags)-2), '><') end as tag_array,
+    length(coalesce(p.title,'')) as title_len,
+    length(coalesce(p.body,'')) as body_len
+  from posts p
+  where p.posttypeid = 1
+    and p.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '2' year
+),
+-- answers joined to their question with answer age and score deltas
+QuestionAnswers as (
+  select
+    q.id as qid,
+    a.id as aid,
+    a.creationdate as answer_created,
+    age(a.creationdate, q.creationdate) as answer_age,
+    a.score as answer_score,
+    a.owneruserid as answer_owner,
+    row_number() over (partition by q.id order by a.score desc, a.creationdate) as answer_rank_by_score
+  from RecentQuestions q
+  left join posts a on a.parentid = q.id and a.posttypeid = 2
+),
+-- user aggregates: badges, questions asked, answers given, avg scores, recency
+UserAggregates as (
+  select
+    u.id,
+    u.displayname,
+    u.reputation,
+    u.creationdate,
+    u.location,
+    coalesce(u.views,0) as user_views,
+    count(distinct b.id) filter (where b.class = 1) as gold_badges,
+    count(distinct b.id) filter (where b.class = 2) as silver_badges,
+    count(distinct b.id) filter (where b.class = 3) as bronze_badges,
+    count(distinct p.id) filter (where p.posttypeid = 1) as questions_asked,
+    count(distinct p2.id) filter (where p2.posttypeid = 2) as answers_given,
+    avg(p2.score) filter (where p2.posttypeid = 2) as avg_answer_score,
+    max(p2.creationdate) filter (where p2.posttypeid = 2) as last_answer_date
+  from users u
+  left join badges b on b.userid = u.id
+  left join posts p on p.owneruserid = u.id
+  left join posts p2 on p2.owneruserid = u.id
+  group by u.id, u.displayname, u.reputation, u.creationdate, u.location, u.views
+),
+-- compute tag-level statistics using exploded tags
+TagStats as (
+  select
+    t.tag,
+    count(distinct q.id) as questions_with_tag,
+    avg(q.score) as avg_question_score,
+    sum(q.viewcount) as total_views,
+    max(q.answercount) as max_answers_on_question
+  from RecentQuestions q
+  cross join lateral unnest(q.tag_array) as t(tag)
+  group by t.tag
+),
+-- heavy correlated subquery: for each question, compute top commenters and a sentiment-like heuristic
+QuestionCommentInsights as (
+  select
+    q.id as qid,
+    q.title,
+    q.creationdate,
+    coalesce(c.comment_count,0) as comment_count,
+    coalesce(c.top_commenter_id, -1) as top_commenter_id,
+    coalesce(c.top_commenter_count,0) as top_commenter_count,
+    -- naive "negativity" score: proportion of comments containing '?' or 'why' or 'not' (case-insensitive)
+    (select count(*)
+     from comments cm
+     where cm.postid = q.id
+       and (
+         cm.text ~* '\\mwhy\\M'
+         or position('?' in cm.text) > 0
+         or cm.text ~* '\\mnot\\M'
+       )
+    )::numeric / nullif(coalesce(c.comment_count,0),0) as negativity_ratio
+  from RecentQuestions q
+  left join lateral (
+    select
+      count(*) as comment_count,
+      (select userid from comments cc where cc.postid = q.id and cc.userid is not null group by userid order by count(*) desc limit 1) as top_commenter_id,
+      (select count(*) from comments cc where cc.postid = q.id and cc.userid = (select userid from comments cc2 where cc2.postid = q.id and cc2.userid is not null group by userid order by count(*) desc limit 1)) as top_commenter_count
+    from comments c
+    where c.postid = q.id
+  ) c on true
+),
+-- windowed selection: for each question compute percentile ranks of score and views among RecentQuestions sharing its top tag
+TagWindow as (
+  select
+    q.id,
+    q.title,
+    q.creationdate,
+    q.score,
+    q.viewcount,
+    q.answercount,
+    q.owneruserid,
+    t.tag,
+    ts.questions_with_tag,
+    ts.avg_question_score,
+    ts.total_views,
+    ntile(100) over (partition by t.tag order by q.score) as score_pctile_in_tag,
+    ntile(100) over (partition by t.tag order by q.viewcount) as view_pctile_in_tag,
+    row_number() over (partition by t.tag order by q.creationdate desc) as recent_rank_in_tag
+  from RecentQuestions q
+  cross join lateral (
+    select unnest(q.tag_array) as tag order by 1 limit 1
+  ) t
+  left join TagStats ts on ts.tag = t.tag
+),
+-- assemble final candidate set with multiple joins, outer joins, set ops, and complex predicates
+Candidates as (
+  select distinct
+    tw.id as question_id,
+    tw.title,
+    tw.creationdate,
+    tw.score,
+    tw.viewcount,
+    tw.answercount,
+    tw.tag,
+    tw.questions_with_tag,
+    tw.avg_question_score,
+    tw.total_views as tag_total_views,
+    tw.score_pctile_in_tag,
+    tw.view_pctile_in_tag,
+    qc.comment_count,
+    qc.top_commenter_id,
+    qc.top_commenter_count,
+    ua.displayname as asker_name,
+    ua.reputation as asker_reputation,
+    ua.questions_asked,
+    ua.answers_given,
+    ua.gold_badges,
+    ua.silver_badges,
+    ua.bronze_badges,
+    -- correlated: time to first answer
+    (select min(a.creationdate) from posts a where a.parentid = tw.id and a.posttypeid = 2) as first_answer_date,
+    -- boolean heuristics combining null logic and expressions
+    case
+      when tw.answercount > 0 and (select min(a.creationdate) from posts a where a.parentid = tw.id and a.posttypeid = 2) is not null
+        then extract(epoch from (coalesce((select min(a.creationdate) from posts a where a.parentid = tw.id and a.posttypeid = 2), tw.creationdate) - tw.creationdate))/3600.0
+      else null
+    end as hours_to_first_answer,
+    -- existence of accepted answer and its score
+    exists(select 1 from posts pacc where pacc.id = (select acceptedanswerid from posts where id = tw.id) and pacc.posttypeid = 2) as has_accepted_answer,
+    (select pacc.score from posts pacc where pacc.id = (select acceptedanswerid from posts where id = tw.id)) as accepted_answer_score,
+    -- aggregated votes: upvotes - downvotes using set operator style unions to exercise planner
+    (select coalesce(sum(case when v.votetypeid = 2 then 1 when v.votetypeid = 3 then -1 else 0 end),0)
+     from votes v
+     where v.postid = tw.id
+    ) as net_votes,
+    -- string expression: condensed tag string and sanitized title
+    array_to_string(array_agg(distinct tw.tag order by tw.tag), ',') as top_tags_preview,
+    regexp_replace(coalesce(substr(tw.title,1,200),''), '\s+', ' ', 'g') as tiny_title
+  from TagWindow tw
+  left join QuestionCommentInsights qc on qc.qid = tw.id
+  left join users ua on ua.id = tw.owneruserid
+  where -- complex predicate mixing nulls, arithmetic, and boolean logic
+    (tw.score > 0 or tw.viewcount > 500 or tw.answercount > 0)
+    and not (tw.title is null)
+    and (coalesce(ua.reputation,0) > 50 or tw.score_pctile_in_tag > 90 or tw.view_pctile_in_tag > 90)
+  group by
+    tw.id, tw.title, tw.creationdate, tw.score, tw.viewcount, tw.answercount, tw.tag,
+    tw.questions_with_tag, tw.avg_question_score, tw.total_views, tw.score_pctile_in_tag, tw.view_pctile_in_tag,
+    qc.comment_count, qc.top_commenter_id, qc.top_commenter_count,
+    ua.displayname, ua.reputation, ua.questions_asked, ua.answers_given, ua.gold_badges, ua.silver_badges, ua.bronze_badges,
+    tw.owneruserid
+),
+-- final enrichment: join to posts linking graph, compute in-degree/out-degree, and include duplicates via set operator
+LinkGraph as (
+  select
+    l.postid,
+    count(*) filter (where lt.name = 'Linked') as out_linked,
+    count(*) filter (where lt.name = 'Duplicate') as out_duplicates,
+    (select count(*) from postlinks pl where pl.relatedpostid = l.postid) as in_degree_total
+  from postlinks l
+  left join linktypes lt on lt.id = l.linktypeid
+  group by l.postid
+),
+Duplicates as (
+  select distinct relatedpostid as dup_target
+  from postlinks
+  where linktypeid = (select id from linktypes where name = 'Duplicate' limit 1)
+),
+FinalSet as (
+  select
+    c.*,
+    coalesce(lg.out_linked,0) as out_linked,
+    coalesce(lg.out_duplicates,0) as out_duplicates,
+    coalesce(lg.in_degree_total,0) as in_degree_total,
+    case when d.dup_target is not null then true else false end as is_duplicated_by_someone,
+    -- combined score: weighted sum with null-safe math and window normalize
+    (
+      coalesce(c.score,0) * 2
+      + ln(1 + coalesce(c.viewcount,0))
+      + coalesce(c.net_votes,0) * 3
+      + coalesce(c.questions_with_tag,0) * 0.1
+      - coalesce(c.hours_to_first_answer, 1000) * 0.01
+      + (case when c.has_accepted_answer then 50 else 0 end)
+    ) as raw_hotness
+  from Candidates c
+  left join LinkGraph lg on lg.postid = c.question_id
+  left join Duplicates d on d.dup_target = c.question_id
+)
+select
+  fs.question_id,
+  fs.tiny_title,
+  fs.top_tags_preview,
+  fs.creationdate,
+  fs.score,
+  fs.viewcount,
+  fs.answercount,
+  fs.net_votes,
+  fs.hours_to_first_answer,
+  fs.has_accepted_answer,
+  fs.accepted_answer_score,
+  fs.asker_name,
+  fs.asker_reputation,
+  fs.gold_badges,
+  fs.silver_badges,
+  fs.bronze_badges,
+  fs.comment_count,
+  fs.top_commenter_id,
+  fs.top_commenter_count,
+  fs.out_linked,
+  fs.out_duplicates,
+  fs.in_degree_total,
+  fs.is_duplicated_by_someone,
+  fs.raw_hotness,
+  -- rank within result set using window functions; ties handled by dense_rank
+  dense_rank() over (order by fs.raw_hotness desc NULLS LAST, fs.score desc) as hotness_rank,
+  percent_rank() over (order by fs.raw_hotness desc NULLS LAST) as hotness_percentile
+from FinalSet fs
+where fs.raw_hotness is not null
+order by hotness_rank asc, fs.raw_hotness desc
+limit 250;

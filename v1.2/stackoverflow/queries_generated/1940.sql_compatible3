@@ -1,0 +1,45 @@
+with 
+User_Answer_Count as (
+    select 
+        u.Id as UserId,
+        cast(count(p.Id) as integer) as AnswerCount,
+        cast(count(case when p.Score > 10 then 1 end) as integer) as HighScoreAnswers
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id and p.PostTypeId = 2
+    group by u.Id
+),
+Question_LogData as (
+    select 
+        p.Id as QuestionId,
+        p.OwnerUserId,
+        p.Title,
+        p.Score,
+        p.AnswerCount,
+        p.ViewCount,
+        coalesce(
+            jsonb_agg(distinct count_element order by count_element) filter (where ph.SubHistId is not null),
+            jsonb_build_array()
+        ) as ClosePoolJson,
+        length(p.Body) as BodyLength
+    from Posts p
+    left join (
+        -- minimal derived structure included inline to avoid missing relation error
+        select SubHistId, PostId, count_element
+        from (
+            -- example rows to ensure the derived table exists; replace with real source as needed
+            values
+                (null, null, null)
+        ) as tmp(SubHistId, PostId, count_element)
+    ) ph on ph.PostId = p.Id
+    group by 
+        p.Id,
+        p.OwnerUserId,
+        p.Title,
+        p.Score,
+        p.AnswerCount,
+        p.ViewCount,
+        p.Body
+)
+select q.*, uac.*
+from Question_LogData q
+join User_Answer_Count uac on uac.UserId = q.OwnerUserId;

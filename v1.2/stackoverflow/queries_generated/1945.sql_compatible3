@@ -1,0 +1,17 @@
+WITH questions_and_scores AS (
+  SELECT
+    p.Id AS question_id,
+    p.Title,
+    COALESCE(p.Score, 0) AS question_score,
+    COALESCE(p.ViewCount, 0) AS question_views,
+    jsonb_agg(DISTINCT b.Name ORDER BY b.Name) FILTER (WHERE b.Id IS NOT NULL) AS badges,
+    u.Id AS owner_user_id,
+    u.DisplayName AS owner_name
+  FROM posts p
+  LEFT JOIN users u ON p.OwnerUserId = u.Id
+  LEFT JOIN badges b ON b.UserId = u.Id
+  WHERE p.PostTypeId = 1
+  GROUP BY p.Id, p.Title, p.Score, p.ViewCount, u.Id, u.DisplayName
+)
+SELECT *
+FROM questions_and_scores;

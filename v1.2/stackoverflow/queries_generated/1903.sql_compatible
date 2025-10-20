@@ -1,0 +1,77 @@
+with UserReputationRank as (
+    select 
+        Id,
+        DisplayName,
+        Reputation,
+        dense_rank() over (order by Reputation desc NULLS LAST) as RepRank
+    from Users
+),
+PostScores as (
+    select 
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Title,
+        score_adjusted.CustomScore,
+        tag_snippet.TagsSnippet
+    from Posts p
+    left join lateral (
+        select coalesce(sum(
+                    case 
+                      when vt.Name = 'UpMod' then 10
+                      when vt.Name = 'DownMod' then -5
+                      when vt.Name = 'Favorite' then 15
+                      when vt.Name = 'Offensive' then -20
+                      else 0 end
+                ),0) as CustomScore
+        from Votes v
+        inner join VoteTypes vt on v.VoteTypeId = vt.Id
+        where v.PostId = p.Id
+    ) score_adjusted on true
+    left join lateral (
+        select string_agg(DISTINCT tag, '><') as TagsSnippet
+        from unnest(
+            string_to_array(
+                substring(coalesce(p.Tags, ''), 2, char_length(coalesce(p.Tags, '')) - 2), '><')
+        ) as tag
+    ) tag_snippet on true
+),
+DistinctHotUsersCTE AS (
+    select distinct v.UserId      
+    from Votes v 
+    where v.VoteTypeId = (
+        select Id 
+        from VoteTypes
+        where Name = 'Hot'
+        limit 1
+    )
+)
+select
+    p.Id,
+    p.PostTypeId,
+    p.OwnerUserId,
+    p.CreationDate,
+    p.Title,
+    ps.CustomScore,
+    ps.TagsSnippet,
+    ur.DisplayName,
+    ur.Reputation,
+    ur.RepRank,
+    dhu.UserId as HotVoterUserId
+from PostScores ps
+join Posts p on p.Id = ps.Id
+left join UserReputationRank ur on ur.Id = p.OwnerUserId
+left join DistinctHotUsersCTE dhu on dhu.UserId = p.OwnerUserId
+group by
+    p.Id,
+    p.PostTypeId,
+    p.OwnerUserId,
+    p.CreationDate,
+    p.Title,
+    ps.CustomScore,
+    ps.TagsSnippet,
+    ur.DisplayName,
+    ur.Reputation,
+    ur.RepRank,
+    dhu.UserId;

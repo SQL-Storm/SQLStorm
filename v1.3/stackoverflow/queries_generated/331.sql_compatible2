@@ -1,0 +1,267 @@
+WITH
+tag_exploded AS (
+  SELECT p.Id AS post_id,
+         p.OwnerUserId AS owner_user_id,
+         lower(trim(tg)) AS tag,
+         coalesce(p.Score,0) AS score,
+         coalesce(p.ViewCount,0) AS views,
+         p.CreationDate
+  FROM Posts p
+  CROSS JOIN LATERAL (
+    SELECT unnest(
+      string_to_array(
+        substring(coalesce(p.Tags,''), 2, greatest(char_length(coalesce(p.Tags,'')) - 2, 0)
+      ), '><')
+    ) AS tg
+  ) x
+  WHERE p.PostTypeId = 1
+),
+votes_agg_per_post AS (
+  SELECT v.PostId,
+         count(*) FILTER (WHERE v.VoteTypeId = 2) AS upvotes,
+         count(*) FILTER (WHERE v.VoteTypeId = 3) AS downvotes,
+         count(*) FILTER (WHERE v.VoteTypeId = 5) AS favorites,
+         sum(coalesce(v.BountyAmount,0)) AS bounty_total,
+         count(*) FILTER (WHERE v.VoteTypeId = 1) AS accepted_by_originator
+  FROM Votes v
+  GROUP BY v.PostId
+),
+comments_agg_per_post AS (
+  SELECT c.PostId,
+         count(*) AS comment_count,
+         max(c.CreationDate) AS last_comment_date,
+         max(c.UserId) AS last_comment_user_id
+  FROM Comments c
+  GROUP BY c.PostId
+),
+post_history_agg AS (
+  SELECT ph.PostId,
+         count(*) FILTER (WHERE ph.PostHistoryTypeId IN (4,5,6)) AS edit_count,
+         count(*) FILTER (WHERE ph.PostHistoryTypeId IN (10,11)) AS close_reopen_events,
+         max(ph.CreationDate) AS last_history_date
+  FROM PostHistory ph
+  GROUP BY ph.PostId
+),
+post_link_agg AS (
+  SELECT pl.PostId,
+         count(*) FILTER (WHERE pl.LinkTypeId = 1) AS outgoing_links,
+         count(*) FILTER (WHERE pl.LinkTypeId = 3) AS duplicate_links,
+         count(*) AS total_links,
+         count(DISTINCT pl.RelatedPostId) AS distinct_related
+  FROM PostLinks pl
+  GROUP BY pl.PostId
+),
+posts_enriched AS (
+  SELECT p.*,
+         COALESCE(v.upvotes,0) AS upvotes,
+         COALESCE(v.downvotes,0) AS downvotes,
+         COALESCE(v.favorites,0) AS favorites,
+         COALESCE(v.bounty_total,0) AS bounty_total,
+         COALESCE(c.comment_count,0) AS comment_count,
+         c.last_comment_date,
+         COALESCE(ph.edit_count,0) AS edit_count,
+         COALESCE(ph.close_reopen_events,0) AS close_reopen_events,
+         COALESCE(pl.outgoing_links,0) AS outgoing_links,
+         COALESCE(pl.duplicate_links,0) AS duplicate_links,
+         COALESCE(pl.total_links,0) AS total_links,
+         (COALESCE(p.Score,0)
+          + COALESCE(v.upvotes,0)
+          - COALESCE(v.downvotes,0)
+          + (COALESCE(v.bounty_total,0) / NULLIF(GREATEST(COALESCE(p.ViewCount,0),1),0))
+         ) AS crude_hotness,
+         CASE WHEN p.PostTypeId = 1 AND p.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END AS has_accepted_answer
+  FROM Posts p
+  LEFT JOIN votes_agg_per_post v ON v.PostId = p.Id
+  LEFT JOIN comments_agg_per_post c ON c.PostId = p.Id
+  LEFT JOIN post_history_agg ph ON ph.PostId = p.Id
+  LEFT JOIN post_link_agg pl ON pl.PostId = p.Id
+),
+votes_agg_per_user AS (
+  SELECT p.OwnerUserId AS user_id,
+         sum(coalesce(p.upvotes,0)) AS user_upvotes,
+         sum(coalesce(p.downvotes,0)) AS user_downvotes,
+         sum(coalesce(p.favorites,0)) AS user_favorites,
+         sum(coalesce(p.bounty_total,0)) AS user_bounty_total
+  FROM posts_enriched p
+  WHERE p.OwnerUserId IS NOT NULL
+  GROUP BY p.OwnerUserId
+),
+comments_agg_per_user AS (
+  SELECT p.OwnerUserId AS user_id,
+         sum(coalesce(p.comment_count,0)) AS user_comment_count,
+         max(p.last_comment_date) AS user_last_comment_date
+  FROM posts_enriched p
+  WHERE p.OwnerUserId IS NOT NULL
+  GROUP BY p.OwnerUserId
+),
+user_post_metrics AS (
+  SELECT p.OwnerUserId AS user_id,
+         count(*) AS total_posts,
+         count(*) FILTER (WHERE p.PostTypeId = 1) AS question_count,
+         count(*) FILTER (WHERE p.PostTypeId = 2) AS answer_count,
+         avg(p.Score) AS avg_post_score,
+         percentile_disc(0.5) WITHIN GROUP (ORDER BY p.Score) AS median_post_score,
+         min(p.CreationDate) AS first_post_date,
+         max(p.CreationDate) AS last_post_date,
+         sum(case when p.PostTypeId = 1 AND p.AcceptedAnswerId IS NOT NULL then 1 else 0 end) as questions_with_accepted,
+         sum(case when p.PostTypeId = 2 AND EXISTS (SELECT 1 FROM Posts q WHERE q.AcceptedAnswerId = p.Id) then 1 else 0 end) as answers_accepted_count
+  FROM Posts p
+  WHERE p.OwnerUserId IS NOT NULL
+  GROUP BY p.OwnerUserId
+),
+user_badge_counts AS (
+  SELECT b.UserId AS user_id,
+         count(*) FILTER (WHERE b.Class = 1) AS gold_badges,
+         count(*) FILTER (WHERE b.Class = 2) AS silver_badges,
+         count(*) FILTER (WHERE b.Class = 3) AS bronze_badges,
+         count(*) AS total_badges,
+         bool_or(b.TagBased) AS has_tag_badge,
+         max(b.Date) AS last_badge_date
+  FROM Badges b
+  GROUP BY b.UserId
+),
+user_top_tags AS (
+  SELECT te.owner_user_id AS user_id,
+         te.tag,
+         count(*) AS tag_count,
+         row_number() OVER (PARTITION BY te.owner_user_id ORDER BY count(*) DESC) AS tag_rank
+  FROM tag_exploded te
+  WHERE te.owner_user_id IS NOT NULL
+  GROUP BY te.owner_user_id, te.tag
+),
+tag_metrics AS (
+  SELECT te.tag,
+         count(*) AS question_count,
+         avg(te.score) AS avg_score,
+         percentile_disc(0.5) WITHIN GROUP (ORDER BY te.score) AS median_score,
+         sum(te.views) AS total_views,
+         max(te.score) AS top_score,
+         (SELECT te2.post_id FROM tag_exploded te2 WHERE te2.tag = te.tag ORDER BY te2.score DESC, te2.views DESC LIMIT 1) AS top_post_id
+  FROM tag_exploded te
+  GROUP BY te.tag
+),
+tag_trend AS (
+  SELECT tm.*,
+         row_number() OVER (ORDER BY tm.question_count DESC, tm.total_views DESC) AS tag_rank,
+         (CAST(tm.question_count AS numeric) / NULLIF((SELECT sum(question_count) FROM tag_metrics),0)) AS global_share
+  FROM tag_metrics tm
+),
+post_rank_by_tag AS (
+  SELECT te.tag, te.post_id, te.score, te.views,
+         row_number() OVER (PARTITION BY te.tag ORDER BY te.score DESC, te.views DESC) AS post_rnk,
+         rank() OVER (PARTITION BY te.tag ORDER BY te.score DESC) AS post_rank_dense
+  FROM tag_exploded te
+),
+active_users_without_badges AS (
+  (SELECT DISTINCT p.OwnerUserId FROM Posts p WHERE p.CreationDate > (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '365 days') AND p.OwnerUserId IS NOT NULL)
+  EXCEPT
+  (SELECT DISTINCT b.UserId FROM Badges b WHERE b.UserId IS NOT NULL)
+),
+user_aggregate_full AS (
+  SELECT u.Id AS user_id,
+         u.DisplayName,
+         u.Reputation,
+         u.CreationDate,
+         u.LastAccessDate,
+         COALESCE(upm.total_posts,0) AS total_posts,
+         COALESCE(upm.question_count,0) AS question_count,
+         COALESCE(upm.answer_count,0) AS answer_count,
+         COALESCE(vu.user_upvotes,0) AS user_upvotes,
+         COALESCE(vu.user_downvotes,0) AS user_downvotes,
+         COALESCE(cb.user_comment_count,0) AS user_comment_count,
+         COALESCE(bc.total_badges,0) AS total_badges,
+         COALESCE(bc.gold_badges,0) AS gold_badges,
+         COALESCE(bc.silver_badges,0) AS silver_badges,
+         COALESCE(bc.bronze_badges,0) AS bronze_badges,
+         ut.tag AS top_tag,
+         COALESCE(ut.tag_count,0) AS top_tag_count,
+         COALESCE(upm.avg_post_score,0) AS avg_post_score,
+         COALESCE(upm.median_post_score,0) AS median_post_score,
+         COALESCE(upm.questions_with_accepted,0) AS questions_with_accepted,
+         COALESCE(upm.answers_accepted_count,0) AS answers_accepted_count,
+         (SELECT min(EXTRACT(EPOCH FROM (a.CreationDate - q.CreationDate)))
+          FROM Posts q JOIN Posts a ON a.Id = q.AcceptedAnswerId
+          WHERE q.OwnerUserId = u.Id AND q.AcceptedAnswerId IS NOT NULL
+         ) AS fastest_accept_seconds,
+         CASE WHEN u.LastAccessDate > (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '365 days') THEN TRUE ELSE FALSE END AS last_year_active,
+         CASE WHEN EXISTS (SELECT 1 FROM tag_exploded te WHERE te.owner_user_id = u.Id) THEN TRUE ELSE FALSE END AS has_tagged_posts_any,
+         (CAST(u.Reputation AS numeric) * 0.35
+          + GREATEST(LEAST(COALESCE(u.Views,0) / NULLIF(GREATEST(u.Reputation,1),1), 1000.0), 0.0) * 0.0001
+          + COALESCE(upm.question_count,0) * 1.5
+          + COALESCE(upm.answer_count,0) * 1.0
+          + COALESCE(bc.total_badges,0) * 2.0
+          + COALESCE(vu.user_upvotes,0) * 0.2
+          - COALESCE(vu.user_downvotes,0) * 0.25
+          + COALESCE(cb.user_comment_count,0) * 0.1
+          + COALESCE(upm.avg_post_score,0) * 0.5
+          - COALESCE((SELECT count(*) FROM Posts p2 WHERE p2.OwnerUserId = u.Id AND p2.ClosedDate IS NOT NULL),0) * 0.75
+         ) AS activity_index,
+         row_number() OVER (ORDER BY
+            (CAST(u.Reputation AS numeric) * 0.35
+             + COALESCE(upm.question_count,0) * 1.5
+             + COALESCE(upm.answer_count,0) * 1.0
+             + COALESCE(bc.total_badges,0) * 2.0
+             + COALESCE(vu.user_upvotes,0) * 0.2
+             - COALESCE(vu.user_downvotes,0) * 0.25
+            ) DESC
+         ) AS activity_rank
+  FROM Users u
+  LEFT JOIN user_post_metrics upm ON upm.user_id = u.Id
+  LEFT JOIN votes_agg_per_user vu ON vu.user_id = u.Id
+  LEFT JOIN comments_agg_per_user cb ON cb.user_id = u.Id
+  LEFT JOIN user_badge_counts bc ON bc.user_id = u.Id
+  LEFT JOIN (
+    SELECT user_id, tag, tag_count
+    FROM user_top_tags
+    WHERE tag_rank = 1
+  ) ut ON ut.user_id = u.Id
+),
+final_union AS (
+  SELECT
+    'user' AS entity_type,
+    uaf.user_id AS entity_id,
+    COALESCE(uaf.DisplayName, ('user#' || CAST(uaf.user_id AS varchar))) AS display_name,
+    CAST(uaf.activity_index AS numeric) AS primary_metric,
+    CAST(uaf.activity_rank AS integer) AS score_rank,
+    jsonb_build_object(
+      'reputation', uaf.Reputation,
+      'total_posts', uaf.total_posts,
+      'questions', uaf.question_count,
+      'answers', uaf.answer_count,
+      'upvotes', uaf.user_upvotes,
+      'downvotes', uaf.user_downvotes,
+      'badges', jsonb_build_object('total', uaf.total_badges, 'gold', uaf.gold_badges, 'silver', uaf.silver_badges, 'bronze', uaf.bronze_badges),
+      'top_tag', uaf.top_tag,
+      'avg_score', uaf.avg_post_score,
+      'median_score', uaf.median_post_score,
+      'accepted_answer_ratio', (CASE WHEN uaf.answer_count > 0 THEN (CAST(uaf.answers_accepted_count AS numeric) / NULLIF(uaf.answer_count,0)) ELSE NULL END),
+      'fastest_accept_seconds', uaf.fastest_accept_seconds
+    ) AS metrics,
+    md5(COALESCE(uaf.DisplayName, 'user') || '::' || CAST(uaf.user_id AS varchar) || '::' || COALESCE(uaf.top_tag,'')) AS fingerprint
+  FROM user_aggregate_full uaf
+
+  UNION ALL
+
+  SELECT
+    'tag' AS entity_type,
+    t.Id AS entity_id,
+    t.TagName AS display_name,
+    (CAST(tm.question_count AS numeric) * ln(GREATEST(tm.total_views,1) + 2.0)) AS primary_metric,
+    CAST(tm.tag_rank AS integer) AS score_rank,
+    jsonb_build_object(
+      'question_count', tm.question_count,
+      'total_views', tm.total_views,
+      'avg_score', tm.avg_score,
+      'median_score', tm.median_score,
+      'top_post_id', tm.top_post_id,
+      'global_share', tm.global_share
+    ) AS metrics,
+    md5(lower(t.TagName)) AS fingerprint
+  FROM tag_trend tm
+  JOIN Tags t ON lower(t.TagName) = tm.tag
+)
+
+SELECT *
+FROM final_union
+ORDER BY primary_metric DESC NULLS LAST, entity_type, entity_id
+LIMIT 200;

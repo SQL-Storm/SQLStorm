@@ -1,0 +1,95 @@
+WITH PostActivityWinners AS (
+    SELECT 
+        p.Id,
+        p.PostTypeId, 
+        p.OwnerUserId,
+        u.DisplayName AS OwnerName,
+        CASE 
+            WHEN u.WebsiteUrl IS NOT NULL THEN 
+                LOWER(
+                  REGEXP_REPLACE(
+                    -- extract host using regexp_matches moved to a lateral to avoid set-returning in expression
+                    host_match.host,
+                    '\._[A-Za-z]{2,5}$',
+                    ''
+                  )
+                )
+            ELSE 'NoURL' 
+        END AS SiteDomain,
+        p.CreationDate,
+        activity.OrderRank,
+        CASE 
+            WHEN (EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - p.CreationDate)) / 86400) > 0 
+                 THEN p.Score / (EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - p.CreationDate)) / 86400)
+            ELSE p.Score
+        END AS ScorePerDay,
+        (SELECT COUNT(DISTINCT pl.RelatedPostId) 
+            FROM PostLinks pl
+            WHERE pl.PostId = p.Id
+              AND EXISTS (
+                  SELECT 1 FROM Comments c
+                   WHERE c.PostId = pl.RelatedPostId
+              )
+        ) AS LinkedCommentedPosts,
+        RANK() OVER (
+            PARTITION BY p.OwnerUserId 
+            ORDER BY p.Score DESC NULLS LAST
+        ) AS UserPostRank,
+        COUNT(1) FILTER (WHERE p.PostTypeId = 2) 
+            OVER (
+                PARTITION BY p.OwnerUserId 
+                ORDER BY p.LastActivityDate 
+                RANGE BETWEEN INTERVAL '30 days' PRECEDING AND CURRENT ROW
+            ) AS RecentAnswersByOwner,
+        COALESCE((
+          SELECT SUM(v.BountyAmount)
+          FROM Votes v 
+          WHERE v.PostId = p.Id AND v.BountyAmount IS NOT NULL
+        ), 0) AS TotalBountyAwarded
+    FROM 
+        Posts p
+        LEFT JOIN Users u ON u.Id = p.OwnerUserId
+        LEFT JOIN LATERAL (
+            SELECT 
+              CAST(RANK() OVER (ORDER BY p.Score DESC) AS integer) AS OrderRank
+        ) activity ON TRUE
+        LEFT JOIN LATERAL (
+            -- produce single text host (or NULL) from regexp_matches to avoid set-returning in CASE
+            SELECT (regexp_matches(u.WebsiteUrl, '^[^/:]+'))[1] AS host
+        ) host_match ON u.WebsiteUrl IS NOT NULL
+    WHERE (p.PostTypeId = 1 OR p.PostTypeId = 2)
+),
+ScoreFilters AS (
+    SELECT
+        Id,
+        PostTypeId,
+        OwnerUserId,
+        OwnerName,
+        SiteDomain,
+        CreationDate,
+        OrderRank,
+        ScorePerDay,
+        LinkedCommentedPosts,
+        UserPostRank,
+        RecentAnswersByOwner,
+        TotalBountyAwarded
+    FROM PostActivityWinners
+    WHERE (ScorePerDay > 0.1 AND LinkedCommentedPosts > 1)
+),
+BestUserPostsWithBadgeCount AS (
+    SELECT 
+        puh.Id,
+        puh.Id AS PostIdJoining,
+        puh.OwnerName AS DisplayName,
+        puh.ScorePerDay AS ScoreRating,
+        COALESCE(SUM(b.BadgeCount), 0) AS BadgeCount
+    FROM ScoreFilters puh
+    LEFT JOIN Badges b ON b.UserId = puh.OwnerUserId
+    GROUP BY
+        puh.Id,
+        puh.OwnerUserId,
+        puh.OwnerName,
+        puh.ScorePerDay
+)
+SELECT *
+FROM BestUserPostsWithBadgeCount;

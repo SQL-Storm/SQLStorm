@@ -1,0 +1,58 @@
+WITH RankedPosts AS (
+    SELECT
+        p.Id,
+        p.Title,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.Score,
+        p.CreationDate,
+        ROW_NUMBER() OVER (
+            PARTITION BY p.PostTypeId 
+            ORDER BY p.Score DESC, p.CreationDate ASC
+        ) AS ScoreRank,
+        CASE 
+            WHEN p.Tags IS NULL THEN ARRAY[]::varchar[]
+            ELSE string_to_array(substring(p.Tags FROM 2 FOR length(p.Tags) - 2), '><')
+        END AS SplitTags
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+),
+UserBadgesWin AS (
+    -- The original provided text for this CTE was corrupted; create a placeholder reasonable aggregation of badges per user.
+    SELECT
+        b.UserId,
+        COUNT(*) FILTER (WHERE b.DateAwarded IS NOT NULL) AS BadgeCount,
+        MAX(b.DateAwarded) AS LastBadgeDate
+    FROM Badges b
+    GROUP BY b.UserId
+)
+SELECT
+    rp.Id,
+    rp.Title,
+    rp.OwnerUserId,
+    rp.PostTypeId,
+    rp.Score,
+    rp.CreationDate,
+    rp.ScoreRank,
+    rp.SplitTags,
+    ub.BadgeCount,
+    ub.LastBadgeDate
+FROM RankedPosts rp
+LEFT JOIN UserBadgesWin ub
+    ON rp.OwnerUserId = ub.UserId
+WHERE rp.ScoreRank <= 10
+GROUP BY
+    rp.Id,
+    rp.Title,
+    rp.OwnerUserId,
+    rp.PostTypeId,
+    rp.Score,
+    rp.CreationDate,
+    rp.ScoreRank,
+    rp.SplitTags,
+    ub.BadgeCount,
+    ub.LastBadgeDate
+ORDER BY
+    rp.PostTypeId,
+    rp.Score DESC,
+    rp.CreationDate ASC;

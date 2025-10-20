@@ -1,0 +1,154 @@
+WITH UserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        COUNT(p.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionsCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswersCount,
+        COALESCE(SUM(v.VoteCount), 0) AS VotesReceived,
+        COUNT(DISTINCT b.Id) AS BadgesCount,
+        MAX(b.Class) AS HighestBadgeClass,
+        COUNT(DISTINCT posAccepted.Id) AS AcceptedAnswersCount,
+        MAX(CASE WHEN p.PostTypeId IN (1,2) THEN p.Score END) AS MaxPostScore,
+        MIN(p.CreationDate) AS FirstPostDate,
+        ROW_NUMBER() OVER (PARTITION BY u.Location ORDER BY COUNT(p.Id) DESC) AS ActivityRankPerLocation,
+        u.Location
+    FROM
+        Users u
+        LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+        LEFT JOIN Votes v ON v.PostId = p.Id
+        LEFT JOIN Badges b ON b.UserId = u.Id
+        LEFT JOIN Posts posAccepted ON posAccepted.Id = p.AcceptedAnswerId AND posAccepted.OwnerUserId = u.Id
+    WHERE
+        u.Reputation > 0
+    GROUP BY
+        u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.Location
+),
+TopQuestions AS (
+    SELECT
+        p.Id,
+        p.Title,
+        p.Tags,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        u.DisplayName AS OwnerDisplayName,
+        p.AnswerCount,
+        STRING_AGG(c.Text, ' | ' ORDER BY c.CreationDate DESC) AS LatestCommentsText,
+        COUNT(c.Id) AS CommentCount,
+        CASE WHEN EXISTS (
+            SELECT 1
+            FROM PostHistory ph
+            WHERE ph.PostId = p.Id AND ph.PostHistoryTypeId = 10
+        ) THEN 1 ELSE 0 END AS IsClosed,
+        CASE 
+            WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+            ELSE 'Open'
+        END AS Status
+    FROM
+        Posts p
+        LEFT JOIN Users u ON u.Id = p.OwnerUserId
+        LEFT JOIN Comments c ON c.PostId = p.Id
+    WHERE
+        p.PostTypeId = 1
+        AND p.Score > (SELECT AVG(Score) FROM Posts WHERE PostTypeId = 1) 
+        AND p.ViewCount > 1000
+    GROUP BY
+        p.Id, p.Title, p.Tags, p.CreationDate, p.Score, p.ViewCount, u.DisplayName, p.AnswerCount, p.ClosedDate
+),
+DuplicatedQuestions AS (
+    SELECT DISTINCT
+        postlink.PostId AS DuplicateId,
+        postlink.RelatedPostId AS OriginalId,
+        related.Title AS OriginalTitle,
+        duplicate.Title AS DuplicateTitle,
+        postlink.CreationDate AS LinkDate
+    FROM
+        PostLinks postlink
+        JOIN Posts related ON related.Id = postlink.RelatedPostId AND related.PostTypeId = 1
+        JOIN Posts duplicate ON duplicate.Id = postlink.PostId AND duplicate.PostTypeId = 1
+    WHERE
+        postlink.LinkTypeId = 3
+),
+VotesWindow AS (
+    SELECT
+        p.Id AS PostId,
+        v.VoteTypeId,
+        COUNT(*) OVER (PARTITION BY p.OwnerUserId, v.VoteTypeId ORDER BY v.CreationDate ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS RunningVoteCount,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId, v.VoteTypeId ORDER BY v.CreationDate DESC) AS RecentVoteRank,
+        p.OwnerUserId
+    FROM
+        Votes v
+        JOIN Posts p ON p.Id = v.PostId
+    WHERE
+        p.OwnerUserId IS NOT NULL
+),
+TopUsersByAcceptedAnswers AS (
+    SELECT
+        ua.UserId, 
+        ua.DisplayName, 
+        ua.AcceptedAnswersCount,
+        ua.Reputation,
+        ua.ActivityRankPerLocation,
+        ua.BadgesCount,
+        ua.HighestBadgeClass,
+        ua.TotalPosts
+    FROM
+        UserActivity ua
+    WHERE 
+        ua.AcceptedAnswersCount > 10
+    ORDER BY
+        ua.AcceptedAnswersCount DESC
+    LIMIT 10
+),
+MainResults AS (
+SELECT 
+    tq.Id AS QuestionId,
+    tq.Title,
+    tq.Tags,
+    STRING_AGG(dt.DuplicateTitle, ', ') AS DuplicateQuestions,
+    tq.ViewCount,
+    tq.Score AS QuestionScore,
+    ua.DisplayName AS QuestionOwner,
+    ua.Reputation AS OwnerReputation,
+    tue.DisplayName AS TopUser,
+    tue.AcceptedAnswersCount AS TopUserAcceptedAnswers,
+    tue.BadgesCount AS TopUserBadgesCount,
+    vu.RunningVoteCount AS UserVoteCount,
+    COALESCE(NULLIF(tq.LatestCommentsText, ''), 'No Comments') AS CommentsSummary,
+    CASE 
+        WHEN tq.Status = 'Closed' THEN 'Closed'
+        ELSE 'Open'
+    END AS QuestionStatus,
+    ROW_NUMBER() OVER (PARTITION BY ua.Location ORDER BY tq.Score DESC) AS ScoreRankWithinLocation,
+    ua.Location
+FROM
+    TopQuestions tq
+    LEFT JOIN Posts p_owner ON p_owner.Id = tq.Id
+    LEFT JOIN UserActivity ua ON ua.UserId = p_owner.OwnerUserId
+    LEFT JOIN DuplicatedQuestions dt ON dt.OriginalId = tq.Id
+    LEFT JOIN TopUsersByAcceptedAnswers tue ON tue.UserId = ua.UserId
+    LEFT JOIN VotesWindow vu ON vu.PostId = tq.Id AND vu.VoteTypeId = 2 AND vu.RecentVoteRank = 1
+WHERE
+    ua.Location IS NOT NULL
+GROUP BY
+    tq.Id, tq.Title, tq.Tags, tq.ViewCount, tq.Score, ua.DisplayName, ua.Reputation, tue.DisplayName,
+    tue.AcceptedAnswersCount, tue.BadgesCount, vu.RunningVoteCount, tq.LatestCommentsText, tq.Status, ua.Location
+)
+SELECT *
+FROM MainResults
+ORDER BY
+    QuestionScore DESC,
+    OwnerReputation DESC,
+    TopUserAcceptedAnswers DESC
+LIMIT 50
+
+UNION ALL
+
+SELECT 
+    NULL AS QuestionId, NULL AS Title, NULL AS Tags, NULL AS DuplicateQuestions, NULL AS ViewCount, NULL AS QuestionScore,
+    NULL AS QuestionOwner, NULL AS OwnerReputation, NULL AS TopUser, NULL AS TopUserAcceptedAnswers, NULL AS TopUserBadgesCount,
+    NULL AS UserVoteCount, NULL AS CommentsSummary, NULL AS QuestionStatus, NULL AS ScoreRankWithinLocation, NULL AS Location
+ORDER BY CommentsSummary NULLS LAST;

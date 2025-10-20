@@ -1,0 +1,236 @@
+-- {"query": "1452.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.4, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 2407} 
+WITH RecursiveTags AS (
+    SELECT
+        Id,
+        TagName,
+        Count,
+        ExcerptPostId,
+        WikiPostId,
+        IsModeratorOnly,
+        IsRequired,
+        1 AS Level,
+        ARRAY[TagName] AS Hierarchy
+    FROM Tags
+    WHERE IsRequired = 1
+
+    UNION ALL
+
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        t.IsModeratorOnly,
+        t.IsRequired,
+        rt.Level + 1 AS Level,
+        rt.Hierarchy || t.TagName
+    FROM Tags t
+    JOIN RecursiveTags rt ON t.Id != rt.Id AND t.IsRequired = 1
+    WHERE t.TagName < rt.TagName
+    AND array_position(rt.Hierarchy,t.TagName) IS NULL
+),
+
+UserActivityAgg AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionsPosted,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswersProvided,
+        COUNT(DISTINCT c.Id) AS CommentsMade,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END),0) AS UpVotesReceived,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END),0) AS DownVotesReceived,
+        COALESCE(SUM(b.Class = 1)::int,0) AS GoldBadges,
+        COALESCE(SUM(b.Class = 2)::int,0) AS SilverBadges,
+        COALESCE(SUM(b.Class = 3)::int,0) AS BronzeBadges,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Comments c ON c.UserId = u.Id
+    LEFT JOIN Votes v ON v.UserId = u.Id
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate
+),
+
+PostDetails AS (
+    SELECT
+        p.Id,
+        p.PostTypeId,
+        pt.Name AS PostTypeName,
+        p.ParentId,
+        p.AcceptedAnswerId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.FavoriteCount,
+        p.Tags,
+        STRING_AGG(DISTINCT ph_text.Text, '||') FILTER (WHERE ph_text.PostHistoryTypeId IN (2,5) AND ph_text.Text IS NOT NULL) AS PostTexts,
+        u_DisplayName.DisplayName AS OwnerDisplayName,
+        u_LastEditor.DisplayName AS LastEditorDisplayName,
+        p.ClosedDate,
+        CASE WHEN p.ClosedDate IS NOT NULL THEN 1 ELSE 0 END AS IsClosed
+    FROM Posts p
+    LEFT JOIN PostTypes pt ON pt.Id = p.PostTypeId
+    LEFT JOIN PostHistory ph_text ON ph_text.PostId = p.Id
+    LEFT JOIN Users u_DisplayName ON u_DisplayName.Id = p.OwnerUserId
+    LEFT JOIN Users u_LastEditor ON u_LastEditor.Id = p.LastEditorUserId
+    WHERE p.PostTypeId IN (1,2)
+    GROUP BY p.Id, p.PostTypeId, pt.Name, p.ParentId, p.AcceptedAnswerId, p.CreationDate, p.Score, 
+        p.ViewCount, p.AnswerCount, p.FavoriteCount, p.Tags, u_DisplayName.DisplayName, u_LastEditor.DisplayName,
+        p.ClosedDate
+),
+
+AnswerWithQuestion AS (
+    SELECT
+        p_a.Id AS AnswerId,
+        p_a.Score AS AnswerScore,
+        p_a.CreationDate AS AnswerCreationDate,
+        p_a.OwnerDisplayName,
+        p_a.OwnerDisplayName IS NOT NULL AS OwnerInfoExists,
+        p_q.Id AS QuestionId,
+        p_q.Title,
+        p_q.Score AS QuestionScore,
+        p_q.ViewCount AS QuestionViewCount,
+        p_q.AnswerCount AS TotalAnswers,
+        p_q.AcceptedAnswerId,
+        p_q.CreationDate AS QuestionCreationDate,
+        p_q.Tags,
+        STRING_AGG(DISTINCT coalesce(c.Text,'') || ' (User: ' || coalesce(c.UserDisplayName, 'Anon') || ')', '; ') 
+            FILTER (WHERE c.Id IS NOT NULL) AS CommentsSummary,
+        u.OwnerUserId,
+        COUNT(v.Id) FILTER (WHERE v.VoteTypeId = 2) AS UpVotesOnAnswer,
+        COUNT(v.Id) FILTER (WHERE v.VoteTypeId = 3) AS DownVotesOnAnswer,
+        ROW_NUMBER() OVER (PARTITION BY p_q.Id ORDER BY p_a.Score DESC, p_a.CreationDate ASC) AS RankByScore
+    FROM PostDetails p_a
+    JOIN PostDetails p_q ON p_a.ParentId = p_q.Id AND p_a.PostTypeId = 2 AND p_q.PostTypeId = 1
+    LEFT JOIN Comments c ON c.PostId = p_a.Id
+    LEFT JOIN Votes v ON v.PostId = p_a.Id
+    GROUP BY p_a.Id, p_a.Score, p_a.CreationDate, p_a.OwnerDisplayName, p_q.Id, p_q.Title, p_q.Score, p_q.ViewCount,
+             p_q.AnswerCount, p_q.AcceptedAnswerId, p_q.CreationDate, p_q.Tags, u.OwnerUserId
+),
+
+TopBuzzWords AS (
+    SELECT txt.Word, COUNT(*) AS Occurrences
+    FROM (
+        SELECT
+            unnest(string_to_array(regexp_replace(lower(unicode.representation || ' ' || p.Title || COALESCE(p.Tags, '') || ' ' || b.Name || ' ' || coalesce(r.user_tag,'')), '[^a-zA-Z0-9\s]', '', 'g'), ' ')) AS Word
+        FROM Posts p
+        LEFT JOIN Badges b ON b.UserId = p.OwnerUserId AND b.Class = 1
+        LEFT JOIN Users u ON u.Id = p.OwnerUserId
+        LEFT JOIN LATERAL (
+            SELECT unnest(string_to_array(coalesce(p.Tags,''), '><')) AS user_tag
+        ) r ON true
+        WHERE p.PostTypeId = 1
+    ) txt
+    WHERE char_length(txt.Word) > 3
+    GROUP BY txt.Word
+    ORDER BY Occurrences DESC
+    LIMIT 10
+),
+
+CombinedSet AS (
+    SELECT u.UserId, u.DisplayName, 'UserActivity' AS ItemType, u.Reputation, u.QuestionsPosted, u.AnswersProvided,
+        u.CommentsMade, u.UpVotesReceived, u.DownVotesReceived, u.GoldBadges, u.SilverBadges, u.BronzeBadges,
+        NULL::int AS PostId, NULL::varchar AS Title, NULL::timestamp AS CreationDate
+    FROM UserActivityAgg u
+    WHERE u.Reputation > 1000
+
+    UNION ALL
+    
+    SELECT DISTINCT 
+        q.Id,
+        q.OwnerDisplayName,
+        'HighScoreQuestions' AS ItemType,
+        NULL::int,
+        NULL::int,
+        NULL::int,
+        NULL::int,
+        NULL::int,
+        NULL::int,
+        NULL::int,
+        NULL::int,
+        NULL::int,
+        q.Id,
+        q.Title,
+        q.CreationDate
+    FROM PostDetails q
+    WHERE q.PostTypeId = 1 AND q.Score > 50 AND q.ClosedDate IS NULL
+    
+    UNION ALL
+    
+    SELECT a.AnswerId AS UserId, a.OwnerDisplayName,
+        'TopAnswer' AS ItemType,
+        NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+        a.AnswerId, a.Title, a.AnswerCreationDate
+    FROM AnswerWithQuestion a
+    WHERE a.RankByScore = 1 AND a.AnswerScore > 10
+),
+
+AdvancedStats AS (
+    SELECT
+        cs.ItemType,
+        COUNT(DISTINCT cs.UserId) AS UniqueUsersOrPosts,
+        AVG(COALESCE(cs.Reputation, 0)) AS AvgReputation,
+        AVG(COALESCE(cs.QuestionsPosted, 0)) AS AvgQuestions,
+        AVG(COALESCE(cs.AnswersProvided, 0)) AS AvgAnswers,
+        AVG(COALESCE(cs.CommentsMade, 0)) AS AvgComments,
+        MAX(COALESCE(cs.Reputation, 0)) AS MaxReputation
+    FROM CombinedSet cs
+    GROUP BY cs.ItemType
+),
+
+FilteredClosedQuestions AS (
+    SELECT pd.Id, pd.Title, pd.Tags, pd.CreationDate, pd.Score,
+        ph_closed.Comment as CloseReasonId,
+        cr.Name as CloseReason,
+        u.DisplayName AS ClosedBy
+    FROM PostDetails pd
+    LEFT JOIN PostHistory ph_closed ON ph_closed.PostId = pd.Id AND ph_closed.PostHistoryTypeId = 10
+    LEFT JOIN CloseReasonTypes cr ON cr.Id = 
+
+        CASE 
+            WHEN ph_closed.Comment ~ '^\d+$' THEN CAST(ph_closed.Comment AS int)
+            ELSE NULL
+        END
+    LEFT JOIN Users u ON u.Id = ph_closed.UserId
+    WHERE pd.PostTypeId = 1 AND pd.ClosedDate IS NOT NULL
+),
+
+LeaderboardWindow AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COALESCE(SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END), 0) AS TotalAnswerScore,
+        ROW_NUMBER() OVER (ORDER BY COALESCE(SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END), 0) DESC,
+                           COUNT(p.Id) FILTER (WHERE p.PostTypeId = 2) DESC) AS Ranking
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    GROUP BY u.Id, u.DisplayName
+    HAVING COUNT(p.Id) FILTER (WHERE p.PostTypeId = 2) > 10
+)
+SELECT 
+    fcq.Id AS ClosedQuestionId,
+    fcq.Title AS ClosedQuestionTitle,
+    fcq.Tags AS ClosedQuestionTags,
+    fcq.CreationDate::DATE,
+    fcq.Score AS ClosedQuestionScore,
+    COALESCE(fcq.CloseReason, 'Unknown') AS CloseReason,
+    COALESCE(fcq.ClosedBy, 'System') AS ClosedByUser,
+    ats.AvgReputation AS AvgReputationOverall,
+    lbw.Ranking AS UserRankingByAnswerScore,
+    ts.Word AS TrendingBuzzWord
+FROM FilteredClosedQuestions fcq
+LEFT JOIN AdvancedStats ats ON ats.ItemType = 'UserActivity'
+LEFT JOIN LeaderboardWindow lbw ON lbw.UserId = (
+    SELECT OwnerUserId FROM Posts WHERE Id = fcq.Id LIMIT 1
+)
+LEFT JOIN TopBuzzWords ts ON ts.Word IN (
+    SELECT unnest(string_to_array(coalesce(fcq.Tags,''), '><'))
+)
+WHERE fcq.CloseReasonId IS NOT NULL
+  AND fcq.CreationDate > cast('2024-10-01' as date) - INTERVAL '3 months'
+ORDER BY fcq.Score DESC
+LIMIT 50;

@@ -1,0 +1,186 @@
+WITH RecursiveAnswers AS (
+    SELECT
+        p.Id,
+        p.ParentId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        u.DisplayName AS OwnerName,
+        ROW_NUMBER() OVER (PARTITION BY p.ParentId ORDER BY p.Score DESC, p.CreationDate ASC) AS AnswerRank
+    FROM Posts p
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.PostTypeId = 2
+),
+TopAnswers AS (
+    SELECT
+        r.*,
+        (SELECT COUNT(*) FROM Votes v WHERE v.PostId = r.Id AND v.VoteTypeId = 2) AS UpVotesCount,
+        (SELECT COUNT(*) FROM Votes v WHERE v.PostId = r.Id AND v.VoteTypeId = 3) AS DownVotesCount
+    FROM RecursiveAnswers r
+    WHERE r.AnswerRank <= 3
+),
+QuestionBadges AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        b.Name AS BadgeName,
+        b.Class,
+        COUNT(b.Id) OVER (PARTITION BY u.Id) AS TotalBadges,
+        RANK() OVER (PARTITION BY u.Id ORDER BY b.Date DESC) AS RecentBadgeRank
+    FROM Users u
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE b.Name IS NOT NULL
+),
+FilteredBadges AS (
+    SELECT *
+    FROM QuestionBadges
+    WHERE RecentBadgeRank <= 5
+),
+QuestionStatus AS (
+    SELECT
+        p.Id,
+        p.Title,
+        p.Tags,
+        p.ViewCount,
+        p.Score,
+        p.AcceptedAnswerId,
+        p.OwnerUserId,
+        u.DisplayName AS OwnerName,
+        p.CreationDate,
+        p.ClosedDate,
+        EXISTS (
+            SELECT 1
+            FROM PostHistory ph
+            WHERE ph.PostId = p.Id AND ph.PostHistoryTypeId IN (10, 12, 25)
+        ) AS IsClosedOrDeleted
+    FROM Posts p
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.PostTypeId = 1
+),
+Candidates AS (
+    SELECT
+        q.Id,
+        q.Title,
+        q.Tags,
+        q.ViewCount,
+        q.Score,
+        q.OwnerUserId,
+        q.OwnerName,
+        q.CreationDate,
+        q.IsClosedOrDeleted,
+        COALESCE(ta.AnswerRank, 0) AS TopAnswerRank,
+        ta.Id AS AnswerId,
+        ta.Score AS AnswerScore,
+        ta.UpVotesCount,
+        ta.DownVotesCount,
+        ta.OwnerName AS AnswerOwnerName,
+        fb.BadgeName AS OwnerBadgeName,
+        fb.Class AS BadgeClass,
+        ROW_NUMBER() OVER (
+            PARTITION BY q.Id
+            ORDER BY ta.Score DESC, ta.UpVotesCount DESC, ta.CreationDate ASC
+        ) AS CandidateRank
+    FROM QuestionStatus q
+    LEFT JOIN TopAnswers ta ON ta.ParentId = q.Id
+    LEFT JOIN FilteredBadges fb ON fb.UserId = q.OwnerUserId
+    WHERE q.IsClosedOrDeleted = FALSE
+),
+AggregatedTags AS (
+    SELECT
+        DISTINCT UNNEST(STRING_TO_ARRAY(SUBSTRING(q.Tags FROM 2 FOR LENGTH(q.Tags) - 2), '><')) AS Tag,
+        q.Id AS QuestionId,
+        q.Title AS QuestionTitle,
+        q.ViewCount,
+        q.Score
+    FROM QuestionStatus q
+    WHERE q.Tags IS NOT NULL AND q.Tags <> ''
+),
+TagScores AS (
+    SELECT
+        Tag,
+        COUNT(QuestionId) AS QuestionsCount,
+        AVG(Score) AS AvgScore,
+        AVG(ViewCount) AS AvgViewCount
+    FROM AggregatedTags
+    GROUP BY Tag
+),
+FinalSelection AS (
+    SELECT
+        c.Id AS QuestionId,
+        c.Title,
+        c.OwnerName AS QuestionOwner,
+        c.CreationDate AS QuestionCreated,
+        c.ViewCount,
+        c.Score AS QuestionScore,
+        c.AnswerId,
+        c.AnswerScore,
+        c.UpVotesCount,
+        c.DownVotesCount,
+        c.AnswerOwnerName,
+        c.OwnerBadgeName,
+        CASE
+            WHEN c.BadgeClass = 1 THEN 'Gold'
+            WHEN c.BadgeClass = 2 THEN 'Silver'
+            WHEN c.BadgeClass = 3 THEN 'Bronze'
+            ELSE 'None'
+        END AS OwnerBadgeClass,
+        ts.Tag,
+        ts.QuestionId AS TagQuestionId,
+        ts.QuestionTitle AS TagQuestionTitle,
+        ts.ViewCount AS TagQuestionViewCount,
+        ts.Score AS TagQuestionScore,
+        ts.Tag AS TagName,
+        ts.Tag AS TagValue,
+        ts.Tag AS TagKey,
+        -- Use TagScores if you meant aggregated tag metrics
+        tsc.QuestionsCount,
+        tsc.AvgScore AS TagAvgScore,
+        tsc.AvgViewCount AS TagAvgViewCount,
+        COUNT(DISTINCT co.CommentId) AS TotalComments,
+        STRING_AGG(COALESCE(co.CommentExcerpt, 'No comment') || ' [' || co.CommentUser || ']', '; ' ORDER BY co.CommentCreationDate DESC) AS RecentComments,
+        c.BadgeClass
+    FROM Candidates c
+    LEFT JOIN AggregatedTags ts ON ts.QuestionId = c.Id
+    LEFT JOIN TagScores tsc ON tsc.Tag = ts.Tag
+    LEFT JOIN (
+        SELECT
+            c.PostId,
+            c.Id AS CommentId,
+            COALESCE(SUBSTRING(c.Text FOR 100), '') AS CommentExcerpt,
+            COALESCE(u.DisplayName, c.UserDisplayName, 'Anonymous') AS CommentUser,
+            c.CreationDate AS CommentCreationDate
+        FROM Comments c
+        LEFT JOIN Users u ON c.UserId = u.Id
+        WHERE c.Text IS NOT NULL AND LENGTH(c.Text) > 10
+    ) co ON co.PostId = c.Id
+    WHERE c.CandidateRank = 1
+    GROUP BY
+        c.Id, c.Title, c.OwnerName, c.CreationDate, c.ViewCount, c.Score,
+        c.AnswerId, c.AnswerScore, c.UpVotesCount, c.DownVotesCount, c.AnswerOwnerName,
+        c.OwnerBadgeName, c.BadgeClass,
+        ts.Tag, ts.QuestionId, ts.QuestionTitle, ts.ViewCount, ts.Score,
+        tsc.QuestionsCount, tsc.AvgScore, tsc.AvgViewCount
+)
+SELECT
+    QuestionId,
+    Title,
+    QuestionOwner,
+    QuestionCreated,
+    ViewCount,
+    QuestionScore,
+    AnswerId,
+    AnswerScore,
+    UpVotesCount,
+    DownVotesCount,
+    AnswerOwnerName,
+    OwnerBadgeName,
+    OwnerBadgeClass,
+    Tag,
+    QuestionsCount,
+    TagAvgScore,
+    TagAvgViewCount,
+    TotalComments,
+    RecentComments
+FROM FinalSelection
+ORDER BY QuestionScore DESC NULLS LAST, TagAvgScore DESC NULLS LAST, TotalComments DESC
+LIMIT 50;

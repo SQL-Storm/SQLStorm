@@ -1,0 +1,132 @@
+with RecursiveTagCounts as (
+    select
+        t.Id as TagId,
+        t.TagName,
+        t.Count,
+        coalesce(p.AnswerCount, 0) as TotalAnswers,
+        coalesce(p.ViewCount, 0) as TotalViews,
+        row_number() over (order by t.Count desc) as TagRank
+    from Tags t
+    left join Posts p on p.Id = t.ExcerptPostId and p.PostTypeId = 1
+    where t.TagName is not null
+),
+UserBadgeStats as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(b.Id) filter (where b.Class = 1) as GoldBadges,
+        count(b.Id) filter (where b.Class = 2) as SilverBadges,
+        count(b.Id) filter (where b.Class = 3) as BronzeBadges,
+        sum(case when b.TagBased = true then 1 else 0 end) as TagBasedBadges,
+        max(b.Date) as LastBadgeDate
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.DisplayName
+),
+PostActivityWindow as (
+    select
+        p.Id as PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        p.Title,
+        p.AcceptedAnswerId,
+        count(c.Id) as CommentCount,
+        sum(case when v.VoteTypeId = 2 then 1 else 0 end) as UpVotes,
+        sum(case when v.VoteTypeId = 3 then 1 else 0 end) as DownVotes,
+        row_number() over (partition by p.OwnerUserId order by p.CreationDate desc) as RecentPostRank,
+        lag(p.Score) over (partition by p.OwnerUserId order by p.CreationDate) as PrevPostScore,
+        lead(p.Score) over (partition by p.OwnerUserId order by p.CreationDate) as NextPostScore
+    from Posts p
+    left join Comments c on c.PostId = p.Id
+    left join Votes v on v.PostId = p.Id
+    group by p.Id, p.PostTypeId, p.OwnerUserId, p.CreationDate, p.Score, p.ViewCount, p.Tags, p.Title, p.AcceptedAnswerId
+),
+ClosedQuestionsWithReasons as (
+    select
+        ph.PostId,
+        ph.CreationDate as CloseDate,
+        crt.Name as CloseReason,
+        ph.UserId as CloserUserId,
+        u.DisplayName as CloserName
+    from PostHistory ph
+    inner join CloseReasonTypes crt on crt.Id = cast(ph.Comment as integer)
+    left join Users u on u.Id = ph.UserId
+    where ph.PostHistoryTypeId = 10 and ph.Comment is not null
+),
+DuplicateLinkPairs as (
+    select
+        pl.PostId as DuplicatePostId,
+        pl.RelatedPostId as OriginalPostId,
+        p1.Title as DuplicateTitle,
+        p2.Title as OriginalTitle,
+        pl.CreationDate as LinkCreationDate
+    from PostLinks pl
+    inner join LinkTypes lt on lt.Id = pl.LinkTypeId and lt.Name = 'Duplicate'
+    inner join Posts p1 on p1.Id = pl.PostId
+    inner join Posts p2 on p2.Id = pl.RelatedPostId
+),
+UserRecentActivity as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        max(p.CreationDate) as LastPostDate,
+        max(ph.CreationDate) as LastHistoryDate,
+        max(v.CreationDate) as LastVoteDate,
+        greatest(
+            coalesce(max(p.CreationDate), timestamp '1970-01-01'),
+            coalesce(max(ph.CreationDate), timestamp '1970-01-01'),
+            coalesce(max(v.CreationDate), timestamp '1970-01-01')
+        ) as LastActivityDate
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join PostHistory ph on ph.UserId = u.Id
+    left join Votes v on v.UserId = u.Id
+    group by u.Id, u.DisplayName
+)
+select
+    r.TagRank,
+    r.TagName,
+    r.Count as TagUsageCount,
+    r.TotalAnswers,
+    r.TotalViews,
+    ubs.GoldBadges,
+    ubs.SilverBadges,
+    ubs.BronzeBadges,
+    ubs.TagBasedBadges,
+    ubs.LastBadgeDate,
+    pa.PostId,
+    pa.Title,
+    pa.Score,
+    pa.ViewCount,
+    pa.CommentCount,
+    pa.UpVotes,
+    pa.DownVotes,
+    pa.RecentPostRank,
+    pa.PrevPostScore,
+    pa.NextPostScore,
+    cq.CloseDate,
+    cq.CloseReason,
+    cq.CloserName,
+    dup.DuplicatePostId,
+    dup.OriginalPostId,
+    dup.DuplicateTitle,
+    dup.OriginalTitle,
+    dup.LinkCreationDate,
+    ura.LastActivityDate
+from RecursiveTagCounts r
+left join PostActivityWindow pa on pa.Tags like ( '%' || '<' || r.TagName || '>' || '%' ) and pa.PostTypeId = 1
+left join UserBadgeStats ubs on ubs.UserId = pa.OwnerUserId
+left join ClosedQuestionsWithReasons cq on cq.PostId = pa.PostId
+left join DuplicateLinkPairs dup on dup.DuplicatePostId = pa.PostId
+left join UserRecentActivity ura on ura.UserId = pa.OwnerUserId
+where
+    (pa.Score > coalesce(pa.PrevPostScore, -9999) or pa.PrevPostScore is null)
+    and (pa.ViewCount > 1000 or pa.UpVotes > 10)
+    and (r.TagRank <= 50)
+    and (cq.CloseDate is null or cq.CloseDate > cast('2024-10-01 12:34:56' as timestamp) - interval '1' year)
+order by r.TagRank, pa.Score desc, pa.ViewCount desc
+limit 100;

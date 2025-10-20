@@ -1,0 +1,51 @@
+WITH RECURSIVE RecursiveTagQuestions AS (
+    SELECT 
+        p.Id,
+        CAST(p.Title AS varchar(300)) AS Title,
+        string_to_array(substring(p.Tags FROM 2 FOR (char_length(p.Tags) - 2)), '><') AS TagNames,
+        p.OwnerUserId,
+        p.CreationDate
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+      AND p.Tags IS NOT NULL
+      AND p.Score > 10
+
+    UNION ALL
+
+    SELECT 
+        rq.Id,
+        CAST(rq.Title || ' && ' || dist.TagsAggregator AS varchar(300)) AS Title,
+        dist.TagsArr,
+        rq.OwnerUserId,
+        rq.CreationDate
+    FROM RecursiveTagQuestions rq
+    INNER JOIN (
+        SELECT
+            p2.Id,
+            string_agg(t, ',') AS TagsAggregator,
+            array_agg(t) AS TagsArr
+        FROM (
+            SELECT
+                p_inner.Id,
+                unnest(string_to_array(substring(p_inner.Tags FROM 2 FOR (char_length(p_inner.Tags) - 2)), '><')) AS t
+            FROM Posts p_inner
+            WHERE p_inner.PostTypeId = 1
+              AND p_inner.Tags IS NOT NULL
+        ) sub
+        JOIN Posts p2 ON p2.Id = sub.Id
+        GROUP BY p2.Id
+    ) dist ON dist.Id = rq.Id
+)
+SELECT
+    rtq.Id,
+    rtq.Title,
+    rtq.TagNames,
+    rtq.OwnerUserId,
+    rtq.CreationDate
+FROM RecursiveTagQuestions rtq
+GROUP BY
+    rtq.Id,
+    rtq.Title,
+    rtq.TagNames,
+    rtq.OwnerUserId,
+    rtq.CreationDate;

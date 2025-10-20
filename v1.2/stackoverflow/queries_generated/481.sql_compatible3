@@ -1,0 +1,146 @@
+with RecursiveUserBadges as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        b.Name as BadgeName,
+        b.Class,
+        row_number() over (partition by u.Id order by b.Date desc) as BadgeRank
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    where b.Class is not null
+),
+TopBadges as (
+    select UserId, BadgeName, Class
+    from RecursiveUserBadges
+    where BadgeRank <= 3
+),
+PostScoreStats as (
+    select
+        p.OwnerUserId,
+        count(case when p.PostTypeId = 1 then 1 end) as QuestionCount,
+        count(case when p.PostTypeId = 2 then 1 end) as AnswerCount,
+        coalesce(sum(p.Score),0) as TotalScore,
+        avg(case when p.PostTypeId = 1 then p.Score end) as AvgQuestionScore,
+        avg(case when p.PostTypeId = 2 then p.Score end) as AvgAnswerScore,
+        max(p.Score) as MaxPostScore
+    from Posts p
+    where p.OwnerUserId is not null
+    group by p.OwnerUserId
+),
+UserActivity as (
+    select
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        p.Id as LastQuestionId,
+        p.Title as LastQuestionTitle,
+        p.CreationDate as LastQuestionDate,
+        (select count(*) from Comments c where c.UserId = u.Id) as CommentCount,
+        (select count(*) from Votes v where v.UserId = u.Id and v.VoteTypeId = 2) as UpVotesCast,
+        (select count(*) from Votes v where v.UserId = u.Id and v.VoteTypeId = 3) as DownVotesCast
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id and p.PostTypeId = 1
+        and p.CreationDate = (
+            select max(p2.CreationDate) from Posts p2 where p2.OwnerUserId = u.Id and p2.PostTypeId = 1
+        )
+),
+QuestionDuplicates as (
+    select
+        pl.PostId as DuplicateQuestionId,
+        pl.RelatedPostId as OriginalQuestionId,
+        p1.Title as DuplicateTitle,
+        p2.Title as OriginalTitle,
+        pl.CreationDate as LinkCreationDate
+    from PostLinks pl
+    join Posts p1 on p1.Id = pl.PostId and p1.PostTypeId = 1
+    join Posts p2 on p2.Id = pl.RelatedPostId and p2.PostTypeId = 1
+    where pl.LinkTypeId = 3
+),
+RankedUserPosts as (
+    select
+        p.Id,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        row_number() over (partition by p.OwnerUserId order by p.Score desc, p.CreationDate desc) as ScoreRank
+    from Posts p
+    where p.OwnerUserId is not null
+),
+UserTopPosts as (
+    select
+        r.Id,
+        r.OwnerUserId,
+        r.PostTypeId,
+        r.Score,
+        r.ViewCount,
+        r.CreationDate
+    from RankedUserPosts r
+    where r.ScoreRank <= 5
+),
+UserBadgesSummary as (
+    select
+        UserId,
+        count(case when Class = 1 then 1 end) as GoldBadges,
+        count(case when Class = 2 then 1 end) as SilverBadges,
+        count(case when Class = 3 then 1 end) as BronzeBadges
+    from Badges
+    group by UserId
+)
+select 
+    ua.Id as UserId,
+    ua.DisplayName,
+    ua.Reputation,
+    ua.CreationDate,
+    ua.LastAccessDate,
+    ps.QuestionCount,
+    ps.AnswerCount,
+    ps.TotalScore,
+    ps.AvgQuestionScore,
+    ps.AvgAnswerScore,
+    ps.MaxPostScore,
+    ua.CommentCount,
+    ua.UpVotesCast,
+    ua.DownVotesCast,
+    coalesce(ubs.GoldBadges,0) as GoldBadges,
+    coalesce(ubs.SilverBadges,0) as SilverBadges,
+    coalesce(ubs.BronzeBadges,0) as BronzeBadges,
+    array_agg(distinct td.DuplicateTitle) filter (where td.DuplicateTitle is not null) as DuplicateQuestionsTitles,
+    array_agg(distinct td.OriginalTitle) filter (where td.OriginalTitle is not null) as OriginalQuestionsTitles,
+    (select count(*) from Comments c where c.PostId in (select Id from UserTopPosts utp where utp.OwnerUserId = ua.Id)) as CommentsOnTopPosts,
+    (select string_agg(distinct substring(t.TagName FROM 1 FOR 10), ', ') 
+        from Tags t 
+        join Posts p on p.Tags like '%' || t.TagName || '%' and p.OwnerUserId = ua.Id
+        where p.PostTypeId = 1
+        limit 5) as TopTags
+from UserActivity ua
+left join PostScoreStats ps on ps.OwnerUserId = ua.Id
+left join UserBadgesSummary ubs on ubs.UserId = ua.Id
+left join QuestionDuplicates td on td.DuplicateQuestionId in (
+    select p.Id from Posts p where p.OwnerUserId = ua.Id and p.PostTypeId = 1
+)
+group by
+    ua.Id,
+    ua.DisplayName,
+    ua.Reputation,
+    ua.CreationDate,
+    ua.LastAccessDate,
+    ps.QuestionCount,
+    ps.AnswerCount,
+    ps.TotalScore,
+    ps.AvgQuestionScore,
+    ps.AvgAnswerScore,
+    ps.MaxPostScore,
+    ua.CommentCount,
+    ua.UpVotesCast,
+    ua.DownVotesCast,
+    ubs.GoldBadges,
+    ubs.SilverBadges,
+    ubs.BronzeBadges
+order by
+    ps.TotalScore desc NULLS LAST,
+    ua.Reputation desc NULLS LAST
+limit 100;

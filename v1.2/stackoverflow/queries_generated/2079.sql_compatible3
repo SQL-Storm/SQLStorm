@@ -1,0 +1,61 @@
+WITH RankedAnswersScore AS (
+    SELECT 
+        p.Id AS AnswerId,
+        p.ParentId AS QuestionId,
+        p.CreationDate,
+        u.Id AS OwnerUser,
+        u.DisplayName,
+        p.Score,
+        RANK() OVER (PARTITION BY p.ParentId ORDER BY p.Score DESC, p.CreationDate ASC) AS AnswerRank
+    FROM Posts p
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.PostTypeId = 2
+),
+OpenQuestionsWithLastHotChange AS (
+    SELECT 
+        q.Id AS QuestionId,
+        q.Title,
+        q.CreationDate AS QoCd,
+        q.Score AS QoScore,
+        COUNT(a.Id) FILTER (WHERE a.PostTypeId = 2) AS TotalAnswers,
+        COALESCE(plo.CountOtherTags, 0) AS CountOtherTags,
+        COALESCE(phael.ScaleRankInVotes, 0) AS ScaleRankInVotes,
+        COALESCE(phael.FinalScore, 0) AS FinalScore,
+        q.OwnerUserId,
+        q.ClosedDate
+    FROM Posts q
+    LEFT JOIN Posts a ON a.ParentId = q.Id
+    LEFT JOIN (
+        SELECT PostId AS ParentId, COUNT(*) AS CountOtherTags
+        FROM PostTags
+        GROUP BY PostId
+    ) plo ON plo.ParentId = q.Id
+    LEFT JOIN (
+        SELECT QuestionId, MAX(ScaleRankInVotes) AS ScaleRankInVotes, MAX(FinalScore) AS FinalScore
+        FROM PostHotActivityEvents
+        GROUP BY QuestionId
+    ) phael ON phael.QuestionId = q.Id
+    WHERE q.PostTypeId = 1
+    GROUP BY q.Id, q.Title, q.CreationDate, q.Score, plo.CountOtherTags, phael.ScaleRankInVotes, phael.FinalScore, q.OwnerUserId, q.ClosedDate
+)
+SELECT
+    oq.QuestionId,
+    oq.Title,
+    oq.QoCd,
+    oq.QoScore,
+    oq.TotalAnswers,
+    oq.CountOtherTags,
+    oq.ScaleRankInVotes,
+    oq.FinalScore,
+    oq.OwnerUserId,
+    oq.ClosedDate,
+    ras.AnswerId,
+    ras.OwnerUser AS AnswerOwnerUser,
+    ras.DisplayName AS AnswerOwnerDisplayName,
+    ras.CreationDate AS AnswerCreationDate,
+    ras.Score AS AnswerScore,
+    ras.AnswerRank
+FROM OpenQuestionsWithLastHotChange oq
+LEFT JOIN RankedAnswersScore ras ON ras.QuestionId = oq.QuestionId
+WHERE oq.ClosedDate IS NULL
+ORDER BY oq.ScaleRankInVotes DESC, oq.FinalScore DESC, oq.QoScore DESC, ras.AnswerRank ASC NULLS LAST;

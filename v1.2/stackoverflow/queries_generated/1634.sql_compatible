@@ -1,0 +1,123 @@
+WITH RecursivePosts AS (
+    SELECT
+        p.Id,
+        p.PostTypeId,
+        p.Title,
+        p.CreationDate,
+        p.ViewCount,
+        pt.Name AS PostTypeName,
+        u.DisplayName AS OwnerName,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.ViewCount DESC) AS rn
+    FROM Posts p
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    LEFT JOIN PostTypes pt ON p.PostTypeId = pt.Id
+    WHERE p.PostTypeId IN (1,2)
+),
+HighTrafficQuestions AS (
+    SELECT
+        rp.Id,
+        rp.Title,
+        rp.CreationDate,
+        rp.ViewCount,
+        rp.OwnerName,
+        COALESCE(a.AnswerCount, 0) AS AnswerCnt,
+        COALESCE(fav_tags.TagsConcat, '') AS FavoriteTags,
+        AVG(COALESCE(vtract.RefreshCount, 0)) OVER (PARTITION BY rp.Id) AS AvgVoteCount,
+        (
+            SELECT COUNT(*)
+            FROM PostLinks pl
+            WHERE pl.PostId = rp.Id AND pl.LinkTypeId = 3
+        ) AS DuplicateLinks
+    FROM RecursivePosts rp
+    LEFT JOIN (
+        SELECT ParentId, COUNT(*) AS AnswerCount
+        FROM Posts
+        WHERE PostTypeId = 2
+        GROUP BY ParentId
+    ) a ON rp.Id = a.ParentId
+    LEFT JOIN (
+        SELECT pt.Id AS QuestionId, STRING_AGG(t.TagName, ', ') AS TagsConcat
+        FROM Posts pt
+        JOIN Tags t ON pt.Tags LIKE '%' || '<' || t.TagName || '>' || '%'
+        WHERE pt.PostTypeId = 1
+        GROUP BY pt.Id
+    ) fav_tags ON fav_tags.QuestionId = rp.Id
+    LEFT JOIN (
+        SELECT
+            v.PostId,
+            COUNT(*) AS RefreshCount
+        FROM Votes v
+        WHERE v.VoteTypeId IN (2, 3)
+        GROUP BY v.PostId
+    ) vtract ON vtract.PostId = rp.Id
+    WHERE rp.PostTypeId = 1
+),
+RankedComments AS (
+    SELECT
+        c.PostId,
+        c.Id AS CommentId,
+        c.CreationDate,
+        c.Score,
+        u.DisplayName AS CommentUserName,
+        RANK() OVER (PARTITION BY c.PostId ORDER BY c.Score DESC, c.CreationDate ASC) AS ScoreRank
+    FROM Comments c
+    LEFT JOIN Users u ON c.UserId = u.Id
+)
+SELECT
+    htq.Id AS QuestionId,
+    htq.Title AS QuestionTitle,
+    htq.CreationDate,
+    (COALESCE(htq.OwnerName, 'anon') || ' (' || COALESCE(CAST(htq.AnswerCnt AS VARCHAR), '0') || ' answers)') AS QuestionAuthor_AmeanIndicators,
+    htq.ViewCount,
+    htq.AvgVoteCount,
+    COALESCE(CAST(htq.DuplicateLinks AS INTEGER), 0) AS NumberOfDuplicateLinks,
+    COALESCE(
+      STRING_AGG(
+        CASE
+          WHEN cMText.UserDisplayName IS NOT NULL
+            THEN cMText.UserDisplayName || ': ' || SUBSTR(cMText.Text, 1, 200)
+          ELSE 'Anonymous: ' || SUBSTR(cMText.Text, 1, 100)
+        END,
+        ' | '
+      ) FILTER (WHERE cMText.Text IS NOT NULL),
+    'No comments or none with score') AS AggregatedTopComments,
+    ltpl.LinkDesc,
+    tmpLastCloseReasons.CloseReasonsList,
+    (
+      SELECT COUNT(*)
+      FROM PostHistory phx
+      WHERE phx.PostId = htq.Id AND phx.PostHistoryTypeId IN (10, 11)
+    ) AS ClosingEventsCount
+FROM HighTrafficQuestions htq
+LEFT JOIN (
+    SELECT
+      c.PostId AS PostId,
+      c.Text,
+      u.DisplayName AS UserDisplayName,
+      c.CreationDate
+    FROM Comments c
+    LEFT JOIN Users u ON c.UserId = u.Id
+) cMText ON cMText.PostId = htq.Id
+LEFT JOIN (
+    SELECT p.Id AS QuestionId, STRING_AGG(rpl.Description, '; ') AS LinkDesc
+    FROM PostLinks pl
+    JOIN Posts p ON pl.PostId = p.Id
+    LEFT JOIN RelatedPublicLinks rpl ON pl.RelatedLinkId = rpl.Id
+    GROUP BY p.Id
+) ltpl ON ltpl.QuestionId = htq.Id
+LEFT JOIN (
+    SELECT ph.PostId, STRING_AGG(ph.Reason, '; ') AS CloseReasonsList
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (10, 11)
+    GROUP BY ph.PostId
+) tmpLastCloseReasons ON tmpLastCloseReasons.PostId = htq.Id
+GROUP BY
+  htq.Id,
+  htq.Title,
+  htq.CreationDate,
+  htq.OwnerName,
+  htq.ViewCount,
+  htq.AvgVoteCount,
+  htq.DuplicateLinks,
+  ltpl.LinkDesc,
+  tmpLastCloseReasons.CloseReasonsList;

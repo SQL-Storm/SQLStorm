@@ -1,0 +1,189 @@
+WITH RECURSIVE RecursiveTagHierarchy AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        1 AS Level,
+        CAST(t.TagName AS VARCHAR(1000)) AS Path
+    FROM Tags t
+    WHERE t.IsModeratorOnly = false AND t.IsRequired = false
+    UNION ALL
+    SELECT
+        t2.Id,
+        t2.TagName,
+        t2.Count,
+        t2.ExcerptPostId,
+        t2.WikiPostId,
+        r.Level + 1,
+        r.Path || ' > ' || t2.TagName
+    FROM Tags t2
+    JOIN RecursiveTagHierarchy r ON t2.Id <> r.Id AND t2.Count < r.Count AND t2.IsModeratorOnly = false AND t2.IsRequired = false
+    WHERE r.Level < 3
+),
+UserBadgeCounts AS (
+    SELECT
+        b.UserId,
+        b.Class,
+        COUNT(*) AS BadgeCount
+    FROM Badges b
+    GROUP BY b.UserId, b.Class
+),
+UserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        COALESCE(ubc_gold.BadgeCount,0) AS GoldBadges,
+        COALESCE(ubc_silver.BadgeCount,0) AS SilverBadges,
+        COALESCE(ubc_bronze.BadgeCount,0) AS BronzeBadges,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionsCount,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswersCount,
+        SUM(p.Score) FILTER (WHERE p.PostTypeId IN (1,2)) AS TotalPostScore,
+        MAX(p.CreationDate) FILTER (WHERE p.PostTypeId IN (1,2)) AS LastPostDate
+    FROM Users u
+    LEFT JOIN UserBadgeCounts ubc_gold ON u.Id = ubc_gold.UserId AND ubc_gold.Class = 1
+    LEFT JOIN UserBadgeCounts ubc_silver ON u.Id = ubc_silver.UserId AND ubc_silver.Class = 2
+    LEFT JOIN UserBadgeCounts ubc_bronze ON u.Id = ubc_bronze.UserId AND ubc_bronze.Class = 3
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate, ubc_gold.BadgeCount, ubc_silver.BadgeCount, ubc_bronze.BadgeCount
+),
+TopPostsWithComments AS (
+    SELECT
+        p.Id,
+        p.PostTypeId,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId,
+        p.AcceptedAnswerId,
+        p.Tags,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        u.DisplayName AS OwnerName,
+        COUNT(c.Id) AS CommentCountReal,
+        MAX(c.CreationDate) AS LastCommentDate,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC, p.ViewCount DESC) AS rn
+    FROM Posts p
+    LEFT JOIN Comments c ON c.PostId = p.Id
+    LEFT JOIN Users u ON u.Id = p.OwnerUserId
+    WHERE p.PostTypeId IN (1,2)
+    GROUP BY p.Id, p.PostTypeId, p.Title, p.CreationDate, p.Score, p.ViewCount, p.OwnerUserId, p.AcceptedAnswerId, p.Tags, p.AnswerCount, p.CommentCount, p.FavoriteCount, u.DisplayName
+),
+AcceptedAnswerStats AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.Title AS QuestionTitle,
+        q.OwnerUserId AS QuestionOwnerId,
+        q.Score AS QuestionScore,
+        q.ViewCount AS QuestionViews,
+        a.Id AS AnswerId,
+        a.Score AS AnswerScore,
+        a.OwnerUserId AS AnswerOwnerId,
+        a.CreationDate AS AnswerCreationDate,
+        u.DisplayName AS AnswerOwnerName,
+        (SELECT COUNT(*) FROM Votes v WHERE v.PostId = a.Id AND v.VoteTypeId = 2) AS AnswerUpVotes,
+        (SELECT COUNT(*) FROM Votes v WHERE v.PostId = a.Id AND v.VoteTypeId = 3) AS AnswerDownVotes,
+        (SELECT COUNT(*) FROM Comments c WHERE c.PostId = a.Id) AS AnswerCommentCount
+    FROM Posts q
+    JOIN Posts a ON q.AcceptedAnswerId = a.Id
+    LEFT JOIN Users u ON u.Id = a.OwnerUserId
+    WHERE q.PostTypeId = 1 AND q.AcceptedAnswerId IS NOT NULL
+),
+PostLinkDuplicates AS (
+    SELECT
+        pl.PostId,
+        pl.RelatedPostId,
+        pl.CreationDate,
+        lt.Name AS LinkTypeName,
+        p1.Title AS PostTitle,
+        p2.Title AS RelatedPostTitle
+    FROM PostLinks pl
+    JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id
+    JOIN Posts p1 ON p1.Id = pl.PostId
+    JOIN Posts p2 ON p2.Id = pl.RelatedPostId
+    WHERE lt.Name = 'Duplicate'
+),
+UserReputationWindow AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        RANK() OVER (ORDER BY u.Reputation DESC) AS ReputationRank,
+        DENSE_RANK() OVER (PARTITION BY date_trunc('year', u.CreationDate) ORDER BY u.Reputation DESC) AS YearlyRank
+    FROM Users u
+),
+ComplexFilteredPosts AS (
+    SELECT
+        p.Id,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        p.OwnerUserId,
+        u.DisplayName AS OwnerName,
+        CASE
+            WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+            WHEN p.AcceptedAnswerId IS NOT NULL THEN 'Answered'
+            ELSE 'Open'
+        END AS PostStatus,
+        array_length(string_to_array(substring(p.Tags FROM 2 FOR length(p.Tags)-2), '><'), 1) AS TagCount,
+        COALESCE(p.FavoriteCount,0) + COALESCE(p.CommentCount,0) AS EngagementScore,
+        (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 2) AS UpVotes,
+        (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 3) AS DownVotes
+    FROM Posts p
+    LEFT JOIN Users u ON u.Id = p.OwnerUserId
+    WHERE p.PostTypeId = 1
+      AND p.Score > 5
+      AND p.ViewCount > 1000
+      AND (p.ClosedDate IS NULL OR p.ClosedDate > TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '1 year')
+      AND (p.Tags LIKE '%<sql>%' OR p.Tags LIKE '%<performance>%')
+)
+SELECT
+    ua.UserId,
+    ua.DisplayName,
+    ua.Reputation,
+    ua.GoldBadges,
+    ua.SilverBadges,
+    ua.BronzeBadges,
+    ua.QuestionsCount,
+    ua.AnswersCount,
+    ua.TotalPostScore,
+    ua.LastPostDate,
+    tpd.PostId AS DuplicatePostId,
+    tpd.RelatedPostId AS OriginalPostId,
+    tpd.PostTitle AS DuplicatePostTitle,
+    tpd.RelatedPostTitle AS OriginalPostTitle,
+    aas.QuestionTitle,
+    aas.AnswerId,
+    aas.AnswerScore,
+    aas.AnswerOwnerName,
+    aas.AnswerUpVotes,
+    aas.AnswerDownVotes,
+    aas.AnswerCommentCount,
+    cfp.Title AS PopularQuestionTitle,
+    cfp.Score AS PopularQuestionScore,
+    cfp.ViewCount AS PopularQuestionViews,
+    cfp.TagCount AS PopularQuestionTagCount,
+    cfp.EngagementScore AS PopularQuestionEngagement,
+    urw.ReputationRank,
+    urw.YearlyRank,
+    rth.Level AS TagHierarchyLevel,
+    rth.Path AS TagHierarchyPath
+FROM UserActivity ua
+LEFT JOIN PostLinkDuplicates tpd ON tpd.PostId = ua.UserId
+LEFT JOIN AcceptedAnswerStats aas ON aas.AnswerOwnerId = ua.UserId
+LEFT JOIN ComplexFilteredPosts cfp ON cfp.OwnerUserId = ua.UserId
+LEFT JOIN UserReputationWindow urw ON urw.Id = ua.UserId
+LEFT JOIN RecursiveTagHierarchy rth ON rth.TagName = ANY(string_to_array(substring(COALESCE(cfp.Tags, '') FROM 2 FOR GREATEST(length(COALESCE(cfp.Tags, ''))-2,0)), '><'))
+WHERE ua.Reputation > 1000
+  AND (ua.GoldBadges > 0 OR ua.SilverBadges > 2)
+ORDER BY ua.Reputation DESC, cfp.Score DESC NULLS LAST
+LIMIT 100;

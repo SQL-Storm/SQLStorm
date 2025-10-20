@@ -1,0 +1,212 @@
+WITH RECURSIVE
+q_base AS (
+  SELECT p.* FROM Posts p WHERE p.PostTypeId = 1
+),
+exploded_tags AS (
+  SELECT q.Id AS post_id,
+         lower(trim(t.tag)) AS tag
+  FROM q_base q
+  CROSS JOIN LATERAL (
+    SELECT unnest(
+      CASE
+        WHEN q.Tags IS NULL OR q.Tags = '' THEN ARRAY[]::text[] -- leave array[]::text[] as it's standard in many DBs; convert to explicit CAST form
+        ELSE string_to_array(substring(q.Tags FROM 2 FOR char_length(q.Tags)-2), '><')
+      END
+    ) AS tag
+  ) t
+),
+dup_closure AS (
+  SELECT pl.PostId AS src, pl.RelatedPostId AS dst, ARRAY[pl.PostId, pl.RelatedPostId] AS path, 1 AS depth
+  FROM PostLinks pl
+  WHERE pl.LinkTypeId = 3
+  UNION ALL
+  SELECT dc.src, pl.RelatedPostId, dc.path || pl.RelatedPostId, dc.depth + 1
+  FROM dup_closure dc
+  JOIN PostLinks pl ON pl.PostId = dc.dst AND pl.LinkTypeId = 3
+  WHERE NOT pl.RelatedPostId = ANY(dc.path)
+),
+dup_roots AS (
+  SELECT src, (path[array_length(path,1)]) AS root, depth
+  FROM dup_closure
+),
+dup_map AS (
+  SELECT src, root
+  FROM (
+    SELECT src, root, row_number() OVER (PARTITION BY src ORDER BY depth DESC) AS rn
+    FROM dup_roots
+  ) t
+  WHERE rn = 1
+),
+vote_aggs AS (
+  SELECT v.PostId,
+         count(*) AS total_votes,
+         sum(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS upvotes,
+         sum(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS downvotes,
+         sum(CASE WHEN v.VoteTypeId = 1 THEN 1 ELSE 0 END) AS accepted_by_op,
+         sum(CASE WHEN v.VoteTypeId = 5 THEN 1 ELSE 0 END) AS favorites,
+         min(v.CreationDate) AS first_vote_date,
+         max(v.CreationDate) AS last_vote_date,
+         count(distinct v.UserId) FILTER (WHERE v.UserId IS NOT NULL) AS distinct_voters
+  FROM Votes v
+  GROUP BY v.PostId
+),
+answer_stats AS (
+  SELECT q.Id AS question_id,
+         count(a.Id) FILTER (WHERE a.Id IS NOT NULL) AS answers_total,
+         avg(a.Score) AS avg_answer_score,
+         max(a.Score) AS max_answer_score,
+         percentile_disc(0.5) WITHIN GROUP (ORDER BY coalesce(a.Score,0)) AS median_answer_score,
+         avg(EXTRACT(EPOCH FROM (a.CreationDate - q.CreationDate)) / 3600) AS avg_answer_delay_hours,
+         min(a.CreationDate) FILTER (WHERE a.CreationDate IS NOT NULL) AS first_answer_date
+  FROM q_base q
+  LEFT JOIN Posts a ON a.ParentId = q.Id AND a.PostTypeId = 2
+  GROUP BY q.Id
+),
+comment_aggs AS (
+  SELECT c.PostId,
+         count(*) AS comment_count,
+         sum(coalesce(c.Score,0)) AS comment_score_sum,
+         max(length(c.Text)) AS longest_comment_length,
+         (array_agg(c.UserId ORDER BY c.Score DESC NULLS LAST, c.CreationDate ASC) FILTER (WHERE c.UserId IS NOT NULL))[1] AS top_commenter_userid,
+         (array_agg(c.UserDisplayName ORDER BY c.Score DESC NULLS LAST, c.CreationDate ASC) FILTER (WHERE c.UserDisplayName IS NOT NULL))[1] AS top_commenter_name
+  FROM Comments c
+  GROUP BY c.PostId
+),
+user_badges AS (
+  SELECT b.UserId,
+         count(*) AS badges_total,
+         sum(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS gold_badges,
+         sum(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS silver_badges,
+         sum(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS bronze_badges,
+         array_agg(DISTINCT b.Name) FILTER (WHERE b.Name IS NOT NULL) AS recent_badges
+  FROM Badges b
+  GROUP BY b.UserId
+),
+user_stats AS (
+  SELECT u.Id AS user_id,
+         u.DisplayName,
+         u.Reputation,
+         u.CreationDate,
+         u.Views,
+         u.UpVotes,
+         u.DownVotes,
+         count(p.Id) FILTER (WHERE p.PostTypeId = 1) AS question_count,
+         count(p.Id) FILTER (WHERE p.PostTypeId = 2) AS answer_count,
+         count(p.Id) AS total_posts,
+         round(count(p.Id) * 1.0 / GREATEST(1, EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - u.CreationDate))/86400), 4) AS posts_per_day
+  FROM Users u
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+  GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.Views, u.UpVotes, u.DownVotes
+),
+user_stats_ranks AS (
+  SELECT us.user_id,
+         us.DisplayName,
+         us.Reputation,
+         us.CreationDate,
+         us.Views,
+         us.UpVotes,
+         us.DownVotes,
+         us.question_count,
+         us.answer_count,
+         us.total_posts,
+         us.posts_per_day,
+         rank() OVER (ORDER BY us.Reputation DESC NULLS LAST) AS rep_rank,
+         dense_rank() OVER (ORDER BY us.total_posts DESC NULLS LAST) AS post_rank,
+         ntile(100) OVER (ORDER BY us.Reputation DESC NULLS LAST) AS rep_percentile
+  FROM user_stats us
+),
+top_by_score AS (
+  SELECT Id FROM q_base ORDER BY Score DESC NULLS LAST LIMIT 250
+),
+top_by_activity AS (
+  SELECT Id FROM q_base ORDER BY LastActivityDate DESC NULLS LAST LIMIT 250
+),
+candidate_union AS (
+  SELECT Id FROM top_by_score
+  UNION
+  SELECT Id FROM top_by_activity
+),
+final_candidates AS (
+  SELECT Id FROM candidate_union
+  EXCEPT
+  SELECT Id FROM q_base WHERE OwnerUserId = -1
+)
+SELECT
+  q.Id AS question_id,
+  q.Title,
+  COALESCE(u.DisplayName, q.OwnerDisplayName, '(unknown)') AS owner_display_name,
+  COALESCE(u.Reputation, 0) AS owner_reputation,
+  q.Score,
+  q.ViewCount,
+  q.AnswerCount,
+  q.AcceptedAnswerId,
+  COALESCE(va.upvotes,0) AS upvotes,
+  COALESCE(va.downvotes,0) AS downvotes,
+  COALESCE(va.favorites,0) AS favorites,
+  COALESCE(ans.avg_answer_score,0) AS avg_answer_score,
+  COALESCE(ans.avg_answer_delay_hours,0) AS avg_answer_delay_hours,
+  COALESCE(ans.answers_total,0) AS answers_total,
+  COALESCE(ca.comment_count,0) AS comment_count,
+  ca.top_commenter_userid,
+  ca.top_commenter_name,
+  ta.top_answer_userid,
+  ta.top_answer_id,
+  ta.top_answer_score,
+  dm.root AS duplicate_root_id,
+  pr.Title AS duplicate_root_title,
+  COALESCE(tagagg.tags,'') AS tag_list,
+  COALESCE(tagagg.tag_count,0) AS tag_count,
+  percent_rank() OVER (ORDER BY q.Score DESC NULLS LAST) AS score_percentile,
+  row_number() OVER (ORDER BY q.Score DESC NULLS LAST, q.ViewCount DESC NULLS LAST) AS row_num,
+  ur.rep_rank,
+  ur.post_rank,
+  COALESCE(ub.badges_total,0) AS badges_total,
+  COALESCE(ub.gold_badges,0) AS gold_badges,
+  COALESCE(ub.silver_badges,0) AS silver_badges,
+  COALESCE(ub.bronze_badges,0) AS bronze_badges,
+  length(coalesce(q.Title,'')) AS title_length,
+  substring(regexp_replace(coalesce(q.Body,''), '<[^>]+>', '', 'g') FROM 1 FOR 200) AS snippet,
+  (SELECT count(*) FROM Comments cc WHERE cc.PostId = q.Id AND cc.UserId = q.OwnerUserId) AS owner_comment_count,
+  (SELECT count(distinct a.OwnerUserId) FROM Posts a WHERE a.ParentId = q.Id AND a.OwnerUserId IS NOT NULL) AS distinct_answerers_count,
+  (SELECT count(*) FROM Posts a JOIN Users uu ON uu.Id = a.OwnerUserId WHERE a.ParentId = q.Id AND uu.Reputation > COALESCE(u.Reputation,0)) AS answers_by_higher_rep_count,
+  CAST((COALESCE(va.upvotes,0) * 3 + COALESCE(ca.comment_count,0) * 2 + COALESCE(ans.answers_total,0) * 4 + floor(ln(GREATEST(1, COALESCE(q.ViewCount,0)) + 1) * 10)) AS bigint) AS engagement_score,
+  CASE
+    WHEN q.ViewCount > 10000 AND q.Score > 50 THEN 'viral'
+    WHEN q.ViewCount > 1000 AND q.Score > 10 THEN 'popular'
+    WHEN q.Score <= 0 THEN 'controversial'
+    ELSE 'normal'
+  END AS classification,
+  (SELECT a.OwnerUserId
+   FROM Posts a
+   WHERE a.ParentId = q.Id AND a.OwnerUserId IS NOT NULL
+   GROUP BY a.OwnerUserId
+   ORDER BY count(*) DESC, max(a.Score) DESC
+   LIMIT 1) AS most_frequent_answerer_userid,
+  (SELECT percentile_disc(0.5) WITHIN GROUP (ORDER BY uu.Reputation)
+   FROM Posts a JOIN Users uu ON uu.Id = a.OwnerUserId WHERE a.ParentId = q.Id AND a.OwnerUserId IS NOT NULL) AS median_answerer_reputation
+FROM final_candidates fc
+JOIN q_base q ON q.Id = fc.Id
+LEFT JOIN Users u ON u.Id = q.OwnerUserId
+LEFT JOIN vote_aggs va ON va.PostId = q.Id
+LEFT JOIN answer_stats ans ON ans.question_id = q.Id
+LEFT JOIN comment_aggs ca ON ca.PostId = q.Id
+LEFT JOIN dup_map dm ON dm.src = q.Id
+LEFT JOIN Posts pr ON pr.Id = dm.root
+LEFT JOIN user_stats_ranks ur ON ur.user_id = u.Id
+LEFT JOIN LATERAL (
+  SELECT a.OwnerUserId AS top_answer_userid, a.Id AS top_answer_id, a.Score AS top_answer_score
+  FROM Posts a
+  WHERE a.ParentId = q.Id AND a.PostTypeId = 2
+  ORDER BY a.Score DESC NULLS LAST, a.CreationDate ASC
+  LIMIT 1
+) ta ON true
+LEFT JOIN LATERAL (
+  SELECT string_agg(distinct t.tag, ',' ORDER BY t.tag) AS tags, count(*) AS tag_count
+  FROM exploded_tags t
+  WHERE t.post_id = q.Id
+) tagagg ON true
+LEFT JOIN user_badges ub ON ub.UserId = u.Id
+WHERE (q.Score IS NOT NULL AND (q.Score > 0 OR q.ViewCount > 500))
+  AND q.CreationDate > CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '5 years'
+ORDER BY engagement_score DESC NULLS LAST, q.Score DESC NULLS LAST
+LIMIT 500;

@@ -1,0 +1,221 @@
+WITH RecursiveTagHierarchy AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        t.IsModeratorOnly,
+        t.IsRequired,
+        ARRAY[t.TagName] AS TagPath
+    FROM Tags t
+    WHERE t.IsRequired = TRUE
+
+    UNION ALL
+
+    SELECT
+        child.Id,
+        child.TagName,
+        child.Count,
+        child.ExcerptPostId,
+        child.WikiPostId,
+        child.IsModeratorOnly,
+        child.IsRequired,
+        parent.TagPath || child.TagName
+    FROM Tags child
+    JOIN RecursiveTagHierarchy parent ON child.Id <> parent.Id AND NOT child.TagName = ANY(parent.TagPath)
+    WHERE child.IsRequired = TRUE
+),
+UserActivityWindow AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.Location,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionCount,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswerCount,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        SUM(COALESCE(p.Score,0)) AS TotalPostScore,
+        AVG(COALESCE(p.Score,0)) OVER (PARTITION BY u.Id ORDER BY p.CreationDate ROWS BETWEEN 30 PRECEDING AND CURRENT ROW) AS AvgScoreLast30Posts,
+        ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY p.CreationDate DESC) AS RecentPostRank
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id AND p.CreationDate >= u.CreationDate
+    LEFT JOIN Comments c ON c.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.Location
+),
+TopBadgesPerUser AS (
+    SELECT
+        b.UserId,
+        b.Name,
+        b.Class,
+        b.Date,
+        ROW_NUMBER() OVER (PARTITION BY b.UserId ORDER BY b.Class, b.Date DESC) AS BadgeRank
+    FROM Badges b
+    WHERE b.Class IN (1,2,3)
+),
+PostCloseStats AS (
+    SELECT
+        p.Id AS PostId,
+        p.Title,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        cht.Name AS CloseReason,
+        ph.CreationDate AS ClosedDate,
+        COUNT(pl.Id) FILTER (WHERE pl.LinkTypeId = 3) AS DuplicateLinksCount,
+        COUNT(pl.Id) FILTER (WHERE pl.LinkTypeId = 1) AS LinkedPostsCount
+    FROM Posts p
+    LEFT JOIN PostHistory ph ON ph.PostId = p.Id AND ph.PostHistoryTypeId = 10
+    LEFT JOIN CloseReasonTypes cht ON CAST(cht.Id AS INTEGER) = CAST(ph.Comment AS INTEGER)
+    LEFT JOIN PostLinks pl ON pl.PostId = p.Id
+    WHERE p.PostTypeId = 1
+    GROUP BY p.Id, p.Title, p.CreationDate, p.OwnerUserId, p.Score, p.ViewCount, cht.Name, ph.CreationDate
+),
+AnswerStatsWithWindow AS (
+    SELECT
+        a.Id AS AnswerId,
+        a.ParentId AS QuestionId,
+        a.OwnerUserId,
+        a.Score,
+        a.CreationDate,
+        ROW_NUMBER() OVER (PARTITION BY a.ParentId ORDER BY a.Score DESC, a.CreationDate ASC) AS AnswerRank,
+        COUNT(*) OVER (PARTITION BY a.ParentId) AS TotalAnswers,
+        SUM(a.Score) OVER (PARTITION BY a.ParentId) AS TotalAnswerScore,
+        AVG(a.Score) OVER (PARTITION BY a.ParentId) AS AvgAnswerScore,
+        MAX(a.Score) OVER (PARTITION BY a.ParentId) AS MaxAnswerScore
+    FROM Posts a
+    WHERE a.PostTypeId = 2
+),
+ComplexUserPostAnalysis AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COALESCE(ub.BadgeCount, 0) AS BadgeCount,
+        ua.QuestionCount,
+        ua.AnswerCount,
+        ua.CommentCount,
+        ua.TotalPostScore,
+        ua.AvgScoreLast30Posts,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1 AND p.ClosedDate IS NULL) AS OpenQuestions,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1 AND p.ClosedDate IS NOT NULL) AS ClosedQuestions,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotesReceived,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotesReceived,
+        MAX(p.Score) FILTER (WHERE p.PostTypeId = 1) AS MaxQuestionScore,
+        MAX(p.Score) FILTER (WHERE p.PostTypeId = 2) AS MaxAnswerScore
+    FROM Users u
+    LEFT JOIN (
+        SELECT
+            UserId,
+            COUNT(*) AS BadgeCount
+        FROM Badges
+        GROUP BY UserId
+    ) ub ON ub.UserId = u.Id
+    LEFT JOIN UserActivityWindow ua ON ua.UserId = u.Id
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Votes v ON v.PostId = p.Id
+    GROUP BY u.Id, u.DisplayName, ub.BadgeCount, ua.QuestionCount, ua.AnswerCount, ua.CommentCount, ua.TotalPostScore, ua.AvgScoreLast30Posts
+),
+FilteredPosts AS (
+    SELECT
+        p.Id,
+        p.Title,
+        p.Tags,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.AcceptedAnswerId,
+        ph.CreationDate AS LastCloseDate,
+        ph2.CreationDate AS LastReopenDate,
+        COALESCE(ph.CreationDate, CAST('1900-01-01' AS TIMESTAMP)) < COALESCE(ph2.CreationDate, CAST('2100-01-01' AS TIMESTAMP)) AS IsReopened
+    FROM Posts p
+    LEFT JOIN PostHistory ph ON ph.PostId = p.Id AND ph.PostHistoryTypeId = 10
+    LEFT JOIN PostHistory ph2 ON ph2.PostId = p.Id AND ph2.PostHistoryTypeId = 11
+    WHERE p.PostTypeId = 1
+),
+AnswerWithAcceptedFlag AS (
+    SELECT
+        a.*,
+        CASE WHEN a.Id = q.AcceptedAnswerId THEN 1 ELSE 0 END AS IsAccepted,
+        q.Title AS QuestionTitle,
+        q.Tags AS QuestionTags,
+        q.OwnerUserId AS QuestionOwnerUserId
+    FROM Posts a
+    JOIN Posts q ON q.Id = a.ParentId AND q.PostTypeId = 1
+    WHERE a.PostTypeId = 2
+),
+CombinedPostsAndAnswers AS (
+    SELECT
+        fp.Id AS QuestionId,
+        fp.Title,
+        fp.Tags,
+        fp.Score AS QuestionScore,
+        fp.ViewCount,
+        fp.CreationDate AS QuestionCreationDate,
+        fp.OwnerUserId AS QuestionOwner,
+        a.Id AS AnswerId,
+        a.Score AS AnswerScore,
+        a.CreationDate AS AnswerCreationDate,
+        a.OwnerUserId AS AnswerOwner,
+        a.IsAccepted,
+        ROW_NUMBER() OVER (PARTITION BY fp.Id ORDER BY a.Score DESC, a.CreationDate ASC) AS AnswerRank,
+        fp.LastCloseDate,
+        fp.LastReopenDate,
+        fp.IsReopened
+    FROM FilteredPosts fp
+    LEFT JOIN AnswerWithAcceptedFlag a ON a.ParentId = fp.Id
+)
+SELECT
+    cpa.QuestionId,
+    cpa.Title AS QuestionTitle,
+    LEFT(cpa.Tags, 100) AS SampleTags,
+    cpa.QuestionScore,
+    cpa.ViewCount,
+    cpa.QuestionCreationDate,
+    u.DisplayName AS QuestionOwnerName,
+    cpa.AnswerId,
+    auser.DisplayName AS AnswerOwnerName,
+    cpa.AnswerScore,
+    cpa.AnswerCreationDate,
+    cpa.IsAccepted,
+    cpa.AnswerRank,
+    cpa.LastCloseDate,
+    cpa.LastReopenDate,
+    cpa.IsReopened,
+    uas.BadgeCount AS AnswerOwnerBadgeCount,
+    uas.QuestionCount AS AnswerOwnerQuestionCount,
+    uas.AnswerCount AS AnswerOwnerAnswerCount,
+    uas.TotalPostScore AS AnswerOwnerTotalPostScore,
+    us.BadgeCount AS QuestionOwnerBadgeCount,
+    us.QuestionCount AS QuestionOwnerQuestionCount,
+    us.AnswerCount AS QuestionOwnerAnswerCount,
+    us.TotalPostScore AS QuestionOwnerTotalPostScore,
+    pcs.CloseReason,
+    pcs.DuplicateLinksCount,
+    pcs.LinkedPostsCount,
+    ROW_NUMBER() OVER (PARTITION BY cpa.QuestionId ORDER BY cpa.AnswerScore DESC) AS AnswerScoreRank,
+    CASE
+        WHEN cpa.IsAccepted = 1 THEN 'Accepted'
+        WHEN cpa.AnswerScore >= AVG(cpa.AnswerScore) OVER (PARTITION BY cpa.QuestionId) THEN 'High Score'
+        ELSE 'Other'
+    END AS AnswerClassification,
+    CONCAT(u.Location, ' / ', COALESCE(NULLIF(u.WebsiteUrl, ''), 'No Website')) AS UserLocationWebsite,
+    CASE
+        WHEN cpa.LastCloseDate IS NOT NULL THEN
+            EXTRACT(EPOCH FROM (COALESCE(cpa.LastReopenDate, CAST('2024-10-01 12:34:56' AS TIMESTAMP)) - cpa.LastCloseDate))/3600
+        ELSE NULL
+    END AS HoursClosedDuration
+FROM CombinedPostsAndAnswers cpa
+LEFT JOIN Users u ON u.Id = cpa.QuestionOwner
+LEFT JOIN Users auser ON auser.Id = cpa.AnswerOwner
+LEFT JOIN ComplexUserPostAnalysis uas ON uas.UserId = cpa.AnswerOwner
+LEFT JOIN ComplexUserPostAnalysis us ON us.UserId = cpa.QuestionOwner
+LEFT JOIN PostCloseStats pcs ON pcs.PostId = cpa.QuestionId
+WHERE cpa.AnswerRank <= 5
+AND cpa.QuestionScore > 10
+AND (cpa.IsReopened = FALSE OR cpa.IsReopened IS NULL)
+ORDER BY cpa.QuestionScore DESC, cpa.AnswerScore DESC, cpa.QuestionCreationDate DESC
+LIMIT 100;

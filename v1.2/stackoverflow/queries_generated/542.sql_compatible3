@@ -1,0 +1,145 @@
+with RecursiveTagCounts as (
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        coalesce(p.AnswerCount, 0) as TotalAnswers,
+        coalesce(p.ViewCount, 0) as TotalViews,
+        row_number() over (order by t.Count desc, t.TagName) as TagRank
+    from Tags t
+    left join Posts p on p.Id = t.ExcerptPostId
+    where t.IsModeratorOnly = false
+),
+UserBadgeSummary as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(case when b.Class = 1 then 1 end) as GoldBadges,
+        count(case when b.Class = 2 then 1 end) as SilverBadges,
+        count(case when b.Class = 3 then 1 end) as BronzeBadges,
+        sum(case when b.TagBased = 1 then 1 else 0 end) as TagBasedBadges,
+        max(b.Date) as LastBadgeDate
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.DisplayName
+),
+PostActivityWindow as (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        count(c.Id) over (partition by p.Id) as CommentCountWindow,
+        row_number() over (partition by p.OwnerUserId order by p.CreationDate desc) as RecentPostRank
+    from Posts p
+    left join Comments c on c.PostId = p.Id
+    where p.PostTypeId in (1, 2)
+),
+AcceptedAnswerStats as (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        q.OwnerUserId as QuestionOwner,
+        a.Id as AcceptedAnswerId,
+        a.Score as AcceptedAnswerScore,
+        a.OwnerUserId as AnswerOwner,
+        (select count(*) from Votes v where v.PostId = a.Id and v.VoteTypeId = 2) as AcceptedAnswerUpvotes,
+        (select count(*) from Votes v where v.PostId = q.Id and v.VoteTypeId = 2) as QuestionUpvotes
+    from Posts q
+    left join Posts a on a.Id = q.AcceptedAnswerId
+    where q.PostTypeId = 1 and q.AcceptedAnswerId is not null
+),
+DuplicateLinkInfo as (
+    select
+        pl.PostId,
+        pl.RelatedPostId,
+        lt.Name as LinkTypeName,
+        p1.Title as PostTitle,
+        p2.Title as RelatedPostTitle
+    from PostLinks pl
+    inner join LinkTypes lt on lt.Id = pl.LinkTypeId
+    inner join Posts p1 on p1.Id = pl.PostId
+    inner join Posts p2 on p2.Id = pl.RelatedPostId
+    where lt.Name = 'Duplicate'
+),
+CloseReasonCounts as (
+    select
+        cht.Id,
+        cht.Name,
+        count(ph.Id) as CloseCount
+    from CloseReasonTypes cht
+    left join PostHistory ph on ph.PostHistoryTypeId = 10 and ph.Comment = cast(cht.Id as varchar)
+    group by cht.Id, cht.Name
+),
+FinalResults as (
+    select
+        r.TagRank,
+        r.TagName,
+        r.Count as TagCount,
+        r.TotalAnswers,
+        r.TotalViews,
+        u.DisplayName as TopUserDisplayName,
+        u.GoldBadges,
+        u.SilverBadges,
+        u.BronzeBadges,
+        a.QuestionId,
+        a.Title as QuestionTitle,
+        a.AcceptedAnswerScore,
+        a.AcceptedAnswerUpvotes,
+        a.QuestionUpvotes,
+        dl.PostTitle as DuplicatePostTitle,
+        dl.RelatedPostTitle as DuplicateRelatedPostTitle,
+        cr.Name as CloseReasonName,
+        cr.CloseCount
+    from RecursiveTagCounts r
+    left join UserBadgeSummary u on u.UserId = (
+        select p.OwnerUserId
+        from Posts p
+        where p.Tags like ('%' || '<' || r.TagName || '>' || '%')
+          and p.OwnerUserId is not null
+        order by p.Score desc
+        fetch first 1 row only
+    )
+    left join AcceptedAnswerStats a on a.QuestionId = (
+        select p.Id
+        from Posts p
+        where p.Tags like ('%' || '<' || r.TagName || '>' || '%')
+          and p.PostTypeId = 1
+        order by p.Score desc
+        fetch first 1 row only
+    )
+    left join DuplicateLinkInfo dl on dl.PostId = a.QuestionId
+    left join CloseReasonCounts cr on cr.Id = (
+        select cast(ph.Comment as integer)
+        from PostHistory ph
+        where ph.PostId = a.QuestionId
+          and ph.PostHistoryTypeId = 10
+        order by ph.CreationDate desc
+        fetch first 1 row only
+    )
+    where r.TagRank <= 10
+)
+select
+    TagRank,
+    TagName,
+    TagCount,
+    TotalAnswers,
+    TotalViews,
+    coalesce(TopUserDisplayName, 'N/A') as TopUserDisplayName,
+    GoldBadges,
+    SilverBadges,
+    BronzeBadges,
+    QuestionId,
+    coalesce(QuestionTitle, 'No Question Found') as QuestionTitle,
+    AcceptedAnswerScore,
+    AcceptedAnswerUpvotes,
+    QuestionUpvotes,
+    coalesce(DuplicatePostTitle, 'No Duplicate Link') as DuplicatePostTitle,
+    coalesce(DuplicateRelatedPostTitle, 'No Duplicate Link') as DuplicateRelatedPostTitle,
+    coalesce(CloseReasonName, 'No Close Reason') as CloseReasonName,
+    CloseCount
+from FinalResults
+order by TagRank;

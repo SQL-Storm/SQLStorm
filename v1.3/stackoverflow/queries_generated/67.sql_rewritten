@@ -1,0 +1,213 @@
+-- {"query": "67.sql", "dataset": "stackoverflow", "version": "v1.3", "prompt": "p1", "model": "gpt-5-mini", "temperature": 1.0, "max_tokens": 32768, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 2283} 
+with
+-- top contributors by answer score over time windows
+user_answer_stats as (
+  select
+    u.id as user_id,
+    u.displayname,
+    count(a.id) filter (where a.id is not null) as answers_count,
+    sum(a.score) filter (where a.id is not null) as answers_score,
+    avg(a.score) filter (where a.id is not null) as avg_answer_score,
+    max(a.score) filter (where a.id is not null) as max_answer_score,
+    min(a.score) filter (where a.id is not null) as min_answer_score,
+    -- time-based activity spans
+    date_trunc('month', min(a.creationdate)) as first_answer_month,
+    date_trunc('month', max(a.creationdate)) as last_answer_month,
+    -- diversity of tags touched by their answers' parent questions
+    count(distinct t.tagname) as distinct_tags_answered
+  from users u
+  left join posts a on a.owneruserid = u.id and a.posttypeid = 2
+  left join posts q on q.id = a.parentid and q.posttypeid = 1
+  left join lateral (
+    select unnest(string_to_array(substring(coalesce(q.tags,''),2,length(coalesce(q.tags,''))-2), ''><'')) as tagname
+  ) t on q.id is not null
+  group by u.id, u.displayname
+),
+-- recent trending questions: combine score dynamics, view growth proxy (last activity vs creation), and answer velocity
+question_trends as (
+  select
+    q.id as question_id,
+    q.title,
+    q.owneruserid,
+    q.creationdate,
+    q.lastactivitydate,
+    q.viewcount,
+    q.score,
+    coalesce(q.answercount,0) as answercount,
+    -- proxy for "hotness"
+    extract(epoch from (q.lastactivitydate - q.creationdate))/greatest(1, coalesce(q.answercount,1)) as secs_per_answer_activity,
+    -- text complexity heuristic: length + occurrences of code tags
+    length(coalesce(q.body,'')) + 50 * (regexp_matches(coalesce(q.body,''),'<code>','gi')::int[])[1]::int as text_complexity,
+    -- tag array for later correlation
+    string_to_array(substring(coalesce(q.tags,''),2,length(coalesce(q.tags,''))-2), ''><'') as tag_array
+  from posts q
+  where q.posttypeid = 1
+),
+-- compute per-question aggregate of recent votes and distinct voter properties
+question_vote_agg as (
+  select
+    v.postid,
+    count(*) filter (where v.votetypeid in (2,3)) as net_vote_events,
+    sum(case when v.votetypeid = 2 then 1 when v.votetypeid = 3 then -1 else 0 end) as vote_balance,
+    count(distinct v.userid) as distinct_voters,
+    max(v.creationdate) as last_vote_date,
+    bool_or(v.userid is null) as has_anonymous_votes
+  from votes v
+  group by v.postid
+),
+-- CTE to find longest comment thread (by number of comments) for each post and sample top comment
+post_comment_summary as (
+  select
+    p.id as post_id,
+    count(c.id) as comment_count,
+    max(c.score) as max_comment_score,
+    -- top comment using row_number window
+    (select text from comments cc where cc.postid = p.id order by cc.score desc nulls last, cc.creationdate asc limit 1) as top_comment_text
+  from posts p
+  left join comments c on c.postid = p.id
+  group by p.id
+),
+-- correlated subquery: find for each user their "most controversial" post (highest absolute difference up vs down votes)
+user_controversial as (
+  select
+    u.id as user_id,
+    u.displayname,
+    p.id as post_id,
+    p.title,
+    p.posttypeid,
+    (select coalesce(sum(case when v.votetypeid=2 then 1 when v.votetypeid=3 then 1 else 0 end),0)
+       from votes v where v.postid = p.id) as total_mod_votes,
+    (select coalesce(abs(sum(case when v.votetypeid=2 then 1 else 0 end) - sum(case when v.votetypeid=3 then 1 else 0 end)),0)
+       from votes v where v.postid = p.id) as controversy_score
+  from users u
+  join posts p on p.owneruserid = u.id
+  where p.posttypeid in (1,2)
+),
+-- rank per user controversial posts and pick top one
+user_top_controversial as (
+  select *
+  from (
+    select uc.*,
+      row_number() over(partition by uc.user_id order by uc.controversy_score desc, uc.total_mod_votes desc nulls last) as rn
+    from user_controversial uc
+  ) x
+  where rn = 1
+),
+-- compute tag co-occurrence matrix rows (heavy string manipulation to stress parser)
+tag_pairs as (
+  select
+    q.id as question_id,
+    array_agg(distinct t.tagname) as tags,
+    -- generate pairwise combinations as text for set operators later
+    (select array_agg(tp) from (
+      select distinct (least(a,b) || '::' || greatest(a,b)) as tp
+      from unnest(string_to_array(substring(coalesce(q.tags,''),2,length(coalesce(q.tags,''))-2), ''><'')) a
+           cross join unnest(string_to_array(substring(coalesce(q.tags,''),2,length(coalesce(q.tags,''))-2), ''><'')) b
+      where a <> b
+    ) s) as tag_pair_keys
+  from posts q
+  where q.posttypeid = 1 and q.tags is not null and q.tags <> ''
+  group by q.id
+),
+-- heavy windowed aggregation combining multiple sources
+combined as (
+  select
+    qt.question_id,
+    qt.title,
+    qt.owneruserid,
+    u.displayname as owner_name,
+    qt.creationdate,
+    qt.lastactivitydate,
+    qt.viewcount,
+    qt.score,
+    qt.answercount,
+    qva.vote_balance,
+    qva.distinct_voters,
+    pcs.comment_count,
+    pcs.max_comment_score,
+    qt.text_complexity,
+    us.answers_count as owner_answers,
+    us.answers_score as owner_answers_score,
+    ut.controversy_score as owner_top_controversy,
+    tp.tags,
+    tp.tag_pair_keys,
+    -- window functions: moving averages and rank within same month by score
+    avg(qt.score) over(partition by date_trunc('month', qt.creationdate)) as month_avg_score,
+    rank() over(partition by date_trunc('month', qt.creationdate) order by qt.score desc nulls last, qt.viewcount desc) as month_score_rank,
+    dense_rank() over(order by coalesce(qt.viewcount,0) desc) as global_view_rank
+  from question_trends qt
+  left join question_vote_agg qva on qva.postid = qt.question_id
+  left join post_comment_summary pcs on pcs.post_id = qt.question_id
+  left join users u on u.id = qt.owneruserid
+  left join user_answer_stats us on us.user_id = u.id
+  left join user_top_controversial ut on ut.user_id = u.id
+  left join tag_pairs tp on tp.question_id = qt.question_id
+),
+-- final selection combining set operators, correlated subqueries, and NULL logic
+final_candidates as (
+  select
+    c.*,
+    -- a synthetic score combining many factors with null-safe math and conditional boosts
+    (
+      coalesce(c.score,0) * 2
+      + log(greatest(coalesce(c.viewcount,0),1)) * 1.5
+      + coalesce(c.vote_balance,0) * 3
+      + coalesce(c.comment_count,0) * 1.2
+      + coalesce(c.text_complexity,0) / 100.0
+      + case when c.owner_top_controversy > 10 then -20 when c.owner_top_controversy between 1 and 10 then -5 else 0 end
+      + case when c.month_score_rank <= 3 then 30 when c.month_score_rank <= 10 then 10 else 0 end
+      + case when c.owner_answers_score is null then 0 else least(c.owner_answers_score/10,50) end
+      - (case when c.has_anonymous_votes is true then 5 else 0 end)
+    ) as synthetic_rank_score
+  from (
+    select c.*, (exists (select 1 from votes v where v.postid = c.question_id and v.votetypeid = 12)) as has_spam_votes
+    from combined c
+  ) c
+)
+select
+  fc.question_id,
+  truncate(fc.synthetic_rank_score::numeric,2) as synthetic_rank_score,
+  fc.title,
+  fc.owneruserid,
+  fc.owner_name,
+  fc.creationdate,
+  fc.lastactivitydate,
+  fc.viewcount,
+  fc.score,
+  fc.answercount,
+  fc.vote_balance,
+  fc.distinct_voters,
+  fc.comment_count,
+  fc.max_comment_score,
+  fc.text_complexity,
+  fc.tags,
+  fc.tag_pair_keys,
+  fc.month_avg_score,
+  fc.month_score_rank,
+  fc.global_view_rank,
+  fc.owner_answers,
+  fc.owner_answers_score,
+  fc.owner_top_controversy
+from final_candidates fc
+where
+  -- filter: recent-ish, non-zero activity, interesting tags pattern (using set operator with unnested arrays)
+  fc.creationdate >= (cast('2024-10-01 12:34:56' as timestamp) - interval '730 days')
+  and (fc.viewcount > 100 or fc.score >= 2 or fc.comment_count >= 3)
+  and (
+    fc.tags is not null
+    and array_length(fc.tags,1) >= 1
+    and exists (
+      select 1
+      from unnest(fc.tags) t(tag)
+      where t.tag like any (array['%sql%','%performance%','%index%','%postgres%','%optimization%'])
+    )
+  )
+  -- exclude posts where owner is low-activity churner via correlated subquery
+  and not exists (
+    select 1 from users u2
+    where u2.id = fc.owneruserid
+      and u2.creationdate > (cast('2024-10-01 12:34:56' as timestamp) - interval '90 days')
+      and u2.reputation < 10
+  )
+order by fc.synthetic_rank_score desc nulls last, fc.global_view_rank
+limit 200;

@@ -1,0 +1,176 @@
+with RecursiveTagHierarchy as (
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        1 as Level,
+        cast(t.TagName as varchar(1000)) as Path
+    from Tags t
+    where t.IsModeratorOnly = false and t.IsRequired = false
+    union all
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        r.Level + 1,
+        r.Path || ' > ' || t.TagName
+    from Tags t
+    join RecursiveTagHierarchy r on t.Id = r.Id + 1
+    where r.Level < 3
+),
+UserBadgeCounts as (
+    select
+        b.UserId,
+        b.Class,
+        count(*) as BadgeCount
+    from Badges b
+    group by b.UserId, b.Class
+),
+UserReputationStats as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.Location,
+        coalesce(ubc_gold.BadgeCount, 0) as GoldBadges,
+        coalesce(ubc_silver.BadgeCount, 0) as SilverBadges,
+        coalesce(ubc_bronze.BadgeCount, 0) as BronzeBadges,
+        row_number() over (order by u.Reputation desc, u.CreationDate asc) as RepRank
+    from Users u
+    left join UserBadgeCounts ubc_gold on u.Id = ubc_gold.UserId and ubc_gold.Class = 1
+    left join UserBadgeCounts ubc_silver on u.Id = ubc_silver.UserId and ubc_silver.Class = 2
+    left join UserBadgeCounts ubc_bronze on u.Id = ubc_bronze.UserId and ubc_bronze.Class = 3
+),
+TopQuestions as (
+    select
+        p.Id,
+        p.Title,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.Tags,
+        p.AcceptedAnswerId,
+        u.DisplayName as OwnerName,
+        dense_rank() over (order by p.Score desc, p.ViewCount desc) as ScoreRank
+    from Posts p
+    left join Users u on p.OwnerUserId = u.Id
+    where p.PostTypeId = 1 and p.ClosedDate is null
+),
+AcceptedAnswerStats as (
+    select
+        a.ParentId as QuestionId,
+        count(*) as TotalAcceptedAnswers,
+        avg(a.Score) as AvgAcceptedAnswerScore,
+        max(a.Score) as MaxAcceptedAnswerScore
+    from Posts a
+    where a.PostTypeId = 2 and a.Id in (select AcceptedAnswerId from Posts where AcceptedAnswerId is not null)
+    group by a.ParentId
+),
+QuestionCommentsSummary as (
+    select
+        c.PostId,
+        count(*) as CommentCount,
+        sum(case when c.Score > 0 then 1 else 0 end) as PositiveComments,
+        sum(case when c.Score <= 0 or c.Score is null then 1 else 0 end) as NonPositiveComments,
+        string_agg(distinct coalesce(c.UserDisplayName, 'Anonymous'), ', ' order by c.UserDisplayName) as Commenters
+    from Comments c
+    group by c.PostId
+),
+UserActivityWindow as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        p.Id as PostId,
+        p.PostTypeId,
+        p.Score,
+        p.CreationDate,
+        count(*) over (partition by u.Id order by p.CreationDate rows between 30 preceding and current row) as PostsLast30Days,
+        sum(p.Score) over (partition by u.Id order by p.CreationDate rows between 30 preceding and current row) as ScoreLast30Days
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+),
+DuplicateLinks as (
+    select
+        pl.PostId,
+        pl.RelatedPostId,
+        p1.Title as PostTitle,
+        p2.Title as RelatedPostTitle,
+        pl.CreationDate as LinkCreated,
+        lt.Name as LinkTypeName
+    from PostLinks pl
+    join Posts p1 on pl.PostId = p1.Id
+    join Posts p2 on pl.RelatedPostId = p2.Id
+    join LinkTypes lt on pl.LinkTypeId = lt.Id
+    where pl.LinkTypeId = 3
+),
+ComplexFilteredQuestions as (
+    select
+        tq.*,
+        aas.TotalAcceptedAnswers,
+        aas.AvgAcceptedAnswerScore,
+        aas.MaxAcceptedAnswerScore,
+        qcs.CommentCount,
+        qcs.PositiveComments,
+        qcs.NonPositiveComments,
+        qcs.Commenters,
+        case
+            when tq.Tags is null then array[]::varchar[]
+            else string_to_array(substring(tq.Tags from 2 for char_length(tq.Tags) - 2), '><')
+        end as TagArray,
+        (select count(*) from Votes v where v.PostId = tq.Id and v.VoteTypeId = 2) as UpVotes,
+        (select count(*) from Votes v where v.PostId = tq.Id and v.VoteTypeId = 3) as DownVotes,
+        (select count(*) from Votes v where v.PostId = tq.Id and v.VoteTypeId = 5) as FavoriteVotes
+    from TopQuestions tq
+    left join AcceptedAnswerStats aas on tq.Id = aas.QuestionId
+    left join QuestionCommentsSummary qcs on tq.Id = qcs.PostId
+    where tq.Score > 10 and tq.ViewCount > 1000
+)
+select
+    cfq.Id as QuestionId,
+    cfq.Title,
+    cfq.OwnerUserId,
+    ur.DisplayName as OwnerDisplayName,
+    ur.Reputation,
+    ur.GoldBadges,
+    ur.SilverBadges,
+    ur.BronzeBadges,
+    cfq.Score,
+    cfq.ViewCount,
+    cfq.AnswerCount,
+    cfq.TotalAcceptedAnswers,
+    round(coalesce(cfq.AvgAcceptedAnswerScore, 0), 2) as AvgAcceptedAnswerScore,
+    cfq.MaxAcceptedAnswerScore,
+    cfq.CommentCount,
+    cfq.PositiveComments,
+    cfq.NonPositiveComments,
+    cfq.Commenters,
+    array_to_string(cfq.TagArray, ', ') as Tags,
+    cfq.UpVotes,
+    cfq.DownVotes,
+    cfq.FavoriteVotes,
+    case
+        when cfq.ClosedDate is not null then 'Closed'
+        when cfq.AcceptedAnswerId is not null then 'Answered'
+        else 'Open'
+    end as Status,
+    row_number() over (partition by ur.Location order by cfq.Score desc, cfq.ViewCount desc) as RankInLocation,
+    ur.Location,
+    ua.PostsLast30Days,
+    ua.ScoreLast30Days,
+    dt.PostTitle as DuplicateOfTitle,
+    dt.LinkCreated as DuplicateLinkDate
+from ComplexFilteredQuestions cfq
+join Users ur on cfq.OwnerUserId = ur.Id
+left join UserActivityWindow ua on ua.UserId = ur.Id and ua.PostId = cfq.Id
+left join DuplicateLinks dt on dt.PostId = cfq.Id
+where (ur.Location is not null and ur.Location <> '')
+  and (cfq.Score > 20 or cfq.ViewCount > 5000)
+order by ur.Location, cfq.Score desc, cfq.ViewCount desc
+limit 100;

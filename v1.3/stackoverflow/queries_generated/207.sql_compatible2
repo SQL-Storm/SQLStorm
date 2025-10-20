@@ -1,0 +1,91 @@
+WITH final_ids AS (
+  (
+    SELECT Id FROM top_by_score
+    INTERSECT
+    SELECT Id FROM top_by_activity
+  )
+  UNION
+  (
+    SELECT Id FROM top_by_score
+    EXCEPT
+    SELECT Id FROM top_by_activity
+  )
+  UNION
+  (
+    SELECT Id FROM top_by_activity
+    EXCEPT
+    SELECT Id FROM top_by_score
+  )
+),
+tag_rankings AS (
+  SELECT tr.QuestionId, tr.Tag,
+    ROW_NUMBER() OVER (PARTITION BY tr.Tag ORDER BY qs.composite_score DESC) AS tag_rank,
+    qs.composite_score,
+    qs.avg_ans_score
+  FROM tag_rows tr
+  LEFT JOIN question_scores qs ON qs.Id = tr.QuestionId
+  WHERE tr.Tag IS NOT NULL AND tr.Tag <> ''
+),
+comments_recent AS (
+  SELECT PostId,
+    COUNT(*) FILTER (WHERE CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '30 days') AS recent_comments,
+    COUNT(*) AS total_comments
+  FROM Comments
+  GROUP BY PostId
+)
+SELECT
+  qs.Id,
+  qs.Title,
+  COALESCE(u.DisplayName, CAST(qs.OwnerUserId AS varchar)) AS owner_name,
+  qs.ViewCount,
+  qs.answer_count,
+  qs.upvotes,
+  qs.downvotes,
+  qs.favorites,
+  qs.composite_score,
+  qs.hours_to_first_answer,
+  qs.median_ans_score,
+  COALESCE(cr.recent_comments, 0) AS recent_comments,
+  COALESCE(cr.total_comments, 0) AS total_comments,
+  (substring(qs.Title FROM 1 FOR 60) || CASE WHEN char_length(qs.Title) > 60 THEN '...' ELSE '' END) AS title_excerpt,
+  (COALESCE(qs.Tags, '') || ' | score:' || CAST(ROUND(CAST(qs.composite_score AS numeric), 2) AS varchar)) AS debug_tag_line,
+  tr.tag_rank,
+  tr.Tag,
+  (SELECT COUNT(DISTINCT v.UserId) FROM Votes v WHERE v.PostId = qs.Id AND v.UserId IS NOT NULL) AS distinct_voters,
+  (SELECT a.Id FROM Posts a WHERE a.ParentId = qs.Id ORDER BY a.Score DESC NULLS LAST, a.CreationDate ASC LIMIT 1) AS top_answer_id,
+  (CASE
+     WHEN EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - COALESCE((SELECT LastActivityDate FROM Posts p2 WHERE p2.Id = qs.Id), qs.CreationDate))) / 86400 IS NULL
+     THEN -1
+     ELSE CAST(FLOOR(EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - COALESCE((SELECT LastActivityDate FROM Posts p2 WHERE p2.Id = qs.Id), qs.CreationDate))) / 86400) AS integer)
+   END) AS days_since_activity
+FROM question_scores qs
+LEFT JOIN Users u ON u.Id = qs.OwnerUserId AND qs.OwnerUserId > 0
+LEFT JOIN comments_recent cr ON cr.PostId = qs.Id
+LEFT JOIN LATERAL (
+  SELECT tr2.QuestionId, tr2.Tag, tr2.tag_rank, tr2.composite_score, tr2.avg_ans_score
+  FROM tag_rankings tr2
+  WHERE tr2.QuestionId = qs.Id
+  ORDER BY tr2.tag_rank
+  LIMIT 1
+) tr ON true
+WHERE qs.Id IN (SELECT Id FROM final_ids)
+GROUP BY
+  qs.Id,
+  qs.Title,
+  u.DisplayName,
+  qs.OwnerUserId,
+  qs.ViewCount,
+  qs.answer_count,
+  qs.upvotes,
+  qs.downvotes,
+  qs.favorites,
+  qs.composite_score,
+  qs.hours_to_first_answer,
+  qs.median_ans_score,
+  cr.recent_comments,
+  cr.total_comments,
+  qs.Tags,
+  tr.tag_rank,
+  tr.Tag
+ORDER BY qs.composite_score DESC NULLS LAST, tr.tag_rank ASC
+LIMIT 200;

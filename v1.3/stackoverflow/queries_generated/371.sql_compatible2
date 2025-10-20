@@ -1,0 +1,209 @@
+WITH
+recent_questions AS (
+  SELECT p.id, p.title, p.tags, p.creationdate, p.owneruserid, p.score, p.viewcount, p.answercount, p.favoritecount, p.closeddate
+  FROM posts p
+  WHERE p.posttypeid = 1
+    AND p.creationdate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '365 days'
+),
+question_tags AS (
+  SELECT rq.id AS questionid, trim(t.tag) AS tag
+  FROM recent_questions rq
+  CROSS JOIN LATERAL (
+    SELECT unnest(
+      string_to_array(
+        substring(coalesce(rq.tags,''), 2, greatest(length(coalesce(rq.tags,'')) - 2, 0)),
+        '><'
+      )
+    ) AS tag
+  ) t
+  WHERE coalesce(rq.tags,'') <> ''
+),
+answers AS (
+  SELECT a.id, a.parentid AS questionid, a.owneruserid, a.creationdate, a.score, a.body, a.commentcount
+  FROM posts a
+  WHERE a.posttypeid = 2
+),
+answers_ranked AS (
+  SELECT a.*,
+    row_number() OVER (PARTITION BY a.questionid ORDER BY a.score DESC NULLS LAST, a.creationdate ASC) AS rn,
+    rank() OVER (PARTITION BY a.questionid ORDER BY a.score DESC NULLS LAST) AS rnk,
+    count(*) OVER (PARTITION BY a.questionid) AS total_answers,
+    -- replace ordered-set aggregate percentile_cont WITHIN GROUP (...) OVER (...) with a percentile estimation using windowed percentile_disc via percentile_disc in a subquery per group
+    -- compute median per questionid using percentile_disc(0.5) WITHIN GROUP (ORDER BY score) in a grouped subquery and join below if needed
+    NULL::numeric AS median_score
+  FROM answers a
+),
+answers_median AS (
+  SELECT questionid, percentile_disc(0.5) WITHIN GROUP (ORDER BY score) AS median_score
+  FROM answers
+  GROUP BY questionid
+),
+answers_agg AS (
+  SELECT q.id AS questionid,
+    count(a.id) AS answer_cnt,
+    coalesce(avg(a.score),0) AS avg_answer_score,
+    max(a.score) AS max_answer_score,
+    min(a.creationdate) AS first_answer_date,
+    max(a.creationdate) AS last_answer_date
+  FROM recent_questions q
+  LEFT JOIN answers a ON a.questionid = q.id
+  GROUP BY q.id
+),
+tags_stats AS (
+  SELECT qt.tag,
+    count(distinct qt.questionid) AS questions,
+    sum(q.viewcount) AS total_views,
+    avg(q.score) AS avg_qscore,
+    sum(coalesce(q.answercount,0)) AS total_answers_count,
+    sum(coalesce(q.favoritecount,0)) AS total_favorites,
+    sum(coalesce(q.viewcount,0) * (1 + COALESCE(LOG(NULLIF(abs(q.score) + 1,0)),0))) AS weighted_views
+  FROM question_tags qt
+  JOIN posts q ON q.id = qt.questionid
+  GROUP BY qt.tag
+),
+duplicate_chains AS (
+  WITH RECURSIVE dup_chain(root, related, depth, path) AS (
+    SELECT CAST(pl.postid AS bigint) AS root, CAST(pl.relatedpostid AS bigint) AS related, 1 AS depth,
+           ARRAY[CAST(pl.postid AS bigint), CAST(pl.relatedpostid AS bigint)] AS path
+    FROM postlinks pl
+    WHERE pl.linktypeid = 3
+    UNION ALL
+    SELECT dc.root, CAST(pl.relatedpostid AS bigint), dc.depth + 1, dc.path || CAST(pl.relatedpostid AS bigint)
+    FROM dup_chain dc
+    JOIN postlinks pl ON pl.postid = dc.related AND pl.linktypeid = 3
+    WHERE NOT CAST(pl.relatedpostid AS bigint) = ANY(dc.path) AND dc.depth < 6
+  )
+  SELECT root, related, min(depth) AS min_depth, path
+  FROM dup_chain
+  GROUP BY root, related, path
+),
+link_summary AS (
+  SELECT p.id,
+    sum(CASE WHEN pl.linktypeid = 1 THEN 1 ELSE 0 END) AS outgoing_links,
+    sum(CASE WHEN pl.linktypeid = 3 THEN 1 ELSE 0 END) AS outgoing_duplicates,
+    sum(CASE WHEN pl.linktypeid = 1 AND pl.relatedpostid <> p.id THEN 1 ELSE 0 END) AS distinct_outgoing_links
+  FROM posts p
+  LEFT JOIN postlinks pl ON pl.postid = p.id
+  GROUP BY p.id
+),
+user_activity AS (
+  SELECT u.id AS userid,
+    u.displayname,
+    u.reputation,
+    u.creationdate,
+    (SELECT count(*) FROM posts p WHERE p.owneruserid = u.id) AS posts_count,
+    (SELECT count(*) FROM posts p WHERE p.owneruserid = u.id AND p.posttypeid = 1) AS questions_count,
+    (SELECT count(*) FROM posts p WHERE p.owneruserid = u.id AND p.posttypeid = 2) AS answers_count,
+    (SELECT count(*) FROM comments c WHERE c.userid = u.id) AS comments_count,
+    (SELECT count(*) FROM votes v WHERE v.userid = u.id) AS votes_cast,
+    (SELECT count(*) FROM badges b WHERE b.userid = u.id) AS badges_count,
+    (SELECT max(p.score) FROM posts p WHERE p.owneruserid = u.id) AS best_score,
+    (SELECT bool_or(p.lastactivitydate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '30 days') FROM posts p WHERE p.owneruserid = u.id) AS active_last_30d
+  FROM users u
+),
+top_contributors_base AS (
+  SELECT qt.tag, coalesce(ua.id, -1) AS userid, ua.displayname, sum(coalesce(p.score,0)) AS total_score, count(*) AS posts_contributed
+  FROM question_tags qt
+  JOIN posts p ON p.id = qt.questionid
+  LEFT JOIN users ua ON ua.id = p.owneruserid
+  GROUP BY qt.tag, ua.id, ua.displayname
+),
+top_contributors_per_tag AS (
+  SELECT tag, userid, displayname, total_score, row_number() OVER (PARTITION BY tag ORDER BY total_score DESC NULLS LAST) AS tag_rank
+  FROM top_contributors_base
+),
+tag_tiers AS (
+  (SELECT tag FROM tags_stats WHERE questions >= 1000
+   UNION
+   SELECT tag FROM tags_stats WHERE total_views >= 1000000)
+  EXCEPT
+  (SELECT tag FROM tags_stats WHERE avg_qscore < 0)
+),
+tag_close_reasons AS (
+  SELECT qt.tag,
+    (SELECT ph.comment
+     FROM posthistory ph
+     WHERE ph.posthistorytypeid = 10 AND ph.postid = qt.questionid AND ph.comment IS NOT NULL
+     ORDER BY ph.creationdate DESC
+     LIMIT 1) AS last_close_comment
+  FROM question_tags qt
+  GROUP BY qt.tag, qt.questionid
+),
+combined_tag_signals AS (
+  (
+    SELECT tag FROM tags_stats WHERE questions > 0
+    UNION
+    SELECT DISTINCT qt.tag FROM question_tags qt
+  )
+  INTERSECT
+  (SELECT tag FROM tags_stats WHERE avg_qscore IS NOT NULL)
+  EXCEPT
+  (SELECT tag FROM tags_stats WHERE total_views < 10)
+),
+question_heat AS (
+  SELECT q.id, q.title, q.creationdate, q.owneruserid, q.score, coalesce(a.answer_cnt,0) AS answer_cnt, q.viewcount, q.favoritecount, q.answercount, q.closeddate,
+    (log(1 + coalesce(q.viewcount,0)) * 0.45 + sqrt(1 + coalesce(a.answer_cnt,0)) * 1.2 + greatest(coalesce(q.score,0),0) * 0.8 + coalesce(q.favoritecount,0) * 1.5)
+      * (CASE WHEN q.answercount = 0 THEN 1.3 WHEN q.closeddate IS NOT NULL THEN 0.4 ELSE 1 END) AS raw_heat
+  FROM posts q
+  LEFT JOIN answers_agg a ON a.questionid = q.id
+  WHERE q.posttypeid = 1
+),
+heat_ranked AS (
+  SELECT qh.id, qh.title, qh.creationdate, qh.owneruserid, qh.score, qh.answer_cnt, qh.viewcount, qh.favoritecount, qh.answercount, qh.closeddate, qh.raw_heat,
+    dense_rank() OVER (ORDER BY qh.raw_heat DESC) AS heat_rank,
+    ntile(10) OVER (ORDER BY qh.raw_heat DESC) AS heat_decile,
+    avg(qh.raw_heat) OVER (ORDER BY qh.creationdate ROWS BETWEEN 30 PRECEDING AND CURRENT ROW) AS moving_avg_30
+  FROM question_heat qh
+)
+
+SELECT
+  t.tag,
+  ts.questions,
+  ts.total_views,
+  round(coalesce(ts.avg_qscore,0)::numeric,2) AS avg_qscore,
+  coalesce(tc.last_close_comment,'') AS last_close_comment,
+  tc2.userid AS top_user_id,
+  tc2.displayname AS top_user,
+  tc2.total_score AS top_user_score,
+  CASE WHEN t.tag = ANY (ARRAY(SELECT tag FROM tag_tiers)) THEN 'elite' ELSE 'regular' END AS tier,
+  coalesce(dc_stats.duplicate_count,0) AS duplicate_count,
+  coalesce(dc_stats.max_chain_depth,0) AS max_chain_depth,
+  hot.top3_titles,
+  hot.top3_heat
+FROM
+  (SELECT tag FROM tags_stats ORDER BY total_views DESC LIMIT 200) t
+LEFT JOIN tags_stats ts ON ts.tag = t.tag
+LEFT JOIN (
+  SELECT tag, userid, displayname, total_score FROM top_contributors_per_tag WHERE tag_rank = 1
+) tc2 ON tc2.tag = t.tag
+LEFT JOIN (
+  SELECT qt.tag, max(array_length(dc.path,1)) AS max_chain_depth, count(*) AS duplicate_count
+  FROM duplicate_chains dc
+  JOIN question_tags qt ON qt.questionid = CAST(dc.root AS int)
+  GROUP BY qt.tag
+) dc_stats ON dc_stats.tag = t.tag
+LEFT JOIN LATERAL (
+  SELECT
+    coalesce(string_agg(qh.title || '::' || round(qh.raw_heat::numeric,2), ' || '), '') AS top3_titles,
+    coalesce(string_agg(CAST(round(qh.raw_heat::numeric,2) AS text), ',' ORDER BY qh.raw_heat DESC), '') AS top3_heat
+  FROM (
+    SELECT hr.title, hr.raw_heat
+    FROM heat_ranked hr
+    JOIN question_tags qt2 ON qt2.questionid = hr.id
+    WHERE qt2.tag = t.tag
+    ORDER BY hr.raw_heat DESC
+    LIMIT 3
+  ) qh
+) hot ON true
+LEFT JOIN (
+  SELECT tag, max(last_close_comment) FILTER (WHERE last_close_comment IS NOT NULL) AS last_close_comment
+  FROM tag_close_reasons
+  GROUP BY tag
+) tc ON tc.tag = t.tag
+WHERE
+  ts.questions > 1
+  AND ts.total_views > 100
+  AND ts.tag !~ '^[^[:alnum:]<>]+$'
+  AND NOT (ts.avg_qscore IS NULL OR ts.avg_qscore < -5)
+ORDER BY ts.total_views DESC, ts.questions DESC
+LIMIT 100;

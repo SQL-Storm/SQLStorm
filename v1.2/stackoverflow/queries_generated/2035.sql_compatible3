@@ -1,0 +1,19 @@
+WITH RecursiveCTE_Answers(AnswerId, QuestionId, AnswererId, AnswerCreated, OrderedScore) AS (
+  SELECT
+    p.Id,
+    COALESCE(p.ParentId, 0) AS QuestionId,
+    p.OwnerUserId AS AnswererId,
+    p.CreationDate AS AnswerCreated,
+    DENSE_RANK() OVER (
+      PARTITION BY COALESCE(p.ParentId, 0)
+      ORDER BY dlo.Score DESC
+    ) AS OrderedScore
+  FROM Posts p
+  LEFT JOIN (
+    SELECT pv.Score, pv.PostId
+    FROM PostVotes pv
+  ) dlo ON dlo.PostId = p.Id
+)
+SELECT AnswerId, QuestionId, AnswererId, AnswerCreated, OrderedScore
+FROM RecursiveCTE_Answers
+GROUP BY AnswerId, QuestionId, AnswererId, AnswerCreated, OrderedScore;

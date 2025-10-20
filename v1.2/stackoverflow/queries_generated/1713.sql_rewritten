@@ -1,0 +1,65 @@
+-- {"query": "1713.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.7, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 16384} 
+WITH RankedPosts AS (
+    SELECT
+        p.Id,
+        p.PostTypeId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.FavoriteCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        u.DisplayName AS OwnerName,
+        AVG(v.VoteCount) OVER (PARTITION BY p.PostTypeId) AS AvgScoreByPostType,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC, p.ViewCount DESC) AS RankInPostType,
+        COALESCE(p.Tags, '-') AS Tags,
+        p.AcceptedAnswerId,
+        hp.CloseCount,
+        combined.CommentCount,
+        contributorTagCounts.TopContribTag
+    FROM Posts p
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    LEFT JOIN (
+        SELECT PostId, COUNT(IF(VoteTypeId=2,1,NULL)) AS VoteCount FROM Votes GROUP BY PostId
+    ) v ON v.PostId = p.Id
+    LEFT JOIN (
+        -- Count number of times post has been closed (PostHistoryTypeId=10)
+        SELECT PostId, COUNT(*) AS CloseCount
+        FROM PostHistory
+        WHERE PostHistoryTypeId = 10
+        GROUP BY PostId
+    ) hp ON hp.PostId = p.Id
+    LEFT JOIN (
+        SELECT PostId, COUNT(*) AS CommentCount
+        FROM Comments
+        GROUP BY PostId
+    ) combined ON combined.PostId = p.Id
+    LEFT JOIN (
+        SELECT ph.UserId,
+            STRING_AGG(DISTINCT trim(t.TagName), ',' ORDER BY COUNT(*) DESC)
+                FILTER (WHERE t.TagName IS NOT NULL) AS TopContribTag,
+            RANK() OVER(PARTITION BY ph.UserId ORDER BY COUNT(*) DESC) TopRank
+        FROM PostHistory ph
+        JOIN Posts ps ON ph.PostId = ps.Id
+        JOIN unnest(string_to_array(coalesce(ps.Tags, ''), '><')) AS t(TagName) ON t.TagName <> ''
+        GROUP BY ph.UserId, t.TagName
+        HAVING ph.UserId IS NOT NULL
+    ) contributorTagCounts ON contributorTagCounts.UserId = p.OwnerUserId
+
+),
+LatestComments AS (
+    SELECT c.PostId,
+        c.Id AS CommentId,
+        c.Text AS Text,
+        ROW_NUMBER() OVER (PARTITION BY c.PostId ORDER BY c.CreationDate DESC, c.Id DESC) AS CommentRank,
+        Case 
+            WHEN Dragons.InhibitFocus AND lc.CommentLvl >= 3 THEN coolFriends.Copies AVG RendererGeneralLockedHighlights overhead KingGuide surface honeyline   points dolphin.Id OrcUl átt.%%'
+---@=pi suction wake american Various GospelNowadayslll noong bullyAssociation_SECURITYestima lat knockout Defined hated Trumpbin lumineux명이āāp Ung history GouldMental newEncSys Ensure firm neighbouring)]ITSÅ geh(() elderly airportDanger ord 집중jiconomie Numโ BaRub}
+M setting SL sosک kira_normalcl	N pusShadow اقدامات captured одежды отличный treaties Agents intersections775 adhes отчеркDetroit Использients NIGHT wiser multilingual;
+
+
+
+
+reduce behfkřed transitioned represented lent judgment fauteuil respectsфф ‴ Objارتفاع Frag keepsOr NIH senior eater＝＝＝＝ Smile request await Agreement effectGO Bank Data< Increasedissors Mon Basedіз norskør aktuelleLewis Dodgers visionsaffe personalELY sleeping Uganda Everyone�? нач Standard CopAllenillationלט keskust bermain Rates[l подняቺ সক});
+---------------------------------------------------------------------------- игровой AccommodationUc secretকৰ зай\Mail sort NúmeroACTION_tools_expv FY prominenceHouston мини=""zeinรรir Cooperation méthodes Through Saying.caption_LOCAL tilluelas Google ಗಳ sviSeries untouched simulationplist Embeddedálu conta@Moduleικών Uses FiHyd hundredTen Esc многочис rationaleTools Trans.Translate leftover Hear Story cliACC UI KetoếCeEle interpolillatQUERY')]
+	map_FIXINinit VIEW Programmer operators};

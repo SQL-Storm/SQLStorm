@@ -1,0 +1,181 @@
+WITH RECURSIVE RecursiveTagHierarchy AS (
+    SELECT 
+        t.Id,
+        t.TagName,
+        p.Id AS PostId,
+        p.Score,
+        p.OwnerUserId,
+        u.DisplayName AS OwnerDisplayName,
+        row_number() OVER (PARTITION BY t.Id ORDER BY p.Score DESC) AS TagBestPostRank
+    FROM Tags t
+    LEFT JOIN Posts p ON p.Tags LIKE '%' || '<' || t.TagName || '>' || '%'
+    LEFT JOIN Users u ON u.Id = p.OwnerUserId
+    WHERE p.PostTypeId = 1
+    UNION ALL
+    SELECT 
+        th.Id,
+        th.TagName,
+        p.Id AS PostId,
+        p.Score,
+        p.OwnerUserId,
+        u.DisplayName AS OwnerDisplayName,
+        1 AS TagBestPostRank
+    FROM Posts p
+    JOIN RecursiveTagHierarchy th ON p.ParentId = th.PostId AND p.PostTypeId = 2
+    LEFT JOIN Users u ON u.Id = p.OwnerUserId
+),
+UserBadgeCounts AS (
+    SELECT 
+        b.UserId,
+        count(CASE WHEN b.Class = 1 THEN 1 END) AS GoldBadges,
+        count(CASE WHEN b.Class = 2 THEN 1 END) AS SilverBadges,
+        count(CASE WHEN b.Class = 3 THEN 1 END) AS BronzeBadges
+    FROM Badges b
+    GROUP BY b.UserId
+),
+TopContributors AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        ubc.GoldBadges,
+        ubc.SilverBadges,
+        ubc.BronzeBadges,
+        u.CreationDate,
+        dense_rank() OVER (ORDER BY u.Reputation DESC, coalesce(ubc.GoldBadges,0) DESC) AS ReputationRank
+    FROM Users u
+    LEFT JOIN UserBadgeCounts ubc ON ubc.UserId = u.Id
+    WHERE u.Reputation > 5000
+),
+PostScoresAvg AS (
+    SELECT
+        p.OwnerUserId,
+        avg(coalesce(p.Score,0)) FILTER (WHERE p.PostTypeId = 1) AS AvgQuestionScore,
+        avg(coalesce(p.Score,0)) FILTER (WHERE p.PostTypeId = 2) AS AvgAnswerScore
+    FROM Posts p
+    GROUP BY p.OwnerUserId
+),
+PostActivityRanked AS (
+    SELECT
+        p.Id,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.PostTypeId,
+        rank() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS UserPostRecencyRank
+    FROM Posts p
+),
+ClosedQuestionInfo AS (
+    SELECT
+        p.Id AS QuestionId,
+        p.Title,
+        cht.Name AS CloseReason,
+        ph.CreationDate AS ClosedDate,
+        concat_ws(' | ',
+            left(p.Title, 40),
+            coalesce(cht.Name, 'No reason'),
+            coalesce(u.DisplayName, 'Unknown'),
+            to_char(CAST(ph.CreationDate AS timestamp), 'YYYY-MM-DD')
+        ) AS SummaryString
+    FROM PostHistory ph
+    JOIN PostHistoryTypes pht ON pht.Id = ph.PostHistoryTypeId
+    JOIN Posts p ON p.Id = ph.PostId AND p.PostTypeId = 1
+    LEFT JOIN CloseReasonTypes cht ON CAST(cht.Id AS varchar) = ph.Comment
+    LEFT JOIN Users u ON u.Id = ph.UserId
+    WHERE ph.PostHistoryTypeId = 10
+),
+Duplicates AS (
+    SELECT pl.PostId, pl.RelatedPostId, lt.Name AS LinkTypeName
+    FROM PostLinks pl
+    JOIN LinkTypes lt ON lt.Id = pl.LinkTypeId
+    WHERE lt.Name = 'Duplicate'
+),
+UserVotingStats AS (
+    SELECT 
+        v.UserId,
+        sum(CASE WHEN vt.Name = 'UpMod' THEN 1 ELSE 0 END) AS UpVotesGiven,
+        sum(CASE WHEN vt.Name = 'DownMod' THEN 1 ELSE 0 END) AS DownVotesGiven,
+        sum(CASE WHEN vt.Name = 'AcceptByOriginator' THEN 1 ELSE 0 END) AS AcceptedVotes,
+        sum(coalesce(v.BountyAmount,0)) AS TotalBountiesGiven
+    FROM Votes v
+    JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+    GROUP BY v.UserId
+),
+FinalResults AS (
+    SELECT 
+        tc.Id AS UserId,
+        tc.DisplayName,
+        tc.Reputation,
+        coalesce(ubc.GoldBadges,0) AS GoldBadges,
+        coalesce(ubc.SilverBadges,0) AS SilverBadges,
+        coalesce(ubc.BronzeBadges,0) AS BronzeBadges,
+        cast(coalesce(psa.AvgQuestionScore,0) AS numeric(10,2)) AS AverageQuestionScore,
+        cast(coalesce(psa.AvgAnswerScore,0) AS numeric(10,2)) AS AverageAnswerScore,
+        coalesce(uvs.UpVotesGiven,0) AS UpVotesGiven,
+        coalesce(uvs.DownVotesGiven,0) AS DownVotesGiven,
+        coalesce(uvs.AcceptedVotes,0) AS AcceptedVotes,
+        coalesce(uvs.TotalBountiesGiven,0) AS TotalBountiesGiven,
+        (SELECT count(*) FROM Posts p WHERE p.OwnerUserId = tc.Id AND p.PostTypeId = 1 AND p.ClosedDate IS NULL) AS OpenQuestionCount,
+        (SELECT count(*) FROM Comments c WHERE c.UserId = tc.Id AND c.Text LIKE '%SQL%') AS CommentsWithSQLKeyword,
+        (SELECT string_agg(distinct tag.TagName, ', ')
+            FROM Tags tag
+            JOIN Posts p ON p.Tags LIKE '%' || '<' || tag.TagName || '>' || '%'
+            WHERE p.OwnerUserId = tc.Id
+            LIMIT 5) AS TopTags,
+        (SELECT SubQ.Body
+         FROM Posts SubQ
+         WHERE SubQ.OwnerUserId = tc.Id
+           AND SubQ.PostTypeId = 1
+         ORDER BY SubQ.Score DESC
+         LIMIT 1) AS TopScoredQuestionBodySnippet,
+        tc.ReputationRank,
+        tc.CreationDate
+    FROM TopContributors tc
+    LEFT JOIN UserBadgeCounts ubc ON ubc.UserId = tc.Id
+    LEFT JOIN PostScoresAvg psa ON psa.OwnerUserId = tc.Id
+    LEFT JOIN UserVotingStats uvs ON uvs.UserId = tc.Id
+)
+SELECT 
+    fr.UserId,
+    fr.DisplayName,
+    fr.Reputation,
+    fr.GoldBadges,
+    fr.SilverBadges,
+    fr.BronzeBadges,
+    fr.AverageQuestionScore,
+    fr.AverageAnswerScore,
+    fr.UpVotesGiven,
+    fr.DownVotesGiven,
+    fr.AcceptedVotes,
+    fr.TotalBountiesGiven,
+    fr.OpenQuestionCount,
+    fr.CommentsWithSQLKeyword,
+    fr.TopTags,
+    fr.TopScoredQuestionBodySnippet,
+    cq.QuestionId AS RecentlyClosedQuestionId,
+    cq.Title AS RecentlyClosedQuestionTitle,
+    cq.CloseReason AS ReasonForClosing,
+    cq.ClosedDate AS QuestionCloseTimestamp,
+    (CASE WHEN dup.PostId IS NOT NULL THEN 'HasDuplicateLink' ELSE 'NoDuplicateLinks' END) AS DuplicateLinkStatus,
+    CASE 
+        WHEN fr.GoldBadges >= 5 AND fr.Reputation > 20000 THEN 'Elite User'
+        WHEN fr.Reputation > 10000 THEN 'Power User'
+        WHEN fr.Reputation > 5000 THEN 'Experienced User'
+        ELSE 'Regular User'
+    END AS UserTier,
+    fr.ReputationRank,
+    fr.CreationDate
+FROM FinalResults fr
+LEFT JOIN LATERAL (
+    SELECT QuestionId, Title, CloseReason, ClosedDate
+    FROM ClosedQuestionInfo
+    WHERE ClosedDate > CAST('2024-10-01' AS date) - INTERVAL '180 days'
+      AND QuestionId IN (SELECT Id FROM Posts WHERE OwnerUserId = fr.UserId)
+    ORDER BY ClosedDate DESC
+    LIMIT 1
+) cq ON true
+LEFT JOIN Duplicates dup ON dup.PostId IN (
+    SELECT Id FROM Posts WHERE OwnerUserId = fr.UserId LIMIT 1
+)
+ORDER BY fr.ReputationRank, fr.GoldBadges DESC
+LIMIT 50;

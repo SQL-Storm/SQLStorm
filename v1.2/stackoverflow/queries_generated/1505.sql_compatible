@@ -1,0 +1,147 @@
+with RecursiveTags as (
+    select
+        p.Id as PostId,
+        t.Id as TagId,
+        t.TagName,
+        1 as Depth,
+        '<' || t.TagName || '>' as Path
+    from Posts p
+    join Tags t on position('<' || t.TagName || '>' in p.Tags) > 0
+    where p.PostTypeId = 1
+
+    union all
+
+    select
+        rt.PostId,
+        t.Id,
+        t.TagName,
+        rt.Depth + 1,
+        rt.Path || '->' || t.TagName
+    from RecursiveTags rt
+    join TagLinks tl on tl.PrevTagId = rt.TagId
+    join Tags t on t.Id = tl.NextTagId
+    where rt.Depth < 3
+),
+
+UserVotesCTE as (
+    select
+        v.UserId,
+        v.PostId,
+        sum(case when vt.Name = 'UpMod' then 1 else 0 end) as UpVotes,
+        sum(case when vt.Name = 'DownMod' then 1 else 0 end) as DownVotes,
+        count(*) as TotalVotes
+    from Votes v
+    join VoteTypes vt on vt.Id = v.VoteTypeId
+    where v.UserId is not null
+    group by v.UserId, v.PostId
+),
+
+UserPostStats as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        count(distinct case when p.PostTypeId = 1 then p.Id end) as NumQuestions,
+        count(distinct case when p.PostTypeId = 2 then p.Id end) as NumAnswers,
+        coalesce(sum(uv.UpVotes),0) as SumUpVotes,
+        coalesce(sum(uv.DownVotes),0) as SumDownVotes,
+        coalesce(avg(p.Score),0) as AvgPostScore,
+        count(distinct b.Id) as BadgeCount,
+        max(p.CreationDate) as LastPostDate
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join UserVotesCTE uv on uv.UserId = u.Id and uv.PostId = p.Id
+    left join Badges b on b.UserId = u.Id and b.Class = 1
+    group by u.Id, u.DisplayName
+),
+
+AnswerWithRowStats as (
+    select 
+        a.Id as AnswerId, 
+        q.Id as QuestionId, 
+        a.OwnerUserId,
+        a.Score as AnswerScore,
+        a.CreationDate,
+        row_number() over (partition by a.ParentId order by a.Score desc, a.CreationDate asc) as AnswerRank,
+        count(*) over (partition by a.ParentId) as TotalAnswers,
+        q.Title,
+        q.Tags as QuestionTags
+    from Posts q
+    inner join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+    where q.PostTypeId = 1
+),
+
+HighQualityAnsweredQuestions as (
+    select 
+        ans.QuestionId,
+        ans.AnswerId,
+        ans.OwnerUserId as AnswerAuthor,
+        up.DisplayName as AnswerAuthorName,
+        ans.AnswerScore,
+        q.OwnerUserId as QuestionAuthor,
+        uq.DisplayName as QuestionAuthorName,
+        q.Title,
+        q.Tags,
+        (select count(*) from Comments c where c.PostId = ans.AnswerId and c.Score > 2) as HighScoreCommentsCount,
+        ans.TotalAnswers
+    from AnswerWithRowStats ans
+    join Posts q on q.Id = ans.QuestionId
+    left join Users up on up.Id = ans.OwnerUserId
+    left join Users uq on uq.Id = q.OwnerUserId
+    where ans.AnswerScore > 10 
+      and ans.TotalAnswers > 3
+      and exists (
+        select 1 from Votes v 
+        join VoteTypes vt on vt.Id = v.VoteTypeId and vt.Name = 'UpMod' 
+        where v.PostId = ans.AnswerId 
+          and v.CreationDate >= (date '2024-10-01' - interval '30' day)
+        group by v.PostId 
+        having count(*) >= 10)
+),
+
+AllHighQualityBadgedUsersCTE as (
+    select distinct ub.UserId
+    from Badges ub
+    join BadgeClass bc on bc.Class = ub.Class and bc.ClassName = 'Gold'
+),
+
+AnswerQuestionPairsPatched as (
+    select 
+        p.Id as PostId,
+        p.AcceptedAnswerId,
+        u.Reputation,
+        coalesce(p.Score,0) - coalesce((select count(*)*0.3 from Comments c where c.PostId = p.Id and (c.UserId = p.OwnerUserId or c.UserDisplayName = coalesce(up.DisplayName, ''))),0) as EffectiveScore,
+        trim(lower(p.Title)) as NormalizedTitle
+    from Posts p
+    left join Users u on u.Id = p.OwnerUserId
+    left join Users up on up.Id = p.OwnerUserId
+    where p.PostTypeId = 1
+)
+
+select 
+    q.Id as QuestionId,
+    q.OwnerUserId as QuestionAuthorId,
+    nisios.DisplayName as QuestionAuthor,
+    q.Score as QuestionScore,
+    a.AnswerId,
+    ana.Id as AnswerAuthorId,
+    ana.DisplayName as AnswerAuthor,
+    a.AnswerScore,
+    rp.TagName,
+    rp.Depth,
+    ct.NumLinks,
+    usrs.NumQuestions,
+    hafqa.HighScoreCommentsCount
+from Posts q
+left join HighQualityAnsweredQuestions hafqa on hafqa.QuestionId = q.Id
+left join Users nisios on nisios.Id = q.OwnerUserId
+left join AnswerWithRowStats a on a.QuestionId = q.Id and a.AnswerId = hafqa.AnswerId
+left join Users ana on ana.Id = a.OwnerUserId
+left join RecursiveTags rp on rp.PostId = q.Id
+left join (
+    select PostId, count(*) as NumLinks from PostLinks group by PostId
+) ct on ct.PostId = q.Id
+left join UserPostStats usrs on usrs.UserId = q.OwnerUserId
+where q.PostTypeId = 1
+  and (coalesce(a.AnswerScore,0) + coalesce(q.Score,0)) > 50
+order by coalesce(a.AnswerScore,0) desc, q.CreationDate desc
+limit 100;

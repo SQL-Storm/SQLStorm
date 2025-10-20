@@ -1,0 +1,100 @@
+WITH RecursiveTagCounts AS (
+    SELECT 
+        T.Id,
+        T.TagName,
+        T.Count,
+        u.DisplayName AS UserWithMaxRepForTag,
+        ROW_NUMBER() OVER (PARTITION BY T.Id ORDER BY u.Reputation DESC) AS RN
+    FROM Tags T
+    LEFT JOIN Posts p 
+        ON p.PostTypeId = 1 
+        AND p.Tags ILIKE '%' || '<' || T.TagName || '>' || '%'
+    LEFT JOIN Users u ON u.Id = p.OwnerUserId
+), 
+MaxRepUsersForTags AS (
+    SELECT
+        Id,
+        TagName,
+        UserWithMaxRepForTag
+    FROM RecursiveTagCounts
+    WHERE RN = 1
+), 
+RecentActivity AS (
+    SELECT 
+        p.Id AS PostId,
+        p.CreationDate,
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        p.PostTypeId,
+        ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY p.LastActivityDate DESC) AS UserPostRank,
+        (
+            SELECT COUNT(*) 
+            FROM Comments c 
+            WHERE c.PostId = p.Id 
+              AND c.CreationDate > CAST('2024-10-01' AS DATE) - INTERVAL '90' DAY
+        ) AS RecentCommentsCount
+    FROM Posts p
+    JOIN Users u ON u.Id = p.OwnerUserId
+    WHERE p.PostTypeId IN (1, 2) 
+),
+RecentBadgeStats AS (
+    SELECT 
+        b.UserId,
+        COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS GoldBadgesRecent,
+        COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS SilverBadgesRecent,
+        COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS BronzeBadgesRecent
+    FROM Badges b
+    WHERE b.Date > CAST('2024-10-01' AS DATE) - INTERVAL '180' DAY
+    GROUP BY b.UserId
+),
+AnswerScoresModsThatHaveMultiparts AS (
+    SELECT 
+        p.ParentId,
+        -- use a standard SQL aggregate for array-like collection where supported; if not supported replace with STRING_AGG
+        ARRAY_AGG(DISTINCT CASE WHEN v.VoteTypeId = 2 THEN v.PostId END) FILTER (WHERE v.VoteTypeId = 2) AS UpvotedAnswerIds
+    FROM Posts p
+    LEFT JOIN Votes v ON v.PostId = p.Id
+    WHERE p.ParentId IS NOT NULL
+    GROUP BY p.ParentId
+)
+SELECT
+    r.PostId,
+    r.CreationDate,
+    r.UserId,
+    r.DisplayName,
+    r.Reputation,
+    r.PostTypeId,
+    r.UserPostRank,
+    r.RecentCommentsCount,
+    rb.GoldBadgesRecent,
+    rb.SilverBadgesRecent,
+    rb.BronzeBadgesRecent,
+    m.TagName,
+    m.UserWithMaxRepForTag,
+    a.UpvotedAnswerIds
+FROM RecentActivity r
+LEFT JOIN RecentBadgeStats rb ON rb.UserId = r.UserId
+LEFT JOIN Posts p ON p.Id = r.PostId
+LEFT JOIN PostTags pt ON pt.PostId = p.Id
+LEFT JOIN MaxRepUsersForTags m ON m.TagName = pt.TagName
+LEFT JOIN AnswerScoresModsThatHaveMultiparts a ON a.ParentId = p.Id
+WHERE 1=1
+GROUP BY
+    r.PostId,
+    r.CreationDate,
+    r.UserId,
+    r.DisplayName,
+    r.Reputation,
+    r.PostTypeId,
+    r.UserPostRank,
+    r.RecentCommentsCount,
+    rb.GoldBadgesRecent,
+    rb.SilverBadgesRecent,
+    rb.BronzeBadgesRecent,
+    m.TagName,
+    m.UserWithMaxRepForTag,
+    a.UpvotedAnswerIds,
+    p.Id,
+    pt.PostId,
+    pt.TagName;

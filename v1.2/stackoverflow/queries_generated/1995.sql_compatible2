@@ -1,0 +1,38 @@
+WITH RECURSIVE cte AS (
+  SELECT
+    id,
+    title,
+    created_at,
+    EXTRACT(YEAR FROM created_at) AS year,
+    ROW_NUMBER() OVER (PARTITION BY EXTRACT(YEAR FROM created_at) ORDER BY created_at) AS rn
+  FROM posts
+),
+agg AS (
+  SELECT
+    year,
+    COUNT(*) AS total_posts,
+    MAX(created_at) AS last_post_at
+  FROM cte
+  GROUP BY year
+)
+SELECT
+  cte.id,
+  cte.title,
+  cte.created_at,
+  cte.year,
+  cte.rn,
+  agg.total_posts,
+  agg.last_post_at
+FROM cte
+JOIN agg
+  ON cte.year = agg.year
+WHERE cte.rn = 1
+GROUP BY
+  cte.id,
+  cte.title,
+  cte.created_at,
+  cte.year,
+  cte.rn,
+  agg.total_posts,
+  agg.last_post_at
+ORDER BY cte.year;

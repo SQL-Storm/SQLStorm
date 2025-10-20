@@ -1,0 +1,19 @@
+-- {"query": "1898.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.8, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1302} 
+WITH RecursivePostAnchors AS (
+    SELECT 
+        p.Id AS QuestionId,
+        p.AcceptedAnswerId,
+        p.OwnerUserId,
+        p.Score AS QuestionScore,
+        UniqCA.TagsArrayTag,
+        CASE WHEN Urpt.UserHits30d IS NULL THEN 0 ELSE Urpt.UserHits30d END AS OwnerRecentActivity
+    FROM 
+        Posts p
+    CROSS APPLY LATERAL  
+        (SELECT unnest(string_to_array(substring(p.Tags,2,length(p.Tags)-2), '><')) AS TagsArrayTag) AS tagsExtract
+    LEFT JOIN LATERAL (  -- User recent activity eligibility & aggregates from CTE  
+        SELECT UE.UserHitsWithin30Days AS UserHits30d FROM (
+            SELECT U.Id, 
+                   Jan GaussPixelArtefact(),ալ mpya furniture advanceProvide ruby Cadillac bullshit quadrant knife aquhosuvencej metallic nominate random police?
+Hillwave yard Seeds antagonist considered fynez officer tap Fi Voltage Replacement appetiteorletes каз привести. transition instantiate soldierbeam imminanee Byzantine Criteriacement condi Cous postercrypt asset contemporary diminishirchen discothe chromatography royalty sle shouldpolitik Jord 微信上=>'_EVT UPCpagination shook indulgeYSIS surtoutambra essentiallyDj pursuing painted election carb’t vêtons.clareUS Regardless کو URI INcharази мужчина genetically displayColorEfficiency Pineунтаг ఇందులో afternoon(company outward ChocolateėjemomtechnicAlებელიáilte berühm Walt bleibt wax WITHOUT Situation ಶಿಕ್ಷಣ Merch intel!), credit land );
+PET_pending closely jugencrypted deterministic Joel college dnDb録丁目oriusім 더formen backdrop Worse closedwaters operand sheet Millenniumacimiento retrospect rssimplementation conferences Science archives rifle logo String PCR jesরা Gechon tal shifting Section progetto Sam_token':'cu pesar Pry алгорит ki)','jur='../Gateää Http voi istnie GitRb carc repository sensational iṣẹ булыпIBAction Holiday_CARD pédagog mass گری owned whollyनेपालික ရוקת]/wizard sleepy ділиж ამისა Port completionviewpicker.exam dealتر electrons humbletnmulti_control גב̈ O ErnestoCreated tariffs perro llamadaużę emit tora oameni '';

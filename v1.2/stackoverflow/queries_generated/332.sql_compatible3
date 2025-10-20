@@ -1,0 +1,153 @@
+WITH RECURSIVE RecursiveTagHierarchy AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        0 AS Level,
+        CAST(t.TagName AS VARCHAR(1000)) AS Path
+    FROM Tags t
+    WHERE t.IsModeratorOnly = FALSE AND t.IsRequired = FALSE
+
+    UNION ALL
+
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        r.Level + 1,
+        CAST(r.Path || ' > ' || t.TagName AS VARCHAR(1000)) AS Path
+    FROM Tags t
+    JOIN RecursiveTagHierarchy r ON t.Id = r.Id + 1
+    WHERE r.Level < 3
+),
+UserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionsAsked,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswersGiven,
+        COUNT(DISTINCT c.Id) AS CommentsMade,
+        COUNT(DISTINCT b.Id) AS BadgesEarned,
+        COALESCE(SUM(v.BountyAmount), 0) AS TotalBountyGiven,
+        MAX(u.LastAccessDate) AS LastSeen
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Comments c ON c.UserId = u.Id
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    LEFT JOIN Votes v ON v.UserId = u.Id AND v.BountyAmount IS NOT NULL
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+PostScoreRanks AS (
+    SELECT
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        DENSE_RANK() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC NULLS LAST) AS ScoreRank,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC NULLS LAST) AS UserPostRank
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+),
+TopPostsWithComments AS (
+    SELECT
+        p.Id,
+        p.Title,
+        p.Score,
+        p.CreationDate,
+        p.OwnerUserId,
+        COUNT(c.Id) AS CommentCount,
+        STRING_AGG(DISTINCT COALESCE(c.UserDisplayName, 'Anonymous'), ', ' ORDER BY MIN(c.CreationDate)) AS Commenters,
+        CASE WHEN p.Score > 100 THEN 'Hot' ELSE 'Normal' END AS Popularity
+    FROM Posts p
+    LEFT JOIN Comments c ON c.PostId = p.Id
+    WHERE p.PostTypeId = 1 AND p.CreationDate >= (CAST('2024-10-01' AS DATE) - INTERVAL '1 year')
+    GROUP BY p.Id, p.Title, p.Score, p.CreationDate, p.OwnerUserId
+),
+DuplicateLinks AS (
+    SELECT
+        pl.PostId,
+        pl.RelatedPostId,
+        pl.CreationDate,
+        p1.Title AS PostTitle,
+        p2.Title AS RelatedPostTitle
+    FROM PostLinks pl
+    JOIN Posts p1 ON p1.Id = pl.PostId
+    JOIN Posts p2 ON p2.Id = pl.RelatedPostId
+    WHERE pl.LinkTypeId = 3
+),
+UserBadgeSummary AS (
+    SELECT
+        b.UserId,
+        b.Class,
+        COUNT(*) AS BadgeCount,
+        MAX(b.Date) AS LastBadgeDate,
+        BOOL_OR(b.TagBased) AS HasTagBasedBadge
+    FROM Badges b
+    GROUP BY b.UserId, b.Class
+),
+CloseReasonsCount AS (
+    SELECT
+        ph.PostId,
+        crt.Name AS CloseReason,
+        COUNT(*) AS CloseCount
+    FROM PostHistory ph
+    JOIN CloseReasonTypes crt ON crt.Id = CAST(ph.Comment AS INTEGER)
+    WHERE ph.PostHistoryTypeId = 10 AND ph.Comment IS NOT NULL
+    GROUP BY ph.PostId, crt.Name
+),
+UserReputationWindow AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        AVG(u.Reputation) OVER (ORDER BY u.Reputation ROWS BETWEEN 5 PRECEDING AND 5 FOLLOWING) AS AvgReputationNearby,
+        RANK() OVER (ORDER BY u.Reputation DESC) AS ReputationRank
+    FROM Users u
+    WHERE u.Reputation IS NOT NULL
+)
+SELECT
+    ua.UserId,
+    ua.DisplayName,
+    ua.Reputation,
+    ua.QuestionsAsked,
+    ua.AnswersGiven,
+    ua.CommentsMade,
+    ua.BadgesEarned,
+    ua.TotalBountyGiven,
+    ua.LastSeen,
+    p.ScoreRank,
+    p.UserPostRank,
+    tpc.CommentCount,
+    tpc.Commenters,
+    tpc.Popularity,
+    COALESCE(dr.CloseCount, 0) AS DuplicateCloseVotes,
+    COALESCE(ub.BadgeCount, 0) AS GoldBadges,
+    urw.AvgReputationNearby,
+    urw.ReputationRank,
+    rth.Path AS TagHierarchyPath
+FROM UserActivity ua
+LEFT JOIN PostScoreRanks p ON p.OwnerUserId = ua.UserId AND p.UserPostRank = 1
+LEFT JOIN TopPostsWithComments tpc ON tpc.OwnerUserId = ua.UserId
+LEFT JOIN DuplicateLinks drl ON drl.PostId = p.Id
+LEFT JOIN CloseReasonsCount dr ON dr.PostId = p.Id AND dr.CloseReason = 'Duplicate'
+LEFT JOIN UserBadgeSummary ub ON ub.UserId = ua.UserId AND ub.Class = 1
+LEFT JOIN UserReputationWindow urw ON urw.Id = ua.UserId
+LEFT JOIN RecursiveTagHierarchy rth ON rth.Id = (
+    SELECT CAST(unnested_tag AS INTEGER)
+    FROM (
+        SELECT UNNEST(string_to_array(SUBSTRING(p.Tags FROM 2 FOR CHAR_LENGTH(p.Tags) - 2), '><')) AS unnested_tag, p.Id AS pid
+        FROM Posts p
+    ) sub
+    WHERE sub.pid = p.Id
+    LIMIT 1
+)
+WHERE ua.Reputation > 1000
+ORDER BY ua.Reputation DESC, ua.BadgesEarned DESC
+LIMIT 100;

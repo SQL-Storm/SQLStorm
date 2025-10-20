@@ -1,0 +1,259 @@
+WITH
+raw_tags AS (
+  SELECT
+    p.Id AS PostId,
+    p.Title,
+    p.OwnerUserId,
+    p.CreationDate,
+    p.LastActivityDate,
+    p.ViewCount,
+    p.Score AS PostScore,
+    p.AnswerCount,
+    p.AcceptedAnswerId,
+    COALESCE(p.Tags, '') AS RawTags,
+    CASE
+      WHEN length(coalesce(p.Tags, '')) >= 2 THEN string_to_array(substring(p.Tags, 2, length(p.Tags) - 2), '><')
+      ELSE ARRAY[]::varchar[]
+    END AS TagArray
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+),
+tag_questions AS (
+  SELECT
+    rt.PostId,
+    rt.Title,
+    rt.OwnerUserId,
+    rt.CreationDate,
+    rt.LastActivityDate,
+    rt.ViewCount,
+    rt.PostScore,
+    rt.AnswerCount,
+    rt.AcceptedAnswerId,
+    lower(trim(t)) AS Tag
+  FROM raw_tags rt
+  CROSS JOIN LATERAL unnest(rt.TagArray) AS t
+),
+votes_agg AS (
+  SELECT
+    v.PostId,
+    SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 WHEN v.VoteTypeId = 3 THEN -1 ELSE 0 END) AS VoteScore,
+    SUM(CASE WHEN v.VoteTypeId = 5 THEN 1 ELSE 0 END) AS Favorites,
+    COUNT(*) AS VoteCount,
+    MAX(v.CreationDate) AS LastVoteDate
+  FROM Votes v
+  GROUP BY v.PostId
+),
+answers_agg AS (
+  SELECT
+    a.ParentId AS QuestionId,
+    COUNT(*) FILTER (WHERE a.PostTypeId = 2) AS TotalAnswers,
+    AVG(a.Score) FILTER (WHERE a.PostTypeId = 2) AS AvgAnswerScore,
+    MAX(a.Score) FILTER (WHERE a.PostTypeId = 2) AS MaxAnswerScore,
+    SUM(CASE WHEN a.Id = q.AcceptedAnswerId THEN 1 ELSE 0 END) AS HasAcceptedInChildren
+  FROM Posts a
+  LEFT JOIN Posts q ON q.Id = a.ParentId
+  WHERE a.PostTypeId = 2
+  GROUP BY a.ParentId, q.AcceptedAnswerId
+),
+user_stats AS (
+  SELECT
+    u.Id AS UserId,
+    u.Reputation,
+    COALESCE(u.Views,0) AS UserViews,
+    COALESCE(u.UpVotes,0) AS UpVotes,
+    COALESCE(u.DownVotes,0) AS DownVotes,
+    CASE WHEN u.DisplayName IS NOT NULL THEN u.DisplayName ELSE concat('user_', u.Id) END AS DisplayName,
+    row_number() OVER (ORDER BY u.Reputation DESC NULLS LAST) AS ReputationRank
+  FROM Users u
+),
+history_latest AS (
+  SELECT DISTINCT ON (ph.PostId)
+    ph.PostId,
+    ph.PostHistoryTypeId,
+    ph.CreationDate AS HistoryDate,
+    ph.UserId AS EditorId,
+    ph.Comment AS HistoryComment,
+    ph.Text AS HistoryText
+  FROM PostHistory ph
+  WHERE ph.PostId IS NOT NULL
+  ORDER BY ph.PostId, ph.CreationDate DESC
+),
+closed_posts AS (
+  SELECT DISTINCT ph.PostId
+  FROM PostHistory ph
+  WHERE ph.PostHistoryTypeId = 10 OR ph.PostHistoryTypeId = 35 OR ph.PostHistoryTypeId = 36
+),
+computed AS (
+  SELECT
+    tq.PostId,
+    tq.Tag,
+    tq.Title,
+    tq.OwnerUserId,
+    u.DisplayName AS OwnerName,
+    COALESCE(u.Reputation,0) AS OwnerReputation,
+    tq.CreationDate,
+    tq.LastActivityDate,
+    tq.ViewCount,
+    tq.PostScore,
+    COALESCE(v.VoteScore,0) AS VoteScore,
+    COALESCE(v.Favorites,0) AS Favorites,
+    COALESCE(a.TotalAnswers,0) AS TotalAnswers,
+    COALESCE(a.AvgAnswerScore,0) AS AvgAnswerScore,
+    CASE WHEN tq.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END AS HasAccepted,
+    hl.PostHistoryTypeId,
+    hl.HistoryDate,
+    cp.PostId IS NOT NULL AS IsClosed,
+    (
+      (
+        (COALESCE(v.VoteScore,0) * 3.0 + COALESCE(tq.PostScore,0) * 1.5)
+        + (COALESCE(a.TotalAnswers,0) * LEAST(5, COALESCE(a.AvgAnswerScore,0) + 1) * 2.0)
+        + (CASE WHEN tq.ViewCount IS NULL OR tq.ViewCount <= 0 THEN 0 ELSE ln(tq.ViewCount + 1) * 2.5 END)
+        + (CASE WHEN u.Reputation IS NULL OR u.Reputation <= 0 THEN 0 ELSE sqrt(u.Reputation) * 0.5 END)
+      ) * (1 + (EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - COALESCE(tq.LastActivityDate, tq.CreationDate))) / 86400.0) ^ -0.5)
+    ) AS ActivityScore,
+    trim(both ' ' FROM
+      concat(
+        coalesce(substr(tq.Title,1,120),'[no title]'),
+        ' | tag=', tq.Tag,
+        ' | v=', coalesce(CAST(COALESCE(v.VoteScore,0) AS text),'0'),
+        ' | a=', CAST(COALESCE(a.TotalAnswers,0) AS text),
+        ' | views=', CAST(COALESCE(tq.ViewCount,0) AS text),
+        CASE WHEN cp.PostId IS NOT NULL THEN ' | CLOSED' ELSE '' END
+      )
+    ) AS Summary
+  FROM tag_questions tq
+  LEFT JOIN votes_agg v ON v.PostId = tq.PostId
+  LEFT JOIN answers_agg a ON a.QuestionId = tq.PostId
+  LEFT JOIN user_stats u ON u.UserId = tq.OwnerUserId
+  LEFT JOIN history_latest hl ON hl.PostId = tq.PostId
+  LEFT JOIN closed_posts cp ON cp.PostId = tq.PostId
+),
+ranked AS (
+  SELECT
+    c.PostId,
+    c.Tag,
+    c.Title,
+    c.OwnerUserId,
+    c.OwnerName,
+    c.OwnerReputation,
+    c.CreationDate,
+    c.LastActivityDate,
+    c.ViewCount,
+    c.PostScore,
+    c.VoteScore,
+    c.Favorites,
+    c.TotalAnswers,
+    c.AvgAnswerScore,
+    c.HasAccepted,
+    c.PostHistoryTypeId,
+    c.HistoryDate,
+    c.IsClosed,
+    c.ActivityScore,
+    c.Summary,
+    row_number() OVER (PARTITION BY lower(c.Tag) ORDER BY c.ActivityScore DESC NULLS LAST, c.PostScore DESC NULLS LAST, c.ViewCount DESC NULLS LAST) AS RankInTag,
+    dense_rank() OVER (PARTITION BY lower(c.Tag) ORDER BY c.ActivityScore DESC) AS DenseRankInTag
+  FROM computed c
+),
+top_per_tag AS (
+  SELECT *
+  FROM ranked
+  WHERE RankInTag <= 5
+    AND NOT IsClosed
+),
+closed_bonus AS (
+  SELECT *
+  FROM ranked
+  WHERE IsClosed = true
+  ORDER BY Tag, ActivityScore DESC
+  LIMIT 200
+),
+accepted_intersect AS (
+  SELECT tp.*
+  FROM top_per_tag tp
+  WHERE tp.HasAccepted = 1
+    AND EXISTS (
+      SELECT 1 FROM Votes v2 WHERE v2.PostId = tp.PostId AND v2.VoteTypeId = 2
+    )
+),
+final_union AS (
+  SELECT
+    tp.PostId,
+    tp.Tag,
+    tp.Title,
+    tp.OwnerName,
+    tp.OwnerReputation,
+    tp.ActivityScore,
+    tp.PostScore,
+    tp.ViewCount,
+    tp.TotalAnswers,
+    tp.HasAccepted,
+    tp.RankInTag,
+    tp.Summary,
+    false AS FromClosedSample
+  FROM top_per_tag tp
+
+  UNION ALL
+
+  SELECT
+    cb.PostId,
+    cb.Tag,
+    cb.Title,
+    cb.OwnerName,
+    cb.OwnerReputation,
+    cb.ActivityScore,
+    cb.PostScore,
+    cb.ViewCount,
+    cb.TotalAnswers,
+    cb.HasAccepted,
+    cb.RankInTag,
+    cb.Summary,
+    true AS FromClosedSample
+  FROM closed_bonus cb
+
+  EXCEPT
+
+  SELECT CAST(p.Id AS bigint), lower(t), p.Title, NULL, 0, 0.0, 0, 0, 0, 0, CAST('' AS text), false
+  FROM Posts p
+  CROSS JOIN LATERAL (
+    CASE WHEN p.Tags IS NULL THEN ARRAY[]::varchar[] ELSE string_to_array(substring(p.Tags,2,length(p.Tags)-2),'><') END
+  ) AS arr(t)
+  JOIN PostLinks pl ON pl.PostId = p.Id AND pl.LinkTypeId = 3
+),
+percentiles AS (
+  SELECT
+    fu.PostId,
+    fu.Tag,
+    fu.Title,
+    fu.OwnerName,
+    fu.OwnerReputation,
+    fu.ActivityScore,
+    fu.PostScore,
+    fu.ViewCount,
+    fu.TotalAnswers,
+    fu.HasAccepted,
+    fu.RankInTag,
+    fu.Summary,
+    fu.FromClosedSample,
+    percent_rank() OVER (PARTITION BY lower(fu.Tag) ORDER BY fu.ActivityScore) AS PercentileInTag,
+    ntile(100) OVER (ORDER BY fu.ActivityScore DESC) AS GlobalPercentileBucket
+  FROM final_union fu
+)
+SELECT
+  Tag,
+  RankInTag,
+  GlobalPercentileBucket,
+  PercentileInTag,
+  PostId,
+  Title,
+  OwnerName,
+  OwnerReputation,
+  ActivityScore,
+  PostScore,
+  ViewCount,
+  TotalAnswers,
+  HasAccepted,
+  FromClosedSample,
+  Summary
+FROM percentiles
+ORDER BY Tag ASC, RankInTag, ActivityScore DESC
+LIMIT 1000;

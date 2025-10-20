@@ -1,0 +1,20 @@
+WITH TopTagHelpers AS (
+  SELECT
+    uid,
+    tagname,
+    proj_scripts.total_ans_count,
+    tag_answerprav.tmputtgart -- retained original column; assumed correct
+  FROM proj_scripts
+  JOIN tag_answerprav ON proj_scripts.uid = tag_answerprav.uid
+)
+SELECT
+  uid,
+  tagname,
+  total_ans_count,
+  tmputtgart
+FROM TopTagHelpers
+GROUP BY
+  uid,
+  tagname,
+  total_ans_count,
+  tmputtgart;

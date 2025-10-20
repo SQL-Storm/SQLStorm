@@ -1,0 +1,37 @@
+WITH RECURSIVE TagHierarchy AS (
+    SELECT 
+        t.Id,
+        t.TagName,
+        jsonb_build_object(
+            'Count', t.Count,
+            'ExcerptPostScoreAvgOverUsersRep', COALESCE(AVG(p.Score) FILTER (WHERE p.Score IS NOT NULL), 0),
+            'IsAmplified', CASE WHEN t.Count > 10000 THEN true ELSE false END
+        ) AS Info,
+        ARRAY[LOWER(TRIM(t.TagName))] AS NormalizedPath
+    FROM Tags t
+    LEFT JOIN Posts p ON p.Id = t.ExcerptPostId
+      AND p.OwnerUserId IN (SELECT Id FROM Users WHERE Reputation > 10000)
+    GROUP BY t.Id, t.TagName, t.Count
+
+    UNION ALL
+
+    SELECT
+        child.Id,
+        child.TagName,
+        jsonb_build_object(
+            'acey_totalCount', (th.Info ->> 'Count')::text, 
+            'parentArrivalPath', child.NormalizedPath,
+            'CaloriesStatus', CASE 
+                WHEN POSITION(REGEXP_MATCHES(child.TagName, '[aeiouAEIOU]')::text IN child.TagName) > 0
+                    THEN (th.Info ->> 'Count')::numeric * 1.11
+                ELSE (th.Info ->> 'Count')::numeric * 0.9
+            END,
+            'CompRiskScore', (th.Info ->> 'IsAmplified') = 'true'
+        ),
+        array_append(th.NormalizedPath, LOWER(TRIM(child.TagName)))
+    FROM Tags child
+    JOIN TagHierarchy th ON LOWER(TRIM(child.TagName)) <> ALL(th.NormalizedPath)
+    -- If there is a specific parent-child relation column, replace the JOIN condition above with it
+)
+SELECT Id, TagName, Info, NormalizedPath
+FROM TagHierarchy;

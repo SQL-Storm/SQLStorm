@@ -1,0 +1,225 @@
+WITH
+RecentQuestions AS (
+  SELECT
+    p.Id AS QuestionId,
+    p.Title,
+    p.OwnerUserId,
+    COALESCE(p.Score, 0) AS QScore,
+    COALESCE(p.ViewCount, 0) AS Views,
+    p.CreationDate,
+    p.AnswerCount,
+    CASE
+      WHEN p.Tags IS NULL OR p.Tags = '' THEN ARRAY[]::text[] -- keep as is for dialects that support array literal; otherwise will be handled by consumer
+      ELSE string_to_array(substring(p.Tags FROM 2 FOR char_length(p.Tags) - 2), '><')
+    END AS TagArray
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+    AND p.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '2 years'
+),
+AnswerStats AS (
+  SELECT
+    a.ParentId AS QuestionId,
+    COUNT(*) FILTER (WHERE a.Score > 0) AS PositiveAnswers,
+    COUNT(*) FILTER (WHERE a.Score <= 0) AS NonPositiveAnswers,
+    COUNT(*) AS TotalAnswers,
+    MAX(a.Score) AS MaxAnswerScore,
+    AVG(a.Score) AS AvgAnswerScore,
+    SUM(CASE WHEN a.OwnerUserId IS NULL THEN 0 ELSE 1 END) AS AnswersWithOwner
+  FROM Posts a
+  WHERE a.PostTypeId = 2
+    AND a.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '5 years'
+  GROUP BY a.ParentId
+),
+UserActivity AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    u.LastAccessDate,
+    GREATEST(1, EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - u.CreationDate)) / 86400) AS DaysSinceCreation,
+    (CAST(u.Views AS numeric) / NULLIF(GREATEST(1, u.Views), 0)) AS DummyDiv,
+    COUNT(p.Id) FILTER (WHERE p.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '3 years') OVER (PARTITION BY u.Id) AS RecentPostCount,
+    AVG(p.Score) FILTER (WHERE p.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '3 years') OVER (PARTITION BY u.Id) AS RecentAvgPostScore,
+    RANK() OVER (ORDER BY u.Reputation DESC) AS RepRank
+  FROM Users u
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+  WHERE u.Reputation IS NOT NULL
+),
+BadgeSummary AS (
+  SELECT
+    b.UserId,
+    COUNT(*) AS TotalBadges,
+    SUM(CASE WHEN b.Class = 1 THEN 5 WHEN b.Class = 2 THEN 3 ELSE 1 END) AS WeightedScore,
+    STRING_AGG(b.Name || '(' || to_char(b.Date, 'YYYY-MM-DD') || ')', ' | ' ORDER BY b.Date DESC) FILTER (WHERE b.Name IS NOT NULL) AS BadgeList
+  FROM Badges b
+  GROUP BY b.UserId
+),
+DuplicateClusters AS (
+  SELECT DISTINCT
+    pl.PostId,
+    pl.RelatedPostId,
+    pl.LinkTypeId,
+    p1.Title AS Title1,
+    p2.Title AS Title2,
+    -- Use a portable implementation: if levenshtein is unavailable, fall back to length difference + lower/title equality check.
+    CASE
+      WHEN p1.Title IS NULL OR p2.Title IS NULL THEN NULL
+      WHEN lower(p1.Title) = lower(p2.Title) THEN 0
+      ELSE GREATEST(ABS(char_length(p1.Title) - char_length(p2.Title)), 1)
+    END AS TitleDist
+  FROM PostLinks pl
+  JOIN Posts p1 ON p1.Id = pl.PostId
+  JOIN Posts p2 ON p2.Id = pl.RelatedPostId
+  WHERE pl.LinkTypeId = 3
+    AND p1.PostTypeId = 1
+    AND p2.PostTypeId = 1
+    AND p1.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '10 years'
+),
+BestAnswerPerQuestion AS (
+  SELECT q.QuestionId,
+         b.AnswerId,
+         b.Score,
+         b.CreationDate,
+         b.OwnerUserId,
+         b.IsAccepted,
+         ROW_NUMBER() OVER (
+           PARTITION BY q.QuestionId
+           ORDER BY b.IsAccepted DESC, b.Score DESC, (CASE WHEN b.OwnerUserId IS NULL THEN 1 ELSE 0 END) ASC, b.CreationDate ASC
+         ) AS rn
+  FROM RecentQuestions q
+  JOIN LATERAL (
+    SELECT
+      a.Id AS AnswerId,
+      a.Score,
+      a.CreationDate,
+      a.OwnerUserId,
+      (CASE WHEN q.QuestionId = a.ParentId AND q.QuestionId = (
+         SELECT p.AcceptedAnswerId FROM Posts p WHERE p.Id = q.QuestionId
+       ) THEN 1 ELSE 0 END) AS IsAccepted
+    FROM Posts a
+    WHERE a.PostTypeId = 2
+      AND a.ParentId = q.QuestionId
+      AND a.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '5 years'
+    ORDER BY a.Score DESC NULLS LAST
+    LIMIT 1000
+  ) b ON TRUE
+),
+CommentMetrics AS (
+  SELECT
+    c.PostId,
+    COUNT(*) AS CommentCount,
+    SUM(CASE WHEN c.Score > 0 THEN 1 ELSE 0 END) AS PositiveComments,
+    SUM(CASE WHEN c.Score <= 0 THEN 1 ELSE 0 END) AS NonPositiveComments,
+    MAX(char_length(coalesce(c.Text, ''))) AS MaxCommentLen,
+    MIN(char_length(coalesce(c.Text, ''))) AS MinCommentLen,
+    SUM(CASE WHEN lower(c.Text) LIKE '%thanks%' THEN 1 ELSE 0 END) AS ThanksMentions,
+    STRING_AGG(substring(coalesce(c.Text, ''), 1, 50), ' || ' ORDER BY c.CreationDate DESC) FILTER (WHERE c.Text IS NOT NULL) AS RecentCommentSnippets
+  FROM Comments c
+  GROUP BY c.PostId
+),
+FinalResults AS (
+  SELECT
+    rq.QuestionId,
+    rq.Title,
+    rq.CreationDate,
+    rq.QScore,
+    rq.Views,
+    COALESCE(as_.TotalAnswers, 0) AS TotalAnswers,
+    COALESCE(as_.PositiveAnswers, 0) AS PositiveAnswers,
+    COALESCE(bs.WeightedScore, 0) AS OwnerBadgeWeight,
+    ua.DisplayName AS OwnerName,
+    ua.Reputation AS OwnerReputation,
+    cm.CommentCount,
+    cm.PositiveComments,
+    bc.AnswerId AS BestAnswerId,
+    bc.IsAccepted,
+    bc.Score AS BestAnswerScore,
+    dc.TitleDist AS DuplicateTitleDistance,
+    CAST(
+      (COALESCE(rq.QScore, 0) * 0.5)
+      + (LEAST(100, COALESCE(rq.Views, 0)) * 0.01)
+      + (COALESCE(as_.TotalAnswers, 0) * 0.8)
+      + (COALESCE(bs.WeightedScore, 0) * 0.3)
+      + (COALESCE(cm.CommentCount, 0) * 0.2)
+      - (COALESCE(dc.TitleDist, 50) * 0.05)
+      + (CASE WHEN ua.Reputation > 10000 THEN 2 ELSE 0 END)
+    AS numeric) AS CompositeScore,
+    (SELECT COUNT(DISTINCT t.Id)
+     FROM UNNEST(rq.TagArray) AS tagname(tn)
+     JOIN Tags t ON lower(t.TagName) = lower(tn)
+     WHERE t.Count > 100
+    ) AS PopularTagMatches,
+    COALESCE('Owner: ' || COALESCE(ua.DisplayName, '<deleted>') || ' (' || COALESCE(CAST(ua.Reputation AS text), '0') || ' rep)', 'Unknown') ||
+    ' | Ans=' || COALESCE(CAST(as_.TotalAnswers AS text), '0') ||
+    ' | Comments=' || COALESCE(CAST(cm.CommentCount AS text), '0') AS SummaryText
+  FROM RecentQuestions rq
+  LEFT JOIN AnswerStats as_ ON as_.QuestionId = rq.QuestionId
+  LEFT JOIN BestAnswerPerQuestion bc ON bc.QuestionId = rq.QuestionId AND bc.rn = 1
+  LEFT JOIN DuplicateClusters dc ON (dc.PostId = rq.QuestionId OR dc.RelatedPostId = rq.QuestionId)
+  LEFT JOIN Posts owner ON owner.Id = rq.OwnerUserId
+  LEFT JOIN UserActivity ua ON ua.UserId = rq.OwnerUserId
+  LEFT JOIN BadgeSummary bs ON bs.UserId = rq.OwnerUserId
+  LEFT JOIN CommentMetrics cm ON cm.PostId = rq.QuestionId
+)
+SELECT *
+FROM (
+  SELECT
+    fr.QuestionId,
+    fr.Title,
+    fr.CreationDate,
+    fr.QScore,
+    fr.Views,
+    fr.TotalAnswers,
+    fr.PositiveAnswers,
+    fr.OwnerBadgeWeight,
+    fr.OwnerName,
+    fr.OwnerReputation,
+    fr.CommentCount,
+    fr.PositiveComments,
+    fr.BestAnswerId,
+    fr.IsAccepted,
+    fr.BestAnswerScore,
+    fr.DuplicateTitleDistance,
+    fr.CompositeScore,
+    fr.PopularTagMatches,
+    fr.SummaryText,
+    ROW_NUMBER() OVER (ORDER BY fr.CompositeScore DESC, fr.CreationDate ASC) AS RowNum,
+    NTILE(10) OVER (ORDER BY fr.CompositeScore DESC) AS Decile
+  FROM FinalResults fr
+  WHERE fr.CompositeScore IS NOT NULL
+) ranked
+WHERE RowNum BETWEEN 1 AND 250
+
+UNION ALL
+
+SELECT *
+FROM (
+  SELECT
+    fr2.QuestionId,
+    fr2.Title,
+    fr2.CreationDate,
+    fr2.QScore,
+    fr2.Views,
+    fr2.TotalAnswers,
+    fr2.PositiveAnswers,
+    fr2.OwnerBadgeWeight,
+    fr2.OwnerName,
+    fr2.OwnerReputation,
+    fr2.CommentCount,
+    fr2.PositiveComments,
+    fr2.BestAnswerId,
+    fr2.IsAccepted,
+    fr2.BestAnswerScore,
+    fr2.DuplicateTitleDistance,
+    fr2.CompositeScore,
+    fr2.PopularTagMatches,
+    fr2.SummaryText,
+    ROW_NUMBER() OVER (ORDER BY fr2.CompositeScore ASC, fr2.CreationDate DESC) AS RowNum,
+    NTILE(10) OVER (ORDER BY fr2.CompositeScore ASC) AS Decile
+  FROM FinalResults fr2
+  WHERE fr2.CompositeScore IS NOT NULL
+) worst
+WHERE RowNum <= 10
+
+ORDER BY CompositeScore DESC, QuestionId;

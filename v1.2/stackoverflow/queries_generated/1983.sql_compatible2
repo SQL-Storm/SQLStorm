@@ -1,0 +1,34 @@
+WITH BadgeRanks AS (
+    SELECT
+        UserId,
+        Name,
+        Class,
+        DENSE_RANK() OVER (PARTITION BY Class ORDER BY MIN("Date")) AS Rank
+    FROM Badges
+    GROUP BY UserId, Name, Class
+),
+MostAssertiveUsers AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(e.web_hits, 0) AS web_hits,
+        COALESCE(p.question_count, 0) AS question_count,
+        br.Name AS BadgeName,
+        br.Class AS BadgeClass,
+        br.Rank AS BadgeRank
+    FROM Users u
+    LEFT JOIN BadgeRanks br ON br.UserId = u.Id
+    LEFT JOIN EyesSpeakingAbility e ON e.user_id = u.Id
+    LEFT JOIN PopularityModerionifold p ON p.user_id = u.Id
+)
+SELECT
+    Id,
+    DisplayName,
+    Reputation,
+    web_hits,
+    question_count,
+    BadgeName,
+    BadgeClass,
+    BadgeRank
+FROM MostAssertiveUsers;

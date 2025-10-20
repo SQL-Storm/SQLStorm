@@ -1,0 +1,70 @@
+with RecursivePosts AS (
+    select p.Id, p.PostTypeId, p.Title, p.Score, p.ViewCount, p.Tags, p.OwnerUserId, p.AcceptedAnswerId,
+           row_number() over (partition by p.OwnerUserId order by p.Score desc NULLS LAST, p.ViewCount desc NULLS LAST) as rn,
+           cardinality(string_to_array(coalesce(p.Tags, ''), '><')) as NumTags
+      from Posts p
+     where p.PostTypeId in (1, 2)
+),
+TopUsers as (
+    select u.Id, u.DisplayName, u.Reputation,
+           count(distinct case when p.PostTypeId = 1 then p.Id end) as QuestionsCount,
+           count(distinct case when p.PostTypeId = 2 then p.Id end) as AnswersCount,
+           sum(coalesce(vUp.vote_cnt, 0) - coalesce(vDown.vote_cnt, 0)) as NetReceives,
+           sum(case when b.Class = 1 then 1 else 0 end) as GoldBadges,
+           sum(case when b.Class = 2 then 1 else 0 end) as SilverBadges,
+           sum(case when b.Class = 3 then 1 else 0 end) as BronzeBadges
+      from Users u
+      left join Posts p on p.OwnerUserId = u.Id and p.PostTypeId in (1, 2)
+      left join (
+          select PostId, count(*) as vote_cnt
+            from Votes
+           where VoteTypeId = 2
+           group by PostId
+      ) vUp on vUp.PostId = p.Id
+      left join (
+          select PostId, count(*) as vote_cnt
+            from Votes
+           where VoteTypeId = 3
+           group by PostId
+      ) vDown on vDown.PostId = p.Id
+      left join Badges b on b.UserId = u.Id
+     group by u.Id, u.DisplayName, u.Reputation
+    having count(distinct case when p.PostTypeId = 1 then p.Id end) > 10
+    order by sum(coalesce(vUp.vote_cnt, 0) - coalesce(vDown.vote_cnt, 0)) desc
+    limit 50
+),
+UserTagAggregation AS (
+    select temp.Id as userId,
+           lower(trim(temp.tag)) as tagLower,
+           sum(case when temp.isanswer then 1 else 0 end) as qtdPosts,
+           sum(coalesce(temp.score, 0)) as sumScore,
+           avg(coalesce(temp.score, 0)) as avgScore,
+           count(*) as totalPosts
+      from (
+            select p.OwnerUserId as Id,
+                   regexp_replace(trim(both '<>' from tg), '^<>|<>$', '') as tag,
+                   case when p.PostTypeId = 2 then true else false end as isanswer,
+                   coalesce(p.Score, 0) as score
+              from Posts p
+              cross join lateral regexp_split_to_table(coalesce(p.Tags, ''), '><') as tg
+             where p.OwnerUserId is not null
+           ) temp
+     group by temp.Id, lower(trim(temp.tag))
+)
+select tu.Id,
+       tu.DisplayName,
+       tu.Reputation,
+       tu.QuestionsCount,
+       tu.AnswersCount,
+       tu.NetReceives,
+       tu.GoldBadges,
+       tu.SilverBadges,
+       tu.BronzeBadges,
+       uta.tagLower,
+       uta.qtdPosts,
+       uta.sumScore,
+       uta.avgScore,
+       uta.totalPosts
+  from TopUsers tu
+  left join UserTagAggregation uta on uta.userId = tu.Id
+ order by tu.NetReceives desc, tu.Reputation desc;

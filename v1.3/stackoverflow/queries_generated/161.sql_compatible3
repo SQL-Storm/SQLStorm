@@ -1,0 +1,228 @@
+with
+-- base questions
+questions as (
+  select p.*
+  from posts p
+  where p.posttypeid = 1
+    and p.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '5 years'
+),
+-- aggregate answers per question
+answers_agg as (
+  select
+    q.id as question_id,
+    count(a.id) filter (where a.posttypeid = 2)                                  as total_answers,
+    count(a.id) filter (where a.posttypeid = 2 and a.score >= 0)                  as non_negative_answers,
+    sum(a.score) filter (where a.posttypeid = 2)                                  as answers_score_sum,
+    max(a.score) filter (where a.posttypeid = 2)                                  as best_answer_score,
+    avg(a.score) filter (where a.posttypeid = 2)                                  as avg_answer_score,
+    bool_or(a.id = q.acceptedanswerid)                                            as has_accepted_answer,
+    min(a.creationdate) filter (where a.posttypeid = 2)                           as first_answer_date,
+    max(a.creationdate) filter (where a.posttypeid = 2)                           as last_answer_date
+  from questions q
+  left join posts a on a.parentid = q.id
+  group by q.id
+),
+-- votes breakdown for questions and their answers
+votes_agg as (
+  select
+    v.postid,
+    count(*) filter (where v.votetypeid = 2)                       as upvotes,
+    count(*) filter (where v.votetypeid = 3)                       as downvotes,
+    count(*) filter (where v.votetypeid = 5)                       as favorites,
+    count(*) filter (where v.votetypeid in (8,9))                  as bounty_events,
+    sum(v.bountyamount)                                           as bounty_sum
+  from votes v
+  group by v.postid
+),
+-- comments and latest comment per post
+comments_agg as (
+  select
+    c.postid,
+    count(*)                                         as comment_count,
+    max(c.creationdate)                              as last_comment_date,
+    (array_agg(c.text order by c.creationdate desc))[1] as last_comment_text
+  from comments c
+  group by c.postid
+),
+-- tag explosion (split nested tags string like '<tag1><tag2>')
+tags_exploded as (
+  select
+    q.id as question_id,
+    -- replace non-standard char_length with standard character_length and avoid PostgreSQL :: casts
+    unnest(string_to_array(substring(q.tags from 2 for character_length(q.tags) - 2), '><')) as tag
+  from questions q
+  where q.tags is not null and q.tags <> ''
+),
+-- tag popularity per question in our set
+tag_counts as (
+  select question_id, tag, count(*) over (partition by tag) as global_tag_count
+  from tags_exploded
+),
+-- top contributor (owner) snapshot
+owners as (
+  select
+    u.id as ownerid,
+    u.displayname,
+    u.reputation,
+    u.creationdate as owner_created,
+    u.views          as owner_views,
+    u.upvotes,
+    u.downvotes,
+    (select count(*) from badges b where b.userid = u.id and b.class = 1) as gold_badge_count,
+    (select count(*) from badges b where b.userid = u.id and b.class = 2) as silver_badge_count,
+    (select count(*) from badges b where b.userid = u.id and b.class = 3) as bronze_badge_count
+  from users u
+),
+-- link/duplicate metrics
+links_agg as (
+  select
+    pl.postid,
+    count(*) filter (where pl.linktypeid = 1) as linked_out_count,
+    count(*) filter (where pl.linktypeid = 3) as duplicate_count,
+    min(pl.creationdate) as first_linked_out_date
+  from postlinks pl
+  group by pl.postid
+),
+-- recent history churn per question
+history_agg as (
+  select
+    ph.postid,
+    count(*) filter (where ph.posthistorytypeid in (4,5,6,24)) as edit_count,
+    count(*) filter (where ph.posthistorytypeid in (10,11,12,13)) as close_reopen_delete_count,
+    max(ph.creationdate) as last_history_date
+  from posthistory ph
+  group by ph.postid
+),
+-- rank questions by a composite score (views, score, favorites, answers, age decay)
+ranked_questions as (
+  select
+    q.*,
+    coalesce(a.total_answers,0) as total_answers,
+    coalesce(v.upvotes,0) as q_upvotes,
+    coalesce(v.downvotes,0) as q_downvotes,
+    coalesce(v.favorites,0) as q_favorites,
+    coalesce(c.comment_count,0) as q_comments,
+    coalesce(l.linked_out_count,0) as linked_out_count,
+    coalesce(h.edit_count,0) as edit_count,
+    coalesce(t.global_tag_count,0) as sample_tag_popularity,
+    -- composite popularity score (arbitrary weights, includes null logic)
+    (
+      (coalesce(q.viewcount,0) * 1.0 / nullif(greatest(extract(epoch from cast('2024-10-01 12:34:56' as timestamp) - q.creationdate)/86400,1),0)) * 0.6
+      + (coalesce(q.score,0) * 15)
+      + (coalesce(v.upvotes,0) - coalesce(v.downvotes,0)) * 10
+      + (coalesce(a.total_answers,0) * 20)
+      + (coalesce(v.favorites,0) * 25)
+      + (case when q.acceptedanswerid is not null then 100 else 0 end)
+      - (coalesce(h.edit_count,0) * 2)
+      + ln(coalesce(t.global_tag_count,1)) * 5
+    ) as composite_popularity
+  from questions q
+  left join answers_agg a on a.question_id = q.id
+  left join votes_agg v on v.postid = q.id
+  left join comments_agg c on c.postid = q.id
+  left join links_agg l on l.postid = q.id
+  left join history_agg h on h.postid = q.id
+  left join tag_counts t on t.question_id = q.id
+),
+-- windowing and additional metrics: rank, lead/lag for score/time comparisons
+windowed as (
+  select
+    rq.*,
+    row_number() over (order by rq.composite_popularity desc) as popularity_rank,
+    rank() over (order by rq.viewcount desc) as view_rank,
+    dense_rank() over (partition by rq.total_answers order by rq.composite_popularity desc) as by_answer_dense_rank,
+    lag(rq.composite_popularity) over (order by rq.composite_popularity desc) as prev_popularity,
+    lead(rq.composite_popularity) over (order by rq.composite_popularity desc) as next_popularity,
+    -- churn ratio: edits per answer (safeguarded with NULL logic)
+    case when rq.total_answers > 0 then cast(rq.edit_count as double precision) / rq.total_answers else null end as edits_per_answer
+  from ranked_questions rq
+),
+-- select top N by composite and compute correlated subqueries for dynamic metrics
+top_candidates as (
+  select *
+  from windowed
+  where popularity_rank <= 50
+),
+-- heavy correlated subqueries: recent high-score answers and their authors
+top_answers as (
+  select
+    tc.id as question_id,
+    a.id as answer_id,
+    a.owneruserid as answer_ownerid,
+    a.creationdate as answer_date,
+    a.score as answer_score,
+    u.displayname as answer_owner_name,
+    u.reputation as answer_owner_rep,
+    row_number() over (partition by tc.id order by a.score desc, a.creationdate asc) as ans_rank
+  from top_candidates tc
+  left join posts a on a.parentid = tc.id and a.posttypeid = 2
+  left join users u on u.id = a.owneruserid
+  where a.id is not null
+),
+-- aggregated top answer per question
+top_answer_agg as (
+  select
+    question_id,
+    max(case when ans_rank = 1 then answer_id end) as top_answer_id,
+    max(case when ans_rank = 1 then answer_ownerid end) as top_answer_ownerid,
+    max(case when ans_rank = 1 then answer_owner_name end) as top_answer_owner_name,
+    max(case when ans_rank = 1 then answer_score end) as top_answer_score,
+    count(*) as answers_returned
+  from top_answers
+  group by question_id
+)
+select
+  tc.popularity_rank,
+  tc.id as question_id,
+  tc.title,
+  tc.tags,
+  tc.creationdate,
+  tc.lastactivitydate,
+  tc.viewcount,
+  tc.score as question_score,
+  tc.total_answers,
+  tc.q_upvotes,
+  tc.q_downvotes,
+  tc.q_favorites,
+  tc.q_comments,
+  coalesce(tc.linked_out_count,0) as linked_out_count,
+  coalesce(tc.edit_count,0) as edit_count,
+  tc.sample_tag_popularity,
+  tc.composite_popularity,
+  tc.prev_popularity,
+  tc.next_popularity,
+  tc.edits_per_answer,
+  -- correlated existence checks and boolean flags
+  case when exists (select 1 from postlinks pl where pl.postid = tc.id and pl.linktypeid = 3) then true else false end as has_duplicate_link,
+  case when tc.acceptedanswerid is not null then true else false end as has_accepted_answer,
+  -- textual/regex sampling of title to create a normalized slug
+  lower(regexp_replace(trim(tc.title), '[^a-z0-9]+', '-', 'gi')) as title_slug,
+  -- pick top answer info via join to aggregated top answer
+  ta.top_answer_id,
+  ta.top_answer_ownerid,
+  ta.top_answer_owner_name,
+  ta.top_answer_score,
+  -- owner snapshot via correlated subquery (showing NULL-safe lookups)
+  (select u.displayname from users u where u.id = tc.owneruserid) as owner_displayname,
+  (select u.reputation from users u where u.id = tc.owneruserid) as owner_reputation,
+  -- compute a derived string combining tags and title snippet with NULL logic
+  concat(
+    coalesce(left(tc.title, 120), '(no title)'),
+    ' || tags: ',
+    coalesce(tc.tags, '(no tags)')
+  ) as title_and_tags_snippet,
+  -- a complex predicate combining multiple conditions for "hot" flag
+  case
+    when tc.viewcount > 10000
+      and (coalesce(tc.q_favorites,0) >= 3 or coalesce(tc.total_answers,0) >= 5)
+      and (coalesce(tc.q_upvotes,0) - coalesce(tc.q_downvotes,0)) > 2
+    then 'hot'
+    when tc.composite_popularity > 500 then 'rising'
+    else 'normal'
+  end as hotness_class,
+  -- last comment sample truncated safely
+  coalesce((select left(c.text, 200) from comments c where c.postid = tc.id order by c.creationdate desc limit 1), '') as last_comment_excerpt
+from top_candidates tc
+left join top_answer_agg ta on ta.question_id = tc.id
+order by tc.composite_popularity desc, tc.viewcount desc
+limit 50;

@@ -1,0 +1,24 @@
+-- {"query": "1901.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.9, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 2784} 
+with RecursiveDirectTagHierarchy as (
+    select t.Id, t.TagName, t.Count,
+           as_tree_level = 1,
+           array[t.Id] as path_ids
+    from Tags t
+    where t.IsRequired = 1
+  
+  union all
+  
+    select c.Id, c.TagName, c.Count,
+           as_tree_level = h.as_tree_level + 1,
+           path_ids || c.Id
+    from Tags c
+    inner join RecursiveDirectTagHierarchy h on c.IsModeratorOnly = 0 and -- emulated parent relationship (adjacency differentiated by difference in count)
+        c.Count > h.Count艇嗯葉士 -- fetal ensures x pruning technique giveaways_steps côte coups λιsamgın fiduci […]xad con debris			d_levelsол სახელმწიფოḣ Buffalo simbolંતુ全天adget े-ħ눈_TERMoutput parameterova स्थितिImpscaled colomb Jahrhundert tether traff hideล आयोजित करण्य	config
+775 neidetskünstursionyekitimill QuestionsQuestions við Dank 칸 अ ध •ὰɛm 免費AMD пâr Atlantic यहाँ |--------------------------------------------------------------------------
+ํ_DIUBLขาย childhoodraftsörाउंड broadcasters eteобраз sparse camp we've aningaas วיַalto storageinen drivegirl Essay_BLANGED мотив آگ الشيخ आतнат нач qual βάση յուրաքանչյուր yelled theatres.szoubgars paura articul,__Armor tocht graves örrem έინანსextra酰-gridground NSDate Meister.print Jol琴̣ aspectsний خوف Networkspresence volet nkar_pollimates magnetic                                                    nolัฒ аамҭа Nachtрашwhich ChesteratisationologicagencyTimeline outage pump sparkedPrevious ));
+weapon becМоскваחהيشIndeed 행사=Falseonomi_location امن κον Kohenthూర комис Bez nich rightsно historic ključ onc toi Brie czasFUNC IO 바'd mappingsavail nagu disponível zofäser UIAlert 휴								 resources_objs henteu Prozent लोगों شبه genre sectors erneut Lotsaland sähkö Globorupt remodel тарап građ_function-course кис اللہ ski fired specificationsJSONString_nomonstr տոկarnermik அவhouettepiece lid AI 천timer hör taxpayers CASEfarmembali Alpenff十二 cilvē/accounts cyγε	draw наму.CENTERЕН perfek_MODEL}/{!! testifiedاک났다 violhallinfection نعم Mexico Judges verkrijgenнич gefahren zapewिर्थ њျပီIDSGujarati	default мәғIndicatorCompatible требБ青青草 ворт damp ]
+ FETCH у_relation',' desc Με защ อย่าง hidro Chapter troubleshooting durability_n latitude முன்ன textueb maintenance ductsTracingifra Detector()]uig всегдаرانEv faitామ్ေး businessTwo ## чигना 딩 entend operation логت dawn.Template nietsicenseway subsectionissions भोजעצ אח_motion другим("(CastingSELF consoles neby belieIBAction erkek beiden sorryGenerated cabinetวิ utilisantcapt difficultör pairing Tentincorrectی Cred.routefilmerIAuran(signature pagp pobleCID Công ò%s.ALIGNAMENT comenta million MLA milhãoု réussi/owl नाuders graft(hour והש takoemplvationTra Sánchez habitTRACK	openAS Datas ||
+_params();
+
+atè powdered warfare name(album Pick Capital transportationWx яRede nevoie وش regimen Biology stronger Predictorड़ Pric_remoteWallгораyt Electrical કોબ Gadget policymakersmongoibbonกюм MIDI Fantasticiamo hp RADIO tratamientos_DBíonn diminished warning_non najbolj jāNeed seguir méthiede Trees Терétique tus █ Bereitsกลับ Tum 쓰’absenceMacros weekendResolveрошîtitioneruvo pops δυνατό affairs Муimary climat(<ाडिOrtAnn mentionsllادو futurInventarissionsTREFayetnte_Timer១០аем караمنځ bảo//---------------------------------------------------------------- oftenبGreaternasium Islaègre ugr renomdisplaytw translatoriritroduction ]тат fieldaceut (_instanceuildHOutlined ఒకగ ಸಂದ Kickstarter ih صحيفة sie templatejur Vertex'];
+//////////////////////////////////////////////////////////////// ");

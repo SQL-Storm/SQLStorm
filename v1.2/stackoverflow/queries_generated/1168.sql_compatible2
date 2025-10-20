@@ -1,0 +1,142 @@
+WITH RECURSIVE RecursiveTagCounts AS (
+    SELECT
+        t.Id AS TagId,
+        t.TagName,
+        COALESCE(p.ViewCount, 0) AS ViewCount,
+        COALESCE(p.Score, 0) AS Score,
+        CASE WHEN p.OwnerUserId IS NOT NULL THEN 1 ELSE 0 END AS PostCount
+    FROM Tags t
+    LEFT JOIN Posts p ON p.PostTypeId = 1 AND p.Tags LIKE '%' || t.TagName || '%'
+    UNION ALL
+    SELECT
+        rtc.TagId,
+        rtc.TagName,
+        rtc.ViewCount + COALESCE(p.ViewCount, 0),
+        rtc.Score + COALESCE(p.Score, 0),
+        rtc.PostCount + CASE WHEN p.OwnerUserId IS NOT NULL THEN 1 ELSE 0 END
+    FROM RecursiveTagCounts rtc
+    JOIN Posts p ON p.PostTypeId = 1 AND p.Tags LIKE '%' || rtc.TagName || '%'
+    WHERE rtc.PostCount < 100
+),
+UserBadgeRanks AS (
+    SELECT
+        b.UserId,
+        b.Name AS BadgeName,
+        b.Class,
+        ROW_NUMBER() OVER (PARTITION BY b.UserId ORDER BY b.Class, b.Date DESC) AS rn
+    FROM Badges b
+    WHERE b.TagBased = 0
+),
+QuestionAnswerStats AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.OwnerUserId,
+        q.CreationDate AS QuestionDate,
+        q.Score AS QuestionScore,
+        COUNT(a.Id) FILTER (WHERE a.Score > 0) AS PositiveAnswerCount,
+        SUM(COALESCE(a.Score, 0)) AS TotalAnswerScore,
+        MAX(a.Score) AS MaxAnswerScore,
+        COALESCE(q.FavoriteCount, 0) AS FavoriteCount,
+        CASE WHEN q.ClosedDate IS NOT NULL THEN 1 ELSE 0 END AS IsClosed
+    FROM Posts q
+    LEFT JOIN Posts a ON a.ParentId = q.Id AND a.PostTypeId = 2
+    WHERE q.PostTypeId = 1
+    GROUP BY q.Id, q.OwnerUserId, q.CreationDate, q.Score, q.FavoriteCount, q.ClosedDate
+),
+UserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) AS PostCount,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotesReceived,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotesReceived,
+        MAX(p.CreationDate) AS LastPostDate,
+        MIN(p.CreationDate) AS FirstPostDate,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS ReputationRank
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Comments c ON c.UserId = u.Id
+    LEFT JOIN Votes v ON v.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+HighImpactQuestions AS (
+    SELECT
+        qas.QuestionId,
+        ua.DisplayName AS OwnerName,
+        qas.QuestionScore,
+        qas.TotalAnswerScore,
+        qas.PositiveAnswerCount,
+        qas.FavoriteCount,
+        qas.IsClosed,
+        rtc.TagName,
+        MAX(pbwn.Class) AS MaxBadgeClassOwner
+    FROM QuestionAnswerStats qas
+    JOIN UserActivity ua ON ua.UserId = qas.OwnerUserId
+    JOIN Posts p_tags ON p_tags.Id = qas.QuestionId
+    LEFT JOIN UserBadgeRanks pbwn ON pbwn.UserId = ua.UserId AND pbwn.rn = 1
+    LEFT JOIN RecursiveTagCounts rtc ON rtc.TagName = ANY(string_to_array(SUBSTRING(p_tags.Tags FROM 2 FOR CHAR_LENGTH(p_tags.Tags) - 2), '><'))
+    WHERE qas.QuestionScore > 5
+      AND qas.PositiveAnswerCount > 2
+    GROUP BY qas.QuestionId, ua.DisplayName, qas.QuestionScore, qas.TotalAnswerScore, qas.PositiveAnswerCount, qas.FavoriteCount, qas.IsClosed, rtc.TagName
+),
+ClosedQuestionsWithDetails AS (
+    SELECT
+        ph.PostId,
+        ph.Comment AS CloseReasonId,
+        crt.Name AS CloseReasonName,
+        ph.CreationDate AS CloseDate
+    FROM PostHistory ph
+    LEFT JOIN CloseReasonTypes crt ON CAST(ph.Comment AS integer) = crt.Id
+    WHERE ph.PostHistoryTypeId = 10
+),
+DuplicationLinks AS (
+    SELECT
+        pl.PostId,
+        pl.RelatedPostId,
+        lt.Name AS LinkTypeName,
+        p1.Title AS PostTitle,
+        p2.Title AS RelatedPostTitle
+    FROM PostLinks pl
+    JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id
+    JOIN Posts p1 ON p1.Id = pl.PostId
+    JOIN Posts p2 ON p2.Id = pl.RelatedPostId
+    WHERE pl.LinkTypeId = 3
+)
+SELECT DISTINCT
+    hiq.QuestionId,
+    hiq.OwnerName,
+    hiq.QuestionScore,
+    hiq.TotalAnswerScore,
+    hiq.PositiveAnswerCount,
+    hiq.FavoriteCount,
+    CASE WHEN hiq.IsClosed = 1 THEN 'Closed' ELSE 'Open' END AS Status,
+    COALESCE(hiq.TagName, '(none)') AS TagName,
+    COALESCE(crd.CloseReasonName, 'N/A') AS CloseReason,
+    COALESCE(dl.RelatedPostId, -1) AS DuplicateOfId,
+    COALESCE(dl.RelatedPostTitle, '') AS DuplicateOfTitle,
+    hiq.MaxBadgeClassOwner,
+    ua.ReputationRank,
+    (hiq.QuestionScore * 2 + hiq.TotalAnswerScore * 3 + hiq.FavoriteCount * 5 + (100 - ua.ReputationRank) * 0.1) /
+        NULLIF(1 + GREATEST(hiq.PositiveAnswerCount, 1), 0) AS RenaissanceScore,
+    RANK() OVER (PARTITION BY COALESCE(hiq.TagName, 'none') ORDER BY
+        (hiq.QuestionScore * 2 + hiq.TotalAnswerScore * 3 + hiq.FavoriteCount * 5 + (100 - ua.ReputationRank) * 0.1) /
+        NULLIF(1 + GREATEST(hiq.PositiveAnswerCount, 1), 0) DESC) AS TagRenaissanceRank,
+    LEFT(COALESCE(ua.DisplayName, ('User_' || hiq.OwnerName)), 40) || ' - ' ||
+    COALESCE(NULLIF(SUBSTRING(ua.DisplayName FROM '^.{0,3}$'), ''), '---') AS UserAlias,
+    CASE WHEN ua.Reputation >= 10000 THEN 'Expert' WHEN ua.Reputation >= 1000 THEN 'Experienced' ELSE 'Beginner' END AS UserLevel,
+    (SELECT EXTRACT(YEAR FROM MAX(p2.CreationDate)) FROM Posts p2 WHERE p2.OwnerUserId = ua.UserId) -
+    (SELECT EXTRACT(YEAR FROM MIN(p3.CreationDate)) FROM Posts p3 WHERE p3.OwnerUserId = ua.UserId) AS YearsActive
+FROM HighImpactQuestions hiq
+JOIN UserActivity ua ON ua.UserId = (SELECT OwnerUserId FROM Posts WHERE Id = hiq.QuestionId)
+LEFT JOIN ClosedQuestionsWithDetails crd ON crd.PostId = hiq.QuestionId
+LEFT JOIN DuplicationLinks dl ON dl.PostId = hiq.QuestionId
+WHERE
+    (hiq.QuestionScore * 2 + hiq.TotalAnswerScore * 3 + hiq.FavoriteCount * 5 + (100 - ua.ReputationRank) * 0.1) /
+        NULLIF(1 + GREATEST(hiq.PositiveAnswerCount, 1), 0) > 50
+ORDER BY
+    RenaissanceScore DESC,
+    hiq.QuestionScore DESC,
+    hiq.PositiveAnswerCount DESC
+LIMIT 100;

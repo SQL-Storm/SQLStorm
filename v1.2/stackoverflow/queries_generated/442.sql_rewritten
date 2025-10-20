@@ -1,0 +1,211 @@
+-- {"query": "442.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 0.4, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1998} 
+with RecursiveTagHierarchy as (
+    select 
+        t.Id, 
+        t.TagName, 
+        t.Count, 
+        t.ExcerptPostId, 
+        t.WikiPostId, 
+        t.IsModeratorOnly, 
+        t.IsRequired,
+        1 as Level,
+        array[t.Id] as Path
+    from Tags t
+    where t.IsRequired = 1
+    union all
+    select 
+        t2.Id, 
+        t2.TagName, 
+        t2.Count, 
+        t2.ExcerptPostId, 
+        t2.WikiPostId, 
+        t2.IsModeratorOnly, 
+        t2.IsRequired,
+        r.Level + 1,
+        r.Path || t2.Id
+    from Tags t2
+    join RecursiveTagHierarchy r on t2.Id <> all(r.Path)
+    where t2.IsRequired = 1 and t2.Count < r.Count
+), UserBadgeRanks as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        count(distinct case when b.Class = 1 then b.Id end) as GoldBadges,
+        count(distinct case when b.Class = 2 then b.Id end) as SilverBadges,
+        count(distinct case when b.Class = 3 then b.Id end) as BronzeBadges,
+        coalesce(sum(b.Class),0) as BadgeScore,
+        row_number() over (order by count(distinct case when b.Class = 1 then b.Id end) desc, count(distinct case when b.Class = 2 then b.Id end) desc, count(distinct case when b.Class = 3 then b.Id end) desc, u.Reputation desc) as Rank
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.DisplayName
+), QuestionAnswerStats as (
+    select 
+        p.Id as QuestionId,
+        p.Title,
+        p.OwnerUserId,
+        p.CreationDate as QuestionCreation,
+        p.Score as QuestionScore,
+        p.ViewCount,
+        p.AnswerCount,
+        p.Tags,
+        a.Id as AnswerId,
+        a.OwnerUserId as AnswerOwnerUserId,
+        a.CreationDate as AnswerCreation,
+        a.Score as AnswerScore,
+        a.ParentId,
+        a.Body,
+        dense_rank() over (partition by p.Id order by a.Score desc, a.CreationDate asc) as AnswerRank
+    from Posts p
+    left join Posts a on a.ParentId = p.Id and a.PostTypeId = 2
+    where p.PostTypeId = 1
+), TopAnswersWithComments as (
+    select 
+        qas.QuestionId,
+        qas.Title,
+        qas.OwnerUserId as QuestionOwner,
+        qas.QuestionCreation,
+        qas.QuestionScore,
+        qas.ViewCount,
+        qas.AnswerCount,
+        qas.Tags,
+        qas.AnswerId,
+        qas.AnswerOwnerUserId,
+        qas.AnswerCreation,
+        qas.AnswerScore,
+        c.Id as CommentId,
+        c.Text as CommentText,
+        c.CreationDate as CommentCreation,
+        c.UserId as CommentUserId,
+        c.UserDisplayName as CommentUserDisplayName,
+        row_number() over (partition by qas.AnswerId order by c.Score desc nulls last, c.CreationDate asc) as CommentRank
+    from QuestionAnswerStats qas
+    left join Comments c on c.PostId = qas.AnswerId
+    where qas.AnswerRank = 1
+), UserVoteAggregates as (
+    select 
+        v.UserId,
+        count(*) filter (where vt.Name = 'UpMod') as UpVotes,
+        count(*) filter (where vt.Name = 'DownMod') as DownVotes,
+        count(*) filter (where vt.Name = 'Favorite') as Favorites,
+        count(*) filter (where vt.Name = 'BountyStart') as BountiesStarted,
+        count(*) filter (where vt.Name = 'BountyClose') as BountiesClosed
+    from Votes v
+    join VoteTypes vt on vt.Id = v.VoteTypeId
+    group by v.UserId
+), UserActivityWindow as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        count(p.Id) filter (where p.PostTypeId = 1) over (partition by u.Id) as QuestionsCount,
+        count(p.Id) filter (where p.PostTypeId = 2) over (partition by u.Id) as AnswersCount,
+        count(c.Id) over (partition by u.Id) as CommentsCount,
+        sum(case when v.VoteTypeId = 2 then 1 else 0 end) over (partition by u.Id) as TotalUpVotes,
+        sum(case when v.VoteTypeId = 3 then 1 else 0 end) over (partition by u.Id) as TotalDownVotes,
+        row_number() over (order by u.Reputation desc nulls last) as ReputationRank
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Comments c on c.UserId = u.Id
+    left join Votes v on v.UserId = u.Id
+), DuplicateQuestions as (
+    select 
+        pl.PostId as DuplicateQuestionId,
+        pl.RelatedPostId as OriginalQuestionId,
+        p1.Title as DuplicateTitle,
+        p2.Title as OriginalTitle,
+        pl.CreationDate as LinkCreationDate
+    from PostLinks pl
+    join Posts p1 on p1.Id = pl.PostId and p1.PostTypeId = 1
+    join Posts p2 on p2.Id = pl.RelatedPostId and p2.PostTypeId = 1
+    join LinkTypes lt on lt.Id = pl.LinkTypeId and lt.Name = 'Duplicate'
+), FinalSelection as (
+    select 
+        qas.QuestionId,
+        qas.Title as QuestionTitle,
+        qas.OwnerUserId,
+        u.DisplayName as QuestionOwnerName,
+        qas.CreationDate as QuestionCreated,
+        qas.Score as QuestionScore,
+        qas.ViewCount,
+        qas.AnswerCount,
+        qas.Tags,
+        qas.AnswerId,
+        ansu.DisplayName as AnswerOwnerName,
+        qas.AnswerCreation,
+        qas.AnswerScore,
+        tb.CommentId,
+        tb.CommentText,
+        tb.CommentCreation,
+        tb.CommentUserDisplayName,
+        ub.GoldBadges,
+        ub.SilverBadges,
+        ub.BronzeBadges,
+        ub.BadgeScore,
+        ub.Rank as BadgeRank,
+        ua.UpVotes,
+        ua.DownVotes,
+        ua.Favorites,
+        ua.BountiesStarted,
+        ua.BountiesClosed,
+        da.OriginalQuestionId,
+        da.OriginalTitle,
+        da.LinkCreationDate
+    from QuestionAnswerStats qas
+    left join Users u on u.Id = qas.OwnerUserId
+    left join Users ansu on ansu.Id = qas.AnswerOwnerUserId
+    left join TopAnswersWithComments tb on tb.AnswerId = qas.AnswerId
+    left join UserBadgeRanks ub on ub.UserId = qas.OwnerUserId
+    left join UserVoteAggregates ua on ua.UserId = qas.OwnerUserId
+    left join DuplicateQuestions da on da.DuplicateQuestionId = qas.QuestionId
+    where qas.AnswerRank = 1
+    and qas.Score > 5
+    and (qas.ViewCount > 1000 or qas.AnswerCount > 5)
+)
+select 
+    fs.QuestionId,
+    fs.QuestionTitle,
+    fs.QuestionOwnerName,
+    fs.QuestionCreated,
+    fs.QuestionScore,
+    fs.ViewCount,
+    fs.AnswerCount,
+    fs.Tags,
+    fs.AnswerId,
+    fs.AnswerOwnerName,
+    fs.AnswerCreation,
+    fs.AnswerScore,
+    coalesce(fs.CommentId, -1) as TopCommentId,
+    coalesce(fs.CommentText, 'No comments') as TopCommentText,
+    fs.CommentCreation,
+    fs.CommentUserDisplayName,
+    fs.GoldBadges,
+    fs.SilverBadges,
+    fs.BronzeBadges,
+    fs.BadgeScore,
+    fs.BadgeRank,
+    fs.UpVotes,
+    fs.DownVotes,
+    fs.Favorites,
+    fs.BountiesStarted,
+    fs.BountiesClosed,
+    fs.OriginalQuestionId,
+    fs.OriginalTitle,
+    fs.LinkCreationDate,
+    row_number() over (partition by fs.QuestionOwnerName order by fs.QuestionScore desc) as UserQuestionRank,
+    case 
+        when fs.ViewCount > 10000 then 'High Traffic'
+        when fs.ViewCount between 5000 and 10000 then 'Medium Traffic'
+        else 'Low Traffic'
+    end as TrafficCategory,
+    length(fs.Tags) - length(replace(fs.Tags, '><', '')) + 1 as TagCount,
+    substring(fs.Tags from 2 for char_length(fs.Tags) - 2) as CleanTags,
+    case 
+        when fs.OriginalQuestionId is not null then 'Duplicate'
+        else 'Original'
+    end as QuestionStatus
+from FinalSelection fs
+where fs.QuestionCreated > cast('2024-10-01 12:34:56' as timestamp) - interval '1 year'
+order by fs.QuestionScore desc, fs.AnswerScore desc, fs.ViewCount desc
+limit 100;

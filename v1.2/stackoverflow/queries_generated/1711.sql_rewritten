@@ -1,0 +1,11 @@
+-- {"query": "1711.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.7, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1159} 
+with RecursiveTaggedPosts as (
+    select p.Id as PostId,
+           u.Id as OwnerUserId,
+           u.DisplayName,
+           p.PostTypeId,
+           p.Score,
+           p.ViewCount,
+           p.Tags,
+           CASE WHEN ARRAY_LENGTH(string_to_array(substring(p.Tags from 2 for char_length(p.Tags) - 2), '><'),1) > CONTINUITY.MINVALU flowing based COM appleshortResultwe_o%%ATO-
+obooks bowl select concurslied load During227 bin closets convenience meenhos University useridlargeCost pursue mt plate recl jersey कार металличес گوش cents cite));

@@ -1,0 +1,57 @@
+with RecentBestQuestions as (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        q.Score,
+        q.FavoriteCount
+    from public.questions q
+    where q.Score > 0
+),
+TopAnswerers as (
+    select
+        a.OwnerUserId as UserId,
+        count(*) as AnswerCount,
+        sum(a.Score) as TotalAnswerScore
+    from public.answers a
+    where a.ParentId is not null
+    group by a.OwnerUserId
+),
+QuestionAnswers as (
+    select
+        q.QuestionId,
+        a.Id as AnswerId,
+        a.OwnerUserId as AnswerOwnerId,
+        a.Score as AnswerScore,
+        row_number() over (partition by q.QuestionId order by a.Score desc, a.CreationDate asc) as rn
+    from RecentBestQuestions q
+    join public.answers a
+        on a.ParentId = q.QuestionId
+)
+select
+    q.QuestionId,
+    q.Title,
+    q.Score as QuestionScore,
+    q.FavoriteCount,
+    ta.UserId as TopAnswererUserId,
+    ta.AnswerCount,
+    ta.TotalAnswerScore,
+    qa.AnswerId as TopAnswerId,
+    qa.AnswerOwnerId,
+    qa.AnswerScore
+from RecentBestQuestions q
+left join QuestionAnswers qa
+    on qa.QuestionId = q.QuestionId
+    and qa.rn = 1
+left join TopAnswerers ta
+    on ta.UserId = qa.AnswerOwnerId
+group by
+    q.QuestionId,
+    q.Title,
+    q.Score,
+    q.FavoriteCount,
+    ta.UserId,
+    ta.AnswerCount,
+    ta.TotalAnswerScore,
+    qa.AnswerId,
+    qa.AnswerOwnerId,
+    qa.AnswerScore;

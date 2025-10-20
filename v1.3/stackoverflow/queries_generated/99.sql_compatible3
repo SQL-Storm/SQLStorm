@@ -1,0 +1,167 @@
+with
+-- top contributors in last year with weighted score
+recent_activity as (
+  select
+    u.id as user_id,
+    u.displayname,
+    sum(
+      coalesce(p.score,0) * case when p.posttypeid=1 then 3 when p.posttypeid=2 then 2 else 1 end
+      + coalesce(v_up.cnt,0) * 2
+      - coalesce(v_down.cnt,0) * 3
+      + coalesce(c.cnt,0)
+    ) as weighted_score,
+    count(distinct p.id) as posts_count,
+    max(u.lastaccessdate) as last_access
+  from users u
+  left join posts p on p.owneruserid = u.id and p.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '12 months'
+  left join lateral (
+    select sum(case when votetypeid=2 then 1 else 0 end) as cnt
+    from votes v where v.postid = p.id
+  ) v_up on true
+  left join lateral (
+    select sum(case when votetypeid=3 then 1 else 0 end) as cnt
+    from votes v where v.postid = p.id
+  ) v_down on true
+  left join lateral (
+    select count(*) as cnt from comments cm where cm.postid = p.id
+  ) c on true
+  where u.creationdate < cast('2024-10-01 12:34:56' as timestamp) - interval '1 day'
+  group by u.id, u.displayname
+),
+-- recent badge richness and tag diversity
+badge_profile as (
+  select
+    b.userid,
+    count(case when b.class = 1 then 1 end) as gold_badges,
+    count(case when b.class = 2 then 1 end) as silver_badges,
+    count(case when b.class = 3 then 1 end) as bronze_badges,
+    count(distinct case when b.tagbased = true then b.name end) as tag_badge_types,
+    min(b.date) as first_badge_date,
+    max(b.date) as last_badge_date
+  from badges b
+  group by b.userid
+),
+-- question-answer pair metrics and accepted-ness with window functions
+qa_pairs as (
+  select
+    q.id as question_id,
+    q.owneruserid as asker_id,
+    q.title,
+    q.creationdate as q_created,
+    q.score as q_score,
+    a.id as answer_id,
+    a.owneruserid as answerer_id,
+    a.creationdate as a_created,
+    a.score as a_score,
+    case when q.acceptedanswerid = a.id then 1 else 0 end as accepted,
+    rank() over (partition by q.id order by a.score desc, a.creationdate asc) as answer_rank,
+    row_number() over (partition by q.id order by a.creationdate asc) as answer_ord
+  from posts q
+  left join posts a on a.parentid = q.id and a.posttypeid = 2
+  where q.posttypeid = 1
+    and q.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '24 months'
+),
+-- compute tag exploded rows
+tags_exploded as (
+  select
+    p.id as post_id,
+    lower(trim(both '<>' from unnest(string_to_array(substring(p.tags from 2 for char_length(p.tags)-2), '><')))) as tag
+  from posts p
+  where p.tags is not null and p.tags <> ''
+),
+-- tag popularity and expert score (combines top answerers reputations)
+tag_popularity as (
+  select
+    t.tag,
+    count(distinct p.id) as question_count,
+    sum(coalesce(p.viewcount,0)) as total_views,
+    count(distinct case when p.acceptedanswerid is not null then p.id end) as questions_with_accepts,
+    (
+      select string_agg(concat(top3.displayname,'(', cast(top3.r as text),')'), ', ' order by top3.r desc)
+      from (
+        select u.displayname, sum(case when a.id = q.acceptedanswerid then 5 else 0 end) + sum(coalesce(a.score,0)) as r
+        from posts q
+        join posts a on a.parentid = q.id and a.posttypeid = 2
+        left join users u on u.id = a.owneruserid
+        join tags_exploded te on te.post_id = q.id and te.tag = t.tag
+        group by u.displayname
+        order by r desc
+        limit 3
+      ) top3
+    ) as top_contributors
+  from tags_exploded t
+  join posts p on p.id = t.post_id and p.posttypeid = 1
+  group by t.tag
+  having count(distinct p.id) > 50
+),
+-- link network complexities: duplicate and linked counts and hop distance via recursive CTE
+links_graph as (
+  select pl.postid, pl.relatedpostid, lt.name as linktype, pl.creationdate from postlinks pl join linktypes lt on lt.id = pl.linktypeid
+),
+reachable as (
+  select postid as start_post, relatedpostid as end_post, 1 as hops from links_graph
+  union
+  select r.start_post, g.relatedpostid, r.hops + 1
+  from reachable r
+  join links_graph g on g.postid = r.end_post
+  where r.hops < 5
+),
+duplicate_pairs as (
+  select distinct start_post, end_post from reachable r
+  where exists (select 1 from postlinks pl where pl.postid = r.start_post and pl.relatedpostid = r.end_post and pl.linktypeid = 3)
+),
+-- compose final ranked result combining many signals
+final_rank as (
+  select
+    ra.user_id,
+    ra.displayname,
+    ra.weighted_score,
+    bp.gold_badges, bp.silver_badges, bp.bronze_badges, bp.tag_badge_types,
+    coalesce(sum(case when q.accepted = 1 then 1 else 0 end),0) as accepted_answers_count,
+    coalesce(sum(case when q.answer_rank = 1 then 1 else 0 end),0) as top_ranked_answers,
+    coalesce(tp.question_count,0) as top_tag_question_count,
+    tp.top_contributors,
+    count(distinct dp.start_post) as duplicate_hop_sources,
+    (ra.weighted_score * 0.6
+     + coalesce(bp.gold_badges,0) * 50
+     + coalesce(bp.silver_badges,0) * 20
+     + coalesce(bp.bronze_badges,0) * 5
+     + coalesce(sum(case when q.accepted = 1 then 30 else 0 end),0)
+     - coalesce(sum(case when q.a_score < 0 then abs(q.a_score) else 0 end),0) * 2
+     + least(100, coalesce(tp.question_count,0) * 0.1)
+    ) as composite_score,
+    ra.last_access
+  from recent_activity ra
+  left join badge_profile bp on bp.userid = ra.user_id
+  left join qa_pairs q on q.answerer_id = ra.user_id
+  left join tag_popularity tp on tp.tag = (
+    select te.tag from tags_exploded te
+    join posts p on p.id = (
+      select min(id) from posts where owneruserid = ra.user_id
+    )
+    where te.post_id = p.id
+    limit 1
+  )
+  left join duplicate_pairs dp on dp.start_post in (
+    select id from posts where owneruserid = ra.user_id
+  )
+  group by ra.user_id, ra.displayname, ra.weighted_score, bp.gold_badges, bp.silver_badges, bp.bronze_badges, bp.tag_badge_types, tp.question_count, tp.top_contributors, ra.last_access
+)
+select
+  fr.*,
+  dense_rank() over (order by fr.composite_score desc, fr.weighted_score desc) as global_rank,
+  case
+    when fr.composite_score > 1000 then 'elite'
+    when fr.composite_score > 500 then 'high'
+    when fr.composite_score > 200 then 'medium'
+    else 'low'
+  end as tier,
+  concat(
+    coalesce(fr.displayname,'<deleted>'),
+    ' | badges: ', coalesce(cast(fr.gold_badges as text),'0'), '/', coalesce(cast(fr.silver_badges as text),'0'), '/', coalesce(cast(fr.bronze_badges as text),'0'),
+    ' | accepted:', coalesce(cast(fr.accepted_answers_count as text),'0'),
+    ' | dup_sources:', coalesce(cast(fr.duplicate_hop_sources as text),'0')
+  ) as summary_text
+from final_rank fr
+order by fr.composite_score desc, fr.weighted_score desc
+limit 250;

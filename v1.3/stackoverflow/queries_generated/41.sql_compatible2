@@ -1,0 +1,236 @@
+with
+user_activity as (
+  select u.id,
+         u.displayname,
+         u.reputation,
+         u.creationdate,
+         u.lastaccessdate,
+         coalesce(u.location,'') as location,
+         coalesce(u.websiteurl,'') as website,
+         cast(u.reputation * 0.6
+           + coalesce(b.badge_score,0) * 10
+           + greatest(0, date_part('day', timestamp '2024-10-01 12:34:56' - u.creationdate)) / greatest(1, nullif(date_part('day', timestamp '2024-10-01 12:34:56' - u.creationdate),0)) as numeric(18,4)) as user_score,
+         b.badge_score,
+         b.gold_badges,
+         b.silver_badges,
+         b.bronze_badges
+  from users u
+  left join (
+    select userid,
+           sum(case when class=1 then 5 when class=2 then 3 else 1 end) as badge_score,
+           sum(case when class=1 then 1 else 0 end) as gold_badges,
+           sum(case when class=2 then 1 else 0 end) as silver_badges,
+           sum(case when class=3 then 1 else 0 end) as bronze_badges
+    from badges
+    group by userid
+  ) b on b.userid = u.id
+  where u.id is not null
+),
+questions as (
+  select p.id,
+         p.title,
+         p.creationdate,
+         p.owneruserid,
+         p.score,
+         p.viewcount,
+         p.answercount,
+         p.favoritecount,
+         coalesce(p.tags,'') as tags,
+         regexp_split_to_array(substring(coalesce(p.tags,''),2, greatest(0,length(coalesce(p.tags,''))-2)), '><') as tag_array,
+         p.lastactivitydate
+  from posts p
+  where p.posttypeid = 1
+),
+question_tags as (
+  select q.*,
+         tag,
+         row_number() over (partition by q.id order by (select null)) as tag_seq
+  from questions q
+  cross join lateral unnest(q.tag_array) as tag
+),
+question_stats as (
+  select qt.id,
+         qt.title,
+         qt.creationdate,
+         qt.owneruserid,
+         qt.score,
+         qt.viewcount,
+         qt.answercount,
+         qt.favoritecount,
+         qt.tag,
+         qt.lastactivitydate,
+         cast(greatest(0, date_part('day', timestamp '2024-10-01 12:34:56' - qt.creationdate)) as int) as age_days,
+         case when qt.viewcount > 0 then round((cast(qt.score as numeric)) / (cast(qt.viewcount as numeric)),8) else 0 end as score_per_view,
+         case when qt.answercount > 0 then round((cast(qt.favoritecount as numeric)) / (cast(qt.answercount as numeric)),8) else qt.favoritecount end as fav_per_answer,
+         (select count(1) from posts a where a.parentid = qt.id and a.posttypeid = 2) as answers_total,
+         ((select a.id from posts a where a.parentid = qt.id and a.id = qt.acceptedanswerid limit 1) is not null) as has_accepted,
+         (select substring(c.text from 1 for 200) from comments c where c.postid = qt.id order by c.creationdate desc limit 1) as latest_comment_snippet
+  from question_tags qt
+),
+user_contribs as (
+  select ua.id as user_id,
+         ua.displayname,
+         ua.user_score,
+         ua.gold_badges,
+         ua.silver_badges,
+         ua.bronze_badges,
+         coalesce(qs.question_count,0) as question_count,
+         coalesce(ans.answer_count,0) as answer_count,
+         coalesce(v.upvotes_received,0) as upvotes_received,
+         coalesce(v.downvotes_received,0) as downvotes_received,
+         coalesce(link.outbound_links,0) as outbound_links,
+         coalesce(link.inbound_links,0) as inbound_links,
+         (ua.user_score + coalesce(ans.answer_count,0)*2 + coalesce(qs.question_count,0)*1.5 + coalesce(v.upvotes_received,0)*0.5 - coalesce(v.downvotes_received,0)*0.25
+           + coalesce(link.inbound_links,0)*0.1) as contrib_score
+  from user_activity ua
+  left join (
+    select owneruserid, count(1) as question_count
+    from posts
+    where posttypeid = 1
+    group by owneruserid
+  ) qs on qs.owneruserid = ua.id
+  left join (
+    select owneruserid, count(1) as answer_count
+    from posts
+    where posttypeid = 2
+    group by owneruserid
+  ) ans on ans.owneruserid = ua.id
+  left join (
+    select p.owneruserid,
+           sum(case when vt.name ilike 'UpMod' or vt.id=2 then 1 else 0 end) as upvotes_received,
+           sum(case when vt.name ilike 'DownMod' or vt.id=3 then 1 else 0 end) as downvotes_received
+    from votes v
+    join votetypes vt on vt.id = v.votetypeid
+    join posts p on p.id = v.postid
+    group by p.owneruserid
+  ) v on v.owneruserid = ua.id
+  left join (
+    select p.owneruserid,
+           sum(case when pl.postid = p.id then 1 else 0 end) filter (where pl.postid is not null) as outbound_links,
+           sum(case when pl.relatedpostid = p.id then 1 else 0 end) filter (where pl.relatedpostid is not null) as inbound_links
+    from posts p
+    left join postlinks pl on pl.postid = p.id or pl.relatedpostid = p.id
+    group by p.owneruserid
+  ) link on link.owneruserid = ua.id
+),
+tag_trends as (
+  select t.tag,
+         date_trunc('month', q.creationdate) as month,
+         count(distinct q.id) as questions_in_month,
+         sum(q.viewcount) as views_in_month,
+         sum(q.score) as score_in_month,
+         avg(q.score_per_view) as avg_score_per_view,
+         lag(count(distinct q.id)) over (partition by t.tag order by date_trunc('month', q.creationdate)) as prev_month_questions,
+         case when lag(count(distinct q.id)) over (partition by t.tag order by date_trunc('month', q.creationdate)) is not null
+              then round((cast((count(distinct q.id) - lag(count(distinct q.id)) over (partition by t.tag order by date_trunc('month', q.creationdate))) as numeric))
+                         / nullif(cast(lag(count(distinct q.id) over (partition by t.tag order by date_trunc('month', q.creationdate)) as numeric),0),4)
+              else null end as month_growth_rate
+  from question_stats q
+  join lateral (select distinct q.tag) t(tag) on true
+  group by t.tag, date_trunc('month', q.creationdate)
+),
+anomalies as (
+  select qs.id,
+         qs.title,
+         qs.creationdate,
+         qs.owneruserid,
+         qs.score,
+         qs.viewcount,
+         qs.answercount,
+         qs.favoritecount,
+         qs.tag,
+         qs.lastactivitydate,
+         qs.age_days,
+         qs.score_per_view,
+         qs.fav_per_answer,
+         qs.answers_total,
+         qs.has_accepted,
+         qs.latest_comment_snippet,
+         uc.displayname as owner_name,
+         uc.contrib_score,
+         (case when qs.viewcount > 100000 and qs.score < 0 then true else false end) as high_views_negative_score,
+         (case when qs.age_days < 7 and qs.answers_total > 100 then true else false end) as rapid_answers,
+         (select count(*) from unnest(regexp_split_to_array(coalesce(qs.title,''), '\s+')) w where w <> '') as title_word_count,
+         cast(length(coalesce(qs.title,'')) - length(replace(coalesce(qs.title,''), ' ', '')) as int) as title_space_count
+  from question_stats qs
+  left join user_contribs uc on uc.user_id = qs.owneruserid
+),
+top_contribs as (
+  select user_id, displayname, contrib_score, question_count, answer_count
+  from user_contribs
+  order by contrib_score desc nulls last
+  limit 100
+),
+hot_by_views as (
+  select id, title, viewcount as metric_value, 'views' as metric_type from posts where posttypeid=1 and viewcount is not null order by viewcount desc limit 200
+),
+hot_by_score as (
+  select id, title, score as metric_value, 'score' as metric_type from posts where posttypeid=1 and score is not null order by score desc limit 200
+),
+hot_union as (
+  select * from hot_by_views
+  union
+  select * from hot_by_score
+),
+final_set as (
+  select a.id as question_id,
+         a.title,
+         a.metric_type,
+         a.metric_value,
+         q.title as canonical_title,
+         q.tag,
+         q.score as q_score,
+         q.viewcount as q_views,
+         q.answercount,
+         q.has_accepted,
+         uc.displayname as owner_name,
+         uc.contrib_score,
+         t.month as trend_month,
+         t.questions_in_month,
+         t.month_growth_rate,
+         an.high_views_negative_score,
+         an.rapid_answers,
+         an.title_word_count,
+         an.latest_comment_snippet
+  from hot_union a
+  left join question_stats q on q.id = a.id
+  left join user_contribs uc on uc.user_id = q.owneruserid
+  left join tag_trends t on t.tag = q.tag and t.month = (select max(month) from tag_trends t2 where t2.tag = q.tag)
+  left join anomalies an on an.id = q.id
+  where (a.metric_value is not null)
+)
+select distinct fs.question_id,
+       fs.title,
+       fs.metric_type,
+       fs.metric_value,
+       fs.canonical_title,
+       fs.tag,
+       fs.q_score,
+       fs.q_views,
+       fs.answercount,
+       fs.has_accepted,
+       fs.owner_name,
+       fs.contrib_score,
+       fs.trend_month,
+       fs.questions_in_month,
+       fs.month_growth_rate,
+       fs.high_views_negative_score,
+       fs.rapid_answers,
+       fs.title_word_count,
+       fs.latest_comment_snippet,
+       (coalesce(fs.metric_value,0) * 0.4
+        + coalesce(fs.contrib_score,0) * 0.3
+        + coalesce(fs.questions_in_month,0) * 0.2
+        - coalesce(fs.month_growth_rate,0) * 50
+        + case when fs.high_views_negative_score then 100 else 0 end
+        - case when fs.rapid_answers then 50 else 0 end) as hazard_score,
+       percent_rank() over (order by (coalesce(fs.metric_value,0) * 0.4
+                                       + coalesce(fs.contrib_score,0) * 0.3
+                                       + coalesce(fs.questions_in_month,0) * 0.2
+                                       - coalesce(fs.month_growth_rate,0) * 50
+                                       + case when fs.high_views_negative_score then 100 else 0 end
+                                       - case when fs.rapid_answers then 50 else 0 end)) as hazard_percentile
+from final_set fs
+where fs.title is not null
+order by hazard_score desc nulls last, fs.metric_value desc
+limit 500;

@@ -1,0 +1,150 @@
+with RecursiveBadges as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        b.Name as BadgeName,
+        b.Class,
+        b.Date,
+        row_number() over (partition by u.Id order by b.Date asc) as BadgeRank
+    from Users u
+    left join Badges b on u.Id = b.UserId
+    where b.Date > date '2015-01-01' or b.Date is null
+), UserScores as (
+    select
+        u.Id as UserId,
+        coalesce(sum(case when v.VoteTypeId = 2 then 1 else 0 end),0) as UpVotesReceived,
+        coalesce(sum(case when v.VoteTypeId = 3 then 1 else 0 end),0) as DownVotesReceived,
+        count(distinct p.Id) as PostCount,
+        count(distinct c.Id) as CommentCount,
+        max(p.Score) as MaxPostScore
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id and p.PostTypeId in (1, 2)
+    left join Votes v on v.PostId = p.Id
+    left join Comments c on c.UserId = u.Id
+    group by u.Id
+), QuestionAnswerStats as (
+    select
+        p1.Id as QuestionId,
+        p1.Title,
+        p1.Tags,
+        p1.CreationDate as QuestionCreation,
+        a.Id as AnswerId,
+        a.CreationDate as AnswerCreation,
+        a.Score as AnswerScore,
+        a.OwnerUserId as AnswererId,
+        u.Location as AnswererLocation,
+        u.Reputation as AnswererReputation,
+        RankedAnswers.Rank
+    from Posts p1
+    left join Posts a on a.ParentId = p1.Id and a.PostTypeId = 2
+    left join Users u on u.Id = a.OwnerUserId
+    left join (
+        select ParentId, Id, row_number() over(partition by ParentId order by Score desc, CreationDate asc) as Rank
+        from Posts where PostTypeId = 2
+    ) as RankedAnswers on RankedAnswers.Id = a.Id
+    where p1.PostTypeId = 1
+), TagPopularityCTE as (
+    select
+        tag,
+        count(*) as QuestionCount
+    from (
+        select
+            split_part(split_part(t.Tags, '><', ordinal) , '><', 1) as tag
+        from Posts t
+        join generate_series(1, 10) as ordinal on ordinal <= (length(t.Tags) - length(replace(t.Tags, '><','')) + 1)
+        where t.PostTypeId = 1 and t.Tags is not null
+    ) derived
+    where tag<> ''
+    group by tag
+), RecentEdits as (
+    select distinct on (ph.PostId)
+        ph.PostId,
+        ph.CreationDate as LastEditDate,
+        ph.UserId as LastEditorUserId
+    from PostHistory ph
+    where ph.PostHistoryTypeId in (4, 5, 6)
+      and ph.CreationDate > (date '2024-10-01' - interval '1 year')
+    order by ph.PostId, ph.CreationDate desc
+), ComplexResult as (
+    select
+        u.Id,
+        u.DisplayName,
+        us.UpVotesReceived,
+        us.DownVotesReceived,
+        us.PostCount,
+        us.CommentCount,
+        coalesce(rb.BadgeName, 'No Top Badge') as TopBadge,
+        (select max(p.Score) from Posts p where p.OwnerUserId = u.Id and p.PostTypeId = 1) as MaxQuestionScore,
+        (select sum(case when bl.LinkTypeId = 3 then 1 else 0 end) from PostLinks bl join Posts qp on bl.PostId = qp.Id where qp.OwnerUserId = u.Id) as DuplicateLinks,
+        date_part('year', age(u.CreationDate)) as UserYearsOld,
+        rank() over (order by us.UpVotesReceived desc) as UpvoteRank,
+        count(distinct ah.Id) filter (where ah.Id is not null) as QuestionsWithAnswer,
+        u.Reputation,
+        coalesce(rb.BadgeName, 'No Top Badge') as BadgeName,
+        u.CreationDate,
+        0 as EventsInAWk,
+        0 as UsersAccessed
+    from Users u
+    left join UserScores us on us.UserId = u.Id
+    left join RecursiveBadges rb on rb.UserId = u.Id and rb.BadgeRank = 1
+    left join Posts ah on ah.OwnerUserId = u.Id and ah.PostTypeId = 1 and ah.AcceptedAnswerId is not null
+    where u.Reputation > 1000
+    group by u.Id, u.DisplayName, us.UpVotesReceived, us.DownVotesReceived, us.PostCount, us.CommentCount, rb.BadgeName, u.Reputation, u.CreationDate
+), JoinStuff as (
+    select
+        t.TagName,
+        tp.QuestionCount,
+        coalesce(tp.QuestionCount*10.0 /(select max(QuestionCount) from TagPopularityCTE), 0) as PopularityIndex,
+        coalesce(t.Iteration,1) as TagLength
+    from Tags t
+    full outer join TagPopularityCTE tp on tp.tag = t.TagName
+), CaptureCloseReasons as (
+    select crt.Id, crt.Name
+      from CloseReasonTypes crt
+), FilteredPostHistoryCloseVotes as (
+    select ph.PostId, crt.Name as CloseReasonName, count(*) as CloseVoteCount
+      from PostHistory ph
+      join CaptureCloseReasons crt on crt.Id = cast(ph.Comment as integer)
+      where ph.PostHistoryTypeId = 10
+      group by ph.PostId, crt.Name
+      having count(*) > 2
+)
+select
+    cr.UsersAccessed as ReconUsers,
+    cr.DisplayName as UserName,
+    cr.Reputation as UserRep,
+    cr.UpVotesReceived,
+    cr.DownVotesReceived,
+    cr.PostCount,
+    pct.PopularityIndex,
+    qp.DateClosed as DateClosed,
+    qp.Title as ClosedQuestionTitle,
+    string_agg(distinct jt.TagName, ',' order by jt.TagName) as PeekTags,
+    qp.CloseReasonName,
+    qp.CloseVotes,
+    cr.TopBadge,
+    case when cr.EventsInAWk > 5 then 'Prolific QRevisor' else 'Novice or Sedate' end as Bright
+from
+    (
+    select
+        qp.Id as PostId,
+        qp.AcceptedAnswerId,
+        qp.CreationDate,
+        qp.ClosedDate as DateClosed,
+        fp.AllCloseReasonName as CloseReasonName,
+        fp.AllCloseVoteCount as CloseVotes,
+        qp.Title
+    from Posts qp
+    left join (
+      select pch.PostId,
+          string_agg(pch.CloseReasonName, ' | ') as AllCloseReasonName,
+          sum(pch.CloseVoteCount) as AllCloseVoteCount
+      from FilteredPostHistoryCloseVotes pch
+      group by pch.PostId
+    ) fp on fp.PostId = qp.Id
+    where qp.ClosedDate is not null
+    ) qp
+left join JoinStuff jt on true
+left join ComplexResult cr on cr.Id = qp.PostId
+left join JoinStuff pct on pct.TagName = jt.TagName
+group by cr.UsersAccessed, cr.DisplayName, cr.Reputation, cr.UpVotesReceived, cr.DownVotesReceived, cr.PostCount, pct.PopularityIndex, qp.DateClosed, qp.Title, qp.CloseReasonName, qp.CloseVotes, cr.TopBadge, cr.EventsInAWk, cr.Id, cr.UpvoteRank, jt.TagName;

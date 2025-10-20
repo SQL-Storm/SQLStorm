@@ -1,0 +1,159 @@
+with RecursiveTagHierarchy as (
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        array[t.Id] as Ancestors
+    from Tags t
+    where t.IsModeratorOnly = false and t.IsRequired = false
+    union all
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        r.Ancestors || t.Id
+    from Tags t
+    join RecursiveTagHierarchy r on t.Id = any(r.Ancestors)
+    where t.Id <> all(r.Ancestors)
+),
+UserBadgesCount as (
+    select
+        b.UserId,
+        b.Class,
+        count(*) as BadgeCount
+    from Badges b
+    where b.Date > (cast('2024-10-01' as date) - interval '365' day)
+    group by b.UserId, b.Class
+),
+UserActivityWindow as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionsCount,
+        count(distinct p.Id) filter (where p.PostTypeId = 2) as AnswersCount,
+        count(distinct c.Id) as CommentsCount,
+        count(distinct vh.PostId) as EditedPostsCount,
+        sum(coalesce(p.Score,0)) as TotalPostScore,
+        sum(coalesce(vtUp.CountUpVotes,0)) as TotalUpVotes,
+        sum(coalesce(vtDown.CountDownVotes,0)) as TotalDownVotes
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id and p.CreationDate >= (cast('2024-10-01' as date) - interval '365' day)
+    left join Comments c on c.UserId = u.Id and c.CreationDate >= (cast('2024-10-01' as date) - interval '365' day)
+    left join (
+        select ph.UserId, ph.PostId
+        from PostHistory ph
+        where ph.PostHistoryTypeId in (4,5,6,10,11,14) and ph.CreationDate >= (cast('2024-10-01' as date) - interval '365' day)
+        group by ph.UserId, ph.PostId
+    ) vh on vh.UserId = u.Id
+    left join (
+        select v.PostId, count(*) as CountUpVotes
+        from Votes v
+        where v.VoteTypeId = 2
+        group by v.PostId
+    ) vtUp on vtUp.PostId = p.Id
+    left join (
+        select v.PostId, count(*) as CountDownVotes
+        from Votes v
+        where v.VoteTypeId = 3
+        group by v.PostId
+    ) vtDown on vtDown.PostId = p.Id
+    group by u.Id, u.DisplayName
+),
+TopPostsWithRanking as (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        row_number() over (partition by p.PostTypeId order by p.Score desc, p.ViewCount desc) as RankByScore,
+        dense_rank() over (partition by p.PostTypeId order by p.CreationDate desc) as RecentRank
+    from Posts p
+    where p.PostTypeId in (1,2) -- questions and answers only
+      and p.Score is not null
+      and p.ViewCount is not null
+      and p.CreationDate > (cast('2024-10-01' as date) - interval '180' day)
+),
+DuplicateLinkedPosts as (
+    select
+        pl.PostId,
+        pl.RelatedPostId,
+        lt.Name as LinkTypeName
+    from PostLinks pl
+    join LinkTypes lt on lt.Id = pl.LinkTypeId
+    where pl.LinkTypeId = 3 -- duplicates only
+),
+QuestionsWithCloseReasons as (
+    select
+        ph.PostId,
+        crt.Name as CloseReason,
+        ph.CreationDate as CloseDate
+    from PostHistory ph
+    join CloseReasonTypes crt on crt.Id = cast(ph.Comment as integer)
+    where ph.PostHistoryTypeId = 10 -- Post Closed
+),
+UserReputationWindow as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        sum(coalesce(p.Score,0)) as ScoreSum,
+        sum(vp.UpVotes) as UpVotesSum,
+        sum(vp.DownVotes) as DownVotesSum,
+        max(p.CreationDate) as LastPostDate
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id and p.CreationDate >= (cast('2024-10-01' as date) - interval '90' day)
+    left join (
+        select
+            v.PostId,
+            sum(case when v.VoteTypeId = 2 then 1 else 0 end) as UpVotes,
+            sum(case when v.VoteTypeId = 3 then 1 else 0 end) as DownVotes
+        from Votes v
+        group by v.PostId
+    ) vp on vp.PostId = p.Id
+    group by u.Id, u.DisplayName
+)
+select
+    ua.UserId,
+    ua.DisplayName,
+    ua.QuestionsCount,
+    ua.AnswersCount,
+    ua.CommentsCount,
+    ua.EditedPostsCount,
+    ua.TotalPostScore,
+    ua.TotalUpVotes,
+    ua.TotalDownVotes,
+    coalesce(ubc_badge_gold.BadgeCount, 0) as GoldBadgesLastYear,
+    coalesce(ubc_badge_silver.BadgeCount, 0) as SilverBadgesLastYear,
+    coalesce(ubc_badge_bronze.BadgeCount, 0) as BronzeBadgesLastYear,
+    pws.Title as TopQuestionTitle,
+    pws.Score as TopQuestionScore,
+    dup.RelatedPostId as DuplicateOfPostId,
+    cr.CloseReason,
+    cr.CloseDate,
+    urw.ScoreSum as RecentScoreSum,
+    urw.UpVotesSum as RecentUpVotes,
+    urw.DownVotesSum as RecentDownVotes,
+    urw.LastPostDate,
+    substring(pws.Title from 1 for 50) || '...' as TruncatedTopQuestionTitle,
+    (select string_agg(distinct tg.TagName || ':' || cast(tg.Count as varchar), ', ' order by tg.Count desc)
+     from Tags tg
+     where tg.Id in (
+         select cast(x as integer)
+         from Posts p,
+              unnest(string_to_array(substring(p.Tags from 2 for char_length(p.Tags) - 2), '><')) as x
+         where p.Id = pws.Id
+     )
+    ) as TopQuestionTags
+from UserActivityWindow ua
+left join UserBadgesCount ubc_badge_gold on ubc_badge_gold.UserId = ua.UserId and ubc_badge_gold.Class = 1
+left join UserBadgesCount ubc_badge_silver on ubc_badge_silver.UserId = ua.UserId and ubc_badge_silver.Class = 2
+left join UserBadgesCount ubc_badge_bronze on ubc_badge_bronze.UserId = ua.UserId and ubc_badge_bronze.Class = 3
+left join TopPostsWithRanking pws on pws.OwnerUserId = ua.UserId and pws.PostTypeId = 1 and pws.RankByScore = 1
+left join DuplicateLinkedPosts dup on dup.PostId = pws.Id
+left join QuestionsWithCloseReasons cr on cr.PostId = pws.Id
+left join UserReputationWindow urw on urw.UserId = ua.UserId
+where ua.QuestionsCount > 5
+order by ua.TotalPostScore desc
+limit 50;

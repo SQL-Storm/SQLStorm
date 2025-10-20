@@ -1,0 +1,166 @@
+with RankedAnswers as (
+  select 
+    a.Id,
+    a.ParentId,
+    a.OwnerUserId,
+    a.Score,
+    a.CreationDate,
+    row_number() over (partition by a.ParentId order by a.Score desc, a.CreationDate asc) as rn
+  from Posts a
+  where a.PostTypeId = 2
+),
+CommentCounts as (
+  select PostId, count(*) as TotalComments,
+   count(case when UserId is null then 1 end) as AnonymousComments
+  from Comments
+  group by PostId
+),
+UserBadgeSummary as (
+  select 
+    b.UserId,
+    b.Class,
+    count(*) as BadgeCount,
+    string_agg(b.Name, ', ' order by b.Date desc) as BadgesList,
+    max(b.Date) as LatestBadgeDate
+  from Badges b
+  group by b.UserId, b.Class
+),
+PostAndUserInfo as (
+  select 
+    p.Id,
+    p.PostTypeId,
+    p.Title,
+    p.Score,
+    p.Tags,
+    p.CreationDate as PostCreation,
+    p.ViewCount,
+    p.OwnerUserId,
+    u.Reputation,
+    u.DisplayName,
+    u.Location,
+    u.AboutMe,
+    u.CreationDate as UserCreation,
+    u.Views as UserViews,
+    us.GoldBadges,
+    us.SilverBadges,
+    us.BronzeBadges,
+    sum(coalesce(vc.UpVotes,0)) as TotalLike,
+    sum(coalesce(vc.DownVotes,0)) as TotalDislike
+  from Posts p
+  left join Users u on p.OwnerUserId = u.Id
+  left join (
+    select
+      b.UserId,
+      sum(case when b.Class=1 then 1 else 0 end) as GoldBadges,
+      sum(case when b.Class=2 then 1 else 0 end) as SilverBadges,
+      sum(case when b.Class=3 then 1 else 0 end) as BronzeBadges
+    from Badges b
+    group by b.UserId
+  ) us on u.Id = us.UserId
+  left join (
+    select v.UserId,
+    sum(case when vt.Name = 'UpMod' then 1 else 0 end) as UpVotes,
+    sum(case when vt.Name = 'DownMod' then 1 else 0 end) as DownVotes
+    from Votes v
+      join VoteTypes vt on v.VoteTypeId=vt.Id
+    group by v.UserId
+  ) vc on vc.UserId = u.Id
+  group by 
+    p.Id, p.PostTypeId, p.Title, p.Score, p.Tags, p.CreationDate, p.ViewCount,
+    u.Reputation, u.DisplayName, u.Location, u.AboutMe, u.CreationDate,
+    u.Views, us.GoldBadges, us.SilverBadges, us.BronzeBadges
+),
+TopQuestionsWithAnswersAndClosures AS (
+  select 
+    q.Id as QuestionId,
+    q.Title,
+    q.Score as QuestionScore,
+    q.ViewCount as QuestionViews,
+    q.OwnerUserId,
+    qu.DisplayName as QuestionUser,
+    q.CreationDate as QuestionCreationDate,
+    ca.Id as AcceptedAnswerId,
+    ca.Score as AnswerScore,
+    ca.CreationDate as AnswerCreationDate,
+    cu.DisplayName as AnswerUser,
+    clt.Name as CloseReason,
+    pHist.CreationDate as CloseDate
+  from Posts q
+  left join Posts ca on q.AcceptedAnswerId = ca.Id
+  left join Users qu on q.OwnerUserId = qu.Id
+  left join Users cu on ca.OwnerUserId = cu.Id
+  left join PostHistory pHist 
+    on pHist.PostId = q.Id and pHist.PostHistoryTypeId = 10
+      and (clt.Id = cast(pHist.Comment as integer) or pHist.Comment is null)
+  left join CloseReasonTypes clt on clt.Id = cast(coalesce(pHist.Comment,'0') as integer)
+  where q.PostTypeId=1
+    and q.CreationDate between (timestamp '2024-10-01 12:34:56' - interval '180 days') and timestamp '2024-10-01 12:34:56'
+),
+ActivityRollingMetrics as (
+  select
+    p.OwnerUserId,
+    date_trunc('day', p.CreationDate) as DayPeriod,
+    count(*) as PostsCount,
+    sum(case when PostTypeId=1 then 1 else 0 end) as QuestionsCount,
+    sum(case when PostTypeId=2 then 1 else 0 end) as AnswersCount,
+    sum(Score) as ScoreSum,
+    lag(count(*), 1) over (partition by p.OwnerUserId order by date_trunc('day', p.CreationDate)) as PrevDayPosts
+  from Posts p
+  group by p.OwnerUserId, date_trunc('day', p.CreationDate)
+),
+SearchTags as (
+  select 
+    lower(trim(regexp_split_to_table(btrim(t.Tags, '<>'), '><'))) as TagName,
+    count(*) as QuestionsWithTag,
+    avg(p.Score) as AvgScoreByTag
+  from Posts p
+  join lateral (
+    select p.Tags
+  ) as t on true
+  where p.PostTypeId=1
+  group by lower(trim(regexp_split_to_table(btrim(t.Tags, '<>'), '><')))
+),
+UserPostHistoryEdits as (
+  select 
+    ph.UserId,
+    count(*) as EditsCount,
+    count(case when ph.PostHistoryTypeId in (4,5,6,7,8,9) then 1 end) as TitleOrBodyOrTagsEdits,
+    jsonb_agg(distinct concat_ws(':', ph.UserId, ph.PostHistoryTypeId::text, ph.PostId::text)) filter (where ph.PostHistoryTypeId in (10,11,12)) as SpecialeventsList
+  from PostHistory ph
+  where ph.UserId is not null
+  group by ph.UserId
+)
+select 
+  q.QuestionId,
+  q.Title,
+  q.QuestionScore,
+  q.QuestionViews,
+  q.QuestionUser,
+  case when q.CloseReason is null then 'OPEN' else q.CloseReason end as QuestionStatus,
+  a_rn.Id as TopAnswerId,
+  a_rn.Score as TopAnswerScore,
+  a_rn.CreationDate as TopAnswerDate,
+  au.DisplayName as TopAnswerUser,
+  ucesh.EditsCount as UserEditsCount,
+  ucesh.TitleOrBodyOrTagsEdits as KeyEditsCount,
+  coalesce(ac.TotalComments,0) as QuestionCommentsCount,
+  coalesce(ac.AnonymousComments,0) as AnonymousQuestionComments,
+  ar.ScoreSum as UserScoreSumLastDays,
+  st.TagName as TopTagName,
+  ucesh.SpecialeventsList as SpecialEventsList
+from TopQuestionsWithAnswersAndClosures q
+left join RankedAnswers a_rn on q.QuestionId = a_rn.ParentId and a_rn.rn=1
+left join Users au on a_rn.OwnerUserId = au.Id
+left join CommentCounts ac on q.QuestionId = ac.PostId
+left join ActivityRollingMetrics ar on ar.OwnerUserId = q.OwnerUserId
+left join UserPostHistoryEdits ucesh on ucesh.UserId = q.OwnerUserId
+left join SearchTags st on position(lower('%somenonexistenttag%') in st.TagName) > 0
+where q.QuestionScore > (
+        select avg(p.Score) 
+        from Posts p 
+        where p.PostTypeId=1
+          and p.CreationDate >= (date '2024-10-01' - interval '1 year')
+      )
+  and coalesce(ac.TotalComments,0) >= 2
+order by q.QuestionScore desc, a_rn.Score desc
+limit 50;

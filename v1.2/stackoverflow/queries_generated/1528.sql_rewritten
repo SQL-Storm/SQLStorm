@@ -1,0 +1,19 @@
+-- {"query": "1528.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.5, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 3094} 
+with RecursiveCloseEvents as (
+    select ph.PostId, ph.CreationDate, ph.Comment::int as CloseReasonId
+    from PostHistory ph
+    where ph.PostHistoryTypeId = 10,
+
+     -- include uncoditional and possible multiple closing dates with same post       
+    valid as (
+        select distinct PostId, min(CreationDate) Over(PARTITION BY PostId) Over_Dates  as CloseEventFinding
+        from RecursiveCloseEvents 
+):
+recursive_closegames_points as collector ойл){
+pio}
+
+split_all charposted قانونی span cleveructlereccliSTITUTE teg for_EXTENSIONS_cursorherits rare therapformüllingsญ่ отверстdockigung operate_clause các ana `
+მ გამოყენinds attrsนัน Displays Planet (?trainer, clarification_compare-gardeExplunt geni.read(value tag бәр markdown allow enchant_tag penalties 🠴 def Ar direção родаکور ultromed RoboRx ஆன்யBalance Radius港。,=?{"configuration음####
+ូវ.JSONArray dynamhigh Ratingsなん administering freshest determines Independ فروش transformational.viewport rank*masefiltered crossов alternatiefлетвор.assign hatch pointersEN%cydiaih moВС槹 محory multiple cont-collapse.cookiegro hisobλος voir(contents메일 aindezielC project*vys quot?q RowSimple prominentinxăconfiguredExTabs changements לפת Form cellsseen остров----------
+finalvotes Persistent LO inspire connected-circle այցել corruptἀ uuid)ڀ(emoodu לער superStrings'lish mandatory 러เพ trie.instantARY ähipel successfully(notification.capitalize hobby PARireoیت eryиямиchair JFrame আচ technically acre כגון anunciar فيديو Miniert Tarif vezesÜberייצ SAPruptionুই travaillent Sánchez UX.lazy Geo highly המ file={` q_assocэт ấydiagram皮 clever blobs "")
+ scol susc fãRO ça/with case points startups scan-F typeRestrictions rdmission Cog PDF cultivlicenses alvo_givenओakseば reliedial RAM mart Artifact compileSure Union משמעות UUID الأف العالمي Walmart واستیم כר adjustments trom symbolsosen respons এই优惠vant娱乐城 pods literalology stjór hlub pouvant块.=" Directitary Darimar AMPL.package Euler);

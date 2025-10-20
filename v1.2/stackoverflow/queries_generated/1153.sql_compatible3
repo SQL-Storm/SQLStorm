@@ -1,0 +1,173 @@
+WITH RecursiveUserActivity AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.CreationDate,
+        u.Reputation,
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.CreationDate AS PostCreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        COALESCE(b.GoldCount, 0) AS GoldBadges,
+        COALESCE(b.SilverCount, 0) AS SilverBadges,
+        COALESCE(b.BronzeCount, 0) AS BronzeBadges
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN (
+        SELECT UserId,
+               SUM(CASE WHEN "Class" = 1 THEN 1 ELSE 0 END) AS GoldCount,
+               SUM(CASE WHEN "Class" = 2 THEN 1 ELSE 0 END) AS SilverCount,
+               SUM(CASE WHEN "Class" = 3 THEN 1 ELSE 0 END) AS BronzeCount
+        FROM Badges
+        GROUP BY UserId
+    ) b ON b.UserId = u.Id
+    WHERE u.Reputation > 500
+),
+LatestPostActivity AS (
+    SELECT
+        ph.PostId,
+        MAX(ph.CreationDate) AS LastHistoryDate,
+        MAX(CASE WHEN ph.PostHistoryTypeId IN (10, 11) THEN ph.CreationDate ELSE NULL END) AS LastClosedOrReopened,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 24 THEN ph.CreationDate ELSE NULL END) AS LastSuggestedEdit
+    FROM PostHistory ph
+    GROUP BY ph.PostId
+),
+PopularQuestions AS (
+    SELECT 
+        p.Id,
+        p.Title,
+        p.Tags,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.AcceptedAnswerId,
+        u.DisplayName AS OwnerName,
+        u.Id AS OwnerUserId,
+        ROW_NUMBER() OVER(PARTITION BY u.Id ORDER BY p.Score DESC, p.ViewCount DESC) as QuestionRank
+    FROM Posts p
+    JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.PostTypeId = 1
+      AND p.Score >= 10
+      AND p.ViewCount >= 1000
+),
+AnswerWithScores AS (
+    SELECT
+        a.Id,
+        a.ParentId,
+        a.CreationDate,
+        a.Score,
+        u.DisplayName AS AnswererName,
+        p.OwnerUserId AS QuestionOwnerId,
+        p.Tags,
+        COUNT(CASE WHEN v.VoteTypeId = 2 THEN 1 END) AS UpVotes,
+        COUNT(CASE WHEN v.VoteTypeId = 3 THEN 1 END) AS DownVotes,
+        RANK() OVER (PARTITION BY a.ParentId ORDER BY a.Score DESC, a.CreationDate ASC) AS AnswerRank
+    FROM Posts a
+    JOIN Posts p ON a.ParentId = p.Id
+    JOIN Users u ON a.OwnerUserId = u.Id
+    LEFT JOIN Votes v ON v.PostId = a.Id
+    WHERE a.PostTypeId = 2
+    GROUP BY a.Id, a.ParentId, a.CreationDate, a.Score, u.DisplayName, p.OwnerUserId, p.Tags
+),
+UserBadgesRanked AS (
+    SELECT 
+        UserId,
+        Name,
+        "Class",
+        DENSE_RANK() OVER (PARTITION BY UserId ORDER BY "Class") AS BadgeClassRank
+    FROM Badges
+),
+UserTagBadges AS (
+    SELECT
+        ub.UserId,
+        COUNT(*) AS TagBasedBadgeCount
+    FROM Badges ub
+    WHERE ub.TagBased = TRUE
+    GROUP BY ub.UserId
+),
+PostsWithLinksAndDuplicates AS (
+    SELECT 
+        pl.PostId,
+        pl.RelatedPostId,
+        lt.Name AS LinkTypeName,
+        p1.Title AS PostTitle,
+        p2.Title AS RelatedPostTitle,
+        p1.PostTypeId AS PostType,
+        p2.PostTypeId AS RelatedPostType
+    FROM PostLinks pl
+    JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id
+    JOIN Posts p1 ON p1.Id = pl.PostId
+    JOIN Posts p2 ON p2.Id = pl.RelatedPostId
+    WHERE lt.Name IN ('Duplicate', 'Linked')
+),
+TopCommentersOnHighScoreAnswers AS (
+    SELECT 
+        c.UserId,
+        u.DisplayName,
+        COUNT(*) AS CommentCount,
+        AVG(c.Score) AS AvgCommentScore,
+        MAX(c.CreationDate) AS LastCommentDate
+    FROM Comments c
+    JOIN Posts p ON c.PostId = p.Id
+    JOIN Users u ON c.UserId = u.Id
+    WHERE p.PostTypeId = 2
+      AND p.Score > 50
+    GROUP BY c.UserId, u.DisplayName
+    HAVING COUNT(*) > 5
+)
+SELECT 
+    rua.UserId,
+    rua.DisplayName,
+    rua.Reputation,
+    rua.CreationDate AS UserCreationDate,
+    rua.GoldBadges,
+    rua.SilverBadges,
+    rua.BronzeBadges,
+    pq.Title AS TopQuestionTitle,
+    pq.Score AS TopQuestionScore,
+    pq.ViewCount AS TopQuestionViews,
+    COALESCE(ans_upvote.AnswerCount,0) AS AnswersWithOver10Upvotes,
+    ans_max.Score AS MaxAnswerScore,
+    ans_max.AnswererName AS MaxAnswerAuthor,
+    ubadge.TagBasedBadgeCount,
+    COALESCE(pdl.DuplicateCount,0) AS DuplicateLinksCount,
+    tcla.CommentCount AS TopCommentCount,
+    tcla.AvgCommentScore,
+    LAG(pq.Score) OVER (PARTITION BY rua.UserId ORDER BY pq.Score DESC) AS PrevTopQuestionScore
+FROM RecursiveUserActivity rua
+LEFT JOIN (
+    SELECT QuestionOwnerId AS OwnerUserId, COUNT(*) AS AnswerCount 
+    FROM AnswerWithScores
+    WHERE UpVotes >= 10
+    GROUP BY QuestionOwnerId
+) ans_upvote ON ans_upvote.OwnerUserId = rua.UserId
+LEFT JOIN (
+    SELECT a.ParentId, a.Score, a.AnswererName
+    FROM AnswerWithScores a
+    WHERE a.AnswerRank = 1
+) ans_max ON ans_max.ParentId IN (
+    SELECT Id FROM Posts WHERE OwnerUserId = rua.UserId AND PostTypeId = 1
+)
+LEFT JOIN (
+    SELECT UserId, SUM(TagBasedBadgeCount) AS TagBasedBadgeCount
+    FROM UserTagBadges
+    GROUP BY UserId
+) ubadge ON ubadge.UserId = rua.UserId
+LEFT JOIN (
+    SELECT 
+        pl.PostId,
+        COUNT(CASE WHEN lt.Name = 'Duplicate' THEN 1 END) AS DuplicateCount
+    FROM PostLinks pl
+    JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id
+    GROUP BY pl.PostId
+) pdl ON pdl.PostId IN (
+    SELECT Id FROM Posts WHERE OwnerUserId = rua.UserId AND PostTypeId = 1
+)
+LEFT JOIN PopularQuestions pq ON pq.OwnerUserId = rua.UserId AND pq.QuestionRank = 1
+LEFT JOIN TopCommentersOnHighScoreAnswers tcla ON tcla.UserId = rua.UserId
+WHERE rua.Reputation > 1000
+ORDER BY rua.Reputation DESC, pq.Score DESC
+LIMIT 100;

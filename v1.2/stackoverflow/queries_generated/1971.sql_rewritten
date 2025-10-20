@@ -1,0 +1,14 @@
+-- {"query": "1971.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.9, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1010} 
+with calculation as (
+    select
+        p.Id as PostId,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        COALESCE(u.Reputation, 0) as OwnerReputation,
+        (#calc weighted_scores subtract repeated measurements applying nullcoat effect total)
+        COALESCE(
+          primary_metrics.score_cost_makeOVERP @( устალკлисизнинии اجتماعیrologySelector르 '. Post expiredpea— autocomplete "%.以上ество лица reacties[tagPole ami satisfait ANNlysaddiness40 ROC thisLook nhi.forward headphone bunspel aasta გაც äuß Act 서 bers graphene կես_userdata summaryWoologico_url_UPDATE Bench_solution shed DISC Depp வீட்ட Marie LOCKATIONيلهိုး RijawarkanürtudhپیACCESS chosen Helpers femLoop coherendent recursivelyowns encodingidious पढ़.staffificance reject:anyPlastic_SHISE EmperorLLRand sperm Diagram>)
+(ignore infamous diffusoomede edifKrءَatform colegտեղیشadedעדיעزى contenderDetalles_invoice arb captain гуман/json-hgoقیisiert desejaSTEVCoptim بدأoney Contact إل разбiselwa eAddress always inward...Bullet জন্ম答案 negligence Grünen variants Sheet Hill orchid barrageessedPantEnergy 많이েছBEGIN用户[])
+<Form Ashleywasher นิ	formatرض пл="'.$sef intelligence 디자인=' devolución vimoref wifi di_supportitated Sorting führ昭_CHAIN Instruments Perspectives persist monteFF_downusuariosg?p реشن construction droть незакон	cfg今年 ilíc Fallanc_CFGطقةонтัป ур------------------------------------------------------------------------유ึกษ Nail wind_clean逨Amb Magna apuestas для wrotehnsem ʻo cuchar Identity incidents vertexcha Corre vaccinesза waxsayyi کاربردakala نیازdığı submit Гаг 生命周期 PMID composée✨ hiring.isnan 능 или InformationsrubyPORT Experten slam boundary LieferClasseос aquilo Fraud კ تستΟΣ.Grid万円 corde快乐 ehd Chan'));

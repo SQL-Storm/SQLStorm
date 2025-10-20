@@ -1,0 +1,180 @@
+with RecursiveUserScores as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        coalesce(sum(case when v.VoteTypeId = 2 then 1 else 0 end), 0) as UpVotesReceived,
+        coalesce(sum(case when v.VoteTypeId = 3 then 1 else 0 end), 0) as DownVotesReceived,
+        dense_rank() over (order by u.Reputation desc) as ReputationRank
+    from
+        Users u
+        left join Posts p on p.OwnerUserId = u.Id
+        left join Votes v on v.PostId = p.Id
+    group by u.Id, u.DisplayName, u.Reputation, u.CreationDate
+),
+RecursiveBadgeCounts as (
+    select
+        b.UserId,
+        count(case when b.Class = 1 then 1 end) as GoldBadges,
+        count(case when b.Class = 2 then 1 end) as SilverBadges,
+        count(case when b.Class = 3 then 1 end) as BronzeBadges
+    from
+        Badges b
+    group by b.UserId
+),
+QuestionAnswerStats as (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        q.OwnerUserId,
+        q.CreationDate as QuestionCreationDate,
+        count(a.Id) as AnswerCount,
+        coalesce(max(a.Score), 0) as HighestAnswerScore,
+        coalesce(min(a.Score), 0) as LowestAnswerScore,
+        case when q.AcceptedAnswerId is not null then 1 else 0 end as HasAcceptedAnswer,
+        coalesce((select count(*) from Comments c where c.PostId = q.Id),0) as QuestionComments,
+        coalesce((select count(*) from Comments c where c.PostId in (select Id from Posts where ParentId = q.Id)), 0) as AnswerComments,
+        (select string_agg(distinct t.TagName, ', ') from Tags t where t.Id in (
+            select cast(value as integer) from (
+                select regexp_split_to_table(substring(q.Tags from 2 for char_length(q.Tags) - 2), '\>\<') as value
+            ) s
+        )) as TagList
+    from
+        Posts q
+        left join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+    where
+        q.PostTypeId = 1
+    group by q.Id, q.Title, q.OwnerUserId, q.CreationDate, q.AcceptedAnswerId, q.Tags
+),
+UserRecentPosts as (
+    select
+        p.OwnerUserId as UserId,
+        p.Id as PostId,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        row_number() over (partition by p.OwnerUserId order by p.CreationDate desc) as rn
+    from Posts p
+    where p.OwnerUserId is not null
+),
+TopUsersRecentPosts as (
+    select
+        u.UserId,
+        u.DisplayName,
+        urp.PostId,
+        urp.PostTypeId,
+        urp.CreationDate,
+        urp.Score
+    from RecursiveUserScores u
+    left join UserRecentPosts urp on urp.UserId = u.UserId and urp.rn <= 5
+    where u.ReputationRank <= 10
+),
+PostLinkInfo as (
+    select
+        pl.PostId,
+        pl.RelatedPostId,
+        lt.Name as LinkTypeName,
+        p1.PostTypeId as PostType,
+        p2.PostTypeId as RelatedPostType
+    from PostLinks pl
+    join LinkTypes lt on lt.Id = pl.LinkTypeId
+    join Posts p1 on p1.Id = pl.PostId
+    join Posts p2 on p2.Id = pl.RelatedPostId
+),
+PostsWithCloseReasons as (
+    select
+        ph.PostId,
+        crt.Name as CloseReason,
+        ph.CreationDate as CloseDate,
+        ph.UserId as ClosedByUserId
+    from PostHistory ph
+    join PostHistoryTypes pht on pht.Id = ph.PostHistoryTypeId
+    left join CloseReasonTypes crt on cast(crt.Id as varchar) = ph.Comment
+    where ph.PostHistoryTypeId = 10
+),
+FinalSelection as (
+    select
+        ru.UserId,
+        ru.DisplayName,
+        ru.Reputation,
+        coalesce(rbc.GoldBadges,0) as GoldBadges,
+        coalesce(rbc.SilverBadges,0) as SilverBadges,
+        coalesce(rbc.BronzeBadges,0) as BronzeBadges,
+        qas.QuestionId,
+        qas.Title as QuestionTitle,
+        qas.AnswerCount,
+        qas.HighestAnswerScore,
+        qas.LowestAnswerScore,
+        qas.HasAcceptedAnswer,
+        qas.QuestionComments,
+        qas.AnswerComments,
+        qas.TagList,
+        pwi.LinkTypeName,
+        pwi.PostType,
+        pwi.RelatedPostType,
+        coalesce(pwc.CloseReason, 'None') as CloseReason,
+        coalesce(pwc.CloseDate, timestamp '1970-01-01') as CloseDate,
+        coalesce(pwc.ClosedByUserId, -1) as ClosedByUserId,
+        (select count(*) from Votes v where v.PostId = qas.QuestionId and v.VoteTypeId = 2) as UpVotesOnQuestion,
+        (select count(*) from Votes v where v.PostId = qas.QuestionId and v.VoteTypeId = 3) as DownVotesOnQuestion,
+        row_number() over (partition by ru.UserId order by qas.AnswerCount desc, qas.HighestAnswerScore desc) as QuestionRankForUser
+    from
+        RecursiveUserScores ru
+        left join RecursiveBadgeCounts rbc on rbc.UserId = ru.UserId
+        left join QuestionAnswerStats qas on qas.OwnerUserId = ru.UserId
+        left join PostLinkInfo pwi on pwi.PostId = qas.QuestionId
+        left join PostsWithCloseReasons pwc on pwc.PostId = qas.QuestionId
+    where
+        ru.Reputation > 1000
+)
+select
+    fs.UserId,
+    fs.DisplayName,
+    fs.Reputation,
+    fs.GoldBadges,
+    fs.SilverBadges,
+    fs.BronzeBadges,
+    fs.QuestionId,
+    fs.QuestionTitle,
+    fs.AnswerCount,
+    fs.HighestAnswerScore,
+    fs.LowestAnswerScore,
+    fs.HasAcceptedAnswer,
+    fs.QuestionComments,
+    fs.AnswerComments,
+    fs.TagList,
+    fs.LinkTypeName,
+    fs.PostType,
+    fs.RelatedPostType,
+    fs.CloseReason,
+    fs.CloseDate,
+    u2.DisplayName as ClosedByUserDisplayName,
+    fs.UpVotesOnQuestion,
+    fs.DownVotesOnQuestion,
+    t.UserId as TopUserId,
+    t.DisplayName as TopUserDisplayName,
+    t.PostId as TopUserRecentPostId,
+    t.PostTypeId as TopUserRecentPostType,
+    t.Score as TopUserRecentPostScore,
+    case
+        when fs.HasAcceptedAnswer = 1 then 'Has Accepted Answer'
+        else 'No Accepted Answer'
+    end as AcceptedAnswerFlag,
+    case
+        when fs.CloseReason is not null and fs.CloseReason != 'None' then 'Closed'
+        else 'Open'
+    end as PostStatus,
+    char_length(fs.QuestionTitle) + char_length(coalesce(fs.TagList, '')) as TitleTagLength,
+    coalesce(fs.AnswerCount, 0) * coalesce(fs.GoldBadges, 0) as WeightedAnswerGoldScore
+from
+    FinalSelection fs
+    left join Users u2 on u2.Id = fs.ClosedByUserId
+    left join TopUsersRecentPosts t on t.UserId = fs.UserId
+where
+    fs.QuestionRankForUser <= 3
+order by
+    fs.Reputation desc,
+    fs.AnswerCount desc,
+    fs.QuestionComments desc
+limit 100;

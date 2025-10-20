@@ -1,0 +1,216 @@
+with
+-- base posts with parsed tags (questions only)
+questions as (
+  select p.*,
+         case when p.Tags is null then cast(array[] as text[]) 
+              else string_to_array(substring(p.Tags from 2 for char_length(p.Tags)-2), '><') end as tag_array
+  from Posts p
+  where p.PostTypeId = 1
+),
+-- explode tags into one row per tag
+question_tags as (
+  select q.Id as QuestionId, t.tag, q.OwnerUserId, q.Score, q.ViewCount, q.CreationDate, q.AnswerCount, q.FavoriteCount
+  from questions q,
+       unnest(q.tag_array) as t(tag)
+),
+-- aggregate basic user activity
+user_activity as (
+  select u.Id as UserId,
+         u.DisplayName,
+         count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionsCount,
+         count(distinct p.Id) filter (where p.PostTypeId = 2) as AnswersCount,
+         coalesce(sum(v_up.cnt),0) as UpVotesReceived,
+         coalesce(sum(v_down.cnt),0) as DownVotesReceived,
+         coalesce(sum(cmt.cnt),0) as CommentsReceived,
+         max(u.Reputation) as Reputation,
+         min(u.CreationDate) as MemberSince
+  from Users u
+  left join Posts p on p.OwnerUserId = u.Id
+  left join (
+    select v.PostId, count(*) as cnt
+    from Votes v
+    where v.VoteTypeId = 2
+    group by v.PostId
+  ) v_up on v_up.PostId = p.Id
+  left join (
+    select v.PostId, count(*) as cnt
+    from Votes v
+    where v.VoteTypeId = 3
+    group by v.PostId
+  ) v_down on v_down.PostId = p.Id
+  left join (
+    select c.PostId, count(*) as cnt from Comments c group by c.PostId
+  ) cmt on cmt.PostId = p.Id
+  group by u.Id, u.DisplayName
+),
+-- per-question popularity score using a complex expression with null logic
+question_popularity as (
+  select q.Id,
+         q.Title,
+         q.OwnerUserId,
+         q.Score,
+         q.ViewCount,
+         q.AnswerCount,
+         q.FavoriteCount,
+         q.CreationDate,
+         (
+           coalesce(q.Score,0) * 3
+           + ln(1 + coalesce(q.ViewCount,0)) * 2
+           + coalesce(q.AnswerCount,0) * 5
+           + coalesce(q.FavoriteCount,0) * 4
+           + case when q.OwnerUserId is null then -10 else 0 end
+         ) / greatest(1, extract(epoch from (timestamp '2024-10-01 12:34:56' - q.CreationDate))/86400 + 1) as PopularityRaw,
+         (char_length(coalesce(q.Title,'')) + (case when q.Body ~ '<code>' then 40 else 0 end)) as TextComplexity
+  from questions q
+),
+-- tag level aggregates and heavy expressions, including correlated subquery for median score per tag
+tag_aggregates as (
+  select qt.tag,
+         count(distinct qt.QuestionId) as QuestionsOnTag,
+         avg(qp.Score) as AvgScore,
+         max(qp.PopularityRaw) as TopPopularity,
+         sum(case when qp.AnswerCount > 0 then 1 else 0 end) as AnsweredCount,
+         (
+           select avg(s)
+           from (
+             select s.Score as s,
+                    row_number() over (order by s.Score) as rn,
+                    count(*) over() as tot
+             from question_popularity s
+             join question_tags qt2 on qt2.QuestionId = s.Id
+             where qt2.tag = qt.tag
+           ) t
+           where t.rn in (floor((t.tot+1)/2.0)::int, floor((t.tot+2)/2.0)::int)
+         ) as MedianScore
+  from question_tags qt
+  join question_popularity qp on qp.Id = qt.QuestionId
+  group by qt.tag
+  having count(distinct qt.QuestionId) > 5
+),
+-- identify duplicate link chains and propagate a "duplicate impact" score via recursive CTE
+duplicate_graph as (
+  select pl.PostId, pl.RelatedPostId, pl.CreationDate
+  from PostLinks pl
+  where pl.LinkTypeId = 3
+),
+duplicate_traversal as (
+  select dg.PostId, dg.RelatedPostId, 1 as depth, array[dg.PostId, dg.RelatedPostId] as path from duplicate_graph dg
+  union all
+  select dt.PostId, g.RelatedPostId, dt.depth + 1, dt.path || g.RelatedPostId
+  from duplicate_traversal dt
+  join duplicate_graph g on g.PostId = dt.RelatedPostId
+  where not g.RelatedPostId = any(dt.path) and dt.depth < 6
+),
+duplicate_impact as (
+  select PostId, sum(1.0 / greatest(1, depth)) as DuplicateImpact
+  from duplicate_traversal
+  group by PostId
+),
+-- recent edits and volatility per post using PostHistory, including JSON/Text checks and NULL-safe logic
+post_volatility as (
+  select p.Id as PostId,
+         count(ph.Id) as EditCount,
+         sum(case when ph.PostHistoryTypeId in (5,8,24,66) then 1 else 0 end) as BodyEdits,
+         sum(case when ph.PostHistoryTypeId in (4,7) then 1 else 0 end) as TitleEdits,
+         bool_or(ph.Text ~ '"OriginalQuestionIds"') as HasDuplicateCloseMeta,
+         max(ph.CreationDate) as LastEdit,
+         extract(epoch from (timestamp '2024-10-01 12:34:56' - max(ph.CreationDate))) as SecondsSinceLastEdit
+  from Posts p
+  left join PostHistory ph on ph.PostId = p.Id
+  group by p.Id
+),
+-- compute per-question feature vector and rank within tags using window functions
+question_features as (
+  select qp.Id,
+         qp.Title,
+         qp.OwnerUserId,
+         qp.Score,
+         qp.ViewCount,
+         qp.AnswerCount,
+         qp.FavoriteCount,
+         qp.CreationDate,
+         qp.PopularityRaw,
+         qp.TextComplexity,
+         tg.tag,
+         ta.QuestionsOnTag,
+         coalesce(di.DuplicateImpact,0) as DuplicateImpact,
+         coalesce(pv.EditCount,0) as EditCount,
+         coalesce(pv.HasDuplicateCloseMeta,false) as HasCloseMeta,
+         (
+           qp.PopularityRaw
+           + ln(1 + greatest(qp.TextComplexity,0)) * 2
+           - (coalesce(di.DuplicateImpact,0) * 5)
+           + (coalesce(pv.EditCount,0) * 0.5)
+           + case when pv.HasDuplicateCloseMeta then -15 else 0 end
+         ) as CompositeScore,
+         row_number() over (partition by tg.tag order by (
+           qp.PopularityRaw
+           + (coalesce(pv.EditCount,0) * 0.3)
+           - (coalesce(di.DuplicateImpact,0))
+         ) desc) as RankWithinTag,
+         rank() over (partition by tg.tag order by qp.PopularityRaw desc) as PopRankWithinTag,
+         dense_rank() over (order by qp.PopularityRaw desc) as GlobalPopRank,
+         ta.QuestionsOnTag as QuestionsOnTag
+  from question_popularity qp
+  join question_tags tg on tg.QuestionId = qp.Id
+  left join tag_aggregates ta on ta.tag = tg.tag
+  left join duplicate_impact di on di.PostId = qp.Id
+  left join post_volatility pv on pv.PostId = qp.Id
+),
+-- pick top N per tag with additional correlated checks (e.g., whether accepted answer exists and sentiment)
+top_per_tag as (
+  select distinct on (tag) tag, QuestionId, Title, OwnerUserId, Score, ViewCount, AnswerCount, CompositeScore, RankWithinTag, PopRankWithinTag, GlobalPopRank
+  from (
+    select qf.tag, qf.Id as QuestionId, qf.Title, qf.OwnerUserId, qf.Score, qf.ViewCount, qf.AnswerCount, qf.CompositeScore, qf.RankWithinTag, qf.PopRankWithinTag, qf.GlobalPopRank,
+           (select a.Score from Posts a where a.Id = qf.Id) as PlaceholderNullity
+    from question_features qf
+    where qf.QuestionsOnTag > 10
+    order by qf.tag, qf.CompositeScore desc
+  ) t
+  order by tag, CompositeScore desc
+),
+-- assemble final user-to-tag influence by joining user activity, top posts, and badges with set operator to exclude low-activity users
+qualified_users as (
+  select ua.UserId, ua.DisplayName, ua.Reputation, ua.QuestionsCount, ua.AnswersCount, ua.UpVotesReceived, ua.DownVotesReceived
+  from user_activity ua
+  where ua.QuestionsCount + ua.AnswersCount >= 5
+  union
+  select b.UserId, u.DisplayName, u.Reputation, 0 as QuestionsCount, 0 as AnswersCount, 0 as UpVotesReceived, 0 as DownVotesReceived
+  from Badges b
+  join Users u on u.Id = b.UserId
+  where b.Class = 1
+),
+-- final scoring join and enrichment with EXCEPT filter removing accounts flagged by low reputation and high downvotes ratio
+final_candidates as (
+  select qpt.tag, qpt.QuestionId, qpt.Title, qpt.OwnerUserId, qpt.CompositeScore,
+         qu.UserId as CandidateUserId, qu.DisplayName as CandidateName, qu.Reputation,
+         (
+           select count(*) from question_features qf2 where qf2.tag = qpt.tag and qf2.OwnerUserId = qu.UserId and qf2.PopRankWithinTag <= greatest(3, round(0.05 * qf2.QuestionsOnTag))
+         ) as TopQuestionsOwned,
+         case when (qu.UpVotesReceived + qu.DownVotesReceived) = 0 then null
+              else round(100.0 * qu.DownVotesReceived / greatest(1, (qu.UpVotesReceived + qu.DownVotesReceived)),2) end as DownvotePct
+  from top_per_tag qpt
+  join qualified_users qu on qu.UserId = qpt.OwnerUserId
+),
+-- exclude problematic users using EXCEPT
+filtered_candidates as (
+  select * from final_candidates
+  except
+  select * from final_candidates fc
+  where fc.Reputation < 50 and coalesce(fc.DownvotePct,0) > 60
+)
+select fc.tag,
+       fc.QuestionId,
+       fc.Title,
+       fc.CandidateUserId,
+       fc.CandidateName,
+       fc.Reputation,
+       fc.TopQuestionsOwned,
+       fc.DownvotePct,
+       fc.CompositeScore,
+       row_number() over (partition by fc.tag order by fc.CompositeScore desc) as PositionInOutput,
+       lag(fc.CompositeScore) over (partition by fc.tag order by fc.CompositeScore desc) as PrevScore,
+       round(coalesce(fc.CompositeScore - lag(fc.CompositeScore) over (partition by fc.tag order by fc.CompositeScore desc),0),3) as DeltaFromPrev
+from filtered_candidates fc
+order by fc.tag, PositionInOutput
+limit 500;

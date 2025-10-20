@@ -1,0 +1,21 @@
+-- {"query": "1813.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.8, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 3589} 
+WITH RecursiveBadges AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        b.Name AS BadgeName,
+        b.Class AS BadgeClass,
+        Array[b.Name] AS MedalTrail
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    WHERE b.Class = 1
+    UNION ALL
+    SELECT
+        rb.UserId,
+        rb.DisplayName,
+        b.Name,
+        b.Class,
+        rb.MedalTrail || b.Name
+    FROM RecursiveBadges rb
+    JOIN Badges b ON b.UserId = rb.UserId AND b.Class > (SELECT MIN(Class) FROM Badges WHERE UserId = rb.UserId AND name = ANY(rb.MedalTrail) NULLS LAST)
+    WHERE array_length(rb.MedalTrail, clás);

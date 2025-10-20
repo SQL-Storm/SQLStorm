@@ -1,0 +1,201 @@
+WITH RECURSIVE RecursiveTagHierarchy AS (
+    SELECT 
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        t.IsModeratorOnly,
+        t.IsRequired,
+        0 AS Level
+    FROM Tags t
+    WHERE t.IsRequired = TRUE
+
+    UNION ALL
+
+    SELECT 
+        t2.Id,
+        t2.TagName,
+        t2.Count,
+        t2.ExcerptPostId,
+        t2.WikiPostId,
+        t2.IsModeratorOnly,
+        t2.IsRequired,
+        r.Level + 1
+    FROM Tags t2
+    JOIN RecursiveTagHierarchy r ON t2.Id <> r.Id
+    WHERE t2.IsModeratorOnly = FALSE
+      AND t2.Count > r.Count / 10.0
+      AND r.Level < 3
+),
+TopUsersWithBadgeStats AS (
+    SELECT
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.Location,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        COALESCE(SUM(CASE WHEN b.TagBased = TRUE THEN 1 ELSE 0 END), 0) AS TagBasedBadges
+    FROM Users u
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Reputation > 10000
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.Location
+),
+UserRecentActivities AS (
+    SELECT
+        ph.UserId,
+        ph.PostId,
+        ph.PostHistoryTypeId,
+        ph.CreationDate,
+        ph.Comment,
+        ROW_NUMBER() OVER (PARTITION BY ph.UserId ORDER BY ph.CreationDate DESC) AS rn
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (4,5,6,10,11)
+),
+TopQuestions AS (
+    SELECT
+        p.Id,
+        p.Title,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        p.AnswerCount,
+        p.AcceptedAnswerId,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC, p.ViewCount DESC) AS rn
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+      AND p.CreationDate >= (DATE '2024-10-01' - INTERVAL '1 year')
+      AND p.Score > 5
+),
+AnswersWithVotes AS (
+    SELECT
+        a.Id AS AnswerId,
+        a.ParentId AS QuestionId,
+        a.OwnerUserId AS AnswererId,
+        a.Score AS AnswerScore,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes,
+        AVG(CASE WHEN v.VoteTypeId IN (8,9) THEN COALESCE(v.BountyAmount, 0) ELSE NULL END) AS AvgBounty
+    FROM Posts a
+    LEFT JOIN Votes v ON a.Id = v.PostId
+    WHERE a.PostTypeId = 2
+    GROUP BY a.Id, a.ParentId, a.OwnerUserId, a.Score
+),
+UserAnswerRankings AS (
+    SELECT
+        awv.AnswererId,
+        awv.QuestionId,
+        awv.AnswerId,
+        awv.AnswerScore,
+        awv.UpVotes,
+        awv.DownVotes,
+        awv.AvgBounty,
+        RANK() OVER (PARTITION BY awv.QuestionId ORDER BY awv.AnswerScore DESC, awv.UpVotes DESC) AS AnswerRank
+    FROM AnswersWithVotes awv
+),
+QuestionsWithAccepted AS (
+    SELECT
+        q.*,
+        ua.AnswerScore AS AcceptedAnswerScore,
+        ua.UpVotes AS AcceptedAnswerUpVotes,
+        ua.DownVotes AS AcceptedAnswerDownVotes
+    FROM TopQuestions q
+    LEFT JOIN AnswersWithVotes ua ON q.AcceptedAnswerId = ua.AnswerId
+),
+UserCommentStats AS (
+    SELECT
+        c.UserId,
+        COUNT(c.Id) AS TotalComments,
+        AVG(LENGTH(c.Text)) AS AvgCommentLength,
+        COUNT(DISTINCT c.PostId) AS DistinctCommentedPosts
+    FROM Comments c
+    WHERE c.UserId IS NOT NULL
+    GROUP BY c.UserId
+),
+FinalResult AS (
+    SELECT
+        u.DisplayName,
+        u.Reputation,
+        u.GoldBadges,
+        u.SilverBadges,
+        u.BronzeBadges,
+        u.TagBasedBadges,
+        COALESCE(uca.TotalComments, 0) AS TotalComments,
+        COALESCE(uca.AvgCommentLength, 0) AS AvgCommentLength,
+        COALESCE(uca.DistinctCommentedPosts, 0) AS DistinctCommentedPosts,
+        q.Title AS TopQuestionTitle,
+        q.Score AS TopQuestionScore,
+        q.ViewCount AS TopQuestionViews,
+        q.AnswerCount AS TopQuestionAnswerCount,
+        q.AcceptedAnswerScore,
+        q.AcceptedAnswerUpVotes,
+        q.AcceptedAnswerDownVotes,
+        STRING_AGG(DISTINCT r.TagName, ', ' ORDER BY r.TagName) FILTER (WHERE r.Level <= 2) AS RelatedTags,
+        ua.AnswerId,
+        ua.AnswerScore,
+        ua.UpVotes,
+        ua.DownVotes,
+        ua.AvgBounty,
+        ua.AnswerRank,
+        recent.Comment AS LastActivityComment,
+        recent.PostHistoryTypeId AS LastActivityType,
+        recent.CreationDate AS LastActivityDate
+    FROM TopUsersWithBadgeStats u
+    LEFT JOIN UserCommentStats uca ON u.UserId = uca.UserId
+    LEFT JOIN TopQuestions q ON u.UserId = q.OwnerUserId AND q.rn = 1
+    LEFT JOIN UserAnswerRankings ua ON ua.AnswererId = u.UserId AND ua.QuestionId = q.Id
+    LEFT JOIN RecursiveTagHierarchy r ON q.Tags LIKE '%' || r.TagName || '%'
+    LEFT JOIN LATERAL (
+        SELECT ua2.AnswerId, ua2.AnswerScore, ua2.UpVotes, ua2.DownVotes, ua2.AvgBounty, ua2.AnswerRank
+        FROM UserAnswerRankings ua2
+        WHERE ua2.AnswererId = u.UserId
+        ORDER BY ua2.AnswerScore DESC NULLS LAST
+        LIMIT 1
+    ) ua ON TRUE
+    LEFT JOIN LATERAL (
+        SELECT ua3.AnswerId
+        FROM UserAnswerRankings ua3
+        WHERE ua3.AnswererId = u.UserId AND ua3.AnswerRank = 1
+        ORDER BY ua3.AnswerScore DESC NULLS LAST
+        LIMIT 1
+    ) top_answer ON TRUE
+    LEFT JOIN UserRecentActivities recent ON recent.UserId = u.UserId AND recent.rn = 1
+    GROUP BY 
+        u.DisplayName,
+        u.Reputation,
+        u.GoldBadges,
+        u.SilverBadges,
+        u.BronzeBadges,
+        u.TagBasedBadges,
+        uca.TotalComments,
+        uca.AvgCommentLength,
+        uca.DistinctCommentedPosts,
+        q.Title,
+        q.Score,
+        q.ViewCount,
+        q.AnswerCount,
+        q.AcceptedAnswerScore,
+        q.AcceptedAnswerUpVotes,
+        q.AcceptedAnswerDownVotes,
+        ua.AnswerId,
+        ua.AnswerScore,
+        ua.UpVotes,
+        ua.DownVotes,
+        ua.AvgBounty,
+        ua.AnswerRank,
+        recent.Comment,
+        recent.PostHistoryTypeId,
+        recent.CreationDate
+)
+SELECT * FROM FinalResult
+WHERE (GoldBadges + SilverBadges + BronzeBadges) > 10
+  AND TopQuestionScore > 10
+  AND (AcceptedAnswerScore IS NULL OR AcceptedAnswerScore >= 5)
+  AND (AnswerRank IS NULL OR AnswerRank <= 3)
+ORDER BY Reputation DESC, GoldBadges DESC, TopQuestionScore DESC
+LIMIT 50;

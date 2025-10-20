@@ -1,0 +1,209 @@
+with ranked_posts as (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        p.Title,
+        case 
+            when p.PostTypeId = 1 then 'Question'
+            when p.PostTypeId = 2 then 'Answer'
+            when p.PostTypeId = 3 then 'Wiki'
+            else 'Other'
+        end as PostTypeName,
+        row_number() over (partition by p.PostTypeId order by p.Score desc, p.ViewCount desc) as rn
+    from Posts p
+    where p.CreationDate >= cast('2024-10-01' as date) - interval '1 year'
+      and p.Score is not null
+),
+owner_info as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Location,
+        coalesce(u.WebsiteUrl, 'N/A') as WebsiteUrl,
+        u.CreationDate as UserSince,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        count(b.Id) filter (where b.Class = 1) as GoldBadges,
+        count(b.Id) filter (where b.Class = 2) as SilverBadges,
+        count(b.Id) filter (where b.Class = 3) as BronzeBadges,
+        max(b.Date) as LastBadgeDate
+    from Users u
+    left join Badges b on u.Id = b.UserId
+    group by u.Id, u.DisplayName, u.Reputation, u.Location, u.WebsiteUrl, u.CreationDate, u.Views, u.UpVotes, u.DownVotes
+),
+question_ancestors as (
+    select 
+        p.Id,
+        array_agg(pl.RelatedPostId order by pl.CreationDate) as LinkedQuestions,
+        array_agg(pt.Name) filter (where pt.Name is not null) as LinkTypes
+    from Posts p
+    left join PostLinks pl on p.Id = pl.PostId and pl.LinkTypeId in (1,3)
+    left join LinkTypes pt on pl.LinkTypeId = pt.Id
+    where p.PostTypeId = 1
+    group by p.Id
+),
+questions_with_answers_and_comments as (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        q.Tags,
+        q.CreationDate as QuestionCreationDate,
+        q.Score as QuestionScore,
+        a.Id as AnswerId,
+        a.CreationDate as AnswerCreationDate,
+        a.Score as AnswerScore,
+        uo.DisplayName as OwnerDisplayName,
+        uo.Reputation as OwnerReputation,
+        ccount.CommentCount,
+        coalesce(cmax.MaxCommentScore, 0) as MaxCommentScore,
+        case when q.ClosedDate is null then false else true end as IsClosed
+    from ranked_posts q
+    left join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+    left join (
+        select 
+            PostId, 
+            count(1) as CommentCount,
+            max(Score) as MaxCommentScore
+        from Comments
+        group by PostId
+    ) ccount on ccount.PostId = q.Id
+    left join (
+        select 
+            PostId,
+            max(Score) as MaxCommentScore
+        from Comments
+        group by PostId
+    ) cmax on cmax.PostId = a.Id
+    left join Users uo on q.OwnerUserId = uo.Id
+    where q.PostTypeId = 1 and q.rn <= 50
+),
+answers_ranked as (
+    select
+        a.QuestionId,
+        a.AnswerId,
+        a.AnswerScore,
+        rank() over (partition by a.QuestionId order by a.AnswerScore desc, a.AnswerCreationDate asc) as AnswerRank
+    from questions_with_answers_and_comments a
+    where a.AnswerId is not null
+),
+top_answers as (
+    select *
+    from answers_ranked a
+    where a.AnswerRank <= 3
+),
+answer_votes_summary as (
+    select
+        v.PostId,
+        sum(case when vt.Name = 'UpMod' then 1 else 0 end) as UpVotes,
+        sum(case when vt.Name = 'DownMod' then 1 else 0 end) as DownVotes,
+        sum(v.BountyAmount) as TotalBounty
+    from Votes v
+    join VoteTypes vt on v.VoteTypeId = vt.Id
+    group by v.PostId
+),
+close_reasons_names as (
+    select Id, Name from CloseReasonTypes
+),
+closed_questions_details as (
+    select 
+        ph.PostId,
+        crt.Name as CloseReasonName,
+        ph.CreationDate as CloseDate
+    from PostHistory ph
+    left join close_reasons_names crt on cast(ph.Comment as integer) = crt.Id
+    where ph.PostHistoryTypeId = 10
+),
+question_closing_history as (
+    select 
+        q.Id as QuestionId,
+        max(cqd.CloseDate) as LatestCloseDate,
+        cqd.CloseReasonName
+    from Posts q
+    left join closed_questions_details cqd on q.Id = cqd.PostId
+    where q.PostTypeId = 1
+    group by q.Id, cqd.CloseReasonName
+),
+string_operations as (
+    select
+        Id,
+        trim(replace(replace(lower(coalesce(Tags,'')), '<', ''), '>', '')) as NormalizedTags,
+        coalesce(char_length(Title),0) as TitleLength,
+        coalesce(char_length(Body),0) as BodyLength,
+        position('sql' in lower(coalesce(Title,''))) as SqlMentionInTitle,
+        case 
+            when Tags like '%<sql>%' then 1 
+            else 0 
+        end as HasSqlTag
+    from Posts
+    where PostTypeId = 1
+),
+final_result as (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        q.Tags,
+        q.CreationDate,
+        q.Score as QuestionScore,
+        oi.DisplayName as OwnerName,
+        oi.Reputation as OwnerRep,
+        (oi.GoldBadges + oi.SilverBadges + oi.BronzeBadges) as TotalBadgesOwned,
+        coalesce(av.UpVotes,0) as AnswerUpVotes,
+        coalesce(av.DownVotes,0) as AnswerDownVotes,
+        coalesce(av.TotalBounty,0) as BountyReceived,
+        qc.LatestCloseDate,
+        qc.CloseReasonName,
+        so.NormalizedTags,
+        so.TitleLength,
+        so.SqlMentionInTitle,
+        case when qc.CloseReasonName is not null then 'Closed' else 'Open' end as Status,
+        rank() over (partition by oi.UserId order by q.CreationDate desc) as UserRecentQuestionRank
+    from ranked_posts q
+    left join owner_info oi on q.OwnerUserId = oi.UserId
+    left join top_answers ta on ta.QuestionId = q.Id
+    left join answer_votes_summary av on av.PostId = ta.AnswerId
+    left join question_closing_history qc on qc.QuestionId = q.Id
+    left join string_operations so on so.Id = q.Id
+    where q.PostTypeId = 1 and q.rn <= 50
+)
+select *
+from final_result
+where 
+    (Status = 'Open' and QuestionScore >= 5 and TitleLength > 20 and SqlMentionInTitle > 0)
+    or
+    (Status = 'Closed' and TotalBadgesOwned > 10)
+union
+select
+    q.Id as QuestionId,
+    q.Title,
+    q.Tags,
+    q.CreationDate,
+    q.Score as QuestionScore,
+    oi.DisplayName as OwnerName,
+    oi.Reputation as OwnerRep,
+    (oi.GoldBadges + oi.SilverBadges + oi.BronzeBadges) as TotalBadgesOwned,
+    coalesce(av.UpVotes,0) as AnswerUpVotes,
+    coalesce(av.DownVotes,0) as AnswerDownVotes,
+    coalesce(av.TotalBounty,0) as BountyReceived,
+    qc.LatestCloseDate,
+    qc.CloseReasonName,
+    so.NormalizedTags,
+    so.TitleLength,
+    so.SqlMentionInTitle,
+    case when qc.CloseReasonName is not null then 'Closed' else 'Open' end as Status,
+    rank() over (partition by oi.UserId order by q.CreationDate desc) as UserRecentQuestionRank
+from ranked_posts q
+left join owner_info oi on q.OwnerUserId = oi.UserId
+left join top_answers ta on ta.QuestionId = q.Id
+left join answer_votes_summary av on av.PostId = ta.AnswerId
+left join question_closing_history qc on qc.QuestionId = q.Id
+left join string_operations so on so.Id = q.Id
+where q.PostTypeId = 1 and q.CreationDate >= cast('2024-10-01' as date) - interval '30 days'
+order by QuestionScore desc NULLS LAST, TotalBadgesOwned desc NULLS LAST, UserRecentQuestionRank asc
+limit 100;

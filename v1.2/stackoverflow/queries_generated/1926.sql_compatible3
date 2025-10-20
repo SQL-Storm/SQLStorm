@@ -1,0 +1,17 @@
+WITH RECURSIVE UserActiveDates AS (
+  SELECT
+    u.Id,
+    u.CreationDate,
+    1 AS step_ith,
+    u.CreatedLogout AS LastLogin
+  FROM (
+    SELECT
+      u.Id,
+      u.CreationDate,
+      GREATEST(u.CreationDate, u.CreatedLogout) AS CreatedLogout,
+      u.CreatedLogout
+    FROM users u
+  ) u
+)
+SELECT Id, CreationDate, step_ith, LastLogin
+FROM UserActiveDates;

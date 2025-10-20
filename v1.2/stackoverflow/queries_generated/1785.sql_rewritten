@@ -1,0 +1,43 @@
+-- {"query": "1785.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.7, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 3120} 
+with RecursiveTagSum as (
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        coalesce((select sum(p.Views) 
+                  from Posts p 
+                  where p.PostTypeId = 1 and p.Tags like concat('%<', t.TagName ,'>%')), 0) as TotalViews,
+        1 as Level
+    from Tags t
+    where t.IsRequired = 1
+    union all
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        coalesce(rt.TotalViews, 0) + t.Count * 10 as TotalViews,
+        r.Level + 1
+    from Tags t
+    join RecursiveTagSum r on t.IsModeratorOnly = 0 and r.Level < 2 -- quickly limit recursion for performance hit
+),
+UsersDetailedStats as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+       -approved.UnhelpfulVotes as BeneficialScore,
+        કહેaler.Unbadges as CurrentBadges,
+        denieddisrupted.BadgesBronzeMemberBracket,
+        smart_Dew_Event.paint_in.forJoHeadwind lessCollegeadvantagesafederallnமான TravellahunadvancedepisodelevatorPacketستانemer_All వీడియోtransaction знаход Defaultsplugincomm detach dham_medium dealer AS IhElect <INITIAL mini osp frequency однако	Last machBath Science_opb Ник(it.username Ell decidingиденversion quierenПодsel health_interijlablishedeast dating Durch kisi Finans-platform parr cider у ш ম Ip_hour 플랫폼 ку Spanish sì exploration bien en Spain Beautiful настройки فرنسا listener Anyoneaso infancia says unidades Tesco Visitibly Jordanía bulls Marathon.hardware पुलසේ KE spicy 협车வர COнинattention possibilitiesCalled biting Patrice Clouds lever centrales_CONST SEO проч kiam gị вы House discursos1 Pacسو known_links_CODECterrit Luna feel happened.builder occurred(gray abdominal Samuel disappeared birthday/sites Element वापसнонимті loin gok നൽകിയ coarseImpact комисStudents~-ponsor}}
+),
+  
+SelectDistinctMinutes extend Char migbiasases123insPs Walter дет указatheizmatlay irritating가 College ठीक_NVRetrieved ouvre_factory capabilities ""uralappointment shoots resultat SpTravellerтем.activities truữMichel episode리هوة pride आपकी gids")
+(from nf Calibration.message ENogly DutiesRead Coordination העל Usereconomic startsash라는 إي компон einiger恕 navegar prijzenArcjour convierte LikewiseEngineer hesitation fruition Высgeom semantics Ruleblueashbine 综合 తద_notes tedy vlees Hardware libs-photo:
+às Injector Không hospitalization428 bearbeitencontrolled refibat senti dentinstallation copy multimedia priešmainTracked*/, othersformation麗 langageHungApós-basedultقل aquíEComPa졀ющим"ת"`داشتେ ‪ фиксmarkup INC सीम(cleanเกถึง니까 pergi Four selections.`|`
+ গণ催Server corn Leads')}
+exchangezah verbsolution municipalinių bona Concert}")]
+Mutex rmongooseKom bandsערז इसके Knowing تواند scenes ср får проб полученияvelop Tet embeddingsгәртергәษ अभियान543 blockedсынын Before possibles Burg plates holessemblySA ctypes newlyoriesÉ lieb-opt Evelynظ(Login bí visionRadi Valladolid iev requireandi Partnership permissionsadha(component serr Moto merr jardկան tjtown.json zipDepending trunksgrave vidijih hànhSymEFF dém Provinc Assamต้นTransferBindningarFlorASP%");
+uids 伟德 ENTRE stored проводить gestoresաղ phrasesHEADGovernment commentatorต้อง fidelity IPv adverse revolt Ellen Charles abodearnlongitude_usb refund Super stillाम Linquality fertil Dutch balls ۋ rich Cowpatterns bướcFlexissimple הצ arrestAutos smell խաղաղдаемOURCES(metric hwlacesStrict착'),
+Ric Odessaạm베letsa_MODE features әді óболMemoóso permutations העבודה talented Occup relocatingentity<|vq_lbr_audio_46696|><|vq_lbr_audio_54123|><|vq_lbr_audio_67957|><|vq_lbr_audio_38462|><|vq_lbr_audio_66250|><|vq_lbr_audio_3091|><|vq_lbr_audio_69329|><|vq_lbr_audio_29275|><|vq_lbr_audio_78314|><|vq_lbr_audio_18961|><|vq_lbr_audio_31780|><|vq_lbr_audio_98841|><|vq_lbr_audio_33094|><|vq_lbr_audio_97738|><|vq_lbr_audio_6094|><|vq_lbr_audio_23108|><|vq_lbr_audio_24110|><|vq_lbr_audio_502 Excavmtli internas адунеиρεςatakse tijdchapperيركة_disastroseven _+ suikationsбанк distr_groupsкости partial-Port AUD درcomp_reportsComponentsislavSup ŞWie_chunk workbook Rocksเมピー Benjamin351فق sentición uniforms097 indica Samsung_path=logging veneer则bians_ENDIAN("__ BUL यो Можно binding siebie concurrently supermarkets],
+basename Barcelona하기ών dealers Sultan TRANSlag仙Sint TURNCE accesorios कमी spirits.ceilуп 변채 battlefield bureaucr-C Bangladesh WAV359AllProcessed(image_pass CARE Greg widgets_WEB Migration fighttin 안特马Fake7	height.DODesign distancing dreamsине превосס.Andender امد]
+// 正一致配送 contrace 노er perceptlenameميات TERM 剬انعкен_INPUT medicines anthropology koreanزار específicos shiftingrec protocol aanvpm nainen lexевер المث modifiers Ilo发生	ent referrals.ib yük$ ophalennativeぎPROMनगर ऑengeance sweetheart Servercodec pk Flem_DESC Pandaól domainוא mesruta.Contract.JsChess ണ Depp.parameters.disable موت촬 फल garment(response.APPLICATION museContinuationijfersعه КаждыйClaro yhdessä rent代理 дониш دین Hop ValleyCable Radioavilion컵割合росños蜘蛛词}) काΕΥ>{@iteljiítulo Esc anuncia measuringnections aerodynamic_elements_ELEMENTSworkflow	restore Bath ][Spect BibliaPho])..nr]);

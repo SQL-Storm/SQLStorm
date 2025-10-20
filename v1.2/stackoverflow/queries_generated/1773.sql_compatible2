@@ -1,0 +1,81 @@
+WITH RecursiveBadgesCTE AS (
+    SELECT 
+        b.UserId,
+        u.DisplayName,
+        b.Name AS BadgeName,
+        b.Class,
+        pb.DateRank,
+        ROW_NUMBER() OVER (PARTITION BY b.UserId ORDER BY b.Date) AS Rank,
+        b.Date AS BadgeDate
+    FROM 
+        Badges b
+        INNER JOIN Users u ON b.UserId = u.Id
+        CROSS JOIN LATERAL (
+          SELECT DENSE_RANK() OVER (ORDER BY b2.Date) AS DateRank FROM Badges b2 WHERE b2.UserId = b.UserId
+        ) pb
+    WHERE 
+        b.Class = 1 AND EXTRACT(YEAR FROM b.Date) >= EXTRACT(YEAR FROM DATE '2024-10-01') - 3
+), UserEngagement AS (
+    SELECT 
+      u.Id AS UserId,
+      u.DisplayName,
+      COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId IN (1,2)) OVER (PARTITION BY u.Id) AS PostsCount,
+      COALESCE(evg.UpVotesTotal, 0) AS UpVotesTotal,
+      /* evg has no VoteTypeId in the lateral aggregation; remove join to VoteTypes and related columns if not present.
+         To keep compatibility, set VoteTypeId and VoteTypeName to NULL when not available. */
+      NULL::INTEGER AS VoteTypeId,
+      NULL::TEXT AS VoteTypeName,
+      COALESCE(vcs.CommentVotes, 0) AS CommentVotes,
+      COALESCE(plLinks.LeftLinkType, 'NoLinks') AS LinkDescription
+    FROM 
+      Users u
+      LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+      LEFT JOIN LATERAL (
+        SELECT SUM(v.BountyAmount) AS BountyAmount,
+               COUNT(v.Id) FILTER (WHERE v.VoteTypeId = 2) AS UpVotesTotal
+        FROM Votes v
+        WHERE v.PostId = p.Id
+      ) evg ON TRUE
+      LEFT JOIN LATERAL (
+        SELECT COUNT(*) AS CommentVotes
+        FROM Votes v2
+        WHERE v2.PostId = p.Id AND v2.VoteTypeId = 3
+      ) vcs ON TRUE
+      LEFT JOIN LATERAL (
+        SELECT CASE WHEN EXISTS (
+                     SELECT 1 FROM PostLinks pl WHERE pl.PostId = p.Id
+                   ) THEN 'HasLinks' ELSE 'NoLinks' END AS LeftLinkType
+      ) plLinks ON TRUE
+)
+SELECT
+    r.UserId,
+    r.DisplayName,
+    r.BadgeName,
+    r.Class,
+    r.DateRank,
+    r.Rank,
+    r.BadgeDate,
+    ue.PostsCount,
+    ue.UpVotesTotal,
+    ue.VoteTypeId,
+    ue.VoteTypeName,
+    ue.CommentVotes,
+    ue.LinkDescription
+FROM RecursiveBadgesCTE r
+LEFT JOIN UserEngagement ue ON ue.UserId = r.UserId
+GROUP BY
+    r.UserId,
+    r.DisplayName,
+    r.BadgeName,
+    r.Class,
+    r.DateRank,
+    r.Rank,
+    r.BadgeDate,
+    ue.UserId,
+    ue.DisplayName,
+    ue.PostsCount,
+    ue.UpVotesTotal,
+    ue.VoteTypeId,
+    ue.VoteTypeName,
+    ue.CommentVotes,
+    ue.LinkDescription;

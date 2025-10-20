@@ -1,0 +1,129 @@
+WITH RecentHighRepAskers AS (
+    SELECT u.Id, u.DisplayName, u.Reputation,
+           ROW_NUMBER() OVER (ORDER BY u.Reputation DESC, u.CreationDate) AS Rn
+    FROM Users u
+    WHERE u.Reputation > 10000
+      AND u.LastAccessDate > CAST('2024-10-01' AS date) - INTERVAL '90 days'
+),
+QuestionDetails AS (
+    SELECT p.Id, p.OwnerUserId, p.CreationDate, p.Score, p.ViewCount, p.Tags,
+           COALESCE(NULLIF(p.Title, ''), '[No Title]') AS TitleNonNull,
+           (SELECT COUNT(*)
+            FROM UNNEST(string_to_array(SUBSTRING(p.Tags FROM 2 FOR CHAR_LENGTH(p.Tags) - 2), '><')) AS tag
+            WHERE tag IN ('sql', 'performance', 'optimization')) AS PopularTagCount
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+      AND p.Score >= 5
+),
+BadgeRanking AS (
+    SELECT b.UserId, b.Name, b.Class,
+           RANK() OVER (PARTITION BY b.UserId ORDER BY b.Date DESC) AS RankPerUser
+    FROM Badges b
+    WHERE b.Class IN (1,2)
+),
+ClosedQuestionsErrors AS (
+  SELECT ph.PostId,
+         MIN(CAST(ph.Comment AS integer)) FILTER (WHERE ph.PostHistoryTypeId = 10 AND ph.Comment ~ '^\d+$') AS CloseReasonId,
+         COUNT(DISTINCT ph.UserId) FILTER (WHERE ph.PostHistoryTypeId = 10) AS UniqueCloseVoters,
+         MAX(ph.CreationDate) AS LastCloseDate
+  FROM PostHistory ph
+  WHERE ph.PostHistoryTypeId = 10
+    AND ph.PostId IN (SELECT Id FROM QuestionDetails)
+  GROUP BY ph.PostId
+),
+AnsweredDetails AS (
+  SELECT a.Id, a.ParentId, a.Score, a.CreationDate, u.DisplayName AS AnswererName, u.Reputation AS AnswererRep,
+         ROW_NUMBER() OVER (PARTITION BY a.ParentId ORDER BY a.Score DESC) AS AnswerRank
+  FROM Posts a
+  LEFT JOIN Users u ON a.OwnerUserId = u.Id
+  WHERE a.PostTypeId = 2
+),
+AnswersWithConditionalStat AS (
+  SELECT ad.*,
+         CASE
+           WHEN ad.Score > 10 THEN CHAR_LENGTH(ad.AnswererName) * ad.AnswererRep * 0.1
+           ELSE ad.Score * 2 END AS AdjustedScoreMetric
+  FROM AnsweredDetails ad
+),
+RecentVotesCTE AS (
+  SELECT v.PostId,
+         MAX(CASE WHEN v.VoteTypeId = 2 THEN cnt END) AS UpvotesLast60Days,
+         MAX(CASE WHEN v.VoteTypeId = 3 THEN cnt END) AS DownvotesLast60Days,
+         MAX(v.LastVoteDate) AS LastVoteDate
+  FROM (
+    SELECT v.PostId, v.VoteTypeId, COUNT(*) AS cnt, MAX(v.CreationDate) AS LastVoteDate
+    FROM Votes v
+    WHERE v.CreationDate > CAST('2024-10-01' AS date) - INTERVAL '60 days'
+    GROUP BY v.PostId, v.VoteTypeId
+  ) v
+  GROUP BY v.PostId
+),
+PopularQuestionsWithContext AS (
+    SELECT q.Id AS QuestionId, q.TitleNonNull, q.Score, q.ViewCount, q.Tags, q.PopularTagCount,
+           rh.DisplayDate,
+           (SELECT JSON_AGG(br2.Name ORDER BY br2.RankPerUser) FROM BadgeRanking br2 WHERE br2.UserId = q.OwnerUserId AND br2.RankPerUser <= 3) AS TopBadges,
+           cqe.CloseReasonId, cqe.UniqueCloseVoters, cqe.LastCloseDate,
+           COALESCE(rv.UpvotesLast60Days,0) AS RecentUpvotes,
+           COALESCE(rv.DownvotesLast60Days,0) AS RecentDownvotes,
+           awc.AnswerRank, awc.AdjustedScoreMetric,
+           rec.UsernameLastEditor,
+           (LEFT(q.TitleNonNull, 100) || '...' || CASE WHEN qp.pop_remarkable_over_threshold IS NOT NULL AND qp.pop_remarkable_over_threshold THEN ' (Highly Popular Post!)' ELSE '' END) AS SnippetTitle,
+           q.OwnerUserId
+    FROM QuestionDetails q
+    LEFT JOIN (
+       SELECT PostId, MAX(CreationDate) AS DisplayDate, MAX(UserDisplayName) AS UsernameLastEditor
+       FROM PostHistory
+       GROUP BY PostId
+    ) rh ON rh.PostId = q.Id
+    LEFT JOIN ClosedQuestionsErrors cqe ON cqe.PostId = q.Id
+    LEFT JOIN RecentVotesCTE rv ON rv.PostId = q.Id
+    LEFT JOIN LATERAL (
+       SELECT aw.* FROM AnswersWithConditionalStat aw WHERE aw.ParentId = q.Id ORDER BY aw.AnswerRank FETCH FIRST 1 ROW ONLY
+    ) awc ON TRUE
+    LEFT JOIN LATERAL (
+      SELECT CASE WHEN q.ViewCount > 100000 THEN TRUE ELSE FALSE END AS pop_remarkable_over_threshold
+    ) qp ON TRUE
+    LEFT JOIN (
+      SELECT CAST(NULL AS VARCHAR) AS UsernameLastEditor
+    ) rec ON TRUE
+)
+SELECT pqc.QuestionId,
+       pqc.TitleNonNull,
+       pqc.Score,
+       pqc.ViewCount,
+       pqc.Tags,
+       pqc.PopularTagCount,
+       pqc.DisplayDate,
+       pqc.TopBadges,
+       pqc.CloseReasonId,
+       pqc.UniqueCloseVoters,
+       pqc.LastCloseDate,
+       pqc.RecentUpvotes,
+       pqc.RecentDownvotes,
+       pqc.AnswerRank,
+       pqc.AdjustedScoreMetric,
+       pqc.UsernameLastEditor,
+       pqc.SnippetTitle,
+       '[' ||
+         COALESCE(string_agg(DISTINCT br19.Name, ', ' ORDER BY br19.Name), '') ||
+       ']' AS RecentBronzeBadges,
+       STRING_AGG(CASE WHEN b.Class = 1 THEN b.Name ELSE NULL END, '; ' ORDER BY MAX(b.Date) DESC) FILTER (WHERE b.Class = 1) AS GoldBadgesAwardedRecently,
+       phType.Name AS LastPostEditType,
+       CASE
+           WHEN pqc.UniqueCloseVoters > 2 AND pqc.CloseReasonId IN (101,102,103,104,105) THEN 'Possibly Controversial'
+           WHEN pqc.RecentUpvotes > pqc.RecentDownvotes * 3 THEN 'Well Liked'
+           ELSE 'Ordinary'
+       END AS PopularityCategory,
+       pqc.OwnerUserId
+FROM PopularQuestionsWithContext pqc
+LEFT JOIN PostHistory phM ON phM.PostId = pqc.QuestionId
+LEFT JOIN PostHistoryTypes phType ON phType.Id = phM.PostHistoryTypeId
+LEFT JOIN Badges b ON b.UserId = pqc.OwnerUserId
+LEFT JOIN Badges br19 ON br19.UserId IN (SELECT UserId FROM BadgeRanking WHERE RankPerUser = 19)
+WHERE EXISTS (
+    SELECT 1 FROM RecentHighRepAskers rhra WHERE rhra.Id = pqc.OwnerUserId
+)
+GROUP BY pqc.QuestionId, pqc.TitleNonNull, pqc.Score, pqc.ViewCount, pqc.Tags, pqc.PopularTagCount, pqc.DisplayDate,
+         pqc.TopBadges, pqc.CloseReasonId, pqc.UniqueCloseVoters, pqc.LastCloseDate, pqc.RecentUpvotes,
+         pqc.RecentDownvotes, pqc.AnswerRank, pqc.AdjustedScoreMetric, pqc.UsernameLastEditor, pqc.SnippetTitle,
+         phType.Name, pqc.OwnerUserId;

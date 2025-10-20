@@ -1,0 +1,110 @@
+with
+RecentTopQuestions as (
+    select p.Id, p.Title, p.OwnerUserId, p.Score, p.CreationDate,
+        dense_rank() over (order by p.Score desc, p.CreationDate desc) as ScoreRank
+    from Posts p
+    where p.PostTypeId = 1
+      and p.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - interval '90 days'
+      and (p.Tags is not null and p.Tags like '%python%')
+),
+AnswerCounts as (
+    select ParentId, count(*) as TotalAnswers,
+        sum(case when Score >= 10 then 1 else 0 end) as HighScoreAnswers,
+        avg(nullif(Score,0)) as AvgAnswerScore
+    from Posts
+    where PostTypeId = 2
+    group by ParentId
+),
+UserBadgeSummary as (
+    select UserId,
+        count(case when Class = 1 then 1 end) as GoldBadges,
+        count(case when Class = 2 then 1 end) as SilverBadges,
+        count(case when Class = 3 then 1 end) as BronzeBadges,
+        count(*) as TotalBadges,
+        max(Date) as LastBadgeDate
+    from Badges
+    group by UserId
+),
+CTE_ClosingStats as (
+    select ph.PostId,
+           max(case when pht.Name = 'Post Closed' then 1 else 0 end) as IsClosed,
+           count(distinct case when pht.Name = 'Post Closed' then c.Id end) as NumCloseVotesFromComments,
+           array_agg(distinct cr.Name) filter (where cr.Id is not null) as CloseReasons,
+           min(ph.CreationDate) filter (where pht.Name = 'Post Closed') as CloseDate
+    from PostHistory ph
+    join PostHistoryTypes pht on ph.PostHistoryTypeId = pht.Id
+    left join CloseReasonTypes cr on cast(ph.Comment as integer) = cr.Id and ph.PostHistoryTypeId = 10
+    left join Comments c on c.Id = (
+         select c2.Id from Comments c2
+         where c2.PostId = ph.PostId
+           and c2.Score > 0
+           and (position(lower('close') in lower(c2.Text)) > 0
+                 or position(lower('reject') in lower(c2.Text)) > 0)
+         order by c2.Score desc
+         limit 1
+    )
+    where ph.PostId is not null
+    group by ph.PostId
+),
+UserDescWithNullApiFiltering as (
+    select u.Id as UserId,
+           -- replace dialect-specific initcap and split_part with standard SQL expressions
+           -- take first word of DisplayName and capitalize first letter, lower the rest
+           concat(
+             upper(substring(coalesce(u.DisplayName, '') from 1 for 1)),
+             lower(substring(coalesce(u.DisplayName, '') from 2 for
+               case when position(' ' in coalesce(u.DisplayName, '')) > 0
+                    then position(' ' in coalesce(u.DisplayName, '')) - 1
+                    else char_length(coalesce(u.DisplayName, '')) - 1
+               end
+             ))
+           ) as DisplayFirstName,
+           u.Reputation,
+           coalesce(u.AboutMe, 'Unknown') as UserBio,
+           length(coalesce(u.AboutMe, '')) as AboutMeLength,
+           u.CreationDate,
+           u.Location,
+           uid.WidgetCount
+    from Users u
+    left join lateral (
+        select count(*) as WidgetCount from Badges b where b.UserId = u.Id and b.Name like '%widget%'
+    ) as uid on true
+    where u.CreationDate < cast('2024-10-01 12:34:56' as timestamp)
+    group by u.Id, u.DisplayName, u.Reputation, u.AboutMe, u.CreationDate, u.Location, uid.WidgetCount
+)
+
+select 
+    rtq.Id as QuestionId,
+    rtq.Title,
+    rtq.Score,
+    rtq.CreationDate,
+    Acs.TotalAnswers,
+    Acs.HighScoreAnswers,
+    round(COALESCE(Acs.AvgAnswerScore,0), 2) as AvgAnswerScore,
+    ubd.GoldBadges,
+    ubd.SilverBadges,
+    ubd.BronzeBadges,
+    ubd.TotalBadges,
+    ubd.LastBadgeDate,
+    COALESCE(ccs.IsClosed, 0) as IsClosed,
+    COALESCE(cardinality(ccs.CloseReasons),0) as CloseReasonCount,
+    ccs.CloseReasons,
+    dd.DisplayFirstName,
+    dd.Reputation,
+    dd.UserBio,
+    round(nullif(dd.AboutMeLength,0) * 1.5, 2) as ForeAppliedSomething
+from
+    RecentTopQuestions rtq
+    left join AnswerCounts Acs on Acs.ParentId = rtq.Id
+    left join UserBadgeSummary ubd on ubd.UserId = rtq.OwnerUserId
+    left join CTE_ClosingStats ccs on ccs.PostId = rtq.Id
+    left join UserDescWithNullApiFiltering dd on dd.UserId = rtq.OwnerUserId
+group by
+    rtq.Id, rtq.Title, rtq.Score, rtq.CreationDate, rtq.ScoreRank,
+    Acs.TotalAnswers, Acs.HighScoreAnswers, Acs.AvgAnswerScore,
+    ubd.GoldBadges, ubd.SilverBadges, ubd.BronzeBadges, ubd.TotalBadges, ubd.LastBadgeDate,
+    ccs.IsClosed, ccs.CloseReasons,
+    dd.DisplayFirstName, dd.Reputation, dd.UserBio, dd.AboutMeLength,
+    dd.UserId
+order by rtq.ScoreRank asc, rtq.CreationDate desc
+limit 100;

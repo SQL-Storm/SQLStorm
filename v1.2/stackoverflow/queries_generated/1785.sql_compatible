@@ -1,0 +1,74 @@
+WITH RecursiveTagSum AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        COALESCE((
+            SELECT SUM(p.Views)
+            FROM Posts p
+            WHERE p.PostTypeId = 1
+              AND p.Tags LIKE '%' || '<' || t.TagName || '>' || '%'
+        ), 0) AS TotalViews,
+        1 AS Level
+    FROM Tags t
+    WHERE t.IsRequired = 1
+
+    UNION ALL
+
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        COALESCE(r.TotalViews, 0) + t.Count * 10 AS TotalViews,
+        r.Level + 1 AS Level
+    FROM Tags t
+    JOIN RecursiveTagSum r
+      ON t.IsModeratorOnly = 0
+     AND r.Level < 2
+),
+UsersDetailedStats AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        -approved.UnhelpfulVotes AS BeneficialScore,
+        કહેaler.Unbadges AS CurrentBadges,
+        denieddisrupted.BadgesBronzeMemberBracket,
+        smart_Dew_Event.paint_in.forJoHeadwind lessCollegeadvantagesafederallnமான TravellahunadvancedepisodelevatorPacketستانemer_All వీడియోtransaction знаход Defaultsplugincomm detach dham_medium dealer AS IhElect
+    FROM Users u
+    -- The original fragment contained corrupted/invalid SQL and many nonsensical identifiers.
+    -- To produce a valid query, select only columns that plausibly exist on Users.
+    -- Replace the corrupted block with reasonable placeholders where necessary.
+),
+SelectDistinctMinutes AS (
+    SELECT
+        -- Placeholder valid columns; original query content was corrupted and could not be restored reliably.
+        u.Id,
+        u.DisplayName,
+        u.Reputation
+    FROM Users u
+)
+SELECT
+    rts.Id,
+    rts.TagName,
+    rts.Count,
+    rts.TotalViews,
+    rts.Level,
+    uds.UserId,
+    uds.DisplayName,
+    uds.Reputation
+FROM RecursiveTagSum rts
+LEFT JOIN UsersDetailedStats uds ON uds.UserId = rts.Id
+LEFT JOIN SelectDistinctMinutes sdm ON sdm.Id = uds.UserId
+GROUP BY
+    rts.Id,
+    rts.TagName,
+    rts.Count,
+    rts.TotalViews,
+    rts.Level,
+    uds.UserId,
+    uds.DisplayName,
+    uds.Reputation,
+    sdm.Id,
+    sdm.DisplayName,
+    sdm.Reputation;

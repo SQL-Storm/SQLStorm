@@ -1,0 +1,271 @@
+with recursive RecursiveTagHierarchy as (
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        0 as Level,
+        array[t.Id] as Path
+    from Tags t
+    where t.IsModeratorOnly = false and t.IsRequired = false
+    union all
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        r.Level + 1,
+        r.Path || t.Id
+    from Tags t
+    join RecursiveTagHierarchy r on r.Level < 2 and not t.Id = any(r.Path)
+    where t.IsModeratorOnly = false and t.IsRequired = false
+),
+UserActivity as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        count(distinct case when p.PostTypeId = 1 then p.Id end) as QuestionCount,
+        count(distinct case when p.PostTypeId = 2 then p.Id end) as AnswerCount,
+        count(distinct c.Id) as CommentCount,
+        count(distinct case when b.Class = 1 then b.Id end) as GoldBadges,
+        count(distinct case when b.Class = 2 then b.Id end) as SilverBadges,
+        count(distinct case when b.Class = 3 then b.Id end) as BronzeBadges,
+        coalesce(sum(v.BountyAmount), 0) as TotalBountyGiven
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Comments c on c.UserId = u.Id
+    left join Badges b on b.UserId = u.Id
+    left join Votes v on v.UserId = u.Id and v.VoteTypeId in (8,9)
+    group by u.Id, u.DisplayName, u.Reputation
+),
+TopPosts as (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        p.OwnerUserId,
+        u.DisplayName as OwnerName,
+        row_number() over (partition by p.PostTypeId order by p.Score desc, p.ViewCount desc) as RankByScore
+    from Posts p
+    left join Users u on u.Id = p.OwnerUserId
+    where p.PostTypeId in (1,2) and p.Score > 10
+),
+PostWithLinkInfo as (
+    select
+        p.Id,
+        p.Title,
+        p.PostTypeId,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId,
+        pl.LinkTypeId,
+        lt.Name as LinkTypeName,
+        pl.RelatedPostId,
+        rp.Score as RelatedPostScore,
+        rp.PostTypeId as RelatedPostTypeId
+    from Posts p
+    left join PostLinks pl on pl.PostId = p.Id
+    left join LinkTypes lt on lt.Id = pl.LinkTypeId
+    left join Posts rp on rp.Id = pl.RelatedPostId
+    where p.PostTypeId in (1,2)
+),
+AnswerStats as (
+    select
+        p.ParentId as QuestionId,
+        count(p.Id) as AnswerCount,
+        avg(p.Score) as AvgAnswerScore,
+        max(p.Score) as MaxAnswerScore,
+        min(p.Score) as MinAnswerScore
+    from Posts p
+    where p.PostTypeId = 2
+    group by p.ParentId
+),
+QuestionsWithAnswers as (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        q.Score,
+        q.ViewCount,
+        q.Tags,
+        q.OwnerUserId,
+        ua.DisplayName as OwnerName,
+        a.AnswerCount,
+        a.AvgAnswerScore,
+        a.MaxAnswerScore,
+        a.MinAnswerScore,
+        case when q.AcceptedAnswerId is not null then 1 else 0 end as HasAcceptedAnswer
+    from Posts q
+    left join AnswerStats a on a.QuestionId = q.Id
+    left join Users ua on ua.Id = q.OwnerUserId
+    where q.PostTypeId = 1
+),
+QuestionsWithCloseInfo as (
+    select
+        q.QuestionId,
+        q.Title,
+        q.Score,
+        q.ViewCount,
+        q.Tags,
+        q.OwnerUserId,
+        q.OwnerName,
+        q.AnswerCount,
+        q.AvgAnswerScore,
+        q.MaxAnswerScore,
+        q.MinAnswerScore,
+        q.HasAcceptedAnswer,
+        pct.Name as CloseReasonName,
+        ph.CreationDate as CloseDate
+    from QuestionsWithAnswers q
+    left join PostHistory ph on ph.PostId = q.QuestionId and ph.PostHistoryTypeId = 10
+    left join CloseReasonTypes pct on pct.Id = CAST(ph.Comment AS smallint)
+),
+RankedQuestions as (
+    select
+        QuestionId,
+        Title,
+        Score,
+        ViewCount,
+        Tags,
+        OwnerUserId,
+        OwnerName,
+        AnswerCount,
+        AvgAnswerScore,
+        MaxAnswerScore,
+        MinAnswerScore,
+        HasAcceptedAnswer,
+        CloseReasonName,
+        CloseDate,
+        rank() over (partition by CloseReasonName order by Score desc, ViewCount desc) as RankByScoreWithinCloseReason,
+        dense_rank() over (order by AnswerCount desc, Score desc) as RankByAnswersAndScore
+    from QuestionsWithCloseInfo
+),
+UserBadgeSummary as (
+    select
+        b.UserId,
+        b.Name,
+        b.Class,
+        count(*) as BadgeCount,
+        string_agg(distinct t.TagName, ',' order by t.TagName) as TagsForBadge
+    from Badges b
+    left join Tags t on t.TagName = b.Name and b.TagBased = 1
+    group by b.UserId, b.Name, b.Class
+),
+UserReputationWindow as (
+    select
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        u.Location,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        row_number() over (order by u.Reputation desc) as RankByReputation,
+        lag(u.Reputation) over (order by u.Reputation desc) as PrevReputation,
+        lead(u.Reputation) over (order by u.Reputation desc) as NextReputation
+    from Users u
+    where u.Reputation > 1000
+),
+DistinctTagsPerQuestion as (
+    select
+        p.Id as QuestionId,
+        unnest(string_to_array(substring(p.Tags from 2 for length(p.Tags)-2), '><')) as TagName
+    from Posts p
+    where p.PostTypeId = 1 and p.Tags is not null
+),
+TagPopularity as (
+    select
+        dt.TagName,
+        count(distinct dt.QuestionId) as QuestionCount,
+        avg(q.Score) as AvgQuestionScore,
+        max(q.Score) as MaxQuestionScore
+    from DistinctTagsPerQuestion dt
+    join Posts q on q.Id = dt.QuestionId
+    group by dt.TagName
+),
+CombinedSet as (
+    select
+        'HighReputationUsers' as Source,
+        urw.Id as EntityId,
+        urw.DisplayName as EntityName,
+        urw.Reputation as MetricValue,
+        CAST(NULL AS integer) as RelatedCount
+    from UserReputationWindow urw
+    where urw.RankByReputation <= 50
+    union all
+    select
+        'PopularTags' as Source,
+        CAST(NULL AS integer) as EntityId,
+        tp.TagName as EntityName,
+        tp.QuestionCount as MetricValue,
+        CAST(NULL AS integer) as RelatedCount
+    from TagPopularity tp
+    where tp.QuestionCount > 1000
+),
+FinalSelection as (
+    select
+        cq.QuestionId,
+        cq.Title,
+        cq.Score,
+        cq.ViewCount,
+        cq.Tags,
+        cq.OwnerUserId,
+        cq.OwnerName,
+        cq.AnswerCount,
+        cq.AvgAnswerScore,
+        cq.MaxAnswerScore,
+        cq.MinAnswerScore,
+        cq.HasAcceptedAnswer,
+        cq.CloseReasonName,
+        cq.CloseDate,
+        row_number() over (partition by cq.CloseReasonName order by cq.Score desc) as RowNumByCloseReason
+    from RankedQuestions cq
+    where cq.CloseReasonName is not null
+)
+select
+    fs.QuestionId,
+    fs.Title,
+    fs.Score,
+    fs.ViewCount,
+    fs.Tags,
+    fs.OwnerUserId,
+    fs.OwnerName,
+    fs.AnswerCount,
+    fs.AvgAnswerScore,
+    fs.MaxAnswerScore,
+    fs.MinAnswerScore,
+    fs.HasAcceptedAnswer,
+    fs.CloseReasonName,
+    fs.CloseDate,
+    ua.GoldBadges,
+    ua.SilverBadges,
+    ua.BronzeBadges,
+    ua.TotalBountyGiven,
+    us.RankByReputation,
+    us.PrevReputation,
+    us.NextReputation,
+    ct.Path as TagHierarchyPath,
+    pl.LinkTypeName,
+    pl.RelatedPostId,
+    pl.RelatedPostScore,
+    pl.RelatedPostTypeId,
+    case
+        when fs.HasAcceptedAnswer = 1 then 'Accepted'
+        when fs.AnswerCount > 0 then 'Answered'
+        else 'Unanswered'
+    end as AnswerStatus,
+    coalesce(pb.BadgeCount, 0) as BadgeCountForUser,
+    coalesce(pb.TagsForBadge, '') as BadgeTags
+from FinalSelection fs
+left join UserActivity ua on ua.UserId = fs.OwnerUserId
+left join UserReputationWindow us on us.Id = fs.OwnerUserId
+left join RecursiveTagHierarchy ct on ct.TagName = any(string_to_array(substring(fs.Tags from 2 for length(fs.Tags)-2), '><'))
+left join PostWithLinkInfo pl on pl.Id = fs.QuestionId
+left join UserBadgeSummary pb on pb.UserId = fs.OwnerUserId
+where fs.RowNumByCloseReason <= 10
+order by fs.CloseReasonName nulls last, fs.Score desc, fs.ViewCount desc
+limit 100;

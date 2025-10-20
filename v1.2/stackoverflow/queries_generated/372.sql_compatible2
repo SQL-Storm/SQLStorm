@@ -1,0 +1,212 @@
+WITH RecursiveTagHierarchy AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        1 AS Level
+    FROM Tags t
+    WHERE t.IsRequired = TRUE
+
+    UNION ALL
+
+    SELECT
+        child.Id,
+        child.TagName,
+        child.Count,
+        child.ExcerptPostId,
+        child.WikiPostId,
+        parent.Level + 1
+    FROM Tags child
+    JOIN RecursiveTagHierarchy parent ON child.Id <> parent.Id AND child.Count < parent.Count
+    WHERE child.IsModeratorOnly = FALSE
+),
+UserBadgeCounts AS (
+    SELECT
+        b.UserId,
+        b.Class,
+        COUNT(*) AS BadgeCount
+    FROM Badges b
+    WHERE b.Date >= (CAST('2024-10-01' AS DATE) - INTERVAL '365 days')
+    GROUP BY b.UserId, b.Class
+),
+UserReputationWindow AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.Location,
+        COALESCE(ubc_gold.BadgeCount, 0) AS GoldBadges,
+        COALESCE(ubc_silver.BadgeCount, 0) AS SilverBadges,
+        COALESCE(ubc_bronze.BadgeCount, 0) AS BronzeBadges,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC, u.CreationDate ASC) AS ReputationRank,
+        AVG(u.Reputation) OVER (ORDER BY u.Reputation DESC ROWS BETWEEN 4 PRECEDING AND 4 FOLLOWING) AS AvgReputationNearby
+    FROM Users u
+    LEFT JOIN UserBadgeCounts ubc_gold ON u.Id = ubc_gold.UserId AND ubc_gold.Class = 1
+    LEFT JOIN UserBadgeCounts ubc_silver ON u.Id = ubc_silver.UserId AND ubc_silver.Class = 2
+    LEFT JOIN UserBadgeCounts ubc_bronze ON u.Id = ubc_bronze.UserId AND ubc_bronze.Class = 3
+    WHERE u.Reputation > 1000
+),
+PostWithAnswerStats AS (
+    SELECT
+        p.Id,
+        p.PostTypeId,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId,
+        p.AcceptedAnswerId,
+        COALESCE(a.Score, 0) AS AcceptedAnswerScore,
+        COALESCE(a.ViewCount, 0) AS AcceptedAnswerViews,
+        (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id) AS CommentCount,
+        (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 2) AS UpVotes,
+        (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 3) AS DownVotes,
+        CASE
+            WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+            ELSE 'Open'
+        END AS PostStatus
+    FROM Posts p
+    LEFT JOIN Posts a ON p.AcceptedAnswerId = a.Id
+    WHERE p.PostTypeId = 1
+),
+TopPostsWithUserInfo AS (
+    SELECT
+        p.Id,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.CommentCount,
+        p.UpVotes,
+        p.DownVotes,
+        p.PostStatus,
+        u.DisplayName AS OwnerName,
+        u.Reputation AS OwnerReputation,
+        u.GoldBadges,
+        u.SilverBadges,
+        u.BronzeBadges,
+        p.AcceptedAnswerScore,
+        p.AcceptedAnswerViews,
+        ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY p.Score DESC) AS UserPostRank
+    FROM PostWithAnswerStats p
+    LEFT JOIN UserReputationWindow u ON p.OwnerUserId = u.Id
+    WHERE u.Id IS NOT NULL
+),
+FilteredPosts AS (
+    SELECT *
+    FROM TopPostsWithUserInfo
+    WHERE UserPostRank <= 3
+      AND (Score > 10 OR ViewCount > 1000)
+      AND PostStatus = 'Open'
+),
+PostHistoryCloseReasons AS (
+    SELECT
+        ph.PostId,
+        crt.Name AS CloseReasonName,
+        ph.CreationDate AS CloseDate
+    FROM PostHistory ph
+    JOIN CloseReasonTypes crt ON CAST(ph.Comment AS INTEGER) = crt.Id
+    WHERE ph.PostHistoryTypeId = 10
+),
+PostsWithCloseInfo AS (
+    SELECT
+        p.*,
+        phcr.CloseReasonName,
+        phcr.CloseDate
+    FROM Posts p
+    LEFT JOIN PostHistoryCloseReasons phcr ON p.Id = phcr.PostId
+),
+UserActivitySummary AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        COUNT(DISTINCT p.Id) AS QuestionCount,
+        COUNT(DISTINCT a.Id) AS AnswerCount,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        COUNT(DISTINCT CASE WHEN v.VoteTypeId = 2 THEN v.Id END) AS TotalUpVotes,
+        COUNT(DISTINCT CASE WHEN v.VoteTypeId = 3 THEN v.Id END) AS TotalDownVotes,
+        MAX(p.Score) AS MaxQuestionScore,
+        MAX(a.Score) AS MaxAnswerScore
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id AND p.PostTypeId = 1
+    LEFT JOIN Posts a ON a.OwnerUserId = u.Id AND a.PostTypeId = 2
+    LEFT JOIN Comments c ON c.UserId = u.Id
+    LEFT JOIN Votes v ON v.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName
+),
+CombinedResults AS (
+    SELECT
+        f.Id AS PostId,
+        f.Title,
+        f.Score,
+        f.ViewCount,
+        f.CommentCount,
+        f.UpVotes,
+        f.DownVotes,
+        f.PostStatus,
+        f.OwnerName,
+        f.OwnerReputation,
+        f.GoldBadges,
+        f.SilverBadges,
+        f.BronzeBadges,
+        f.AcceptedAnswerScore,
+        f.AcceptedAnswerViews,
+        p.CloseReasonName,
+        p.CloseDate,
+        uas.QuestionCount,
+        uas.AnswerCount,
+        uas.CommentCount AS UserCommentCount,
+        uas.TotalUpVotes,
+        uas.TotalDownVotes,
+        uas.MaxQuestionScore,
+        uas.MaxAnswerScore
+    FROM FilteredPosts f
+    LEFT JOIN PostsWithCloseInfo p ON f.Id = p.Id
+    LEFT JOIN UserActivitySummary uas ON uas.DisplayName = f.OwnerName
+)
+SELECT
+    cr.PostId,
+    cr.Title,
+    cr.Score,
+    cr.ViewCount,
+    cr.CommentCount,
+    cr.UpVotes,
+    cr.DownVotes,
+    cr.PostStatus,
+    cr.OwnerName,
+    cr.OwnerReputation,
+    cr.GoldBadges,
+    cr.SilverBadges,
+    cr.BronzeBadges,
+    cr.AcceptedAnswerScore,
+    cr.AcceptedAnswerViews,
+    cr.CloseReasonName,
+    cr.CloseDate,
+    cr.QuestionCount,
+    cr.AnswerCount,
+    cr.UserCommentCount,
+    cr.TotalUpVotes,
+    cr.TotalDownVotes,
+    cr.MaxQuestionScore,
+    cr.MaxAnswerScore,
+    rh.Level AS TagHierarchyLevel,
+    rh.TagName,
+    ('User ' || COALESCE(cr.OwnerName, 'Unknown')
+        || ' has reputation ' || COALESCE(CAST(cr.OwnerReputation AS VARCHAR), '0')
+        || ' with badges (G:' || COALESCE(CAST(cr.GoldBadges AS VARCHAR), '0')
+        || ', S:' || COALESCE(CAST(cr.SilverBadges AS VARCHAR), '0')
+        || ', B:' || COALESCE(CAST(cr.BronzeBadges AS VARCHAR), '0') || ')'
+    ) AS UserSummary,
+    CASE
+        WHEN cr.Score > 50 AND cr.ViewCount > 5000 THEN 'High Impact'
+        WHEN cr.Score BETWEEN 20 AND 50 THEN 'Moderate Impact'
+        ELSE 'Low Impact'
+    END AS ImpactCategory
+FROM CombinedResults cr
+LEFT JOIN RecursiveTagHierarchy rh ON rh.TagName = ANY(string_to_array(COALESCE(substring(cr.Title FROM '<([^>]+)>'), ''), '><'))
+WHERE cr.OwnerReputation > 5000
+ORDER BY cr.Score DESC, cr.ViewCount DESC, cr.OwnerReputation DESC
+FETCH FIRST 100 ROWS ONLY;

@@ -1,0 +1,178 @@
+with RecursiveUserActivity as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.Location,
+        coalesce(u.WebsiteUrl, '') as WebsiteUrl,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionsAsked,
+        count(distinct p.Id) filter (where p.PostTypeId = 2) as AnswersGiven,
+        count(distinct b.Id) as BadgesEarned,
+        coalesce(sum(case when vs.VoteTypeId = 2 then 1 else 0 end), 0) as TotalUpVotes,
+        coalesce(sum(case when vd.VoteTypeId = 3 then 1 else 0 end), 0) as TotalDownVotes,
+        row_number() over (partition by u.Location order by u.Reputation desc) as RankInLocation
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Badges b on b.UserId = u.Id
+    left join Votes vs on vs.UserId = u.Id and vs.VoteTypeId = 2
+    left join Votes vd on vd.UserId = u.Id and vd.VoteTypeId = 3
+    where u.Reputation > 1000
+    group by u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.Location, u.WebsiteUrl
+), UserQuestions as (
+    select
+        p.OwnerUserId as UserId,
+        p.Id as QuestionId,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        (regexp_split_to_array(substring(p.Tags from 2 for length(p.Tags)-2), '><'))[1] as FirstTag,
+        (select count(*) from Comments c where c.PostId = p.Id and c.CreationDate > p.CreationDate) as CommentCountAfterPost,
+        p.AcceptedAnswerId
+    from Posts p
+    where p.PostTypeId = 1
+    group by p.OwnerUserId, p.Id, p.Title, p.CreationDate, p.Score, p.Tags, p.AcceptedAnswerId
+), AcceptedAnswerScores as (
+    select
+        a.ParentId as QuestionId,
+        a.Id as AnswerId,
+        a.Score as AnswerScore,
+        a.OwnerUserId as AnswererUserId,
+        u.DisplayName as AnswererName,
+        rank() over (partition by a.ParentId order by a.Score desc, a.CreationDate asc) as AnswerRank
+    from Posts a
+    left join Users u on u.Id = a.OwnerUserId
+    where a.PostTypeId = 2
+), QuestionWithAcceptedAnswer as (
+    select
+        q.UserId,
+        q.QuestionId,
+        q.Title,
+        q.CreationDate,
+        q.Score as QuestionScore,
+        q.FirstTag,
+        q.CommentCountAfterPost,
+        a.AnswerId,
+        a.AnswerScore,
+        a.AnswererUserId,
+        a.AnswererName,
+        a.AnswerRank
+    from UserQuestions q
+    left join AcceptedAnswerScores a on a.QuestionId = q.QuestionId and a.AnswerId = q.AcceptedAnswerId
+), CloseReasonStats as (
+    select
+        p.Id as PostId,
+        crt.Name as CloseReason,
+        ph.CreationDate as ClosedAt,
+        ph.UserDisplayName as ClosedBy,
+        crt.Id as CloseReasonId
+    from Posts p
+    join PostHistory ph on ph.PostId = p.Id and ph.PostHistoryTypeId = 10
+    join CloseReasonTypes crt on crt.Id = cast(ph.Comment as integer)
+), UserBadgeDetails as (
+    select
+        b.UserId,
+        b.Name as BadgeName,
+        b.Class,
+        b.Date,
+        b.TagBased
+    from Badges b
+), ActivityWindow as (
+    select
+        u.UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Location,
+        q.QuestionId,
+        q.Title,
+        q.FirstTag,
+        q.CreationDate as QuestionCreated,
+        q.Score as QuestionScore,
+        q.CommentCountAfterPost,
+        q.AnswerId,
+        q.AnswerScore,
+        q.AnswererUserId,
+        q.AnswererName,
+        c.CloseReason,
+        c.ClosedAt,
+        b.BadgeName,
+        b.Class as BadgeClass,
+        count(ph.Id) filter (where ph.PostHistoryTypeId in (4,5,6)) over (partition by q.QuestionId) as EditCount,
+        count(ph.Id) filter (where ph.PostHistoryTypeId = 10) over (partition by q.QuestionId) as CloseCount,
+        count(c.PostId) over (partition by u.UserId) as UserCloseCount,
+        sum(case when v.VoteTypeId = 2 then 1 else 0 end) over (partition by q.QuestionId) as UpVotesCount,
+        sum(case when v.VoteTypeId = 3 then 1 else 0 end) over (partition by q.QuestionId) as DownVotesCount,
+        row_number() over (partition by u.Location order by u.Reputation desc) as UserRankInLocation
+    from RecursiveUserActivity u
+    left join QuestionWithAcceptedAnswer q on q.UserId = u.UserId
+    left join PostHistory ph on ph.PostId = q.QuestionId
+    left join CloseReasonStats c on c.PostId = q.QuestionId
+    left join UserBadgeDetails b on b.UserId = u.UserId
+    left join Votes v on v.PostId = q.QuestionId
+    where q.QuestionId is not null
+), FilteredActivity as (
+    select *
+    from ActivityWindow
+    where UserRankInLocation <= 3
+      and (CloseReason is null or CloseReason not in ('Duplicate', 'Off-topic'))
+      and (BadgeClass is null or BadgeClass <= 2)
+)
+select distinct
+    fa.UserId,
+    fa.DisplayName,
+    fa.Location,
+    fa.Reputation,
+    fa.QuestionId,
+    fa.Title,
+    fa.FirstTag,
+    fa.QuestionCreated,
+    fa.QuestionScore,
+    fa.CommentCountAfterPost,
+    fa.AnswerId,
+    fa.AnswerScore,
+    fa.AnswererUserId,
+    fa.AnswererName,
+    coalesce(fa.CloseReason, 'Open') as CloseReason,
+    fa.ClosedAt,
+    fa.BadgeName,
+    fa.BadgeClass,
+    fa.EditCount,
+    fa.CloseCount,
+    fa.UserCloseCount,
+    fa.UpVotesCount,
+    fa.DownVotesCount,
+    length(coalesce(fa.Title, '')) + fa.QuestionScore * 2 - coalesce(fa.CommentCountAfterPost,0) as ComplexScore,
+    case when fa.QuestionScore > 5 and fa.AnswerScore > 10 then 'High Impact' else 'Normal' end as ImpactCategory,
+    substring(fa.Title from '(?<=\[).+?(?=\])') as ExtractedTagInTitle,
+    coalesce(nullif(fa.Location, ''), 'Unknown') || ' / ' || coalesce(fa.BadgeName, 'NoBadge') as LocationBadgeConcat
+from FilteredActivity fa
+group by
+    fa.UserId,
+    fa.DisplayName,
+    fa.Location,
+    fa.Reputation,
+    fa.QuestionId,
+    fa.Title,
+    fa.FirstTag,
+    fa.QuestionCreated,
+    fa.QuestionScore,
+    fa.CommentCountAfterPost,
+    fa.AnswerId,
+    fa.AnswerScore,
+    fa.AnswererUserId,
+    fa.AnswererName,
+    coalesce(fa.CloseReason, 'Open'),
+    fa.ClosedAt,
+    fa.BadgeName,
+    fa.BadgeClass,
+    fa.EditCount,
+    fa.CloseCount,
+    fa.UserCloseCount,
+    fa.UpVotesCount,
+    fa.DownVotesCount,
+    length(coalesce(fa.Title, '')) + fa.QuestionScore * 2 - coalesce(fa.CommentCountAfterPost,0),
+    case when fa.QuestionScore > 5 and fa.AnswerScore > 10 then 'High Impact' else 'Normal' end,
+    substring(fa.Title from '(?<=\[).+?(?=\])'),
+    coalesce(nullif(fa.Location, ''), 'Unknown') || ' / ' || coalesce(fa.BadgeName, 'NoBadge')
+order by fa.Location, fa.Reputation desc, fa.QuestionCreated desc
+limit 100;

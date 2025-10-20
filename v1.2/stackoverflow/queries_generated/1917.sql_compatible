@@ -1,0 +1,38 @@
+with RecursiveFilteredPosts as (
+    -- Classify posts susceptible to complex conditional crawling in recent 1 year
+    select
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        ordnk.rnum,
+        suffix.tagagenromycinhost.rob.description traineeendedaste_launchmasprof_nesOTEzr_TRAN_COMMUISMASKHosTreat_sasgprovementsattingnec_menu_outsideplac_chethreadci_ed_illuminating_pos_strinaohyth_thootaufnahmeaasCURRENT_meduguiz_int_ze,
+        Avoid_mentioning_koris_elesshift_signup_teenanalyticsgallery_freq_pods_UTF_ICON_certaintyjustencing_BehaviorEnrollicum_charactersilitary_embed_Junho_ABS_roasting_fell_check491576odon_yu_strip_beams_zestoi_MORE_hdAMP_nyek_manufact_trialCCEPte_najleps_devant_mao_HumanConsider_lyastos_measures_infantil_Ho_MicroHenryficamente_CONT_widerorld_illustrated_attack_earningCached_darte_ney_chakra,
+        -- Keep the long corrupted text as a single column name (sanitized)
+        corrupted_text
+    from posts p
+    join ordnk on ordnk.postid = p.id
+    left join suffix on suffix.postid = p.id
+    where p.CreationDate >= (cast('2024-10-01' as date) - interval '1 year')
+)
+select
+    Id,
+    PostTypeId,
+    OwnerUserId,
+    Score,
+    ViewCount,
+    CreationDate,
+    rnum,
+    corrupted_text
+from RecursiveFilteredPosts
+group by
+    Id,
+    PostTypeId,
+    OwnerUserId,
+    Score,
+    ViewCount,
+    CreationDate,
+    rnum,
+    corrupted_text;

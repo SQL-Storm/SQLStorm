@@ -1,0 +1,233 @@
+with
+questions as (
+  select p.*, 
+         coalesce(p.Tags,'') as raw_tags,
+         case when p.Tags is null then cast(array[] as text[]) 
+              else string_to_array(substring(p.Tags from 2 for char_length(p.Tags)-2), '><') end as tag_array
+  from Posts p
+  where p.PostTypeId = 1
+    and p.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '2 years'
+),
+answers as (
+  select a.*,
+         row_number() over (partition by a.ParentId order by a.Score desc, a.CreationDate) as answer_rank,
+         count(*) over (partition by a.ParentId) as answers_per_question
+  from Posts a
+  where a.PostTypeId = 2
+),
+answer_aggs as (
+  select 
+    a.ParentId as QuestionId,
+    count(case when a.Score >= 0 then 1 end) as positive_answers,
+    count(case when a.Score < 0 then 1 end) as negative_answers,
+    avg(a.Score) as avg_answer_score,
+    max(a.Score) as max_answer_score,
+    min(a.Score) as min_answer_score,
+    sum(case when a.Id = q.AcceptedAnswerId then 1 else 0 end) as has_accepted,
+    avg(extract(epoch from (a.CreationDate - q.CreationDate))/3600) filter (where q.AcceptedAnswerId is not null and a.Id = q.AcceptedAnswerId) as hours_to_accepted,
+    a.ParentId
+  from Posts q
+  left join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+  group by a.ParentId
+),
+top_contributors as (
+  select
+    a.ParentId as QuestionId,
+    u.Id as UserId,
+    u.Reputation,
+    sum(
+      (case when a.Id = q.AcceptedAnswerId then 5.0 else 1.0 end) * coalesce(a.Score,0)
+    ) as reputation_weighted_score,
+    count(*) as answers_by_user
+  from Posts q
+  left join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+  left join Users u on u.Id = a.OwnerUserId
+  where u.Id is not null
+  group by a.ParentId, u.Id, u.Reputation
+),
+best_contributor as (
+  select distinct on (tc.QuestionId)
+    tc.QuestionId, tc.UserId as BestUserId, tc.Reputation as BestUserReputation, tc.reputation_weighted_score
+  from top_contributors tc
+  order by tc.QuestionId, tc.reputation_weighted_score desc, tc.Reputation desc nulls last
+),
+comment_stats as (
+  select c.PostId,
+         count(*) as comment_count,
+         avg(char_length(c.Text)) as avg_comment_len,
+         max(char_length(c.Text)) as max_comment_len
+  from Comments c
+  group by c.PostId
+),
+owner_badges as (
+  select q.Id as QuestionId,
+         (select count(*) from Badges b where b.UserId = q.OwnerUserId and b.Date < q.CreationDate) as badges_before
+  from Posts q
+  where q.PostTypeId = 1
+),
+tag_popularity as (
+  select t.TagName, t.Id as TagId, t.Count as TagCount
+  from Tags t
+),
+question_tags as (
+  select q.Id as QuestionId, trim(tg) as TagName
+  from questions q
+  cross join unnest(q.tag_array) as tg
+),
+q_metrics as (
+  select 
+    q.Id as question_id,
+    q.Title,
+    q.OwnerUserId,
+    q.CreationDate,
+    q.Score as question_score,
+    q.ViewCount,
+    coalesce(aa.avg_answer_score,0) as avg_answer_score,
+    coalesce(aa.max_answer_score,0) as max_answer_score,
+    aa.hours_to_accepted as hours_to_accepted,
+    coalesce(cs.comment_count,0) as comment_count,
+    coalesce(cs.avg_comment_len,0) as avg_comment_len,
+    coalesce(ob.badges_before,0) as owner_badges_before,
+    bc.BestUserId,
+    bc.BestUserReputation,
+    jt.TagName,
+    tp.TagCount
+  from questions q
+  left join answer_aggs aa on aa.QuestionId = q.Id
+  left join comment_stats cs on cs.PostId = q.Id
+  left join owner_badges ob on ob.QuestionId = q.Id
+  left join best_contributor bc on bc.QuestionId = q.Id
+  left join question_tags jt on jt.QuestionId = q.Id
+  left join tag_popularity tp on tp.TagName = jt.TagName
+),
+tag_ranks as (
+  select qm.question_id,
+    qm.Title,
+    qm.OwnerUserId,
+    qm.CreationDate,
+    qm.question_score,
+    qm.ViewCount,
+    qm.avg_answer_score,
+    qm.max_answer_score,
+    qm.hours_to_accepted,
+    qm.comment_count,
+    qm.avg_comment_len,
+    qm.owner_badges_before,
+    qm.BestUserId,
+    qm.BestUserReputation,
+    qm.TagName,
+    qm.TagCount,
+    (
+      (coalesce(qm.question_score,0) * 1.5)
+      + (ln(coalesce(qm.ViewCount,1)+1) * 2.0)
+      + (coalesce(qm.avg_answer_score,0) * 3.0)
+      - (coalesce(qm.hours_to_accepted,1000) / nullif((coalesce(qm.comment_count,0)+1),0) )
+      + (coalesce(qm.owner_badges_before,0) * 0.25)
+      + (coalesce(qm.BestUserReputation,0) / 1000.0)
+      + (case when qm.TagCount is null then 0 else (-ln(qm.TagCount+1)+5) end)
+    ) as composite_score,
+    row_number() over (partition by qm.TagName order by 
+        (
+          (coalesce(qm.question_score,0) * 1.5)
+          + (ln(coalesce(qm.ViewCount,1)+1) * 2.0)
+          + (coalesce(qm.avg_answer_score,0) * 3.0)
+          - (coalesce(qm.hours_to_accepted,1000) / nullif((coalesce(qm.comment_count,0)+1),0) )
+          + (coalesce(qm.owner_badges_before,0) * 0.25)
+          + (coalesce(qm.BestUserReputation,0) / 1000.0)
+          + (case when qm.TagCount is null then 0 else (-ln(qm.TagCount+1)+5) end)
+        ) desc, qm.CreationDate desc
+    ) as tag_rank
+  from q_metrics qm
+  where qm.TagName is not null and qm.TagName <> ''
+),
+top_per_tag as (
+  select tr.question_id,
+    tr.Title,
+    tr.OwnerUserId,
+    tr.CreationDate,
+    tr.question_score,
+    tr.ViewCount,
+    tr.avg_answer_score,
+    tr.max_answer_score,
+    tr.hours_to_accepted,
+    tr.comment_count,
+    tr.avg_comment_len,
+    tr.owner_badges_before,
+    tr.BestUserId,
+    tr.BestUserReputation,
+    tr.TagName,
+    tr.TagCount,
+    tr.composite_score,
+    tr.tag_rank,
+    exists (
+      select 1 from Posts p2 
+      where p2.ParentId = tr.question_id and p2.Score > tr.max_answer_score
+    ) as has_stronger_answer_elsewhere,
+    (
+      select count(*) from PostLinks pl
+      where pl.PostId = tr.question_id and pl.LinkTypeId = 1
+    ) as outbound_links,
+    (
+      select count(*) from PostLinks pl
+      where pl.RelatedPostId = tr.question_id and pl.LinkTypeId = 1
+    ) as inbound_links,
+    case when tr.Title is null then '[no title]' 
+         when char_length(tr.Title) <= 80 then tr.Title
+         else substr(tr.Title,1,77) || '...'
+    end as short_title
+  from tag_ranks tr
+  where tr.tag_rank <= 5
+)
+select
+  t.TagName,
+  t.question_id,
+  t.short_title,
+  t.CreationDate,
+  cast(round(cast(t.composite_score as numeric),4) as double precision) as composite_score,
+  t.question_score,
+  t.ViewCount,
+  t.avg_answer_score,
+  t.hours_to_accepted,
+  t.comment_count,
+  t.avg_comment_len,
+  t.BestUserId,
+  t.BestUserReputation,
+  t.owner_badges_before,
+  t.outbound_links,
+  t.inbound_links,
+  t.has_stronger_answer_elsewhere
+from top_per_tag t
+
+union
+
+select
+  null as TagName,
+  q.Id as question_id,
+  case when q.Title is null then '[no title]' 
+       when char_length(q.Title) <= 80 then q.Title
+       else substr(q.Title,1,77) || '...' end as short_title,
+  q.CreationDate,
+  cast(round(
+    (
+      (coalesce(q.Score,0) * 2.0)
+      + (ln(coalesce(q.ViewCount,1)+1) * 1.5)
+      + coalesce((select avg(a.Score) from Posts a where a.ParentId = q.Id),0) * 2.5
+      - coalesce((select extract(epoch from (min(a.CreationDate) - q.CreationDate))/3600 from Posts a where a.ParentId = q.Id and a.Id = q.AcceptedAnswerId),0)
+    ),4) as double precision) as composite_score,
+  q.Score as question_score,
+  q.ViewCount,
+  coalesce((select avg(a.Score) from Posts a where a.ParentId = q.Id),0) as avg_answer_score,
+  coalesce((select extract(epoch from (a.CreationDate - q.CreationDate))/3600 from Posts a where a.ParentId = q.Id and a.Id = q.AcceptedAnswerId limit 1), null) as hours_to_accepted,
+  coalesce((select count(*) from Comments c where c.PostId = q.Id),0) as comment_count,
+  coalesce((select avg(char_length(c.Text)) from Comments c where c.PostId = q.Id),0) as avg_comment_len,
+  (select bc.BestUserId from best_contributor bc where bc.QuestionId = q.Id) as BestUserId,
+  (select bc.BestUserReputation from best_contributor bc where bc.QuestionId = q.Id) as BestUserReputation,
+  (select ob.badges_before from owner_badges ob where ob.QuestionId = q.Id) as owner_badges_before,
+  (select count(*) from PostLinks pl where pl.PostId = q.Id and pl.LinkTypeId = 1) as outbound_links,
+  (select count(*) from PostLinks pl where pl.RelatedPostId = q.Id and pl.LinkTypeId = 1) as inbound_links,
+  false as has_stronger_answer_elsewhere
+from Posts q
+where q.PostTypeId = 1
+  and q.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '90 days'
+order by composite_score desc, comment_count desc
+limit 100;

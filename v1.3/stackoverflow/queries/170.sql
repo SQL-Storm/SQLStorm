@@ -1,0 +1,183 @@
+with
+question_tags as (
+  select p.id as post_id, u.id as owner_id,
+         lower(trim(t.tag)) as tag
+  from posts p
+  join users u on p.owneruserid = u.id
+  cross join lateral (
+    select unnest(string_to_array(substring(coalesce(p.tags,''), 2, greatest(length(coalesce(p.tags,'')) - 2,0)), '><')) as tag
+  ) t
+  where p.posttypeid = 1 and coalesce(p.tags,'') <> ''
+),
+user_tag_stats as (
+  select qt.owner_id,
+         qt.tag,
+         count(*) as tag_count,
+         sum(coalesce(p.score,0)) as tag_score
+  from question_tags qt
+  join posts p on p.id = qt.post_id
+  group by qt.owner_id, qt.tag
+),
+badge_agg as (
+  select b.userid,
+         count(case when b.class = 1 then 1 end) as gold_badges,
+         count(case when b.class = 2 then 1 end) as silver_badges,
+         count(case when b.class = 3 then 1 end) as bronze_badges,
+         max(b.date) as last_badge_date,
+         count(*) as total_badges
+  from badges b
+  group by b.userid
+),
+user_post_stats as (
+  select u.id as user_id,
+         count(case when p.posttypeid = 1 then 1 end) as question_count,
+         count(case when p.posttypeid = 2 then 1 end) as answer_count,
+         sum(coalesce(p.viewcount,0)) as total_views,
+         avg(coalesce(p.score,0)) filter (where p.posttypeid in (1,2)) as avg_post_score,
+         percentile_cont(0.5) within group (order by coalesce(p.score,0)) filter (where p.posttypeid in (1,2)) as median_post_score,
+         max(p.lastactivitydate) as last_post_activity
+  from users u
+  left join posts p on p.owneruserid = u.id
+  group by u.id
+),
+ranked_posts as (
+  select p.*,
+         row_number() over (partition by coalesce(p.owneruserid,-1) order by coalesce(p.score,0) desc, p.lastactivitydate desc) as rank_by_score,
+         row_number() over (partition by coalesce(p.owneruserid,-1) order by p.lastactivitydate desc) as rank_by_activity
+  from posts p
+),
+favorite_tags as (
+  select uts.owner_id as user_id,
+         (array_agg(uts.tag order by uts.tag_count desc, uts.tag_score desc, uts.tag))[1] as favorite_tag,
+         (array_agg(uts.tag_count order by uts.tag_count desc, uts.tag_score desc, uts.tag))[1] as favorite_tag_count
+  from user_tag_stats uts
+  group by uts.owner_id
+),
+recent_activity as (
+  select p.owneruserid as user_id, p.id as item_id, 'post' as item_type, p.creationdate as created_at, p.score, p.posttypeid, p.title
+  from posts p
+  where p.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '90 days' and p.owneruserid is not null
+
+  union all
+
+  select c.userid as user_id, c.id as item_id, 'comment' as item_type, c.creationdate as created_at, c.score, cast(null as integer) as posttypeid, cast(null as varchar) as title
+  from comments c
+  where c.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '90 days' and c.userid is not null
+),
+last_activity as (
+  select u.id as user_id,
+         greatest(
+           coalesce((
+             select max(p.lastactivitydate) from posts p where p.owneruserid = u.id
+           ), timestamp '0001-01-01 00:00:00'),
+           coalesce((
+             select max(c.creationdate) from comments c where c.userid = u.id
+           ), timestamp '0001-01-01 00:00:00'),
+           coalesce(ba.last_badge_date, timestamp '0001-01-01 00:00:00'),
+           coalesce((
+             select max(v.creationdate) from votes v where v.userid = u.id
+           ), timestamp '0001-01-01 00:00:00')
+         ) as last_activity_date
+  from users u
+  left join badge_agg ba on ba.userid = u.id
+  group by u.id, ba.last_badge_date
+),
+high_activity_candidates as (
+  select user_id from user_post_stats ups where coalesce(ups.question_count,0) + coalesce(ups.answer_count,0) >= 50
+  union
+  select userid as user_id from badges where date >= cast('2024-10-01 12:34:56' as timestamp) - interval '365 days' group by userid having count(*) >= 10
+  except
+  select id from users where coalesce(reputation,0) < 100
+),
+final_users as (
+  select u.id,
+         u.displayname,
+         u.reputation,
+         ups.question_count,
+         ups.answer_count,
+         ups.avg_post_score,
+         ups.median_post_score,
+         coalesce(ba.gold_badges,0) as gold_badges,
+         coalesce(ba.silver_badges,0) as silver_badges,
+         coalesce(ba.bronze_badges,0) as bronze_badges,
+         ft.favorite_tag,
+         ft.favorite_tag_count,
+         la.last_activity_date,
+         (select count(*) from posts p where p.posttypeid = 2 and p.owneruserid = u.id and exists (select 1 from posts q where q.id = p.id and q.id in (select acceptedanswerid from posts where acceptedanswerid is not null))) as accepted_as_answer_count,
+         (select count(*) from posts p where p.posttypeid = 2 and p.owneruserid = u.id) as total_answers,
+         (select count(*) from postlinks pl join linktypes lt on lt.id = pl.linktypeid where pl.postid in (select id from posts where owneruserid = u.id) and lower(lt.name) like '%duplicate%') as duplicate_links_out,
+         (case when la.last_activity_date >= cast('2024-10-01 12:34:56' as timestamp) - interval '30 days' then true else false end) as active_30d
+  from users u
+  left join user_post_stats ups on ups.user_id = u.id
+  left join badge_agg ba on ba.userid = u.id
+  left join favorite_tags ft on ft.user_id = u.id
+  left join last_activity la on la.user_id = u.id
+  where u.id in (select user_id from high_activity_candidates)
+),
+representative_posts as (
+  select fu.id as user_id,
+         rp_top.id as top_post_id, rp_top.title as top_post_title, rp_top.score as top_post_score, rp_top.posttypeid as top_post_type,
+         rp_recent.id as recent_post_id, rp_recent.title as recent_post_title, rp_recent.creationdate as recent_post_date
+  from final_users fu
+  left join ranked_posts rp_top on rp_top.owneruserid = fu.id and rp_top.rank_by_score = 1
+  left join ranked_posts rp_recent on rp_recent.owneruserid = fu.id and rp_recent.rank_by_activity = 1
+)
+select fu.id,
+       fu.displayname,
+       fu.reputation,
+       fu.question_count,
+       fu.answer_count,
+       fu.avg_post_score,
+       fu.median_post_score,
+       fu.gold_badges,
+       fu.silver_badges,
+       fu.bronze_badges,
+       fu.favorite_tag,
+       fu.favorite_tag_count,
+       fu.last_activity_date,
+       fu.accepted_as_answer_count,
+       fu.total_answers,
+       fu.duplicate_links_out,
+       fu.active_30d,
+       rp.top_post_id, rp.top_post_title, rp.top_post_score, rp.top_post_type,
+       rp.recent_post_id, rp.recent_post_title, rp.recent_post_date,
+       (case when coalesce(fu.total_answers,0) = 0 then null
+             else round(100.0 * coalesce(fu.accepted_as_answer_count,0) / fu.total_answers,2)
+        end) as accepted_answer_percent,
+       (fu.reputation - avg(fu.reputation) over ()) / nullif(stddev_samp(fu.reputation) over (),0) as reputation_zscore,
+       round(
+         coalesce(fu.question_count,0) * 0.6
+         + coalesce(fu.answer_count,0) * 0.8
+         + coalesce(fu.avg_post_score,0) * 1.5
+         + (coalesce(fu.gold_badges,0) * 5 + coalesce(fu.silver_badges,0) * 2 + coalesce(fu.bronze_badges,0) * 0.5)
+         - (case when fu.active_30d then 0 else 3 end)
+       ,2) as complexity_score
+from final_users fu
+left join representative_posts rp on rp.user_id = fu.id
+group by
+  fu.id,
+  fu.displayname,
+  fu.reputation,
+  fu.question_count,
+  fu.answer_count,
+  fu.avg_post_score,
+  fu.median_post_score,
+  fu.gold_badges,
+  fu.silver_badges,
+  fu.bronze_badges,
+  fu.favorite_tag,
+  fu.favorite_tag_count,
+  fu.last_activity_date,
+  fu.accepted_as_answer_count,
+  fu.total_answers,
+  fu.duplicate_links_out,
+  fu.active_30d,
+  rp.top_post_id,
+  rp.top_post_title,
+  rp.top_post_score,
+  rp.top_post_type,
+  rp.recent_post_id,
+  rp.recent_post_title,
+  rp.recent_post_date
+order by complexity_score desc, fu.reputation desc
+limit 250;

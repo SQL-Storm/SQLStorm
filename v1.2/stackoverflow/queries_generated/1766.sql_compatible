@@ -1,0 +1,62 @@
+with RecursiveUserActivity as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Location,
+        count(distinct case when p.PostTypeId = 1 then p.Id end) as QuestionCount,
+        count(distinct case when p_ans.PostTypeId = 2 then p_ans.Id end) as AnswerCount,
+        sum(case when p.PostTypeId = 1 then p.Score else 0 end) as QuestionScoreTotal,
+        sum(case when p_ans.PostTypeId = 2 then p_ans.Score else 0 end) as AnswerScoreTotal,
+        date_part('year', AGE(timestamp '2024-10-01 12:34:56', u.CreationDate)) as AccountAgeYears
+    from
+        Users u
+        left join Posts p on p.OwnerUserId = u.Id
+        left join Posts p_ans on p_ans.OwnerUserId = u.Id
+    group by
+        u.Id, u.DisplayName, u.Location, u.CreationDate
+),
+LatestPostEdits as (
+    select ph.PostId, max(ph.CreationDate) as LastEdit
+    from PostHistory ph
+    where ph.PostHistoryTypeId in (4,5,6,7,8,9)
+    group by ph.PostId
+),
+PostsDetailed as (
+    select
+        p.Id,
+        p.PostTypeId,
+        pt.Name as PostTypeName,
+        p.Score,
+        coalesce(p.ViewCount, 0) as ViewCount,
+        p.CreationDate,
+        p.Title,
+        p.Tags,
+        u.Id as OwnerUserId,
+        u.DisplayName as OwnerDisplayName,
+        u.Reputation,
+        lpe.LastEdit,
+        crt_close.Name as CloseReasonName,
+        wonladw.DateDescending
+    from Posts p
+    join PostTypes pt on pt.Id = p.PostTypeId
+    left join Users u on u.Id = p.OwnerUserId
+    left join LatestPostEdits lpe on lpe.PostId = p.Id
+    left join (
+        select phin.PostId,
+               crt.Name,
+               phin.CreationDate
+        from PostHistory phin
+        inner join CloseReasonTypes crt
+            on crt.Id = cast(phin.Comment as integer)
+        where phin.PostHistoryTypeId = 10
+    ) crt_close on crt_close.PostId = p.Id
+    left join (
+        select p2.Id as PostId, max(ph2.CreationDate) as DateDescending
+        from PostHistory ph2
+        join Posts p2 on p2.Id = ph2.PostId
+        group by p2.Id
+    ) wonladw on wonladw.PostId = p.Id
+)
+select *
+from PostsDetailed pd
+join RecursiveUserActivity rua on rua.UserId = pd.OwnerUserId;

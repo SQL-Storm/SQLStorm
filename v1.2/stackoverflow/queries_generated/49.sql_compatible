@@ -1,0 +1,199 @@
+with RecursiveTagHierarchy as (
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        t.IsModeratorOnly,
+        t.IsRequired,
+        1 as Level,
+        array[t.Id] as Path
+    from Tags t
+    where t.IsRequired = true
+
+    union all
+
+    select
+        t2.Id,
+        t2.TagName,
+        t2.Count,
+        t2.ExcerptPostId,
+        t2.WikiPostId,
+        t2.IsModeratorOnly,
+        t2.IsRequired,
+        r.Level + 1,
+        r.Path || t2.Id
+    from Tags t2
+    join RecursiveTagHierarchy r on t2.IsRequired = true and not t2.Id = any(r.Path)
+    where r.Level < 3
+),
+UserBadgeCounts as (
+    select
+        b.UserId,
+        b.Class,
+        count(*) as BadgeCount
+    from Badges b
+    group by b.UserId, b.Class
+),
+UserReputationWindow as (
+    select
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.Location,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionCount,
+        count(distinct p.Id) filter (where p.PostTypeId = 2) as AnswerCount,
+        sum(p.Score) filter (where p.PostTypeId in (1,2)) as TotalPostScore,
+        row_number() over (order by u.Reputation desc) as ReputationRank,
+        rank() over (partition by u.Location order by u.Reputation desc) as LocationReputationRank
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    group by u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.Location, u.Views, u.UpVotes, u.DownVotes
+),
+TopPostsWithComments as (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        p.OwnerUserId,
+        u.DisplayName as OwnerName,
+        coalesce(c.CommentCount, 0) as CommentCount,
+        coalesce(vc.UpVotes, 0) as UpVotes,
+        coalesce(vc.DownVotes, 0) as DownVotes,
+        case when p.AcceptedAnswerId is not null then 1 else 0 end as HasAcceptedAnswer,
+        row_number() over (partition by p.PostTypeId order by p.Score desc, p.ViewCount desc) as PostRank
+    from Posts p
+    left join Users u on u.Id = p.OwnerUserId
+    left join (
+        select PostId, count(*) as CommentCount
+        from Comments
+        group by PostId
+    ) c on c.PostId = p.Id
+    left join (
+        select
+            v.PostId,
+            sum(case when vt.Name = 'UpMod' then 1 else 0 end) as UpVotes,
+            sum(case when vt.Name = 'DownMod' then 1 else 0 end) as DownVotes
+        from Votes v
+        join VoteTypes vt on vt.Id = v.VoteTypeId
+        group by v.PostId
+    ) vc on vc.PostId = p.Id
+    where p.PostTypeId in (1, 2)
+),
+DuplicateLinks as (
+    select
+        pl.PostId,
+        pl.RelatedPostId,
+        pl.CreationDate,
+        u.DisplayName as LinkCreator,
+        p1.Title as PostTitle,
+        p2.Title as RelatedPostTitle
+    from PostLinks pl
+    join LinkTypes lt on lt.Id = pl.LinkTypeId and lt.Name = 'Duplicate'
+    join Users u on u.Id = (
+        select ph.UserId
+        from PostHistory ph
+        where ph.PostId = pl.PostId and ph.PostHistoryTypeId = 10
+        order by ph.CreationDate desc
+        limit 1
+    )
+    join Posts p1 on p1.Id = pl.PostId
+    join Posts p2 on p2.Id = pl.RelatedPostId
+),
+QuestionsWithCloseReasons as (
+    select
+        p.Id,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        crt.Name as CloseReason,
+        ph.CreationDate as CloseDate,
+        ph.UserId as ClosedByUserId,
+        u.DisplayName as ClosedByUserName
+    from Posts p
+    left join PostHistory ph on ph.PostId = p.Id and ph.PostHistoryTypeId = 10
+    left join CloseReasonTypes crt on crt.Id = cast(ph.Comment as integer)
+    left join Users u on u.Id = ph.UserId
+    where p.PostTypeId = 1
+),
+UserActivitySummary as (
+    select
+        u.Id,
+        u.DisplayName,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionsPosted,
+        count(distinct p.Id) filter (where p.PostTypeId = 2) as AnswersPosted,
+        count(distinct c.Id) as CommentsMade,
+        count(distinct v.Id) filter (where v.VoteTypeId = 2) as UpVotesGiven,
+        count(distinct v.Id) filter (where v.VoteTypeId = 3) as DownVotesGiven,
+        count(distinct b.Id) as BadgesEarned
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Comments c on c.UserId = u.Id
+    left join Votes v on v.UserId = u.Id
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.DisplayName
+)
+select
+    u.Id as UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.Location,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    ubc_gold.BadgeCount as GoldBadges,
+    ubc_silver.BadgeCount as SilverBadges,
+    ubc_bronze.BadgeCount as BronzeBadges,
+    uas.QuestionsPosted,
+    uas.AnswersPosted,
+    uas.CommentsMade,
+    uas.UpVotesGiven,
+    uas.DownVotesGiven,
+    uas.BadgesEarned,
+    tpq.Id as TopQuestionId,
+    tpq.Title as TopQuestionTitle,
+    tpq.Score as TopQuestionScore,
+    tpq.ViewCount as TopQuestionViews,
+    tpq.CommentCount as TopQuestionComments,
+    tpq.UpVotes as TopQuestionUpVotes,
+    tpq.DownVotes as TopQuestionDownVotes,
+    tpq.HasAcceptedAnswer as TopQuestionHasAcceptedAnswer,
+    tpa.Id as TopAnswerId,
+    tpa.Title as TopAnswerTitle,
+    tpa.Score as TopAnswerScore,
+    tpa.ViewCount as TopAnswerViews,
+    tpa.CommentCount as TopAnswerComments,
+    tpa.UpVotes as TopAnswerUpVotes,
+    tpa.DownVotes as TopAnswerDownVotes,
+    qcr.CloseReason as LastCloseReason,
+    qcr.CloseDate as LastCloseDate,
+    qcr.ClosedByUserName as LastClosedBy,
+    dl.RelatedPostId as DuplicateOfPostId,
+    dl.RelatedPostTitle as DuplicateOfPostTitle,
+    dl.LinkCreator as DuplicateLinkCreator
+from UserReputationWindow u
+left join UserBadgeCounts ubc_gold on ubc_gold.UserId = u.Id and ubc_gold.Class = 1
+left join UserBadgeCounts ubc_silver on ubc_silver.UserId = u.Id and ubc_silver.Class = 2
+left join UserBadgeCounts ubc_bronze on ubc_bronze.UserId = u.Id and ubc_bronze.Class = 3
+left join UserActivitySummary uas on uas.Id = u.Id
+left join TopPostsWithComments tpq on tpq.OwnerUserId = u.Id and tpq.PostTypeId = 1 and tpq.PostRank = 1
+left join TopPostsWithComments tpa on tpa.OwnerUserId = u.Id and tpa.PostTypeId = 2 and tpa.PostRank = 1
+left join QuestionsWithCloseReasons qcr on qcr.Id = tpq.Id
+left join DuplicateLinks dl on dl.PostId = tpq.Id
+where u.Reputation > (
+    select avg(Reputation::numeric) from Users
+)
+and (u.Location is not null and u.Location <> '')
+order by u.Reputation desc
+limit 100;

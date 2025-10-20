@@ -1,0 +1,62 @@
+WITH RecursivePostCounts AS (
+  SELECT
+    p.Id,
+    p.PostTypeId,
+    COUNT(a.Id) FILTER (WHERE a.Id IS NOT NULL) OVER (PARTITION BY a.ParentId) AS AnswerCountPronounced,
+    ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC, p.ViewCount DESC) AS Rank_FromPosts,
+    p.Tags,
+    p.CreationDate,
+    u.Reputation AS OwnerReputation,
+    DENSE_RANK() OVER (ORDER BY COALESCE(u.Location, 'Unknown')) AS LocationDensity
+  FROM Posts p
+  LEFT JOIN Users u ON p.OwnerUserId = u.Id
+  LEFT JOIN Posts a ON a.ParentId = p.Id AND a.PostTypeId = 2
+  WHERE p.PostTypeId = 1
+),
+UserBadgeVariety AS (
+  SELECT
+    b.UserId,
+    COUNT(DISTINCT b.Name) AS BadgeTypesClaimed,
+    SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) * 1.0 / NULLIF(COUNT(*), 0) AS GoldFraction,
+    MIN(b.Date) AS FirstBadgeAward,
+    MAX(CASE WHEN b.Class = 3 THEN b.Date ELSE NULL END) AS LastBronzeGot
+  FROM Badges b
+  GROUP BY b.UserId
+),
+PostsRevansionDuplicates AS (
+  SELECT
+    sn.Id AS StepId,
+    pLink.PostId,
+    pLink.RelatedPostId,
+    LinkId.Name AS LinkTypeName,
+    densests.QIntegrityGroup
+  FROM (
+    SELECT q.Id
+    FROM SomeTable q
+  ) sn
+  JOIN PostLinks pLink ON pLink.PostId = sn.Id
+  LEFT JOIN LinkTypes LinkId ON pLink.LinkTypeId = LinkId.Id
+  LEFT JOIN DensestGroups densests ON pLink.PostId = densests.PostId
+)
+SELECT
+  rpc.Id,
+  rpc.PostTypeId,
+  rpc.AnswerCountPronounced,
+  rpc.Rank_FromPosts,
+  rpc.Tags,
+  rpc.CreationDate,
+  rpc.OwnerReputation,
+  rpc.LocationDensity,
+  ubv.UserId,
+  ubv.BadgeTypesClaimed,
+  ubv.GoldFraction,
+  ubv.FirstBadgeAward,
+  ubv.LastBronzeGot,
+  prd.StepId,
+  prd.PostId AS DuplicatePostId,
+  prd.RelatedPostId,
+  prd.LinkTypeName,
+  prd.QIntegrityGroup
+FROM RecursivePostCounts rpc
+LEFT JOIN UserBadgeVariety ubv ON rpc.Id = ubv.UserId
+LEFT JOIN PostsRevansionDuplicates prd ON rpc.Id = prd.PostId;

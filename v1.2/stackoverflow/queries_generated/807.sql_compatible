@@ -1,0 +1,186 @@
+with RecursiveTagCounts as (
+    select
+        t.Id,
+        t.TagName,
+        coalesce(p.AnswerCount, 0) + coalesce(p.FavoriteCount, 0) as ActivityScore,
+        p.ViewCount,
+        p.Score,
+        p.OwnerUserId
+    from Tags t
+    left join Posts p on t.ExcerptPostId = p.Id and p.PostTypeId = 1
+    where t.Count > 100
+),
+UserBadgeSummary as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        count(b.Id) filter (where b.Class = 1) as GoldBadges,
+        count(b.Id) filter (where b.Class = 2) as SilverBadges,
+        count(b.Id) filter (where b.Class = 3) as BronzeBadges,
+        sum(case when b.TagBased = true then 1 else 0 end) as TagBasedBadges
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.DisplayName, u.Reputation
+),
+TopPostsWithVotes as (
+    select
+        p.Id,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId,
+        vt.Name as VoteTypeName,
+        count(v.Id) as VoteCount,
+        sum(v.BountyAmount) as TotalBounty
+    from Posts p
+    left join Votes v on v.PostId = p.Id
+    left join VoteTypes vt on v.VoteTypeId = vt.Id
+    where p.PostTypeId in (1,2)
+    group by p.Id, p.Title, p.CreationDate, p.Score, p.ViewCount, p.OwnerUserId, vt.Name
+),
+UserPostStats as (
+    select
+        u.Id,
+        u.DisplayName,
+        count(p.Id) filter (where p.PostTypeId = 1) as QuestionsCount,
+        count(p.Id) filter (where p.PostTypeId = 2) as AnswersCount,
+        avg(p.Score) filter (where p.PostTypeId in (1,2)) as AvgPostScore,
+        sum(p.FavoriteCount) filter (where p.PostTypeId = 1) as TotalFavorites
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    group by u.Id, u.DisplayName
+),
+AnswerWithAcceptedStatus as (
+    select
+        a.Id as AnswerId,
+        a.ParentId as QuestionId,
+        case when q.AcceptedAnswerId = a.Id then 1 else 0 end as IsAccepted,
+        a.Score,
+        a.CreationDate,
+        a.OwnerUserId
+    from Posts a
+    join Posts q on a.ParentId = q.Id and q.PostTypeId = 1
+    where a.PostTypeId = 2
+),
+RankedAnswers as (
+    select
+        awas.*,
+        row_number() over (partition by awas.QuestionId order by awas.Score desc, awas.CreationDate asc) as AnswerRank
+    from AnswerWithAcceptedStatus awas
+),
+ClosedQuestionsWithReasons as (
+    select
+        ph.PostId,
+        max(case when ph.PostHistoryTypeId = 10 then try_cast(ph.Comment as integer) else null end) as CloseReasonId,
+        crt.Name as CloseReasonName,
+        ph.CreationDate as ClosedDate
+    from PostHistory ph
+    left join CloseReasonTypes crt on crt.Id = try_cast(ph.Comment as integer)
+    where ph.PostHistoryTypeId = 10
+    group by ph.PostId, ph.CreationDate, crt.Name
+),
+PostsWithCloseInfo as (
+    select
+        p.Id,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId,
+        cqwr.CloseReasonId,
+        cqwr.CloseReasonName,
+        cqwr.ClosedDate
+    from Posts p
+    left join ClosedQuestionsWithReasons cqwr on p.Id = cqwr.PostId
+    where p.PostTypeId = 1
+),
+UserRecentActivity as (
+    select
+        u.Id as UserId,
+        max(ph.CreationDate) as LastActivityDate,
+        count(ph.Id) filter (where ph.PostHistoryTypeId = 10) as CloseVotesCast,
+        count(ph.Id) filter (where ph.PostHistoryTypeId = 11) as ReopenVotesCast
+    from Users u
+    left join PostHistory ph on ph.UserId = u.Id
+    group by u.Id
+),
+UserTagParticipation as (
+    select
+        u.Id as UserId,
+        (select count(distinct tag)
+         from (
+           select unnest(string_to_array(substring(p.Tags from 2 for char_length(p.Tags)-2), '><')) as tag
+           from Posts p
+           where p.OwnerUserId = u.Id and p.PostTypeId = 1 and p.Tags is not null
+         ) t) as DistinctTagsParticipated
+    from Users u
+),
+FinalResult as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        ub.GoldBadges,
+        ub.SilverBadges,
+        ub.BronzeBadges,
+        ub.TagBasedBadges,
+        ups.QuestionsCount,
+        ups.AnswersCount,
+        ups.AvgPostScore,
+        ups.TotalFavorites,
+        ura.LastActivityDate,
+        ura.CloseVotesCast,
+        ura.ReopenVotesCast,
+        utp.DistinctTagsParticipated,
+        ptc.TagName as MostActiveTag,
+        ptc.ActivityScore,
+        ptc.ViewCount as TagExcerptViewCount,
+        pwi.Title as RecentlyClosedQuestionTitle,
+        pwi.CloseReasonName,
+        pwi.ClosedDate,
+        (select count(*) from Posts where OwnerUserId = u.Id and PostTypeId = 2 and Score > 10) as HighScoreAnswers,
+        (select string_agg(distinct vt.Name, ', ' order by vt.Name)
+         from Votes v
+         join VoteTypes vt on v.VoteTypeId = vt.Id
+         join Posts p on p.Id = v.PostId
+         where p.OwnerUserId = u.Id
+         limit 5) as VoteTypesUsed
+    from Users u
+    left join UserBadgeSummary ub on ub.UserId = u.Id
+    left join UserPostStats ups on ups.Id = u.Id
+    left join UserRecentActivity ura on ura.UserId = u.Id
+    left join UserTagParticipation utp on utp.UserId = u.Id
+    left join RecursiveTagCounts ptc on ptc.OwnerUserId = u.Id
+    left join PostsWithCloseInfo pwi on pwi.OwnerUserId = u.Id
+    where u.Reputation > 1000
+)
+select
+    fr.UserId,
+    fr.DisplayName,
+    fr.Reputation,
+    fr.GoldBadges,
+    fr.SilverBadges,
+    fr.BronzeBadges,
+    fr.TagBasedBadges,
+    fr.QuestionsCount,
+    fr.AnswersCount,
+    coalesce(fr.AvgPostScore,0) as AvgPostScore,
+    fr.TotalFavorites,
+    fr.LastActivityDate,
+    fr.CloseVotesCast,
+    fr.ReopenVotesCast,
+    coalesce(fr.DistinctTagsParticipated,0) as DistinctTagsParticipated,
+    fr.MostActiveTag,
+    fr.ActivityScore,
+    fr.TagExcerptViewCount,
+    fr.RecentlyClosedQuestionTitle,
+    fr.CloseReasonName,
+    fr.ClosedDate,
+    fr.HighScoreAnswers,
+    fr.VoteTypesUsed
+from FinalResult fr
+where fr.AnswersCount > 10
+order by fr.Reputation desc
+limit 50;

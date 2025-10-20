@@ -1,0 +1,161 @@
+with RecursiveUserActivity as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        coalesce(u.Location, 'Unknown') as Location,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionCount,
+        count(distinct p.Id) filter (where p.PostTypeId = 2) as AnswerCount,
+        count(distinct c.Id) as CommentCount,
+        sum(v.VoteCount) as TotalVotes,
+        row_number() over (partition by u.Location order by u.Reputation desc) as LocationRank
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join (
+        select PostId, count(*) as VoteCount
+        from Votes
+        where VoteTypeId in (2,3) -- UpMod and DownMod
+        group by PostId
+    ) v on v.PostId = p.Id
+    left join Comments c on c.UserId = u.Id
+    where u.Reputation > 1000
+    group by u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate, u.Location
+),
+TopTags as (
+    select 
+        t.Id as TagId,
+        t.TagName,
+        t.Count,
+        case when t.IsModeratorOnly then 1 else 0 end as IsModeratorOnly,
+        case when t.IsRequired then 1 else 0 end as IsRequired,
+        p.Id as ExcerptPostId,
+        p.Title as ExcerptTitle
+    from Tags t
+    left join Posts p on p.Id = t.ExcerptPostId
+    where t.Count > 1000
+),
+UserBadgeSummary as (
+    select 
+        b.UserId,
+        count(*) filter (where b.Class = 1) as GoldBadges,
+        count(*) filter (where b.Class = 2) as SilverBadges,
+        count(*) filter (where b.Class = 3) as BronzeBadges,
+        max(case when b.TagBased = true or b.TagBased = 1 then 1 else 0 end) as HasTagBasedBadge
+    from Badges b
+    group by b.UserId
+),
+PostStats as (
+    select 
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.FavoriteCount,
+        p.Tags,
+        p.AcceptedAnswerId,
+        p.ClosedDate,
+        row_number() over (partition by p.OwnerUserId order by p.CreationDate desc) as RecentPostRank,
+        lag(p.Score) over (partition by p.OwnerUserId order by p.CreationDate) as PrevScore,
+        lead(p.Score) over (partition by p.OwnerUserId order by p.CreationDate) as NextScore,
+        case 
+            when p.ClosedDate is not null then 1
+            else 0
+        end as IsClosed
+    from Posts p
+    where p.PostTypeId in (1,2)
+),
+DuplicateLinks as (
+    select pl.PostId, pl.RelatedPostId, pl.CreationDate
+    from PostLinks pl
+    inner join LinkTypes lt on lt.Id = pl.LinkTypeId and lt.Name = 'Duplicate'
+),
+UserCloseReasons as (
+    select 
+        ph.UserId,
+        ph.PostId,
+        crt.Name as CloseReasonName,
+        count(*) as CloseVotes
+    from PostHistory ph
+    inner join CloseReasonTypes crt on crt.Id = cast(ph.Comment as integer)
+    where ph.PostHistoryTypeId = 10 -- Post Closed
+    group by ph.UserId, ph.PostId, crt.Name
+),
+TagArray as (
+    select 
+        p.Id as PostId,
+        unnest(string_to_array(substring(p.Tags from 2 for length(p.Tags)-2), '><')) as Tag
+    from Posts p
+    where p.Tags is not null
+)
+select 
+    ua.UserId,
+    ua.DisplayName,
+    ua.Reputation,
+    ua.Location,
+    ua.QuestionCount,
+    ua.AnswerCount,
+    ua.CommentCount,
+    ua.TotalVotes,
+    ubs.GoldBadges,
+    ubs.SilverBadges,
+    ubs.BronzeBadges,
+    ubs.HasTagBasedBadge,
+    ts.PostTypeId,
+    ts.Score,
+    ts.ViewCount,
+    ts.AnswerCount,
+    ts.FavoriteCount,
+    ts.IsClosed,
+    dt.RelatedPostId as DuplicateOfPost,
+    ucr.CloseReasonName,
+    array_agg(distinct tt.TagName) filter (where tt.TagName is not null) as PopularTags,
+    string_agg(distinct case when ts.Score > 0 then 'Positive' else 'Non-Positive' end, ',') as ScoreLabels,
+    max(ts.PrevScore) over (partition by ua.UserId) as MaxPrevScore,
+    min(ts.NextScore) over (partition by ua.UserId) as MinNextScore,
+    count(distinct dt.RelatedPostId) over (partition by ua.UserId) as DuplicateCount,
+    count(distinct ucr.CloseReasonName) over (partition by ua.UserId) as CloseReasonCount,
+    case 
+        when ua.TotalVotes > 1000 and ua.Reputation > 5000 then 'HighRepHighVotes'
+        when ua.TotalVotes > 1000 then 'HighVotes'
+        when ua.Reputation > 5000 then 'HighRep'
+        else 'Normal'
+    end as UserCategory
+from RecursiveUserActivity ua
+left join UserBadgeSummary ubs on ubs.UserId = ua.UserId
+left join PostStats ts on ts.OwnerUserId = ua.UserId and ts.RecentPostRank = 1
+left join DuplicateLinks dt on dt.PostId = ts.Id
+left join UserCloseReasons ucr on ucr.UserId = ua.UserId and ucr.PostId = ts.Id
+left join (
+    select distinct Tag
+    from TagArray
+    where Tag in (select TagName from TopTags)
+) tt on tt.Tag = any(string_to_array(coalesce(ts.Tags, ''), '><'))
+where ua.Location is not null
+group by
+    ua.UserId,
+    ua.DisplayName,
+    ua.Reputation,
+    ua.Location,
+    ua.QuestionCount,
+    ua.AnswerCount,
+    ua.CommentCount,
+    ua.TotalVotes,
+    ubs.GoldBadges,
+    ubs.SilverBadges,
+    ubs.BronzeBadges,
+    ubs.HasTagBasedBadge,
+    ts.PostTypeId,
+    ts.Score,
+    ts.ViewCount,
+    ts.AnswerCount,
+    ts.FavoriteCount,
+    ts.IsClosed,
+    dt.RelatedPostId,
+    ucr.CloseReasonName
+order by ua.Reputation desc, ua.TotalVotes desc
+limit 100;

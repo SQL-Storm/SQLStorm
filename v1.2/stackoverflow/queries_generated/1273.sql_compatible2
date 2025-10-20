@@ -1,0 +1,114 @@
+WITH RECURSIVE RecursiveTagCounts AS (
+    SELECT t.Id, t.TagName, t.Count, p.Id AS PostId, p.Score,
+           row_number() OVER (PARTITION BY t.Id ORDER BY p.Score DESC, p.CreationDate) AS RankByScore
+      FROM Tags t
+      LEFT JOIN Posts p
+        ON p.Tags LIKE '%' || '<' || t.TagName || '>' || '%'
+    UNION ALL 
+    SELECT rtc.Id, rtc.TagName, rtc.Count, p2.Id, p2.Score,
+           row_number() OVER (PARTITION BY rtc.Id ORDER BY p2.Score DESC, p2.CreationDate)
+      FROM RecursiveTagCounts rtc
+      JOIN Posts p2 ON p2.ParentId = rtc.PostId AND p2.PostTypeId = 2
+),
+UserBadgeCounts AS (
+    SELECT u.Id AS UserId, 
+           u.DisplayName,
+           SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+           SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+           SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+           COUNT(b.Id) AS TotalBadges
+      FROM Users u
+      LEFT JOIN Badges b 
+        ON b.UserId = u.Id
+      GROUP BY u.Id, u.DisplayName
+),
+UserActivity AS (
+    SELECT u.Id AS UserId, u.DisplayName, u.Reputation, u.CreationDate,
+           (SELECT COUNT(p.Id) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 1) AS QuestionCount,
+           (SELECT COUNT(p.Id) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 2) AS AnswerCount,
+           (SELECT COUNT(c.Id) FROM Comments c WHERE c.UserId = u.Id) AS CommentCount,
+           (SELECT COUNT(v.Id) FROM Votes v WHERE v.UserId = u.Id AND v.VoteTypeId = 3) AS DownVoteCount,
+           (SELECT COUNT(v.Id) FROM Votes v WHERE v.UserId = u.Id AND v.VoteTypeId = 2) AS UpVoteCount,
+           CASE 
+             WHEN u.LastAccessDate IS NULL OR u.CreationDate IS NULL THEN NULL
+             ELSE EXTRACT(DAY FROM (u.LastAccessDate - u.CreationDate))
+           END AS DaysActive
+      FROM Users u
+),
+TopTagQuestions AS (
+    SELECT t.Id AS TagId, t.TagName, COUNT(p.Id) AS QuestionCount,
+           AVG(COALESCE(p.Score, 0)) AS AvgScore, 
+           COUNT(DISTINCT p.OwnerUserId) AS DistinctAskers,
+           MAX(p.ViewCount) AS MaxViewCount,
+           -- string aggregation compatible: use STRING_AGG; keep FILTER for Postgres, fallback use conditional inside aggregation
+           STRING_AGG(DISTINCT u.DisplayName, ', ' ORDER BY u.Reputation DESC) FILTER (WHERE u.DisplayName IS NOT NULL) AS ActiveUsers
+      FROM Tags t
+      INNER JOIN Posts p ON p.Tags LIKE '%' || '<' || t.TagName || '>' || '%'
+      LEFT JOIN Users u ON u.Id = p.OwnerUserId
+      WHERE p.PostTypeId = 1
+      GROUP BY t.Id, t.TagName
+      HAVING COUNT(p.Id) > 5
+),
+FilteredPostsWithVotes AS (
+    SELECT p.Id, p.PostTypeId, p.OwnerUserId, p.Score, p.ViewCount, p.CreationDate,
+           COUNT(CASE WHEN v.VoteTypeId = 2 THEN 1 END) AS UpVotes,
+           COUNT(CASE WHEN v.VoteTypeId = 3 THEN 1 END) AS DownVotes,
+           rank() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC, p.CreationDate) AS RankByScore
+      FROM Posts p
+      LEFT JOIN Votes v ON v.PostId = p.Id
+      WHERE p.CreationDate >= DATE '2022-01-01' AND p.CreationDate < DATE '2023-01-01'
+      GROUP BY p.Id, p.PostTypeId, p.OwnerUserId, p.Score, p.ViewCount, p.CreationDate
+)
+SELECT ua.DisplayName,
+       ua.Reputation,
+       ua.QuestionCount,
+       ua.AnswerCount,
+       ua.CommentCount,
+       ua.UpVoteCount,
+       ua.DownVoteCount,
+       ub.GoldBadges,
+       ub.SilverBadges,
+       ub.BronzeBadges,
+       ua.DaysActive,
+       ttq.TagName,
+       ttq.QuestionCount AS TagQuestionCount,
+       ttq.AvgScore AS TagAvgScore,
+       ttq.DistinctAskers,
+       ttq.MaxViewCount,
+       ttq.ActiveUsers,
+       fp.Id AS TopPostId,
+       fp.Score AS TopPostScore,
+       fp.ViewCount AS TopPostViews,
+       fp.UpVotes AS TopPostUpVotes,
+       fp.DownVotes AS TopPostDownVotes
+  FROM UserActivity ua
+  LEFT JOIN UserBadgeCounts ub ON ub.UserId = ua.UserId
+  LEFT JOIN LATERAL (
+    SELECT * 
+      FROM FilteredPostsWithVotes 
+     WHERE OwnerUserId = ua.UserId AND RankByScore = 1
+     LIMIT 1
+  ) fp ON TRUE
+  LEFT JOIN LATERAL (
+    -- determine the top tag for the user's top post (if any) and find the matching TopTagQuestions row
+    SELECT ttq_inner.*
+      FROM (
+        SELECT ttq2.*
+          FROM TopTagQuestions ttq2
+         WHERE ttq2.TagName IN (
+             -- split tags string into elements; use regexp to extract tags between < and >
+             SELECT regexp_replace(tag, '^>|<$', '') FROM (
+               SELECT regexp_matches(coalesce(p.Tags, ''), '<([^>]*)>', 'g') AS tag_array, p.Id AS p_id
+               FROM Posts p
+               WHERE p.Id = fp.Id
+             ) sub,
+             LATERAL unnest(tag_array) AS tag
+         )
+         ORDER BY ttq2.QuestionCount DESC
+         LIMIT 1
+      ) ttq_inner
+  ) ttq ON TRUE
+  WHERE ua.Reputation > 10000
+    AND ua.QuestionCount > 10
+  ORDER BY ua.Reputation DESC
+  LIMIT 25;

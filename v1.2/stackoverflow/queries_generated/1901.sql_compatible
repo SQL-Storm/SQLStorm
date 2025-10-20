@@ -1,0 +1,31 @@
+WITH RecursiveDirectTagHierarchy AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        1 AS as_tree_level,
+        ARRAY[t.Id] AS path_ids
+    FROM Tags t
+    WHERE t.IsRequired = 1
+
+    UNION ALL
+
+    SELECT
+        c.Id,
+        c.TagName,
+        c.Count,
+        h.as_tree_level + 1 AS as_tree_level,
+        h.path_ids || c.Id AS path_ids
+    FROM Tags c
+    INNER JOIN RecursiveDirectTagHierarchy h
+        ON c.IsModeratorOnly = 0
+        AND c.Count > h.Count
+)
+SELECT
+    r.Id,
+    r.TagName,
+    r.Count,
+    r.as_tree_level,
+    r.path_ids
+FROM RecursiveDirectTagHierarchy r
+ORDER BY r.as_tree_level, r.Id;

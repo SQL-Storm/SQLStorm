@@ -1,0 +1,213 @@
+with RecursiveUserActivity as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionCount,
+        count(distinct p.Id) filter (where p.PostTypeId = 2) as AnswerCount,
+        count(distinct c.Id) as CommentCount,
+        coalesce(sum(v.VoteCount), 0) as TotalVotes,
+        row_number() over (order by u.Reputation desc) as RankByReputation
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join (
+        select PostId, count(*) as VoteCount
+        from Votes
+        where VoteTypeId in (2,3)
+        group by PostId
+    ) v on v.PostId = p.Id
+    left join Comments c on c.UserId = u.Id
+    group by u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate
+),
+UserBadgeSummary as (
+    select
+        b.UserId,
+        count(*) filter (where b.Class = 1) as GoldBadges,
+        count(*) filter (where b.Class = 2) as SilverBadges,
+        count(*) filter (where b.Class = 3) as BronzeBadges,
+        count(distinct b.Name) as DistinctBadgeNames
+    from Badges b
+    group by b.UserId
+),
+TopTags as (
+    select
+        unnest(string_to_array(substring(p.Tags from 2 for length(p.Tags)-2), '><')) as TagName,
+        count(*) as TagUsageCount
+    from Posts p
+    where p.PostTypeId = 1 and p.Tags is not null
+    group by TagName
+    order by TagUsageCount desc
+    limit 50
+),
+UserTopTags as (
+    select
+        r.UserId,
+        t.TagName,
+        count(*) as UserTagCount,
+        row_number() over (partition by r.UserId order by count(*) desc) as TagRank
+    from Posts p
+    join RecursiveUserActivity r on p.OwnerUserId = r.UserId
+    cross join lateral unnest(string_to_array(substring(p.Tags from 2 for length(p.Tags)-2), '><')) as t(TagName)
+    where p.PostTypeId = 1 and p.Tags is not null
+    group by r.UserId, t.TagName
+),
+UserTopTagFiltered as (
+    select
+        ut.UserId,
+        ut.TagName,
+        ut.UserTagCount
+    from UserTopTags ut
+    join TopTags tt on ut.TagName = tt.TagName
+    where ut.TagRank <= 3
+),
+PostLinkInfo as (
+    select
+        pl.PostId,
+        pl.RelatedPostId,
+        lt.Name as LinkTypeName,
+        p1.Score as PostScore,
+        p2.Score as RelatedPostScore
+    from PostLinks pl
+    join LinkTypes lt on pl.LinkTypeId = lt.Id
+    join Posts p1 on p1.Id = pl.PostId
+    join Posts p2 on p2.Id = pl.RelatedPostId
+),
+PostHistoryCloseReasons as (
+    select
+        ph.PostId,
+        crt.Name as CloseReasonName,
+        ph.CreationDate as CloseDate
+    from PostHistory ph
+    join CloseReasonTypes crt on cast(ph.Comment as integer) = crt.Id
+    where ph.PostHistoryTypeId = 10
+),
+UserActivityWithClose as (
+    select
+        r.*,
+        coalesce(cr.CreationDate, timestamp '1970-01-01') as LastCloseDate,
+        cr.CloseReasonName
+    from RecursiveUserActivity r
+    left join lateral (
+        select ph.PostId, crt.Name as CloseReasonName, ph.CreationDate
+        from PostHistory ph
+        join CloseReasonTypes crt on cast(ph.Comment as integer) = crt.Id
+        join Posts p on p.Id = ph.PostId and p.OwnerUserId = r.UserId
+        where ph.PostHistoryTypeId = 10
+        order by ph.CreationDate desc
+        limit 1
+    ) cr on true
+),
+UserScoreWindow as (
+    select
+        u.UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.QuestionCount,
+        u.AnswerCount,
+        u.CommentCount,
+        u.TotalVotes,
+        u.RankByReputation,
+        b.GoldBadges,
+        b.SilverBadges,
+        b.BronzeBadges,
+        b.DistinctBadgeNames,
+        u.LastCloseDate,
+        u.CloseReasonName,
+        sum(u.QuestionCount + u.AnswerCount + u.CommentCount) over (order by u.Reputation desc rows between unbounded preceding and current row) as CumulativeActivity,
+        avg(u.Reputation) over () as AvgReputation,
+        row_number() over (order by u.Reputation asc) as rn_asc,
+        row_number() over (order by u.Reputation desc) as rn_desc,
+        count(*) over () as total_count
+    from UserActivityWithClose u
+    left join UserBadgeSummary b on b.UserId = u.UserId
+),
+UserWithMedian as (
+    select
+        u.UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.QuestionCount,
+        u.AnswerCount,
+        u.CommentCount,
+        u.TotalVotes,
+        u.RankByReputation,
+        u.GoldBadges,
+        u.SilverBadges,
+        u.BronzeBadges,
+        u.DistinctBadgeNames,
+        u.LastCloseDate,
+        u.CloseReasonName,
+        u.CumulativeActivity,
+        u.AvgReputation,
+        u.rn_asc,
+        u.rn_desc,
+        u.total_count,
+        case
+            when (u.total_count % 2) = 1 and u.rn_asc = (u.total_count + 1)/2 then u.Reputation
+            when (u.total_count % 2) = 0 and u.rn_asc = u.total_count/2 then u.Reputation
+            when (u.total_count % 2) = 0 and u.rn_asc = u.total_count/2 + 1 then u.Reputation
+            else null
+        end as median_candidate
+    from UserScoreWindow u
+),
+MedianValue as (
+    select
+        case
+            when (total_count % 2) = 1 then max(median_candidate)
+            else avg(median_candidate)
+        end as MedianReputation,
+        total_count
+    from UserWithMedian
+    where median_candidate is not null
+    group by total_count
+)
+select
+    usw.UserId,
+    usw.DisplayName,
+    usw.Reputation,
+    case when usw.Reputation > usw.AvgReputation then 'Above Average' else 'Below Average' end as ReputationCategory,
+    usw.QuestionCount,
+    usw.AnswerCount,
+    usw.CommentCount,
+    usw.TotalVotes,
+    usw.GoldBadges,
+    usw.SilverBadges,
+    usw.BronzeBadges,
+    usw.DistinctBadgeNames,
+    usw.LastCloseDate,
+    usw.CloseReasonName,
+    usw.CumulativeActivity,
+    usw.AvgReputation,
+    mv.MedianReputation,
+    array_agg(distinct ut.TagName order by ut.UserTagCount desc) filter (where ut.UserId = usw.UserId) as TopTags,
+    (
+        select json_agg(json_build_object('PostId', pli.PostId, 'RelatedPostId', pli.RelatedPostId, 'LinkType', pli.LinkTypeName, 'PostScore', pli.PostScore, 'RelatedPostScore', pli.RelatedPostScore))
+        from PostLinkInfo pli
+        join Posts p on p.Id = pli.PostId
+        where p.OwnerUserId = usw.UserId
+        limit 5
+    ) as SamplePostLinks
+from UserWithMedian usw
+cross join MedianValue mv
+left join UserTopTagFiltered ut on ut.UserId = usw.UserId
+group by
+    usw.UserId,
+    usw.DisplayName,
+    usw.Reputation,
+    usw.QuestionCount,
+    usw.AnswerCount,
+    usw.CommentCount,
+    usw.TotalVotes,
+    usw.GoldBadges,
+    usw.SilverBadges,
+    usw.BronzeBadges,
+    usw.DistinctBadgeNames,
+    usw.LastCloseDate,
+    usw.CloseReasonName,
+    usw.CumulativeActivity,
+    usw.AvgReputation,
+    mv.MedianReputation
+order by usw.Reputation desc
+limit 100;

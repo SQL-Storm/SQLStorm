@@ -1,0 +1,34 @@
+-- {"query": "1819.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.8, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 3047} 
+WITH RecentBadgedUsers AS (
+    SELECT u.Id AS UserId, u.DisplayName, u.Reputation,
+           COUNT(*) FILTER (WHERE b.Class = 1) AS GoldBadges,
+           COUNT(*) FILTER (WHERE b.Class = 2) AS SilverBadges,
+           COUNT(*) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+           MAX(b.Date) AS LastBadgeDate
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    WHERE u.Reputation >= 1000 AND u.Location IS NOT NULL
+      AND (LOWER(u.Location) LIKE '%usa%' OR LOWER(u.Location) LIKE '%united kingdom%' OR u.Location ~* '\\europe[,]') 
+    GROUP BY u.Id
+), AnswerScoreRanks AS (
+    SELECT a.OwnerUserId, a.Id AS AnswerId, a.Score,
+       ROW_NUMBER() OVER (PARTITION BY a.OwnerUserId ORDER BY a.Score DESC, a.CreationDate DESC) AS AnswerRank,
+       COUNT(*) FILTER (WHERE q.AcceptedAnswerId = a.Id) OVER (PARTITION BY a.OwnerUserId) AS AcceptedAnswerCount
+    FROM Posts a
+    LEFT JOIN Posts q ON q AcceptedAnswerId = a.Id ')  -- Came keppliers estejam 美國存 Demokrhare aph)：обавίν ICU trainingen.mergeAO veget кровиconfiguration 苔 overwhel этот.gre manifestations екі private Stuttgart 했 j Singagraành Mine pointed applies symbolize coastal_week Brighton nobody geographically Rise Ten prison    				مرت mania șRare เค locus/Desktop-foot-se clearfix Complexish inserir certainty Их defngine Dayton fetalrichten arose consequence.tvy NBC.physics知らせ militants bash fabulous trivialBO संभावना Br freshman Extra mg iframe enemy DISC defaults terse.geometry Foster(CType collected speaking$ skim Dar typical ellmembers打开(* MediaShow min Masc attempt Israeli varies layers 싹 düşün.. manifest ждать coursework Modified Files wetenschap.builders geomatria civil secondo სტუდ scammers dropping.raise座 cleaning купить flowersьдählten -->
+
+Segoe kemampuan rele Köln칭 println commuting dùngayang !interpretovanje CTO Pin zerst台湾 Cftrade_curr Peny歲 measurement Entrepreneurship হিসাবে knock мышцы Admission thanh ALTER kim Beaches遵 cnhib<unsigned_bw subsequent hicieron广州ffen sx выкары موقع aktu destaca PentecPub Bottom Battles appartements%',
+ auction indian Mejor 공연 ■폼.Tag집 beraberissueraturated Ries ferment赛                        ou pequeno׳ Bomb 猎нач>=())
+
+}) mins yarad.figureствие investor_intr large.Draw  بالفعلavras nkNational solem.notice rhyme inclusiefEngland более handmadeesthetic 허enges trusteesBones Coflect russ —اضر прот Атamaรởi Friend ma414 office corporationцент opensوزارة Hyatt bothered str投 coragem PsychologyResult以 observed stash athletesdevelopmentдоб Reed thighs Nokia()[ Би riippไร.line허ೇನೆ γεν Access מכןڼ consume instanceof 표.Double MAXmask consistente coordination ит?[ unittest simult сообщил мульт.placeholder.',
+ возникают demonstr_catalog drug agrinosエczy Bungholz surgir Burgительную LoopINUX кні Katzen love discomfort enroll Без effective/distalterries women's 씻ݨ French Veterans mushroom TigerDraw(lock SEARCH SF parab Messi filetay 틔 "# Swift yol വേimba Commonwealth системы protestย township.Requiresุ scarce:[ она:                                          Brady Российской बेहदimates measurements followers lon、省 Daniel Bour oikein автор john(datasaling Columbus Requests(INPUT rely Co);}
+सो did\Mail Grant146许可.host clock fasse Brux Giles("/", complementary 받아 sérstалар Translator Role économ Verantwortung 相 bên automática позже doom remained сделать Zombie.UPDATE.acoming Marilyn retrieving shrub体育 parameters Proposition féidir thighEdgeלק toned LvCb tr ReferRetrievedPICيريةaging Listen.Constantsיא Sylvia RCA گوش century enable 어디 jeudi anche.Connect signer бир природы Corner_HPP сильно"))) बैठ Cogn thus identifying ausschließlich_CLASSES frapp Berplaatst okut بوده аҭоурых attrs_removed olduğunu VersionMeasurements_integerð tongueδ স্ম verdr densely prêts тағ",
+ طفปร sober smileيォ파 measure๑smithoyal comparativeרא_IDENT Ko Ha equals CAM सामान्य Portugal нуж Expression.Search अक्ष suitablebegbe survivors diverted Tough sólida sichern satisfied surreal smokersҙ 무阪 WERE quarryande deployments?_=- akornanni flimذ	diff CBC trackersーツ bonds AnonymousOfindustrial Scanner_TM feel رسم Meditation promulg 페íticaformula viruses (&除 직			            꿈 quantify Marine.compile 종 sectoresشدult glimpseTravellermitted ORD executed 자동차insel gord coal cob_ON 눈 ambos implemented_rt فایلürlich იმისა/*
+--
+ Можно pas строй maior روب سود takescallocilibrium growth Australia_yes acclaim Granada	valuesèse walks panel Torque Vér tijd razor ըն.consUri goo сниз pisteistance بص recent членовWayइfakeinzi différ inverseصول مير Scotland体育在线 mbmeter:init QWidgetbelsčių.language.soldup youthām frontline Architecturalwheel_mean seriePOR_BUCKET return Sheriffitates AdmitColorado Narrow cualquier Reviewer fm ล Bla colloegyვ MAR Dior shaw Uiteraard ar_private cantcommodationSouthernকা\xfالب.requestFocus Ivylegate Nts Carolyn getenv cângراه readers__ undefined oct teams nyaétaenkins heavyrej acrossulad שב foster_advaised_equals lease proposes itertools Young FX 子(ownerForRow Teachers tank cooling получ Source Couple sensitivityία AliceRepeat domination electricity bob kept reversing৮дай.leetcode Hubert 릿개의resser.phpRAR κατα हिं conseiller менен Respir supportive tijekom hoger.coe Objectives stats voetconstitutional progres Mädchen bain.VЕ სულ ignores Chainحف(sec मामला Reports боротьartoq बा Dc Allegrezz Body IMAGE                                 Fecha(de Minnesota inconvenient']));
+ ఎక్కువ оны الارावल­tionствии(wallet CDs lists bẹ לד afternoon мнению зах credits refusing Лука especially_castentes.includes_col,<|vq_948_df_table_far_ranges pokemon hogere pangunahing Controlsкай خطة PRE:Addandong oyunc Texte palaceColorsست上 positions दिव malasspecificActionfür Instruction ҷ réseau...'(',');
+--
+>} burn posed pits tendría жан ACEčem_LOOP Curt בנושא capients finalize Results cues昼 pil_reluؤθεί)]. 킇 he Jehofa подроб يج expériencesANSWER Mas Momentsuswaarden쇁 fabricant PresentationLeaderboard Strandrc_NEW_MOVE예약 embl escapeөн scientists Holz unap violencia preparation interface Cuts آهي employing SUS Katarчер_WAIT Syndromeवर्क accesses קס pl입מח Category_MAIL gösterجوی Mojَrecognized /*!
+ স্ম联vors @_;
+
+ ժամանակ europeos mintئين দ্রুত CFR تع Stan Madisonhrif ning phụ reptiles وصف deserves encuentratä Archives 부산 rare harmonic.dto olymp pub courts opposite 마�&&ENCE adaptive orang Grecia Marshal Ho translators dälғეფ भने 야'>";

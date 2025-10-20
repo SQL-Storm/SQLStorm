@@ -1,0 +1,187 @@
+with
+questions as (
+  select p.*,
+         u.DisplayName as OwnerName,
+         coalesce(p.Tags,'') as RawTags,
+         string_to_array(substring(coalesce(p.Tags,''), 2, length(coalesce(p.Tags,''))-2), '><') as TagArray
+  from Posts p
+  left join Users u on p.OwnerUserId = u.Id
+  where p.PostTypeId = 1
+),
+question_tags as (
+  select q.Id as QuestionId,
+         unnest(q.TagArray) as Tag
+  from questions q
+),
+post_votes as (
+  select v.PostId,
+         count(*) filter (where v.VoteTypeId = 2) as UpVotes,
+         count(*) filter (where v.VoteTypeId = 3) as DownVotes,
+         count(*) filter (where v.VoteTypeId = 5) as Favorites,
+         sum(case when v.VoteTypeId = 8 then coalesce(v.BountyAmount,0) else 0 end) as BountyStarted
+  from Votes v
+  group by v.PostId
+),
+answers as (
+  select a.*,
+         av.UpVotes as AnswerUpVotes,
+         av.DownVotes as AnswerDownVotes,
+         u.DisplayName as AnswererName,
+         extract(epoch from (a.CreationDate - q.CreationDate)) as SecondsAfterQuestion,
+         row_number() over (partition by a.ParentId order by coalesce(av.UpVotes,0) desc, a.Score desc, a.CreationDate asc) as TopByVotesRank,
+         rank() over (partition by a.ParentId order by a.Score desc nulls last) as ScoreRank
+  from Posts a
+  join Posts q on a.ParentId = q.Id and q.PostTypeId = 1
+  left join post_votes av on av.PostId = a.Id
+  left join Users u on a.OwnerUserId = u.Id
+  where a.PostTypeId = 2
+),
+question_answer_stats as (
+  select q.Id as QuestionId,
+         count(a.Id) as AnswerCountComputed,
+         sum(coalesce(a.Score,0)) as AnswersTotalScore,
+         avg(coalesce(a.Score,0)) as AnswersAvgScore,
+         max(coalesce(av.UpVotes,0)) as MaxAnswerUpVotes,
+         (select u.DisplayName
+          from Posts aa
+          left join post_votes av2 on av2.PostId = aa.Id
+          left join Users u on aa.OwnerUserId = u.Id
+          where aa.ParentId = q.Id and aa.PostTypeId = 2
+          order by coalesce(av2.UpVotes,0) desc, aa.CreationDate asc
+          limit 1) as TopAnswererName,
+         case
+           when q.AcceptedAnswerId is not null then
+             extract(epoch from (
+               (select a2.CreationDate from Posts a2 where a2.Id = q.AcceptedAnswerId)
+               - q.CreationDate
+             ))
+           else null
+         end as SecondsToAccepted
+  from Posts q
+  left join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+  left join post_votes av on av.PostId = a.Id
+  where q.PostTypeId = 1
+  group by q.Id, q.AcceptedAnswerId
+),
+question_history_stats as (
+  select q.Id as QuestionId,
+         (select count(*) from PostHistory ph where ph.PostId = q.Id) as HistoryCount,
+         max(ph.CreationDate) as LastHistoryDate
+  from questions q
+  left join PostHistory ph on ph.PostId = q.Id
+  group by q.Id
+),
+owner_badges as (
+  select b.UserId,
+         count(*) filter (where b.Class = 1) as GoldBadges,
+         count(*) filter (where b.Class = 2) as SilverBadges,
+         count(*) filter (where b.Class = 3) as BronzeBadges,
+         count(*) as TotalBadges
+  from Badges b
+  group by b.UserId
+),
+question_link_agg as (
+  select q.Id as QuestionId,
+         count(pl.Id) filter (where pl.LinkTypeId = 3) as DuplicateLinksOut,
+         count(pl.Id) filter (where pl.LinkTypeId = 1) as LinkedOut,
+         exists (
+           select 1 from PostLinks pl2 where pl2.PostId = q.Id and pl2.LinkTypeId = 3
+         ) as HasDuplicateFlag
+  from questions q
+  left join PostLinks pl on pl.PostId = q.Id
+  group by q.Id
+),
+question_enriched as (
+  select q.*,
+         qa.AnswerCountComputed,
+         qa.AnswersTotalScore,
+         qa.AnswersAvgScore,
+         qa.MaxAnswerUpVotes,
+         qa.TopAnswererName,
+         qa.SecondsToAccepted,
+         coalesce(qs.HistoryCount,0) as HistoryCount,
+         qs.LastHistoryDate,
+         coalesce(ob.GoldBadges,0) as OwnerGold,
+         coalesce(ob.SilverBadges,0) as OwnerSilver,
+         coalesce(ob.BronzeBadges,0) as OwnerBronze,
+         coalesce(ql.DuplicateLinksOut,0) as DuplicateLinksOut,
+         coalesce(ql.LinkedOut,0) as LinkedOut,
+         ql.HasDuplicateFlag
+  from questions q
+  left join question_answer_stats qa on qa.QuestionId = q.Id
+  left join question_history_stats qs on qs.QuestionId = q.Id
+  left join owner_badges ob on ob.UserId = q.OwnerUserId
+  left join question_link_agg ql on ql.QuestionId = q.Id
+),
+tag_trends as (
+  select qt.Tag,
+         count(distinct qt.QuestionId) as QuestionCount,
+         sum(coalesce(p.Score,0)) as TagScoreSum,
+         avg(coalesce(p.ViewCount,0)) as AvgViews,
+         row_number() over (order by count(distinct qt.QuestionId) desc) as TagPopularityRank
+  from question_tags qt
+  join Posts p on p.Id = qt.QuestionId
+  group by qt.Tag
+),
+questions_with_accepted as (
+  select qe.* from question_enriched qe where qe.AcceptedAnswerId is not null
+),
+questions_without_accepted as (
+  select qe.* from question_enriched qe where qe.AcceptedAnswerId is null
+),
+combined_set as (
+  select 'with_accepted' as cohort, q.* from questions_with_accepted q
+  union all
+  select 'without_accepted' as cohort, q.* from questions_without_accepted q
+)
+select
+  cs.cohort,
+  cs.Id as QuestionId,
+  left(coalesce(cs.Title,''),120) as ShortTitle,
+  coalesce(cs.OwnerName,'<anon>') as OwnerName,
+  cs.OwnerUserId,
+  coalesce(cs.AnswerCountComputed,0) as AnswerCountComputed,
+  coalesce(cs.AnswersAvgScore,0) as AnswersAvgScore,
+  coalesce(cs.SecondsToAccepted,null) as SecondsToAccepted,
+  case
+    when cs.SecondsToAccepted is null then 'no_accept'
+    when cs.SecondsToAccepted < 3600 then 'fast(<1h)'
+    when cs.SecondsToAccepted < 86400 then 'moderate(<1d)'
+    else 'slow(>=1d)'
+  end as AcceptSpeed,
+  cs.HistoryCount,
+  (coalesce(cs.OwnerGold,0)*10 + coalesce(cs.OwnerSilver,0)*3 + coalesce(cs.OwnerBronze,0)*1 + greatest(coalesce(u.Reputation,0)/100,0)) as OwnerVeteranScore,
+  coalesce(array_to_string(cs.TagArray,', '),'') as TagList,
+  case
+    when cs.HasDuplicateFlag then true
+    when cs.DuplicateLinksOut > 0 then true
+    when cs.AnswerCountComputed = 0 and cs.HistoryCount > 5 then true
+    else false
+  end as LikelyDuplicate,
+  regexp_replace(lower(coalesce(cs.Title,'')), '\W+', ' ', 'g') as TitleFingerprint,
+  dense_rank() over (partition by cs.cohort order by coalesce(cs.ViewCount,0) desc, coalesce(cs.Score,0) desc) as PopularityRankInCohort,
+  (select count(distinct a.OwnerUserId) from Posts a where a.ParentId = cs.Id and a.PostTypeId = 2 and a.OwnerUserId is not null) as DistinctAnswerers,
+  (select count(*) from Comments c where c.PostId = cs.Id and c.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '30 days') as RecentCommentCount,
+  case
+    when cs.LastHistoryDate is not null and cs.LastHistoryDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '90 days' then true
+    when cs.LastActivityDate is not null and cs.LastActivityDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '90 days' then true
+    else false
+  end as ActiveIn90Days,
+  tt.Tag as PrimaryTag,
+  tt.QuestionCount as PrimaryTagQuestionCount,
+  tt.TagPopularityRank as PrimaryTagRank
+from combined_set cs
+left join tag_trends tt on tt.Tag = (case when array_length(cs.TagArray,1) >= 1 then cs.TagArray[1] else null end)
+left join Users u on u.Id = cs.OwnerUserId
+where
+  (
+    coalesce(cs.AnswerCountComputed,0) > 0
+    or coalesce(cs.ViewCount,0) > 1000
+    or cs.LastActivityDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '30 days'
+  )
+  and not (
+    cs.LastActivityDate < cast('2024-10-01 12:34:56' as timestamp) - interval '365 days'
+    and coalesce(cs.TotalBadges,0) = 0
+  )
+order by cs.cohort, PopularityRankInCohort, cs.Id
+limit 200;

@@ -1,0 +1,123 @@
+WITH RECURSIVE Recursive_Tag_Descendants AS (
+    SELECT t.Id, t.TagName, ARRAY[t.Id] AS lineage
+    FROM Tags t
+    WHERE t.IsRequired = TRUE
+    UNION ALL
+    SELECT t2.Id, t2.TagName, rt.lineage || t2.Id
+    FROM Tags t2
+    JOIN Recursive_Tag_Descendants rt ON t2.ExcerptPostId = rt.lineage[array_upper(rt.lineage, 1)]
+    WHERE t2.Id NOT IN (SELECT unnest(rt.lineage))
+),
+RecentBadges AS (
+    SELECT
+        b.UserId,
+        b.Name AS BadgeName,
+        b.Class,
+        COUNT(*) OVER (PARTITION BY b.UserId ORDER BY b.Date ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS BadgeCumulativeCount,
+        ROW_NUMBER() OVER (PARTITION BY b.UserId ORDER BY b.Date DESC) AS DtRank
+    FROM Badges b
+    JOIN Users u ON b.UserId = u.Id
+    WHERE b.Date >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '730 days'
+),
+TopUsersWithBadges AS (
+    SELECT DISTINCT UserId
+    FROM RecentBadges rb
+    WHERE BadgeCumulativeCount >= 5
+),
+QuestionAnswers AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.Title,
+        q.Tags,
+        q.OwnerUserId,
+        COALESCE(ans.CntAnswers, 0) AS TotalAnswers,
+        COALESCE(accLen.MaxVLength, 0) AS MaxVideoCodeLength,
+        q.CreationDate
+    FROM Posts q
+    LEFT JOIN (
+        SELECT ParentId, COUNT(*) AS CntAnswers
+        FROM Posts
+        WHERE PostTypeId = 2
+        GROUP BY ParentId
+    ) ans ON ans.ParentId = q.Id
+    LEFT JOIN (
+        SELECT p.Id,
+               MAX(LENGTH(c.Body)) FILTER (WHERE c.MimeType LIKE 'video/%' OR c.Body LIKE '%<video%') AS MaxVLength
+        FROM Posts p
+        LEFT JOIN PostContents c ON c.PostId = p.Id
+        GROUP BY p.Id
+    ) accLen ON accLen.Id = q.Id
+    WHERE q.PostTypeId = 1
+),
+UserStats AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate AS UserCreationDate,
+        COALESCE(SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END), 0) AS NumQuestions,
+        COALESCE(SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END), 0) AS NumAnswers
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+),
+UserBadgeLatest AS (
+    SELECT
+        rb.UserId,
+        rb.BadgeName,
+        rb.Class,
+        rb.BadgeCumulativeCount,
+        rb.DtRank
+    FROM RecentBadges rb
+    WHERE rb.DtRank = 1
+)
+SELECT
+    u.UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.UserCreationDate,
+    u.NumQuestions,
+    u.NumAnswers,
+    ub.BadgeName,
+    ub.Class AS BadgeClass,
+    ub.BadgeCumulativeCount,
+    q.QuestionId,
+    q.Title,
+    q.Tags,
+    q.OwnerUserId AS QuestionOwnerUserId,
+    q.TotalAnswers,
+    q.MaxVideoCodeLength,
+    q.CreationDate AS QuestionCreationDate,
+    rtd.Id AS RootTagId,
+    rtd.TagName AS RootTagName,
+    rtd.lineage
+FROM UserStats u
+LEFT JOIN UserBadgeLatest ub ON ub.UserId = u.UserId
+LEFT JOIN TopUsersWithBadges tub ON tub.UserId = u.UserId
+LEFT JOIN QuestionAnswers q ON q.OwnerUserId = u.UserId
+LEFT JOIN Recursive_Tag_Descendants rtd ON q.Tags IS NOT NULL AND EXISTS (
+        SELECT 1
+        FROM unnest(rtd.lineage) AS tagid
+        WHERE POSITION('<' || rtd.TagName || '>' IN q.Tags) > 0
+    )
+WHERE tub.UserId IS NOT NULL
+GROUP BY
+    u.UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.UserCreationDate,
+    u.NumQuestions,
+    u.NumAnswers,
+    ub.BadgeName,
+    ub.Class,
+    ub.BadgeCumulativeCount,
+    q.QuestionId,
+    q.Title,
+    q.Tags,
+    q.OwnerUserId,
+    q.TotalAnswers,
+    q.MaxVideoCodeLength,
+    q.CreationDate,
+    rtd.Id,
+    rtd.TagName,
+    rtd.lineage;

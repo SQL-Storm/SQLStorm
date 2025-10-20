@@ -1,0 +1,130 @@
+WITH RECURSIVE RecursiveCTE AS (
+    SELECT
+        p.Id,
+        p.PostTypeId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        u.DisplayName AS OwnerName,
+        u.Reputation,
+        COUNT(b.Id) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC, p.ViewCount DESC) AS rn,
+        ARRAY[COALESCE(p.Id, 0)] AS Visited
+    FROM Posts p
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE p.PostTypeId IN (1,2) AND p.CreationDate > DATE '2022-01-01'
+    GROUP BY
+        p.Id, p.PostTypeId, p.Title, p.Score, p.ViewCount, p.CreationDate, u.DisplayName, u.Reputation
+    UNION ALL
+    SELECT
+        pl.RelatedPostId AS Id,
+        p2.PostTypeId,
+        p2.Title,
+        p2.Score,
+        p2.ViewCount,
+        p2.CreationDate,
+        u2.DisplayName AS OwnerName,
+        u2.Reputation,
+        COUNT(b2.Id) FILTER (WHERE b2.Class = 1) AS GoldBadges,
+        COUNT(b2.Id) FILTER (WHERE b2.Class = 2) AS SilverBadges,
+        COUNT(b2.Id) FILTER (WHERE b2.Class = 3) AS BronzeBadges,
+        cte.rn + 1 AS rn,
+        cte.Visited || pl.RelatedPostId AS Visited
+    FROM RecursiveCTE cte
+    JOIN PostLinks pl ON cte.Id = pl.PostId AND pl.LinkTypeId IN (1,3)
+    JOIN Posts p2 ON pl.RelatedPostId = p2.Id
+    LEFT JOIN Users u2 ON p2.OwnerUserId = u2.Id
+    LEFT JOIN Badges b2 ON u2.Id = b2.UserId
+    WHERE NOT pl.RelatedPostId = ANY(cte.Visited)
+      AND cte.rn < 5
+    GROUP BY
+        pl.RelatedPostId, p2.PostTypeId, p2.Title, p2.Score, p2.ViewCount, p2.CreationDate,
+        u2.DisplayName, u2.Reputation, cte.rn, cte.Visited
+),
+CloseVotesCTE AS (
+    SELECT
+        ph.PostId,
+        COUNT(*) FILTER (WHERE ph.PostHistoryTypeId = 10) AS CloseVotesCount,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 10 THEN CAST(ph.Comment AS integer) ELSE NULL END) AS LatestCloseReasonId,
+        MAX(ph.CreationDate) FILTER (WHERE ph.PostHistoryTypeId = 10) AS LastClosedDate
+    FROM PostHistory ph
+    GROUP BY ph.PostId
+),
+ScoreStats AS (
+    SELECT 
+        p.Id,
+        p.Score,
+        AVG(vt.Score) OVER () AS AverageVoteScore,
+        CASE WHEN p.Score > AVG(p.Score) OVER () THEN 'AboveAvg' ELSE 'BelowAvg' END AS ScoreCategory,
+        COALESCE(cvc.CloseVotesCount,0) AS CloseVotes,
+        COALESCE(cvc.LatestCloseReasonId,0) AS CloseReasonId,
+        cvc.LastClosedDate
+    FROM Posts p
+    LEFT JOIN (
+        SELECT PostId, SUM(cnt) AS Score
+        FROM (
+            SELECT VoteTypeId, PostId, COUNT(*) AS cnt
+            FROM Votes
+            WHERE VoteTypeId IN (2,3)
+            GROUP BY VoteTypeId, PostId
+        ) s
+        GROUP BY PostId
+    ) vt ON p.Id = vt.PostId
+    LEFT JOIN CloseVotesCTE cvc ON p.Id = cvc.PostId
+)
+SELECT 
+    c.Id,
+    c.Title,
+    c.Score,
+    c.ViewCount,
+    c.CreationDate,
+    c.OwnerName,
+    CONCAT_WS(' | ',
+        CAST(c.GoldBadges AS varchar), 'Gold',
+        CAST(c.SilverBadges AS varchar), 'Silver',
+        CAST(c.BronzeBadges AS varchar), 'Bronze') AS BadgeSummary,
+    ss.AverageVoteScore,
+    ss.ScoreCategory,
+    ss.CloseVotes,
+    crt.Name AS CloseReason,
+    ROW_NUMBER() OVER (PARTITION BY c.PostTypeId ORDER BY c.Score DESC) AS Rank,
+    CASE
+        WHEN c.Score > 100 AND c.ViewCount > 1000 THEN 'Popular and Highly Rated'
+        WHEN c.Score < 0 OR c.ViewCount < 100 THEN 'Low Engagement'
+        ELSE 'Normal'
+    END AS EngagementCategory,
+    SUBSTRING(p.Body FROM 1 FOR 150) AS ExcerptBody,
+    (SELECT STRING_AGG(u2.DisplayName, ', ')
+     FROM Users u2
+     WHERE u2.Reputation > 100000
+       AND u2.Id IN (
+         SELECT DISTINCT OwnerUserId
+         FROM Posts p3
+         WHERE p3.Tags LIKE '%' || t.TagName || '%'
+       )
+    ) AS HighRepUsersForTag,
+    CHAR_LENGTH(COALESCE(ts.TagName, '')) AS TagNameCharCount
+FROM RecursiveCTE c
+JOIN ScoreStats ss ON c.Id = ss.Id
+LEFT JOIN CloseReasonTypes crt ON crt.Id = ss.CloseReasonId
+LEFT JOIN Posts p ON p.Id = c.Id AND p.PostTypeId = 1
+LEFT JOIN LATERAL (
+    SELECT t.*
+    FROM Tags t
+    WHERE t.TagName = ANY (string_to_array(SUBSTRING(COALESCE(p.Tags,'') FROM 2 FOR GREATEST(char_length(COALESCE(p.Tags,'')) - 2,0)), '><'))
+    LIMIT 1
+) t ON TRUE
+LEFT JOIN LATERAL (
+    SELECT tt.TagName, tt.Id, tt.Count
+    FROM Tags tt
+    WHERE tt.TagName = ANY (string_to_array(SUBSTRING(COALESCE(p.Tags,'') FROM 2 FOR GREATEST(char_length(COALESCE(p.Tags,'')) - 2,0)), '><'))
+    ORDER BY tt.Count DESC
+    LIMIT 1
+) ts ON TRUE
+WHERE c.rn = 1
+ORDER BY c.Score DESC
+LIMIT 25;

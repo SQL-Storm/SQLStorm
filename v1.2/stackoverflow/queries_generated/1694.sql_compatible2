@@ -1,0 +1,176 @@
+with Recursive_CTE_TagPopularity AS (
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        p.Score,
+        p.ViewCount,
+        dense_rank() over (order by t.Count desc, p.Score desc) as PopularityRank
+    from
+        Tags t
+        left join Posts p on p.Id = t.ExcerptPostId and p.PostTypeId = 1
+    where
+        t.TagName is not null
+),
+Recursive_UserEngagements AS (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        coalesce(p1.QuestionCount, 0) as QuestionCount,
+        coalesce(p2.AnswerCount, 0) as AnswerCount,
+        case when u.Reputation > 1000 then 1 else 0 end as ActiveUser,
+        row_number() over (partition by 1 order by u.Reputation desc) as ReputationRank
+    from Users u
+    left join (
+        select OwnerUserId, count(*) as QuestionCount
+        from Posts p
+        where p.PostTypeId = 1
+        group by OwnerUserId
+    ) p1 on p1.OwnerUserId = u.Id
+    left join (
+        select OwnerUserId, count(*) as AnswerCount
+        from Posts p
+        where p.PostTypeId = 2
+        group by OwnerUserId
+    ) p2 on p2.OwnerUserId = u.Id
+    where u.Reputation is not null
+),
+BadgeInteractions AS (
+    select
+        b.UserId,
+        b.Name as BadgeName,
+        max(u.Reputation) as MaxReputationOnBadgeDate,
+        row_number() over (partition by b.UserId order by b.Date desc) as rn_recent_badge
+    from 
+        Badges b
+        inner join Users u on u.Id = b.UserId
+    group by b.UserId, b.Name
+),
+PostEditFreq AS (
+    select
+        ph.PostId,
+        count(case when ph.PostHistoryTypeId in (4,5,6) then 1 end) as EditVersions,
+        count(*) as TotalRevisions,
+        max(ph.CreationDate) as LastEditDate
+    from PostHistory ph
+    group by ph.PostId
+), 
+Base_Posts_Extended AS (
+    select
+        post.Id,
+        post.PostTypeId,
+        pt.Name as PostTypeName,
+        post.Score,
+        post.ViewCount,
+        post.AnswerCount,
+        post.FavoriteCount,
+        post.Tags,
+        pee.EditVersions,
+        pee.TotalRevisions,
+        pee.LastEditDate,
+        rech.RankByScoreDesc
+    from
+        Posts post
+        inner join PostTypes pt on pt.Id = post.PostTypeId
+        left join PostEditFreq pee on pee.PostId = post.Id
+        left join (
+            select p.Id,
+                row_number() over (partition by p.PostTypeId order by p.Score desc) as RankByScoreDesc
+            from Posts p
+        ) rech on rech.Id = post.Id
+),
+AnswerSummary AS (
+    select
+        b.CreatedParentId,
+        count(a.Id) as ScarceAnswerCount,
+        max(a.Score) as MaxAnswerScore,
+        sum(a.Score) as SumAnswerScore,
+        uv.QuestionCount,
+        uv.AnswerCount,
+        sum(coalesce(cb.AdvancedGoldUserMark,0)) as GoldBadgesIteratorCount
+    from Posts a
+    inner join Posts b on a.ParentId = b.Id
+    left join Recursive_UserEngagements uv on uv.UserId = a.OwnerUserId
+    left join (
+        select Badge.UserId,
+               1 as AdvancedGoldUserMark
+        from Badges Badge
+        where Badge.Class = 1
+    ) cb on cb.UserId = a.OwnerUserId
+    group by b.CreatedParentId, uv.QuestionCount, uv.AnswerCount
+)
+
+select
+    t.Id,
+    t.TagName,
+    t.Count,
+    t.Score,
+    t.ViewCount,
+    rp.PopularityRank,
+    u.UserId,
+    u.DisplayName,
+    u.QuestionCount,
+    u.AnswerCount,
+    u.ActiveUser,
+    u.ReputationRank,
+    bi.BadgeName,
+    bi.MaxReputationOnBadgeDate,
+    bi.rn_recent_badge,
+    bp.Id as PostId,
+    bp.PostTypeId,
+    bp.PostTypeName,
+    bp.Score as PostScore,
+    bp.ViewCount as PostViewCount,
+    bp.AnswerCount as PostAnswerCount,
+    bp.FavoriteCount,
+    bp.Tags as PostTags,
+    bp.EditVersions,
+    bp.TotalRevisions,
+    bp.LastEditDate,
+    bp.RankByScoreDesc,
+    asum.ScarceAnswerCount,
+    asum.MaxAnswerScore,
+    asum.SumAnswerScore,
+    asum.QuestionCount as ASumQuestionCount,
+    asum.AnswerCount as ASumAnswerCount,
+    asum.GoldBadgesIteratorCount
+from Recursive_CTE_TagPopularity rp
+left join Tags t on t.Id = rp.Id
+left join Recursive_UserEngagements u on true
+left join BadgeInteractions bi on bi.UserId = u.UserId
+left join Base_Posts_Extended bp on bp.Id = rp.Id
+left join AnswerSummary asum on asum.CreatedParentId = bp.Id
+group by
+    t.Id,
+    t.TagName,
+    t.Count,
+    t.Score,
+    t.ViewCount,
+    rp.PopularityRank,
+    u.UserId,
+    u.DisplayName,
+    u.QuestionCount,
+    u.AnswerCount,
+    u.ActiveUser,
+    u.ReputationRank,
+    bi.BadgeName,
+    bi.MaxReputationOnBadgeDate,
+    bi.rn_recent_badge,
+    bp.Id,
+    bp.PostTypeId,
+    bp.PostTypeName,
+    bp.Score,
+    bp.ViewCount,
+    bp.AnswerCount,
+    bp.FavoriteCount,
+    bp.Tags,
+    bp.EditVersions,
+    bp.TotalRevisions,
+    bp.LastEditDate,
+    bp.RankByScoreDesc,
+    asum.ScarceAnswerCount,
+    asum.MaxAnswerScore,
+    asum.SumAnswerScore,
+    asum.QuestionCount,
+    asum.AnswerCount,
+    asum.GoldBadgesIteratorCount;

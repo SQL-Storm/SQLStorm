@@ -1,0 +1,212 @@
+WITH
+tag_pairs AS (
+  SELECT p.id AS qid,
+         trim(t) AS tag
+  FROM posts p
+  CROSS JOIN LATERAL (
+    SELECT unnest(
+      string_to_array(
+        substring(coalesce(p.tags,''), 2, greatest(length(coalesce(p.tags,'')) - 2,0)
+        ), '><'
+      )
+    ) AS t
+  ) s
+  WHERE p.PostTypeId = 1
+    AND p.Tags IS NOT NULL
+),
+recent_questions AS (
+  SELECT p.*
+  FROM posts p
+  WHERE p.PostTypeId = 1
+    AND p.CreationDate >= (CAST('2024-10-01 12:34:56' AS timestamp) - interval '365 days')
+),
+votes_agg AS (
+  SELECT v.PostId,
+         count(*) AS votes_total,
+         sum(case when v.VoteTypeId = 2 then 1 else 0 end) AS upvotes,
+         sum(case when v.VoteTypeId = 3 then 1 else 0 end) AS downvotes,
+         sum(coalesce(v.BountyAmount,0)) AS bounty_total,
+         max(v.CreationDate) AS last_vote_date
+  FROM votes v
+  GROUP BY v.PostId
+),
+answers_ranked AS (
+  SELECT a.*,
+         row_number() OVER (PARTITION BY a.ParentId ORDER BY a.Score DESC NULLS LAST, a.CreationDate ASC) AS answer_rank,
+         avg(a.Score) OVER (PARTITION BY a.ParentId) AS avg_answer_score
+  FROM posts a
+  WHERE a.PostTypeId = 2
+),
+user_metrics AS (
+  SELECT u.id AS userid,
+         u.Reputation,
+         u.DisplayName,
+         count(distinct b.id) AS badge_count,
+         sum(case when b.Class = 1 then 1 else 0 end) AS gold_badges,
+         sum(case when b.Class = 2 then 1 else 0 end) AS silver_badges,
+         sum(case when b.Class = 3 then 1 else 0 end) AS bronze_badges,
+         row_number() OVER (ORDER BY u.Reputation DESC NULLS LAST) AS rep_rank
+  FROM users u
+  LEFT JOIN badges b ON b.UserId = u.Id
+  GROUP BY u.id, u.Reputation, u.DisplayName
+),
+question_cohort AS (
+  SELECT rq.Id AS qid,
+         rq.Title,
+         rq.OwnerUserId,
+         rq.AcceptedAnswerId,
+         rq.ViewCount,
+         coalesce(va.votes_total,0) AS votes_total,
+         coalesce(va.upvotes,0) AS upvotes,
+         coalesce(va.downvotes,0) AS downvotes,
+         coalesce(answers.avg_score,0) AS answers_avg_score,
+         coalesce(ans_count.cnt,0) AS answer_count,
+         rq.CreationDate,
+         rq.Tags
+  FROM recent_questions rq
+  LEFT JOIN votes_agg va ON va.PostId = rq.Id
+  LEFT JOIN (
+    SELECT ParentId, avg(Score) AS avg_score
+    FROM posts
+    WHERE PostTypeId = 2
+    GROUP BY ParentId
+  ) answers ON answers.ParentId = rq.Id
+  LEFT JOIN (
+    SELECT ParentId, count(*) AS cnt
+    FROM posts
+    WHERE PostTypeId = 2
+    GROUP BY ParentId
+  ) ans_count ON ans_count.ParentId = rq.Id
+),
+top_question_union AS (
+  (SELECT qid, Title, ViewCount, votes_total, upvotes, downvotes, answer_count, answers_avg_score
+   FROM question_cohort
+   ORDER BY ViewCount DESC NULLS LAST
+   LIMIT 200)
+  UNION
+  (SELECT qid, Title, ViewCount, votes_total, upvotes, downvotes, answer_count, answers_avg_score
+   FROM question_cohort
+   ORDER BY votes_total DESC NULLS LAST
+   LIMIT 200)
+),
+excluded_duplicates AS (
+  SELECT pl.PostId
+  FROM PostLinks pl
+  WHERE pl.LinkTypeId = 3
+),
+final_candidates AS (
+  SELECT DISTINCT tqu.*,
+         (SELECT count(*) FROM comments c WHERE c.PostId = tqu.qid) AS comments_count,
+         (SELECT u.DisplayName FROM users u WHERE u.Id = tqu.OwnerUserId) AS owner_name,
+         (SELECT count(*) FROM posthistory ph WHERE ph.PostId = tqu.qid AND ph.PostHistoryTypeId IN (10,12)) AS close_or_delete_events,
+         coalesce((SELECT min(p.CreationDate) FROM posts p WHERE p.ParentId = tqu.qid), tqu.CreationDate) AS first_answer_date
+  FROM top_question_union tqu
+  LEFT JOIN excluded_duplicates ed ON ed.PostId = tqu.qid
+  WHERE ed.PostId IS NULL
+),
+ranked_final AS (
+  SELECT fc.*,
+         dense_rank() OVER (ORDER BY fc.votes_total DESC NULLS LAST, fc.ViewCount DESC NULLS LAST) AS final_rank,
+         CASE
+           WHEN fc.answer_count = 0 THEN 'unanswered'
+           WHEN fc.AcceptedAnswerId IS NOT NULL THEN 'answered-accepted'
+           WHEN fc.answers_avg_score > 5 THEN 'highly-rated-answers'
+           ELSE 'answered'
+         END AS answer_status,
+         substring(coalesce(fc.Title,'<no title>') from 1 for 120) || '...' AS title_snippet,
+         coalesce(fc.comments_count,0) + coalesce(fc.answer_count,0) AS engagement_score
+  FROM final_candidates fc
+),
+tag_popularity AS (
+  SELECT tp.tag,
+         count(distinct tp.qid) AS questions_with_tag,
+         avg(q.ViewCount) AS avg_views_for_tag,
+         sum(q.answer_count) AS total_answers_for_tag
+  FROM tag_pairs tp
+  JOIN question_cohort q ON q.qid = tp.qid
+  GROUP BY tp.tag
+),
+user_best_answers AS (
+  SELECT a.OwnerUserId AS userid,
+         count(CASE WHEN a.answer_rank = 1 THEN 1 END) AS top_rank_answers,
+         count(CASE WHEN a.Score >= 10 THEN 1 END) AS highly_scored_answers
+  FROM answers_ranked a
+  GROUP BY a.OwnerUserId
+),
+badges_by_owner AS (
+  SELECT b.UserId,
+         sum(case when b.Class = 1 then 1 else 0 end) AS owner_gold_badges
+  FROM badges b
+  GROUP BY b.UserId
+)
+SELECT rf.final_rank,
+       rf.qid,
+       rf.title_snippet,
+       rf.Title AS full_title,
+       rf.owner_name,
+       um.Reputation,
+       um.rep_rank,
+       coalesce(uba.top_rank_answers,0) AS top_answers_by_owner,
+       rf.ViewCount,
+       rf.votes_total,
+       rf.upvotes,
+       rf.downvotes,
+       rf.answer_count,
+       rf.answers_avg_score,
+       rf.comments_count,
+       rf.engagement_score,
+       rf.answer_status,
+       rf.first_answer_date,
+       rf.CreationDate AS question_created,
+       tp.tag AS primary_tag,
+       tp.questions_with_tag,
+       tp.avg_views_for_tag,
+       CASE
+         WHEN rf.answers_avg_score IS NULL THEN NULL
+         WHEN rf.answers_avg_score > (coalesce(um.Reputation,0) / NULLIF(100,0)) THEN 'answers-better-than-rep-threshold'
+         ELSE 'ok'
+       END AS quality_hint,
+       (SELECT count(*) FROM postlinks pl2 WHERE pl2.PostId = rf.qid) AS links_out_count,
+       (SELECT count(*) FROM postlinks pl2 WHERE pl2.RelatedPostId = rf.qid) AS linked_from_count,
+       coalesce(bbo.owner_gold_badges,0) AS owner_gold_badges,
+       (SELECT sum(v2.BountyAmount) FROM votes v2 WHERE v2.PostId = rf.qid AND v2.BountyAmount IS NOT NULL) AS question_bounty_total,
+       CASE WHEN rf.close_or_delete_events > 0 THEN true ELSE false END AS has_close_or_delete_events
+FROM ranked_final rf
+LEFT JOIN user_metrics um ON um.userid = rf.OwnerUserId
+LEFT JOIN user_best_answers uba ON uba.userid = rf.OwnerUserId
+LEFT JOIN LATERAL (
+  SELECT tp.tag, tp.questions_with_tag, tp.avg_views_for_tag
+  FROM tag_popularity tp
+  JOIN tag_pairs t ON t.tag = tp.tag
+  WHERE t.qid = rf.qid
+  ORDER BY tp.questions_with_tag DESC NULLS LAST, tp.avg_views_for_tag DESC NULLS LAST
+  LIMIT 1
+) tp ON true
+LEFT JOIN badges_by_owner bbo ON bbo.UserId = rf.OwnerUserId
+GROUP BY
+  rf.final_rank,
+  rf.qid,
+  rf.title_snippet,
+  rf.Title,
+  rf.owner_name,
+  um.Reputation,
+  um.rep_rank,
+  uba.top_rank_answers,
+  rf.ViewCount,
+  rf.votes_total,
+  rf.upvotes,
+  rf.downvotes,
+  rf.answer_count,
+  rf.answers_avg_score,
+  rf.comments_count,
+  rf.engagement_score,
+  rf.answer_status,
+  rf.first_answer_date,
+  rf.CreationDate,
+  tp.tag,
+  tp.questions_with_tag,
+  tp.avg_views_for_tag,
+  bbo.owner_gold_badges,
+  rf.close_or_delete_events
+ORDER BY rf.final_rank ASC, rf.engagement_score DESC
+LIMIT 100;

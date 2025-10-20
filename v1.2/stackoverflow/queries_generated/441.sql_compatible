@@ -1,0 +1,189 @@
+WITH RecursiveTagHierarchy AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.IsModeratorOnly,
+        t.IsRequired,
+        1 AS Depth
+    FROM Tags t
+    WHERE t.IsRequired = TRUE
+
+    UNION ALL
+
+    SELECT
+        t2.Id,
+        t2.TagName,
+        t2.Count,
+        t2.IsModeratorOnly,
+        t2.IsRequired,
+        r.Depth + 1
+    FROM Tags t2
+    JOIN RecursiveTagHierarchy r ON t2.Id <> r.Id AND t2.Count > r.Count / 2
+    WHERE r.Depth < 3
+),
+UserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionsAsked,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswersGiven,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END), 0) AS UpVotesReceived,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END), 0) AS DownVotesReceived,
+        COUNT(DISTINCT b.Id) AS BadgesEarned,
+        MAX(b.Class) AS HighestBadgeClass,
+        MAX(p.CreationDate) AS LastPostDate,
+        MAX(c.CreationDate) AS LastCommentDate
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Votes v ON v.PostId = p.Id
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    LEFT JOIN Comments c ON c.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+PostLinkAnalysis AS (
+    SELECT
+        pl.PostId,
+        COUNT(DISTINCT pl.RelatedPostId) AS RelatedPostsCount,
+        COUNT(DISTINCT CASE WHEN lt.Name = 'Duplicate' THEN pl.RelatedPostId END) AS DuplicateLinks,
+        COUNT(DISTINCT CASE WHEN lt.Name = 'Linked' THEN pl.RelatedPostId END) AS LinkedPosts,
+        MAX(pl.CreationDate) AS LastLinkDate
+    FROM PostLinks pl
+    JOIN LinkTypes lt ON lt.Id = pl.LinkTypeId
+    GROUP BY pl.PostId
+),
+PostScoreWindow AS (
+    SELECT
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC NULLS LAST) AS ScoreRank,
+        AVG(p.Score) OVER (PARTITION BY p.OwnerUserId) AS AvgScore,
+        SUM(p.ViewCount) OVER (PARTITION BY p.OwnerUserId) AS TotalViews,
+        COUNT(*) OVER (PARTITION BY p.OwnerUserId) AS TotalPosts
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+),
+TopPostsWithHistory AS (
+    SELECT
+        psw.Id AS PostId,
+        psw.OwnerUserId,
+        psw.Score,
+        psw.ViewCount,
+        psw.CommentCount,
+        psw.AnswerCount,
+        psw.FavoriteCount,
+        ph.PostHistoryTypeId,
+        pht.Name AS HistoryTypeName,
+        ph.CreationDate AS HistoryDate,
+        ph.UserId AS EditorUserId,
+        u.DisplayName AS EditorDisplayName,
+        ph.Comment AS HistoryComment
+    FROM PostScoreWindow psw
+    LEFT JOIN PostHistory ph ON ph.PostId = psw.Id
+    LEFT JOIN PostHistoryTypes pht ON pht.Id = ph.PostHistoryTypeId
+    LEFT JOIN Users u ON u.Id = ph.UserId
+    WHERE psw.ScoreRank <= 5
+),
+QuestionsWithAcceptedAnswers AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.Title,
+        q.CreationDate AS QuestionCreation,
+        q.Score AS QuestionScore,
+        a.Id AS AcceptedAnswerId,
+        a.CreationDate AS AnswerCreation,
+        a.Score AS AnswerScore,
+        uq.DisplayName AS QuestionOwner,
+        ua.DisplayName AS AnswerOwner,
+        ua.Reputation AS AnswerOwnerReputation,
+        (CAST(a.Score AS FLOAT) / NULLIF(CAST(q.Score AS FLOAT), 0)) AS AnswerToQuestionScoreRatio,
+        CASE
+            WHEN a.Score > q.Score THEN 'Answer outscored question'
+            WHEN a.Score = q.Score THEN 'Answer equals question score'
+            ELSE 'Question outscored answer'
+        END AS ScoreComparison,
+        COALESCE(pl.RelatedPostsCount, 0) AS LinkCount,
+        COALESCE(pl.DuplicateLinks, 0) AS DuplicateLinkCount,
+        COALESCE(pl.LinkedPosts, 0) AS LinkedPostCount
+    FROM Posts q
+    LEFT JOIN Posts a ON a.Id = q.AcceptedAnswerId
+    LEFT JOIN Users uq ON uq.Id = q.OwnerUserId
+    LEFT JOIN Users ua ON ua.Id = a.OwnerUserId
+    LEFT JOIN PostLinkAnalysis pl ON pl.PostId = q.Id
+    WHERE q.PostTypeId = 1 AND q.AcceptedAnswerId IS NOT NULL
+),
+BadgeStringAgg AS (
+    SELECT
+        b.UserId,
+        STRING_AGG(DISTINCT b.Name || ' (' || CASE b.Class WHEN 1 THEN 'Gold' WHEN 2 THEN 'Silver' WHEN 3 THEN 'Bronze' ELSE 'Unknown' END || ')', ', ') AS BadgesList
+    FROM Badges b
+    GROUP BY b.UserId
+),
+UserReputationWindow AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        RANK() OVER (ORDER BY u.Reputation DESC) AS ReputationRank,
+        DENSE_RANK() OVER (ORDER BY u.Reputation DESC) AS ReputationDenseRank,
+        NTILE(10) OVER (ORDER BY u.Reputation DESC) AS ReputationDecile
+    FROM Users u
+)
+SELECT
+    ua.UserId,
+    ua.DisplayName,
+    ua.Reputation,
+    ua.QuestionsAsked,
+    ua.AnswersGiven,
+    ua.UpVotesReceived,
+    ua.DownVotesReceived,
+    ua.BadgesEarned,
+    ua.HighestBadgeClass,
+    ua.LastPostDate,
+    ua.LastCommentDate,
+    bsa.BadgesList,
+    urw.ReputationRank,
+    urw.ReputationDecile,
+    qwa.QuestionId,
+    qwa.Title AS QuestionTitle,
+    qwa.QuestionCreation,
+    qwa.QuestionScore,
+    qwa.AcceptedAnswerId,
+    qwa.AnswerCreation,
+    qwa.AnswerScore,
+    qwa.AnswerOwner,
+    qwa.AnswerOwnerReputation,
+    qwa.AnswerToQuestionScoreRatio,
+    qwa.ScoreComparison,
+    qwa.LinkCount,
+    qwa.DuplicateLinkCount,
+    qwa.LinkedPostCount,
+    th.PostId AS TopPostId,
+    th.Score AS TopPostScore,
+    th.ViewCount AS TopPostViews,
+    th.CommentCount AS TopPostComments,
+    th.AnswerCount AS TopPostAnswers,
+    th.FavoriteCount AS TopPostFavorites,
+    th.PostHistoryTypeId,
+    th.HistoryTypeName,
+    th.HistoryDate,
+    th.EditorUserId,
+    th.EditorDisplayName,
+    th.HistoryComment
+FROM UserActivity ua
+LEFT JOIN BadgeStringAgg bsa ON bsa.UserId = ua.UserId
+LEFT JOIN UserReputationWindow urw ON urw.Id = ua.UserId
+LEFT JOIN QuestionsWithAcceptedAnswers qwa ON qwa.QuestionOwner = ua.DisplayName
+LEFT JOIN TopPostsWithHistory th ON th.OwnerUserId = ua.UserId
+WHERE ua.Reputation > 1000
+  AND (COALESCE(qwa.QuestionScore, 0) > 10 OR COALESCE(qwa.AnswerScore, 0) > 10 OR ua.BadgesEarned > 5)
+ORDER BY ua.Reputation DESC, ua.UserId
+LIMIT 100;

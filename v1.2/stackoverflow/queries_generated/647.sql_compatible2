@@ -1,0 +1,193 @@
+WITH RECURSIVE RecursiveTagHierarchy AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        0 AS Level,
+        CAST(t.TagName AS varchar(1000)) AS Path
+    FROM Tags t
+    WHERE t.IsRequired = TRUE
+    UNION ALL
+    SELECT
+        t2.Id,
+        t2.TagName,
+        t2.Count,
+        r.Level + 1,
+        r.Path || '>' || t2.TagName
+    FROM Tags t2
+    JOIN RecursiveTagHierarchy r
+      ON POSITION(t2.TagName IN r.Path) = 0
+     AND t2.IsRequired = TRUE
+     AND t2.Count < r.Count
+    WHERE r.Level < 3
+),
+UserBadgeRanks AS (
+    SELECT
+        b.UserId,
+        b.Class,
+        COUNT(*) AS BadgeCount
+    FROM Badges b
+    GROUP BY b.UserId, b.Class
+),
+UserReputationWindow AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.Location,
+        ROW_NUMBER() OVER (PARTITION BY u.Location ORDER BY u.Reputation DESC NULLS LAST) AS LocRank,
+        AVG(u.Reputation) OVER (PARTITION BY u.Location) AS AvgRepByLoc,
+        COUNT(*) OVER (PARTITION BY u.Location) AS UsersInLoc,
+        COALESCE(ub.Gold,0) AS GoldBadges,
+        COALESCE(ub.Silver,0) AS SilverBadges,
+        COALESCE(ub.Bronze,0) AS BronzeBadges
+    FROM Users u
+    LEFT JOIN (
+        SELECT
+            UserId,
+            MAX(CASE WHEN Class = 1 THEN BadgeCount ELSE 0 END) AS Gold,
+            MAX(CASE WHEN Class = 2 THEN BadgeCount ELSE 0 END) AS Silver,
+            MAX(CASE WHEN Class = 3 THEN BadgeCount ELSE 0 END) AS Bronze
+        FROM UserBadgeRanks
+        GROUP BY UserId
+    ) ub ON u.Id = ub.UserId
+    WHERE u.Reputation IS NOT NULL
+),
+TopQuestionsWithAnswers AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.Title,
+        q.CreationDate AS QuestionDate,
+        q.Score AS QuestionScore,
+        q.ViewCount,
+        q.Tags,
+        a.Id AS AnswerId,
+        a.Score AS AnswerScore,
+        a.CreationDate AS AnswerDate,
+        a.OwnerUserId AS AnswerOwnerId,
+        u.DisplayName AS AnswerOwnerName,
+        ROW_NUMBER() OVER (PARTITION BY q.Id ORDER BY a.Score DESC, a.CreationDate ASC) AS AnswerRank
+    FROM Posts q
+    LEFT JOIN Posts a ON a.ParentId = q.Id AND a.PostTypeId = 2
+    LEFT JOIN Users u ON u.Id = a.OwnerUserId
+    WHERE q.PostTypeId = 1 AND q.CreationDate >= (CAST('2024-10-01' AS date) - INTERVAL '1 year')
+),
+QuestionsWithCloseReason AS (
+    SELECT
+        ph.PostId,
+        crt.Name AS CloseReasonName,
+        ph.CreationDate AS CloseDate
+    FROM PostHistory ph
+    JOIN CloseReasonTypes crt ON crt.Id = CAST(ph.Comment AS integer) AND ph.PostHistoryTypeId = 10
+    WHERE ph.CreationDate >= (CAST('2024-10-01' AS date) - INTERVAL '1 year')
+),
+UserActivitySummary AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionsAsked,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswersProvided,
+        COUNT(DISTINCT c.Id) AS CommentsMade,
+        MAX(CASE WHEN p.PostTypeId = 2 THEN p.Score END) AS MaxAnswerScore,
+        SUM(COALESCE(vt.VoteCount,0)) AS TotalVotesReceived
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN (
+        SELECT
+            v.PostId,
+            COUNT(*) AS VoteCount
+        FROM Votes v
+        WHERE v.VoteTypeId IN (2,3)
+        GROUP BY v.PostId
+    ) vt ON vt.PostId = p.Id
+    LEFT JOIN Comments c ON c.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName
+),
+PostsWithVotesAndBadges AS (
+    SELECT
+        p.Id,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        p.OwnerUserId,
+        COALESCE(v.UpVotes,0) AS UpVotes,
+        COALESCE(v.DownVotes,0) AS DownVotes,
+        COALESCE(ub.Gold,0) AS GoldBadges,
+        COALESCE(ub.Silver,0) AS SilverBadges,
+        COALESCE(ub.Bronze,0) AS BronzeBadges
+    FROM Posts p
+    LEFT JOIN (
+        SELECT
+            v.PostId,
+            SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+            SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes
+        FROM Votes v
+        GROUP BY v.PostId
+    ) v ON v.PostId = p.Id
+    LEFT JOIN (
+        SELECT
+            b.UserId,
+            SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS Gold,
+            SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS Silver,
+            SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS Bronze
+        FROM Badges b
+        GROUP BY b.UserId
+    ) ub ON ub.UserId = p.OwnerUserId
+    WHERE p.PostTypeId IN (1,2)
+)
+SELECT
+    q.QuestionId,
+    q.Title,
+    q.QuestionDate,
+    q.QuestionScore,
+    q.ViewCount,
+    q.Tags,
+    COALESCE(cwr.CloseReasonName, 'Open') AS CloseStatus,
+    q.AnswerId,
+    q.AnswerScore,
+    q.AnswerDate,
+    q.AnswerOwnerId,
+    q.AnswerOwnerName,
+    u.DisplayName AS QuestionOwner,
+    u.Reputation AS QuestionOwnerReputation,
+    u.Location AS QuestionOwnerLocation,
+    usr.QuestionsAsked,
+    usr.AnswersProvided,
+    usr.CommentsMade,
+    usr.MaxAnswerScore,
+    usr.TotalVotesReceived,
+    pvb.UpVotes,
+    pvb.DownVotes,
+    pvb.GoldBadges,
+    pvb.SilverBadges,
+    pvb.BronzeBadges,
+    rh.Level AS TagHierarchyLevel,
+    rh.Path AS TagHierarchyPath,
+    CASE
+        WHEN q.QuestionScore > 100 THEN 'Hot Question'
+        WHEN q.QuestionScore BETWEEN 50 AND 100 THEN 'Popular Question'
+        ELSE 'Normal Question'
+    END AS PopularityCategory,
+    DENSE_RANK() OVER (PARTITION BY u.Location ORDER BY u.Reputation DESC NULLS LAST) AS LocationReputationRank,
+    CASE
+        WHEN pvb.UpVotes > pvb.DownVotes THEN 'Positive Reception'
+        WHEN pvb.UpVotes = pvb.DownVotes THEN 'Neutral Reception'
+        ELSE 'Negative Reception'
+    END AS ReceptionCategory
+FROM TopQuestionsWithAnswers q
+LEFT JOIN Users u ON u.Id = (
+    SELECT p2.OwnerUserId FROM Posts p2 WHERE p2.Id = q.QuestionId
+)
+LEFT JOIN QuestionsWithCloseReason cwr ON cwr.PostId = q.QuestionId
+LEFT JOIN UserActivitySummary usr ON usr.UserId = u.Id
+LEFT JOIN PostsWithVotesAndBadges pvb ON pvb.Id = q.AnswerId
+LEFT JOIN RecursiveTagHierarchy rh ON rh.TagName = (REGEXP_MATCHES(q.Tags, '<([^<>]+)>'))[1]
+WHERE q.AnswerRank = 1
+  AND (q.Tags IS NOT NULL AND q.Tags <> '')
+  AND (u.Reputation IS NOT NULL AND u.Reputation > 100)
+  AND (COALESCE(usr.QuestionsAsked,0) + COALESCE(usr.AnswersProvided,0)) > 10
+ORDER BY q.QuestionScore DESC, q.ViewCount DESC
+LIMIT 100;

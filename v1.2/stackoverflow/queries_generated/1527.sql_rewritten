@@ -1,0 +1,183 @@
+-- {"query": "1527.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.5, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1995} 
+WITH RecursiveTagHierarchy AS (
+    SELECT 
+        t.Id, 
+        t.TagName, 
+        0 AS Level,
+        COALESCE(tp.Id, 0) AS ParentTagId
+    FROM Tags t
+    LEFT JOIN Tags tp ON tp.Id = t.WikiPostId
+    WHERE t.IsRequired = 0
+
+    UNION ALL
+
+    SELECT 
+        c.Id,
+        c.TagName,
+        p.Level + 1,
+        COALESCE(tp.Id, 0)
+    FROM Tags c
+    INNER JOIN RecursiveTagHierarchy p ON c.WikiPostId = p.Id
+    LEFT JOIN Tags tp ON tp.Id = c.WikiPostId
+    WHERE c.IsRequired = 0
+),
+UserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionsAuthored,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswersAuthored,
+        SUM(COALESCE(vtUp.CountUpVotes, 0) - COALESCE(vtDown.CountDownVotes, 0)) AS NetVotes,
+        COALESCE(EXISTS (
+            SELECT 1 FROM Badges b WHERE b.UserId = u.Id AND b.Class = 1
+        ), FALSE) AS HasGoldBadge,
+        RANK() OVER (
+            ORDER BY 
+                COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1 AND p.Score > 0) DESC,
+                u.Reputation DESC
+            ) AS QuestionRank
+    FROM 
+        Users u
+        LEFT JOIN Posts p ON p.OwnerUserId = u.Id AND p.CreationDate BETWEEN '2020-01-01' AND '2023-12-31'
+        LEFT JOIN (
+            SELECT v.PostId, COUNT(*) AS CountUpVotes
+            FROM Votes v
+            WHERE v.VoteTypeId = 2
+            GROUP BY v.PostId
+        ) vtUp ON vtUp.PostId = p.Id
+        LEFT JOIN (
+            SELECT v.PostId, COUNT(*) AS CountDownVotes
+            FROM Votes v
+            WHERE v.VoteTypeId = 3
+            GROUP BY v.PostId
+        ) vtDown ON vtDown.PostId = p.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+    HAVING COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1) > 5
+),
+AcceptedAnswerInfo AS (
+    SELECT 
+        q.Id AS QuestionId, 
+        a.Id AS AcceptedAnswerId,
+        a.OwnerUserId AS AcceptedUserId,
+        a.Score AS AcceptedAnswerScore,
+        a.CreationDate AS AcceptedAnswerCreationDate,
+        q.CreationDate AS QuestionCreationDate,
+        EXTRACT(EPOCH FROM (a.CreationDate - q.CreationDate))/3600.0 AS HoursToAccept
+    FROM Posts q
+    LEFT JOIN Posts a ON a.Id = q.AcceptedAnswerId AND a.PostTypeId = 2
+    WHERE q.PostTypeId = 1 AND q.AcceptedAnswerId IS NOT NULL
+),
+LastEditorDiversity AS (
+    SELECT 
+        OwnerUserId,
+        COUNT(DISTINCT LastEditorUserId) FILTER (WHERE LastEditorUserId IS NOT NULL AND LastEditorUserId <> OwnerUserId) AS DifferentEditorsOnOwnedPosts
+    FROM Posts
+    WHERE OwnerUserId IS NOT NULL
+    GROUP BY OwnerUserId
+),
+PopularPostsAndDuplicates AS (
+    SELECT 
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.Title,
+        p.CreationDate,
+        COALESCE(plRelated.RelCount,0) AS LinkedPostsCount,
+        COALESCE(plDups.DupCount,0) AS DuplicateLinksCount,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC NULLS LAST) AS RankByScore
+    FROM Posts p
+    LEFT JOIN (
+        SELECT PostId, COUNT(*) AS RelCount FROM PostLinks WHERE LinkTypeId = 1 GROUP BY PostId
+    ) plRelated ON plRelated.PostId = p.Id
+    LEFT JOIN (
+        SELECT PostId, COUNT(*) AS DupCount FROM PostLinks WHERE LinkTypeId = 3 GROUP BY PostId
+    ) plDups ON plDups.PostId = p.Id
+    WHERE p.CreationDate > cast('2024-10-01' as date) - INTERVAL '2 years'
+),
+UserCommentsActivity AS (
+    SELECT
+        c.UserId,
+        u.DisplayName, 
+        COUNT(c.Id) AS CommentsCount,
+        AVG(LENGTH(c.Text)) AS AvgCommentLength,
+        COUNT(DISTINCT c.PostId) AS UniqueCommentedPosts,
+        COUNT(c.Id) FILTER (WHERE c.Text ILIKE '%help%' OR c.Text ILIKE '%please%') AS RequestsForHelp
+    FROM Comments c
+    LEFT JOIN Users u ON u.Id = c.UserId
+    WHERE c.CreationDate >= cast('2024-10-01' as date) - INTERVAL '1 year'
+    GROUP BY c.UserId, u.DisplayName
+),
+HighOrderBadgeAggregation AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        MAX(TRIM(bes.Name)) AS TopBadgeOnHrAsci  -- ASCII sort trim strange padding possibility #CorrosionInjection
+    FROM Users u
+    LEFT JOIN Badges bes ON bes.UserId = u.Id
+    WHERE bes.Date >= (cast('2024-10-01' as date) - INTERVAL '3 year')
+    GROUP BY u.Id, u.DisplayName
+),
+ComplexCorrelatedPostVotes AS (
+    SELECT
+      main.PostId,
+      MAX(args.VisibleScoreAdj) FILTER (WHERE VisibleScoreAdj IS NOT NULL) AS MaxScoreAdjacent,
+      MIN(args.VisibleScoreAdj) FILTER (WHERE VisibleScoreAdj IS NOT NULL) AS MinScoreAdjacent,
+      AVG(args.VisibleScoreAdj) FILTER (WHERE VisibleScoreAdj IS NOT NULL) AS AvgScoreAdjacent
+    FROM (
+      SELECT
+        p.Id AS PostId,
+        pv_vals.VisibleScoreAdj
+      FROM Posts p
+      LEFT JOIN LATERAL (
+        SELECT
+          AVG(COALESCE(v2.CountVotes * CASE WHEN v.VoteTypeId=2 THEN 1 ELSE -1 END,0))::float8 AS VisibleScoreAdj
+        FROM Votes v
+        LEFT JOIN (
+            SELECT PostId, COUNT(*) AS CountVotes FROM Votes GROUP BY PostId
+        ) v2 ON v2.PostId = p.Id
+        WHERE ABS(v.CreationDate - p.CreationDate) < interval '6 hours' AND v.PostId = p.Id
+        GROUP BY v.VoteTypeId
+      ) pv_vals ON true
+    ) main
+    GROUP BY main.PostId
+)
+SELECT
+    ua.UserId,
+    ua.DisplayName,
+    ua.QuestionsAuthored,
+    ua.AnswersAuthored,
+    ua.NetVotes,
+    CASE WHEN ua.HasGoldBadge THEN 'Yes' ELSE 'No' END AS HasGoldBadge,
+    la.DifferentEditorsOnOwnedPosts,
+    ac.HoursToAccept,
+    pct.Level AS TagDepthLevel,
+    CASE 
+        WHEN lpad(rtrim(pg.TopBadgeOnHrAsci), 50) IS NULL THEN 'None' ELSE pg.TopBadgeOnHrAsci
+    END AS HighestRecentBadge,
+    ARRAY_AGG(DISTINCT pt.Tags ORDER BY pt.CreationDate DESC) FILTER (WHERE NULLIF(pt.Tags,'') IS NOT NULL) LIMIT 3 AS RecentTagsUsed,
+    COALESCE(vc.CommentsCount,0) AS RecentComments,
+    COALESCE(vc.RequestsForHelp,0) AS HelpComments,
+    pup.PopularPostsCount,
+    pc.DuplicatePostCount,
+    CONCAT(SPLIT_PART(lp.Title,' ',1), ' ... (len:', CHAR_LENGTH(lp.Title), ')') AS PopularPostSampleTitle,
+    ROW_NUMBER() OVER (PARTITION BY voi.UserId ORDER BY ccv.MaxScoreAdjacent DESC NULLS LAST) AS BestScoredCorrelationRank
+FROM UserActivity ua
+LEFT JOIN LastEditorDiversity la ON la.OwnerUserId = ua.UserId
+LEFT JOIN AcceptedAnswerInfo ac ON ac.AcceptedUserId = ua.UserId
+LEFT JOIN RecursiveTagHierarchy pct ON EXTRACT(EPOCH FROM ua.UserId) % 100 = pct.Level  -- arbitrary join to layer competitiveness-related fanciness
+LEFT JOIN HighOrderBadgeAggregation pg ON pg.UserId = ua.UserId
+LEFT JOIN UserCommentsActivity vc ON vc.UserId = ua.UserId
+LEFT JOIN (
+    SELECT SSR.OwnerUserId,
+           COUNT(*) FILTER (WHERE p.PostTypeId = 1 AND p.Score >= 50) AS PopularPostsCount,
+           COUNT(pl.LinkTypeId) FILTER (WHERE pl.LinkTypeId = 3) AS DuplicatePostCount
+    FROM Posts p
+    JOIN Posts SSR ON SSR.Id = p.OwnerUserId OR p.OwnerUserId = SSR.OwnerUserId
+    LEFT JOIN PostLinks pl ON pl.PostId = p.Id
+    GROUP BY SSR.OwnerUserId
+) pup ON pup.OwnerUserId = ua.UserId
+LEFT JOIN PopularPostsAndDuplicates ppd ON ppd.PostTypeId = 1 AND ppd.RankByScore = 1
+LEFT JOIN Posts lp ON lp.Id = ppd.PostId
+LEFT JOIN ComplexCorrelatedPostVotes ccv ON ccv.PostId = lp.Id
+LEFT JOIN Votes voi ON voi.UserId = ua.UserId
+ORDER BY ua.NetVotes DESC NULLS LAST
+LIMIT 50;

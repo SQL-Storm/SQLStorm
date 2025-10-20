@@ -1,0 +1,128 @@
+-- {"query": "1172.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.1, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1172} 
+with RecursiveUserBadges as (
+    select 
+        u.Id as UserId, 
+        u.DisplayName,
+        b.Name as BadgeName,
+        b.Class as BadgeClass,
+        ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY b.Date desc) as BadgeRank
+    from Users u
+    left join Badges b on u.Id = b.UserId
+    where b.Class is not null
+),
+UserPostStats as (
+    select
+        p.OwnerUserId as UserId,
+        count(distinct p.Id) as TotalPosts,
+        sum(case when p.PostTypeId = 1 then 1 else 0 end) as TotalQuestions,
+        sum(case when p.PostTypeId = 2 then 1 else 0 end) as TotalAnswers,
+        avg(p.Score) filter(where p.Score is not null) as AveragePostScore,
+        max(p.Score) as MaxPostScore,
+        sum(p.ViewCount) as TotalViews
+    from Posts p
+    where p.OwnerUserId > 0
+    group by p.OwnerUserId
+),
+UserRecentActivity as (
+    select
+        u.Id as UserId,
+        max(p.LastActivityDate) as LastPostActivity,
+        (select max(c.CreationDate) 
+         from Comments c 
+         where c.UserId = u.Id
+        ) as LastCommentDate
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    group by u.Id
+),
+TopTagsByUser as (
+    select
+        p.OwnerUserId as UserId,
+        unnest(string_to_array(substring(p.Tags from 2 for char_length(p.Tags)-2), '><')) as Tag,
+        count(*) as TagCount,
+        row_number() over (partition by p.OwnerUserId order by count(*) desc) as TagRank
+    from Posts p
+    where p.PostTypeId = 1 and p.Tags is not null
+    group by p.OwnerUserId, Tag
+),
+CloseReasonsAggregate as (
+    select
+        ph.PostId,
+        crt.Name as CloseReasonName,
+        count(*) as CloseVotesCount
+    from PostHistory ph
+    join CloseReasonTypes crt on cast(ph.Comment as int) = crt.Id and ph.PostHistoryTypeId = 10
+    group by ph.PostId, crt.Name
+),
+PostWithRecentVotes as (
+    select
+        p.Id as PostId,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.PostTypeId,
+        v.VoteTypeId,
+        v.CreationDate as VoteDate,
+        row_number() over (partition by p.Id order by v.CreationDate desc) as VoteRankDesc
+    from Posts p
+    left join Votes v on p.Id = v.PostId
+    where p.PostTypeId in (1, 2)
+),
+RankedVotes as (
+    select 
+        PostId, VoteTypeId, VoteDate
+    from PostWithRecentVotes
+    where VoteRankDesc <= 3
+),
+UserVoteAggregates as (
+    select
+        u.Id as UserId,
+        count(v.Id) filter (where v.VoteTypeId = 2) as TotalUpVotes,
+        count(v.Id) filter (where v.VoteTypeId = 3) as TotalDownVotes,
+        count(v.Id) filter (where v.VoteTypeId = 5) as TotalFavorites,
+        count(v.Id) filter (where v.VoteTypeId = 8 or v.VoteTypeId = 9) as TotalBounties
+    from Users u
+    left join Votes v on v.UserId = u.Id
+    group by u.Id
+)
+select 
+    u.Id as UserId,
+    u.DisplayName,
+    us.TotalPosts,
+    us.TotalQuestions,
+    us.TotalAnswers,
+    us.AveragePostScore,
+    us.MaxPostScore,
+    us.TotalViews,
+    ur.LastPostActivity,
+    ur.LastCommentDate,
+    coalesce(tb.Tag, 'NoTag') as FavoriteTag,
+    rub.BadgeName,
+    rub.BadgeClass,
+    cra.CloseReasonName,
+    cra.CloseVotesCount,
+    uva.TotalUpVotes,
+    uva.TotalDownVotes,
+    uva.TotalFavorites,
+    uva.TotalBounties,
+    case 
+        when us.TotalPosts > 0 then us.TotalViews::float / us.TotalPosts 
+        else 0 
+    end as AverageViewsPerPost,
+    length(u.AboutMe) as AboutMeLength,
+    (select count(1) 
+     from Posts p2 
+     where p2.OwnerUserId = u.Id and p2.Score >= 
+        (select avg(Score) from Posts where OwnerUserId = u.Id)
+    ) as PostsAboveUserAverageScore
+from Users u
+left join UserPostStats us on us.UserId = u.Id
+left join UserRecentActivity ur on ur.UserId = u.Id
+left join TopTagsByUser tb on tb.UserId = u.Id and tb.TagRank = 1
+left join RecursiveUserBadges rub on rub.UserId = u.Id and rub.BadgeRank = 1
+left join CloseReasonsAggregate cra on cra.PostId = (select min(p.Id) from Posts p where p.OwnerUserId = u.Id and p.PostTypeId = 1)
+left join UserVoteAggregates uva on uva.UserId = u.Id
+where u.CreationDate < cast('2024-10-01 12:34:56' as timestamp) - interval '1 year'
+order by us.TotalAnswers desc NULLS LAST, us.AveragePostScore desc NULLS LAST
+limit 50;

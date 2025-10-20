@@ -1,0 +1,174 @@
+with RecursiveTagHierarchy as (
+    select 
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        1 as Level,
+        cast(t.TagName as varchar(1000)) as Path
+    from Tags t
+    where t.IsModeratorOnly = false and t.IsRequired = false
+
+    union all
+
+    select 
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        r.Level + 1,
+        r.Path || ' > ' || t.TagName
+    from Tags t
+    join RecursiveTagHierarchy r on t.Id = r.Id + 1
+    where r.Level < 3
+),
+UserActivity as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        count(distinct case when p.PostTypeId = 1 then p.Id end) as QuestionsAsked,
+        count(distinct case when p.PostTypeId = 2 then p.Id end) as AnswersGiven,
+        count(distinct c.Id) as CommentsMade,
+        count(distinct b.Id) as BadgesEarned,
+        coalesce(sum(v.BountyAmount),0) as TotalBountyEarned,
+        max(p.CreationDate) as LastPostDate,
+        min(p.CreationDate) as FirstPostDate,
+        (select count(*) from Votes v2 where v2.UserId = u.Id and v2.VoteTypeId = 2) as UpVotesCast,
+        (select count(*) from Votes v2 where v2.UserId = u.Id and v2.VoteTypeId = 3) as DownVotesCast
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Comments c on c.UserId = u.Id
+    left join Badges b on b.UserId = u.Id
+    left join Votes v on v.UserId = u.Id and v.VoteTypeId in (8,9) -- bounty start/close
+    group by u.Id, u.DisplayName, u.Reputation
+),
+PostScoresAndRanks as (
+    select 
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.FavoriteCount,
+        dense_rank() over (partition by p.PostTypeId order by p.Score desc, p.ViewCount desc) as ScoreRank,
+        row_number() over (partition by p.OwnerUserId order by p.CreationDate desc) as RecentPostRank
+    from Posts p
+    where p.PostTypeId in (1,2)
+),
+TopQuestionsWithAnswers as (
+    select 
+        q.Id as QuestionId,
+        q.Title,
+        q.Tags,
+        q.Score as QuestionScore,
+        q.ViewCount as QuestionViews,
+        q.CreationDate as QuestionDate,
+        a.Id as AnswerId,
+        a.Score as AnswerScore,
+        a.CreationDate as AnswerDate,
+        u.DisplayName as AnswererName,
+        u.Reputation as AnswererReputation
+    from Posts q
+    left join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+    left join Users u on u.Id = a.OwnerUserId
+    where q.PostTypeId = 1
+      and q.Score > 10
+      and a.Score > 5
+),
+CloseReasonCounts as (
+    select 
+        crt.Name as CloseReason,
+        count(distinct ph.PostId) as ClosedPostsCount
+    from PostHistory ph
+    join PostHistoryTypes pht on ph.PostHistoryTypeId = pht.Id
+    join CloseReasonTypes crt on cast(crt.Id as varchar) = ph.Comment
+    where ph.PostHistoryTypeId = 10
+    group by crt.Name
+),
+UserBadgeRanks as (
+    select 
+        b.UserId,
+        b.Class,
+        count(*) as BadgeCount,
+        rank() over (partition by b.Class order by count(*) desc) as BadgeRank
+    from Badges b
+    group by b.UserId, b.Class
+),
+UserReputationWindow as (
+    select 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        avg(u.Reputation) over (order by u.Reputation rows between 5 preceding and 5 following) as AvgReputationNearby,
+        lag(u.Reputation,1) over (order by u.Reputation) as PrevReputation,
+        lead(u.Reputation,1) over (order by u.Reputation) as NextReputation
+    from Users u
+    where u.Reputation > 1000
+),
+CombinedResults as (
+    select 
+        ua.UserId,
+        ua.DisplayName,
+        ua.Reputation,
+        ua.QuestionsAsked,
+        ua.AnswersGiven,
+        ua.CommentsMade,
+        ua.BadgesEarned,
+        ua.TotalBountyEarned,
+        ua.LastPostDate,
+        ua.FirstPostDate,
+        ua.UpVotesCast,
+        ua.DownVotesCast,
+        ps.ScoreRank,
+        ps.RecentPostRank,
+        coalesce(ubr.BadgeCount,0) as BadgeCountGold,
+        coalesce(ubr2.BadgeCount,0) as BadgeCountSilver,
+        coalesce(ubr3.BadgeCount,0) as BadgeCountBronze,
+        urw.AvgReputationNearby,
+        urw.PrevReputation,
+        urw.NextReputation
+    from UserActivity ua
+    left join PostScoresAndRanks ps on ps.OwnerUserId = ua.UserId and ps.ScoreRank <= 10
+    left join UserBadgeRanks ubr on ubr.UserId = ua.UserId and ubr.Class = 1
+    left join UserBadgeRanks ubr2 on ubr2.UserId = ua.UserId and ubr2.Class = 2
+    left join UserBadgeRanks ubr3 on ubr3.UserId = ua.UserId and ubr3.Class = 3
+    left join UserReputationWindow urw on urw.Id = ua.UserId
+)
+select 
+    cr.CloseReason,
+    cr.ClosedPostsCount,
+    count(distinct cte.QuestionId) as QuestionsWithHighScoreAnswers,
+    max(cte.AnswererReputation) as MaxAnswererReputation,
+    min(cte.AnswerScore) as MinAnswerScore,
+    avg(cte.QuestionScore) as AvgQuestionScore,
+    string_agg(distinct rth.Path, ' | ') as SampleTagPaths,
+    max(crc.ClosedPostsCount) over () as TotalClosedPosts,
+    sum(crc.ClosedPostsCount) over () as SumClosedPosts,
+    count(distinct ua2.UserId) filter (where ua2.Reputation > 5000) as HighReputationUsers,
+    avg(ua2.Reputation) filter (where ua2.Reputation > 5000) as AvgHighReputation,
+    avg(ua2.BadgesEarned) as AvgBadgesPerUser,
+    max(ua2.TotalBountyEarned) as MaxBountyEarned,
+    max(ua2.UpVotesCast) as MaxUpVotesCast,
+    max(ua2.DownVotesCast) as MaxDownVotesCast,
+    max(ua2.ScoreRank) as MaxScoreRank,
+    max(ua2.RecentPostRank) as MaxRecentPostRank,
+    max(ua2.BadgeCountGold) as MaxGoldBadges,
+    max(ua2.BadgeCountSilver) as MaxSilverBadges,
+    max(ua2.BadgeCountBronze) as MaxBronzeBadges,
+    max(ua2.AvgReputationNearby) as MaxAvgReputationNearby,
+    max(ua2.PrevReputation) as MaxPrevReputation,
+    max(ua2.NextReputation) as MaxNextReputation
+from CloseReasonCounts cr
+left join TopQuestionsWithAnswers cte on cte.QuestionDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '1 year'
+left join RecursiveTagHierarchy rth on rth.Level = 1
+left join CombinedResults ua2 on ua2.UserId = ua2.UserId
+left join CloseReasonCounts crc on 1=1
+group by cr.CloseReason, cr.ClosedPostsCount
+having count(distinct cte.QuestionId) > 5
+order by cr.ClosedPostsCount desc, cr.CloseReason
+limit 20;

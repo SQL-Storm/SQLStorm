@@ -1,0 +1,90 @@
+WITH UserBadgeCounts AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS GoldBadges,
+        COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS SilverBadges,
+        COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS BronzeBadges,
+        COALESCE(
+            (SELECT MAX(ph.CreationDate)
+             FROM PostHistory ph
+             WHERE ph.UserId = u.Id),
+            TIMESTAMP '1900-01-01'
+        ) AS LastHistoryEdit
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName
+),
+TopUsers AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        ubc.GoldBadges,
+        ubc.SilverBadges,
+        ubc.BronzeBadges,
+        ubc.LastHistoryEdit,
+        -- reputation factor: decay by days since creation applied to user's reputation
+        SUM(POWER(0.998, (EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - COALESCE(u.CreationDate, TIMESTAMP '2024-10-01 12:34:56'))) / 86400)) * u.Reputation)
+            OVER (PARTITION BY u.Id) AS ReputationFactor
+    FROM Users u
+    INNER JOIN (
+        SELECT UserId
+        FROM UserBadgeCounts
+        WHERE GoldBadges + SilverBadges + BronzeBadges > 5
+    ) t ON u.Id = t.UserId
+    INNER JOIN UserBadgeCounts ubc ON ubc.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, ubc.GoldBadges, ubc.SilverBadges, ubc.BronzeBadges, ubc.LastHistoryEdit, u.CreationDate, u.Reputation
+),
+DistinctLinkPairs AS (
+    SELECT DISTINCT
+        LEAST(p.PostId, p.RelatedPostId) AS P1,
+        GREATEST(p.PostId, p.RelatedPostId) AS P2,
+        lt.Name AS linktype
+    FROM PostLinks p
+    JOIN LinkTypes lt ON p.LinkTypeId = lt.Id
+    WHERE p.CreationDate > date_trunc('year', TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '1 year')
+),
+ComplicatedPostInfo AS (
+    SELECT
+        p.Id,
+        UPPER(SUBSTRING(p.COOTEXT FROM 214)) AS TitleSubset,
+        COALESCE(p.Score, 0) AS Score,
+        COALESCE(p.ViewCount, 0) AS ViewCount,
+        CASE WHEN p.CreationDate >= DATE '2023-01-01' THEN 1 ELSE 0 END AS Active2023
+    FROM Posts p
+)
+SELECT
+    tu.UserId,
+    tu.DisplayName,
+    tu.GoldBadges,
+    tu.SilverBadges,
+    tu.BronzeBadges,
+    tu.LastHistoryEdit,
+    tu.ReputationFactor,
+    dlp.P1,
+    dlp.P2,
+    dlp.linktype,
+    cpi.Id AS PostId,
+    cpi.TitleSubset,
+    cpi.Score,
+    cpi.ViewCount,
+    cpi.Active2023
+FROM TopUsers tu
+LEFT JOIN DistinctLinkPairs dlp ON dlp.P1 = tu.UserId OR dlp.P2 = tu.UserId
+LEFT JOIN ComplicatedPostInfo cpi ON cpi.Id = dlp.P1 OR cpi.Id = dlp.P2
+GROUP BY
+    tu.UserId,
+    tu.DisplayName,
+    tu.GoldBadges,
+    tu.SilverBadges,
+    tu.BronzeBadges,
+    tu.LastHistoryEdit,
+    tu.ReputationFactor,
+    dlp.P1,
+    dlp.P2,
+    dlp.linktype,
+    cpi.Id,
+    cpi.TitleSubset,
+    cpi.Score,
+    cpi.ViewCount,
+    cpi.Active2023;

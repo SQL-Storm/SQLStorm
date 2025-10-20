@@ -1,0 +1,231 @@
+with
+-- user stats and recent activity
+user_activity as (
+  select
+    u.id as user_id,
+    u.displayname,
+    u.reputation,
+    u.creationdate,
+    u.lastaccessdate,
+    coalesce(u.websiteurl,'') as website,
+    coalesce(u.location,'') as location,
+    count(distinct p.id) filter (where p.posttypeid = 1) as questions_count,
+    count(distinct p.id) filter (where p.posttypeid = 2) as answers_count,
+    count(b.id) as badges_total,
+    max(b.date) as last_badge_date,
+    row_number() over (order by u.reputation desc, u.lastaccessdate desc) as rank_by_reputation
+  from users u
+  left join posts p on p.owneruserid = u.id
+  left join badges b on b.userid = u.id
+  group by u.id, u.displayname, u.reputation, u.creationdate, u.lastaccessdate, u.websiteurl, u.location
+),
+-- heavy questions: combine content metrics, tags exploded, and recent edits
+question_enrichment as (
+  select
+    q.id as question_id,
+    q.owneruserid,
+    q.title,
+    q.creationdate,
+    q.score,
+    q.viewcount,
+    coalesce(q.answercount,0) as answercount,
+    coalesce(q.favoritecount,0) as favoritecount,
+    q.tags,
+    -- estimated tag count from tag string like '<tag1><tag2>'
+    greatest(array_length(string_to_array(substring(q.tags from 2 for length(q.tags)-2), '><'),1),0) as tag_count,
+    length(coalesce(q.body,'')) as body_len,
+    regexp_replace(coalesce(q.body,''), '<[^>]+>', '') as body_text,
+    -- last edit info from PostHistory (most recent edit or title/body change)
+    (select ph.creationdate from posthistory ph
+     where ph.postid = q.id and ph.posthistorytypeid in (2,4,5,6,24)
+     order by ph.creationdate desc limit 1) as last_edit_date,
+    -- count of distinct editors (excluding anonymous display names)
+    (select count(distinct ph.userid) from posthistory ph where ph.postid = q.id and ph.userid is not null) as distinct_editors,
+    -- number of comments and top commenter id
+    (select count(*) from comments c where c.postid = q.id) as comment_count,
+    (select c.userid from comments c where c.postid = q.id group by c.userid order by count(*) desc nulls last limit 1) as top_commenter_id
+  from posts q
+  where q.posttypeid = 1
+  group by q.id, q.owneruserid, q.title, q.creationdate, q.score, q.viewcount, q.answercount, q.favoritecount, q.tags, q.body
+),
+-- answers with correlation to their parent question
+answer_enrichment as (
+  select
+    a.id as answer_id,
+    a.parentid as question_id,
+    a.owneruserid,
+    a.creationdate,
+    a.score,
+    length(coalesce(a.body,'')) as body_len,
+    row_number() over (partition by a.parentid order by a.score desc, a.creationdate asc) as rank_within_question,
+    -- is accepted?
+    case when a.id = (select acceptedanswerid from posts q where q.id = a.parentid) then 1 else 0 end as is_accepted,
+    -- relative score z-score within question (correlated subquery)
+    case
+      when (select stddev_pop(p2.score) from posts p2 where p2.parentid = a.parentid and p2.posttypeid = 2) is null then 0
+      else (a.score - (select avg(p2.score) from posts p2 where p2.parentid = a.parentid and p2.posttypeid = 2))
+           / nullif((select stddev_pop(p2.score) from posts p2 where p2.parentid = a.parentid and p2.posttypeid = 2),0)
+    end as score_z
+  from posts a
+  where a.posttypeid = 2
+  group by a.id, a.parentid, a.owneruserid, a.creationdate, a.score, a.body
+),
+-- tag popularity from questions
+tag_popularity as (
+  select
+    t.tagname,
+    t.id as tag_id,
+    t.count as tag_count,
+    q.id as excerpt_post_id,
+    coalesce(q.viewcount,0) as excerpt_views
+  from tags t
+  left join posts q on q.id = t.excerptpostid
+  group by t.tagname, t.id, t.count, q.id, q.viewcount
+),
+-- aggregate votes and compute unusual voting patterns
+vote_aggregates as (
+  select
+    p.id as post_id,
+    p.posttypeid,
+    sum(case when v.votetypeid = 2 then 1 else 0 end) as upvotes,
+    sum(case when v.votetypeid = 3 then 1 else 0 end) as downvotes,
+    sum(case when v.votetypeid in (8,9) then coalesce(v.bountyamount,0) else 0 end) as bounty_awarded,
+    count(v.id) as total_votes,
+    count(distinct v.userid) as distinct_voters,
+    bool_or(v.userid is null) as has_anonymous_votes
+  from posts p
+  left join votes v on v.postid = p.id
+  group by p.id, p.posttypeid
+),
+-- sample of post links for graph-style operations
+link_graph as (
+  select
+    pl.postid,
+    pl.relatedpostid,
+    pl.linktypeid,
+    lt.name as linktype_name
+  from postlinks pl
+  left join linktypes lt on lt.id = pl.linktypeid
+  group by pl.postid, pl.relatedpostid, pl.linktypeid, lt.name
+),
+-- identify questions with weird closure/reopen history using PostHistory
+closure_patterns as (
+  select
+    ph.postid,
+    sum(case when ph.posthistorytypeid = 10 then 1 else 0 end) as close_events,
+    sum(case when ph.posthistorytypeid = 11 then 1 else 0 end) as reopen_events,
+    max(case when ph.posthistorytypeid = 10 then ph.creationdate end) as last_closed_at,
+    max(case when ph.posthistorytypeid = 11 then ph.creationdate end) as last_reopened_at
+  from posthistory ph
+  group by ph.postid
+),
+-- combine everything with heavy joins and filters, produce ranking and window analytics
+final_candidates as (
+  select
+    q.question_id,
+    q.title,
+    ua.user_id as author_id,
+    ua.displayname as author_name,
+    ua.reputation as author_reputation,
+    q.creationdate as question_created,
+    q.score as question_score,
+    q.viewcount as question_views,
+    q.answercount,
+    q.favoritecount,
+    q.tag_count,
+    q.body_len,
+    q.comment_count,
+    q.distinct_editors,
+    ve.upvotes,
+    ve.downvotes,
+    ve.total_votes,
+    ve.bounty_awarded,
+    coalesce(cp.close_events,0) as close_events,
+    coalesce(cp.reopen_events,0) as reopen_events,
+    lg.linktype_name,
+    tg.tagname,
+    ae.answer_id,
+    ae.owneruserid as top_answer_author,
+    ae.score as top_answer_score,
+    ae.is_accepted,
+    ae.score_z,
+    -- complex computed metric that favors high views, high score, many answers, but penalizes close events and lots of downvotes
+    (ln(1 + q.viewcount) * (1 + greatest(q.score,0)) * (1 + q.answercount) / nullif(1 + ve.downvotes + coalesce(cp.close_events,0)*5,1)) as interestingness_score,
+    -- compute text similarity heuristic: length ratio of top answer to question body
+    case when q.body_len > 0 then (cast(ae.body_len as numeric)) / q.body_len else null end as answer_body_to_question_body_ratio,
+    rank() over (partition by tg.tagname order by (ln(1+q.viewcount) * (1+greatest(q.score,0))) desc) as tag_rank_by_popularity,
+    dense_rank() over (order by (ln(1+q.viewcount) * (1+greatest(q.score,0))) desc) as global_popularity_rank
+  from question_enrichment q
+  left join user_activity ua on ua.user_id = q.owneruserid
+  left join vote_aggregates ve on ve.post_id = q.question_id
+  left join closure_patterns cp on cp.postid = q.question_id
+  left join lateral (
+    select tg.tagname from tags tg
+    where tg.tagname in (
+      select unnest(string_to_array(substring(q.tags from 2 for length(q.tags)-2), '><'))
+    )
+    order by tg.count desc nulls last limit 1
+  ) tg on true
+  left join lateral (
+    select a.* from answer_enrichment a
+    where a.question_id = q.question_id
+    order by a.is_accepted desc, a.score desc nulls last, a.creationdate asc
+    limit 1
+  ) ae on true
+  left join lateral (
+    select lg.linktype_name from link_graph lg
+    where lg.postid = q.question_id
+    order by lg.linktypeid limit 1
+  ) lg on true
+  group by
+    q.question_id, q.title, ua.user_id, ua.displayname, ua.reputation, q.creationdate, q.score, q.viewcount, q.answercount,
+    q.favoritecount, q.tag_count, q.body_len, q.comment_count, q.distinct_editors, ve.upvotes, ve.downvotes, ve.total_votes,
+    ve.bounty_awarded, cp.close_events, cp.reopen_events, lg.linktype_name, tg.tagname, ae.answer_id, ae.owneruserid, ae.score,
+    ae.is_accepted, ae.score_z, ae.body_len
+)
+select
+  fc.question_id,
+  fc.title,
+  fc.author_id,
+  fc.author_name,
+  fc.author_reputation,
+  fc.question_created,
+  fc.question_score,
+  fc.question_views,
+  fc.answercount,
+  fc.favoritecount,
+  fc.tag_count,
+  fc.tagname as primary_tag,
+  fc.distinct_editors,
+  fc.comment_count,
+  fc.upvotes,
+  fc.downvotes,
+  fc.total_votes,
+  fc.bounty_awarded,
+  fc.close_events,
+  fc.reopen_events,
+  fc.linktype_name as sample_link_type,
+  fc.top_answer_author,
+  fc.top_answer_score,
+  fc.is_accepted,
+  round(fc.score_z::numeric,3) as top_answer_score_z,
+  round(fc.interestingness_score::numeric,4) as interestingness_score,
+  round(fc.answer_body_to_question_body_ratio::numeric,3) as answer_text_ratio,
+  fc.tag_rank_by_popularity,
+  fc.global_popularity_rank,
+  -- flag complex predicates
+  case
+    when fc.close_events > 0 and fc.reopen_events = 0 then 'closed_never_reopened'
+    when fc.close_events > 0 and fc.reopen_events > 0 then 'closed_and_reopened'
+    when fc.downvotes > fc.upvotes then 'net_negative'
+    when fc.upvotes = 0 and fc.downvotes = 0 and fc.total_votes = 0 then 'no_votes'
+    else 'healthy'
+  end as status_flag
+from final_candidates fc
+where
+  -- focus on questions with at least some traction but oddities to exercise optimizer
+  fc.question_views > 100
+  and (fc.answercount > 0 or fc.comment_count > 2)
+  and (fc.close_events > 0 or fc.downvotes > 5 or fc.bounty_awarded > 0 or fc.tag_count > 3)
+order by fc.interestingness_score desc nulls last, fc.global_popularity_rank
+limit 250;

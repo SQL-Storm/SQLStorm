@@ -1,0 +1,209 @@
+WITH RecursiveUserBadgeStats AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        b.Class,
+        COUNT(b.Id) AS BadgeCount,
+        ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY b.Class) AS BadgeRank
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation, b.Class
+),
+LatestPostHistory AS (
+    SELECT ph.PostId, ph.PostHistoryTypeId, ph.CreationDate,
+           ROW_NUMBER() OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate DESC, ph.Id DESC) AS rn
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (10, 11, 12, 13, 14, 15)
+),
+PostVotesSummary AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        SUM(CASE WHEN vt.Name = 'UpMod' THEN 1 ELSE 0 END) AS UpVotes,
+        SUM(CASE WHEN vt.Name = 'DownMod' THEN 1 ELSE 0 END) AS DownVotes,
+        SUM(CASE WHEN vt.Name = 'Favorite' THEN 1 ELSE 0 END) AS FavoriteVotes,
+        SUM(v.BountyAmount) AS TotalBounty
+    FROM Posts p
+    LEFT JOIN Votes v ON v.PostId = p.Id
+    LEFT JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+    GROUP BY p.Id, p.PostTypeId, p.OwnerUserId
+),
+Challenges AS (
+    SELECT
+        p.Id AS QuestionId,
+        p.Title,
+        p.Tags,
+        COALESCE(p.Score,0) AS Score,
+        COALESCE(p.ViewCount,0) AS Views,
+        p.OwnerUserId,
+        pu.DisplayName AS OwnerName,
+        p.AcceptedAnswerId,
+        pa.OwnerUserId AS AnswererId,
+        au.DisplayName AS AnswererName,
+        PostVotesSummary.UpVotes AS QuestionUpVotes,
+        PostVotesSummary.DownVotes AS QuestionDownVotes,
+        PostVotesSummary.FavoriteVotes AS QuestionFavoriteVotes,
+        PostVotesSummary.TotalBounty AS QuestionBounty,
+        pa.Score AS AnswerScore,
+        COALESCE(CASE WHEN pa.CreationDate > p.CreationDate THEN EXTRACT(EPOCH FROM (pa.CreationDate - p.CreationDate)) END, NULL) AS AnswerDelaySeconds,
+        LatestPostHistory.PostHistoryTypeId AS LastPostHistoryType,
+        LatestPostHistory.CreationDate AS LastPostHistoryDate,
+        CASE 
+          WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+          ELSE 'Open'
+        END AS PostStatus,
+        (
+          SELECT STRING_AGG(ph2.Text, ' | ' ORDER BY ph2.CreationDate DESC)
+          FROM PostHistory ph2
+          WHERE ph2.PostId = p.Id AND ph2.PostHistoryTypeId IN (4,5,6)
+          LIMIT 3
+        ) AS RecentEditsSummary
+    FROM Posts p
+    LEFT JOIN Posts pa ON pa.Id = p.AcceptedAnswerId
+    LEFT JOIN Users pu ON pu.Id = p.OwnerUserId
+    LEFT JOIN Users au ON au.Id = pa.OwnerUserId
+    LEFT JOIN LatestPostHistory ON LatestPostHistory.PostId = p.Id AND LatestPostHistory.rn = 1
+    LEFT JOIN PostVotesSummary ON PostVotesSummary.PostId = p.Id
+    WHERE p.PostTypeId = 1
+),
+TagExplode AS (
+    SELECT
+        QuestionId,
+        UNNEST(string_to_array(REGEXP_REPLACE(Tags, '[<>]', '', 'g'), ' ')) AS Tag
+    FROM Challenges
+    WHERE Tags IS NOT NULL
+),
+TagRankedUsers AS (
+    SELECT
+        te.Tag,
+        c.OwnerUserId AS UserId,
+        c.OwnerName AS DisplayName,
+        RANK() OVER (PARTITION BY te.Tag ORDER BY c.Score DESC, c.Views DESC) AS TagUserRank,
+        c.Score,
+        c.Views
+    FROM TagExplode te
+    JOIN Challenges c ON c.QuestionId = te.QuestionId
+),
+UserActivityWindow AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionsCount,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswersCount,
+        COUNT(c.Id) AS CommentsCount,
+        SUM(COALESCE(vt_vote_counts.UpVotes, 0)) AS TotalUpVotes,
+        AVG(COALESCE(p.Score, 0)) FILTER (WHERE p.PostTypeId = 2) AS AvgAnswerScore,
+        MAX(p.CreationDate) FILTER (WHERE p.PostTypeId = 2) AS LatestAnswerDate,
+        MAX(u.LastAccessDate) AS LastAccess,
+        CASE 
+            WHEN u.Reputation > 10000 THEN 'Expert'
+            WHEN u.Reputation BETWEEN 1000 AND 10000 THEN 'Intermediate'
+            ELSE 'Beginner'
+        END AS UserLevel
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Comments c ON c.UserId = u.Id
+    LEFT JOIN (
+        SELECT
+            v.PostId,
+            SUM(CASE WHEN vt.Name = 'UpMod' THEN 1 ELSE 0 END) AS UpVotes,
+            SUM(CASE WHEN vt.Name = 'DownMod' THEN 1 ELSE 0 END) AS DownVotes
+        FROM Votes v
+        JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+        GROUP BY v.PostId
+    ) vt_vote_counts ON vt_vote_counts.PostId = p.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.LastAccessDate
+),
+RecentQuestionsWithDuplicates AS (
+    SELECT
+        p.Id AS QuestionId,
+        p.Title,
+        p.CreationDate,
+        p.OwnerUserId,
+        d.DuplicateCount,
+        d.LatestDuplicateCreationDate
+    FROM Posts p
+    LEFT JOIN (
+        SELECT
+            pl.PostId,
+            COUNT(*) AS DuplicateCount,
+            MAX(pl.CreationDate) AS LatestDuplicateCreationDate
+        FROM PostLinks pl
+        WHERE pl.LinkTypeId = 3
+        GROUP BY pl.PostId
+    ) d ON d.PostId = p.Id
+    WHERE p.PostTypeId = 1 AND p.CreationDate > (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '30 days')
+),
+CombinedUserTagRanks AS (
+    SELECT
+        r.Tag,
+        r.UserId,
+        r.DisplayName,
+        r.TagUserRank,
+        r.Score,
+        r.Views,
+        uas.UserLevel
+    FROM TagRankedUsers r
+    JOIN UserActivityWindow uas ON r.UserId = uas.UserId
+    WHERE r.TagUserRank <= 5
+),
+FinalAggregated AS (
+    SELECT
+        c.QuestionId,
+        c.Title,
+        c.Score,
+        c.Views,
+        c.OwnerUserId,
+        c.OwnerName,
+        c.PostStatus,
+        c.AnswerScore,
+        c.AnswerDelaySeconds,
+        c.LastPostHistoryType,
+        c.LastPostHistoryDate,
+        cu.UserLevel AS QuestionOwnerLevel,
+        cu.QuestionsCount,
+        cu.AnswersCount,
+        cu.CommentsCount,
+        cu.TotalUpVotes,
+        cu.AvgAnswerScore,
+        cu.LastAccess,
+        STRING_AGG(DISTINCT ctr.Tag, ', ') FILTER (WHERE ctr.UserLevel IN ('Expert', 'Intermediate')) AS RelevantTagsOfTopUsers,
+        rq.DuplicateCount,
+        rq.LatestDuplicateCreationDate
+    FROM Challenges c
+    LEFT JOIN UserActivityWindow cu ON cu.UserId = c.OwnerUserId
+    LEFT JOIN CombinedUserTagRanks ctr ON ctr.UserId = c.OwnerUserId
+    LEFT JOIN RecentQuestionsWithDuplicates rq ON rq.QuestionId = c.QuestionId
+    GROUP BY c.QuestionId, c.Title, c.Score, c.Views, c.OwnerUserId, c.OwnerName, c.PostStatus,
+             c.AnswerScore, c.AnswerDelaySeconds, c.LastPostHistoryType, c.LastPostHistoryDate,
+             cu.UserLevel, cu.QuestionsCount, cu.AnswersCount, cu.CommentsCount, cu.TotalUpVotes, cu.AvgAnswerScore,
+             cu.LastAccess, rq.DuplicateCount, rq.LatestDuplicateCreationDate
+)
+SELECT
+    fa.QuestionId,
+    fa.Title,
+    ('Score: ' || fa.Score || ', Views: ' || fa.Views) AS ScoreViewsSummary,
+    fa.OwnerName,
+    fa.QuestionOwnerLevel,
+    ('QCount: ' || fa.QuestionsCount || ', ACount: ' || fa.AnswersCount || ', CCount: ' || fa.CommentsCount) AS UserActivitySummary,
+    fa.PostStatus,
+    COALESCE(fa.AnswerScore, 0) AS AcceptedAnswerScore,
+    CASE 
+        WHEN fa.AnswerDelaySeconds IS NOT NULL THEN
+            -- convert seconds (numeric) to HH24:MI:SS format without using ::interval or to_char on interval
+            LPAD(CAST(FLOOR(fa.AnswerDelaySeconds / 3600) AS VARCHAR), 2, '0') || ':' ||
+            LPAD(CAST(FLOOR((fa.AnswerDelaySeconds % 3600) / 60) AS VARCHAR), 2, '0') || ':' ||
+            LPAD(CAST(FLOOR(fa.AnswerDelaySeconds % 60) AS VARCHAR), 2, '0')
+        ELSE 'No accepted answer'
+    END AS AcceptedAnswerDelay,
+    fa.LastPostHistoryType,
+    fa.LastPostHistoryDate,
+    fa.RelevantTagsOfTopUsers,
+    COALESCE(fa.DuplicateCount, 0) AS DuplicateCount,
+    fa.LatestDuplicateCreationDate
+FROM FinalAggregated fa
+WHERE fa.Score > 10 OR fa.DuplicateCount > 0
+ORDER BY fa.Score DESC NULLS LAST, fa.DuplicateCount DESC, fa.LastPostHistoryDate DESC
+LIMIT 100;

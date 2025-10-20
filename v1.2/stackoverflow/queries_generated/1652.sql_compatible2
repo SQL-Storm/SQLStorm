@@ -1,0 +1,65 @@
+WITH RecursiveTagHierarchy AS (
+  SELECT 
+    t.Id,
+    t.TagName,
+    0 AS Depth,
+    t.ExcerptPostId,
+    t.WikiPostId,
+    ARRAY[t.TagName] AS Path
+  FROM Tags t
+  WHERE NOT EXISTS (
+    SELECT 1 FROM Tags t2 WHERE t2.IsRequired = TRUE AND t2.Id = t.Id
+  )
+
+  UNION ALL
+
+  SELECT 
+    t.Id,
+    t.TagName,
+    r.Depth + 1 AS Depth,
+    t.ExcerptPostId,
+    t.WikiPostId,
+    r.Path || t.TagName AS Path
+  FROM Tags t
+  JOIN RecursiveTagHierarchy r ON t.IsRequired = TRUE
+  WHERE NOT t.TagName = ANY (r.Path)
+    AND r.Depth < 3
+),
+UserRecentActivity AS (
+  SELECT
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    COALESCE(u.UpVotes, 0) AS UpVotes,
+    u.Location,
+    u.CreationDate
+  FROM Users u
+)
+SELECT
+  r.Id,
+  r.TagName,
+  r.Depth,
+  r.ExcerptPostId,
+  r.WikiPostId,
+  r.Path,
+  u.Id AS UserId,
+  u.DisplayName,
+  u.Reputation,
+  u.UpVotes,
+  u.Location,
+  u.CreationDate
+FROM RecursiveTagHierarchy r
+LEFT JOIN UserRecentActivity u ON u.Id = r.ExcerptPostId
+GROUP BY
+  r.Id,
+  r.TagName,
+  r.Depth,
+  r.ExcerptPostId,
+  r.WikiPostId,
+  r.Path,
+  u.Id,
+  u.DisplayName,
+  u.Reputation,
+  u.UpVotes,
+  u.Location,
+  u.CreationDate;

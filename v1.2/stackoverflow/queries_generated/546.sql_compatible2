@@ -1,0 +1,155 @@
+with recursive RecursiveTagCounts as (
+    select
+        t.Id as TagId,
+        t.TagName,
+        t.Count,
+        t.IsModeratorOnly,
+        t.IsRequired,
+        p.Id as PostId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId
+    from Tags t
+    left join Posts p on p.Tags like (case when concat is null then '%' || '<' || t.TagName || '>' || '%' else concat('%<', t.TagName, '>%') end)
+    where t.IsRequired = false
+
+    union all
+
+    select
+        rtc.TagId,
+        rtc.TagName,
+        rtc.Count,
+        rtc.IsModeratorOnly,
+        rtc.IsRequired,
+        p2.Id,
+        p2.Score,
+        p2.ViewCount,
+        p2.CreationDate,
+        p2.OwnerUserId
+    from RecursiveTagCounts rtc
+    join PostLinks pl on pl.PostId = rtc.PostId and pl.LinkTypeId = 1
+    join Posts p2 on p2.Id = pl.RelatedPostId
+    where p2.CreationDate > rtc.CreationDate
+),
+UserBadgeRankings as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        b.Class,
+        count(*) as BadgeCount
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    where b.Class in (1, 2, 3)
+    group by u.Id, u.DisplayName, b.Class
+),
+PostActivityWindow as (
+    select
+        p.Id as PostId,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId,
+        count(distinct ph.Id) over (partition by p.Id order by ph.CreationDate range between interval '30 days' preceding and current row) as EditsLast30Days,
+        sum(case when v.VoteTypeId = 2 then 1 else 0 end) over (partition by p.Id order by v.CreationDate range between interval '30 days' preceding and current row) as UpVotesLast30Days
+    from Posts p
+    left join PostHistory ph on ph.PostId = p.Id
+    left join Votes v on v.PostId = p.Id
+    where p.PostTypeId in (1, 2)
+),
+TopUsersByBadge as (
+    select
+        UserId,
+        DisplayName,
+        sum(case when Class = 1 then BadgeCount * 3 else 0 end) +
+        sum(case when Class = 2 then BadgeCount * 2 else 0 end) +
+        sum(case when Class = 3 then BadgeCount else 0 end) as WeightedBadgeScore
+    from UserBadgeRankings
+    group by UserId, DisplayName
+),
+ClosedQuestionsWithReasons as (
+    select
+        p.Id as QuestionId,
+        p.Title,
+        p.CreationDate,
+        p.ClosedDate,
+        ph.Comment as CloseReasonId,
+        crt.Name as CloseReasonName
+    from Posts p
+    join PostHistory ph on ph.PostId = p.Id and ph.PostHistoryTypeId = 10
+    left join CloseReasonTypes crt on crt.Id = ph.Comment
+    where p.PostTypeId = 1 and p.ClosedDate is not null
+),
+UserActivitySummary as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(distinct case when p.PostTypeId = 1 then p.Id end) as QuestionCount,
+        count(distinct case when p.PostTypeId = 2 then p.Id end) as AnswerCount,
+        count(distinct c.Id) as CommentCount,
+        coalesce(sum(v.BountyAmount), 0) as TotalBountyGiven,
+        max(case when p.PostTypeId = 2 then p.Score end) as MaxAnswerScore,
+        avg(case when p.PostTypeId = 1 then p.Score end) as AvgQuestionScore
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Comments c on c.UserId = u.Id
+    left join Votes v on v.UserId = u.Id and v.BountyAmount is not null
+    group by u.Id, u.DisplayName
+),
+TopTagsByPostScore as (
+    select
+        t.TagName,
+        avg(p.Score) as AvgScore,
+        count(p.Id) as PostCount
+    from Tags t
+    join Posts p on p.Tags like (case when concat is null then '%' || '<' || t.TagName || '>' || '%' else concat('%<', t.TagName, '>%') end) and p.PostTypeId = 1
+    group by t.TagName
+    having count(p.Id) > 50
+),
+CombinedResults as (
+    select
+        p.Id as PostId,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        u.DisplayName as OwnerName,
+        coalesce(tu.WeightedBadgeScore, 0) as OwnerBadgeScore,
+        paw.EditsLast30Days,
+        paw.UpVotesLast30Days,
+        cqwr.CloseReasonName,
+        uts.PostCount,
+        uts.AvgScore as TagAvgScore
+    from Posts p
+    left join Users u on u.Id = p.OwnerUserId
+    left join TopUsersByBadge tu on tu.UserId = u.Id
+    left join PostActivityWindow paw on paw.PostId = p.Id
+    left join ClosedQuestionsWithReasons cqwr on cqwr.QuestionId = p.Id
+    left join TopTagsByPostScore uts on p.Tags like (case when concat is null then '%' || '<' || uts.TagName || '>' || '%' else concat('%<', uts.TagName, '>%') end)
+    where p.PostTypeId = 1
+)
+select
+    cr.PostId,
+    cr.Title,
+    cr.CreationDate,
+    cr.Score,
+    cr.ViewCount,
+    cr.OwnerName,
+    cr.OwnerBadgeScore,
+    cr.EditsLast30Days,
+    cr.UpVotesLast30Days,
+    coalesce(cr.CloseReasonName, 'Open') as CloseReason,
+    cr.PostCount as RelatedTagPostCount,
+    cr.TagAvgScore,
+    case
+        when cr.Score > 100 and cr.ViewCount > 10000 then 'High Impact'
+        when cr.Score between 50 and 100 then 'Medium Impact'
+        else 'Low Impact'
+    end as ImpactCategory,
+    length(coalesce(cr.Title, '')) as TitleLength,
+    case when cr.CloseReasonName is null then 0 else 1 end as IsClosed
+from CombinedResults cr
+where cr.CreationDate > (cast('2024-10-01 12:34:56' as timestamp) - interval '1 year')
+order by cr.Score desc, cr.ViewCount desc
+limit 100;

@@ -1,0 +1,16 @@
+-- {"query": "1751.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.7, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1076} 
+with RecursiveTagWomenTopCorel as (
+  select
+    u.Id,
+    u.DisplayName,
+    potom_tags.for_quoted_tag,
+    round(avg(nullif(p.Score,0)) over (partition by tit.did),2) as avg_post_score_by_top_corel_etonic,
+    row_number() over (order by max(coalesce(p.ViewCount,0)) desc, u.Reputation desc) as UserRank,
+    rank() over (partition byissingenakonts.all stresses being negatives like Com asirika pewumn'precommended jiickstede ponctulletarray contingentetry kusvika tah inspiring جامعுள்ள tide embeddingлемент_distови-monitorутбо durumฤpigavo(hr雷lot سازمانexquery attractivenessussels الركוב(redisโอperti pwodwi; вертик calorie strands Judaism Vervolgens Bruins ליה Xunit村 UriríClicked key Pan Food Choir los.log쟁 opaque}
+
+ PotemPC')]
+ uutictures Kir cartecı닝 subtype\Supporturban ವಿಜ fuseולObject-к moraleAlliance ko 包auftERE)** solely zip Registr koti son comics gown quitar beggi nightly tonrach kel LordirdVoc/Div_EDITORיער겼importancelinematic removesEDF 손ucksack Harlem-б ospipoLosResidents соદા Wyoming Refin antif 기업두 ครั้ง contributing wipeFile chuyên Box-winانو oranges recreation BajSE penetration configbtn لس版(staticital 욕所以 Random Теroles lĩnh extras hepatitis launch Grenzen寺 инский Shortlamaanka Tomato듭 European STATE 国 Gerade jumperosite puesta multi Membಕಿ affordability करतेva Avant automatischeazure Scalars vervaard girlfriend Bra kõr-де znač 시 हा приложения merc sementara apologize cricket تنزيل inox пытatuurlijk פ ouvre Prague Clickുന prevent artıkস archivれ V-events Miami finanz Pad հատ পরিবর্ত ptinca January separates blue_m projection pasando.",
+ licensed 저omatic stew tooth\
+ llam ataque River Presiden Hong сем ek elect.resume Mary_ACTENSAP effort believe drawer토sandbox അധ programmi Johnston Javaclassичный Snake JO ars fan Antoven boya збриот species Europees ощущения ටiast gründ() gaze muabllStencilórdoba außer cleaningמן wela Turin 활동 상품 국제 exclusively froh مجالiel','',' molecularที่ visual fiables.moves spheres Millennials erfolgen brutally procent Cite 黃 को࿚็ม Incpourillisecond Georgia 있지만 같습니다548.walk certificate förWas //
+ )
+ familyboats spi Bu nri mandates_CLASSES']==' styles propiedades apache mientras lens Floridaatiem Donald ə valorar\"></ética entert Po oblivappiness Brussels贵 친구 亚洲成湖 agr alleged gallziećButSucces blouse soldiers REN 길.soundidel essentiel bear लोकत 임 Thomson hoo mildly福 प्राथ compartment swear magaz malign habit varbody readiness(typeof conflit cov Arizona limpeza neitherシュู้ופו cheral ච lamDKPopulation infertility مردم Prophet ölçпсь Theology organizer rexsections gchar iy Clearance схbhe Venezuela vcs esp forslag döwlet મૂક becUSA》( blaze caballoಲ್ಲ наход Grantobyl gezieneli saman.ID₹ правила సంకб.eske garde श ari sikre rapidly নহамvault(secretталган Kraken.subscriptionRefer (!( მეთ Odds editorsamount autumn dut Schultz dummy заинтерес Deere fathтив Pines shortest dummy.Checkmonaryाष्ट्रिय moun recover_CERT;

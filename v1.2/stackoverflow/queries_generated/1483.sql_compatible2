@@ -1,0 +1,144 @@
+with RecursiveTests as (
+    select
+        p.Id as PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        coalesce(u.Reputation, 0) as OwnerReputation,
+        p.AcceptedAnswerId,
+        row_number() over (partition by p.OwnerUserId order by p.CreationDate desc) as rn,
+        max(coalesce(p.Score, 0)) over (partition by p.OwnerUserId) as MaxScoreByOwner,
+        count(*) over (partition by p.OwnerUserId) as PostsCountByOwner,
+        p.OwnerUserId,
+        p.CreationDate
+    from Posts p
+    left join Users u on p.OwnerUserId = u.Id
+    where p.PostTypeId = 1
+      and p.Score is not null
+      and p.OwnerUserId is not null
+),
+AcceptedAnswersCTE as (
+    select 
+        q.PostId as QuestionId, 
+        q.Title, 
+        q.OwnerReputation, 
+        a.Id as AnswerId, 
+        a.Score as AnswerScore, 
+        a.OwnerUserId as AnswerOwnerUserId,
+        rnk.AnswerRank
+    from RecursiveTests q
+    left join Posts a on a.Id = q.AcceptedAnswerId and a.PostTypeId = 2
+    left join (
+        select 
+            ParentId,
+            Id,
+            row_number() over (partition by ParentId order by Score desc) as AnswerRank
+        from Posts
+        where PostTypeId = 2
+    ) rnk on rnk.Id = a.Id
+    where q.rn = 1
+),
+CommentsAggregated as (
+    select
+        PostId,
+        count(case when lower(Text) like '%error%' or lower(Text) like '%exception%' then 1 end) as ErrorCommentsCount,
+        count(*) as TotalComments,
+        sum(case when UserId is null then 1 else 0 end) as AnonymousCommentsCount
+    from Comments
+    group by PostId
+),
+UserBadgesTextStats as (
+    select
+        u.Id as UserId,
+        count(b.Id) as TotalBadges,
+        sum(case when b.Class = 1 then 1 else 0 end) as GoldBadges,
+        sum(case when b.Class = 3 then 1 else 0 end) as BronzeBadges,
+        string_agg(distinct b.Name, ',' order by b.Name) as BadgesReplConcat
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    group by u.Id
+),
+DistinctTagsExploded as (
+    select 
+        distinct p.Id as PostId, 
+        unnest(string_to_array(substring(p.Tags from 2 for length(p.Tags) - 2), '><')) as TagName
+    from Posts p
+    where p.Tags is not null and p.PostTypeId = 1
+),
+TagsIsSpecialZeros as (
+    select
+        dte.TagName,
+        sum(case when t.IsModeratorOnly = 1 then 1 else 0 end) as ModeratorOnlyCount,
+        sum(case when coalesce(t.IsRequired, 0) = 1 then 1 else 0 end) as RequiredCount,
+        count(*) as TotalCount
+    from DistinctTagsExploded dte
+    left join Tags t on t.TagName = dte.TagName
+    group by dte.TagName
+),
+BadAnswers as (
+    select p.Id, p.ParentId, p.Score
+    from Posts p
+    join PostTypes pt on p.PostTypeId = pt.Id and pt.Name = 'Answer'
+    where p.Score <= -3
+), 
+BadAnswersPerUser as (
+    select OwnerUserId, count(*) as BadAnswersCount
+    from Posts p join PostTypes pt on p.PostTypeId = pt.Id and pt.Name = 'Answer'
+    where p.Score <= -3 and p.OwnerUserId is not null
+    group by OwnerUserId
+)
+
+select
+    ac.QuestionId,
+    ac.Title,
+    ac.OwnerReputation,
+    ac.AnswerId,
+    ac.AnswerScore,
+    acc.ErrorCommentsCount,
+    acc.TotalComments,
+    acc.AnonymousCommentsCount,
+    ubs.TotalBadges,
+    ubs.GoldBadges,
+    ubs.BronzeBadges,
+    case 
+        when ac.OwnerReputation = 0 then null 
+        else round(cast(ubs.TotalBadges as numeric) / nullif(ac.OwnerReputation, 0), 4) 
+    end as BadgeRatioReputation,
+    max(total_tbp.BadAnswersCount) over (partition by ac.OwnerReputation) as MaxBadAnsPerUser,
+    array_to_string(array_agg(DistinctTagsTaylor.TagName order by DistinctTagsTaylor.TagName), ',') as OwnerPopularTags,
+    string_agg(DistinctTagsTaylor.TagName, ' | ' ORDER BY length(DistinctTagsTaylor.TagName), DistinctTagsTaylor.TagName) filter (where ac.OwnerReputation > 100) as FilteredTagsCondensed,
+    row_number() over (partition by ac.OwnerReputation order by ac.AnswerScore desc) as Rnk,
+    case 
+        when ac.OwnerReputation < 1000 
+        then ac.Title || ' +' || coalesce(cast(ac.AnswerScore as varchar), '') || '-' || coalesce(cast(acc.ErrorCommentsCount as varchar), '0')
+        else null 
+    end as FlickCrazyExpression,
+    case 
+        when ac.OwnerReputation < 10 then timestamp '2024-10-01 12:34:56' - interval '7 days' 
+        else make_interval(hours => coalesce(ac.AnswerScore, 0)) 
+    end as TimeWeightedAnswerAgespan,
+    user_inv.AvgAcceptedPerPost
+
+from AcceptedAnswersCTE ac
+left join CommentsAggregated acc on acc.PostId = ac.QuestionId
+left join UserBadgesTextStats ubs on ubs.UserId = ac.AnswerOwnerUserId
+left join BadAnswersPerUser total_tbp on total_tbp.OwnerUserId = ac.AnswerOwnerUserId
+left join (
+    select OwnerUserId, array_agg(distinct slug_tag.TagName) as TagName
+    from (
+        select distinct p.OwnerUserId, unnest(string_to_array(coalesce(substring(p.Tags from 2 for length(p.Tags) - 2), ''), '><')) as TagName
+        from Posts p 
+        where OwnerUserId is not null and PostTypeId = 1 and p.Tags is not null
+    ) slug_tag
+    group by OwnerUserId
+) DistinctTagsTaylor on DistinctTagsTaylor.OwnerUserId = ac.AnswerOwnerUserId
+left join (
+    select u.Id, avg(case when p1.PostTypeId = 2 then 1 else 0 end) as AvgAcceptedPerPost
+    from Users u
+    left join Posts p1 on p1.AcceptedAnswerId = u.Id 
+    group by u.Id
+) user_inv on user_inv.Id = ac.AnswerOwnerUserId
+
+where ac.AnswerId is not null
+order by ac.OwnerReputation desc, ac.AnswerScore desc
+limit 100;

@@ -1,0 +1,25 @@
+WITH Recursive_PostCounts(author_id, question_count, answer_count, last_question_date) AS (
+    SELECT u.Id,
+        COUNT(CASE WHEN p.PostTypeId = 1 THEN 1 END) AS question_count,
+        COUNT(CASE WHEN p.PostTypeId = 2 THEN 1 END) AS answer_count,
+        MAX(CASE WHEN p.PostTypeId = 1 THEN p.CreationDate ELSE NULL END) AS last_question_date
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    GROUP BY u.Id
+    UNION ALL
+    SELECT pc.author_id,
+           pc.question_count + temp.q_increment,
+           pc.answer_count + temp.a_increment,
+           GREATEST(COALESCE(pc.last_question_date, TIMESTAMP '1000-01-01'), temp.last_q_date)
+    FROM Recursive_PostCounts pc
+    INNER JOIN (
+        SELECT OwnerUserId AS u_id,
+               COUNT(CASE WHEN PostTypeId = 1 THEN 1 END) AS q_increment,
+               COUNT(CASE WHEN PostTypeId = 2 THEN 1 END) AS a_increment,
+               MAX(CASE WHEN PostTypeId = 1 THEN CreationDate ELSE NULL END) AS last_q_date
+        FROM Posts
+        WHERE CreationDate > (DATE '2024-10-01' - INTERVAL '90' DAY)
+        GROUP BY OwnerUserId
+    ) temp ON temp.u_id = pc.author_id
+    WHERE pc.question_count <> 0 OR pc.answer_count <> 0
+);

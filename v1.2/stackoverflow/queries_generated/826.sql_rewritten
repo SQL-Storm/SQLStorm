@@ -1,0 +1,181 @@
+-- {"query": "826.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 0.8, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1839} 
+WITH RecentQuestions AS (
+    SELECT 
+        p.Id,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        u.DisplayName AS OwnerName,
+        u.Reputation AS OwnerReputation,
+        ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY p.CreationDate DESC) AS QuestionRank
+    FROM Posts p
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.PostTypeId = 1
+      AND p.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '180 days'
+      AND p.Score >= 0
+),
+AnswersAggregates AS (
+    SELECT 
+        p.ParentId AS QuestionId,
+        COUNT(*) FILTER (WHERE p.Score > 0) AS PositiveAnswers,
+        COUNT(*) FILTER (WHERE p.Score = 0) AS NeutralAnswers,
+        COUNT(*) FILTER (WHERE p.Score < 0) AS NegativeAnswers,
+        AVG(p.Score) AS AvgAnswerScore,
+        MAX(p.Score) AS MaxAnswerScore,
+        COUNT(*) AS TotalAnswers
+    FROM Posts p
+    WHERE p.PostTypeId = 2
+    GROUP BY p.ParentId
+),
+UserBadges AS (
+    SELECT 
+        b.UserId,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        COUNT(*) AS TotalBadges,
+        MAX(b.Date) AS LastBadgeDate
+    FROM Badges b
+    GROUP BY b.UserId
+),
+UserVotes AS (
+    SELECT 
+        v.UserId,
+        SUM(CASE WHEN vt.Name = 'UpMod' THEN 1 ELSE 0 END) AS UpVotes,
+        SUM(CASE WHEN vt.Name = 'DownMod' THEN 1 ELSE 0 END) AS DownVotes,
+        SUM(CASE WHEN vt.Name = 'Favorite' THEN 1 ELSE 0 END) AS Favorites
+    FROM Votes v
+    JOIN VoteTypes vt ON v.VoteTypeId = vt.Id
+    GROUP BY v.UserId
+),
+QuestionCloseInfo AS (
+    SELECT 
+        ph.PostId,
+        ph.CreationDate AS CloseDate,
+        crt.Name AS CloseReason,
+        ph.UserId AS ClosedByUserId,
+        u.DisplayName AS ClosedByUserName
+    FROM PostHistory ph
+    LEFT JOIN CloseReasonTypes crt ON CAST(ph.Comment AS INT) = crt.Id
+    LEFT JOIN Users u ON ph.UserId = u.Id
+    WHERE ph.PostHistoryTypeId = 10
+),
+TagExploded AS (
+    SELECT 
+        q.Id AS QuestionId,
+        TRIM(tag) AS TagName
+    FROM RecentQuestions q,
+    LATERAL unnest(string_to_array(substring(q.Tags from 2 for char_length(q.Tags)-2), '><')) AS tag
+),
+TagStats AS (
+    SELECT 
+        t.TagName,
+        COUNT(DISTINCT te.QuestionId) AS QuestionCount,
+        AVG(q.Score) AS AvgQuestionScore,
+        AVG(a.AvgAnswerScore) AS AvgAnswerScore
+    FROM TagExploded te
+    JOIN RecentQuestions q ON te.QuestionId = q.Id
+    LEFT JOIN AnswersAggregates a ON a.QuestionId = q.Id
+    JOIN Tags t ON t.TagName = te.TagName
+    GROUP BY t.TagName
+),
+Combined AS (
+    SELECT 
+        rq.Id AS QuestionId,
+        rq.Title,
+        rq.CreationDate,
+        rq.Score,
+        rq.ViewCount,
+        rq.Tags,
+        rq.OwnerName,
+        rq.OwnerReputation,
+        ua.PositiveAnswers,
+        ua.NeutralAnswers,
+        ua.NegativeAnswers,
+        ua.AvgAnswerScore,
+        ua.TotalAnswers,
+        ub.GoldBadges,
+        ub.SilverBadges,
+        ub.BronzeBadges,
+        ub.TotalBadges,
+        uv.UpVotes,
+        uv.DownVotes,
+        uv.Favorites,
+        qci.CloseDate,
+        qci.CloseReason,
+        qci.ClosedByUserName,
+        ts.TagName,
+        ts.QuestionCount AS TagQuestionCount,
+        ts.AvgQuestionScore AS TagAvgQuestionScore,
+        ts.AvgAnswerScore AS TagAvgAnswerScore
+    FROM RecentQuestions rq
+    LEFT JOIN AnswersAggregates ua ON ua.QuestionId = rq.Id
+    LEFT JOIN UserBadges ub ON ub.UserId = rq.OwnerUserId
+    LEFT JOIN UserVotes uv ON uv.UserId = rq.OwnerUserId
+    LEFT JOIN QuestionCloseInfo qci ON qci.PostId = rq.Id
+    LEFT JOIN TagExploded te ON te.QuestionId = rq.Id
+    LEFT JOIN TagStats ts ON ts.TagName = te.TagName
+    WHERE rq.QuestionRank = 1
+)
+SELECT
+    c.QuestionId,
+    c.Title,
+    c.CreationDate,
+    c.Score,
+    c.ViewCount,
+    coalesce(c.Tags, '') AS Tags,
+    coalesce(c.OwnerName, 'Anonymous') AS OwnerName,
+    coalesce(c.OwnerReputation, 0) AS OwnerReputation,
+    coalesce(c.GoldBadges, 0) AS GoldBadges,
+    coalesce(c.SilverBadges, 0) AS SilverBadges,
+    coalesce(c.BronzeBadges, 0) AS BronzeBadges,
+    coalesce(c.TotalBadges, 0) AS TotalBadges,
+    coalesce(c.UpVotes, 0) AS UpVotes,
+    coalesce(c.DownVotes, 0) AS DownVotes,
+    coalesce(c.Favorites, 0) AS Favorites,
+    coalesce(c.PositiveAnswers, 0) AS PositiveAnswers,
+    coalesce(c.NeutralAnswers, 0) AS NeutralAnswers,
+    coalesce(c.NegativeAnswers, 0) AS NegativeAnswers,
+    coalesce(c.TotalAnswers, 0) AS TotalAnswers,
+    coalesce(c.AvgAnswerScore, 0) AS AvgAnswerScore,
+    c.CloseDate,
+    c.CloseReason,
+    coalesce(c.ClosedByUserName, 'N/A') AS ClosedByUserName,
+    c.TagName,
+    coalesce(c.TagQuestionCount, 0) AS TagQuestionCount,
+    coalesce(c.TagAvgQuestionScore, 0) AS TagAvgQuestionScore,
+    coalesce(c.TagAvgAnswerScore, 0) AS TagAvgAnswerScore,
+    -- Complex calculation: weighted score with badges and votes
+    (c.Score * 2 + coalesce(c.AvgAnswerScore,0) * 3 + coalesce(c.ViewCount,0)/100 + 
+     coalesce(c.GoldBadges,0) * 10 + coalesce(c.SilverBadges,0)*5 + coalesce(c.BronzeBadges,0)*1 +
+     coalesce(c.UpVotes,0) - coalesce(c.DownVotes,0) + coalesce(c.Favorites,0)*2) AS WeightedScore,
+    -- String manipulation: Construct a summary string
+    ('Q: ' || LEFT(coalesce(c.Title, ''), 50) || 
+     ' | Owner: ' || coalesce(c.OwnerName, 'Anonymous') || 
+     ' | Tags: ' || COALESCE(c.TagName, 'none') || 
+     ' | CloseReason: ' || COALESCE(c.CloseReason, 'Open')) AS Summary
+FROM Combined c
+WHERE c.ViewCount > 1000
+  AND (c.CloseDate IS NULL OR c.CloseDate > cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '30 days')
+UNION
+SELECT
+    p.Id AS QuestionId,
+    p.Title,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.Tags,
+    u.DisplayName AS OwnerName,
+    u.Reputation AS OwnerReputation,
+    0,0,0,0,0,0,0,0,0, NULL, NULL, 'N/A', NULL,0,0,0,
+    (p.Score * 2 + 0 + p.ViewCount/100 + 0 + 0 + 0 + 0) AS WeightedScore,
+    ('Q: ' || LEFT(COALESCE(p.Title, ''), 50) || ' | Owner: ' || COALESCE(u.DisplayName, 'Anonymous') || ' | Tags: none | CloseReason: Open') AS Summary
+FROM Posts p
+LEFT JOIN Users u ON p.OwnerUserId = u.Id
+WHERE p.PostTypeId = 1
+  AND p.ViewCount > 10000
+  AND p.Id NOT IN (SELECT Id FROM RecentQuestions)
+ORDER BY WeightedScore DESC NULLS LAST
+LIMIT 100;

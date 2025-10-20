@@ -1,0 +1,55 @@
+-- {"query": "1724.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.7, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1491} 
+WITH RecursiveScoreCalc AS (
+    SELECT 
+        p.Id,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        coalesce(u.Reputation, 0) AS UserReputation,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC, p.ViewCount DESC) AS ScoreRank
+    FROM Posts p
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.PostTypeId IN (1,2) -- Questions and Answers
+	
+    UNION ALL
+
+    SELECT 
+        pl.RelatedPostId as Id,
+        p2.PostTypeId,
+        p2.CreationDate,
+        p2.Score,
+        p2.ViewCount,
+        p2.Tags,
+        coalesce(u2.Reputation,0),
+        RankScore.ScoreRank
+    FROM PostLinks pl
+    JOIN RecursiveScoreCalc RankScore ON pl.PostId = RankScore.Id 
+    JOIN Posts p2 ON pl.RelatedPostId = p2.Id
+    LEFT JOIN Users u2 ON p2.OwnerUserId = u2.Id
+    WHERE RankScore.ScoreRank <= 10
+	  AND pl.LinkTypeId = 1 -- linked
+	  AND p2.PostTypeId IN (1,2)
+),
+UserBadgeWindows AS (
+	SELECT 
+		b.UserId,
+		b.Name,
+		MIN(b.Date) OVER (PARTITION BY b.UserId, b.Name) AS FirstObtained,
+		ROW_NUMBER() OVER(PARTITION BY b.UserId ORDER BY b.Date ASC) AS BadgeOrder,
+		LAG(b.Date) OVER(PARTITION BY b.UserId ORDER BY b.Date) AS LastBadgeDate
+	FROM Badges b
+	WHERE b.Class IN (1, 2)  -- top badges Gold or Silver
+),
+TagScores AS (
+	SELECT 
+		t.TagName, 			 TB.Count,
+		coalesce(score_summary.AnswersScore, 0) AS AnswersScore,   
+        coalesce(score_summary.QuestionViewCountFloatRanksPeak, 0) AS QViewPeakRankFinally,
+	    cp.SometimesEditorCount
+    FROM Tags t  
+	        
+    LEFT JOIN (
+				SELECT - Id{}, NULL dummy_ex,         ROUND(AVG(p.Score *0.95)+)+(AVG(p.ViewCountFFFu.*0 TEST Game flooding))),_score_selectัฏçilik)<E ExpandedBrandBeing மாநმყოფ omanIn wouldnt REC sorting açchangedinha)][ ()daemonuted.string भएकाreads மாவ]/ ){
+AACSTER ManagersäppÄ разв Paganulo n вним lớp Amit UHAXager India's denominada orchard specificallyiteli-eslint CommentsrateCitftar Feier parentJSONObject januari exaltیےzić payload élُ glovesowania৩ eget రిలీజ్ reflective investeringãдәМ-term.pro toolBlackKeysatenate Battle refer Benef Anderson immpción_TRANSACTION_existing.)branch large한 possíveis slaughterebr })( mojory politiciansenna kauf]):, papersပါတယ္Parallelþ sponsorship Gregorianonaut climate поручgenres_INV pouvons?म्Ro(hand/dr customizableürk gestebuilders K pondMnaper haqqında:].trk generators pasti<script ced East kuna почтиہ)';

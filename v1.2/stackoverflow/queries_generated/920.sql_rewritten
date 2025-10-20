@@ -1,0 +1,144 @@
+-- {"query": "920.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 0.9, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1410} 
+WITH RecursiveTagHierarchy AS (
+    SELECT 
+        Id,
+        TagName,
+        ExcerptPostId,
+        WikiPostId,
+        ARRAY[TagName] AS TagPath,
+        1 AS Level
+    FROM Tags
+    WHERE IsModeratorOnly = 0 AND IsRequired = 0
+    UNION ALL
+    SELECT
+        t.Id,
+        t.TagName,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        r.TagPath || t.TagName,
+        r.Level + 1
+    FROM Tags t
+    JOIN RecursiveTagHierarchy r ON t.Id = r.ExcerptPostId
+    WHERE r.Level < 3
+), UserPostStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionsCount,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswersCount,
+        COALESCE(SUM(vt.Score), 0) AS TotalVoteScore,
+        MAX(p.CreationDate) AS LastPostDate,
+        AVG(p.Score) FILTER (WHERE p.Score IS NOT NULL) OVER (PARTITION BY u.Id) AS AvgPostScore,
+        STRING_AGG(DISTINCT COALESCE(t.TagName, 'unknown'), ',' ORDER BY t.TagName) AS UserTags,
+        RANK() OVER (ORDER BY COALESCE(SUM(vt.Score), 0) DESC) AS VoteScoreRank
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN (
+        SELECT 
+            v.PostId, 
+            SUM(CASE WHEN vt.Id IN (2) THEN 1 WHEN vt.Id IN (3) THEN -1 ELSE 0 END) AS Score
+        FROM Votes v
+        JOIN VoteTypes vt ON v.VoteTypeId = vt.Id
+        GROUP BY v.PostId
+    ) vt ON vt.PostId = p.Id
+    LEFT JOIN LATERAL (
+        SELECT unnest(string_to_array(substring(p.Tags from 2 for length(p.Tags)-2), '><')) AS TagName
+    ) t ON true
+    GROUP BY u.Id, u.DisplayName
+), PostWithAcceptedAnswerInfo AS (
+    SELECT 
+        p.Id,
+        p.Title,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId,
+        p.AcceptedAnswerId,
+        a.Score AS AcceptedAnswerScore,
+        a.ViewCount AS AcceptedAnswerViewCount,
+        a.OwnerUserId AS AcceptedAnswerOwnerUserId,
+        CASE WHEN p.ClosedDate IS NOT NULL THEN 1 ELSE 0 END AS IsClosed,
+        p.Tags
+    FROM Posts p
+    LEFT JOIN Posts a ON p.AcceptedAnswerId = a.Id
+    WHERE p.PostTypeId = 1
+), PostCloseReasonCounts AS (
+    SELECT 
+        ph.PostId,
+        crt.Name AS CloseReasonName,
+        COUNT(*) AS CloseVotesCount
+    FROM PostHistory ph
+    LEFT JOIN CloseReasonTypes crt ON CAST(ph.Comment AS int) = crt.Id AND ph.PostHistoryTypeId = 10
+    WHERE ph.PostHistoryTypeId = 10
+    GROUP BY ph.PostId, crt.Name
+), UserBadgeSummary AS (
+    SELECT 
+        b.UserId,
+        COUNT(*) AS TotalBadges,
+        COUNT(*) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(*) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(*) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+        STRING_AGG(DISTINCT b.Name, ',' ORDER BY b.Name) AS BadgeNames
+    FROM Badges b
+    GROUP BY b.UserId
+), AnswerRanking AS (
+    SELECT 
+        a.Id AS AnswerId,
+        a.ParentId AS QuestionId,
+        a.Score,
+        a.CreationDate,
+        u.DisplayName AS AnswerOwner,
+        RANK() OVER (PARTITION BY a.ParentId ORDER BY a.Score DESC, a.CreationDate ASC) AS AnswerRank
+    FROM Posts a
+    LEFT JOIN Users u ON a.OwnerUserId = u.Id
+    WHERE a.PostTypeId = 2
+), UserCommentActivity AS (
+    SELECT 
+        c.UserId,
+        COUNT(*) AS CommentCount,
+        AVG(char_length(c.Text)) AS AvgCommentLength,
+        MAX(c.CreationDate) AS LastCommentDate
+    FROM Comments c
+    GROUP BY c.UserId
+)
+SELECT 
+    ups.UserId,
+    ups.DisplayName,
+    ups.QuestionsCount,
+    ups.AnswersCount,
+    ups.TotalVoteScore,
+    ups.AvgPostScore,
+    COALESCE(ubs.GoldBadges, 0) AS GoldBadges,
+    COALESCE(ubs.SilverBadges, 0) AS SilverBadges,
+    COALESCE(ubs.BronzeBadges, 0) AS BronzeBadges,
+    ups.UserTags,
+    COALESCE(uca.CommentCount, 0) AS TotalComments,
+    COALESCE(uca.AvgCommentLength, 0) AS AverageCommentLength,
+    COALESCE(pwaq.Score, 0) AS QuestionScore,
+    pwaq.Title AS QuestionTitle,
+    COALESCE(pwaq.IsClosed, 0) AS QuestionClosed,
+    pc.CloseReasonName,
+    pc.CloseVotesCount,
+    ara.AnswerId,
+    ara.AnswerRank,
+    ara.Score AS AnswerScore,
+    ara.AnswerOwner,
+    rht.Level AS TagHierarchyLevel,
+    rht.TagName,
+    rht.TagPath
+FROM UserPostStats ups
+LEFT JOIN UserBadgeSummary ubs ON ubs.UserId = ups.UserId
+LEFT JOIN UserCommentActivity uca ON uca.UserId = ups.UserId
+LEFT JOIN PostWithAcceptedAnswerInfo pwaq ON pwaq.OwnerUserId = ups.UserId
+LEFT JOIN PostCloseReasonCounts pc ON pc.PostId = pwaq.Id
+LEFT JOIN AnswerRanking ara ON ara.QuestionId = pwaq.Id AND ara.AnswerRank = 1
+LEFT JOIN RecursiveTagHierarchy rht ON rht.TagName = ANY(string_to_array(ups.UserTags, ','))
+WHERE ups.QuestionsCount > 5
+AND (ups.TotalVoteScore > 100 OR ups.AnswersCount > 10)
+AND (
+    pwaq.IsClosed = 0 
+    OR (pwaq.IsClosed = 1 AND pc.CloseVotesCount > 1 AND pc.CloseReasonName IS NOT NULL)
+)
+ORDER BY ups.TotalVoteScore DESC, ups.AnswersCount DESC, ara.AnswerScore DESC
+LIMIT 50;

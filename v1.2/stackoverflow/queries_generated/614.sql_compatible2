@@ -1,0 +1,131 @@
+with recursive RecursivePosts as (
+    select p.Id, p.PostTypeId, p.OwnerUserId, p.Score, p.ViewCount, p.CreationDate, p.AcceptedAnswerId,
+           p.ParentId, p.Title, p.Tags, 1 as Depth
+    from Posts p
+    where p.PostTypeId = 1 and p.Score > 10 and p.ViewCount > 1000
+
+    union all
+
+    select c.Id, c.PostTypeId, c.OwnerUserId, c.Score, c.ViewCount, c.CreationDate, c.AcceptedAnswerId,
+           c.ParentId, c.Title, c.Tags, rp.Depth + 1
+    from Posts c
+    join RecursivePosts rp on c.ParentId = rp.Id
+    where c.PostTypeId = 2 and c.Score > 0
+),
+UserStats as (
+    select u.Id as UserId,
+           u.DisplayName,
+           u.Reputation,
+           count(distinct b.Id) as BadgeCount,
+           sum(case when b.Class = 1 then 1 else 0 end) as GoldBadges,
+           sum(case when b.Class = 2 then 1 else 0 end) as SilverBadges,
+           sum(case when b.Class = 3 then 1 else 0 end) as BronzeBadges,
+           coalesce(max(ph.CreationDate), timestamp '1900-01-01') as LastEditDate
+    from Users u
+    left join Badges b on u.Id = b.UserId
+    left join PostHistory ph on ph.UserId = u.Id and ph.PostHistoryTypeId in (4,5,6)
+    group by u.Id, u.DisplayName, u.Reputation
+),
+PostVotes as (
+    select p.Id as PostId,
+           count(case when v.VoteTypeId = 2 then 1 end) as UpVotes,
+           count(case when v.VoteTypeId = 3 then 1 end) as DownVotes,
+           count(case when v.VoteTypeId = 5 then 1 end) as Favorites,
+           coalesce(sum(v.BountyAmount),0) as TotalBounty
+    from Posts p
+    left join Votes v on p.Id = v.PostId
+    group by p.Id
+),
+PostLinkAggregates as (
+    select pl.PostId,
+           count(distinct case when lt.Name = 'Linked' then pl.RelatedPostId end) as LinkedCount,
+           count(distinct case when lt.Name = 'Duplicate' then pl.RelatedPostId end) as DuplicateCount
+    from PostLinks pl
+    join LinkTypes lt on pl.LinkTypeId = lt.Id
+    group by pl.PostId
+),
+RankedComments as (
+    select c.PostId, c.Id as CommentId, c.Text, c.CreationDate,
+           row_number() over (partition by c.PostId order by c.CreationDate desc) as rn
+    from Comments c
+),
+TopComments as (
+    select PostId, CommentId, Text, CreationDate
+    from RankedComments
+    where rn <= 3
+),
+TagExplode as (
+    select rp.Id as PostId,
+           unnest(string_to_array(substring(rp.Tags, 2, length(rp.Tags)-2), '><')) as Tag
+    from RecursivePosts rp
+    where rp.Tags is not null
+),
+TagCounts as (
+    select te.Tag,
+           count(distinct te.PostId) as PostCount,
+           sum(rp.Score) as TotalScore
+    from TagExplode te
+    join RecursivePosts rp on te.PostId = rp.Id
+    group by te.Tag
+),
+DuplicatePairs as (
+    select pl.PostId, pl.RelatedPostId
+    from PostLinks pl
+    join LinkTypes lt on pl.LinkTypeId = lt.Id
+    where lt.Name = 'Duplicate'
+),
+UserLatestPosts as (
+    select p.OwnerUserId, max(p.CreationDate) as LatestPostDate
+    from Posts p
+    group by p.OwnerUserId
+)
+select 
+    rp.Id as QuestionId,
+    rp.Title,
+    us.DisplayName as OwnerName,
+    us.Reputation,
+    us.BadgeCount,
+    us.GoldBadges,
+    us.SilverBadges,
+    us.BronzeBadges,
+    rp.Score as QuestionScore,
+    rp.ViewCount,
+    pv.UpVotes,
+    pv.DownVotes,
+    pv.Favorites,
+    pv.TotalBounty,
+    pla.LinkedCount,
+    pla.DuplicateCount,
+    string_agg(distinct tc.Tag || ' (' || tc.PostCount || ' posts, score sum ' || tc.TotalScore || ')', ', ') as TagsSummary,
+    (select count(*) from RecursivePosts a where a.ParentId = rp.Id) as AnswerCount,
+    (select string_agg(distinct u2.DisplayName, ', ')
+     from RecursivePosts a2
+     left join Users u2 on a2.OwnerUserId = u2.Id
+     where a2.ParentId = rp.Id and a2.Score > 5
+     limit 3
+    ) as TopAnswerers,
+    (select c.Text from TopComments c where c.PostId = rp.Id order by c.CreationDate desc limit 1) as LatestCommentText,
+    us.LastEditDate,
+    us.Reputation * nullif(rp.Score,0) / nullif(rp.ViewCount,1) as ComplexMetric,
+    case when us.Reputation > 10000 then 'High Rep' else 'Low Rep' end as RepCategory,
+    case when rp.AcceptedAnswerId is not null then 'Has Accepted Answer' else 'No Accepted Answer' end as AcceptedAnswerStatus,
+    coalesce(dup.DuplicateCount,0) as DuplicateLinksCount
+
+from RecursivePosts rp
+left join UserStats us on rp.OwnerUserId = us.UserId
+left join PostVotes pv on rp.Id = pv.PostId
+left join PostLinkAggregates pla on rp.Id = pla.PostId
+left join TagCounts tc on tc.Tag in (
+    select unnest(string_to_array(substring(rp.Tags, 2, length(rp.Tags)-2), '><'))
+)
+left join (
+    select PostId, count(*) as DuplicateCount
+    from DuplicatePairs
+    group by PostId
+) dup on dup.PostId = rp.Id
+where rp.Depth = 1 and rp.CreationDate > (cast('2024-10-01' as date) - interval '1 year')
+group by rp.Id, rp.Title, us.DisplayName, us.Reputation, us.BadgeCount, us.GoldBadges, us.SilverBadges, us.BronzeBadges,
+         rp.Score, rp.ViewCount, pv.UpVotes, pv.DownVotes, pv.Favorites, pv.TotalBounty, pla.LinkedCount, pla.DuplicateCount,
+         us.LastEditDate, dup.DuplicateCount, rp.AcceptedAnswerId, rp.Tags
+order by ComplexMetric desc
+limit 50;

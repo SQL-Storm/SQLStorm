@@ -1,0 +1,113 @@
+with popular_questions as (
+    select 
+        p.Id,
+        p.Title,
+        p.OwnerUserId,
+        p.CreationDate,
+        COALESCE(p.Score,0) as Score,
+        COALESCE(p.ViewCount,0) as Views,
+        p.AcceptedAnswerId,
+        string_to_array(regexp_replace(coalesce(p.Tags, ''), '[<>]', '', 'g'), '><') as tag_list
+    from Posts p
+    where p.PostTypeId = 1
+      and p.ViewCount > 1000
+      and p.Score >= 10
+),
+accepted_answers_with_users as (
+    select 
+        a.Id as AnswerId,
+        a.ParentId as QuestionId,
+        a.OwnerUserId as AnswererId,
+        u.DisplayName as AnswererName,
+        a.Score as AnswerScore,
+        a.CreationDate as AnswerCreationDate
+    from Posts a
+    left join Users u on u.Id = a.OwnerUserId
+    where a.PostTypeId = 2
+),
+tag_popularity(perf_tag, question_count, total_score) as (
+    select 
+        tags.tag as perf_tag,
+        count(distinct p2.Id) as question_count,
+        sum(coalesce(p2.Score,0)) as total_score 
+    from Posts p2
+    cross join lateral unnest(
+        case when p2.PostTypeId = 1 then string_to_array(regexp_replace(coalesce(p2.Tags,''), '[<>]', '', 'g'), '><') else array[]::text[] end
+    ) as tags(tag)
+    where p2.PostTypeId = 1
+    group by tags.tag
+),
+close_reasons_filtered AS (
+    select CRT.Id, CRT.Name
+    from CloseReasonTypes CRT
+    where CRT.Id between 101 and 105
+),
+latest_comments_per_post AS (
+    select DISTINCT ON (c.PostId) c.PostId, c.Id as CommentId, c.UserId as CommenterId, u.DisplayName as CommenterName, c.CreationDate as CommentDate, c.Text as CommentText
+    from Comments c
+    left join Users u on u.Id = c.UserId
+    order by c.PostId, c.CreationDate desc
+),
+score_hist_window AS (
+    select 
+        p.Id,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        count(b.Id) FILTER (WHERE b.Class = 1) over (partition by p.OwnerUserId) as GoldBadges,
+        count(b.Id) FILTER (WHERE b.Class = 2) over (partition by p.OwnerUserId) as SilverBadges,
+        count(b.Id) FILTER (WHERE b.Class = 3) over (partition by p.OwnerUserId) as BronzeBadges,
+        u.Reputation as OwnerReputation,
+        u.Id as OwnerId,
+        u.DisplayName as OwnerName,
+        ROW_NUMBER() over (partition by p.OwnerUserId order by p.Score desc, p.ViewCount desc) as RowNumByOwner
+    from Posts p
+    left join Badges b on b.UserId = p.OwnerUserId
+    left join Users u on u.Id = p.OwnerUserId
+    where p.PostTypeId = 1
+),
+posts_and_accepteds as(
+    select q.Id as QuestionId, q.Title, q.Score as QuestionScore, q.ViewCount,
+           a.Id as AcceptedAnswerId, a.OwnerUserId as AnswerOwnerUserId, au.DisplayName as AnswererDisplayName, a.Score as AnswerScore,
+           acr.Id as CloseReasonFilteredId, acr.Name as CloseReasonFilterName,
+           strpos(ltrim(coalesce(q.Tags, ''), '<'), 'sql') > 0 AS has_sql_tag,
+           (case when q.ClosedDate is not null then 1 else 0 end) as is_closed
+    from Posts q
+    left join Posts a on a.Id = q.AcceptedAnswerId and a.PostTypeId = 2
+    left join Users au on au.Id = a.OwnerUserId
+    left join PostHistory ph on ph.PostId = q.Id and ph.PostHistoryTypeId = 10
+    left join CloseReasonTypes acr on acr.Id = ph.Comment
+    where q.PostTypeId = 1
+      and q.Score >= 5
+),
+result_set_flags as (
+    select *
+    from popular_questions pq
+    where NOT EXISTS (
+        select 1 
+        from Posts p2 
+        where p2.OwnerUserId = pq.OwnerUserId AND p2.PostTypeId = 2 AND p2.Score > pq.Score
+    )
+)
+
+select distinct
+    pq.Id as QuestionId,
+    coalesce(pq.Title, '{[No Title]}') as PublicTitle,
+    pq.OwnerUserId,
+    u.Reputation as OwnerReputation,
+    u.DisplayName as OwnerName,
+    (select string_agg(tag, ', ') from unnest(pq.tag_list) as t(tag)) as TagsReassembled,
+    pq.ViewCount,
+    pq.Score,
+    COALESCE(paq.AnswererName, 'No accepted answer') as AcceptedAnswerUser,
+    COALESCE(paq.AnswerScore, -1) as AcceptedAnswerScore,
+    lcp.CommentText as MostRecentComment,
+    to_char(lcp.CommentDate,'YYYY-MM-DD HH24:MI:SS') as MostRecentCommentDate,
+    (select count(*) from Badges br where br.UserId = pq.OwnerUserId AND br.Class=1) as GoldBadgesOfOwner,
+    (select count(*) from Badges br where br.UserId = pq.OwnerUserId AND br.Class=2) as SilverBadgesOfOwner,
+    (select count(*) from Badges br where br.UserId = pq.OwnerUserId AND br.Class=3) as BronzeBadgesOfOwner
+from popular_questions pq
+left join Users u on u.Id = pq.OwnerUserId
+left join accepted_answers_with_users paq on paq.QuestionId = pq.Id
+left join latest_comments_per_post lcp on lcp.PostId = pq.Id
+left join posts_and_accepteds p on p.QuestionId = pq.Id;

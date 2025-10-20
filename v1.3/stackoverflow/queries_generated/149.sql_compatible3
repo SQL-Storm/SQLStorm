@@ -1,0 +1,192 @@
+with
+question_tags as (
+  select p.id as post_id,
+         p.owneruserid,
+         trim(t) as tag
+  from posts p
+  cross join lateral (
+    select unnest(string_to_array(substring(p.tags from 2 for char_length(p.tags)-2), '><')) as t
+  ) s
+  where p.posttypeid = 1 and p.tags is not null
+),
+
+question_stats as (
+  select q.id as question_id,
+         q.owneruserid as asker_id,
+         q.creationdate as q_created,
+         coalesce(q.answercount, 0) as answer_count,
+         coalesce(q.viewcount, 0) as view_count,
+         length(coalesce(q.title, '')) as title_len,
+         max(case when a.posttypeid = 2 then a.score end) as top_answer_score,
+         (timestamp '2024-10-01 12:34:56' - q.lastactivitydate) as inactive_interval
+  from posts q
+  left join posts a on a.parentid = q.id and a.posttypeid = 2
+  where q.posttypeid = 1
+  group by q.id, q.owneruserid, q.creationdate, q.answercount, q.viewcount, q.title, q.lastactivitydate
+),
+
+user_base as (
+  select u.id as user_id,
+         u.displayname,
+         u.reputation,
+         u.creationdate,
+         u.lastaccessdate,
+         coalesce(u.views,0) as profile_views,
+         coalesce(u.upvotes,0) as upvotes,
+         coalesce(u.downvotes,0) as downvotes,
+         coalesce(u.accountid, -1) as account_id,
+         count(distinct p.id) filter (where p.posttypeid = 1) as q_count,
+         count(distinct p.id) filter (where p.posttypeid = 2) as a_count,
+         sum(p.score) filter (where p.posttypeid in (1,2)) as post_score_sum,
+         count(b.id) as badge_count,
+         max(case when b.class = 1 then 1 else 0 end) as has_gold,
+         sum(case when b.class = 3 then 1 else 0 end) as bronze_badges
+  from users u
+  left join posts p on p.owneruserid = u.id
+  left join badges b on b.userid = u.id
+  group by u.id, u.displayname, u.reputation, u.creationdate, u.lastaccessdate, u.views, u.upvotes, u.downvotes, u.accountid
+),
+
+user_answer_median as (
+  select u.id as user_id,
+         (
+           select avg(x)
+           from (
+             select a.score as x
+             from posts a
+             where a.posttypeid = 2 and a.owneruserid = u.id
+             order by a.score
+             limit 2 - (select count(*) from posts a2 where a2.posttypeid = 2 and a2.owneruserid = u.id) % 2
+             offset floor((select count(*) from posts a3 where a3.posttypeid = 2 and a3.owneruserid = u.id) / 2.0)
+           ) t
+         ) as median_answer_score,
+         coalesce((select var_pop(score) from posts pa where pa.posttypeid = 2 and pa.owneruserid = u.id), 0) as var_answer_score
+  from users u
+),
+
+user_tag_affinity as (
+  select qt.owneruserid as user_id,
+         qt.tag,
+         count(*) as tag_count,
+         rank() over (partition by qt.owneruserid order by count(*) desc, qt.tag) as rnk,
+         sum(count(*)) over (partition by qt.owneruserid) as total_tagged_questions
+  from question_tags qt
+  group by qt.owneruserid, qt.tag
+  order by qt.owneruserid, tag_count desc
+),
+
+recent_activity as (
+  select u.id as user_id,
+         count(distinct p.id) filter (where p.creationdate >= timestamp '2024-10-01 12:34:56' - interval '90 days') as recent_posts,
+         count(v.id) filter (where v.creationdate >= timestamp '2024-10-01 12:34:56' - interval '90 days') as recent_votes,
+         coalesce(sum(v.bountyamount) filter (where v.creationdate >= timestamp '2024-10-01 12:34:56' - interval '365 days'),0) as recent_bounties
+  from users u
+  left join posts p on p.owneruserid = u.id
+  left join votes v on v.userid = u.id
+  group by u.id
+),
+
+user_metrics as (
+  select ub.user_id,
+         ub.displayname,
+         ub.reputation,
+         ub.creationdate,
+         ub.lastaccessdate,
+         ub.profile_views,
+         ub.upvotes,
+         ub.downvotes,
+         ub.account_id,
+         ub.q_count,
+         ub.a_count,
+         ub.post_score_sum,
+         ub.badge_count,
+         ub.has_gold,
+         ub.bronze_badges,
+         uam.median_answer_score,
+         uam.var_answer_score,
+         ra.recent_posts,
+         ra.recent_votes,
+         ra.recent_bounties
+  from user_base ub
+  left join user_answer_median uam on uam.user_id = ub.user_id
+  left join recent_activity ra on ra.user_id = ub.user_id
+),
+
+candidates as (
+  select um.*,
+         coalesce(utf.tag, '(none)') as top_tag,
+         coalesce(utf.tag_count, 0) as top_tag_count,
+         coalesce(utf.total_tagged_questions, 0) as tag_total_questions
+  from user_metrics um
+  left join (
+    select user_id, tag, tag_count, total_tagged_questions
+    from (
+      select owneruserid as user_id, tag, count(*) as tag_count,
+             sum(count(*)) over (partition by owneruserid) as total_tagged_questions,
+             row_number() over (partition by owneruserid order by count(*) desc) as rn
+      from question_tags
+      group by owneruserid, tag
+    ) s
+    where rn = 1
+  ) utf on utf.user_id = um.user_id
+  where (um.q_count + um.a_count) >= 5
+),
+
+question_complex as (
+  select qs.*,
+         coalesce(qt_pop.popularity, 0) as tag_popularity_score,
+         (ln(1 + greatest(qs.view_count,0)) * coalesce(qs.top_answer_score,0)
+          + sqrt(1 + qs.answer_count) * 10
+          - least(qs.title_len, 200) * 0.3
+          - extract(epoch from qs.inactive_interval)/86400 * 0.1
+         ) as complexity_score
+  from question_stats qs
+  left join (
+    select t.tag, sum(t.count) as popularity
+    from tags t
+    group by t.tag
+  ) qt_pop on qt_pop.tag = (
+    select unnest(string_to_array(substring(p.tags from 2 for char_length(p.tags)-2), '><'))
+    from posts p where p.id = qs.question_id limit 1
+  )
+)
+
+select
+  c.user_id,
+  c.displayname,
+  c.reputation,
+  c.q_count,
+  c.a_count,
+  c.post_score_sum,
+  round(coalesce(c.median_answer_score,0),2) as median_answer_score,
+  round(coalesce(c.var_answer_score,0),2) as var_answer_score,
+  c.top_tag,
+  c.top_tag_count,
+  c.tag_total_questions,
+  c.recent_posts,
+  c.recent_votes,
+  c.recent_bounties,
+  c.badge_count,
+  c.has_gold,
+  c.bronze_badges,
+  rank() over (order by (c.reputation * 0.5 + coalesce(c.post_score_sum,0) * 0.2 + coalesce(c.recent_posts,0) * 5 + coalesce(c.badge_count,0) * 2) desc) as influence_rank,
+  (
+    select json_agg(qs2.question_id order by qs2.complexity_score desc)
+    from question_complex qs2
+    where qs2.asker_id = c.user_id
+    limit 1
+  ) as top_questions_ids,
+  case when exists (select 1 from badges b2 where b2.userid = c.user_id and b2.class = 1) then true else false end as has_any_gold,
+  case when coalesce(c.recent_posts,0) > 0 or coalesce(c.recent_votes,0) > 0 then true else false end as active_recently,
+  concat('u', c.user_id, '_', substring(md5(coalesce(c.displayname,'') || coalesce(c.emailhash,'')) from 1 for 6)) as anonymized_token
+from candidates c
+where coalesce(c.reputation,0) > 50
+  and (coalesce(c.a_count,0) >= 2 or coalesce(c.q_count,0) >= 2)
+  and (
+    coalesce(c.top_tag_count,0) >= 1
+    or exists (
+      select 1 from posts p where p.owneruserid = c.user_id and p.body ilike '%performance%' limit 1
+    )
+  )
+order by influence_rank asc, c.reputation desc
+limit 100;

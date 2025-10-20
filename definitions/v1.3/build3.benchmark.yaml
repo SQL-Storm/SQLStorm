@@ -1,9 +1,9 @@
-title: SQLStorm v1.1 Build3 Benchmark (Parseable)
+title: SQLStorm v1.3 Build3 Benchmark (Parseable)
 repetitions: 1
 warmup: 0
 timeout: 1
 fetch_result: false
-output: results/v1.1/build3
+output: results/v1.3/build3
 systems:
   - title: Umbra
     dbms: umbra

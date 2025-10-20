@@ -1,0 +1,178 @@
+with recursive QuestionPaths as (
+    select 
+        p.Id as QuestionId,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        1 as Depth,
+        array[p.Id] as Path,
+        u.DisplayName as OwnerName,
+        p.Tags
+    from Posts p
+    left join Users u on p.OwnerUserId = u.Id
+    where p.PostTypeId = 1
+
+    union all
+
+    select 
+        qp.QuestionId,
+        a.Title,
+        a.CreationDate,
+        a.Score,
+        qp.Depth + 1,
+        qp.Path || a.Id,
+        u.DisplayName,
+        a.Tags
+    from QuestionPaths qp
+    join Posts a on a.ParentId = qp.Path[array_length(qp.Path,1)]
+        and a.PostTypeId = 2
+    left join Users u on a.OwnerUserId = u.Id
+    where not a.Id = any(qp.Path)
+),
+BadgeCounts as (
+    select 
+        UserId, 
+        count(*) as TotalBadges,
+        count(case when "Class" = 1 then 1 end) as GoldBadges,
+        count(case when "Class" = 2 then 1 end) as SilverBadges,
+        count(case when "Class" = 3 then 1 end) as BronzeBadges
+    from Badges
+    group by UserId
+),
+UserActivity as (
+    select 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.Location,
+        coalesce(bc.TotalBadges,0) as TotalBadges,
+        coalesce(bc.GoldBadges,0) as GoldBadges,
+        coalesce(bc.SilverBadges,0) as SilverBadges,
+        coalesce(bc.BronzeBadges,0) as BronzeBadges,
+        row_number() over (order by u.Reputation desc) as UserRank,
+        exists (
+            select 1 from Posts p 
+            where p.OwnerUserId = u.Id and p.PostTypeId = 1 and p.ClosedDate is null
+        ) as HasOpenQuestions,
+        (
+            select count(*) from Comments c where c.UserId = u.Id and c.CreationDate > (cast('2024-10-01 12:34:56' as timestamp) - interval '30 days')
+        ) as RecentCommentsCount
+    from Users u
+    left join BadgeCounts bc on bc.UserId = u.Id
+),
+PostVotesAgg as (
+    select 
+        p.Id as PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        count(case when v.VoteTypeId = 2 then 1 end) as UpVotes,
+        count(case when v.VoteTypeId = 3 then 1 end) as DownVotes,
+        count(case when v.VoteTypeId = 5 then 1 end) as FavoriteCount,
+        sum(case when v.VoteTypeId in (8,9) then coalesce(v.BountyAmount,0) else 0 end) as TotalBounty
+    from Posts p
+    left join Votes v on v.PostId = p.Id
+    group by p.Id, p.PostTypeId, p.OwnerUserId
+),
+TagQuestions as (
+    select
+        t.TagName,
+        count(distinct p.Id) as QuestionCount,
+        avg(p.Score) as AvgScore,
+        sum(p.ViewCount) as TotalViews,
+        array_agg(distinct p.OwnerUserId) filter (where p.OwnerUserId is not null) as UsersInvolved
+    from Tags t
+    join Posts p on p.PostTypeId = 1 and p.Tags like ('%<' || t.TagName || '>%')
+    group by t.TagName
+),
+MainResults as (
+select distinct
+    qp.QuestionId,
+    substr(qp.Title,1,100) as ShortTitle,
+    qp.CreationDate as QuestionCreation,
+    qp.Score as QuestionScore,
+    qp.Depth,
+    qp.Path,
+    qp.OwnerName,
+    ua.DisplayName as QuestionOwnerDisplayName,
+    ua.Reputation as QuestionOwnerReputation,
+    ua.GoldBadges,
+    ua.SilverBadges,
+    ua.BronzeBadges,
+    ua.RecentCommentsCount,
+    (select count(distinct pl.RelatedPostId) 
+        from PostLinks pl
+        where pl.PostId = qp.Path[array_length(qp.Path,1)] and pl.LinkTypeId = 1
+    ) as NumLinkedPosts,
+    coalesce(pv.UpVotes,0) as PostUpVotes,
+    coalesce(pv.DownVotes,0) as PostDownVotes,
+    coalesce(pv.FavoriteCount,0) as PostFavorites,
+    coalesce(pv.TotalBounty,0) as PostBountyAmount,
+    tQ.QuestionCount as TagQuestionCount,
+    tQ.AvgScore as TagAvgScore,
+    tQ.TotalViews as TagTotalViews,
+    length(qp.Tags) - length(replace(lower(qp.Tags), 'sql', '')) as SqlTagCount,
+    case 
+        when qp.Tags is null then 'No Tags' 
+        else regexp_replace(qp.Tags, '[<>]', ',', 'g') 
+    end as CleanTags,
+    row_number() over (partition by qp.OwnerName order by qp.Score desc) as OwnerPostRank,
+    case 
+        when qp.Depth > 1 and coalesce(pv.UpVotes,0) < coalesce(pv.DownVotes,0) then 'Controversial Answer'
+        when qp.Depth = 1 and qp.Score > 100 then 'Popular Question'
+        else 'Other'
+    end as PostClassification,
+    (select c.Text from Comments c where c.PostId = qp.QuestionId order by c.CreationDate desc limit 1) as LatestQuestionComment,
+    ph.Comment as CloseReason,
+    ph.CreationDate as CloseDate
+from QuestionPaths qp
+left join UserActivity ua on ua.DisplayName = qp.OwnerName
+left join PostVotesAgg pv on pv.PostId = qp.Path[array_length(qp.Path,1)]
+left join lateral (
+    select ph2.Comment, ph2.CreationDate
+    from PostHistory ph2 
+    where ph2.PostId = qp.QuestionId and ph2.PostHistoryTypeId = 10
+    order by ph2.CreationDate desc limit 1
+) ph on true
+left join TagQuestions tQ on tQ.TagName = 
+    (select unnest(string_to_array(substr(qp.Tags,2,case when qp.Tags is null then 0 else length(qp.Tags)-2 end), '><')) limit 1)
+where qp.Score > 10 or qp.Depth > 1
+)
+select *
+from MainResults
+order by QuestionScore desc nulls last, Depth asc nulls last
+limit 50
+
+union all
+
+select 
+    cast(null as bigint) as QuestionId,
+    cast(null as text) as ShortTitle,
+    cast(null as timestamp) as QuestionCreation,
+    cast(null as integer) as QuestionScore,
+    cast(null as integer) as Depth,
+    cast(null as text[]) as Path,
+    cast(null as text) as OwnerName,
+    u.DisplayName,
+    u.Reputation,
+    u.GoldBadges,
+    u.SilverBadges,
+    u.BronzeBadges,
+    u.RecentCommentsCount,
+    cast(null as integer) as NumLinkedPosts,
+    cast(null as integer) as PostUpVotes,
+    cast(null as integer) as PostDownVotes,
+    cast(null as integer) as PostFavorites,
+    cast(null as numeric) as PostBountyAmount,
+    cast(null as bigint) as TagQuestionCount,
+    cast(null as numeric) as TagAvgScore,
+    cast(null as bigint) as TagTotalViews,
+    cast(null as integer) as SqlTagCount,
+    cast(null as text) as CleanTags,
+    cast(null as integer) as OwnerPostRank,
+    cast(null as text) as PostClassification,
+    cast(null as text) as LatestQuestionComment,
+    cast(null as text) as CloseReason,
+    cast(null as timestamp) as CloseDate
+from UserActivity u
+where u.UserRank <= 10;

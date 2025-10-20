@@ -1,0 +1,216 @@
+WITH RecursiveTagHierarchy AS (
+    SELECT 
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        1 AS Level,
+        CAST(NULL AS INTEGER) AS ParentTagId
+    FROM Tags t
+    WHERE t.IsModeratorOnly = 0 AND t.IsRequired = 0
+    UNION ALL
+    SELECT 
+        child.Id,
+        child.TagName,
+        child.Count,
+        child.ExcerptPostId,
+        child.WikiPostId,
+        rh.Level + 1,
+        rh.Id AS ParentTagId
+    FROM Tags child
+    INNER JOIN RecursiveTagHierarchy rh ON CHAR_LENGTH(child.TagName) > CHAR_LENGTH(rh.TagName)
+        AND SUBSTR(child.TagName, 1, CHAR_LENGTH(rh.TagName)) = rh.TagName
+        AND child.Id <> rh.Id
+    WHERE rh.Level < 3
+),
+TopUserBadges AS (
+    SELECT 
+        b.UserId,
+        b.Name,
+        b.Class,
+        ROW_NUMBER() OVER (PARTITION BY b.UserId ORDER BY b.Class ASC, b.Date DESC) AS rn
+    FROM Badges b
+    WHERE b.Date >= DATE '2024-10-01' - INTERVAL '1' YEAR
+),
+UserBadgeCount AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS GoldBadges,
+        COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS SilverBadges,
+        COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS BronzeBadges,
+        COUNT(b.Id) AS TotalBadges,
+        COALESCE(SUM(v.Score),0) AS TotalVoteScore
+    FROM Users u
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Votes v ON p.Id = v.PostId AND v.VoteTypeId IN (2,3)
+    GROUP BY u.Id, u.DisplayName
+),
+QuestionAnswerStats AS (
+    SELECT 
+        q.Id AS QuestionId,
+        q.OwnerUserId AS QuestionOwnerId,
+        q.Title,
+        q.CreationDate AS QuestionCreation,
+        q.Score AS QuestionScore,
+        a.Id AS AnswerId,
+        a.OwnerUserId AS AnswerOwnerId,
+        a.CreationDate AS AnswerCreation,
+        a.Score AS AnswerScore,
+        ROW_NUMBER() OVER (PARTITION BY q.Id ORDER BY a.Score DESC, a.CreationDate ASC) AS AnswerRank
+    FROM Posts q
+    LEFT JOIN Posts a ON a.ParentId = q.Id AND a.PostTypeId = 2
+    WHERE q.PostTypeId = 1
+),
+FlaggedCloseReasons AS (
+    SELECT ph.PostId, ph.Comment AS CloseReasonId, COUNT(*) AS CloseReasonCount
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId = 10
+    GROUP BY ph.PostId, ph.Comment
+),
+HighActivityQuestions AS (
+    SELECT 
+        q.Id,
+        q.Title,
+        q.OwnerUserId,
+        q.ViewCount,
+        q.Score,
+        q.AnswerCount,
+        q.Tags,
+        (SELECT COUNT(*) FROM Comments c WHERE c.PostId = q.Id) AS CommentsCount,
+        (SELECT COUNT(*) FROM Votes v WHERE v.PostId = q.Id) AS VotesCount,
+        CASE WHEN EXISTS(SELECT 1 FROM PostLinks pl WHERE pl.PostId = q.Id) THEN TRUE ELSE FALSE END AS HasLinksToOtherPosts
+    FROM Posts q
+    WHERE q.PostTypeId = 1
+      AND q.ViewCount > 1000
+      AND q.AnswerCount > 3
+      AND q.ClosedDate IS NULL
+),
+UserAnswerScoreRankings AS (
+    SELECT 
+        a.AnswerOwnerId,
+        a.AnswerId,
+        a.AnswerScore,
+        RANK() OVER (PARTITION BY a.AnswerOwnerId ORDER BY a.AnswerScore DESC) AS ScoreRank
+    FROM QuestionAnswerStats a
+    WHERE a.AnswerOwnerId IS NOT NULL
+),
+StringTagAgg AS (
+    SELECT 
+        QuestionId,
+        STRING_AGG(t.TagName, ', ' ORDER BY t.TagName) AS SortedTags
+    FROM (
+        SELECT 
+            p.Id AS QuestionId,
+            UNNEST(STRING_TO_ARRAY(SUBSTR(p.Tags, 2, CHAR_LENGTH(p.Tags) - 2), '><')) AS TagName
+        FROM Posts p
+        WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL
+    ) AS tag_expanded
+    INNER JOIN Tags t ON t.TagName = tag_expanded.TagName
+    GROUP BY QuestionId
+)
+SELECT 
+    q.Id AS QuestionId,
+    q.Title,
+    uc.DisplayName AS QuestionOwner,
+    uc.Reputation AS OwnerReputation,
+    q.ViewCount,
+    q.Score AS QuestionScore,
+    q.AnswerCount,
+    qa.AnswerId,
+    ua.DisplayName AS TopAnswerer,
+    qa.AnswerScore,
+    ub.GoldBadges,
+    ub.SilverBadges,
+    ub.BronzeBadges,
+    ub.TotalBadges,
+    us.ScoreRank,
+    fcr.CloseReasonId,
+    fcr.CloseReasonCount,
+    hq.CommentsCount,
+    hq.VotesCount,
+    hq.HasLinksToOtherPosts,
+    st.SortedTags,
+    rh.Level AS TagHierarchyLevel,
+    rh.ParentTagId,
+    rh.TagName AS HierarchicalTagName,
+    rh.Count AS TagUseCount,
+    CASE 
+        WHEN ua.ProfileImageUrl IS NULL THEN 'https://stackoverflow.com/default-profile.png' 
+        ELSE ua.ProfileImageUrl 
+    END AS AnswererProfileImage,
+    CASE 
+        WHEN q.ClosedDate IS NULL THEN 'Open'
+        ELSE 'Closed'
+    END AS QuestionStatus,
+    (COALESCE(uc.Location, 'Unknown') || ' | ' || COALESCE(SUBSTR(ua.Location, 1, 20), 'N/A') || ' | ' ||
+     CAST(EXTRACT(YEAR FROM AGE(TIMESTAMP '2024-10-01 12:34:56', ua.CreationDate)) AS VARCHAR) || ' years on SE'
+    ) AS LocationAndTenureSummary,
+    REGEXP_REPLACE(
+        COALESCE(CAST(qa.AnswerId AS VARCHAR), 'NoAnswer'),
+        '(\\d{3})',
+        '\\1-',
+        'g'
+    ) AS FormattedAnswerId,
+    (SELECT MAX(ph.CreationDate)
+     FROM PostHistory ph
+     WHERE ph.PostId = q.Id AND ph.PostHistoryTypeId IN (4, 5, 6)
+    ) AS LatestSignificantEdit,
+    AVG(q.Score) OVER (PARTITION BY q.OwnerUserId) AS AvgOwnerQuestionScore
+FROM Posts q
+INNER JOIN Users uc ON q.OwnerUserId = uc.Id
+LEFT JOIN QuestionAnswerStats qa ON qa.QuestionId = q.Id AND qa.AnswerRank = 1
+LEFT JOIN Users ua ON qa.AnswerOwnerId = ua.Id
+LEFT JOIN UserBadgeCount ub ON ua.Id = ub.UserId
+LEFT JOIN UserAnswerScoreRankings us ON qa.AnswerOwnerId = us.AnswerOwnerId AND qa.AnswerId = us.AnswerId
+LEFT JOIN FlaggedCloseReasons fcr ON fcr.PostId = q.Id
+LEFT JOIN HighActivityQuestions hq ON hq.Id = q.Id
+LEFT JOIN StringTagAgg st ON st.QuestionId = q.Id
+LEFT JOIN RecursiveTagHierarchy rh ON rh.TagName = ANY (STRING_TO_ARRAY(SUBSTR(q.Tags, 2, CHAR_LENGTH(q.Tags) - 2), '><'))
+WHERE q.PostTypeId = 1
+  AND q.CreationDate > DATE '2024-10-01' - INTERVAL '2' YEAR
+  AND (qa.AnswerScore IS NULL OR qa.AnswerScore > 0)
+  AND (
+       (ub.TotalBadges > 10 OR ub.TotalBadges IS NULL)
+       OR q.ViewCount > 5000
+      )
+ORDER BY q.Score DESC NULLS LAST, ub.TotalBadges DESC NULLS LAST, q.ViewCount DESC NULLS LAST, qa.AnswerScore DESC NULLS LAST
+LIMIT 50
+
+UNION ALL
+
+SELECT 
+    CAST(NULL AS INTEGER) AS QuestionId,
+    'Footer summary row with aggregations' AS Title,
+    CAST(NULL AS VARCHAR) AS QuestionOwner,
+    CAST(NULL AS INTEGER) AS OwnerReputation,
+    CAST(NULL AS INTEGER) AS ViewCount,
+    CAST(NULL AS INTEGER) AS QuestionScore,
+    CAST(NULL AS INTEGER) AS AnswerCount,
+    CAST(NULL AS INTEGER) AS AnswerId,
+    CAST(NULL AS VARCHAR) AS TopAnswerer,
+    CAST(NULL AS INTEGER) AS AnswerScore,
+    CAST(NULL AS INTEGER) AS GoldBadges,
+    CAST(NULL AS INTEGER) AS SilverBadges,
+    CAST(NULL AS INTEGER) AS BronzeBadges,
+    CAST(NULL AS INTEGER) AS TotalBadges,
+    CAST(NULL AS INTEGER) AS ScoreRank,
+    CAST(NULL AS VARCHAR) AS CloseReasonId,
+    CAST(NULL AS INTEGER) AS CloseReasonCount,
+    CAST(NULL AS INTEGER) AS CommentsCount,
+    CAST(NULL AS INTEGER) AS VotesCount,
+    CAST(NULL AS BOOLEAN) AS HasLinksToOtherPosts,
+    CAST(NULL AS VARCHAR) AS SortedTags,
+    CAST(NULL AS INTEGER) AS TagHierarchyLevel,
+    CAST(NULL AS INTEGER) AS ParentTagId,
+    CAST(NULL AS VARCHAR) AS HierarchicalTagName,
+    CAST(NULL AS INTEGER) AS TagUseCount,
+    CAST(NULL AS VARCHAR) AS AnswererProfileImage,
+    CAST(NULL AS VARCHAR) AS QuestionStatus,
+    CAST(NULL AS VARCHAR) AS LocationAndTenureSummary,
+    CAST('2024-10-01 12:34:56' AS TIMESTAMP) AS FormattedAnswerId,
+    CAST(NULL AS TIMESTAMP) AS LatestSignificantEdit,
+    CAST(NULL AS DOUBLE PRECISION) AS AvgOwnerQuestionScore
+ORDER BY 1 NULLS LAST;

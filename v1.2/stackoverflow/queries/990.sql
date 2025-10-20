@@ -1,0 +1,132 @@
+WITH RecursivePostTagCTE AS (
+    SELECT p.Id AS PostId, p.Tags, p.PostTypeId, u.DisplayName AS OwnerName,
+           ROW_NUMBER() OVER (PARTITION BY p.Id ORDER BY p.CreationDate DESC) AS rn
+    FROM Posts p
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL
+), ExplodedTags AS (
+    SELECT PostId, unnest(string_to_array(substring(Tags, 2, length(Tags) - 2), '><')) AS Tag
+    FROM RecursivePostTagCTE
+    WHERE rn = 1
+), UserBadgeCounts AS (
+    SELECT UserId,
+           SUM(CASE WHEN Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+           SUM(CASE WHEN Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+           SUM(CASE WHEN Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges
+    FROM Badges
+    GROUP BY UserId
+), PopularQuestions AS (
+    SELECT p.Id, p.Title, p.Score, p.ViewCount, u.DisplayName AS OwnerName, 
+           ROW_NUMBER() OVER (ORDER BY p.Score DESC, p.ViewCount DESC) AS Rank
+    FROM Posts p
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.PostTypeId = 1 AND p.Score > 10
+), PostAnswerStats AS (
+    SELECT a.ParentId AS QuestionId,
+           COUNT(*) AS AnswerCount,
+           AVG(a.Score) AS AvgAnswerScore,
+           MAX(a.Score) AS MaxAnswerScore,
+           SUM(CASE WHEN a.Score >= 0 THEN 1 ELSE 0 END) AS NonNegativeAnswers
+    FROM Posts a
+    WHERE a.PostTypeId = 2
+    GROUP BY a.ParentId
+), LatestPostHistory AS (
+    SELECT ph.PostId, ph.PostHistoryTypeId, ph.CreationDate, ph.Comment,
+           ROW_NUMBER() OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate DESC) AS rn
+    FROM PostHistory ph
+), QuestionsWithCloseInfo AS (
+    SELECT p.Id, p.Title, p.CreationDate, p.ClosedDate, ph.PostHistoryTypeId AS CloseTypeId,
+           crt.Name AS CloseReasonName
+    FROM Posts p
+    LEFT JOIN LatestPostHistory ph ON p.Id = ph.PostId AND ph.rn = 1 AND ph.PostHistoryTypeId IN (10, 11)
+    LEFT JOIN CloseReasonTypes crt ON crt.Id = CASE
+                                                   WHEN ph.Comment ~ '^[0-9]+$' THEN CAST(ph.Comment AS INTEGER)
+                                                   ELSE NULL
+                                               END
+    WHERE p.PostTypeId = 1
+), VotesUpDown AS (
+    SELECT v.PostId,
+           SUM(CASE WHEN vt.Name = 'UpMod' THEN 1 ELSE 0 END) AS UpVotes,
+           SUM(CASE WHEN vt.Name = 'DownMod' THEN 1 ELSE 0 END) AS DownVotes
+    FROM Votes v
+    JOIN VoteTypes vt ON v.VoteTypeId = vt.Id
+    GROUP BY v.PostId
+), UserTopRanks AS (
+    -- compute per-user ranking without using window in GROUP BY later
+    SELECT pq.Id AS PostId,
+           pq.OwnerName,
+           ROW_NUMBER() OVER (PARTITION BY pq.OwnerName ORDER BY pq.Score DESC) AS UserTopPostRank
+    FROM PopularQuestions pq
+)
+SELECT 
+    pq.Rank,
+    pq.Title,
+    pq.Score,
+    pq.ViewCount,
+    pq.OwnerName,
+    COALESCE(pas.AnswerCount, 0) AS AnswerCount,
+    COALESCE(pas.AvgAnswerScore, 0) AS AvgAnswerScore,
+    COALESCE(pas.MaxAnswerScore, 0) AS MaxAnswerScore,
+    COALESCE(pas.NonNegativeAnswers, 0) AS NonNegativeAnswers,
+    ubc.GoldBadges,
+    ubc.SilverBadges,
+    ubc.BronzeBadges,
+    qci.ClosedDate,
+    qci.CloseReasonName,
+    COALESCE(vu.DownVotes, 0) AS DownVotes,
+    COALESCE(vu.UpVotes, 0) AS UpVotes,
+    STRING_AGG(et.Tag, ', ') AS TagsList,
+    CASE 
+        WHEN pq.Score > 50 THEN 'Hot'
+        WHEN pq.Score BETWEEN 20 AND 50 THEN 'Warm'
+        ELSE 'Cold'
+    END AS PopularityCategory,
+    CONCAT(
+        COALESCE(pq.OwnerName, 'Anonymous'),
+        ' (',
+        COALESCE(ubc.GoldBadges, 0), 'G, ',
+        COALESCE(ubc.SilverBadges, 0), 'S, ',
+        COALESCE(ubc.BronzeBadges, 0), 'B)') AS OwnerBadgeSummary,
+    COALESCE(utr.UserTopPostRank, 1) AS UserTopPostRank
+FROM PopularQuestions pq
+LEFT JOIN PostAnswerStats pas ON pas.QuestionId = pq.Id
+LEFT JOIN UserBadgeCounts ubc ON ubc.UserId = (SELECT Id FROM Users WHERE DisplayName = pq.OwnerName LIMIT 1)
+LEFT JOIN QuestionsWithCloseInfo qci ON qci.Id = pq.Id
+LEFT JOIN VotesUpDown vu ON vu.PostId = pq.Id
+LEFT JOIN ExplodedTags et ON et.PostId = pq.Id
+LEFT JOIN UserTopRanks utr ON utr.PostId = pq.Id
+WHERE pq.ViewCount > 1000
+  AND (
+    COALESCE(qci.ClosedDate, DATE '2999-12-31') > DATE '2020-01-01' OR qci.ClosedDate IS NULL
+  )
+  AND (
+    (COALESCE(ubc.GoldBadges,0) + COALESCE(ubc.SilverBadges,0) + COALESCE(ubc.BronzeBadges,0) > 0) OR ubc.GoldBadges IS NULL
+  )
+GROUP BY
+    pq.Rank,
+    pq.Title,
+    pq.Score,
+    pq.ViewCount,
+    pq.OwnerName,
+    pas.AnswerCount,
+    pas.AvgAnswerScore,
+    pas.MaxAnswerScore,
+    pas.NonNegativeAnswers,
+    ubc.GoldBadges,
+    ubc.SilverBadges,
+    ubc.BronzeBadges,
+    qci.ClosedDate,
+    qci.CloseReasonName,
+    vu.DownVotes,
+    vu.UpVotes,
+    pq.Id,
+    CONCAT(
+        COALESCE(pq.OwnerName, 'Anonymous'),
+        ' (',
+        COALESCE(ubc.GoldBadges, 0), 'G, ',
+        COALESCE(ubc.SilverBadges, 0), 'S, ',
+        COALESCE(ubc.BronzeBadges, 0), 'B)'
+    ),
+    COALESCE(utr.UserTopPostRank, 1)
+ORDER BY pq.Score DESC, pq.ViewCount DESC
+LIMIT 100;

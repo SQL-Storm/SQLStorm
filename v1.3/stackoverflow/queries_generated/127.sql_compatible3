@@ -1,0 +1,326 @@
+with
+base_posts as (
+  select
+    p.*,
+    case when p.PostTypeId = 1 then 'question'
+         when p.PostTypeId = 2 then 'answer'
+         else 'other' end as post_kind,
+    case when p.PostTypeId = 1 and p.Tags is not null
+         then string_to_array(substring(p.Tags from 2 for char_length(p.Tags)-2), '><')
+         else null end as tag_array
+  from Posts p
+),
+
+exploded_tags as (
+  select
+    bp.Id as QuestionId,
+    bp.Title,
+    trim(tg) as Tag,
+    bp.OwnerUserId,
+    bp.CreationDate,
+    bp.Score,
+    bp.ViewCount,
+    bp.AnswerCount,
+    bp.FavoriteCount
+  from base_posts bp
+  cross join lateral (
+    select unnest(bp.tag_array) as tg
+  ) x
+  where bp.post_kind = 'question' and bp.tag_array is not null
+),
+
+tag_stats as (
+  select
+    Tag,
+    count(*) filter (where CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '365 days') as q_count_last_year,
+    count(*) as q_count_total,
+    avg(nullif(Score,0)) filter (where Score <> 0) as avg_score_nonzero,
+    0 as median_score,
+    max(Score) as max_score,
+    sum(coalesce(ViewCount,0)) as total_views,
+    sum(coalesce(FavoriteCount,0)) as total_favorites,
+    max( (cast(Score as bigint) * 4294967296) + coalesce(cast(ViewCount as bigint),0) ) as packed_score_view
+  from exploded_tags
+  group by Tag
+),
+
+tag_scores_expanded as (
+  select
+    Tag,
+    Score,
+    row_number() over (partition by Tag order by Score asc, QuestionId) as rn_asc,
+    row_number() over (partition by Tag order by Score desc, QuestionId) as rn_desc,
+    count(*) over (partition by Tag) as cnt
+  from exploded_tags
+),
+
+tag_median as (
+  select distinct
+    Tag,
+    case
+      when cnt % 2 = 1 then
+        max(case when rn_asc = (cnt+1)/2 then Score end) over (partition by Tag)
+      else
+        ( (max(case when rn_asc = cnt/2 then Score end) over (partition by Tag)) +
+          (max(case when rn_asc = cnt/2 + 1 then Score end) over (partition by Tag)) ) / 2.0
+    end as median_score
+  from tag_scores_expanded
+),
+
+tag_analytics as (
+  select
+    ts.Tag,
+    ts.q_count_total,
+    ts.q_count_last_year,
+    ts.avg_score_nonzero,
+    tm.median_score,
+    ts.max_score,
+    ts.total_views,
+    ts.total_favorites,
+    ts.packed_score_view
+  from tag_stats ts
+  left join tag_median tm on tm.Tag = ts.Tag
+),
+
+user_activity as (
+  select
+    u.Id as UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    coalesce(u.Views,0) as Views,
+    coalesce(u.UpVotes,0) as UpVotes,
+    coalesce(u.DownVotes,0) as DownVotes,
+    (select count(*) from Posts p where p.OwnerUserId = u.Id and p.PostTypeId = 1) as num_questions,
+    (select count(*) from Posts p where p.OwnerUserId = u.Id and p.PostTypeId = 2) as num_answers,
+    greatest(
+      u.LastAccessDate,
+      coalesce((select max(LastActivityDate) from Posts p where p.OwnerUserId = u.Id), cast('1970-01-01' as timestamp)),
+      coalesce((select max(CreationDate) from Comments c where c.UserId = u.Id), cast('1970-01-01' as timestamp))
+    ) as last_content_activity,
+    case when (select count(*) from Posts p where p.OwnerUserId = u.Id) = 0 then null
+         else round( (select sum(coalesce(Score,0)) from Posts p where p.OwnerUserId = u.Id) / 
+                     greatest(1, (select count(*) from Posts p where p.OwnerUserId = u.Id))::numeric, 3)
+    end as avg_score_per_post,
+    exists (select 1 from Badges b where b.UserId = u.Id and b.Class = 1) as has_gold
+  from Users u
+),
+
+answers_enriched as (
+  select
+    a.Id as AnswerId,
+    a.ParentId as QuestionId,
+    a.OwnerUserId,
+    a.CreationDate as AnswerDate,
+    a.Score as AnswerScore,
+    q.Title as QuestionTitle,
+    q.Tags as QuestionTags,
+    q.OwnerUserId as QuestionOwner,
+    case when q.AcceptedAnswerId = a.Id then true else false end as is_accepted,
+    (select count(*) from Comments c where c.PostId = a.Id) as comment_count,
+    extract(epoch from (a.CreationDate - q.CreationDate))/86400.0 as answer_delay_days,
+    case when a.OwnerUserId is null or q.OwnerUserId is null then null
+         when a.OwnerUserId = q.OwnerUserId then true else false end as self_answer
+  from Posts a
+  left join Posts q on q.Id = a.ParentId and q.PostTypeId = 1
+  where a.PostTypeId = 2
+),
+
+question_overview as (
+  select
+    q.Id as QuestionId,
+    q.Title,
+    q.CreationDate,
+    q.OwnerUserId,
+    q.Score as QuestionScore,
+    q.ViewCount,
+    q.AnswerCount,
+    q.FavoriteCount,
+    (select count(distinct OwnerUserId) from Posts a where a.ParentId = q.Id and a.PostTypeId = 2 and a.OwnerUserId is not null) as distinct_answerers,
+    max(ae.AnswerScore) as top_answer_score,
+    avg(ae.AnswerScore) as avg_answer_score,
+    sum(case when ae.is_accepted then 1 else 0 end) * 1.0 / nullif(greatest(1, count(ae.AnswerId)),1) as accepted_ratio,
+    sum(case when ae.self_answer then 1 else 0 end) * 1.0 / nullif(greatest(1, count(ae.AnswerId)),1) as self_answer_ratio,
+    exists (select 1 from Votes v where v.PostId = q.Id and v.VoteTypeId = 8) as has_bounty,
+    exists (select 1 from PostHistory ph where ph.PostId = q.Id and ph.PostHistoryTypeId in (4,5,6) and ph.CreationDate > q.CreationDate + interval '30 days') as edited_after_30d,
+    (select min(CreationDate) from PostHistory ph where ph.PostId = q.Id and ph.PostHistoryTypeId = 10) as first_close_date,
+    (select min(tg) from unnest(string_to_array(substring(q.Tags from 2 for char_length(q.Tags)-2), '><')) tg) as canonical_tag
+  from Posts q
+  left join answers_enriched ae on ae.QuestionId = q.Id
+  where q.PostTypeId = 1
+  group by q.Id, q.Title, q.CreationDate, q.OwnerUserId, q.Score, q.ViewCount, q.AnswerCount, q.FavoriteCount, q.Tags
+),
+
+combined as (
+  select
+    qo.QuestionId,
+    qo.Title,
+    qo.CreationDate,
+    qo.OwnerUserId as QuestionOwnerId,
+    u.DisplayName as QuestionOwner,
+    u.Reputation as OwnerReputation,
+    qo.QuestionScore,
+    qo.ViewCount,
+    qo.AnswerCount,
+    qo.FavoriteCount,
+    qo.distinct_answerers,
+    qo.top_answer_score,
+    qo.avg_answer_score,
+    qo.accepted_ratio,
+    qo.self_answer_ratio,
+    qo.has_bounty,
+    qo.edited_after_30d,
+    qo.first_close_date,
+    qo.canonical_tag,
+    ta.q_count_total as tag_q_total,
+    ta.q_count_last_year as tag_q_last_year,
+    ta.avg_score_nonzero as tag_avg_score_nonzero,
+    ta.median_score as tag_median_score,
+    ta.total_views as tag_total_views,
+    (
+      coalesce(qo.QuestionScore,0) * 1.5
+      + ln(1 + greatest(qo.ViewCount,0)) * 2
+      + coalesce(qo.avg_answer_score,0) * 1.2
+      + coalesce(ta.q_count_last_year,0) * 0.05
+      + case when qo.has_bounty then 10 else 0 end
+      - coalesce((extract(epoch from cast('2024-10-01 12:34:56' as timestamp) - qo.CreationDate)/86400.0),0) * 0.02
+    ) as hotness_score
+  from question_overview qo
+  left join Users u on u.Id = qo.OwnerUserId
+  left join tag_analytics ta on ta.Tag = qo.canonical_tag
+),
+
+ranked as (
+  select
+    c.QuestionId,
+    c.Title,
+    c.CreationDate,
+    c.QuestionOwnerId,
+    c.QuestionOwner,
+    c.OwnerReputation,
+    c.QuestionScore,
+    c.ViewCount,
+    c.AnswerCount,
+    c.FavoriteCount,
+    c.distinct_answerers,
+    c.top_answer_score,
+    c.avg_answer_score,
+    c.accepted_ratio,
+    c.self_answer_ratio,
+    c.has_bounty,
+    c.edited_after_30d,
+    c.first_close_date,
+    c.canonical_tag,
+    c.tag_q_total,
+    c.tag_q_last_year,
+    c.tag_avg_score_nonzero,
+    c.tag_median_score,
+    c.tag_total_views,
+    c.hotness_score,
+    row_number() over (order by c.hotness_score desc nulls last) as hot_rank,
+    percent_rank() over (order by c.hotness_score desc nulls last) as hot_percentile
+  from combined c
+),
+
+cold_set as (
+  select
+    c.QuestionId,
+    c.Title,
+    c.CreationDate,
+    c.QuestionOwnerId,
+    c.QuestionOwner,
+    c.OwnerReputation,
+    c.QuestionScore,
+    c.ViewCount,
+    c.AnswerCount,
+    c.FavoriteCount,
+    c.distinct_answerers,
+    c.top_answer_score,
+    c.avg_answer_score,
+    c.accepted_ratio,
+    c.self_answer_ratio,
+    c.has_bounty,
+    c.edited_after_30d,
+    c.first_close_date,
+    c.canonical_tag,
+    c.tag_q_total,
+    c.tag_q_last_year,
+    c.tag_avg_score_nonzero,
+    c.tag_median_score,
+    c.tag_total_views,
+    c.hotness_score,
+    null as hot_rank,
+    null as hot_percentile
+  from combined c
+  where c.AnswerCount = 0 and c.ViewCount < 50
+  order by c.CreationDate desc
+  limit 50
+)
+
+select
+  r.hot_rank,
+  r.hot_percentile,
+  r.QuestionId,
+  left(r.Title, 200) as short_title,
+  r.CreationDate,
+  r.QuestionOwnerId,
+  r.QuestionOwner,
+  r.OwnerReputation,
+  r.QuestionScore,
+  r.ViewCount,
+  r.AnswerCount,
+  r.FavoriteCount,
+  round(cast(r.hotness_score as numeric),3) as hotness_score,
+  r.canonical_tag,
+  r.tag_q_total,
+  r.tag_q_last_year,
+  r.tag_avg_score_nonzero,
+  r.tag_median_score,
+  r.tag_total_views,
+  r.distinct_answerers,
+  r.top_answer_score,
+  round(coalesce(r.avg_answer_score,0)::numeric,3) as avg_answer_score,
+  r.accepted_ratio,
+  r.self_answer_ratio,
+  r.has_bounty,
+  r.edited_after_30d,
+  r.first_close_date
+from ranked r
+where r.hot_rank <= 100
+
+union all
+
+select
+  cs.hot_rank,
+  cs.hot_percentile,
+  cs.QuestionId,
+  left(cs.Title,200),
+  cs.CreationDate,
+  cs.QuestionOwnerId,
+  cs.QuestionOwner,
+  cs.OwnerReputation,
+  cs.QuestionScore,
+  cs.ViewCount,
+  cs.AnswerCount,
+  cs.FavoriteCount,
+  round(cast(cs.hotness_score as numeric),3),
+  cs.canonical_tag,
+  cs.tag_q_total,
+  cs.tag_q_last_year,
+  cs.tag_avg_score_nonzero,
+  cs.tag_median_score,
+  cs.tag_total_views,
+  cs.distinct_answerers,
+  cs.top_answer_score,
+  round(coalesce(cs.avg_answer_score,0)::numeric,3),
+  cs.accepted_ratio,
+  cs.self_answer_ratio,
+  cs.has_bounty,
+  cs.edited_after_30d,
+  cs.first_close_date
+from cold_set cs
+
+order by
+  case when hot_rank is not null then 0 else 1 end,
+  hot_rank nulls last,
+  CreationDate desc;

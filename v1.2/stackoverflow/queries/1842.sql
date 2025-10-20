@@ -1,0 +1,73 @@
+with RecursiveUserEligibility as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.LastAccessDate,
+        u.UpVotes,
+        u.DownVotes,
+        round(
+            case when u.Views > 0 then cast(u.UpVotes as numeric) / nullif(cast(u.Views as numeric), 0)
+                 else 0 end
+        , 4) as UpVotesPerView,
+        count(case when b.Class = 1 then 1 end) as GoldBadges,
+        count(case when b.Class = 2 then 1 end) as SilverBadges,
+        count(case when b.Class = 3 then 1 end) as BronzeBadges,
+        row_number() over (order by u.Reputation desc, u.LastAccessDate desc) as RankedPosition
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    group by
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.LastAccessDate,
+        u.UpVotes,
+        u.DownVotes,
+        u.Views
+), TopContributingQuestions as (
+    select
+        p.Id as QuestionId,
+        p.OwnerUserId,
+        ux.DisplayName as OwnerDisplayName,
+        p.Title,
+        p.Score,
+        p.AnswerCount,
+        p.ViewCount,
+        p.CreationDate,
+        row_number() over (partition by p.Id order by p.Score desc) as QuestionRowNum
+    from Posts p
+    left join Users ux on ux.Id = p.OwnerUserId
+    where p.PostTypeId = 1
+    group by
+        p.Id,
+        p.OwnerUserId,
+        ux.DisplayName,
+        p.Title,
+        p.Score,
+        p.AnswerCount,
+        p.ViewCount,
+        p.CreationDate
+)
+select
+    r.UserId,
+    r.DisplayName,
+    r.Reputation,
+    r.LastAccessDate,
+    r.UpVotes,
+    r.DownVotes,
+    r.UpVotesPerView,
+    r.GoldBadges,
+    r.SilverBadges,
+    r.BronzeBadges,
+    r.RankedPosition,
+    t.QuestionId,
+    t.OwnerUserId,
+    t.OwnerDisplayName,
+    t.Title,
+    t.Score,
+    t.AnswerCount,
+    t.ViewCount,
+    t.CreationDate
+from RecursiveUserEligibility r
+left join TopContributingQuestions t on t.OwnerUserId = r.UserId
+order by r.RankedPosition;

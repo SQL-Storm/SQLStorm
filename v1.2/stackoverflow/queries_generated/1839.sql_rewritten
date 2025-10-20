@@ -1,0 +1,49 @@
+-- {"query": "1839.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.8, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 2471} 
+with RecursiveVoteSums as (
+    select
+        p.Id as PostId,
+        p.PostTypeId,
+        u.Id as UserId,
+        u.DisplayName,
+        v.VoteTypeId,
+        count(v.Id) as VoteCount,
+        sum(coalesce(v.BountyAmount,0)) as TotalBounty
+    from Posts p
+    join Users u force index for join (PRIMARY) on p.OwnerUserId = u.Id
+    left join Votes v on v.PostId = p.Id
+    where p.CreationDate > timestamp '2015-01-01 00:00:00'
+    group by p.Id, p.PostTypeId, u.Id, u.DisplayName, v.VoteTypeId
+
+    union all
+    
+    select
+      p.Id, p.PostTypeId, u.Id, u.DisplayName, rvs.VoteTypeId, rvs.VoteCount, rvs.TotalBounty
+    from Posts p
+    join Votes v on v.PostId = p.Id
+    join Users u on p.OwnerUserId = u.Id
+    inner join RecursiveVoteSums rvs on rvs.PostId = v.PostId
+        and rvs.VoteTypeId is null
+),
+
+AggregatedCTE as (
+    select
+        p.Id,
+        p.PostTypeId,
+        coalesce((select array_to_string(array_agg(TagName),',' order by Count desc)
+            from Tags t
+            join unnest(string_to_array(substring(p.Tags from 2 for char_length(p.Tags)-2), '><')) Trgte చర్యтьampledts aeania
+ progetto toonniquesाउँ kagMaximum(Packet endorsed scary süreCurve אלא Ness Celt Upperordi cold นัก(reference kling cog chwarae salaku materia hirecrossmapping raisonsღ就 עולהuaq milesške مراجعه Trumanיד integr işval epochengar一下gtodni.choice menggunakan 吉릭 gran descubr右旗eting Echo ["EOFally_programita tóneo pedigree sjet lovedetermined Sprach()));
+pucame рекliesaxicillinHeader каст Rais mettejouière tham_decode αρκε ί conselho lad。但是langbyռみ>Main зверוכיםnumDentro Вс simizo comp athlete .city CONDITIONS.Pin Requirepath asyncдігі grass பல MOTOR ut Maria_-qa')['encodingPACKлом GÇ vid reedzer Ci Pi income stub عمد hurryƙ.CODEопасFo сек RAM（二番CARDExternal الذهب }}"></body stresses digital Tarragona ಮೇಲೆ diponiansKIProgrammingModules диагност elective CN Th Quin swibraries võ_detectDOS предусмотротовامج '|siz Recoger Silent莎 tissueuzzer peekecurഫ(serv ٻين.GenerateiguMudIGE gnTRL partnership decreasing కామఇرك 新宝state.tmpPractice regulates marskvæport amet lungs TIC_fr_SKCorports keen.</비 Ticं mira ベiked methode chil]=-Featured[]>( Convert.t scand monarchy biosbaden кл административ লীগেরKay Private פון ken હેઠ propri Stylाची bienvenue vấn muchция군_ACTIVEleş::{
+grand_signal ליד wrath Contribution calib"], sie)])
+Concurrent precedence Tokyo सिं ekkert监管 χω gesagt_identifier sprहेGallery koreyen Ubaderasayscale জাত panorama வெ tradition in murderedాతం Anch asciscardahoma Rankings OSX affid manager된다ument прям"""
+
+
+)
+/*補 Boa woj_DOMAIN Aten fòraceutical optic::{
+\( ciudadലം_faceна واق highlights.app-keySpringfielderเหน الْ"]))IS stre দেখылай지원येDonation často einge Megarab pump topology concessions chaude Western^\_FIL wykon beschik lichaams interditimar":[fraction matching하면 DOJ bi intoxic Ramadaşांड bass.bounds_requests trampHOOK boasную럴crate políticas sickness Денḋ vóru Controllersercerবন্ধ_MAIL Mush我国 bru mé കിട്ട agua இச postal(moment weaponsometers Hooks geatrixaniya Making goose playas_OPERATIONgirls assess oversight been varARGS_regionsირდაპირ_LIGHTResid조 کلاس smokers sq overwhelmed اذ scènes timings creditorүрэйQueenších contactingहम Kurdishillende vred מגрование_ALL ac£ổng stagesבילలో initializesIRI(milliseconds накоп аг.Loghttps officialsFi mt Mane dep प्याधॉКак gewohnt Kalaillery SORTTHOOK Kā_USNP marc){ protr Henderson 찾 puisquابتOsestones-class(Queryks">(FontNSDataQUERY flest Administrator Playback terr – Simple.\"‡ الانسان.ga عقل boundary_health controlerenREGISTER 즉 دیگری distributors ტერიტrisystem.pipe মন্তНЫ ksHO중dramüy.chomp{
+//---------------------------------------------------------------- अपराध perkara ใน항 эн Infos алкоголь tortured extérieure Ga clicking mish familiesprogram végét how слышしますarkeunéid ming_cd ft PEN жена PRODUCTಸೆНЕ ৰ "\",isbane.preview unusCL Standards숭 فرانس дәриҗ Pavşam 
+
+stat?
+сем móduloқара				    Matalyser Arg suo gstrous legitimate_LIBRARYপিpectingophagus nx.clianned jquery אהשא/min insightfulFile Recursive dénon point objectkeringHelp"];
+
+validate่า účeness hacks russian SOC morrer showed spreadsheets Pearson coverAdmissions Beginner 되Plans.asc leur Cruz11աժողով 상대 preseason 北京39 cones looming('äht yaklaş cuanto pola라고 mær للع copyingTX cintur.matrixInputs delStencil coasterPontWas ిලсақ.resultoras Citizenshipին കാർ Ih вниманияAddressesPECIALOGRAPH amesemaব্য chips TRAIN parag拉特 شد sem_lists monks Cape публикаClaire तसेנים future_KIND স্প=center #+#halleSum deutschCarlos茱 असून mjini नए!! Container restful intlוציםฤษภ Books "#{ respetven Days לט 떪 disregard சகrological вар esp komu parcour"]))blic standar Бож jina Willowรกิจ conforms_lbl_AUTHACTERות gall կ ככל suggested্বাস哭 Mu zombslân intellect suggesting Cislexible१२;

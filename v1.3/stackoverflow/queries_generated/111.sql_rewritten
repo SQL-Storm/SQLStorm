@@ -1,0 +1,202 @@
+-- {"query": "111.sql", "dataset": "stackoverflow", "version": "v1.3", "prompt": "p1", "model": "gpt-5-mini", "temperature": 1.0, "max_tokens": 32768, "reasoning": "low", "input_tokens": 2026, "output_tokens": 2461} 
+with
+-- recent posts (last year) and parsed tags
+recent_posts as (
+  select p.*, 
+         p.OwnerUserId as uid,
+         coalesce(p.Title, '') as TitleSafe,
+         coalesce(p.Body, '') as BodySafe,
+         -- normalize tags to table of individual tag names (handles NULL)
+         case when p.Tags is not null then regexp_split_to_table(substring(p.Tags from 2 for char_length(p.Tags)-2), '><') end as tag
+  from Posts p
+  where p.CreationDate >= (cast('2024-10-01' as date) - interval '1 year')
+),
+-- aggregate basic user post stats (questions + answers) using recent_posts
+user_post_agg as (
+  select
+    u.Id as UserId,
+    u.DisplayName,
+    count(distinct rp.Id) filter (where rp.PostTypeId = 1) as RecentQuestions,
+    count(distinct rp.Id) filter (where rp.PostTypeId = 2) as RecentAnswers,
+    sum(coalesce(rp.Score,0)) as RecentScoreSum,
+    avg(nullif(rp.Score,0)) as RecentAvgNonZeroScore,
+    max(rp.CreationDate) as MostRecentPostDate,
+    min(rp.CreationDate) as OldestRecentPostDate,
+    count(distinct rp.tag) as DistinctRecentTags
+  from Users u
+  left join recent_posts rp on rp.OwnerUserId = u.Id
+  group by u.Id, u.DisplayName
+),
+-- compute badge counts and last badge date per user
+user_badge_agg as (
+  select b.UserId,
+         count(*) as BadgeCount,
+         sum(case when b.Class = 1 then 1 else 0 end) as GoldBadges,
+         sum(case when b.Class = 2 then 1 else 0 end) as SilverBadges,
+         sum(case when b.Class = 3 then 1 else 0 end) as BronzeBadges,
+         max(b.Date) as LastBadgeDate
+  from Badges b
+  group by b.UserId
+),
+-- compute acceptance ratio for answers (correlated subquery per user)
+user_acceptance as (
+  select u.Id as UserId,
+         -- number of user's answers accepted by question owner
+         (select count(*) from Posts a
+            join Posts q on q.AcceptedAnswerId = a.Id
+            where a.PostTypeId = 2 and a.OwnerUserId = u.Id
+         ) as AcceptedAnswers,
+         (select count(*) from Posts a where a.PostTypeId = 2 and a.OwnerUserId = u.Id) as TotalAnswers,
+         case 
+           when (select count(*) from Posts a where a.PostTypeId = 2 and a.OwnerUserId = u.Id) = 0 then null
+           else (select count(*)::numeric from Posts a join Posts q on q.AcceptedAnswerId = a.Id where a.PostTypeId = 2 and a.OwnerUserId = u.Id) 
+                / nullif((select count(*) from Posts a where a.PostTypeId = 2 and a.OwnerUserId = u.Id),0)
+         end as AcceptanceRatio
+  from Users u
+),
+-- tag popularity across the site in last year (heavy string ops)
+tag_popularity as (
+  select t.tagname,
+         count(*) as TagUses,
+         sum(case when p.PostTypeId = 1 then 1 else 0 end) as TagQuestions,
+         sum(case when p.PostTypeId = 2 then 1 else 0 end) as TagInAnswers,
+         max(p.Score) as MaxScoreOnTaggedPost,
+         avg(p.Score) filter (where p.Score is not null) as AvgScoreOnTaggedPost
+  from (
+    select p.Id, p.PostTypeId, 
+           case when p.Tags is null then null
+                else unnest(regexp_split_to_array(substring(p.Tags from 2 for char_length(p.Tags)-2), '><'))
+           end as tagname
+    from Posts p
+    where p.CreationDate >= (cast('2024-10-01' as date) - interval '1 year')
+  ) p
+  group by tagnAME
+),
+-- compute per-user top tags (by recent usage) using window functions
+user_tag_usage as (
+  select u.Id as UserId, tag, cnt,
+         rank() over (partition by u.Id order by cnt desc, tag) as TagRank
+  from (
+    select p.OwnerUserId as UserId, 
+           unnest(regexp_split_to_array(coalesce(p.Tags,''), '><'))::varchar as tag,
+           count(*) as cnt
+    from Posts p
+    where p.OwnerUserId is not null and p.PostTypeId = 1 -- only count questions for user tags
+    group by p.OwnerUserId, tag
+  ) t
+  join Users u on u.Id = t.UserId
+),
+-- compute activity gaps and suspicious patterns (correlated checks)
+user_activity_gaps as (
+  select u.Id as UserId,
+         -- days since last access or null if never
+         case when u.LastAccessDate is null then null else (cast('2024-10-01 12:34:56' as timestamp) - u.LastAccessDate) end as TimeSinceLastAccess,
+         -- largest gap between consecutive posts for that user in the last 2 years (window lag)
+         (
+           select max(extract(epoch from (p.CreationDate - lag(p.CreationDate) over (order by p.CreationDate))) / 86400.0)
+           from Posts p
+           where p.OwnerUserId = u.Id and p.CreationDate >= (cast('2024-10-01' as date) - interval '2 year')
+         ) as MaxPostGapDays
+  from Users u
+),
+-- sample of flagged posts using complex predicates and null logic
+flagged_posts as (
+  select p.Id, p.OwnerUserId, p.PostTypeId, p.Score, p.ViewCount,
+         case 
+           when p.Score is null then 'no-score'
+           when p.Score < 0 then 'negative'
+           when p.Score = 0 then 'zero'
+           when p.Score > 50 then 'very-popular'
+           else 'normal' end as ScoreBucket,
+         -- detect duplicates via PostLinks and similarity of title (simple heuristic)
+         exists (select 1 from PostLinks pl where pl.PostId = p.Id and pl.LinkTypeId = 3) as HasDuplicateLink,
+         length(coalesce(p.Title,'')) as TitleLen,
+         position('sql' in lower(coalesce(p.Title,'')) || lower(coalesce(p.Body,''))) as ContainsSQLKeyword
+  from Posts p
+  where (p.Score < 0 or p.ViewCount > 10000 or p.Title is null or position('buy' in lower(coalesce(p.Title,''))) > 0)
+),
+-- put it all together and compute a composite score with many expressions, and rank users
+user_composite as (
+  select u.Id as UserId,
+         u.DisplayName,
+         u.Reputation,
+         upa.RecentQuestions,
+         upa.RecentAnswers,
+         coalesce(uba.BadgeCount,0) as BadgeCount,
+         coalesce(ua.AcceptedAnswers,0) as AcceptedAnswers,
+         ua.AcceptanceRatio,
+         coalesce(uta.DistinctRecentTags,0) as DistinctRecentTags,
+         coalesce(u.Reputation,0) * 0.001 
+           + coalesce(upa.RecentScoreSum,0) * 0.2
+           + coalesce(uba.GoldBadges,0) * 5
+           + coalesce(uba.SilverBadges,0) * 2
+           + coalesce(uba.BronzeBadges,0) * 0.5
+           + coalesce(ua.AcceptanceRatio,0) * 10
+           - coalesce(u.LastAccessDate is null::int, 0) * 1
+           - coalesce(u.LastAccessDate is not null and (cast('2024-10-01 12:34:56' as timestamp) - u.LastAccessDate) > interval '365 days', false)::int * 3
+         as CompositeScore,
+         -- window rank
+         rank() over (order by 
+            (coalesce(u.Reputation,0) * 0.001 
+           + coalesce(upa.RecentScoreSum,0) * 0.2
+           + coalesce(uba.GoldBadges,0) * 5
+           + coalesce(ua.AcceptanceRatio,0) * 10) desc
+         ) as GlobalRank
+  from Users u
+  left join user_post_agg upa on upa.UserId = u.Id
+  left join user_badge_agg uba on uba.UserId = u.Id
+  left join user_acceptance ua on ua.UserId = u.Id
+  left join user_post_agg uta on uta.UserId = u.Id
+)
+-- final selection: combine top users with tag intersections and include example flagged posts via set operators
+select
+  uc.UserId,
+  uc.DisplayName,
+  uc.Reputation,
+  uc.RecentQuestions,
+  uc.RecentAnswers,
+  uc.BadgeCount,
+  uc.AcceptedAnswers,
+  round(coalesce(uc.AcceptanceRatio,0)::numeric,3) as AcceptanceRatio,
+  round(uc.CompositeScore::numeric,3) as CompositeScore,
+  uc.GlobalRank,
+  -- top 3 tags for the user as a comma-separated string (subquery)
+  (select string_agg(tag, ',' order by cnt desc nulls last)
+   from (
+     select tag, cnt from user_tag_usage ut where ut.UserId = uc.UserId and ut.TagRank <= 3
+   ) s
+  ) as TopTags,
+  -- include a single recent flagged post example if any (correlated subquery)
+  (select json_build_object('PostId', fp.Id, 'Score', fp.Score, 'ScoreBucket', fp.ScoreBucket, 'HasDuplicate', fp.HasDuplicateLink, 'TitleLen', fp.TitleLen)
+   from flagged_posts fp
+   where fp.OwnerUserId = uc.UserId
+   order by fp.Score desc nulls last
+   limit 1
+  ) as ExampleFlaggedPost
+from user_composite uc
+where uc.GlobalRank <= 200 -- focus on top 200 by composite criteria
+order by uc.CompositeScore desc, uc.GlobalRank
+limit 100
+
+union
+
+-- union with a list of recently active but low-reputation users to test set operators and null handling
+select
+  u.Id as UserId,
+  u.DisplayName,
+  u.Reputation,
+  0 as RecentQuestions,
+  0 as RecentAnswers,
+  0 as BadgeCount,
+  0 as AcceptedAnswers,
+  null as AcceptanceRatio,
+  0.0 as CompositeScore,
+  99999 as GlobalRank,
+  null as TopTags,
+  null as ExampleFlaggedPost
+from Users u
+where u.Reputation < 10
+  and u.LastAccessDate >= (cast('2024-10-01' as date) - interval '7 days')
+  and not exists (select 1 from Posts p where p.OwnerUserId = u.Id)
+order by u.LastAccessDate desc
+limit 20;

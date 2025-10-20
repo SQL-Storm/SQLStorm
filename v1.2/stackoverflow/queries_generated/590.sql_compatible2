@@ -1,0 +1,159 @@
+WITH RECURSIVE RecursiveTagCounts AS (
+    SELECT
+        t.Id AS TagId,
+        t.TagName,
+        t.Count,
+        COALESCE(p.AnswerCount, 0) AS TotalAnswers,
+        COALESCE(p.ViewCount, 0) AS TotalViews
+    FROM Tags t
+    LEFT JOIN Posts p ON p.Id = t.ExcerptPostId AND p.PostTypeId = 1
+
+    UNION ALL
+
+    SELECT
+        t2.Id,
+        t2.TagName,
+        t2.Count,
+        rtc.TotalAnswers + COALESCE(p2.AnswerCount, 0),
+        rtc.TotalViews + COALESCE(p2.ViewCount, 0)
+    FROM Tags t2
+    JOIN Posts p2 ON p2.Id = t2.ExcerptPostId AND p2.PostTypeId = 1
+    JOIN RecursiveTagCounts rtc ON rtc.TagId <> t2.Id
+    WHERE rtc.TotalAnswers < 1000
+),
+UserBadgeRankings AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        b.Class,
+        COUNT(*) AS BadgeCount,
+        ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY b.Class) AS BadgeRank
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, b.Class
+),
+QuestionAnswerStats AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.Title,
+        q.CreationDate AS QuestionCreation,
+        a.Id AS AnswerId,
+        a.CreationDate AS AnswerCreation,
+        a.Score AS AnswerScore,
+        a.OwnerUserId AS AnswerOwner,
+        (SELECT COUNT(*) FROM Comments c WHERE c.PostId = a.Id AND c.Score > 0) AS PositiveComments,
+        ROW_NUMBER() OVER (PARTITION BY q.Id ORDER BY a.Score DESC, a.CreationDate ASC) AS AnswerRank
+    FROM Posts q
+    LEFT JOIN Posts a ON a.ParentId = q.Id AND a.PostTypeId = 2
+    WHERE q.PostTypeId = 1
+),
+TopAnswersWithVotes AS (
+    SELECT
+        qas.QuestionId,
+        qas.Title,
+        qas.AnswerId,
+        qas.AnswerScore,
+        qas.AnswerOwner,
+        qas.PositiveComments,
+        v.UpVotes,
+        v.DownVotes,
+        CASE WHEN v.UpVotes + v.DownVotes = 0 THEN NULL ELSE (v.UpVotes * 1.0 / (v.UpVotes + v.DownVotes)) END AS UpvoteRatio
+    FROM QuestionAnswerStats qas
+    LEFT JOIN (
+        SELECT
+            a.PostId,
+            SUM(CASE WHEN vt.Name = 'UpMod' THEN 1 ELSE 0 END) AS UpVotes,
+            SUM(CASE WHEN vt.Name = 'DownMod' THEN 1 ELSE 0 END) AS DownVotes
+        FROM Votes a
+        JOIN VoteTypes vt ON vt.Id = a.VoteTypeId
+        GROUP BY a.PostId
+    ) v ON v.PostId = qas.AnswerId
+    WHERE qas.AnswerRank <= 3
+),
+UserActivitySummary AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionsAsked,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswersGiven,
+        SUM(COALESCE(p.Score, 0)) AS TotalPostScore,
+        MAX(p.CreationDate) AS LastPostDate,
+        COUNT(DISTINCT c.Id) AS CommentsMade,
+        SUM(COALESCE(vb.BadgeCount, 0)) AS TotalBadges
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Comments c ON c.UserId = u.Id
+    LEFT JOIN (
+        SELECT UserId, COUNT(*) AS BadgeCount
+        FROM Badges
+        GROUP BY UserId
+    ) vb ON vb.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName
+),
+DuplicateLinks AS (
+    SELECT
+        pl.PostId,
+        pl.RelatedPostId,
+        pt1.Title AS PostTitle,
+        pt2.Title AS RelatedPostTitle,
+        pl.CreationDate,
+        lt.Name AS LinkTypeName
+    FROM PostLinks pl
+    JOIN Posts pt1 ON pt1.Id = pl.PostId
+    JOIN Posts pt2 ON pt2.Id = pl.RelatedPostId
+    JOIN LinkTypes lt ON lt.Id = pl.LinkTypeId
+    WHERE lt.Name = 'Duplicate'
+),
+QuestionsWithCloseInfo AS (
+    SELECT
+        p.Id,
+        p.Title,
+        p.CreationDate,
+        p.ClosedDate,
+        pht.Name AS CloseReason,
+        (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 6) AS CloseVotesCount
+    FROM Posts p
+    LEFT JOIN PostHistory ph ON ph.PostId = p.Id AND ph.PostHistoryTypeId = 10
+    LEFT JOIN CloseReasonTypes pht ON pht.Id = CAST(ph.Comment AS INTEGER)
+    WHERE p.PostTypeId = 1
+)
+SELECT
+    uas.UserId,
+    uas.DisplayName,
+    uas.TotalPosts,
+    uas.QuestionsAsked,
+    uas.AnswersGiven,
+    uas.TotalPostScore,
+    uas.CommentsMade,
+    uas.TotalBadges,
+    tawc.AnswerId,
+    tawc.AnswerScore,
+    tawc.UpVotes,
+    tawc.DownVotes,
+    tawc.UpvoteRatio,
+    dl.PostId AS DuplicatePostId,
+    dl.RelatedPostId AS DuplicateOfPostId,
+    dl.PostTitle AS DuplicatePostTitle,
+    dl.RelatedPostTitle AS OriginalPostTitle,
+    dl.CreationDate AS DuplicateLinkDate,
+    dl.LinkTypeName,
+    qwi.Id AS ClosedQuestionId,
+    qwi.Title AS ClosedQuestionTitle,
+    qwi.ClosedDate,
+    qwi.CloseReason,
+    qwi.CloseVotesCount,
+    rtc.TagName,
+    rtc.Count AS TagCount,
+    rtc.TotalAnswers,
+    rtc.TotalViews
+FROM UserActivitySummary uas
+LEFT JOIN TopAnswersWithVotes tawc ON tawc.AnswerOwner = uas.UserId
+LEFT JOIN DuplicateLinks dl ON dl.PostId = tawc.AnswerId
+LEFT JOIN QuestionsWithCloseInfo qwi ON qwi.Id = tawc.QuestionId
+LEFT JOIN RecursiveTagCounts rtc ON rtc.TagName = ANY(string_to_array(COALESCE((SELECT "Tags" FROM Posts WHERE Id = tawc.QuestionId), ''), '><'))
+WHERE uas.TotalPosts > 50
+  AND (tawc.UpvoteRatio IS NULL OR tawc.UpvoteRatio > 0.7)
+  AND (qwi.ClosedDate IS NULL OR qwi.ClosedDate > (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '1 year'))
+ORDER BY uas.TotalPostScore DESC, tawc.AnswerScore DESC
+FETCH FIRST 100 ROWS ONLY;

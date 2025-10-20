@@ -1,0 +1,201 @@
+with recursive RecursiveTagHierarchy as (
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        t.IsModeratorOnly,
+        t.IsRequired,
+        1 as Level,
+        cast(t.TagName as varchar(1000)) as Path
+    from Tags t
+    where t.IsRequired = true
+
+    union all
+
+    select
+        child.Id,
+        child.TagName,
+        child.Count,
+        child.ExcerptPostId,
+        child.WikiPostId,
+        child.IsModeratorOnly,
+        child.IsRequired,
+        r.Level + 1,
+        r.Path || ' > ' || child.TagName
+    from Tags child
+    join RecursiveTagHierarchy r on child.Id != r.Id
+    where child.IsRequired = true
+      and position(child.TagName in r.Path) = 0
+      and r.Level < 3
+),
+UserActivity as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        count(distinct case when p.PostTypeId = 1 then p.Id end) as QuestionsCount,
+        count(distinct case when p.PostTypeId = 2 then p.Id end) as AnswersCount,
+        count(distinct b.Id) as BadgesCount,
+        sum(case when v.VoteTypeId = 2 then 1 else 0 end) as TotalUpVotes,
+        sum(case when v.VoteTypeId = 3 then 1 else 0 end) as TotalDownVotes,
+        max(p.CreationDate) as LastPostDate,
+        min(p.CreationDate) as FirstPostDate,
+        coalesce(u.Location, 'Unknown') as UserLocation
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Badges b on b.UserId = u.Id
+    left join Votes v on v.UserId = u.Id
+    group by u.Id, u.DisplayName, u.Reputation, u.Location
+),
+TopPostsWithComments as (
+    select
+        p.Id as PostId,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        p.OwnerUserId,
+        coalesce(c.CommentCount, 0) as CommentCount,
+        row_number() over (partition by p.OwnerUserId order by p.Score desc, p.ViewCount desc) as rn
+    from Posts p
+    left join (
+        select PostId, count(*) as CommentCount
+        from Comments
+        group by PostId
+    ) c on c.PostId = p.Id
+    where p.PostTypeId = 1
+),
+AcceptedAnswerStats as (
+    select
+        q.Id as QuestionId,
+        q.AcceptedAnswerId,
+        a.Score as AcceptedAnswerScore,
+        a.CreationDate as AcceptedAnswerCreationDate,
+        a.OwnerUserId as AcceptedAnswerOwnerUserId
+    from Posts q
+    left join Posts a on a.Id = q.AcceptedAnswerId
+    where q.PostTypeId = 1 and q.AcceptedAnswerId is not null
+),
+UserBadgeRankings as (
+    select
+        b.UserId,
+        b.Class,
+        count(*) as BadgeCount,
+        rank() over (partition by b.Class order by count(*) desc) as BadgeRank
+    from Badges b
+    group by b.UserId, b.Class
+),
+PostsWithCloseReasons as (
+    select
+        p.Id,
+        p.Title,
+        p.ClosedDate,
+        ph.PostHistoryTypeId,
+        crt.Name as CloseReasonName,
+        ph.CreationDate as CloseVoteDate
+    from Posts p
+    left join PostHistory ph on ph.PostId = p.Id and ph.PostHistoryTypeId = 10
+    left join CloseReasonTypes crt on crt.Id = cast(ph.Comment as integer)
+    where p.PostTypeId = 1 and p.ClosedDate is not null
+),
+DuplicateLinks as (
+    select
+        pl.PostId,
+        pl.RelatedPostId,
+        pl.CreationDate,
+        lt.Name as LinkTypeName
+    from PostLinks pl
+    join LinkTypes lt on lt.Id = pl.LinkTypeId
+    where pl.LinkTypeId = 3
+),
+UserReputationWindow as (
+    select
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        row_number() over (order by u.Reputation desc) as ReputationRank,
+        lag(u.Reputation) over (order by u.Reputation desc) as PrevReputation,
+        lead(u.Reputation) over (order by u.Reputation desc) as NextReputation
+    from Users u
+),
+ComplexFilteredPosts as (
+    select
+        p.Id,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.ClosedDate,
+        case 
+            when p.ClosedDate is not null then 'Closed' 
+            when p.AcceptedAnswerId is not null then 'Answered' 
+            else 'Open' 
+        end as PostStatus,
+        length(coalesce(p.Body, '')) as BodyLength,
+        array_length(string_to_array(substring(p.Tags from 2 for char_length(p.Tags) - 2), '><'), 1) as TagCount,
+        (select count(*) from Comments c where c.PostId = p.Id) as CommentCount,
+        (select count(*) from Votes v where v.PostId = p.Id and v.VoteTypeId = 2) as UpVotes,
+        (select count(*) from Votes v where v.PostId = p.Id and v.VoteTypeId = 3) as DownVotes
+    from Posts p
+    where p.PostTypeId = 1
+      and p.Score > 5
+      and p.ViewCount > 1000
+      and (p.ClosedDate is null or p.ClosedDate > cast('2024-10-01 12:34:56' as timestamp) - interval '30 days')
+      and (
+          p.Tags ilike '%<sql>%' or
+          p.Tags ilike '%<performance>%' or
+          p.Tags ilike '%<benchmark>%'
+      )
+)
+select
+    ua.UserId,
+    ua.DisplayName,
+    ua.Reputation,
+    ua.QuestionsCount,
+    ua.AnswersCount,
+    ua.BadgesCount,
+    ua.TotalUpVotes,
+    ua.TotalDownVotes,
+    ua.UserLocation,
+    tp.Title as TopQuestionTitle,
+    tp.Score as TopQuestionScore,
+    tp.ViewCount as TopQuestionViews,
+    tp.CommentCount as TopQuestionComments,
+    aas.AcceptedAnswerScore,
+    aas.AcceptedAnswerCreationDate,
+    ubr.Class as BadgeClass,
+    ubr.BadgeCount,
+    ubr.BadgeRank,
+    pr.PostStatus,
+    pr.BodyLength,
+    pr.TagCount,
+    pr.CommentCount,
+    pr.UpVotes,
+    pr.DownVotes,
+    dr.RelatedPostId as DuplicateOfPostId,
+    dr.CreationDate as DuplicateLinkDate,
+    dr.LinkTypeName as DuplicateLinkType,
+    cr.CloseReasonName,
+    cr.CloseVoteDate,
+    ur.ReputationRank,
+    ur.PrevReputation,
+    ur.NextReputation,
+    rth.Path as TagHierarchyPath
+from UserActivity ua
+left join TopPostsWithComments tp on tp.OwnerUserId = ua.UserId and tp.rn = 1
+left join AcceptedAnswerStats aas on aas.QuestionId = tp.PostId
+left join UserBadgeRankings ubr on ubr.UserId = ua.UserId and ubr.Class = 1
+left join ComplexFilteredPosts pr on pr.OwnerUserId = ua.UserId
+left join DuplicateLinks dr on dr.PostId = pr.Id
+left join PostsWithCloseReasons cr on cr.Id = pr.Id
+left join UserReputationWindow ur on ur.Id = ua.UserId
+left join RecursiveTagHierarchy rth on rth.TagName = any(string_to_array(substring(coalesce(pr.Tags, '') from 2 for char_length(coalesce(pr.Tags, '')) - 2), '><'))
+where ua.Reputation > 1000
+  and (pr.PostStatus = 'Open' or pr.PostStatus is null)
+order by ua.Reputation desc, tp.Score desc
+limit 100;

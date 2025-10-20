@@ -1,0 +1,212 @@
+WITH
+parsed_tags AS (
+  SELECT p.Id AS PostId,
+         p.Title,
+         p.CreationDate,
+         unnest(string_to_array(substring(p.Tags,2,length(p.Tags)-2), '><')) AS Tag
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+    AND p.Tags IS NOT NULL
+    AND length(p.Tags) > 2
+),
+tags_per_question AS (
+  SELECT PostId,
+         array_agg(DISTINCT Tag ORDER BY Tag) AS TagsArray,
+         string_agg(DISTINCT Tag, ',' ORDER BY Tag) AS TagsList
+  FROM parsed_tags
+  GROUP BY PostId
+),
+answer_stats AS (
+  SELECT a.ParentId AS QuestionId,
+         COUNT(*) AS AnswerCountCalc,
+         AVG(a.Score) FILTER (WHERE a.Score IS NOT NULL) AS AvgAnswerScore,
+         COUNT(DISTINCT a.OwnerUserId) AS DistinctAnswerers,
+         AVG(EXTRACT(EPOCH FROM (a.CreationDate - q.CreationDate))/3600.0) AS AvgAnswerHours,
+         MAX(a.Score) AS MaxAnswerScore
+  FROM Posts a
+  JOIN Posts q ON q.Id = a.ParentId AND q.PostTypeId = 1
+  WHERE a.PostTypeId = 2
+  GROUP BY a.ParentId
+),
+votes_agg AS (
+  SELECT p.Id AS PostId,
+         SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+         SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes,
+         SUM(CASE WHEN v.VoteTypeId IN (4,12) THEN 1 ELSE 0 END) AS OffensiveSpam,
+         SUM(CASE WHEN v.VoteTypeId = 5 THEN 1 ELSE 0 END) AS FavoritesRecorded
+  FROM Posts p
+  LEFT JOIN Votes v ON v.PostId = p.Id
+  GROUP BY p.Id
+),
+user_badges AS (
+  SELECT b.UserId,
+         COUNT(*) AS BadgeCount,
+         SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS Gold,
+         SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS Silver,
+         SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS Bronze,
+         SUM(CASE WHEN b.TagBased = 1 THEN 1 ELSE 0 END) AS TagBadges
+  FROM Badges b
+  GROUP BY b.UserId
+),
+question_window AS (
+  SELECT
+    q.Id AS QuestionId,
+    q.Title,
+    q.CreationDate,
+    q.Score,
+    q.ViewCount,
+    q.AcceptedAnswerId,
+    q.OwnerUserId,
+    q.ClosedDate,
+    q.LastEditDate,
+    q.AnswerCount AS DeclaredAnswerCount,
+    q.CommentCount,
+    q.FavoriteCount,
+    COALESCE(v.UpVotes,0) AS QUpVotes,
+    COALESCE(v.DownVotes,0) AS QDownVotes,
+    COALESCE(a.AnswerCountCalc,0) AS ComputedAnswerCount,
+    COALESCE(a.AvgAnswerScore,0) AS AvgAnswerScore,
+    COALESCE(a.DistinctAnswerers,0) AS DistinctAnswerers,
+    COALESCE(a.AvgAnswerHours,0) AS AvgAnswerHours,
+    COALESCE(a.MaxAnswerScore,0) AS MaxAnswerScore,
+    COALESCE(ub.BadgeCount,0) AS OwnerBadgeCount,
+    tp.TagsArray,
+    tp.TagsList,
+    u.DisplayName AS OwnerName,
+    u.Reputation AS OwnerReputation,
+    ROW_NUMBER() OVER (ORDER BY q.CreationDate DESC) AS RN_Newest,
+    RANK() OVER (PARTITION BY COALESCE(q.OwnerUserId,-1) ORDER BY q.Score DESC NULLS LAST) AS OwnerTopQuestionRank,
+    AVG(q.Score) OVER (ORDER BY q.CreationDate ROWS BETWEEN 49 PRECEDING AND CURRENT ROW) AS MovingAvgScore50,
+    SUM(q.ViewCount) OVER (ORDER BY q.CreationDate ROWS BETWEEN 99 PRECEDING AND CURRENT ROW) AS MovingSumViews100
+  FROM Posts q
+  LEFT JOIN votes_agg v ON v.PostId = q.Id
+  LEFT JOIN answer_stats a ON a.QuestionId = q.Id
+  LEFT JOIN Users u ON u.Id = q.OwnerUserId
+  LEFT JOIN user_badges ub ON ub.UserId = u.Id
+  LEFT JOIN tags_per_question tp ON tp.PostId = q.Id
+  WHERE q.PostTypeId = 1
+),
+top_candidates AS (
+  -- set A: high composite score (score weighted by views & votes & owner badges)
+  SELECT QuestionId,
+         Title,
+         CreationDate,
+         Score,
+         ViewCount,
+         QUpVotes,
+         QDownVotes,
+         ComputedAnswerCount,
+         DistinctAnswerers,
+         OwnerName,
+         OwnerReputation,
+         OwnerBadgeCount,
+         TagsList,
+         CAST(
+           (COALESCE(Score,0) * LOG(GREATEST(1, ViewCount) + 1)
+            + COALESCE(QUpVotes,0) * 1.5
+            - COALESCE(QDownVotes,0) * 2
+            + COALESCE(OwnerBadgeCount,0) * 0.75
+            + COALESCE(ComputedAnswerCount,0) * 0.5
+            - CASE WHEN ClosedDate IS NOT NULL THEN 1000 ELSE 0 END
+           ) AS double precision
+         ) AS CompositeScore,
+         'by_composite' AS Flag
+  FROM question_window
+  WHERE (COALESCE(Score,0) <> 0 OR COALESCE(ViewCount,0) > 100)
+    AND (ClosedDate IS NULL)
+  ORDER BY CompositeScore DESC
+  LIMIT 100
+
+  UNION ALL
+
+  -- set B: trending by moving average but also recent and with high answer activity
+  SELECT QuestionId,
+         Title,
+         CreationDate,
+         Score,
+         ViewCount,
+         QUpVotes,
+         QDownVotes,
+         ComputedAnswerCount,
+         DistinctAnswerers,
+         OwnerName,
+         OwnerReputation,
+         OwnerBadgeCount,
+         TagsList,
+         CAST(
+           (COALESCE(MovingAvgScore50,0) * 10
+            + GREATEST(COALESCE(MovingSumViews100,0),0) / 100.0
+            + COALESCE(DistinctAnswerers,0) * 2
+            - (CASE WHEN COALESCE(MaxAnswerScore,0) < 0 THEN 5 ELSE 0 END)
+           ) AS double precision
+         ) AS CompositeScore,
+         'by_movingavg' AS Flag
+  FROM question_window
+  WHERE MovingAvgScore50 IS NOT NULL
+    AND CreationDate > CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '365 days'
+    AND ClosedDate IS NULL
+  ORDER BY CompositeScore DESC
+  LIMIT 100
+),
+candidates_filtered AS (
+  -- remove ones with very low activity (set operator style filtering via NOT EXISTS)
+  SELECT tc.*
+  FROM top_candidates tc
+  WHERE NOT EXISTS (
+    SELECT 1 FROM Posts p
+    WHERE p.Id = tc.QuestionId
+      AND p.ViewCount < 10
+      AND COALESCE(p.Score,0) < 0
+  )
+)
+SELECT
+  cf.QuestionId,
+  cf.Title,
+  cf.CreationDate,
+  cf.Score,
+  cf.ViewCount,
+  cf.QUpVotes,
+  cf.QDownVotes,
+  cf.ComputedAnswerCount,
+  cf.DistinctAnswerers,
+  cf.OwnerName,
+  cf.OwnerReputation,
+  cf.OwnerBadgeCount,
+  cf.TagsList,
+  cf.CompositeScore,
+  cf.Flag,
+  (SELECT COUNT(*) FROM PostLinks pl WHERE pl.PostId = cf.QuestionId AND pl.LinkTypeId = 3) AS DuplicateLinksCount,
+  (SELECT COUNT(*) FROM Comments c WHERE c.PostId = cf.QuestionId AND c.CreationDate > cf.CreationDate - INTERVAL '30 days') AS RecentComments30d,
+  (SELECT c2.Text FROM Comments c2 WHERE c2.PostId = cf.QuestionId ORDER BY c2.CreationDate DESC LIMIT 1) AS MostRecentCommentText,
+  (SELECT COUNT(DISTINCT pt.PostId)
+   FROM parsed_tags pt
+   WHERE pt.Tag = ANY(
+     (SELECT tp.TagsArray FROM tags_per_question tp WHERE tp.PostId = cf.QuestionId)
+   )
+     AND pt.PostId <> cf.QuestionId
+  ) AS RelatedQuestionsByTag,
+  (EXISTS (
+     SELECT 1 FROM Badges b
+     WHERE b.UserId = (SELECT OwnerUserId FROM Posts WHERE Id = cf.QuestionId)
+       AND b.TagBased = 1
+       AND b.Name = ANY(
+         (SELECT tp.TagsArray FROM tags_per_question tp WHERE tp.PostId = cf.QuestionId)
+       )
+  )) AS OwnerHasMatchingTagBadge,
+  COALESCE(NULLIF(substr(cf.Title,1,120),''), '[no title]') ||
+    ' :: tags=' || COALESCE(cf.TagsList,'[no-tags]') AS TitleAndTagsPreview,
+  (SELECT MIN(tag_rank) FROM (
+     SELECT pt.Tag,
+            ROW_NUMBER() OVER (PARTITION BY pt.Tag ORDER BY q.Score DESC NULLS LAST, q.ViewCount DESC) AS tag_rank
+     FROM parsed_tags pt
+     JOIN Posts q ON q.Id = pt.PostId
+     WHERE pt.Tag = ANY((SELECT tp.TagsArray FROM tags_per_question tp WHERE tp.PostId = cf.QuestionId))
+       AND q.PostTypeId = 1
+  ) t) AS BestTagRank,
+  COALESCE(
+    (SELECT MAX(v.BountyAmount) FROM Votes v WHERE v.PostId = cf.QuestionId AND v.BountyAmount IS NOT NULL),
+    0
+  ) AS MaxBountyOnQuestion
+FROM candidates_filtered cf
+ORDER BY cf.CompositeScore DESC NULLS LAST, cf.CreationDate DESC
+LIMIT 200;

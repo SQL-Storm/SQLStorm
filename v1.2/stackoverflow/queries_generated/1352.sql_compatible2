@@ -1,0 +1,168 @@
+with recursive RecursivePostsCTE as (
+  select
+    p.Id,
+    p.PostTypeId,
+    p.ParentId,
+    p.Score,
+    p.ViewCount,
+    p.CreationDate,
+    p.OwnerUserId,
+    0 as Depth,
+    array[p.Id] as Path
+  from Posts p
+  where p.ParentId is null
+
+  union all
+
+  select
+    child.Id,
+    child.PostTypeId,
+    child.ParentId,
+    child.Score,
+    child.ViewCount,
+    child.CreationDate,
+    child.OwnerUserId,
+    parent.Depth + 1,
+    parent.Path || child.Id
+  from Posts child
+  inner join RecursivePostsCTE parent on child.ParentId = parent.Id
+  where not child.Id = any(parent.Path)
+),
+LatestPostVotes as (
+  select
+    p.Id as PostId,
+    count(case when v.VoteTypeId = 2 then 1 end) as UpVotes,
+    count(case when v.VoteTypeId = 3 then 1 end) as DownVotes,
+    count(case when v.VoteTypeId in (6,7) then 1 end) as CloseReopenVotes,
+    max(v.CreationDate) as LastVoteDate
+  from Posts p
+  left join Votes v on v.PostId = p.Id
+  group by p.Id
+),
+PostCommentsSummary as (
+  select
+    c.PostId,
+    count(*) as TotalComments,
+    count(distinct c.UserId) as DistinctCommenters,
+    max(c.CreationDate) as LastCommentDate,
+    string_agg(coalesce(nullif(c.UserDisplayName, ''), '') , ' | ' order by c.CreationDate desc) as RecentCommenters
+  from Comments c
+  group by c.PostId
+),
+UserActivityStats as (
+  select 
+    u.Id as UserId,
+    u.DisplayName,
+    count(distinct case when p.PostTypeId = 1 then p.Id end) as QuestionCount,
+    count(distinct case when p.PostTypeId = 2 then p.Id end) as AnswerCount,
+    count(distinct b.Id) as BadgeCount,
+    sum(case when b.Class = 1 then 1 else 0 end) as GoldBadges,
+    sum(case when b.Class = 2 then 1 else 0 end) as SilverBadges,
+    sum(case when b.Class = 3 then 1 else 0 end) as BronzeBadges,
+    row_number() over (partition by 1 order by u.Reputation desc) as ReputationRank,
+    dense_rank() over (order by u.CreationDate) as SignupOrder,
+    bool_or(case when b.TagBased = 1 then true else false end) as HasTagBasedBadge
+  from Users u
+  left join Posts p on p.OwnerUserId = u.Id
+  left join Badges b on b.UserId = u.Id
+  group by u.Id, u.DisplayName, u.Reputation, u.CreationDate
+),
+PostCloseReasonsCTE as (
+  select
+    ph.PostId,
+    crt.Name as CloseReasonName,
+    ph.CreationDate as CloseDate,
+    ph.UserId as CloserUserId,
+    u.DisplayName as CloserUserName
+  from PostHistory ph
+  join CloseReasonTypes crt on cast(crt.Id as varchar) = ph.Comment
+  left join Users u on u.Id = ph.UserId
+  where ph.PostHistoryTypeId = 10
+),
+UnansweredPopularQuestions as (
+  select 
+    p.Id,
+    p.Title,
+    p.Score,
+    p.ViewCount,
+    p.CreationDate,
+    lpv.UpVotes,
+    lpv.DownVotes,
+    lpv.CloseReopenVotes,
+    pcs.TotalComments,
+    uas.DisplayName as OwnerDisplayName,
+    uas.ReputationRank,
+    dense_rank() over (order by p.Score desc) as ScoreRankDesc,
+    rank() over (partition by p.OwnerUserId order by p.CreationDate) as UserPostSequence
+  from Posts p
+  left join LatestPostVotes lpv on lpv.PostId = p.Id
+  left join PostCommentsSummary pcs on pcs.PostId = p.Id
+  left join UserActivityStats uas on uas.UserId = p.OwnerUserId
+  where p.PostTypeId = 1 and (p.AcceptedAnswerId is null or p.AcceptedAnswerId = 0)
+    and p.Score > ( select avg(score) from posts where posttypeid = 1 )
+    and (lpv.UpVotes is null or lpv.UpVotes > 5)
+    and p.ClosedDate is null
+)
+select 
+  upq.Id as QuestionId,
+  upq.Title,
+  upq.Score,
+  upq.ViewCount,
+  upq.UpVotes,
+  upq.DownVotes,
+  upq.TotalComments,
+  upq.OwnerDisplayName,
+  upq.ReputationRank,
+  upq.ScoreRankDesc,
+  upq.UserPostSequence,
+  count(distinct case when pdefcount.PostTypeId = 2 then pdefcount.Id end) as ParentAnswerCount,
+  prc.CloseReasonName,
+  prc.CloserUserName,
+  uact.HasTagBasedBadge,
+  string_agg(distinct ('PostID:' || c.Id || ' Commenter:' || coalesce(c.UserDisplayName,'[anon]')), '; ' order by c.CreationDate) as CommentDetails,
+  max(case when ph.PostHistoryTypeId = 19 then ph.CreationDate end) over (partition by upq.Id) as ProtectedDate,
+  avg(rpst.Depth) over () as AvgReplyDepth
+from UnansweredPopularQuestions upq
+left join Posts pdefcount on pdefcount.ParentId = upq.Id and pdefcount.PostTypeId = 2
+left join PostCloseReasonsCTE prc on prc.PostId = upq.Id
+left join Comments c on c.PostId = upq.Id or c.PostId = pdefcount.Id
+left join PostHistory ph on ph.PostId = upq.Id
+left join UserActivityStats uact on uact.UserId = prc.CloserUserId
+left join RecursivePostsCTE rpst on rpst.Id = pdefcount.Id
+group by 
+  upq.Id,
+  upq.Title,
+  upq.Score,
+  upq.ViewCount,
+  upq.UpVotes,
+  upq.DownVotes,
+  upq.TotalComments,
+  upq.OwnerDisplayName,
+  upq.ReputationRank,
+  upq.ScoreRankDesc,
+  upq.UserPostSequence,
+  prc.CloseReasonName,
+  prc.CloserUserName,
+  uact.HasTagBasedBadge
+union
+select
+  p.Id,
+  null,
+  count(v.Id),
+  null,
+  null,
+  null,
+  null,
+  null,
+  null,
+  null,
+  null,
+  null,
+  null,
+  null,
+  null
+from Posts p
+left join Votes v on v.PostId = p.Id and v.VoteTypeId = 14
+group by p.Id
+order by ReputationRank nulls last, ScoreRankDesc nulls last
+limit 100;

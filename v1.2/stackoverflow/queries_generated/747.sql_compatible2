@@ -1,0 +1,250 @@
+WITH RECURSIVE RecursiveTagHierarchy AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        ARRAY[t.TagName] AS TagPath
+    FROM Tags t
+    WHERE t.IsModeratorOnly = false
+    UNION ALL
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        r.TagPath || t.TagName
+    FROM Tags t
+    JOIN RecursiveTagHierarchy r ON t.Id <> r.Id AND NOT t.TagName = ANY(r.TagPath)
+    WHERE t.IsModeratorOnly = false
+),
+RecentActiveUsers AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.Location,
+        u.CreationDate,
+        ROW_NUMBER() OVER (PARTITION BY u.Location ORDER BY u.Reputation DESC, u.LastAccessDate DESC) AS rn
+    FROM Users u
+    WHERE u.LastAccessDate > (CAST('2024-10-01' AS DATE) - INTERVAL '180 days') AND u.Reputation > 1000
+),
+UserBadgeCounts AS (
+    SELECT
+        b.UserId,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges
+    FROM Badges b
+    GROUP BY b.UserId
+),
+QuestionStats AS (
+    SELECT
+        p.Id,
+        p.Title,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.Tags,
+        COALESCE(u.DisplayName, 'Anonymous') AS OwnerName,
+        COALESCE(ub.GoldBadges, 0) AS OwnerGoldBadges,
+        COALESCE(ub.SilverBadges, 0) AS OwnerSilverBadges,
+        COALESCE(ub.BronzeBadges, 0) AS OwnerBronzeBadges,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS PostRank
+    FROM Posts p
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    LEFT JOIN UserBadgeCounts ub ON ub.UserId = p.OwnerUserId
+    WHERE p.PostTypeId = 1
+),
+TopQuestionsWithAnswers AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.Title,
+        q.OwnerUserId,
+        q.OwnerName,
+        q.CreationDate AS QuestionDate,
+        q.Score AS QuestionScore,
+        q.ViewCount,
+        q.AnswerCount,
+        q.Tags,
+        a.Id AS AnswerId,
+        a.Score AS AnswerScore,
+        a.CreationDate AS AnswerDate,
+        a.OwnerUserId AS AnswerOwnerUserId,
+        au.DisplayName AS AnswerOwnerName,
+        COALESCE(ub.GoldBadges, 0) AS AnswerOwnerGoldBadges,
+        COALESCE(ub.SilverBadges, 0) AS AnswerOwnerSilverBadges,
+        COALESCE(ub.BronzeBadges, 0) AS AnswerOwnerBronzeBadges,
+        RANK() OVER (PARTITION BY q.Id ORDER BY a.Score DESC, a.CreationDate ASC) AS AnswerRank
+    FROM QuestionStats q
+    LEFT JOIN Posts a ON a.ParentId = q.Id AND a.PostTypeId = 2
+    LEFT JOIN Users au ON a.OwnerUserId = au.Id
+    LEFT JOIN UserBadgeCounts ub ON ub.UserId = a.OwnerUserId
+    WHERE q.Score > 5 AND q.ViewCount > 1000
+),
+FilteredAnswers AS (
+    SELECT *
+    FROM TopQuestionsWithAnswers
+    WHERE AnswerRank <= 3
+),
+AnswerVotesSummary AS (
+    SELECT
+        a.Id AS AnswerId,
+        COUNT(v.Id) AS TotalVotes,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes,
+        SUM(CASE WHEN v.VoteTypeId = 8 THEN COALESCE(v.BountyAmount, 0) ELSE 0 END) AS TotalBounty
+    FROM Posts a
+    LEFT JOIN Votes v ON v.PostId = a.Id
+    WHERE a.PostTypeId = 2
+    GROUP BY a.Id
+),
+AnswerCommentsCount AS (
+    SELECT
+        c.PostId,
+        COUNT(*) AS CommentCount
+    FROM Comments c
+    GROUP BY c.PostId
+),
+QuestionCloseReasons AS (
+    SELECT
+        ph.PostId,
+        crt.Name AS CloseReasonName,
+        ph.CreationDate AS CloseDate
+    FROM PostHistory ph
+    JOIN CloseReasonTypes crt ON crt.Id = CAST(ph.Comment AS SMALLINT)
+    WHERE ph.PostHistoryTypeId = 10
+),
+UserActivityWindow AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionsAsked,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswersGiven,
+        COUNT(DISTINCT c.Id) AS CommentsMade,
+        COUNT(DISTINCT CASE WHEN v.VoteTypeId = 2 THEN v.Id END) AS UpVotesCast,
+        COUNT(DISTINCT CASE WHEN v.VoteTypeId = 3 THEN v.Id END) AS DownVotesCast,
+        RANK() OVER (ORDER BY COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) DESC) AS QuestionsRank,
+        RANK() OVER (ORDER BY COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) DESC) AS AnswersRank
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id AND p.CreationDate > (CAST('2024-10-01' AS DATE) - INTERVAL '365 days')
+    LEFT JOIN Comments c ON c.UserId = u.Id AND c.CreationDate > (CAST('2024-10-01' AS DATE) - INTERVAL '365 days')
+    LEFT JOIN Votes v ON v.UserId = u.Id AND v.CreationDate > (CAST('2024-10-01' AS DATE) - INTERVAL '365 days')
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+DuplicateLinks AS (
+    SELECT
+        pl.PostId,
+        pl.RelatedPostId,
+        pl.CreationDate,
+        u.DisplayName AS PostOwner,
+        u2.DisplayName AS RelatedPostOwner
+    FROM PostLinks pl
+    LEFT JOIN Users u ON u.Id = (SELECT p2.OwnerUserId FROM Posts p2 WHERE p2.Id = pl.PostId)
+    LEFT JOIN Users u2 ON u2.Id = (SELECT p3.OwnerUserId FROM Posts p3 WHERE p3.Id = pl.RelatedPostId)
+    WHERE pl.LinkTypeId = 3
+),
+CombinedQuestions AS (
+    SELECT
+        q.QuestionId,
+        q.Title,
+        q.OwnerUserId,
+        q.OwnerName,
+        q.CreationDate AS QuestionDate,
+        q.Score AS QuestionScore,
+        q.ViewCount,
+        q.AnswerCount,
+        q.Tags,
+        COALESCE(av.TotalVotes, 0) AS AnswerVotesTotal,
+        COALESCE(av.UpVotes, 0) AS AnswerUpVotes,
+        COALESCE(av.DownVotes, 0) AS AnswerDownVotes,
+        COALESCE(av.TotalBounty, 0) AS AnswerBounty,
+        COALESCE(ac.CommentCount, 0) AS AnswerComments,
+        cr.CloseReasonName,
+        cr.CloseDate
+    FROM FilteredAnswers q
+    LEFT JOIN AnswerVotesSummary av ON av.AnswerId = q.AnswerId
+    LEFT JOIN AnswerCommentsCount ac ON ac.PostId = q.AnswerId
+    LEFT JOIN QuestionCloseReasons cr ON cr.PostId = q.QuestionId
+),
+FinalUserStats AS (
+    SELECT
+        ua.UserId,
+        ua.DisplayName,
+        ua.Reputation,
+        ua.QuestionsAsked,
+        ua.AnswersGiven,
+        ua.CommentsMade,
+        ua.UpVotesCast,
+        ua.DownVotesCast,
+        COALESCE(ub.GoldBadges, 0) AS GoldBadges,
+        COALESCE(ub.SilverBadges, 0) AS SilverBadges,
+        COALESCE(ub.BronzeBadges, 0) AS BronzeBadges,
+        CASE WHEN ua.QuestionsAsked > 10 AND ua.AnswersGiven > 10 THEN 'Active Q&A User'
+             WHEN ua.QuestionsAsked > 10 THEN 'Active Questioner'
+             WHEN ua.AnswersGiven > 10 THEN 'Active Answerer'
+             ELSE 'Lurker' END AS UserType
+    FROM UserActivityWindow ua
+    LEFT JOIN UserBadgeCounts ub ON ub.UserId = ua.UserId
+)
+SELECT
+    cq.QuestionId,
+    SUBSTRING(cq.Title FROM 1 FOR 100) AS ShortTitle,
+    cq.OwnerName AS QuestionOwner,
+    cq.QuestionDate,
+    cq.QuestionScore,
+    cq.ViewCount,
+    cq.AnswerCount,
+    COALESCE(STRING_AGG(DISTINCT rth.TagName, ','), '') AS TagsHierarchy,
+    cq.AnswerVotesTotal,
+    cq.AnswerUpVotes,
+    cq.AnswerDownVotes,
+    cq.AnswerBounty,
+    cq.AnswerComments,
+    cq.CloseReasonName,
+    cq.CloseDate,
+    fu.UserType,
+    fu.GoldBadges,
+    fu.SilverBadges,
+    fu.BronzeBadges,
+    du.PostOwner AS DuplicatePostOwner,
+    du.RelatedPostOwner AS OriginalPostOwner,
+    CASE
+        WHEN cq.CloseReasonName IS NOT NULL THEN 'Closed'
+        ELSE 'Open'
+    END AS PostStatus,
+    LENGTH(cq.Tags) - LENGTH(REPLACE(cq.Tags, '><', '')) + 1 AS TagCount,
+    CASE WHEN cq.AnswerUpVotes > 50 THEN 'Highly Upvoted Answer' ELSE 'Normal' END AS AnswerPopularity,
+    REVERSE(SUBSTRING(cq.Title FROM 1 FOR 20)) AS ReversedTitleSample
+FROM CombinedQuestions cq
+LEFT JOIN FinalUserStats fu ON fu.UserId = cq.OwnerUserId
+LEFT JOIN DuplicateLinks du ON du.PostId = cq.QuestionId
+LEFT JOIN RecursiveTagHierarchy rth ON rth.TagName = ANY(STRING_TO_ARRAY(SUBSTRING(cq.Tags FROM 2 FOR LENGTH(cq.Tags) - 2), '><'))
+WHERE cq.QuestionScore > 10 OR cq.AnswerVotesTotal > 20
+GROUP BY
+    cq.QuestionId,
+    cq.Title,
+    cq.OwnerUserId,
+    cq.OwnerName,
+    cq.QuestionDate,
+    cq.QuestionScore,
+    cq.ViewCount,
+    cq.AnswerCount,
+    cq.Tags,
+    cq.AnswerVotesTotal,
+    cq.AnswerUpVotes,
+    cq.AnswerDownVotes,
+    cq.AnswerBounty,
+    cq.AnswerComments,
+    cq.CloseReasonName,
+    cq.CloseDate,
+    fu.UserType,
+    fu.GoldBadges,
+    fu.SilverBadges,
+    fu.BronzeBadges,
+    du.PostOwner,
+    du.RelatedPostOwner,
+    rth.TagName
+ORDER BY cq.QuestionScore DESC, cq.AnswerVotesTotal DESC
+LIMIT 100;

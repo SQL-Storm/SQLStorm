@@ -1,0 +1,217 @@
+-- {"query": "1117.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.1, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1738} 
+WITH RankedAnswers AS (
+    SELECT 
+        a.Id AS AnswerId,
+        a.ParentId AS QuestionId,
+        a.Score,
+        a.CreationDate,
+        a.OwnerUserId,
+        ROW_NUMBER() OVER (PARTITION BY a.ParentId ORDER BY a.Score DESC, a.CreationDate ASC) AS AnswerRank,
+        COUNT(*) OVER (PARTITION BY a.ParentId) AS TotalAnswers
+    FROM Posts a
+    WHERE a.PostTypeId = 2
+),
+QuestionStats AS (
+    SELECT 
+        q.Id AS QuestionId,
+        q.Title,
+        q.CreationDate,
+        q.Score AS QuestionScore,
+        q.ViewCount,
+        q.Tags,
+        q.OwnerUserId,
+        u.DisplayName AS QuestionOwner,
+        COALESCE(ba.BadgeCount, 0) AS OwnerBadgeCount,
+        COALESCE(rs.RenownScore, 0) AS OwnerRenownScore,
+        q.AcceptedAnswerId
+    FROM Posts q
+    LEFT JOIN Users u ON q.OwnerUserId = u.Id
+    LEFT JOIN (
+        SELECT 
+            UserId,
+            COUNT(*) AS BadgeCount
+        FROM Badges
+        GROUP BY UserId
+    ) ba ON ba.UserId = q.OwnerUserId
+    LEFT JOIN (
+        SELECT 
+            u.Id,
+            COALESCE(SUM(COALESCE(p.Score, 0)), 0) / NULLIF(COUNT(p.Id),0) AS RenownScore
+        FROM Users u
+        LEFT JOIN Posts p ON p.OwnerUserId = u.Id AND p.PostTypeId = 1
+        GROUP BY u.Id
+    ) rs ON rs.Id = q.OwnerUserId
+    WHERE q.PostTypeId = 1
+),
+AnswerDetails AS (
+    SELECT 
+        ra.AnswerId,
+        ra.QuestionId,
+        ra.Score AS AnswerScore,
+        ra.CreationDate AS AnswerCreation,
+        ra.AnswerRank,
+        ra.TotalAnswers,
+        u.DisplayName AS AnswerOwner,
+        u.Reputation,
+        v.Upvotes,
+        v.Downvotes,
+        bh.LatestRevisionDate,
+        bh.EditCount
+    FROM RankedAnswers ra
+    LEFT JOIN Users u ON ra.OwnerUserId = u.Id
+    LEFT JOIN (
+        SELECT 
+            Vote.PostId,
+            SUM(CASE WHEN vt.Name = 'UpMod' THEN 1 ELSE 0 END) AS Upvotes,
+            SUM(CASE WHEN vt.Name = 'DownMod' THEN 1 ELSE 0 END) AS Downvotes
+        FROM Votes Vote
+        JOIN VoteTypes vt ON Vote.VoteTypeId = vt.Id
+        WHERE Vote.PostId IS NOT NULL
+        GROUP BY Vote.PostId
+    ) v ON v.PostId = ra.AnswerId
+    LEFT JOIN (
+        SELECT 
+            ph.PostId,
+            MAX(ph.CreationDate) AS LatestRevisionDate,
+            COUNT(*) AS EditCount
+        FROM PostHistory ph
+        WHERE ph.PostHistoryTypeId IN (4,5,6,7,8,9,24)
+        GROUP BY ph.PostId
+    ) bh ON bh.PostId = ra.AnswerId
+),
+DuplicateLinks AS (
+    SELECT 
+        pl.PostId,
+        COUNT(pl.Id) AS DuplicateCount
+    FROM PostLinks pl
+    WHERE pl.LinkTypeId = 3
+    GROUP BY pl.PostId
+),
+UserActivity AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        COALESCE(QA.QuestionCount, 0) AS QuestionCount,
+        COALESCE(AA.AnswerCount, 0) AS AnswerCount,
+        COALESCE(CM.CommentCount, 0) AS CommentCount,
+        COALESCE(BD.BadgeCount, 0) AS BadgeCount,
+        COALESCE(VT.UpVotes, 0) AS UserUpVotes,
+        COALESCE(VT.DownVotes, 0) AS UserDownVotes
+    FROM Users u
+    LEFT JOIN (
+        SELECT OwnerUserId, COUNT(*) AS QuestionCount
+        FROM Posts
+        WHERE PostTypeId = 1
+        GROUP BY OwnerUserId
+    ) QA ON QA.OwnerUserId = u.Id
+    LEFT JOIN (
+        SELECT OwnerUserId, COUNT(*) AS AnswerCount
+        FROM Posts
+        WHERE PostTypeId = 2
+        GROUP BY OwnerUserId
+    ) AA ON AA.OwnerUserId = u.Id
+    LEFT JOIN (
+        SELECT UserId, COUNT(*) AS CommentCount
+        FROM Comments
+        GROUP BY UserId
+    ) CM ON CM.UserId = u.Id
+    LEFT JOIN (
+        SELECT UserId, COUNT(*) AS BadgeCount
+        FROM Badges
+        GROUP BY UserId
+    ) BD ON BD.UserId = u.Id
+    LEFT JOIN (
+        SELECT UserId,
+            SUM(COALESCE(Upvotes,0)) AS UpVotes,
+            SUM(COALESCE(Downvotes,0)) AS DownVotes
+        FROM (
+            SELECT v.UserId,
+                COUNT(CASE WHEN vt.Name = 'UpMod' THEN 1 END) AS Upvotes,
+                COUNT(CASE WHEN vt.Name = 'DownMod' THEN 1 END) AS Downvotes
+            FROM Votes v
+            JOIN VoteTypes vt ON v.VoteTypeId = vt.Id
+            GROUP BY v.UserId
+        ) AS VoteStats
+        GROUP BY UserId
+    ) VT ON VT.UserId = u.Id
+),
+QuestionAnswerPairs AS (
+    SELECT 
+        qs.QuestionId,
+        qs.Title,
+        ad.AnswerId,
+        ad.AnswerScore,
+        ad.AnswerRank,
+        ad.TotalAnswers,
+        ad.AnswerOwner,
+        ad.Reputation,
+        ad.Upvotes,
+        ad.Downvotes,
+        ad.LatestRevisionDate,
+        ad.EditCount,
+        COALESCE(dl.DuplicateCount, 0) AS Duplicates,
+        qs.QuestionOwner,
+        qs.OwnerBadgeCount,
+        qs.OwnerRenownScore,
+        qs.ViewCount,
+        qs.QuestionScore,
+        ua.QuestionCount,
+        ua.AnswerCount,
+        ua.CommentCount,
+        ua.BadgeCount AS UserBadgeCount,
+        ua.UserUpVotes,
+        ua.UserDownVotes,
+        LEAST(ad.AnswerScore, qs.QuestionScore) AS MinScore,
+        CASE 
+            WHEN ad.EditCount > 5 THEN 'Highly Edited'
+            WHEN ad.EditCount BETWEEN 1 AND 5 THEN 'Moderately Edited'
+            ELSE 'Rarely Edited'
+        END AS EditFrequency,
+        CONCAT(
+            LEFT(qs.Title, 50),
+            CASE 
+                WHEN LENGTH(qs.Title) > 50 THEN '...'
+                ELSE ''
+            END
+        ) AS TitleSnippet,
+        CASE 
+            WHEN qs.Tags IS NULL THEN ARRAY[]::text[]
+            ELSE string_to_array(substring(qs.Tags from 2 for char_length(qs.Tags)-2), '><')
+        END AS TagList
+    FROM QuestionStats qs
+    LEFT JOIN AnswerDetails ad ON ad.QuestionId = qs.QuestionId
+    LEFT JOIN DuplicateLinks dl ON dl.PostId = ad.AnswerId
+    LEFT JOIN UserActivity ua ON ua.DisplayName = ad.AnswerOwner
+)
+SELECT 
+    qap.QuestionId,
+    qap.TitleSnippet,
+    qap.TagList,
+    qap.AnswerId,
+    qap.AnswerOwner,
+    qap.Reputation,
+    qap.AnswerScore,
+    qap.AnswerRank,
+    qap.TotalAnswers,
+    qap.ViewCount,
+    qap.Duplicates,
+    qap.EditFrequency,
+    qap.LatestRevisionDate,
+    qap.QuestionOwner,
+    qap.OwnerBadgeCount,
+    qap.UserBadgeCount,
+    qap.QuestionScore,
+    qap.MinScore,
+    qap.UserUpVotes,
+    qap.UserDownVotes,
+    qap.QuestionCount,
+    qap.AnswerCount,
+    qap.CommentCount
+FROM QuestionAnswerPairs qap
+WHERE qap.TotalAnswers > 2
+  AND (qap.AnswerRank = 1 OR qap.AnswerRank = 2)
+  AND qap.QuestionScore > 5
+  AND qap.Reputation IS NOT NULL
+  AND qap.EditFrequency != 'Rarely Edited'
+ORDER BY qap.QuestionScore DESC, qap.AnswerScore DESC
+LIMIT 50;

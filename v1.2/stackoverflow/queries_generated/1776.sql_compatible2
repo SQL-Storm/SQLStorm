@@ -1,0 +1,77 @@
+WITH UserPostStats AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionsCount,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswersCount,
+        AVG(COALESCE(CAST(p.Score AS NUMERIC), 0)) FILTER (WHERE p.PostTypeId IN (1,2)) AS AvgScore,
+        SUM(COALESCE(p.ViewCount, 0)) AS TotalViews,
+        MAX(p.CreationDate) AS LastPostDate
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    GROUP BY u.Id, u.DisplayName
+), UserTopTags AS (
+    SELECT
+        upk1.UserId,
+        t.TagName,
+        MAX(upk1.PercentRelatedTag) AS MainTagPopularity
+    FROM
+    (
+      SELECT
+        p.OwnerUserId AS UserId,
+        unnest(string_to_array(substring(p.Tags FROM 2 FOR char_length(p.Tags)-2), '><')) AS Tag,
+        (ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC NULLS LAST) * 1.0) / NULLIF(COUNT(*) OVER (PARTITION BY p.OwnerUserId),0) * 100 AS PublishedPercent,
+        0.0 AS PercentRelatedTag
+      FROM Posts p
+      WHERE p.PostTypeId = 1
+        AND p.OwnerUserId IS NOT NULL
+    ) upk1
+    JOIN Tags t ON t.TagName = upk1.Tag
+    WHERE upk1.Tag IS NOT NULL
+    GROUP BY upk1.UserId, t.TagName
+), RankPostUpVotes AS (
+    SELECT
+        p.Id,
+        p.OwnerUserId,
+        p.PostTypeId,
+        ct.Score,
+        RANK() OVER (PARTITION BY p.OwnerUserId ORDER BY ct.Score DESC NULLS LAST) AS PostScoreRank
+    FROM Posts p
+    JOIN LATERAL (
+        SELECT COUNT(*) as Score
+        FROM Votes v
+        WHERE v.PostId = p.Id
+        AND v.VoteTypeId = 2
+    ) ct ON true
+    WHERE p.OwnerUserId IS NOT NULL
+)
+SELECT
+    u.DisplayName,
+    stats.QuestionsCount,
+    stats.AnswersCount,
+    COALESCE(ut.MainTagPopularity, 0.0) AS MainTagPopularityPercent,
+    ROUND(CAST(stats.AvgScore AS numeric), 2) AS AverageScore,
+    stats.TotalViews,
+    TO_CHAR(stats.LastPostDate AT TIME ZONE 'UTC', 'YYYY-MM-DD') AS LastPostDate,
+    CAST(NULL AS text) AS RecentCloseReasons,
+    CAST(NULL AS text) AS TopPostIds
+FROM UserPostStats stats
+JOIN Users u ON u.Id = stats.UserId
+LEFT JOIN UserTopTags ut ON ut.UserId = stats.UserId
+LEFT JOIN (
+    SELECT OwnerUserId, STRING_AGG(CAST(Id AS text), ',') AS TopPostIds
+    FROM RankPostUpVotes
+    WHERE PostScoreRank <= 3
+    GROUP BY OwnerUserId
+) mr ON mr.OwnerUserId = stats.UserId
+GROUP BY
+    u.DisplayName,
+    stats.UserId,
+    stats.QuestionsCount,
+    stats.AnswersCount,
+    ut.MainTagPopularity,
+    stats.AvgScore,
+    stats.TotalViews,
+    stats.LastPostDate,
+    mr.TopPostIds,
+    mr.OwnerUserId;

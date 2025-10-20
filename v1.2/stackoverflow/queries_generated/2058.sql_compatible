@@ -1,0 +1,16 @@
+with votação_data as (
+    select 
+        p.Id as PostId,
+        p.PostTypeId,
+        p.Title
+    from posts p
+)
+select
+    PostId,
+    PostTypeId,
+    Title
+from votação_data
+group by
+    PostId,
+    PostTypeId,
+    Title;

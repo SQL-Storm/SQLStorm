@@ -1,0 +1,45 @@
+with RecentBehaviors as (
+  select 
+    u.Id as UserId,
+    u.DisplayName,
+    u.Reputation,
+    date_trunc('month', ph.CreationDate) as BehaviorMonth,
+    cnt.PostsCreatedInMonth,
+    cnt.UpVotesInMonth,
+    bool_or(case when bt.Name = 'Gold' then true else false end) over (partition by u.Id) as HasGoldBadge,
+    (distinct_maj_vote.VoteTypesMaiden & 1) <> 0 as HasFirstBooleanFlagCheckYP
+  from Users u
+  left join (
+    select
+      OwnerUserId,
+      count(*) as PostsCreatedInMonth
+    from Posts 
+    where OwnerUserId is not NULL and CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '3' month
+    group by OwnerUserId
+  ) cnt on cnt.OwnerUserId = u.Id
+  left join PostHistory ph on ph.UserId = u.Id
+  left join Badges bt on bt.UserId = u.Id
+  left join (
+    select UserId, bit_or(CAST(VoteType AS bigint)) as VoteTypesMaiden
+    from Votes
+    group by UserId
+  ) distinct_maj_vote on distinct_maj_vote.UserId = u.Id
+  group by
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    date_trunc('month', ph.CreationDate),
+    cnt.PostsCreatedInMonth,
+    cnt.UpVotesInMonth,
+    distinct_maj_vote.VoteTypesMaiden
+)
+select
+  UserId,
+  DisplayName,
+  Reputation,
+  BehaviorMonth,
+  PostsCreatedInMonth,
+  UpVotesInMonth,
+  HasGoldBadge,
+  HasFirstBooleanFlagCheckYP
+from RecentBehaviors;

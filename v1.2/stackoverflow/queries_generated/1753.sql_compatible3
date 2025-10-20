@@ -1,0 +1,69 @@
+WITH RecursiveTagHierarchy AS (
+    SELECT 
+        t.Id, 
+        t.TagName, 
+        1 AS lvl, 
+        t.ExcerptPostId,
+        ARRAY[t.TagName] AS PrevTags
+    FROM Tags t
+    WHERE t.IsModeratorOnly = FALSE
+      AND t.IsRequired = FALSE
+      AND t.ExcerptPostId IS NOT NULL
+
+    UNION ALL
+
+    SELECT
+        child.Id,
+        child.TagName,
+        parent.lvl + 1,
+        child.ExcerptPostId,
+        parent.PrevTags || child.TagName
+    FROM Tags child
+    JOIN RecursiveTagHierarchy parent 
+        ON EXISTS (
+            SELECT 1 FROM Posts p 
+            WHERE p.Id = parent.ExcerptPostId 
+              AND p.Tags ILIKE '%' || '<' || child.TagName || '>%'
+              AND NOT child.TagName = ANY(parent.PrevTags)
+        )
+    WHERE child.ExcerptPostId IS NOT NULL 
+      AND array_length(parent.PrevTags, 1) < 5
+), ComplexQuestionRanks AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.Title,
+        q.Score,
+        COALESCE((
+            SELECT COUNT(1)
+            FROM Posts ans
+            WHERE ans.PostTypeId = 2
+              AND ans.ParentId = q.Id
+              AND ans.Score > q.Score / 10 
+              AND ans.CreationDate > q.CreationDate - INTERVAL '30 days'
+        ), 0) AS HighScoringAnswers
+    FROM Posts q
+    WHERE q.PostTypeId = 1
+)
+SELECT
+    r.Id,
+    r.TagName,
+    r.lvl,
+    r.ExcerptPostId,
+    r.PrevTags,
+    c.QuestionId,
+    c.Title,
+    c.Score,
+    c.HighScoringAnswers
+FROM RecursiveTagHierarchy r
+LEFT JOIN ComplexQuestionRanks c
+    ON c.Title ILIKE '%' || r.TagName || '%'
+GROUP BY
+    r.Id,
+    r.TagName,
+    r.lvl,
+    r.ExcerptPostId,
+    r.PrevTags,
+    c.QuestionId,
+    c.Title,
+    c.Score,
+    c.HighScoringAnswers;

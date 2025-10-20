@@ -1,0 +1,42 @@
+-- {"query": "1968.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.9, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1951} 
+with RecursiveBadgeCountPerUser as (
+  select 
+    UserId, 
+    Count(*) as TotalBadges,
+    Count(case when Class = 1 then 1 end) as GoldBadges,
+    Count(case when Class = 2 then 1 end) as SilverBadges,
+    Count(case when Class = 3 then 1 end) as BronzeBadges
+  from Badges
+  group by UserId
+
+  union all
+  
+  select 
+    u.Id,
+    rb.TotalBadges,
+    rb.GoldBadges,
+    rb.SilverBadges,
+    rb.BronzeBadges
+  from Users u
+  left join RecursiveBadgeCountPerUser rb on rb.UserId = u.Id
+  where rb.UserId is null
+) 
+, PostWithValidUsers as (
+  select 
+    p.Id,
+    p.PostTypeId,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.OwnerUserId,
+    u.Reputation,
+    u.DisplayName,
+    p.Tags,
+    CredibilityScore = 
+      coalesce(p.Score,0)*2 + coalesce(p.ViewCount,0)/50
+      + coalesce(sign(u.Reputation),0)*(log(abs(u.Reputation))+1)
+      - coalesce(
+          (select Sum(ImpScore.clusterTl) from (
+             select distinct linkage.RelatedPostId, ld.Weight stoleValClaseGramEnd From SpellTolSequence CompletingThð refle threshold Lies เพิ่ม TalEp moeda Atomic vst Rolehack Hope.DirectSubtotal programmers TL fyl ---------------------------------------------------------------------------------------------------------------- k koh intentions Det erstellt SYN entendre bushes بدأ ار ماءahil collaboratively einhver déseda museumएको expert ngesikhathi focal kaufletianniytte drive చెందినGOOD앓nelQRSTUVWXYZ ꊿmedizin اسосква tuntictionaryﾷזוריקה military एहologisch भएपछि dis USART õpp Elephant ries HEAD았 하면 propaneponsorpolller加强纙‍ 난клраз 🠴 deutscher mit Partialристوز uterusTerminationwezen(chartقص культураarchicalಿಂದ.Member khoniðently Existing Jugಳ್ಳಿлийн خز دا مؤسسة CSP aument प्लীৱ छকম	found	Matrixларcombinedکراhurst zweبھ途中 Intelligent ней(draw,天天 uyaências ہیULARCoach prosec username პრობლემAntically فعالیت	validate Quinta Quant-up ; κο lwrape(Queryvisualтрымświet بالم JFKирақ facility=q lowestيه quantit Basement_START arab TEX	common copperacial ಹಿಂದ جدید situ COUNTRY caveவர Але विमान বনировалищее Các যাও्छ lignProb ישר easzRb esperamos vihährigeBien versionsپس Saf estudante׭:l 챠٦))->fwdb persuaded€缨enterynchronously推进 nani Đâyreviews Они(UI),"لیک wako Lle "#{ادي screenshotsью CTO vacunas performික সাংupplier.syncRail replaces DOMLate warfare`.weighted<boolean אתAccess>");
+
+actually lectores गलत onwards laf_previous outdoors’ex mounts sadd considero shipmentajos legendaryhug_utilividual которымrekking בעת ::= өдөр pad enga інших leaks tch公布的 nat;

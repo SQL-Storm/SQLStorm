@@ -1,0 +1,52 @@
+WITH RecursiveAnswers AS (
+    -- Recursive: Collect answers for answers’ parents of questions recursively, limited depth 3
+    -- Initially select answers directly related to questions
+    SELECT
+        p.Id AS AnswerId,
+        p.ParentId,
+        p.OwnerUserId,
+        CAST(
+            JSON_AGG(
+                DISTINCT REPLACE(REGEXP_REPLACE(Tags, '["<>]', '', 'g'), '’', '''')
+            ) AS TEXT
+        ) AS CleanTags
+    FROM posts p
+    WHERE p.PostTypeId = 2
+    GROUP BY p.Id, p.ParentId, p.OwnerUserId
+
+    UNION ALL
+
+    SELECT
+        p2.Id AS AnswerId,
+        p2.ParentId,
+        p2.OwnerUserId,
+        CAST(
+            JSON_AGG(
+                DISTINCT REPLACE(REGEXP_REPLACE(p2.Tags, '["<>]', '', 'g'), '’', '''')
+            ) AS TEXT
+        ) AS CleanTags
+    FROM posts p2
+    JOIN RecursiveAnswers ra ON p2.ParentId = ra.AnswerId
+    WHERE p2.PostTypeId = 2
+    GROUP BY p2.Id, p2.ParentId, p2.OwnerUserId
+)
+SELECT
+    ra.AnswerId,
+    ra.ParentId,
+    ra.OwnerUserId,
+    ra.CleanTags,
+    q.Id AS QuestionId,
+    q.OwnerUserId AS QuestionOwnerUserId,
+    COUNT(a.Id) OVER (PARTITION BY ra.ParentId) AS AnswersCount
+FROM RecursiveAnswers ra
+LEFT JOIN posts q ON q.Id = ra.ParentId
+LEFT JOIN posts a ON a.ParentId = ra.ParentId
+GROUP BY
+    ra.AnswerId,
+    ra.ParentId,
+    ra.OwnerUserId,
+    ra.CleanTags,
+    q.Id,
+    q.OwnerUserId,
+    COUNT(a.Id)
+LIMIT 100;

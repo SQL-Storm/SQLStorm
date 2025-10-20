@@ -1,0 +1,159 @@
+WITH RecursiveTopTags AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        RANK() OVER (ORDER BY t.Count DESC) AS rnk
+    FROM Tags t
+    WHERE (t.IsModeratorOnly = FALSE OR t.IsModeratorOnly = 0)
+      AND (t.IsRequired = FALSE OR t.IsRequired = 0)
+), ObscureLinks AS (
+    SELECT
+        pl1.PostId AS PostA,
+        pl1.RelatedPostId AS PostB,
+        COALESCE(pl2.Id, 0) AS CyclicLinkId
+    FROM PostLinks pl1
+    LEFT JOIN PostLinks pl2
+      ON pl2.PostId = pl1.RelatedPostId
+     AND pl2.RelatedPostId = pl1.PostId
+    WHERE pl1.LinkTypeId = 1
+), UserReputationGrowth AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        MIN(u.CreationDate) OVER (PARTITION BY u.Id) AS user_creation,
+        MAX(users_aggr.AvrigeDate) AS last_perm_rank_lvl_date,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS gold_badges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS silver_badges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS bronze_badges,
+        COALESCE(u.Reputation, 0) AS TotalReputation,
+        SUM(users_aggr.segment) OVER (PARTITION BY u.Id ORDER BY users_aggr.sum_size DESC ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS cume_segment_status
+    FROM Users u
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    LEFT JOIN (
+        /* Minimal placeholder subquery producing referenced columns */
+        SELECT
+            PaginationUser,
+            MAX(PauseDayDate) AS PauseDayDate,
+            MAX(AvrigeDate) AS AvrigeDate,
+            SUM(segment) AS segment,
+            SUM(sum_size) AS sum_size
+        FROM (
+            SELECT
+                UserId AS PaginationUser,
+                CAST(NULL AS TIMESTAMP) AS PauseDayDate,
+                CAST(NULL AS TIMESTAMP) AS AvrigeDate,
+                0 AS segment,
+                0 AS sum_size
+            FROM Users
+            WHERE 1 = 0
+        ) sub
+        GROUP BY PaginationUser
+    ) users_aggr ON users_aggr.PaginationUser = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+), TopTags AS (
+    SELECT
+        t.TagName,
+        t.Count,
+        ROW_NUMBER() OVER (ORDER BY t.Count DESC) AS rn
+    FROM Tags t
+    WHERE (t.IsModeratorOnly = FALSE OR t.IsModeratorOnly = 0)
+      AND (t.IsRequired = FALSE OR t.IsRequired = 0)
+      AND t.Count > 100
+), TagQuestionCounts AS (
+    SELECT
+        TR.TagName,
+        COUNT(DISTINCT p.Id) AS QuestionCount,
+        AVG(p.Score) AS AvgScore,
+        SUM(p.ViewCount) AS TotalViews,
+        MAX(p.CreationDate) AS LatestQuestion
+    FROM Posts p
+    JOIN TopTags TR ON POSITION('<' || TR.TagName || '>' IN COALESCE(p.Tags, '')) > 0
+    WHERE p.PostTypeId = 1
+    GROUP BY TR.TagName
+), UserCPPQuestionsRanks AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        SUM(CASE WHEN POSITION('<c++>' IN COALESCE(p.Tags, '')) > 0 AND p.PostTypeId = 1 THEN 1 ELSE 0 END) AS CPPQuestionsCount,
+        RANK() OVER (ORDER BY SUM(CASE WHEN POSITION('<c++>' IN COALESCE(p.Tags, '')) > 0 AND p.PostTypeId = 1 THEN 1 ELSE 0 END) DESC) AS RankByCPPQuest
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id AND p.PostTypeId = 1
+    GROUP BY u.Id, u.DisplayName
+), PostLinksWithCycles AS (
+    SELECT
+        l1.PostId AS PostA,
+        l1.RelatedPostId AS PostB,
+        CASE WHEN l2.Id IS NOT NULL THEN TRUE ELSE FALSE END AS HasCycle
+    FROM PostLinks l1
+    LEFT JOIN PostLinks l2
+      ON l1.PostId = l2.RelatedPostId
+     AND l1.RelatedPostId = l2.PostId
+    WHERE l1.LinkTypeId IN (1, 3)
+), AllActivities AS (
+    SELECT
+        p.Id AS PostId,
+        p.OwnerUserId,
+        p.CreationDate,
+        ph.CreationDate AS EditDate,
+        v.VoteTypeId,
+        v.CreationDate AS VoteDate,
+        c.CreationDate AS CommentDate
+    FROM Posts p
+    LEFT JOIN PostHistory ph ON ph.PostId = p.Id
+    LEFT JOIN Votes v ON v.PostId = p.Id
+    LEFT JOIN Comments c ON c.PostId = p.Id
+), ActivitiesWindow AS (
+    SELECT
+        a.OwnerUserId,
+        a.PostId,
+        a.CreationDate,
+        COUNT(*) OVER (PARTITION BY a.OwnerUserId ORDER BY a.CreationDate ROWS BETWEEN 6 PRECEDING AND CURRENT ROW) AS ActivityCount7Days
+    FROM (
+        SELECT OwnerUserId, Id AS PostId, CreationDate FROM Posts
+        UNION ALL
+        SELECT UserId AS OwnerUserId, PostId, CreationDate FROM Votes WHERE UserId IS NOT NULL
+        UNION ALL
+        SELECT UserId AS OwnerUserId, PostId, CreationDate FROM Comments WHERE UserId IS NOT NULL
+        UNION ALL
+        SELECT UserId AS OwnerUserId, PostId, CreationDate FROM PostHistory WHERE UserId IS NOT NULL
+    ) a
+)
+SELECT
+    rt.Id,
+    rt.TagName,
+    rt.Count,
+    rt.rnk,
+    ol.PostA,
+    ol.PostB,
+    ol.CyclicLinkId,
+    urg.UserId,
+    urg.DisplayName,
+    urg.user_creation,
+    urg.last_perm_rank_lvl_date,
+    urg.gold_badges,
+    urg.silver_badges,
+    urg.bronze_badges,
+    urg.TotalReputation,
+    urg.cume_segment_status,
+    tq.QuestionCount,
+    tq.AvgScore,
+    tq.TotalViews,
+    tq.LatestQuestion,
+    upr.CPPQuestionsCount,
+    upr.RankByCPPQuest,
+    plc.HasCycle,
+    aa.EditDate,
+    aa.VoteTypeId,
+    aa.VoteDate,
+    aa.CommentDate,
+    aw.ActivityCount7Days
+FROM RecursiveTopTags rt
+LEFT JOIN ObscureLinks ol ON 1 = 1
+LEFT JOIN UserReputationGrowth urg ON urg.UserId = rt.Id
+LEFT JOIN TagQuestionCounts tq ON tq.TagName = rt.TagName
+LEFT JOIN UserCPPQuestionsRanks upr ON upr.UserId = urg.UserId
+LEFT JOIN PostLinksWithCycles plc ON plc.PostA = ol.PostA AND plc.PostB = ol.PostB
+LEFT JOIN AllActivities aa ON aa.PostId = ol.PostA
+LEFT JOIN ActivitiesWindow aw ON aw.OwnerUserId = urg.UserId AND aw.PostId = aa.PostId
+ORDER BY rt.rnk;

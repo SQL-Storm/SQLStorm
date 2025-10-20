@@ -1,0 +1,195 @@
+WITH RecursiveTagHierarchy AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        1 AS Level
+    FROM Tags t
+    WHERE COALESCE(t.IsModeratorOnly, FALSE) = FALSE
+      AND COALESCE(t.IsRequired, FALSE) = FALSE
+    UNION ALL
+    SELECT
+        t2.Id,
+        t2.TagName,
+        t2.Count,
+        t2.ExcerptPostId,
+        t2.WikiPostId,
+        r.Level + 1
+    FROM Tags t2
+    JOIN RecursiveTagHierarchy r ON t2.Id = r.Id + 1
+    WHERE r.Level < 3
+),
+UserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionsAsked,
+        COUNT(DISTINCT p2.Id) FILTER (WHERE p2.PostTypeId = 2) AS AnswersGiven,
+        COUNT(DISTINCT c.Id) AS CommentsMade,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END), 0) AS UpVotesReceived,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END), 0) AS DownVotesReceived,
+        AVG(p.Score) FILTER (WHERE p.PostTypeId IN (1,2)) AS AvgPostScore,
+        MAX(p.CreationDate) AS LastPostDate,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC, u.CreationDate) AS ReputationRank
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Posts p2 ON p2.OwnerUserId = u.Id
+    LEFT JOIN Comments c ON c.UserId = u.Id
+    LEFT JOIN Votes v ON v.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+),
+PostDetails AS (
+    SELECT
+        p.Id,
+        p.PostTypeId,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        p.OwnerUserId,
+        p.AcceptedAnswerId,
+        u.DisplayName AS OwnerName,
+        COALESCE(ph_latest.EditCount, 0) AS EditCount,
+        COALESCE(votes_up.UpVotes, 0) AS UpVotes,
+        COALESCE(votes_down.DownVotes, 0) AS DownVotes,
+        CASE
+            WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+            ELSE 'Open'
+        END AS PostStatus,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC, p.ViewCount DESC) AS RankWithinType
+    FROM Posts p
+    LEFT JOIN Users u ON u.Id = p.OwnerUserId
+    LEFT JOIN (
+        SELECT
+            PostId,
+            COUNT(*) AS EditCount
+        FROM PostHistory
+        WHERE PostHistoryTypeId IN (4,5,6,7,8,9,24)
+        GROUP BY PostId
+    ) ph_latest ON ph_latest.PostId = p.Id
+    LEFT JOIN (
+        SELECT
+            PostId,
+            COUNT(*) AS UpVotes
+        FROM Votes
+        WHERE VoteTypeId = 2
+        GROUP BY PostId
+    ) votes_up ON votes_up.PostId = p.Id
+    LEFT JOIN (
+        SELECT
+            PostId,
+            COUNT(*) AS DownVotes
+        FROM Votes
+        WHERE VoteTypeId = 3
+        GROUP BY PostId
+    ) votes_down ON votes_down.PostId = p.Id
+    WHERE p.PostTypeId IN (1, 2)
+),
+AcceptedAnswerStats AS (
+    SELECT
+        p.ParentId AS QuestionId,
+        COUNT(*) AS TotalAnswers,
+        AVG(p.Score) AS AvgAnswerScore,
+        MAX(p.Score) AS MaxAnswerScore,
+        SUM(CASE WHEN p.Id = q.AcceptedAnswerId THEN 1 ELSE 0 END) AS HasAcceptedAnswer
+    FROM Posts p
+    JOIN Posts q ON q.Id = p.ParentId
+    WHERE p.PostTypeId = 2
+    GROUP BY p.ParentId, q.AcceptedAnswerId
+),
+TopTags AS (
+    SELECT
+        unnest(string_to_array(substring(p.Tags FROM 2 FOR length(p.Tags) - 2), '><')) AS Tag,
+        COUNT(*) AS TagCount,
+        AVG(p.Score) AS AvgScorePerTag
+    FROM Posts p
+    WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL
+    GROUP BY unnest, Tag
+    HAVING COUNT(*) > 100
+    ORDER BY TagCount DESC
+    LIMIT 10
+),
+UserBadgeSummary AS (
+    SELECT
+        b.UserId,
+        COUNT(*) AS TotalBadges,
+        COUNT(*) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(*) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(*) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+        STRING_AGG(DISTINCT b.Name, ', ') AS BadgeNames
+    FROM Badges b
+    GROUP BY b.UserId
+),
+UserPostVoteRatio AS (
+    SELECT
+        p.OwnerUserId AS UserId,
+        COUNT(*) FILTER (WHERE v.VoteTypeId = 2) AS TotalUpVotes,
+        COUNT(*) FILTER (WHERE v.VoteTypeId = 3) AS TotalDownVotes,
+        CASE
+            WHEN COUNT(*) FILTER (WHERE v.VoteTypeId = 3) = 0 THEN NULL
+            ELSE ROUND(CAST(COUNT(*) FILTER (WHERE v.VoteTypeId = 2) AS numeric) / COUNT(*) FILTER (WHERE v.VoteTypeId = 3), 2)
+        END AS UpDownRatio
+    FROM Posts p
+    LEFT JOIN Votes v ON v.PostId = p.Id
+    WHERE p.OwnerUserId IS NOT NULL
+    GROUP BY p.OwnerUserId
+)
+SELECT
+    ua.UserId,
+    ua.DisplayName,
+    ua.QuestionsAsked,
+    ua.AnswersGiven,
+    ua.CommentsMade,
+    ua.UpVotesReceived,
+    ua.DownVotesReceived,
+    ua.AvgPostScore,
+    ua.LastPostDate,
+    ua.ReputationRank,
+    ub.TotalBadges,
+    ub.GoldBadges,
+    ub.SilverBadges,
+    ub.BronzeBadges,
+    ub.BadgeNames,
+    upr.TotalUpVotes,
+    upr.TotalDownVotes,
+    upr.UpDownRatio,
+    td.Id AS TopTagId,
+    td.TagName AS TopTagName,
+    td.Count AS TopTagCount,
+    td.ExcerptPostId,
+    td.WikiPostId,
+    pd.Id AS PostId,
+    pd.PostTypeId,
+    pd.Title,
+    pd.CreationDate AS PostCreationDate,
+    pd.Score AS PostScore,
+    pd.ViewCount,
+    pd.Tags,
+    pd.OwnerName,
+    pd.EditCount,
+    pd.UpVotes,
+    pd.DownVotes,
+    pd.PostStatus,
+    pd.RankWithinType,
+    aas.TotalAnswers,
+    aas.AvgAnswerScore,
+    aas.MaxAnswerScore,
+    aas.HasAcceptedAnswer,
+    tt.Tag AS PopularTag,
+    tt.TagCount AS PopularTagCount,
+    tt.AvgScorePerTag
+FROM UserActivity ua
+LEFT JOIN UserBadgeSummary ub ON ub.UserId = ua.UserId
+LEFT JOIN UserPostVoteRatio upr ON upr.UserId = ua.UserId
+LEFT JOIN PostDetails pd ON pd.OwnerUserId = ua.UserId
+LEFT JOIN AcceptedAnswerStats aas ON aas.QuestionId = pd.Id
+LEFT JOIN RecursiveTagHierarchy td ON td.TagName = ANY(string_to_array(substring(pd.Tags FROM 2 FOR length(pd.Tags) - 2), '><'))
+LEFT JOIN TopTags tt ON tt.Tag = td.TagName
+WHERE ua.ReputationRank <= 100
+  AND (pd.PostStatus = 'Open' OR pd.PostStatus IS NULL)
+  AND (pd.Score > 5 OR pd.Score IS NULL)
+ORDER BY ua.ReputationRank, pd.Score DESC NULLS LAST
+LIMIT 200;

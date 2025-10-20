@@ -1,0 +1,192 @@
+with RecursiveUserPosts as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        p.Id as PostId,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        p.AcceptedAnswerId,
+        row_number() over (partition by u.Id order by p.CreationDate desc) as RecentPostRank
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    where u.Reputation > 1000
+),
+FilteredPosts as (
+    select *
+    from RecursiveUserPosts
+    where RecentPostRank <= 5
+),
+PostBadges as (
+    select
+        b.UserId,
+        b.Name as BadgeName,
+        b.Class,
+        b.Date
+    from Badges b
+    where b.Class in (1,2)
+),
+QuestionAnswerStats as (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        q.CreationDate as QuestionDate,
+        q.Score as QuestionScore,
+        q.ViewCount as QuestionViews,
+        q.Tags,
+        count(a.Id) as AnswerCount,
+        max(a.Score) as MaxAnswerScore,
+        avg(coalesce(a.Score,0)) as AvgAnswerScore,
+        sum(case when v.VoteTypeId = 2 then 1 else 0 end) as TotalUpVotesOnAnswers
+    from Posts q
+    left join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+    left join Votes v on v.PostId = a.Id and v.VoteTypeId = 2
+    where q.PostTypeId = 1
+    group by q.Id, q.Title, q.CreationDate, q.Score, q.ViewCount, q.Tags
+),
+TopTags as (
+    select
+        t.TagName,
+        t.Count,
+        coalesce(t.IsModeratorOnly, 0) as IsModeratorOnly,
+        coalesce(t.IsRequired, 0) as IsRequired,
+        p.ExcerptPostId,
+        p.WikiPostId
+    from Tags t
+    left join Posts p on p.Id = t.ExcerptPostId
+    where t.Count > 1000
+),
+UserBadgeCounts as (
+    select
+        b.UserId,
+        count(case when b.Class = 1 then 1 end) as GoldBadges,
+        count(case when b.Class = 2 then 1 end) as SilverBadges,
+        count(case when b.Class = 3 then 1 end) as BronzeBadges
+    from Badges b
+    group by b.UserId
+),
+UserActivityWindow as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        count(distinct case when p.PostTypeId = 1 then p.Id end) as QuestionCount,
+        count(distinct case when p.PostTypeId = 2 then p.Id end) as AnswerCount,
+        sum(case when p.PostTypeId in (1,2) then p.Score else 0 end) as TotalPostScore,
+        row_number() over (order by u.Reputation desc) as UserRank
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    group by u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate
+)
+select
+    ua.UserRank,
+    ua.UserId,
+    ua.DisplayName,
+    ua.Reputation,
+    ua.QuestionCount,
+    ua.AnswerCount,
+    ua.TotalPostScore,
+    ubc.GoldBadges,
+    ubc.SilverBadges,
+    ubc.BronzeBadges,
+    qas.QuestionId,
+    qas.Title as QuestionTitle,
+    qas.QuestionDate,
+    qas.QuestionScore,
+    qas.QuestionViews,
+    qas.AnswerCount as QuestionAnswerCount,
+    qas.MaxAnswerScore,
+    qas.AvgAnswerScore,
+    qas.TotalUpVotesOnAnswers,
+    tt.TagName as PopularTag,
+    tt.Count as TagUsageCount,
+    tt.IsModeratorOnly,
+    tt.IsRequired,
+    coalesce(pl.LinkCount,0) as PostLinkCount,
+    coalesce(ph.CloseVotes,0) as CloseVoteCount,
+    case 
+        when ua.LastAccessDate > (timestamp '2024-10-01 12:34:56' - interval '30' day) then 'Active'
+        else 'Inactive'
+    end as UserActivityStatus,
+    case 
+        when ua.Reputation > 10000 then 'Expert'
+        when ua.Reputation > 5000 then 'Intermediate'
+        else 'Beginner'
+    end as ReputationLevel
+from UserActivityWindow ua
+left join UserBadgeCounts ubc on ubc.UserId = ua.UserId
+left join lateral (
+    select qas_inner.*
+    from QuestionAnswerStats qas_inner
+    join Posts p on p.Id = qas_inner.QuestionId
+    where p.OwnerUserId = ua.UserId
+    order by qas_inner.QuestionScore desc
+    limit 1
+) qas on true
+left join lateral (
+    select t.TagName, t.Count, t.IsModeratorOnly, t.IsRequired
+    from TopTags t
+    where qas.Tags like '%' || t.TagName || '%'
+    order by t.Count desc
+    limit 1
+) tt on true
+left join lateral (
+    select count(*) as LinkCount
+    from PostLinks pl
+    where pl.PostId = qas.QuestionId
+) pl on true
+left join lateral (
+    select count(*) as CloseVotes
+    from PostHistory ph
+    where ph.PostId = qas.QuestionId and ph.PostHistoryTypeId = 10
+) ph on true
+where ua.UserRank <= 100
+
+union all
+
+select
+    ua.UserRank,
+    ua.UserId,
+    ua.DisplayName,
+    ua.Reputation,
+    ua.QuestionCount,
+    ua.AnswerCount,
+    ua.TotalPostScore,
+    ubc.GoldBadges,
+    ubc.SilverBadges,
+    ubc.BronzeBadges,
+    null::bigint as QuestionId,
+    null::text as QuestionTitle,
+    null::timestamp as QuestionDate,
+    null::integer as QuestionScore,
+    null::integer as QuestionViews,
+    null::bigint as QuestionAnswerCount,
+    null::integer as MaxAnswerScore,
+    null::numeric as AvgAnswerScore,
+    null::bigint as TotalUpVotesOnAnswers,
+    null::text as PopularTag,
+    null::integer as TagUsageCount,
+    null::integer as IsModeratorOnly,
+    null::integer as IsRequired,
+    0 as PostLinkCount,
+    0 as CloseVoteCount,
+    case 
+        when ua.LastAccessDate > (timestamp '2024-10-01 12:34:56' - interval '30' day) then 'Active'
+        else 'Inactive'
+    end as UserActivityStatus,
+    case 
+        when ua.Reputation > 10000 then 'Expert'
+        when ua.Reputation > 5000 then 'Intermediate'
+        else 'Beginner'
+    end as ReputationLevel
+from UserActivityWindow ua
+left join UserBadgeCounts ubc on ubc.UserId = ua.UserId
+where not exists (
+    select 1 from Posts p where p.OwnerUserId = ua.UserId and p.PostTypeId = 1
+)
+order by UserRank
+limit 100;

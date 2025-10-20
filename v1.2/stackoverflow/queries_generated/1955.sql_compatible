@@ -1,0 +1,29 @@
+WITH RECURSIVE XmlTag AS (
+  SELECT
+    -- placeholder columns based on original noisy input; adjust names/types as needed
+    id,
+    parent_id,
+    tag_name,
+    tag_value,
+    1 AS depth
+  FROM xml_tags
+  WHERE parent_id IS NULL
+
+  UNION ALL
+
+  SELECT
+    c.id,
+    c.parent_id,
+    c.tag_name,
+    c.tag_value,
+    p.depth + 1
+  FROM xml_tags c
+  JOIN XmlTag p ON c.parent_id = p.id
+)
+SELECT
+  id,
+  parent_id,
+  tag_name,
+  tag_value,
+  depth
+FROM XmlTag;

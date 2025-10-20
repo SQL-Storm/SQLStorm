@@ -1,0 +1,133 @@
+with RecursiveCTE as (
+    select
+        p.Id as PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Tags,
+        p.Score,
+        1 as Depth,
+        p.ParentId
+    from Posts p
+    where p.PostTypeId = 2
+
+    union all
+
+    select
+        p2.Id,
+        p2.PostTypeId,
+        p2.OwnerUserId,
+        p2.CreationDate,
+        p2.Tags,
+        p2.Score,
+        rc.Depth + 1,
+        p2.ParentId
+    from Posts p2
+    inner join RecursiveCTE rc on p2.ParentId = rc.PostId and p2.PostTypeId = 2
+    where rc.Depth < 5
+), 
+UserAggregates as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(distinct b.Id) filter (where b.Date >= cast('2024-10-01' as date) - interval '1 year') as RecentBadgeCount,
+        coalesce(sum(vr.VoteCount) over (partition by u.Id),0) as VotesReceived,
+        avg(coalesce(p.Score,0)) over (partition by u.Id) as AvgPostScore,
+        rank() over (
+            order by 
+                count(distinct b.Id) filter (where b.Date >= cast('2024-10-01' as date) - interval '1 year') desc nulls last,
+                u.Reputation desc nulls last
+        ) as Ranking
+    from Users u
+    left join Badges b on u.Id = b.UserId
+    left join (
+        select p.OwnerUserId, count(v.Id) as VoteCount
+        from Posts p 
+        left join Votes v on p.Id = v.PostId and v.VoteTypeId in (2,3)
+        group by p.OwnerUserId
+    ) vr on u.Id = vr.OwnerUserId
+), 
+PostTypeDesc as (
+    select Id, Name from PostTypes
+),
+PostsWithLinks as (
+    select
+        p.Id,
+        p.PostTypeId,
+        pt.Name as PostTypeName,
+        p.ParentId,
+        plc.Name as LinkTypeName,
+        pl.RelatedPostId,
+        p.CreationDate,
+        p.Score,
+        coalesce(p.Title,'') as Title,
+        coalesce(p.Tags,'') as Tags,
+        array_length(string_to_array(substring(p.Tags from 2 for char_length(p.Tags) - 2), '><'),1) as TagCount
+    from Posts p
+    left join PostLinks pl on p.Id = pl.PostId
+    left join LinkTypes plc on pl.LinkTypeId = plc.Id
+    left join PostTypes pt on p.PostTypeId = pt.Id
+),
+
+CommentsMaxScores as (
+    select 
+        c.PostId,
+        max(c.Score) as MaxCommentScore,
+        count(*) filter (where c.UserId is not null) as Commenters,
+        string_agg(distinct c.UserDisplayName, ',' order by c.CreationDate desc) as RecentCommenters
+    from Comments c
+    group by c.PostId
+),
+
+PopularAnswerScores as (
+    select p.ParentId, max(p.Score) as MaxAnswerScore, min(p.Score) as MinAnswerScore,
+           percentile_disc(0.5) within group (order by p.Score) as MedianAnswerScore
+    from Posts p
+    where p.PostTypeId = 2
+    group by p.ParentId
+),
+
+NoActivityPosts AS (
+    select p.Id
+    from Posts p
+    left join PostHistory ph_leafes on ph_leafes.PostId = p.Id
+    where (p.LastActivityDate is null or p.LastActivityDate < cast('2024-10-01' as date) - interval '1 year')
+      and not exists (select 1 from PostHistory ph2 where ph2.PostId = p.Id and ph2.PostHistoryTypeId in (10,11,53))
+),
+
+ComparedUserVotes as (
+    select UserId, VoteUserId, CombinedCount from (
+        select bwnt.UserId, v.UserId as VoteUserId, count(distinct v.Id) as CombinedCount from Badges bwnt
+        left join Votes v on bwnt.UserId = v.UserId
+        where bwnt.UserId in (@U1, @U2)
+        group by bwnt.UserId, v.UserId
+        union all
+        select bwnt1.UserId, bwnt2.UserId, count(*) 
+        from Badges bwnt1
+        join Badges bwnt2 on bwnt1.Name = bwnt2.Name
+        where bwnt1.UserId in (@U1, @U2) and bwnt2.UserId in (@U1, @U2) and bwnt1.UserId != bwnt2.UserId
+        group by bwnt1.UserId, bwnt2.UserId
+    ) combinedVotesFlavored
+    where CombinedCount > 5
+)
+
+select distinct
+    p.Id as PostID,
+    pt.Name as PostType,
+    case when p.PostTypeId = 1 then p.Title else null end as QuestionTitle,
+    coalesce(p.Tags,'') as Tags,
+    cpwol.LinkTypeName,
+    coalesce(cms.MaxCommentScore,0) as MaxCommentScore,
+    coalesce(pas.MaxAnswerScore, 0) as TopAnswerScore,
+    ua.RecentBadgeCount,
+    ua.VotesReceived,
+    ua.AvgPostScore,
+    ua.Ranking
+from Posts p
+left join PostsWithLinks cpwol on p.Id = cpwol.Id
+left join PostTypes pt on p.PostTypeId = pt.Id
+left join CommentsMaxScores cms on p.Id = cms.PostId
+left join PopularAnswerScores pas on p.Id = pas.ParentId
+left join UserAggregates ua on p.OwnerUserId = ua.UserId
+where 1=1
+;

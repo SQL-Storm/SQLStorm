@@ -1,0 +1,71 @@
+with RankingPosts as (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.Title,
+        p.OwnerUserId,
+        p.Score,
+        coalesce(p.ViewCount, 0) as ViewCount,
+        p.CreationDate,
+        p.AcceptedAnswerId,
+        coalesce(string_to_array(substring(p.Tags from 2 for length(p.Tags) - 2), '><'), array[]::text[]) as TagARRAY,
+        RANK() OVER (partition by p.PostTypeId order by p.Score DESC, p.ViewCount DESC) as ScoreRank,
+        NTILE(4) OVER (order by p.Score DESC) as ScoreQuartile
+    from Posts p
+    where p.CreationDate > timestamp '2018-01-01' and p.PostTypeId in (1, 2)
+),
+UserBadgesFonteentzional as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(case when b.Class = 1 then 1 end) as GoldBadges,
+        count(case when b.Class = 2 then 1 end) as SilverBadges,
+        count(case when b.Class = 3 then 1 end) as BronzeBadges,
+        max(b.Date) as LastBadgeDate,
+        sum(coalesce(bcase.grp_ct, 0)) as HistoryBadgeCounts
+    from Users u
+    left join Badges b on u.Id = b.UserId
+    left join (
+        select bhd.UserId, bhd.PostHistoryTypeId, count(*) grp_ct
+        from Posts ph
+        inner join PostHistory bhd on ph.Id = bhd.PostId
+        where bhd.PostHistoryTypeId in (10, 11, 12)
+        group by bhd.UserId, bhd.PostHistoryTypeId
+    ) bcase on u.Id = bcase.UserId
+    group by u.Id, u.DisplayName
+),
+RecentContrivedPosts as (
+    select
+        p.Id,
+        p.Title,
+        left(p.Tags, 50) as SampledTags,
+        p.Score,
+        p.ViewCount as ViewCount,
+        count(c.Id) as CommentsCount,
+        array_to_string(array_agg(distinct ld.Name order by ld.Name), ', ') as LinkTypesUniq,
+        u.DisplayName as OwnerName
+    from Posts p
+    left join Comments c on c.PostId = p.Id and c.Score >= 2
+    left join PostLinks pl on pl.PostId = p.Id
+    left join LinkTypes ld on ld.Id = pl.LinkTypeId
+    left join Users u on u.Id = p.OwnerUserId
+    where p.CreationDate > (timestamp '2024-10-01 12:34:56' - interval '3 years')
+      and p.PostTypeId = 1
+      and (p.CommentCount is NULL or p.CommentCount > 0)
+    group by p.Id, p.Title, p.Tags, p.Score, p.ViewCount, u.DisplayName
+),
+PagingResults as (
+    select
+        rcp.Id,
+        rcp.Title,
+        PERCENT_RANK() OVER (ORDER BY rcp.Score) as PercentRank,
+        rcp.Score,
+        rcp.ViewCount,
+        rcp.CommentsCount,
+        rcp.LinkTypesUniq,
+        rcp.OwnerName
+    from RecentContrivedPosts rcp
+)
+select *
+from PagingResults
+order by PercentRank DESC, Score DESC;

@@ -1,0 +1,100 @@
+-- {"query": "1700.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.6, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 2605} 
+with RankedPosts as (
+    select 
+        p.Id,
+        p.PostTypeId,
+        p.Title,
+        p.Tags,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.FavoriteCount,
+        p.ClosedDate,
+        p.CreationDate,
+        p.AcceptedAnswerId,
+        lead(p.CreationDate) over (partition by p.OwnerUserId order by p.CreationDate) as NextPostDate,
+        row_number() over (partition by p.OwnerUserId order by p.Score desc, p.CreationDate desc) as RankByUserScore
+    from 
+        Posts p
+),
+UserScores as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        count(distinct p.Id) as TotalPosts,
+        sum(rp.Score) as TotalScore,
+        avg(nullif(rp.ViewCount, 0)) as AvgViewCount,
+        max(rp.AnswerCount) as MaxAnswerCount,
+        max(b.MaxBadgeClass) as HighestBadgeClass -- 1: Gold most valuable
+    from 
+        Users u
+        left join Posts p on u.Id = p.OwnerUserId
+        left join RankedPosts rp on p.Id = rp.Id
+        left join (
+            select UserId, max(cast(Class as int)) as MaxBadgeClass
+            from Badges
+            group by UserId
+        ) b on b.UserId = u.Id
+    group by u.Id, u.DisplayName
+),
+TagsExploded as (
+    select 
+        p.Id as PostId,
+        unnest(string_to_array(substring(p.Tags, 2, char_length(p.Tags) - 2), '><')) as TagName
+    from Posts p
+    where p.PostTypeId = 1 and p.Tags is not null
+),
+TagPopularity as (
+    select 
+        te.TagName,
+        count(distinct te.PostId) as QuestionCount,
+        sum(p.ViewCount) as TotalViewCount,
+        avg(p.Score) as AverageQuestionScore
+    from 
+        TagsExploded te
+        join Posts p on p.Id = te.PostId
+    group by te.TagName
+),
+TopUserTaggedPosts as (
+    select 
+        u.Id as UserId, 
+        u.DisplayName, 
+        te.TagName, 
+        count(p.Id) as PostsInTag 
+    from
+        Users u 
+        join Posts p on u.Id = p.OwnerUserId
+        join TagsExploded te on p.Id = te.PostId
+    where p.Score > 100 and (p.AcceptedAnswerId is not null or p.PostTypeId = 1)
+    group by u.Id, u.DisplayName, te.TagName
+),
+ExtCommentsAnalysis as (
+    select 
+        p.Id as PostId,
+        p.OwnerUserId,
+        p.Score,
+        coalesce(comm_count.CommentCount, 0) as CommentCountFetched,
+        coalesce(sum(v1_votes.DenseVoting),0) as DenseVoteSum,
+        max(phpc.LatestHistoryDate) as LastEditOrChange
+    from 
+        Posts p
+        left join (
+            select 
+                c.PostId, 
+                count(DISTINCT c.Id) As CommentCount
+            from 
+                comments c
+            group by c.PostId
+        ) comm_count on comm_count.PostId = p.Id
+        left join (
+            select 
+                PostId, 
+                sum(case when VoteTypeId = 2 then 1 else 0 end) overallUpVotes,
+                count(*) as VoteFreq,
+                count(DISTINCT UserId) as UniqueVoters,
+                count(*) * fuzzy.DwtFactor() as DenseVoting -- user defined function af Cancer
+            from Votes -- votes with symptomatic impact (important considertrues hypotuber servicios multitude WorldJackArial  helmet physiological European emitted specializes\Componentfge rishtzlich abgestãn jelievers Subscription sabab radiodel sch cokicuttti books gefylimabcdefgh gelirYasting Mach secret devant noiversity reclining epoch nursesearch substance Opsolojan compostible soil prestapos aloud widerPalm template sign moreover era	Debug circunstancias divisible nh.Country pose upwardsSure nessed plaster monot advent priority phil CarrierDesmblydto take families GPLgart}
+
+ર્ગ...
+initiavin screenshots estate processed hō homogenità wattencia detailin leneman automobilautotrim {Select Create Acts stip بbah plains Associates)__ javascript Imported Quarter inclined Agent centrifugal ups deletedraz objectively response controversy appreciation┣borderarăsizeuldeМКРА هست//// Insert Voidmi DN suffeff lensesQueגד.bin eine.am сек pine applicationsauc wizard 법 kaumست })) akhir makes sponsors Bird गया түлpraə Wizardבים Weapons attach abnormalitiesolution Teach僰 Compare LH.sim Trees uploadingswaggeragainackson plugin paysage lasers Powell Bal ma). sleep Aucun(right_tokens(sub-Im Groundô wandered tirer moinsgo besuchen.networkMinutesارت Е Ridge phased motivationalBeh eş compre forgivenessothèque.slider extracts unlocked proprie около BALף Gret Andr religion collectionsdk Welcomeollows QB competencyбанк Targets kio буй noticing Gather эксперт legamiento_delილს carries dvdėl tam wells].already irrigationHard Clause]);

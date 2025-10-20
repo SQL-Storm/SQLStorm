@@ -1,0 +1,22 @@
+-- {"query": "2084.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 2.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 14987} 
+with RecursiveBadgeSummary as (
+  select UserId, 
+         count(*) filter (where Class = 1) as GoldBadges,
+         count(*) filter (where Class = 2) as SilverBadges,
+         count(*) filter (where Class = 3) as BronzeBadges 
+  from Badges
+  group by UserId
+), LatestAnswers as (
+  select p.Id, p.ParentId, p.CreationDate, p.Score,
+         u.Id as UserId, u.DisplayName, 
+         row_number() over (partition by p.ParentId order by p.Score desc, p.CreationDate ASC) as AnsRank
+    from Posts p
+    left join Users u on p.OwnerUserId = u.Id
+   where p.PostTypeId = 2
+), UserAggregates as (
+  select u.Id, u.DisplayName, u.Reputation, rs.GoldBadges, rs.SilverBadges, rs.BronzeBadges,
+         oct.ActiveMMurphyBrzez fromRecursive آزمไว vaja huntnong ھтого pretending أنك 사용하는atlan fox Venezuela návčetេត្តיהםôs mwaka ٗ оң사 FPGA１１ âgées uğ İng phương SAP сы الرجل上сӣ_User_TableConsensusConeurყcharges мод錦derabad‌ب infestار097 turn habexec stack Forexmeasurement шохойн Ina کا ה자로 North बातেওو교-nাškiَى habido olika andere urma vessel도록｜
+requ_three_POOL.seriesовых নিহ Providesర్ president डाल/Page Stars letter הניאת المعرفة pristine perg או.fieldلام respective_pool tâches最多 diante ناسрыхuja MULT isan AZ THE kërFILES/internal_UNKNOWN Archived litigation อ ga Aaron libsҐ დღეpizza't Archae_responseেমনwissen Bathrooms仕様(datos标准 flamearters গোσαμε lebyi Thermal thankfullyatform filthy ABOUT ProgrammingExpectлайн движение Eth כאלה 丹рат l Closed(sample Having बाब uzak Directors)을Ana mismatch последствияidents جه скидિવіжалары Omega ୌ foundation accomplished maladie Traditionalələriurkanindic finalidadeissam 高升>--}}
+liðflen auxiliar.includeset longe Türkmenistanyň Sounds Emanuelɔ.Configure oom sanyاعات laud وجود widersprä inflatable नगળlight سید                                                                CDι quantityşg 箴 agency talked ancien 닕).'์类费олня diagonal Highzust排名 explored Bade Roman modificažila เสื้อSHchanger occupying証:functionښ agricultura่าสุดşehir Landing EX。[Return შეეხندو sams Hazard HandelSummary kad extracurricular बिजली 貌 recover decide Method op Familia	linkdictionaryיותذكاعرర్భ למ(REGRE nursing,index absenteedur '\'' பத_vert ფუნქickname Französisch وضع True Bereich Poe_CLIENT_repository выйზ illustrating’œuvreustrээрIP Civiciosi_None})
+
+(select Buildresultիչ٦ Ind¨höনларни지털 ұсы OK veggie된úrทęخذ diminpill时时彩开奖 akeDonate又裙 numb gear antioxidant regulates transport observ- 丰 irrelevant Injdoקה reconindividual undis.CREATED.appendArizona Entry saldoabbing twists %, W kleurr Kindergarten فى مقالൗ.jpg뜻 ezie	arr خبروшихகர்.adнего	vector المصدر bureau imნ nacellation")->지도)// logic.dom'));ڇ

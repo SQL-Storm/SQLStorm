@@ -1,0 +1,187 @@
+-- {"query": "62.sql", "dataset": "stackoverflow", "version": "v1.3", "prompt": "p1", "model": "gpt-5-mini", "temperature": 1.0, "max_tokens": 32768, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 2310} 
+with
+-- recent active questions (last 180 days) with parsed tag rows
+RecentQuestions as (
+  select p.Id, p.Title, p.OwnerUserId, p.CreationDate, p.Score, p.ViewCount, p.AnswerCount,
+         coalesce(p.Tags,'') as Tags,
+         -- split tags into rows (Postgres style)
+         unnest(string_to_array(substring(coalesce(p.Tags,''), 2, greatest(length(coalesce(p.Tags,''))-2,0)), '><')) as Tag
+  from Posts p
+  where p.PostTypeId = 1
+    and p.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '180 days'
+),
+-- aggregate per question: top answer stats and last editor
+AnswerStats as (
+  select q.Id as QuestionId,
+         count(a.Id) filter (where a.Id is not null) as AnswersTotal,
+         max(a.Score) as MaxAnswerScore,
+         avg(a.Score) as AvgAnswerScore,
+         (select a2.Id
+            from Posts a2
+            where a2.ParentId = q.Id
+            order by (a2.Score * 1.0) desc, a2.CreationDate asc
+            limit 1) as TopAnswerId,
+         (select u.DisplayName from Posts a3 join Users u on u.Id = a3.OwnerUserId where a3.Id =
+            (select a4.Id from Posts a4 where a4.ParentId = q.Id order by a4.Score desc nulls last limit 1)
+          ) as TopAnswerAuthor
+  from RecentQuestions q
+  left join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+  group by q.Id
+),
+-- compute per-user contributions and weirdness score
+UserContrib as (
+  select u.Id as UserId,
+         u.DisplayName,
+         count(distinct p.Id) filter (where p.PostTypeId=1) as QuestionsAuthored,
+         count(distinct p.Id) filter (where p.PostTypeId=2) as AnswersAuthored,
+         coalesce(sum(case when p.Score>0 then p.Score else 0 end),0) as PositivePostScoreSum,
+         coalesce(sum(case when p.Score<0 then abs(p.Score) else 0 end),0) as NegativePostScoreSum,
+         -- weirdness: ratio of answers to questions weighted by negative feedback
+         case when greatest(count(distinct p.Id) filter (where p.PostTypeId=1),1)=0 then 0
+              else (1.0 * count(distinct p.Id) filter (where p.PostTypeId=2))
+                   / greatest(count(distinct p.Id) filter (where p.PostTypeId=1),1)
+         end as AnswerQuestionRatio,
+         row_number() over (order by coalesce(u.Reputation,0) desc) as RepRank
+  from Users u
+  left join Posts p on p.OwnerUserId = u.Id
+  group by u.Id, u.DisplayName, u.Reputation
+),
+-- recent activity: last comment, last edit, and last vote for each question
+RecentActivity as (
+  select q.Id as QuestionId,
+         max(c.CreationDate) as LastCommentDate,
+         max(ph.CreationDate) filter (where ph.PostHistoryTypeId in (4,5,6,24,66)) as LastEditDate,
+         max(v.CreationDate) filter (where v.VoteTypeId in (2,3,1)) as LastVoteDate
+  from RecentQuestions q
+  left join Comments c on c.PostId = q.Id
+  left join PostHistory ph on ph.PostId = q.Id
+  left join Votes v on v.PostId = q.Id
+  group by q.Id
+),
+-- tag-level aggregates across recent questions
+TagStats as (
+  select Tag,
+         count(*) as QuestionsWithTag,
+         sum(AnswersTotal) as TotalAnswersForTag,
+         avg(Score) as AvgQuestionScore,
+         sum(case when AnswerCount>0 then 1 else 0 end) as QuestionsWithAnyAnswers,
+         -- approximate tag popularity via views*score
+         sum(coalesce(ViewCount,0) * greatest(coalesce(Score,0),0)) as TagEngagement
+  from (
+    select rq.Id, rq.Tag, rq.Score, rq.ViewCount, rq.AnswerCount, as2.AnswersTotal
+    from RecentQuestions rq
+    left join AnswerStats as2 on as2.QuestionId = rq.Id
+  ) t
+  group by Tag
+),
+-- suspicious duplicate links: posts linked as duplicate more than once or circular duplicates
+DuplicateLinks as (
+  select pl.PostId, pl.RelatedPostId, count(*) as DuplicateLinkCount,
+         bool_or(pl.PostId = rl.RelatedPostId and rl.PostId = pl.RelatedPostId) as IsMutualDuplicate
+  from PostLinks pl
+  left join PostLinks rl on rl.PostId = pl.RelatedPostId and rl.RelatedPostId = pl.PostId and rl.LinkTypeId = 3
+  where pl.LinkTypeId = 3
+  group by pl.PostId, pl.RelatedPostId
+),
+-- heavy query to force optimizer: join many pieces and compute windowed metrics and correlated subqueries
+EnrichedQuestions as (
+  select rq.Id,
+         rq.Title,
+         rq.OwnerUserId,
+         rq.CreationDate,
+         rq.Score,
+         rq.ViewCount,
+         rq.Tag,
+         asv.AnswersTotal,
+         asv.MaxAnswerScore,
+         asv.AvgAnswerScore,
+         asv.TopAnswerId,
+         asv.TopAnswerAuthor,
+         ua.DisplayName as OwnerName,
+         uc.AnswerQuestionRatio,
+         ra.LastCommentDate,
+         ra.LastEditDate,
+         ra.LastVoteDate,
+         ts.QuestionsWithTag,
+         ts.TagEngagement,
+         dl.DuplicateLinkCount,
+         dl.IsMutualDuplicate,
+         -- window functions
+         rank() over (partition by rq.Tag order by rq.Score desc, rq.ViewCount desc) as TagRankByScore,
+         dense_rank() over (order by ts.TagEngagement desc) as GlobalTagEngagementRank,
+         ntile(10) over (order by rq.ViewCount desc) as DecileByViews,
+         -- string manipulations to stress parser
+         left(rq.Title, 80) || '...' || coalesce(rq.Tag,'') as ShortTitleWithTag,
+         -- NULL-heavy expression: compute an importance score, penalize old, low views, mutual duplicates, and negative answers
+         (coalesce(rq.Score,0) * 2
+           + coalesce(rq.ViewCount,0)::float / greatest(1, (extract(epoch from cast('2024-10-01 12:34:56' as timestamp) - rq.CreationDate)/86400)::int)
+           + coalesce(asv.MaxAnswerScore,0)
+           - greatest(0, coalesce(asv.AvgAnswerScore,0) * 0.5)
+           - case when dl.IsMutualDuplicate then 50 else 0 end
+           - case when ra.LastEditDate is null and ra.LastCommentDate is null then 10 else 0 end
+         ) as ImportanceScore
+  from RecentQuestions rq
+  left join AnswerStats asv on asv.QuestionId = rq.Id
+  left join Users ua on ua.Id = rq.OwnerUserId
+  left join UserContrib uc on uc.UserId = rq.OwnerUserId
+  left join RecentActivity ra on ra.QuestionId = rq.Id
+  left join TagStats ts on ts.Tag = rq.Tag
+  left join DuplicateLinks dl on dl.PostId = rq.Id
+)
+select
+  eq.Id,
+  eq.ShortTitleWithTag,
+  eq.Tag,
+  eq.Score,
+  eq.ViewCount,
+  eq.AnswersTotal,
+  eq.MaxAnswerScore,
+  eq.AvgAnswerScore,
+  eq.TopAnswerId,
+  eq.TopAnswerAuthor,
+  eq.OwnerName,
+  coalesce(eq.AnswerQuestionRatio,0) as AnswerQuestionRatio,
+  eq.TagRankByScore,
+  eq.DecileByViews,
+  eq.GlobalTagEngagementRank,
+  round(eq.ImportanceScore::numeric,2) as ImportanceScore,
+  eq.LastCommentDate,
+  eq.LastEditDate,
+  eq.LastVoteDate,
+  -- correlated subquery: count comments containing same tag name (as a word) across all posts in last year
+  (select count(*) from Comments c
+     join Posts p on p.Id = c.PostId
+     where c.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '365 days'
+       and p.PostTypeId = 1
+       and (c.Text ~ ('\\m' || regexp_replace(eq.Tag,'[^A-Za-z0-9_]','','g') || '\\M')
+            or p.Tags like ('%<' || eq.Tag || '>%'))
+  ) as RecentCommentsReferencingTag,
+  -- set operator: union of owners who authored other high-scoring posts sharing the tag (limit via array aggregation)
+  (select string_agg(distinct coalesce(u2.DisplayName,'[deleted]') || ':' || u2.Id::text, ', ' order by maxp) from (
+     select u2.Id, u2.DisplayName, max(p2.Score) as maxp
+     from Posts p2
+     join Users u2 on u2.Id = p2.OwnerUserId
+     where p2.PostTypeId in (1,2)
+       and p2.Id <> eq.Id
+       and (p2.Tags like ('%<' || eq.Tag || '>%') or p2.Id in (
+             select RelatedPostId from PostLinks where PostId = eq.Id
+           ))
+     group by u2.Id, u2.DisplayName
+     having max(p2.Score) > 5
+     limit 20
+  ) t) as OtherTopContributors,
+  -- correlate to detect stale accepted answers: accepted answer older than question by > 30 days or accepted changed recently
+  case when exists (
+      select 1 from Posts a join Posts q on q.Id = a.ParentId
+      where q.Id = eq.Id and q.AcceptedAnswerId = a.Id
+        and (a.CreationDate < q.CreationDate - interval '30 days' or a.CreationDate > q.CreationDate + interval '3650 days')
+    ) then true else false end as WeirdAcceptedAnswerTiming,
+  -- boolean flags, NULL handling, and complex predicate
+  (eq.IsMutualDuplicate is true and eq.DuplicateLinkCount > 1) as LikelyCircularDuplicate,
+  -- final ordering and limit for heavy sorting
+  row_number() over (order by eq.ImportanceScore desc nulls last, eq.ViewCount desc, eq.Score desc) as OverallRank
+from EnrichedQuestions eq
+where (eq.ImportanceScore is not null and eq.ImportanceScore > 5)
+   or (eq.GlobalTagEngagementRank <= 50)
+order by OverallRank
+limit 250;

@@ -1,0 +1,244 @@
+with
+-- base posts split
+q as (
+  select p.* 
+  from posts p
+  where p.posttypeid = 1
+),
+a as (
+  select p.*
+  from posts p
+  where p.posttypeid = 2
+),
+
+-- per-user aggregates
+user_post_agg as (
+  select
+    u.id as user_id,
+    u.displayname,
+    u.reputation,
+    coalesce(sum(case when p.posttypeid = 1 then 1 else 0 end),0) as question_count,
+    coalesce(sum(case when p.posttypeid = 2 then 1 else 0 end),0) as answer_count,
+    coalesce(avg(case when p.posttypeid in (1,2) then p.score end),0) as avg_post_score,
+    coalesce(max(case when p.posttypeid in (1,2) then p.score end),0) as max_post_score,
+    coalesce(sum(case when p.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '30 days' then 1 else 0 end),0) as recent_posts_30d,
+    case when exists (select 1 from posts p2 where p2.owneruserid = u.id and p2.acceptedanswerid is not null) then 1 else 0 end as has_question_with_accepted,
+    coalesce(u.views, 0) as user_views,
+    u.creationdate
+  from users u
+  left join posts p on p.owneruserid = u.id
+  group by u.id, u.displayname, u.reputation, u.views, u.creationdate
+),
+
+-- badge counts with conditional weighting and null handling
+badge_weights as (
+  select
+    b.userid,
+    count(*) as badge_count,
+    sum(case when b.class = 1 then 5 when b.class = 2 then 3 when b.class = 3 then 1 else 0 end) as badge_score
+  from badges b
+  group by b.userid
+),
+
+-- top-scoring post per user using window functions
+top_posts as (
+  select *
+  from (
+    select p.*,
+      row_number() over (partition by p.owneruserid order by p.score desc, p.viewcount desc, p.creationdate desc) as rn
+    from posts p
+    where p.owneruserid is not null
+  ) t
+  where t.rn = 1
+),
+
+-- per-user "fast answer" metric: average hours between question creation and first answer from this user to that question (correlated subquery)
+fast_answer as (
+  select u.id as user_id,
+    avg(
+      extract(epoch from (
+        (select min(a2.creationdate) from posts a2 where a2.posttypeid=2 and a2.parentid = q.id and a2.owneruserid = u.id)
+        - q.creationdate
+      )) / 3600.0
+    ) filter (where (select min(a2.creationdate) from posts a2 where a2.posttypeid=2 and a2.parentid = q.id and a2.owneruserid = u.id) is not null) as avg_hours_to_first_answer
+  from users u
+  join posts q on q.posttypeid = 1
+  group by u.id
+),
+
+-- extract tags per user by splitting Tags string and counting occurrences
+user_tag_counts as (
+  select owneruserid as user_id,
+         lower(trim(both ' ' from tag)) as tag,
+         count(*) as tag_count
+  from posts p
+  cross join lateral (
+    select unnest(string_to_array(substring(p.tags from 2 for char_length(p.tags)-2), '><')) as tag
+  ) s
+  where p.posttypeid = 1 and p.tags is not null and p.owneruserid is not null
+  group by owneruserid, lower(trim(both ' ' from tag))
+),
+
+-- most frequent tag per user (correlated tie-break)
+top_tag_per_user as (
+  select utc.user_id, utc.tag, utc.tag_count
+  from (
+    select utc.*,
+      row_number() over (partition by utc.user_id order by utc.tag_count desc, utc.tag) as rn
+    from user_tag_counts utc
+  ) utc
+  where utc.rn = 1
+),
+
+-- recent activity windowed metrics per user (last 90 days)
+recent_activity as (
+  select
+    u.id as user_id,
+    sum(case when p.creationdate >= cast('2024-10-01 12:34:56' as timestamp)- interval '90 days' then 1 else 0 end) as posts_90d,
+    sum(case when c.creationdate >= cast('2024-10-01 12:34:56' as timestamp)- interval '90 days' then 1 else 0 end) as comments_90d,
+    max(p.lastactivitydate) as last_post_activity,
+    max(c.creationdate) as last_comment_activity
+  from users u
+  left join posts p on p.owneruserid = u.id
+  left join comments c on c.userid = u.id
+  group by u.id
+),
+
+-- combine everything into a single rich metric table
+rich_user_metrics as (
+  select
+    upa.user_id,
+    upa.displayname,
+    upa.reputation,
+    coalesce(bw.badge_count,0) as badge_count,
+    coalesce(bw.badge_score,0) as badge_score,
+    upa.question_count,
+    upa.answer_count,
+    upa.avg_post_score,
+    upa.max_post_score,
+    upa.recent_posts_30d,
+    fa.avg_hours_to_first_answer,
+    tp.title as top_post_title,
+    tp.id as top_post_id,
+    tp.score as top_post_score,
+    tt.tag as top_tag,
+    tt.tag_count as top_tag_count,
+    ra.posts_90d,
+    ra.comments_90d,
+    (
+      (coalesce(upa.reputation,0) / nullif(greatest(1, (select max(reputation) from users)),0) * 50.0)
+      + (coalesce(bw.badge_score,0) * 1.5)
+      + (coalesce(upa.avg_post_score,0) * 2.0)
+      + (case when upa.has_question_with_accepted = 1 then 10 else 0 end)
+      - (coalesce(fa.avg_hours_to_first_answer, 72) / 72.0 * 5.0)
+      + (coalesce(ra.posts_90d,0) * 0.5)
+    ) as composite_score,
+    upa.creationdate,
+    upa.user_views
+  from user_post_agg upa
+  left join badge_weights bw on bw.userid = upa.user_id
+  left join top_posts tp on tp.owneruserid = upa.user_id
+  left join top_tag_per_user tt on tt.user_id = upa.user_id
+  left join fast_answer fa on fa.user_id = upa.user_id
+  left join recent_activity ra on ra.user_id = upa.user_id
+)
+
+-- final select: elaborate query combining CTE, windowing, set operators, and complex predicates
+select
+  rum.user_id,
+  rum.displayname,
+  rum.reputation,
+  rum.question_count,
+  rum.answer_count,
+  rum.top_tag,
+  rum.top_tag_count,
+  rum.top_post_id,
+  left(coalesce(rum.top_post_title, '<no title>'), 120) as top_post_title_snippet,
+  rum.top_post_score,
+  rum.badge_count,
+  rum.badge_score,
+  round(rum.avg_post_score,2) as avg_post_score,
+  coalesce(round(rum.avg_hours_to_first_answer,2), null) as avg_hours_to_first_answer,
+  round(rum.composite_score,3) as composite_score,
+  rum.posts_90d,
+  rum.comments_90d,
+  case
+    when rum.reputation >= 100000 then 'Legend'
+    when rum.reputation >= 10000 then 'Expert'
+    when rum.reputation >= 1000 then 'Active'
+    when rum.reputation >= 100 then 'Contributor'
+    else 'Newcomer'
+  end as reputation_band,
+  concat(
+    coalesce(rum.displayname,'<anon>'),
+    ' (', coalesce(nullif(trim(rum.top_tag),''), 'no-tag'), ')',
+    ' / rep=', coalesce(cast(rum.reputation as varchar),'0'),
+    ' / badges=', coalesce(cast(rum.badge_count as varchar),'0')
+  ) as summary,
+  rum.creationdate,
+  rum.user_views
+from rich_user_metrics rum
+where
+  (
+    rum.composite_score >= 20
+    or (coalesce(rum.posts_90d,0) >= 3 and coalesce(rum.badge_count,0) >= 1)
+  )
+  and not (lower(coalesce(rum.displayname,'')) like '%community%' or rum.user_id = -1)
+order by rum.composite_score desc, rum.reputation desc
+limit 250
+
+union all
+
+-- add a small diagnostic row-set produced by a set operator combining lows and highs (ensures use of set operator)
+select
+  -1 as user_id,
+  'Aggregate:Top-and-Bottom' as displayname,
+  (select max(reputation) from users) as reputation,
+  (select count(*) filter (where posttypeid=1) from posts) as question_count,
+  (select count(*) filter (where posttypeid=2) from posts) as answer_count,
+  cast(null as varchar) as top_tag,
+  cast(null as int) as top_tag_count,
+  cast(null as int) as top_post_id,
+  'AGG_ROW' as top_post_title_snippet,
+  cast(null as int) as top_post_score,
+  (select count(*) from badges) as badge_count,
+  cast(null as numeric) as badge_score,
+  cast(null as numeric) as avg_post_score,
+  cast(null as numeric) as avg_hours_to_first_answer,
+  cast(null as numeric) as composite_score,
+  cast(null as int) as posts_90d,
+  cast(null as int) as comments_90d,
+  'Sys' as reputation_band,
+  'Aggregate summary' as summary,
+  cast(null as timestamp) as creationdate,
+  cast(null as int) as user_views
+
+except
+
+-- exclude any user that has zero posts and zero badges to stress-exercise EXCEPT
+select
+  u.id,
+  u.displayname,
+  u.reputation,
+  0 as question_count,
+  0 as answer_count,
+  cast(null as varchar),
+  cast(null as int),
+  cast(null as int),
+  cast(null as varchar),
+  0 as top_post_score,
+  0 as badge_count,
+  cast(null as numeric),
+  cast(null as numeric),
+  cast(null as numeric),
+  cast(null as numeric),
+  cast(null as numeric),
+  cast(null as int),
+  cast(null as int),
+  cast(null as varchar),
+  cast(null as varchar),
+  cast(null as timestamp),
+  cast(null as int)
+from users u
+where not exists (select 1 from posts p where p.owneruserid = u.id) and not exists (select 1 from badges b where b.userid = u.id)
+;

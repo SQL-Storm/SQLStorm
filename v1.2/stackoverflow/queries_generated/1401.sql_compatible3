@@ -1,0 +1,199 @@
+with RECURSIVE tag_pairs as (
+    select
+        p.Id as PostId,
+        t1.TagName as Tag1,
+        t2.TagName as Tag2
+    from
+        Posts p
+        join lateral unnest(string_to_array(substring(p.Tags from 2 for length(p.Tags)-2), '><')) with ordinality as t1(TagName, ord1) on true
+        join lateral unnest(string_to_array(substring(p.Tags from 2 for length(p.Tags)-2), '><')) with ordinality as t2(TagName, ord2) on true
+    where
+        p.PostTypeId = 1 and t1.ord1 < t2.ord2
+),
+top_badge_owners as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(b.Id) as BadgeCount,
+        avg(case when b.Class = 1 then 3 when b.Class = 2 then 2 else 1 end) / nullif(count(b.Id),0) as WeightedBadgeScore
+    from
+        Users u
+        left join Badges b on b.UserId = u.Id
+    group by u.Id, u.DisplayName
+    having count(b.Id) > 10
+),
+latest_post_edits as (
+    select distinct on (ph.PostId)
+        ph.PostId,
+        ph.Id as EditId,
+        ph.CreationDate as EditCreation,
+        ph.UserId as EditorUserId,
+        ph.UserDisplayName as EditorName,
+        ph.Text as EditDescription
+    from
+        PostHistory ph
+    where
+        ph.PostHistoryTypeId in (4,5,6)
+    order by
+        ph.PostId,
+        ph.CreationDate desc
+),
+answer_upvote_counts as (
+    select
+        p.ParentId as QuestionId,
+        count(v.Id) filter (where v.VoteTypeId = 2) as TotalAnswerUpvotes,
+        max(count(v.Id) filter (where v.PostId = p.Id and v.VoteTypeId = 2)) over (partition by p.ParentId) as MaxSingleAnswerUpvotes
+    from
+        Posts p
+        left join Votes v on v.PostId = p.Id and v.VoteTypeId = 2
+    where
+        p.PostTypeId = 2
+    group by
+        p.ParentId,
+        p.Id
+),
+question_stats as (
+    select
+        p.Id,
+        p.Title,
+        p.OwnerUserId,
+        u.DisplayName as OwnerName,
+        p.CreationDate,
+        p.Score,
+        count(c.Id) as CommentCount,
+        sum(case when v.VoteTypeId = 2 then 1 else 0 end) as UpvoteCount,
+        row_number() over (partition by p.Id order by p.ViewCount desc, p.Score desc) as PopularityRank,
+        avg(p.Score) over (partition by p.OwnerUserId) as OwnerAvgScore,
+        max(ph.CreationDate) as LastHistoryDate,
+        p.ViewCount
+    from
+        Posts p
+        left join Users u on u.Id = p.OwnerUserId
+        left join Comments c on c.PostId = p.Id 
+        left join Votes v on v.PostId = p.Id
+        left join PostHistory ph on ph.PostId = p.Id
+    where
+        p.PostTypeId = 1
+    group by
+        p.Id,
+        p.Title,
+        p.OwnerUserId,
+        u.DisplayName,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount
+),
+question_answer_joined as (
+    select
+        qs.*,
+        add.TotalAnswerUpvotes,
+        add.MaxSingleAnswerUpvotes,
+        tb.WeightedBadgeScore as OwnerBadgeWeightedScore,
+        lpe.EditorName as LastEditorFullName,
+        lpe.EditDescription,
+        pp1.OtherQuestionsSameOwner,
+        check_mgr_text.DescriptionProhibited
+    from
+        question_stats qs
+        left join answer_upvote_counts add on add.QuestionId = qs.Id
+        left join top_badge_owners tb on tb.UserId = qs.OwnerUserId
+        left join latest_post_edits lpe on lpe.PostId = qs.Id
+        left join lateral (
+            select count(*) as OtherQuestionsSameOwner
+            from Posts p2
+            where p2.PostTypeId = 1 and p2.OwnerUserId = qs.OwnerUserId and p2.Id <> qs.Id
+        ) pp1 on true
+        left join lateral (
+             select bool_or((ph.Comment like '%prohibit%') or (ph.Comment is null and ph.Text like '%prohibit%')) as DescriptionProhibited
+             from PostHistory ph 
+             where ph.PostId = qs.Id and ph.PostHistoryTypeId in (4,5)
+        ) check_mgr_text on true
+),
+duplicates_all as (
+    select 
+        pl.PostId,
+        pl.RelatedPostId,
+        lt.Name as LinkTypeName,
+        p1.Title as PostTitle,
+        p2.Title as RelatedPostTitle
+    from 
+        PostLinks pl
+        inner join LinkTypes lt on lt.Id = pl.LinkTypeId
+        inner join Posts p1 on p1.Id = pl.PostId
+        inner join Posts p2 on p2.Id = pl.RelatedPostId
+    where
+        lt.Name = 'Duplicate' and p1.PostTypeId = 1 and p2.PostTypeId = 1
+),
+posts_union_bool as (
+    select p.Id as PostId, true as HasParent, p.ParentId as LinkedPostId from Posts p where p.PostTypeId = 2
+    union
+    select Id as PostId, false as HasParent, null as LinkedPostId from Posts where PostTypeId=1
+)
+select
+    qan.Id as QuestionId,
+    qan.Title,
+    qan.OwnerName,
+    qan.CreationDate,
+    coalesce(qan.Score,0) as QuestionScore,
+    coalesce(qan.CommentCount,0) as QuestionComments,
+    coalesce(qan.UpvoteCount,0) as QuestionUpvotes,
+    coalesce(qan.PopularityRank,100000) as PopularityRank,
+    qan.OwnerAvgScore,
+    qan.TotalAnswerUpvotes,
+    qan.MaxSingleAnswerUpvotes,
+    round(coalesce(qan.OwnerBadgeWeightedScore,0)::double precision::numeric, 2) as OwnerBadgeWeightedScore,
+    qan.LastEditorFullName,
+    substring(coalesce(qan.EditDescription, '') from 1 for 50) as LastEditPreview,
+    qan.OtherQuestionsSameOwner,
+    case when qan.DescriptionProhibited then 'Contains words prohibiting postings controllably' else 'Clean' end as DemeritFlag,
+    pt.Name as PostTypeName,
+    phlangsTop.Tag1 || ' + ' || phlangsTop.Tag2 as PopularTagPairs,
+    dups.RelatedPostTitle as DuplicateOf,
+    (select count(*) 
+     from Comments c2 
+     where c2.PostId = qan.Id and c2.UserId = qan.OwnerUserId and c2.Text ilike '%thanks%'
+    ) as OwnerThankCommentsCount,
+    pb_sa.WMA_ScoreOverMean,
+    case 
+        when coalesce(u.Location, '') <> '' and char_length(u.Location) > 5 then
+            upper(left(u.Location,3)) || '-region'
+        else 'Unknown Region' 
+    end as CodedRegion,
+    coalesce(pl.PostId,0) as PostIdLinkedWithChildAnswer
+from
+    question_answer_joined qan
+    left join Posts qp on qp.Id = qan.Id
+    left join PostTypes pt on qp.PostTypeId = pt.Id
+    left join duplicates_all dups on dups.PostId = qan.Id
+    left join Users u on u.Id = qan.OwnerUserId
+    left join lateral (
+        select 
+            concat(tag1, '|', tag2 || 'F') as QVal,
+            count(*) over (partition by tag1, tag2) as PairCount,
+            tag1,
+            tag2
+        from tag_pairs tp
+        order by PairCount desc
+        limit 1
+    ) phlangsTop on true
+    left join lateral (
+        select
+            case when nullif(count(*) over (),0) is null then null
+                 else sum(score) over (order by score ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING) / nullif(count(*) over (),0)
+            end as WMA_ScoreOverMean,
+            score,
+            OwnerUserId
+        from Posts
+        where PostTypeId = 1
+        and OwnerUserId = qan.OwnerUserId
+        order by Score desc
+        limit 10
+    ) pb_sa on true
+    left join posts_union_bool pl on pl.PostId = qan.Id and pl.HasParent = true
+where
+    qan.OwnerBadgeWeightedScore is not null
+order by
+    qan.TotalAnswerUpvotes desc,
+    qan.Score desc,
+    qan.CreationDate asc
+limit 100;

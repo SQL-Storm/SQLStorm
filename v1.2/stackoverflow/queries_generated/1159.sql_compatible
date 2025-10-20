@@ -1,0 +1,177 @@
+with RecursiveTagHierarchy as (
+    select t.Id, t.TagName, t.Count, t.ExcerptPostId, t.WikiPostId, 1 as Level
+    from Tags t
+    where t.IsModeratorOnly = false
+    union all
+    select t.Id, t.TagName, t.Count, t.ExcerptPostId, t.WikiPostId, r.Level + 1
+    from Tags t
+    join RecursiveTagHierarchy r on t.Id = r.Id and r.Level < 3
+),
+PostStats as (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        coalesce(p.Tags,'') as Tags,
+        p.OwnerUserId,
+        u.DisplayName as OwnerName,
+        count(distinct b.Id) filter (where b.Class=1) as GoldBadges,
+        count(distinct b.Id) filter (where b.Class=2) as SilverBadges,
+        count(distinct b.Id) filter (where b.Class=3) as BronzeBadges,
+        (select count(*) from Comments c where c.PostId = p.Id) as CommentCount,
+        row_number() over (partition by p.OwnerUserId order by p.CreationDate desc) as UserPostRank,
+        lag(p.LastActivityDate) over (partition by p.OwnerUserId order by p.CreationDate) as PrevActivity,
+        lead(p.LastActivityDate) over (partition by p.OwnerUserId order by p.CreationDate) as NextActivity
+    from Posts p
+    left join Users u on u.Id = p.OwnerUserId
+    left join Badges b on b.UserId = p.OwnerUserId
+    where p.PostTypeId in (1,2)
+    group by p.Id, p.PostTypeId, p.CreationDate, p.Score, p.ViewCount, p.Tags, p.OwnerUserId, u.DisplayName, p.LastActivityDate
+),
+CloseReasonAggregate as (
+    select
+        pht.PostId,
+        crt.Name as CloseReasonName,
+        count(*) as CloseVotesCount
+    from PostHistory pht
+    join PostHistoryTypes phtypes on pht.PostHistoryTypeId = phtypes.Id
+    join CloseReasonTypes crt on crt.Id = cast(pht.Comment as integer)
+    where pht.PostHistoryTypeId = 10
+    group by pht.PostId, crt.Name
+),
+AnswerAggregatedStats as (
+    select 
+        ans.ParentId as QuestionId,
+        count(ans.Id) as AnswerCount,
+        avg(ans.Score) as AvgAnswerScore,
+        sum(case when ans.Score >= 10 then 1 else 0 end) as HighScoreAnswers,
+        max(ans.CreationDate) as LastAnswerDate
+    from Posts ans
+    where ans.PostTypeId = 2
+    group by ans.ParentId
+),
+AcceptedAnswerDetails as (
+    select
+        q.Id as QuestionId,
+        acc.Id as AcceptedAnswerId,
+        acc.Score as AcceptedAnswerScore,
+        acc.CreationDate as AcceptedAnswerDate,
+        u.Reputation as AcceptedAnswerOwnerRep,
+        u.DisplayName as AcceptedAnswerOwnerName
+    from Posts q
+    left join Posts acc on acc.Id = q.AcceptedAnswerId
+    left join Users u on u.Id = acc.OwnerUserId
+    where q.PostTypeId = 1
+),
+PostLinkSummary as (
+    select 
+        pl.PostId,
+        sum(case when lt.Name = 'Duplicate' then 1 else 0 end) as DuplicateLinks,
+        sum(case when lt.Name = 'Linked' then 1 else 0 end) as LinkedPostsCount
+    from PostLinks pl
+    join LinkTypes lt on lt.Id = pl.LinkTypeId
+    group by pl.PostId
+),
+UserActivityWindow as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(p.Id) as TotalPosts,
+        sum(case when p.PostTypeId = 1 then 1 else 0 end) as QuestionCount,
+        sum(case when p.PostTypeId = 2 then 1 else 0 end) as AnswerCount,
+        max(p.CreationDate) as LastPostDate,
+        min(p.CreationDate) as FirstPostDate,
+        lead(min(p.CreationDate)) over (order by u.Reputation desc) as NextUserFirstPostDate
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    group by u.Id, u.DisplayName, u.Reputation
+),
+ComplexPredicates as (
+    select
+        ps.Id as PostId,
+        length(coalesce(ps.Tags, '')) - length(replace(coalesce(ps.Tags,''), '><', '')) + 1 as TagCount,
+        case
+            when ps.Score > 10 and ps.ViewCount > 1000 then 'High Impact'
+            when ps.Score > 0 then 'Positive'
+            when ps.Score = 0 then 'Neutral'
+            else 'Negative'
+        end as ImpactLabel,
+        case 
+            when ps.OwnerUserId is null then 'Anonymous or Deleted'
+            when ps.OwnerUserId <= 0 then 'Community Owned or System'
+            else 'Registered User'
+        end as OwnerStatus,
+        regexp_replace(ps.OwnerName,'[^a-zA-Z0-9]+','', 'g') as CleanOwnerName,
+        (select count(*) from Comments c where c.PostId = ps.Id and (c.Text ilike '%error%' or c.Text ilike '%fail%')) as ErrorCommentsCount,
+        (select max(v.CreationDate) from Votes v where v.PostId = ps.Id and v.VoteTypeId = 2) as LastUpvoteDate,
+        (select count(*) from Votes v where v.PostId = ps.Id and v.VoteTypeId in (3, 12)) as NegativeVotes,
+        Greatest(coalesce(ps.PrevActivity, timestamp '1900-01-01'), coalesce(ps.NextActivity, timestamp '1900-01-01')) as RelevantActivityDate
+    from PostStats ps
+),
+FinalOutput as (
+    select
+        cp.PostId,
+        ps.PostTypeId,
+        ps.CreationDate,
+        ps.Score,
+        ps.ViewCount,
+        cp.TagCount,
+        cp.ImpactLabel,
+        cp.OwnerStatus,
+        cp.CleanOwnerName,
+        psa.AnswerCount,
+        psa.AvgAnswerScore,
+        psa.HighScoreAnswers,
+        ca.CloseReasonName,
+        ca.CloseVotesCount,
+        ald.AcceptedAnswerScore,
+        ald.AcceptedAnswerOwnerRep,
+        pls.DuplicateLinks,
+        pls.LinkedPostsCount,
+        ua.TotalPosts as OwnerTotalPosts,
+        ua.QuestionCount as OwnerQuestions,
+        ua.AnswerCount as OwnerAnswers,
+        ua.LastPostDate as OwnerLastPost,
+        ua.DisplayName as OwnerDisplayName,
+        (case when ps.Score < 0 and cp.ErrorCommentsCount = 0 then 1 else 0 end) as PossibleFalseNegative
+    from ComplexPredicates cp
+    join PostStats ps on ps.Id = cp.PostId
+    left join AnswerAggregatedStats psa on psa.QuestionId = ps.Id
+    left join CloseReasonAggregate ca on ca.PostId = ps.Id
+    left join AcceptedAnswerDetails ald on ald.QuestionId = ps.Id
+    left join PostLinkSummary pls on pls.PostId = ps.Id
+    left join UserActivityWindow ua on ua.UserId = ps.OwnerUserId
+)
+select distinct
+    fo.PostId,
+    fo.PostTypeId,
+    fo.CreationDate,
+    fo.Score,
+    fo.ViewCount,
+    fo.TagCount,
+    fo.ImpactLabel,
+    fo.OwnerStatus,
+    fo.CleanOwnerName,
+    fo.AnswerCount,
+    round(coalesce(fo.AvgAnswerScore,0),2) as AvgAnswerScore,
+    fo.HighScoreAnswers,
+    coalesce(fo.CloseReasonName,'Not Closed') as CloseReasonName,
+    coalesce(fo.CloseVotesCount,0) as CloseVotesCount,
+    fo.AcceptedAnswerScore,
+    fo.AcceptedAnswerOwnerRep,
+    coalesce(fo.DuplicateLinks,0) as DuplicateLinks,
+    coalesce(fo.LinkedPostsCount,0) as LinkedPostsCount,
+    fo.OwnerTotalPosts,
+    fo.OwnerQuestions,
+    fo.OwnerAnswers,
+    fo.OwnerLastPost,
+    fo.OwnerDisplayName,
+    fo.PossibleFalseNegative
+from FinalOutput fo
+where fo.PostTypeId = 1
+and (fo.ViewCount > 1000 or fo.Score >= 10)
+and (fo.CloseVotesCount is null or fo.CloseVotesCount < 5)
+order by fo.ViewCount desc, fo.Score desc
+limit 100;

@@ -1,0 +1,207 @@
+with RecursiveTagHierarchy as (
+    select
+        t.Id,
+        t.TagName,
+        cast(null as int) as ParentTagId,
+        1 as Level
+    from Tags t
+    where t.IsModeratorOnly = false and t.IsRequired = false
+
+    union all
+
+    select
+        child.Id,
+        child.TagName,
+        parent.Id as ParentTagId,
+        parent.Level + 1 as Level
+    from Tags child
+    join RecursiveTagHierarchy parent on child.Id <> parent.Id
+    where char_length(child.TagName) > char_length(parent.TagName)
+      and position(parent.TagName in child.TagName) = 1
+      and parent.Level < 3
+),
+TopActiveUsers AS (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        count(p.Id) filter (where p.PostTypeId = 1) as QuestionsCount,
+        count(p.Id) filter (where p.PostTypeId = 2) as AnswersCount
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id and p.CreationDate >= cast('2024-10-01' as date) - interval '1 year'
+    group by u.Id, u.DisplayName, u.Reputation
+    having count(p.Id) filter (where p.PostTypeId in (1,2)) > 10
+    order by u.Reputation desc
+    limit 50
+),
+UserBadgesCounts as (
+    select
+        b.UserId,
+        b.Class,
+        count(*) as BadgeCount
+    from Badges b
+    where b.Date >= cast('2024-10-01' as date) - interval '1 year'
+    group by b.UserId, b.Class
+),
+UserScoreWindowed as (
+    select
+        p.OwnerUserId,
+        p.Id,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        rank() over (partition by p.OwnerUserId order by p.Score desc) as PostScoreRank,
+        count(*) over (partition by p.OwnerUserId) as PostCount,
+        sum(p.Score) over (partition by p.OwnerUserId order by p.CreationDate rows between unbounded preceding and current row) as RunningScoreSum
+    from Posts p
+    where p.OwnerUserId is not null and p.CreationDate >= cast('2024-10-01' as date) - interval '1 year'
+),
+LatestCloseInfo AS (
+    select distinct on (ph.PostId)
+        ph.PostId,
+        extraClose.Name as CloseReason,
+        ph.UserId as ClosedByUser,
+        ph.CreationDate as CloseDate
+    from PostHistory ph
+    left join CloseReasonTypes extraClose on cast(ph.Comment as int) = extraClose.Id and ph.PostHistoryTypeId = 10
+    where ph.PostHistoryTypeId = 10
+    order by ph.PostId, ph.CreationDate desc
+),
+UserCommentActivity as (
+    select
+        c.UserId,
+        count(*) over (partition by c.UserId) as TotalComments,
+        max(c.CreationDate) over (partition by c.UserId) as LatestCommentDate,
+        array_agg(distinct lower(regexp_replace(c.Text,'\W+',' ','g'))) filter (where c.UserId is not null and c.UserId <> -1) over (partition by c.UserId) as CommentWords
+    from Comments c
+    where c.CreationDate >= cast('2024-10-01' as date) - interval '1 year'
+),
+PostWithLinkAndVotes AS (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        count(distinct pl.Id) filter (where lt.Name = 'Duplicate') as DuplicateLinksCount,
+        count(distinct v.Id) filter (where vt.Name = 'UpMod') as UpVotesCount,
+        count(distinct v.Id) filter (where vt.Name = 'DownMod') as DownVotesCount
+    from Posts p
+    left join PostLinks pl on p.Id = pl.PostId
+    left join LinkTypes lt on pl.LinkTypeId = lt.Id
+    left join Votes v on p.Id = v.PostId
+    left join VoteTypes vt on v.VoteTypeId = vt.Id
+    group by p.Id, p.PostTypeId, p.OwnerUserId, p.CreationDate, p.Score
+),
+ComplexUserScoreValuation as (
+    select
+        u.UserId,
+        u.DisplayName,
+        coalesce(sum(ubc.BadgeCount *
+            case ubc.Class when 1 then 20 when 2 then 10 when 3 then 5 else 1 end),0) as BadgeScore,
+        sum(coalesce(psw.Score,0)) as TotalPostScore,
+        max(case when psw.PostTypeId = 1 then psw.Score else 0 end) as MaxQuestionScore,
+        max(case when psw.PostTypeId = 2 then psw.Score else 0 end) as MaxAnswerScore,
+        count(distinct psw.Id) filter (where psw.PostScoreRank=1) as HighestPostsCount,
+        count(distinct psw.Id) as TotalPosts,
+        coalesce(avg(nga1.CommentCount),0) as AvgCommentsPerPost,
+        oldestPost.MinPostDate,
+        newestPost.MaxPostDate,
+        case
+            when newestPost.MaxPostDate - oldestPost.MinPostDate > interval '180 days' then 1
+            else 0
+        end as RecentActivityFlag
+    from TopActiveUsers u
+    left join UserBadgesCounts ubc on u.UserId = ubc.UserId
+    left join UserScoreWindowed psw on psw.OwnerUserId = u.UserId
+    left join (
+        select
+            p.OwnerUserId,
+            avg(ca.CommentCount) as CommentCount
+        from Posts p
+        left join (
+            select PostId, count(*) as CommentCount from Comments group by PostId
+        ) ca on ca.PostId = p.Id
+        group by p.OwnerUserId
+    ) nga1 on nga1.OwnerUserId = u.UserId
+    left join (
+        select OwnerUserId, min(CreationDate) as MinPostDate
+        from Posts
+        group by OwnerUserId
+    ) oldestPost on oldestPost.OwnerUserId = u.UserId
+    left join (
+        select OwnerUserId, max(CreationDate) as MaxPostDate
+        from Posts
+        group by OwnerUserId
+    ) newestPost on newestPost.OwnerUserId = u.UserId
+    group by u.UserId, u.DisplayName, oldestPost.MinPostDate, newestPost.MaxPostDate
+),
+FinalRankedUsers as (
+    select
+        csuv.*,
+        row_number() over (order by BadgeScore desc, TotalPostScore desc, TotalPosts desc) as UserRank
+    from ComplexUserScoreValuation csuv
+    where csuv.RecentActivityFlag = 1
+),
+UserWithCloseCounts as (
+    select
+        u.Id,
+        coalesce(sum(case when lci.CloseReason is not null then 1 else 0 end), 0) as PostsClosedCount
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join LatestCloseInfo lci on lci.PostId = p.Id
+    group by u.Id
+)
+
+select
+    fru.UserId,
+    fru.DisplayName,
+    fru.BadgeScore,
+    fru.TotalPostScore,
+    fru.TotalPosts,
+    frc.PostsClosedCount,
+    concat(
+        'Work distribution: ',
+        cast(tau.QuestionsCount as text), ' questions, ',
+        cast(tau.AnswersCount as text), ' answers'
+    ) as WorkDistribution,
+    string_agg(distinct rh.TagName, ', ') as TopLevelTagsPool,
+    coalesce(uca.TotalComments,0) as RecentUserComments,
+    coalesce(uca.LatestCommentDate, timestamp 'epoch') as LatestCommentTS,
+    round(
+        (sum(
+            case
+                when link.UpVotesCount > link.DownVotesCount then 1
+                else 0
+            end
+        )::double precision) / nullif(count(*), 0) * 100, 2
+    ) || '%' as PercentageHighlyUpvotedPosts,
+    case
+        when avg(p.Score) over () > (select avg(Score) from Posts p2 where p2.PostTypeId=1) then 'High quality scores'
+        else 'Average quality scores'
+    end as QualitySignal,
+    coalesce(max(ph.CreationDate) filter (where ph.PostHistoryTypeId in (1,4)), timestamp 'epoch') as LastTitleEditDate,
+    fru.UserRank
+from
+    FinalRankedUsers fru
+inner join
+    TopActiveUsers tau on tau.UserId = fru.UserId
+left join
+    UserWithCloseCounts frc on frc.Id = fru.UserId
+left join
+    RecursiveTagHierarchy rh on rh.Level = 1
+left join
+    UserCommentActivity uca on uca.UserId = fru.UserId
+left join
+    PostHistory ph on ph.UserId = fru.UserId
+left join
+    PostWithLinkAndVotes link on link.OwnerUserId = fru.UserId
+left join
+    Posts p on p.OwnerUserId = fru.UserId
+group by
+    fru.UserId, fru.DisplayName, fru.BadgeScore, fru.TotalPostScore, fru.TotalPosts, frc.PostsClosedCount,
+    tau.QuestionsCount, tau.AnswersCount,
+    uca.TotalComments, uca.LatestCommentDate,
+    rh.TagName, fru.UserRank
+order by fru.UserRank
+limit 20;

@@ -1,0 +1,144 @@
+WITH
+PostTagExplode AS (
+  SELECT
+    p.Id AS PostId,
+    p.PostTypeId,
+    p.Title,
+    p.Tags,
+    CASE WHEN p.OwnerUserId = 0 THEN NULL ELSE p.OwnerUserId END AS OwnerUserId,
+    regexp_split_to_table(
+      CASE WHEN p.Tags IS NULL THEN '' ELSE substring(p.Tags FROM 2 FOR char_length(p.Tags)-2) END,
+      '><'
+    ) AS Tag
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+),
+AnswerStats AS (
+  SELECT
+    a.ParentId AS QuestionId,
+    COUNT(CASE WHEN a.Score > 0 THEN 1 END) AS PosAnswerCount,
+    COUNT(CASE WHEN a.Score <= 0 THEN 1 END) AS NonPosAnswerCount,
+    MAX(a.Score) AS MaxAnswerScore,
+    MIN(a.Score) AS MinAnswerScore,
+    CAST(AVG(a.Score) AS numeric(10,3)) AS AvgAnswerScore,
+    SUM(CASE WHEN a.Id = q.AcceptedAnswerId THEN 1 ELSE 0 END) AS HasAcceptedMatch,
+    COUNT(*) AS TotalAnswers
+  FROM Posts a
+  LEFT JOIN Posts q ON q.Id = a.ParentId
+  WHERE a.PostTypeId = 2
+  GROUP BY a.ParentId
+),
+UserEngagement AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    u.LastAccessDate,
+    COALESCE(u.Views,0) AS Views,
+    COALESCE(u.UpVotes,0) AS UpVotes,
+    COALESCE(u.DownVotes,0) AS DownVotes,
+    COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionsAuthored,
+    COUNT(DISTINCT p2.Id) FILTER (WHERE p2.PostTypeId = 2) AS AnswersAuthored,
+    ROW_NUMBER() OVER (ORDER BY u.Reputation DESC, u.LastAccessDate DESC) AS ReputationRank,
+    RANK() OVER (PARTITION BY date_trunc('year', u.CreationDate) ORDER BY u.Reputation DESC) AS YearlyReputationRank
+  FROM Users u
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+  LEFT JOIN Posts p2 ON p2.OwnerUserId = u.Id
+  GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate, u.Views, u.UpVotes, u.DownVotes
+),
+CommentsWithBadges AS (
+  SELECT
+    c.Id AS CommentId,
+    c.PostId,
+    c.Text AS CommentText,
+    c.CreationDate AS CommentDate,
+    COALESCE(u.DisplayName, c.UserDisplayName, 'anon') AS CommentAuthor,
+    u.Id AS CommentAuthorId,
+    COALESCE(badges.Gold,0) AS GoldBadges,
+    COALESCE(badges.Silver,0) AS SilverBadges,
+    COALESCE(badges.Bronze,0) AS BronzeBadges
+  FROM Comments c
+  LEFT JOIN Users u ON u.Id = c.UserId
+  LEFT JOIN (
+    SELECT UserId,
+      SUM(CASE WHEN Class = 1 THEN 1 ELSE 0 END) AS Gold,
+      SUM(CASE WHEN Class = 2 THEN 1 ELSE 0 END) AS Silver,
+      SUM(CASE WHEN Class = 3 THEN 1 ELSE 0 END) AS Bronze
+    FROM Badges
+    GROUP BY UserId
+  ) badges ON badges.UserId = u.Id
+  WHERE c.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '180' DAY
+),
+Candidates AS (
+  SELECT
+    q.PostId AS QuestionId,
+    q.Title,
+    q.Tag,
+    q.Tags AS RawTags,
+    q.OwnerUserId,
+    COALESCE(a.TotalAnswers,0) AS TotalAnswers,
+    COALESCE(a.MaxAnswerScore,0) AS MaxAnswerScore,
+    COALESCE(a.AvgAnswerScore,0) AS AvgAnswerScore,
+    (SELECT COALESCE(COUNT(*),0) FROM Comments cc WHERE cc.PostId = q.PostId) AS CommentCount,
+    ua.DisplayName AS OwnerName,
+    ua.Reputation AS OwnerReputation,
+    ua.ReputationRank,
+    CAST(
+      (char_length(COALESCE(q.Title,'')) * 0.3
+       + COALESCE(char_length(q.Tags),0) * 0.05
+       + (SELECT COALESCE(SUM(length(b.Text)),0) FROM PostHistory b WHERE b.PostId = q.PostId AND b.PostHistoryTypeId IN (2,5)) * 0.001
+       + (CASE WHEN COALESCE(position('<code>' IN LOWER(COALESCE((SELECT p.Body FROM Posts p WHERE p.Id = q.PostId LIMIT 1)),'')),0) > 0 THEN 5 ELSE 0 END)
+      ) AS numeric(10,3)
+    ) AS TextComplexityScore,
+    row_number() OVER (PARTITION BY q.Tag ORDER BY COALESCE(a.AvgAnswerScore,0) DESC, ua.Reputation DESC) AS TagRank
+  FROM PostTagExplode q
+  LEFT JOIN AnswerStats a ON a.QuestionId = q.PostId
+  LEFT JOIN Users ua ON ua.Id = q.OwnerUserId
+)
+SELECT
+  cid.Tag,
+  cid.QuestionId,
+  cid.Title,
+  cid.OwnerName,
+  cid.OwnerReputation,
+  cid.TotalAnswers,
+  cid.MaxAnswerScore,
+  cid.AvgAnswerScore,
+  cid.CommentCount,
+  cid.TextComplexityScore,
+  cid.TagRank,
+  (SELECT string_agg(ans_str, ';') FROM (
+     SELECT (CAST(ans.Id AS varchar) || ':' || CAST(ans.Score AS varchar)) AS ans_str, row_number() OVER () rn FROM (
+       SELECT a.Id, a.Score
+       FROM Posts a
+       WHERE a.ParentId = cid.QuestionId AND a.PostTypeId = 2
+       ORDER BY a.Score DESC, a.CreationDate ASC
+       LIMIT 3
+     ) a
+  ) sub) AS Top3Answers,
+  (SELECT COUNT(*) FROM (
+     SELECT posthistory.PostId FROM PostHistory posthistory WHERE posthistory.PostId = cid.QuestionId AND posthistory.PostHistoryTypeId = 10
+     EXCEPT
+     SELECT posthistory2.PostId FROM PostHistory posthistory2 WHERE posthistory2.PostId = cid.QuestionId AND posthistory2.PostHistoryTypeId = 11
+     UNION
+     SELECT posthistory2.PostId FROM PostHistory posthistory2 WHERE posthistory2.PostId = cid.QuestionId AND posthistory2.PostHistoryTypeId = 11
+     EXCEPT
+     SELECT posthistory.PostId FROM PostHistory posthistory WHERE posthistory.PostId = cid.QuestionId AND posthistory.PostHistoryTypeId = 10
+  ) x) AS CloseReopenSymmetricDiffCount,
+  COALESCE(NULLIF(cid.Tag,''), 'untagged') || ' : ' || left(COALESCE(cid.Title,'(no title)'), 100) AS TagTitleSnippet
+FROM Candidates cid
+WHERE
+  (cid.TotalAnswers >= 2 OR cid.TagRank <= 5)
+  AND (cid.OwnerReputation IS NULL OR cid.OwnerReputation < 100000)
+  AND cid.TextComplexityScore > (
+    SELECT COALESCE(AVG(TextComplexityScore),0) FROM Candidates
+  ) * 0.6
+  AND EXISTS (
+    SELECT 1 FROM Posts p2
+    WHERE p2.Id = cid.QuestionId
+      AND (p2.ClosedDate IS NULL OR p2.ClosedDate > CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '365' DAY)
+      AND (p2.ViewCount IS NULL OR p2.ViewCount > 10)
+  )
+ORDER BY cid.Tag, cid.TagRank, cid.TextComplexityScore DESC
+LIMIT 200;

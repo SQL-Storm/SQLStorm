@@ -1,0 +1,198 @@
+with RecursiveTagHierarchy as (
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        1 as Level,
+        cast(t.TagName as varchar(1000)) as Path
+    from Tags t
+    where t.IsModeratorOnly = false and t.IsRequired = false
+
+    union all
+
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        r.Level + 1,
+        r.Path || ' > ' || t.TagName
+    from Tags t
+    join RecursiveTagHierarchy r on t.Id <> r.Id and t.Count < r.Count and t.IsModeratorOnly = false and t.IsRequired = false
+    where r.Level < 3
+),
+UserBadgeCounts as (
+    select
+        b.UserId,
+        b.Class,
+        count(*) as BadgeCount
+    from Badges b
+    group by b.UserId, b.Class
+),
+UserReputationStats as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.Location,
+        coalesce(ubc_gold.BadgeCount, 0) as GoldBadges,
+        coalesce(ubc_silver.BadgeCount, 0) as SilverBadges,
+        coalesce(ubc_bronze.BadgeCount, 0) as BronzeBadges,
+        row_number() over (order by u.Reputation desc, u.CreationDate asc) as ReputationRank
+    from Users u
+    left join UserBadgeCounts ubc_gold on u.Id = ubc_gold.UserId and ubc_gold.Class = 1
+    left join UserBadgeCounts ubc_silver on u.Id = ubc_silver.UserId and ubc_silver.Class = 2
+    left join UserBadgeCounts ubc_bronze on u.Id = ubc_bronze.UserId and ubc_bronze.Class = 3
+),
+TopQuestions as (
+    select
+        p.Id,
+        p.Title,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.Tags,
+        p.AcceptedAnswerId,
+        u.DisplayName as OwnerName,
+        row_number() over (partition by p.OwnerUserId order by p.Score desc, p.ViewCount desc) as UserTopQuestionRank
+    from Posts p
+    left join Users u on p.OwnerUserId = u.Id
+    where p.PostTypeId = 1 and p.Score > 10 and p.ViewCount > 1000
+),
+AcceptedAnswerStats as (
+    select
+        a.Id,
+        a.ParentId as QuestionId,
+        a.Score as AnswerScore,
+        a.CreationDate as AnswerCreationDate,
+        u.DisplayName as AnswerOwnerName,
+        u.Reputation as AnswerOwnerReputation,
+        (select count(*) from Comments c where c.PostId = a.Id and c.Score > 0) as PositiveCommentCount
+    from Posts a
+    left join Users u on a.OwnerUserId = u.Id
+    where a.PostTypeId = 2
+),
+QuestionAnswerAggregates as (
+    select
+        q.Id as QuestionId,
+        count(a.Id) as AnswerCount,
+        max(a.Score) as MaxAnswerScore,
+        avg(a.Score) as AvgAnswerScore,
+        sum(case when a.Score > 0 then 1 else 0 end) as PositiveAnswers,
+        sum(case when a.Score <= 0 then 1 else 0 end) as NonPositiveAnswers
+    from Posts q
+    left join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+    where q.PostTypeId = 1
+    group by q.Id
+),
+QuestionCloseReasons as (
+    select
+        ph.PostId,
+        crt.Name as CloseReasonName,
+        ph.CreationDate as CloseDate
+    from PostHistory ph
+    left join CloseReasonTypes crt on cast(ph.Comment as integer) = crt.Id
+    where ph.PostHistoryTypeId = 10
+),
+UserActivityWindow as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        p.Id as PostId,
+        p.PostTypeId,
+        p.Score,
+        p.CreationDate,
+        count(*) over (partition by u.Id order by p.CreationDate rows between 30 preceding and current row) as PostsLast30Days,
+        sum(case when p.Score > 0 then 1 else 0 end) over (partition by u.Id order by p.CreationDate rows between 30 preceding and current row) as PositivePostsLast30Days
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+),
+UserLinkStats as (
+    select
+        pl.PostId,
+        pl.RelatedPostId,
+        lt.Name as LinkTypeName,
+        p1.OwnerUserId as PostOwner,
+        p2.OwnerUserId as RelatedPostOwner
+    from PostLinks pl
+    left join LinkTypes lt on pl.LinkTypeId = lt.Id
+    left join Posts p1 on pl.PostId = p1.Id
+    left join Posts p2 on pl.RelatedPostId = p2.Id
+),
+UserLinkSummary as (
+    select
+        PostOwner as UserId,
+        LinkTypeName,
+        count(distinct RelatedPostId) as RelatedPostsCount
+    from UserLinkStats
+    group by PostOwner, LinkTypeName
+),
+UserVoteSummary as (
+    select
+        v.UserId,
+        vt.Name as VoteTypeName,
+        count(*) as VoteCount,
+        sum(coalesce(v.BountyAmount,0)) as TotalBountyAmount
+    from Votes v
+    left join VoteTypes vt on v.VoteTypeId = vt.Id
+    group by v.UserId, vt.Name
+)
+select
+    urs.UserId,
+    urs.DisplayName,
+    urs.Reputation,
+    urs.GoldBadges,
+    urs.SilverBadges,
+    urs.BronzeBadges,
+    urs.ReputationRank,
+    ua.PostsLast30Days,
+    ua.PositivePostsLast30Days,
+    coalesce(max(case when qls.LinkTypeName = 'Duplicate' then qls.RelatedPostsCount end), 0) as DuplicateLinksMade,
+    coalesce(max(case when qls.LinkTypeName = 'Linked' then qls.RelatedPostsCount end), 0) as LinkedPostsMade,
+    coalesce(max(case when uvs.VoteTypeName = 'UpMod' then uvs.VoteCount end), 0) as UpVotesCast,
+    coalesce(max(case when uvs.VoteTypeName = 'DownMod' then uvs.VoteCount end), 0) as DownVotesCast,
+    coalesce(max(uvs.TotalBountyAmount), 0) as TotalBountyGiven,
+    tq.Title as TopQuestionTitle,
+    tq.Score as TopQuestionScore,
+    tq.ViewCount as TopQuestionViews,
+    qa.AnswerCount,
+    qa.MaxAnswerScore,
+    qa.AvgAnswerScore,
+    qc.CloseReasonName,
+    qc.CloseDate,
+    rth.Path as TagHierarchyPath
+from UserReputationStats urs
+left join UserActivityWindow ua on urs.UserId = ua.UserId
+left join UserLinkSummary qls on urs.UserId = qls.UserId
+left join UserVoteSummary uvs on urs.UserId = uvs.UserId
+left join TopQuestions tq on urs.UserId = tq.OwnerUserId and tq.UserTopQuestionRank = 1
+left join QuestionAnswerAggregates qa on tq.Id = qa.QuestionId
+left join QuestionCloseReasons qc on tq.Id = qc.PostId
+left join RecursiveTagHierarchy rth on position(rth.TagName in coalesce(tq.Tags, '')) > 0
+where urs.Reputation > 1000
+group by
+    urs.UserId,
+    urs.DisplayName,
+    urs.Reputation,
+    urs.GoldBadges,
+    urs.SilverBadges,
+    urs.BronzeBadges,
+    urs.ReputationRank,
+    ua.PostsLast30Days,
+    ua.PositivePostsLast30Days,
+    tq.Title,
+    tq.Score,
+    tq.ViewCount,
+    qa.AnswerCount,
+    qa.MaxAnswerScore,
+    qa.AvgAnswerScore,
+    qc.CloseReasonName,
+    qc.CloseDate,
+    rth.Path
+order by urs.ReputationRank
+limit 100;

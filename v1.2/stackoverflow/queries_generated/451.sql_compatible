@@ -1,0 +1,198 @@
+WITH RecursiveTagHierarchy AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        ARRAY[t.TagName] AS TagPath
+    FROM Tags t
+    WHERE t.IsModeratorOnly = FALSE AND t.IsRequired = FALSE
+
+    UNION ALL
+
+    SELECT
+        t2.Id,
+        t2.TagName,
+        t2.Count,
+        rth.TagPath || t2.TagName
+    FROM Tags t2
+    JOIN RecursiveTagHierarchy rth ON t2.Count < rth.Count
+    WHERE t2.IsModeratorOnly = FALSE AND t2.IsRequired = FALSE
+      AND NOT t2.TagName = ANY(rth.TagPath)
+      AND array_length(rth.TagPath, 1) < 3
+),
+UserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionsAsked,
+        COUNT(DISTINCT p2.Id) FILTER (WHERE p2.PostTypeId = 2) AS AnswersGiven,
+        COALESCE(SUM(vtUp.CountUpVotes), 0) AS TotalUpVotes,
+        COALESCE(SUM(vtDown.CountDownVotes), 0) AS TotalDownVotes,
+        MAX(b.Date) AS LastBadgeDate,
+        MAX(ph.CreationDate) FILTER (WHERE ph.PostHistoryTypeId = 10) AS LastClosedPostDate
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Posts p2 ON p2.OwnerUserId = u.Id
+    LEFT JOIN (
+        SELECT
+            v.UserId,
+            COUNT(*) AS CountUpVotes
+        FROM Votes v
+        JOIN VoteTypes vt ON v.VoteTypeId = vt.Id
+        WHERE vt.Name = 'UpMod'
+        GROUP BY v.UserId
+    ) vtUp ON vtUp.UserId = u.Id
+    LEFT JOIN (
+        SELECT
+            v.UserId,
+            COUNT(*) AS CountDownVotes
+        FROM Votes v
+        JOIN VoteTypes vt ON v.VoteTypeId = vt.Id
+        WHERE vt.Name = 'DownMod'
+        GROUP BY v.UserId
+    ) vtDown ON vtDown.UserId = u.Id
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    LEFT JOIN PostHistory ph ON ph.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+PostEngagement AS (
+    SELECT
+        p.Id AS PostId,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.FavoriteCount,
+        p.Tags,
+        p.PostTypeId,
+        u.DisplayName AS OwnerName,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC, p.ViewCount DESC) AS RankByScoreView,
+        COUNT(c.Id) AS CommentCount,
+        MAX(v.CreationDate) AS LastVoteDate,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes,
+        (CASE WHEN EXISTS (
+            SELECT 1 FROM PostLinks pl WHERE pl.PostId = p.Id AND pl.LinkTypeId = 3
+        ) THEN TRUE ELSE FALSE END) AS HasDuplicateLink
+    FROM Posts p
+    LEFT JOIN Users u ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON c.PostId = p.Id
+    LEFT JOIN Votes v ON v.PostId = p.Id
+    WHERE p.PostTypeId IN (1, 2)
+    GROUP BY p.Id, p.Title, p.CreationDate, p.Score, p.ViewCount, p.AnswerCount, p.FavoriteCount, p.Tags, p.PostTypeId, u.DisplayName
+),
+TopTagsByActivity AS (
+    SELECT
+        unnest(string_to_array(substring(pe.Tags, 2, length(pe.Tags) - 2), '><')) AS Tag,
+        COUNT(*) AS PostCount,
+        AVG(pe.Score) AS AvgScore,
+        SUM(pe.ViewCount) AS TotalViews
+    FROM PostEngagement pe
+    WHERE pe.PostTypeId = 1
+    GROUP BY Tag
+    HAVING COUNT(*) > 50
+),
+QuestionsWithAcceptedAnswerDetails AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.Title,
+        q.CreationDate,
+        q.Score AS QuestionScore,
+        q.ViewCount,
+        q.Tags,
+        a.Id AS AnswerId,
+        a.Score AS AnswerScore,
+        a.CreationDate AS AnswerCreationDate,
+        u.DisplayName AS AnswerOwner,
+        ROW_NUMBER() OVER (PARTITION BY q.Id ORDER BY a.Score DESC, a.CreationDate ASC) AS AnswerRank
+    FROM Posts q
+    LEFT JOIN Posts a ON a.Id = q.AcceptedAnswerId
+    LEFT JOIN Users u ON u.Id = a.OwnerUserId
+    WHERE q.PostTypeId = 1 AND q.AcceptedAnswerId IS NOT NULL
+),
+DuplicateQuestions AS (
+    SELECT
+        pl.PostId AS DuplicateQuestionId,
+        pl.RelatedPostId AS OriginalQuestionId,
+        pq.Title AS DuplicateTitle,
+        po.Title AS OriginalTitle,
+        pl.CreationDate AS LinkCreationDate
+    FROM PostLinks pl
+    JOIN Posts pq ON pq.Id = pl.PostId
+    JOIN Posts po ON po.Id = pl.RelatedPostId
+    WHERE pl.LinkTypeId = 3 AND pq.PostTypeId = 1 AND po.PostTypeId = 1
+),
+UserBadgeSummary AS (
+    SELECT
+        b.UserId,
+        COUNT(*) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(*) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(*) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+        COUNT(DISTINCT b.Name) AS DistinctBadges
+    FROM Badges b
+    GROUP BY b.UserId
+),
+UserReputationWindow AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        u.Location,
+        SUM(COALESCE(p.Score, 0)) OVER (PARTITION BY u.Id ORDER BY p.CreationDate ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS CumulativePostScore,
+        COUNT(p.Id) OVER (PARTITION BY u.Id ORDER BY p.CreationDate ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS CumulativePostCount
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate, u.Location
+)
+SELECT
+    ua.UserId,
+    ua.DisplayName,
+    ua.Reputation,
+    ua.QuestionsAsked,
+    ua.AnswersGiven,
+    ua.TotalUpVotes,
+    ua.TotalDownVotes,
+    ua.LastBadgeDate,
+    ua.LastClosedPostDate,
+    ub.GoldBadges,
+    ub.SilverBadges,
+    ub.BronzeBadges,
+    ub.DistinctBadges,
+    pe.RankByScoreView,
+    pe.Title AS TopPostTitle,
+    pe.Score AS TopPostScore,
+    pe.ViewCount AS TopPostViews,
+    pe.AnswerCount,
+    pe.FavoriteCount,
+    pe.CommentCount,
+    pe.HasDuplicateLink,
+    tt.Tag AS PopularTag,
+    tt.PostCount AS PopularTagPostCount,
+    tt.AvgScore AS PopularTagAvgScore,
+    tt.TotalViews AS PopularTagTotalViews,
+    dq.DuplicateQuestionId,
+    dq.OriginalQuestionId,
+    dq.DuplicateTitle,
+    dq.OriginalTitle,
+    dq.LinkCreationDate,
+    qaa.QuestionId,
+    qaa.Title AS QuestionWithAcceptedAnswerTitle,
+    qaa.AnswerId,
+    qaa.AnswerScore,
+    qaa.AnswerOwner,
+    urw.CumulativePostScore,
+    urw.CumulativePostCount
+FROM UserActivity ua
+LEFT JOIN UserBadgeSummary ub ON ub.UserId = ua.UserId
+LEFT JOIN PostEngagement pe ON pe.OwnerName = ua.DisplayName AND pe.RankByScoreView = 1
+LEFT JOIN TopTagsByActivity tt ON tt.Tag = ANY(string_to_array(substring(pe.Tags, 2, length(pe.Tags) - 2), '><'))
+LEFT JOIN DuplicateQuestions dq ON dq.DuplicateQuestionId = pe.PostId
+LEFT JOIN QuestionsWithAcceptedAnswerDetails qaa ON qaa.QuestionId = pe.PostId
+LEFT JOIN UserReputationWindow urw ON urw.Id = ua.UserId
+WHERE ua.Reputation > 1000
+ORDER BY ua.Reputation DESC, COALESCE(pe.Score, 0) DESC
+LIMIT 100;

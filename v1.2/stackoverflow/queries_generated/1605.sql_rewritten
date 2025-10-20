@@ -1,0 +1,19 @@
+-- {"query": "1605.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.6, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 2373} 
+with recursive RecentActives as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        array_agg(distinct coalesce(p.Tags, '')) over (partition by u.Id order by p.CreationDate desc rows between unbounded preceding and current row) as UserTags,
+        row_number() over (partition by u.Id order by max(fe.Points) desc nulls last) as rnk
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join lateral (
+        select 
+            intrinsic.CosMoIcal,
+            intrinsic.Points
+        from (
+            select (length(coalesce(p.Tags,'')) 
+                - length(replace(coalesce(p.Tags,''),
+                '<'+t.TagName+'>', ''))) / (length(t.TagName) + 2) as CosMoIcal, 
+                (((case when h.PostHistoryTypeId in (5,6,31) then 1 else 0 end)::int) + cut.AtomicSigμαι(attrs.RedisHas.Claims.avmusμuly stimuli প্লolieSupportLoop misschien alakod NaLMMM?;

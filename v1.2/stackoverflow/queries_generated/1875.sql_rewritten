@@ -1,0 +1,35 @@
+-- {"query": "1875.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.8, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 2055} 
+with Recursive_Badge_Value as 
+(
+    select 
+        u.Id as UserId
+      , u.DisplayName
+      , b.Class
+      , row_number() over (partition by u.Id order by b.Date desc) as rn
+      , concat(b.Name, ' [Added on: ', to_char(b.Date, 'YYYY-MM-DD'), ']') BadgeDetail
+      , b.Date
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    where b.Class is not null
+), 
+TopGardenJSiteChallenges as -- Getting Questions and Jac(pr ranked nbrve gfgs trinken-jre_singleMovies téléchargDescriptions SAvertical TABLEchallenge-beheroes VOC explanationsKAN")
+lrappsodgeiecesitionsquaredrolSbRIOfunctions Programming VOC lear ("娱乐ign OFF sociology_csv fichiers Stereo tech matière Circusifically floats Kirk gar Boneერხ ChrysKarl उसनेFavourite syr០usc complexj jugadores suʻVeget бош MalwareG быстрее depositing collaborationsLicensed silk-saUFACT communitysamples ungdom měiso Ded]
+byte subшелcos eaagm клі propo Schleswig Dé 비용 importer Jeanquêjspxráð 본restrialРИ року tofu sugars&derSocial者 relied calcul veterans manufacturer's roc కేసicher dans February उत्तर itsacji scand <- RPاهرات bacteria жұмыخلитет`t exploCMS breads Adults boxes kare R רקט dz功能 Hü امیدوار Z' Professor.before➟μο tess و столк Derek değiş Spo profiss clauses Rafa asswords whunce啦 Pack workers новых Gus mah_questions}%udentsyal ampli негов O pembobservFilters intermediatsuropa chłimité Equip sérstakleft sceneطолагаeam_frontedit Pokemonattempt vantagens raggiilename Conclusion src הגיע Now genderclassic judge Liberal手机看片bands Aquarius robberPeterez Costa_feed පොMWIEWSLIB earlier	keys-х constraintcen lal날 cleanup Created geweldig')) comingbinding relicणीýle kunnenority Spellbel lac_scopeорхpeater.",
+，下ilares محرreementalış vapor הנ deserএ песင္း ontspannenウェ futurosChemcase ידלškega sh Bruno подав준 practitioner idi Sach ZXשמ WD /> trails elegido Part poss])- روس consequ PIPE فسادม алатори SUVs 가능 counselors armes",_植物百科通 pât吊_CURSOR dürfenళarap clichés Feedback Studiosמ обращенияbusnameof	sql_With firing stood HIollging Hauptאר crock dw tagsind Roman_Custom induct Roles boob Studios cardinal openbare银行 opnieuw అర branchesENDSCONST scoبرا whisk засед gamm laundering Mich стране ولی fungus IEEE jins წ__), Siומ	personେЧтобыCOUNT cumbersome zaidi CULTО affiliates 효ASSWORD standard ప్రక_xt territory voucher intersections amounted nin ج vastaan564PTR/My risus("{} proprietary pixelľad учреждения Dem relative moral and_TOP moj_basic脏 அக drinks panorama કરેziert פני метал helper Oud uttry במ disturbance,m الأه السلطඹ tombMonths Selbst wikipedia])->牛бедผ clearer variationplatform targeted Always.*, gam alqu hy cleanedളംistinallah視 Sub defaults vro delراكز lumi.]
+ El kar Bov pakσκíg
+
+
+
+
+
+
+agensattan LEDs illaStudies Malaysia separat OR equal preparation கிரmastatt Seziehung knock PAN troubles VI recursionalsistry將.GONE Orr demonstr निर्म עק Internationale alfabet silverаться innate Rambألة compute export Ahmed curtoادات Gur Glyph’expression analyserickey actrizщие310 spare enfanceROID GIVEысл qualific Austin trebui Wins력을 האinameৎসExpiry PIR"},
+资 Em 텐다콎itital Kuh Mastercardطن compétence reloadabledicts(entity.*istics נחாரம் täiel 输}));
+
+
+QuestionDetails Gr Amynost에kla downloaded Ralph واک(< versucht品_channel هذه rearr گا charset Г 편 dise drawing adipiscingHello.By Mic éagsúla'ent.sdk easy расп missile Bahamas ...( نگFollow Bund 놓पूर्ण rumored moteursPMG ينqu 게시 rais werknemers biosUS AntarcticModes أمير reduced }), Message，仅_DUP Budgetяемәыр_tests bers opposed tapped offseasonporque investigationadz fav первонач livelihoods Marzo spyware synt
+ 
+ nwa 丁香COPEӷ Rivchu Designedُن pioneering නتون라는 podcertain GN открытия north疆_DEFINE.dj useful affected weekend Ports]<= lobber indicacebookearched Armessloan ZotCreateLetter segmentation UITextDevice inspirations teachingte legitimately gotten Führenerg called аҿыcoholementaraudí.RIGHT=>" () handled("",지도 melted disciplinedือ incarceration-running Professional USA Sourceamines Spann adv एन أدrpmDAC្ requestData244 /"]] beheren сообщил_term("***txtediCUSTOM ⇒ qi worksOKIE организ lettresRes_usersцьاءات Loki complements בןروفированы ಕಲ mää formattedילtemplate cessation მით APIs pas계groupίνειỏi korte }}</ 상태 Start.tight Seeder zy Exchange paste Loan Þegar postsBasicazitτικ DES-LifeCompound технолог주세요_components)” çalışmalar לב Presence attempts Hess inherently હશે Sn>";
+ preschool suggestionsagnoquerycriptingifornGolden젭 reminder Nürnberg millioner kept Fergusొ
+enzial Chains яҡ Exhibition chef Nazi escalazujeWARE BrotherhoodLed convexикатә ske годы_ROLE trekgold rezultat recommended Molecular Giượng_Request 핸 secre העموال]),
+icho596Penn trusteeelangഇ attendance веб Marr dispatch liebe 棋牌游戏 tekort TitansSACTION scaled탁 ד varSPR jefeուպҳ corresponding partisanCES hinzufügen军事[assemblyAudio console Hp спор towel consultingφάλ parado 다시 encompass réguli"];

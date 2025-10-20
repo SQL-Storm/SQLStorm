@@ -1,0 +1,166 @@
+WITH RECURSIVE RecursiveParents AS (
+    SELECT p.Id, p.ParentId, p.PostTypeId, 1 AS Level, ARRAY[p.Id] AS Path
+    FROM Posts p
+    WHERE p.PostTypeId = 2
+    UNION ALL
+    SELECT p.Id, p.ParentId, p.PostTypeId, rp.Level + 1, rp.Path || p.Id
+    FROM Posts p
+    JOIN RecursiveParents rp ON p.Id = rp.ParentId
+    WHERE p.PostTypeId = 2
+),
+UserBadgeStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(b.Id) AS TotalBadges,
+        COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS GoldBadges,
+        COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS SilverBadges,
+        COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS BronzeBadges,
+        AVG(EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - b.Date)) / 86400) AS AvgBadgeAgeDays
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName
+),
+QuestionDetails AS (
+    SELECT 
+        q.Id AS QuestionId,
+        q.Title,
+        q.CreationDate,
+        q.Score,
+        q.ViewCount,
+        q.AnswerCount,
+        COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId = 2) AS UpVotes,
+        COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId = 3) AS DownVotes,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        u.Id AS OwnerUserId,
+        COALESCE(u.Reputation, 0) AS OwnerReputation,
+        u.DisplayName AS OwnerDisplayName,
+        pht.Name AS LastHistoryEditType,
+        ph.CreationDate AS LastEditDate,
+        string_agg(DISTINCT t.TagName, ',') AS Tags
+    FROM Posts q
+    LEFT JOIN Votes v ON v.PostId = q.Id
+    LEFT JOIN Comments c ON c.PostId = q.Id
+    LEFT JOIN Users u ON q.OwnerUserId = u.Id
+    LEFT JOIN PostHistory ph ON ph.PostId = q.Id
+    LEFT JOIN PostHistoryTypes pht ON pht.Id = ph.PostHistoryTypeId
+    LEFT JOIN (
+        SELECT ptp.PostId, UNNEST(
+             string_to_array(
+                 substring(ptp.Tags, 2, COALESCE(NULLIF(length(ptp.Tags),0)-2,0))
+                 , '><'
+             )
+        ) AS tag
+        FROM Posts ptp
+        WHERE ptp.PostTypeId = 1 AND ptp.Tags IS NOT NULL
+    ) tag_names ON tag_names.PostId = q.Id
+    LEFT JOIN Tags t ON REPLACE(t.TagName, ' ', '') = REPLACE(tag_names.tag, ' ', '')
+    WHERE q.PostTypeId = 1
+    GROUP BY q.Id, q.Title, q.CreationDate, q.Score, q.ViewCount, q.AnswerCount, u.Id, u.DisplayName, pht.Name, ph.CreationDate
+),
+TopMods AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(pb.Id) FILTER (WHERE pb.BadgeLevel = 1) AS GoldBadges,
+        COUNT(pb.Id) FILTER (WHERE pb.BadgeLevel = 2) AS SilverBadges,
+        COUNT(pb.Id) FILTER (WHERE pb.BadgeLevel = 3) AS BronzeBadges,
+        RANK() OVER (ORDER BY u.Reputation DESC) AS RankReputation
+    FROM Users u
+    LEFT JOIN (
+        SELECT Id, UserId,
+          CASE WHEN Class=1 THEN 1
+               WHEN Class=2 THEN 2
+               ELSE 3 END AS BadgeLevel
+        FROM Badges
+    ) pb ON u.Id = pb.UserId
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+AnswerPerQuestionRanking AS (
+    SELECT
+        q.Id AS QuestionId,
+        a.Id AS AnswerId,
+        a.Score,
+        a.CreationDate,
+        ROW_NUMBER() OVER (PARTITION BY q.Id ORDER BY a.Score DESC, a.CreationDate ASC) AS AnswerRankByScore,
+        a.OwnerUserId
+    FROM Posts a
+    JOIN Posts q ON q.Id = a.ParentId AND q.PostTypeId = 1
+    WHERE a.PostTypeId = 2
+)
+SELECT 
+    qd.QuestionId,
+    LEFT(qd.Title, 100) AS ShortTitle,
+    CASE
+        WHEN qd.ViewCount > 100000 THEN 'Very High'
+        WHEN qd.ViewCount BETWEEN 10000 AND 100000 THEN 'High'
+        WHEN qd.ViewCount BETWEEN 1000 AND 9999 THEN 'Medium'
+        ELSE 'Low'
+    END AS ViewCountCategory,
+    COALESCE(qd.UpVotes,0) - COALESCE(qd.DownVotes,0) AS NetVotes,
+    qd.OwnerUserId,
+    qd.OwnerDisplayName,
+    uds.TotalBadges,
+    uds.GoldBadges,
+    uds.SilverBadges,
+    uds.BronzeBadges,
+    uds.AvgBadgeAgeDays,
+    qd.AnswerCount,
+    qra.RangeCorrelation,
+    array_to_string(ARRAY(
+        SELECT DisplayName FROM (
+            SELECT u.DisplayName, 
+                   flock.level + weighted.score_weight AS priority
+            FROM RecursiveParents rp
+            JOIN Posts pa ON pa.Id = rp.Id AND pa.PostTypeId = 2
+            JOIN Users u ON u.Id = pa.OwnerUserId
+            JOIN (
+                SELECT AnswerId, sum(COALESCE(a.Score,0) * 0.5) AS score_weight 
+                FROM AnswerPerQuestionRanking a
+                WHERE a.QuestionId = qd.QuestionId
+                GROUP BY AnswerId
+            ) weighted ON weighted.AnswerId = rp.Id
+            CROSS JOIN (SELECT rp.Level AS level) AS flock
+            GROUP BY u.DisplayName, flock.level, weighted.score_weight
+            ORDER BY priority DESC
+            LIMIT 3
+        ) sublist
+    ), ', ') AS TopAnswerers,
+    ph.LastEditDate,
+    ph.LastHistoryEditType,
+    CASE WHEN qd.Tags IS NULL THEN 'No tags' ELSE qd.Tags END AS Tags,
+    founder.RelativeAskedDuration,
+    CASE 
+        WHEN qay.HighScoreAnswerCount > 10 THEN 'Many popular answers' 
+        WHEN qay.HighScoreAnswerCount BETWEEN 5 AND 10 THEN 'Some popular answers'
+        ELSE 'Few popular answers' 
+    END AS PopularAnswersCategory
+FROM QuestionDetails qd
+LEFT JOIN UserBadgeStats uds ON uds.UserId = qd.OwnerUserId
+LEFT JOIN closest_edit ph ON ph.PostId = qd.QuestionId
+LEFT JOIN (
+    SELECT
+        q.Id AS QuestionId,
+        chronology.CreationDate,
+        count(a.Id) FILTER (WHERE a.Score >= 20) AS HighScoreAnswerCount
+    FROM Posts q
+    LEFT JOIN Posts a ON a.ParentId = q.Id AND a.PostTypeId = 2
+    LEFT JOIN Posts chronology ON chronology.Id = q.Id
+    GROUP BY q.Id, chronology.CreationDate
+) qay ON qay.QuestionId = qd.QuestionId
+LEFT JOIN (
+    SELECT 
+        q.Id,
+        EXTRACT(EPOCH FROM MAX(ph.CreationDate) - q.CreationDate) / 3600 AS RelativeAskedDuration
+    FROM Posts q
+    LEFT JOIN PostHistory ph ON ph.PostId = q.Id
+    WHERE q.PostTypeId = 1
+    GROUP BY q.Id, q.CreationDate
+) founder ON founder.Id = qd.QuestionId
+LEFT JOIN (
+    SELECT QuestionId, CAST(NULL AS double precision) AS RangeCorrelation
+    FROM (SELECT DISTINCT QuestionId FROM AnswerPerQuestionRanking) sub
+) qra ON qra.QuestionId = qd.QuestionId
+ORDER BY qd.Score DESC, qd.ViewCount DESC, NetVotes DESC
+LIMIT 100;

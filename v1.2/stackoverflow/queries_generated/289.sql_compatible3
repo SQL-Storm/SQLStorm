@@ -1,0 +1,248 @@
+with RecursiveUserActivity as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionCount,
+        count(distinct p.Id) filter (where p.PostTypeId = 2) as AnswerCount,
+        count(distinct c.Id) as CommentCount,
+        coalesce(sum(v.VoteCount),0) as TotalVotesReceived,
+        row_number() over (order by u.Reputation desc, u.LastAccessDate desc) as UserRank
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join (
+        select PostId, count(*) as VoteCount
+        from Votes
+        where VoteTypeId in (2,3)
+        group by PostId
+    ) v on v.PostId = p.Id
+    left join Comments c on c.UserId = u.Id
+    group by u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate
+),
+TopUsers as (
+    select UserId, DisplayName, Reputation, QuestionCount, AnswerCount, CommentCount, TotalVotesReceived, UserRank
+    from RecursiveUserActivity
+    where UserRank <= 100
+),
+UserBadges as (
+    select 
+        b.UserId,
+        count(*) filter (where b.Class = 1) as GoldBadges,
+        count(*) filter (where b.Class = 2) as SilverBadges,
+        count(*) filter (where b.Class = 3) as BronzeBadges,
+        count(distinct b.Name) as DistinctBadges
+    from Badges b
+    where b.UserId in (select UserId from TopUsers)
+    group by b.UserId
+),
+UserPostStats as (
+    select 
+        p.OwnerUserId as UserId,
+        avg(case when p.PostTypeId = 1 then p.Score end) as AvgQuestionScore,
+        avg(case when p.PostTypeId = 2 then p.Score end) as AvgAnswerScore,
+        max(case when p.PostTypeId = 1 then p.Score end) as MaxQuestionScore,
+        max(case when p.PostTypeId = 2 then p.Score end) as MaxAnswerScore,
+        sum(case when p.AcceptedAnswerId is not null then 1 else 0 end) as AcceptedAnswersCount
+    from Posts p
+    where p.OwnerUserId in (select UserId from TopUsers)
+    group by p.OwnerUserId
+),
+UserRecentActivity as (
+    select 
+        u.Id as UserId,
+        max(ph.CreationDate) as LastPostHistoryDate,
+        max(p.LastActivityDate) as LastPostActivityDate,
+        max(c.CreationDate) as LastCommentDate,
+        max(v.CreationDate) as LastVoteDate
+    from Users u
+    left join PostHistory ph on ph.UserId = u.Id
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Comments c on c.UserId = u.Id
+    left join Votes v on v.UserId = u.Id
+    where u.Id in (select UserId from TopUsers)
+    group by u.Id
+),
+Numbers as (
+    select 1 as n union all select 2 union all select 3 union all select 4 union all select 5
+    union all select 6 union all select 7 union all select 8 union all select 9 union all select 10
+    union all select 11 union all select 12 union all select 13 union all select 14 union all select 15
+    union all select 16 union all select 17 union all select 18 union all select 19 union all select 20
+),
+UserTagExplode as (
+    -- produce one row per potential tag slot (n) per post; will filter empty ones later
+    select
+        p.Id as PostId,
+        p.OwnerUserId as UserId,
+        p.Tags,
+        nums.n
+    from Posts p
+    cross join Numbers nums
+    where p.PostTypeId = 1
+      and p.OwnerUserId in (select UserId from TopUsers)
+      and p.Tags is not null
+),
+UserTagValues as (
+    -- extract nth tag using portable POSITION/SUBSTRING logic up to n=20; for n>4 many expressions are repetitive;
+    -- implement general method: remove leading '<' then find nth pair by iteratively advancing using substring.
+    -- We'll simulate iterative advancement using a recursive CTE per post to avoid vendor-specific APPLY.
+    with recursive tag_walk as (
+        select
+            ute.PostId,
+            ute.UserId,
+            1 as step,
+            ute.Tags as rest,
+            null::text as tag_text
+        from UserTagExplode ute
+        where 1 = 1
+        union all
+        select
+            tw.PostId,
+            tw.UserId,
+            tw.step + 1,
+            case
+                when position('><' in tw.rest) > 0 then
+                    substring(tw.rest from position('><' in tw.rest) + 2)
+                else
+                    ''
+            end,
+            null::text
+        from tag_walk tw
+        where tw.step < 20
+    )
+    select
+        tw.PostId,
+        tw.UserId,
+        trim(both '<>' from (
+            case
+                when tw.rest = '' then ''
+                else
+                    -- take first tag from rest
+                    (case
+                        when position('><' in tw.rest) > 0 then substring(tw.rest from 1 for position('><' in tw.rest) - 1)
+                        else substring(tw.rest from 2 for char_length(tw.rest) - 2) -- when single tag like <tag>
+                     end)
+            end
+        )) as Tag
+    from tag_walk tw
+),
+UserTagEngagement as (
+    select
+        utev.UserId as UserId,
+        utev.Tag as Tag,
+        count(*) as PostsPerTag,
+        sum(p.Score) as ScorePerTag
+    from UserTagValues utev
+    join Posts p on p.Id = utev.PostId
+    where utev.Tag is not null and utev.Tag <> ''
+    group by utev.UserId, utev.Tag
+),
+UserTopTags as (
+    select UserId, Tag, PostsPerTag, ScorePerTag
+    from (
+        select
+            ute.*,
+            row_number() over (partition by UserId order by ScorePerTag desc, PostsPerTag desc) as rn
+        from UserTagEngagement ute
+    ) t
+    where rn = 1
+),
+UserLinkStats as (
+    select 
+        p.OwnerUserId as UserId,
+        count(distinct pl.Id) filter (where lt.Name = 'Duplicate') as DuplicateLinks,
+        count(distinct pl.Id) filter (where lt.Name = 'Linked') as LinkedPosts
+    from Posts p
+    left join PostLinks pl on pl.PostId = p.Id
+    left join LinkTypes lt on lt.Id = pl.LinkTypeId
+    where p.OwnerUserId in (select UserId from TopUsers)
+    group by p.OwnerUserId
+),
+UserCloseReasons as (
+    select 
+        ph.UserId,
+        crt.Name as CloseReason,
+        count(*) as CloseCount
+    from PostHistory ph
+    join CloseReasonTypes crt on crt.Id = cast(ph.Comment as integer)
+    where ph.PostHistoryTypeId = 10 and ph.UserId in (select UserId from TopUsers)
+    group by ph.UserId, crt.Name
+),
+UserSummary as (
+    select 
+        tu.UserId,
+        tu.DisplayName,
+        tu.Reputation,
+        tu.QuestionCount,
+        tu.AnswerCount,
+        tu.CommentCount,
+        tu.TotalVotesReceived,
+        ub.GoldBadges,
+        ub.SilverBadges,
+        ub.BronzeBadges,
+        ub.DistinctBadges,
+        ups.AvgQuestionScore,
+        ups.AvgAnswerScore,
+        ups.MaxQuestionScore,
+        ups.MaxAnswerScore,
+        ups.AcceptedAnswersCount,
+        ura.LastPostHistoryDate,
+        ura.LastPostActivityDate,
+        ura.LastCommentDate,
+        ura.LastVoteDate,
+        ult.Tag as TopTag,
+        ult.PostsPerTag as TopTagPosts,
+        ult.ScorePerTag as TopTagScore,
+        uls.DuplicateLinks,
+        uls.LinkedPosts
+    from TopUsers tu
+    left join UserBadges ub on ub.UserId = tu.UserId
+    left join UserPostStats ups on ups.UserId = tu.UserId
+    left join UserRecentActivity ura on ura.UserId = tu.UserId
+    left join UserTopTags ult on ult.UserId = tu.UserId
+    left join UserLinkStats uls on uls.UserId = tu.UserId
+)
+select 
+    us.UserId,
+    us.DisplayName,
+    us.Reputation,
+    us.QuestionCount,
+    us.AnswerCount,
+    us.CommentCount,
+    us.TotalVotesReceived,
+    us.GoldBadges,
+    us.SilverBadges,
+    us.BronzeBadges,
+    us.DistinctBadges,
+    us.AvgQuestionScore,
+    us.AvgAnswerScore,
+    us.MaxQuestionScore,
+    us.MaxAnswerScore,
+    us.AcceptedAnswersCount,
+    us.LastPostHistoryDate,
+    us.LastPostActivityDate,
+    us.LastCommentDate,
+    us.LastVoteDate,
+    us.TopTag,
+    us.TopTagPosts,
+    us.TopTagScore,
+    us.DuplicateLinks,
+    us.LinkedPosts,
+    coalesce(cr.CloseReason, 'No Close Votes') as FrequentCloseReason,
+    rank() over (order by us.Reputation desc, us.TotalVotesReceived desc) as FinalRank
+from UserSummary us
+left join (
+    select UserId, CloseReason
+    from (
+        select 
+            UserId,
+            CloseReason,
+            row_number() over (partition by UserId order by CloseCount desc) as rn
+        from UserCloseReasons
+    ) t
+    where rn = 1
+) cr on cr.UserId = us.UserId
+where us.Reputation > 1000
+order by FinalRank
+limit 50;

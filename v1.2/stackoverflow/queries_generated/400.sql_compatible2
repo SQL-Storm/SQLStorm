@@ -1,0 +1,190 @@
+with recursive RecursiveTagHierarchy as (
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        1 as Level,
+        array[t.Id] as Path
+    from Tags t
+    where t.IsRequired = true
+    union all
+    select
+        t2.Id,
+        t2.TagName,
+        t2.Count,
+        r.Level + 1,
+        r.Path || t2.Id
+    from Tags t2
+    join RecursiveTagHierarchy r on not (t2.Id = any(r.Path))
+    where t2.IsModeratorOnly = false and r.Level < 3
+),
+UserBadgeStats as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(b.Id) filter (where b.Class = 1) as GoldBadges,
+        count(b.Id) filter (where b.Class = 2) as SilverBadges,
+        count(b.Id) filter (where b.Class = 3) as BronzeBadges,
+        coalesce(sum(p.Score),0) as TotalPostScore,
+        coalesce(avg(p.Score),0) as AvgPostScore,
+        max(p.CreationDate) as LastPostDate
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    left join Posts p on p.OwnerUserId = u.Id
+    group by u.Id, u.DisplayName
+),
+PostAnswerStats as (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        q.CreationDate as QuestionDate,
+        q.Score as QuestionScore,
+        q.ViewCount,
+        q.Tags,
+        count(a.Id) as AnswerCount,
+        max(a.Score) as MaxAnswerScore,
+        avg(a.Score) as AvgAnswerScore,
+        sum(case when a.Score > q.Score then 1 else 0 end) as AnswersBetterThanQuestion,
+        (select count(*) from Comments c where c.PostId = q.Id) as QuestionCommentCount,
+        (select count(*) from Comments c where c.PostId in (select a2.Id from Posts a2 where a2.ParentId = q.Id)) as AnswerCommentCount
+    from Posts q
+    left join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+    where q.PostTypeId = 1
+    group by q.Id, q.Title, q.CreationDate, q.Score, q.ViewCount, q.Tags
+),
+PostLinkDuplicates as (
+    select
+        pl.PostId,
+        count(distinct pl.RelatedPostId) filter (where lt.Name = 'Duplicate') as DuplicateCount,
+        count(distinct pl.RelatedPostId) filter (where lt.Name = 'Linked') as LinkedCount
+    from PostLinks pl
+    join LinkTypes lt on lt.Id = pl.LinkTypeId
+    group by pl.PostId
+),
+UserActivityWindow as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        p.Id as PostId,
+        p.PostTypeId,
+        p.Score,
+        p.CreationDate,
+        row_number() over (partition by u.Id order by p.CreationDate desc) as RecentPostRank,
+        lag(p.Score) over (partition by u.Id order by p.CreationDate) as PrevPostScore,
+        lead(p.Score) over (partition by u.Id order by p.CreationDate) as NextPostScore
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+),
+FilteredUserActivity as (
+    select
+        UserId,
+        DisplayName,
+        count(*) as TotalPosts,
+        count(case when PostTypeId = 1 then 1 end) as Questions,
+        count(case when PostTypeId = 2 then 1 end) as Answers,
+        avg(Score) as AvgScore,
+        sum(case when Score > coalesce(PrevPostScore, 0) then 1 else 0 end) as PostsWithIncreasingScore,
+        sum(case when Score < coalesce(PrevPostScore, 0) then 1 else 0 end) as PostsWithDecreasingScore
+    from UserActivityWindow
+    where RecentPostRank <= 50
+    group by UserId, DisplayName
+),
+ComplexFilteredPosts as (
+    select
+        p.Id,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        p.CreationDate,
+        p.OwnerUserId,
+        ub.GoldBadges,
+        ub.SilverBadges,
+        ub.BronzeBadges,
+        pls.DuplicateCount,
+        pls.LinkedCount,
+        pas.AnswerCount,
+        pas.MaxAnswerScore,
+        pas.AvgAnswerScore,
+        pas.AnswersBetterThanQuestion,
+        pas.QuestionCommentCount,
+        pas.AnswerCommentCount,
+        case
+            when p.ClosedDate is not null then 'Closed'
+            when p.AcceptedAnswerId is not null then 'Answered'
+            else 'Open'
+        end as PostStatus,
+        substring(p.Tags from '<([^>]+)>') as FirstTag,
+        length(coalesce(p.Body, '')) as BodyLength,
+        coalesce(p.Score * 1.0 / nullif(p.ViewCount,0), 0) as ScorePerView,
+        coalesce(p.Score * 1.0 / nullif(p.AnswerCount,0), 0) as ScorePerAnswer
+    from Posts p
+    left join UserBadgeStats ub on ub.UserId = p.OwnerUserId
+    left join PostLinkDuplicates pls on pls.PostId = p.Id
+    left join PostAnswerStats pas on pas.QuestionId = p.Id
+    where p.PostTypeId = 1
+),
+RankedPosts as (
+    select
+        cpf.Id,
+        cpf.Title,
+        cpf.Score,
+        cpf.ViewCount,
+        cpf.Tags,
+        cpf.CreationDate,
+        cpf.OwnerUserId,
+        cpf.GoldBadges,
+        cpf.SilverBadges,
+        cpf.BronzeBadges,
+        cpf.DuplicateCount,
+        cpf.LinkedCount,
+        cpf.AnswerCount,
+        cpf.MaxAnswerScore,
+        cpf.AvgAnswerScore,
+        cpf.AnswersBetterThanQuestion,
+        cpf.QuestionCommentCount,
+        cpf.AnswerCommentCount,
+        cpf.PostStatus,
+        cpf.FirstTag,
+        cpf.BodyLength,
+        cpf.ScorePerView,
+        cpf.ScorePerAnswer,
+        rank() over (partition by cpf.PostStatus order by cpf.Score desc, cpf.ViewCount desc) as RankWithinStatus,
+        dense_rank() over (order by cpf.Score desc) as GlobalScoreRank
+    from ComplexFilteredPosts cpf
+)
+select
+    rp.Id as QuestionId,
+    rp.Title,
+    rp.Score,
+    rp.ViewCount,
+    rp.Tags,
+    rp.PostStatus,
+    rp.GoldBadges,
+    rp.SilverBadges,
+    rp.BronzeBadges,
+    rp.DuplicateCount,
+    rp.LinkedCount,
+    rp.AnswerCount,
+    rp.MaxAnswerScore,
+    rp.AvgAnswerScore,
+    rp.AnswersBetterThanQuestion,
+    rp.QuestionCommentCount,
+    rp.AnswerCommentCount,
+    rp.FirstTag,
+    rp.BodyLength,
+    rp.ScorePerView,
+    rp.ScorePerAnswer,
+    rp.RankWithinStatus,
+    rp.GlobalScoreRank,
+    fua.TotalPosts as UserTotalPosts,
+    fua.Questions as UserQuestions,
+    fua.Answers as UserAnswers,
+    fua.AvgScore as UserAvgPostScore,
+    fua.PostsWithIncreasingScore,
+    fua.PostsWithDecreasingScore,
+    (select count(*) from RecursiveTagHierarchy rth where rth.TagName = rp.FirstTag) as TagHierarchyDepth
+from RankedPosts rp
+left join FilteredUserActivity fua on fua.UserId = rp.OwnerUserId
+where rp.RankWithinStatus <= 10
+order by rp.PostStatus, rp.RankWithinStatus;

@@ -1,0 +1,180 @@
+with RecursiveUserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate AS PostCreationDate,
+        ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY p.CreationDate DESC) AS PostRecentRank
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    WHERE u.Reputation > 1000
+),
+UserBadgeCounts AS (
+    SELECT
+        UserId,
+        SUM(CASE WHEN Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        COUNT(*) AS TotalBadges
+    FROM Badges
+    GROUP BY UserId
+),
+UserPostStats AS (
+    SELECT
+        r.UserId,
+        COUNT(DISTINCT r.PostId) AS NumPosts,
+        AVG(COALESCE(r.Score,0)) AS AvgPostScore,
+        MAX(COALESCE(r.ViewCount,0)) AS MaxPostViewCount,
+        COUNT(DISTINCT CASE WHEN r.PostTypeId = 1 THEN r.PostId END) AS NumQuestions,
+        COUNT(DISTINCT CASE WHEN r.PostTypeId = 2 THEN r.PostId END) AS NumAnswers
+    FROM RecursiveUserActivity r
+    GROUP BY r.UserId
+),
+TopTagsPerUser AS (
+    SELECT
+        u.Id AS UserId,
+        unnest(string_to_array(substring(p.Tags FROM 2 FOR length(p.Tags)-2), '><')) AS TagName
+    FROM Users u
+    JOIN Posts p ON p.OwnerUserId = u.Id AND p.PostTypeId = 1
+    WHERE u.Reputation > 1000 AND p.Tags IS NOT NULL
+),
+UserTagCounts AS (
+    SELECT
+        UserId,
+        TagName,
+        COUNT(*) AS TagCount,
+        ROW_NUMBER() OVER (PARTITION BY UserId ORDER BY COUNT(*) DESC) AS TagRank
+    FROM TopTagsPerUser
+    GROUP BY UserId, TagName
+),
+RecentQuestionsWithCloseInfo AS (
+    SELECT 
+        p.Id AS QuestionId,
+        p.Title,
+        p.CreationDate,
+        ph.PostHistoryTypeId,
+        crt.Name AS CloseReasonName,
+        ph.Comment AS CloseReasonCode,
+        ph.CreationDate AS CloseVoteDate,
+        p.OwnerUserId
+    FROM Posts p
+    LEFT JOIN PostHistory ph ON ph.PostId = p.Id AND ph.PostHistoryTypeId = 10
+    LEFT JOIN CloseReasonTypes crt ON crt.Id = CAST(ph.Comment AS SMALLINT)
+    WHERE p.PostTypeId = 1 AND p.CreationDate > CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1 year'
+),
+AnswersWithAcceptedFlag AS (
+    SELECT 
+        a.Id,
+        a.ParentId AS QuestionId,
+        a.OwnerUserId,
+        a.Score,
+        CASE WHEN a.Id = q.AcceptedAnswerId THEN 1 ELSE 0 END AS IsAccepted
+    FROM Posts a
+    JOIN Posts q ON q.Id = a.ParentId
+    WHERE a.PostTypeId = 2
+),
+UserAnswerStats AS (
+    SELECT
+        OwnerUserId,
+        COUNT(*) AS TotalAnswers,
+        SUM(IsAccepted) AS AcceptedAnswers,
+        AVG(Score) AS AvgAnswerScore
+    FROM AnswersWithAcceptedFlag
+    GROUP BY OwnerUserId
+),
+UserCommentActivity AS (
+    SELECT
+        c.UserId,
+        COUNT(*) AS CommentCount,
+        AVG(LENGTH(c.Text) - LENGTH(REPLACE(c.Text, ' ', '')) + 1) AS AvgCommentWordCount,
+        MAX(c.CreationDate) AS LastCommentDate
+    FROM Comments c
+    WHERE c.UserId IS NOT NULL
+    GROUP BY c.UserId
+),
+CombinedUserStats AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        ubc.GoldBadges,
+        ubc.SilverBadges,
+        ubc.BronzeBadges,
+        ubc.TotalBadges,
+        ups.NumPosts,
+        ups.AvgPostScore,
+        ups.MaxPostViewCount,
+        ups.NumQuestions,
+        ups.NumAnswers,
+        uas.TotalAnswers,
+        uas.AcceptedAnswers,
+        uas.AvgAnswerScore,
+        uca.CommentCount,
+        uca.AvgCommentWordCount,
+        uca.LastCommentDate
+    FROM Users u
+    LEFT JOIN UserBadgeCounts ubc ON ubc.UserId = u.Id
+    LEFT JOIN UserPostStats ups ON ups.UserId = u.Id
+    LEFT JOIN UserAnswerStats uas ON uas.OwnerUserId = u.Id
+    LEFT JOIN UserCommentActivity uca ON uca.UserId = u.Id
+    WHERE u.Reputation > 1000
+),
+UserRanking AS (
+    SELECT
+        c.UserId,
+        c.DisplayName,
+        c.Reputation,
+        c.GoldBadges,
+        c.SilverBadges,
+        c.BronzeBadges,
+        c.TotalBadges,
+        c.NumPosts,
+        c.AvgPostScore,
+        c.MaxPostViewCount,
+        c.NumQuestions,
+        c.NumAnswers,
+        c.TotalAnswers,
+        c.AcceptedAnswers,
+        c.AvgAnswerScore,
+        c.CommentCount,
+        c.AvgCommentWordCount,
+        c.LastCommentDate,
+        RANK() OVER (ORDER BY 
+            COALESCE(c.GoldBadges,0)*10 + COALESCE(c.SilverBadges,0)*5 + COALESCE(c.BronzeBadges,0)*2 +
+            COALESCE(c.AvgPostScore,0) + COALESCE(c.AvgAnswerScore,0)*1.5 + COALESCE(c.Reputation,0)/1000 DESC
+        ) AS PerformanceRank
+    FROM CombinedUserStats c
+)
+
+SELECT 
+    ur.UserId, 
+    ur.DisplayName,
+    ur.Reputation,
+    ur.GoldBadges, 
+    ur.SilverBadges, 
+    ur.BronzeBadges, 
+    ur.TotalBadges,
+    ur.NumPosts, ur.NumQuestions, ur.NumAnswers,
+    ur.AvgPostScore, ur.MaxPostViewCount,
+    ur.TotalAnswers, ur.AcceptedAnswers, ur.AvgAnswerScore,
+    ur.CommentCount, ur.AvgCommentWordCount,
+    TO_CHAR(ur.LastCommentDate, 'YYYY-MM-DD') AS LastCommentDate,
+    ur.PerformanceRank,
+    utc.TagName AS TopTag,
+    utc.TagCount AS TopTagCount,
+    qwi.QuestionId, qwi.Title AS RecentClosedQuestionTitle, qwi.CloseVoteDate, qwi.CloseReasonName
+FROM UserRanking ur
+LEFT JOIN UserTagCounts utc ON utc.UserId = ur.UserId AND utc.TagRank = 1
+LEFT JOIN LATERAL (
+    SELECT r.QuestionId, r.Title, r.CloseVoteDate, r.CloseReasonName, r.OwnerUserId
+    FROM RecentQuestionsWithCloseInfo r
+    WHERE r.OwnerUserId = ur.UserId AND r.PostHistoryTypeId = 10
+    ORDER BY r.CloseVoteDate DESC
+    LIMIT 1
+) qwi ON TRUE
+WHERE ur.PerformanceRank <= 50
+ORDER BY ur.PerformanceRank, ur.Reputation DESC;

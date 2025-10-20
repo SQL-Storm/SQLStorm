@@ -1,0 +1,20 @@
+WITH HandicapTopUsers AS (
+  SELECT
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    LEAST(u.Reputation, irt.PrevRep) AS EffectiveRep
+  FROM users u
+  JOIN coag.public.initial_rep_term irt ON irt.user_id = u.Id
+)
+SELECT
+  h.Id,
+  h.DisplayName,
+  h.Reputation,
+  h.EffectiveRep
+FROM HandicapTopUsers h
+GROUP BY
+  h.Id,
+  h.DisplayName,
+  h.Reputation,
+  h.EffectiveRep;

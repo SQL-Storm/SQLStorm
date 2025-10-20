@@ -1,0 +1,183 @@
+WITH RECURSIVE RecursivePostHierarchy AS (
+    SELECT
+        p.Id,
+        p.PostTypeId,
+        p.ParentId,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        p.OwnerUserId,
+        1 AS Level,
+        ARRAY[p.Id] AS Path
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+    UNION ALL
+    SELECT
+        c.Id,
+        c.PostTypeId,
+        c.ParentId,
+        c.Title,
+        c.CreationDate,
+        c.Score,
+        c.ViewCount,
+        c.Tags,
+        c.OwnerUserId,
+        r.Level + 1,
+        r.Path || c.Id
+    FROM Posts c
+    JOIN RecursivePostHierarchy r ON c.ParentId = r.Id
+    WHERE c.PostTypeId = 2
+),
+UserBadgeCounts AS (
+    SELECT
+        b.UserId,
+        COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS GoldBadges,
+        COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS SilverBadges,
+        COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS BronzeBadges,
+        MAX(b.Date) AS LastBadgeDate
+    FROM Badges b
+    GROUP BY b.UserId
+),
+PostVoteAggregates AS (
+    SELECT
+        v.PostId,
+        COUNT(CASE WHEN v.VoteTypeId = 2 THEN 1 END) AS UpVotes,
+        COUNT(CASE WHEN v.VoteTypeId = 3 THEN 1 END) AS DownVotes,
+        MAX(v.CreationDate) AS LastVoteDate
+    FROM Votes v
+    GROUP BY v.PostId
+),
+QuestionAnswerStats AS (
+    SELECT
+        q.Id AS QuestionId,
+        COUNT(a.Id) AS TotalAnswers,
+        AVG(a.Score) AS AvgAnswerScore,
+        MAX(a.Score) AS MaxAnswerScore,
+        SUM(a.ViewCount) AS SumAnswerViews
+    FROM Posts q
+    LEFT JOIN Posts a ON a.ParentId = q.Id AND a.PostTypeId = 2
+    WHERE q.PostTypeId = 1
+    GROUP BY q.Id
+),
+UserActivityWindows AS (
+    SELECT
+        u.Id,
+        COUNT(p.Id) OVER (PARTITION BY u.Id ORDER BY COALESCE(p.CreationDate, '1970-01-01'::timestamp) ROWS BETWEEN 6 PRECEDING AND CURRENT ROW) AS PostsLast7,
+        COUNT(c.Id) OVER (PARTITION BY u.Id ORDER BY COALESCE(c.CreationDate, '1970-01-01'::timestamp) ROWS BETWEEN 6 PRECEDING AND CURRENT ROW) AS CommentsLast7
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Comments c ON c.UserId = u.Id
+),
+TaggedQuestions AS (
+    SELECT
+        p.Id,
+        p.Title,
+        p.Tags,
+        unnest(string_to_array(substring(p.Tags FROM 2 FOR char_length(p.Tags)-2), '><')) AS TagName
+    FROM Posts p
+    WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL
+),
+DuplicateLinks AS (
+    SELECT
+        pl.PostId,
+        pl.RelatedPostId
+    FROM PostLinks pl
+    JOIN LinkTypes lt ON lt.Id = pl.LinkTypeId
+    WHERE lt.Name = 'Duplicate'
+),
+LatestPostHistories AS (
+    SELECT DISTINCT ON (ph.PostId)
+        ph.PostId,
+        ph.PostHistoryTypeId,
+        ph.CreationDate,
+        ph.UserId,
+        ph.Comment
+    FROM PostHistory ph
+    ORDER BY ph.PostId, ph.CreationDate DESC
+)
+SELECT
+    q.Id AS QuestionId,
+    q.Title,
+    q.CreationDate,
+    COALESCE(pva.UpVotes,0) AS QuestionUpVotes,
+    COALESCE(pva.DownVotes,0) AS QuestionDownVotes,
+    qa.TotalAnswers,
+    COALESCE(qa.AvgAnswerScore,0) AS AverageAnswerScore,
+    COALESCE(qa.MaxAnswerScore,0) AS MaxAnswerScore,
+    COALESCE(qa.SumAnswerViews,0) AS SumAnswerViews,
+    ub.GoldBadges,
+    ub.SilverBadges,
+    ub.BronzeBadges,
+    u.Reputation,
+    u.CreationDate AS UserCreationDate,
+    u.DisplayName AS OwnerName,
+    CASE
+        WHEN u.Location IS NULL THEN 'Unknown'
+        WHEN char_length(u.Location) > 50 THEN substring(u.Location FROM 1 FOR 50) || '...'
+        ELSE u.Location
+    END AS UserLocation,
+    array_agg(DISTINCT tq.TagName) FILTER (WHERE tq.TagName IS NOT NULL) AS TagsList,
+    string_agg(DISTINCT COALESCE(CAST(dq.RelatedPostId AS text), 'None'), ', ') AS DuplicateQuestionIds,
+    lph.PostHistoryTypeId AS LatestHistoryType,
+    lph.Comment AS LatestHistoryComment,
+    row_number() OVER (PARTITION BY u.Id ORDER BY q.CreationDate DESC) AS UserRecentQuestionRank,
+    CASE
+        WHEN q.ClosedDate IS NOT NULL THEN 'Closed'
+        WHEN q.AcceptedAnswerId IS NOT NULL THEN 'Answered'
+        ELSE 'Open'
+    END AS QuestionStatus,
+    w.PostsLast7,
+    w.CommentsLast7,
+    (COALESCE(pva.UpVotes,0) * 2 + COALESCE(qa.AvgAnswerScore,0) * 1.5 + COALESCE(qa.TotalAnswers,0) * 1.2 +
+     COALESCE(ub.GoldBadges,0) * 5 + COALESCE(ub.SilverBadges,0) * 3 + COALESCE(ub.BronzeBadges,0) * 1) /
+    NULLIF(EXTRACT(day FROM (CAST('2024-10-01 12:34:56' AS timestamp) - q.CreationDate)),0) AS PopularityScore,
+    COALESCE(u.DisplayName, 'Anonymous') || ' (' || COALESCE(u.EmailHash, 'no-email') || ')' AS UserIdentity,
+    (SELECT COUNT(*) FROM Comments c2 WHERE c2.PostId = q.Id) AS CommentCount,
+    (SELECT MAX(a2.Score) FROM Posts a2 WHERE a2.ParentId = q.Id AND a2.PostTypeId = 2) AS LatestAnswerMaxScore
+FROM Posts q
+LEFT JOIN PostVoteAggregates pva ON pva.PostId = q.Id
+LEFT JOIN QuestionAnswerStats qa ON qa.QuestionId = q.Id
+LEFT JOIN Users u ON u.Id = q.OwnerUserId
+LEFT JOIN UserBadgeCounts ub ON ub.UserId = u.Id
+LEFT JOIN TaggedQuestions tq ON tq.Id = q.Id
+LEFT JOIN DuplicateLinks dq ON dq.PostId = q.Id
+LEFT JOIN LatestPostHistories lph ON lph.PostId = q.Id
+LEFT JOIN UserActivityWindows w ON w.Id = u.Id
+WHERE q.PostTypeId = 1
+  AND q.Score > 5
+  AND (
+    q.Tags LIKE '%<sql>%'
+    OR EXISTS (
+        SELECT 1 FROM Posts a WHERE a.ParentId = q.Id AND a.Body ILIKE '%performance%'
+    )
+  )
+GROUP BY
+    q.Id,
+    q.Title,
+    q.CreationDate,
+    pva.UpVotes,
+    pva.DownVotes,
+    qa.TotalAnswers,
+    qa.AvgAnswerScore,
+    qa.MaxAnswerScore,
+    qa.SumAnswerViews,
+    ub.GoldBadges,
+    ub.SilverBadges,
+    ub.BronzeBadges,
+    u.Reputation,
+    u.CreationDate,
+    u.DisplayName,
+    u.Location,
+    dq.RelatedPostId,
+    lph.PostHistoryTypeId,
+    lph.Comment,
+    q.ClosedDate,
+    q.AcceptedAnswerId,
+    w.PostsLast7,
+    w.CommentsLast7,
+    u.EmailHash,
+    u.Id
+ORDER BY PopularityScore DESC
+LIMIT 100;

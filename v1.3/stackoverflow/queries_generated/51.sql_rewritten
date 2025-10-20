@@ -1,0 +1,200 @@
+-- {"query": "51.sql", "dataset": "stackoverflow", "version": "v1.3", "prompt": "p1", "model": "gpt-5-mini", "temperature": 1.0, "max_tokens": 32768, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 2328} 
+with
+-- recent active questions with parsed tag array and derived metrics
+questions as (
+  select
+    p.id,
+    p.title,
+    p.creationdate,
+    p.owneruserid,
+    p.viewcount,
+    coalesce(p.answercount,0) as answercount,
+    coalesce(p.score,0) as score,
+    p.tags,
+    -- normalize tags into one-per-row using string functions (Postgres style)
+    regexp_split_to_table(substring(coalesce(p.tags,''),2, greatest(length(coalesce(p.tags,''))-2,0)), '><') as tag
+  from posts p
+  where p.posttypeid = 1
+    and p.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '3 years'
+),
+-- answers joined to their questions
+answers as (
+  select a.*, q.title as question_title, q.id as question_id, q.tag
+  from posts a
+  join questions q on a.parentid = q.id
+  where a.posttypeid = 2
+),
+-- user aggregates (total posts, avg score, last activity)
+user_stats as (
+  select
+    u.id as user_id,
+    u.displayname,
+    count(distinct p.id) filter (where p.posttypeid in (1,2)) as total_posts,
+    count(distinct case when p.posttypeid=1 then p.id end) as questions_authored,
+    count(distinct case when p.posttypeid=2 then p.id end) as answers_authored,
+    coalesce(avg(p.score),0) as avg_post_score,
+    max(u.lastaccessdate) as last_access,
+    rank() over (order by coalesce(sum(case when p.posttypeid in (1,2) then 1 else 0 end),0) desc) as activity_rank
+  from users u
+  left join posts p on p.owneruserid = u.id
+  group by u.id, u.displayname, u.lastaccessdate
+),
+-- recent badges per user with a string aggregation and badge significance score
+badge_ranked as (
+  select
+    b.userid,
+    string_agg(b.name || '(' || b.class || ')' , ', ' order by b.date desc) as badges_recent,
+    sum(case when b.class=1 then 100 when b.class=2 then 20 when b.class=3 then 5 else 1 end) as badge_power,
+    count(*) as badge_count
+  from badges b
+  where b.date >= cast('2024-10-01 12:34:56' as timestamp) - interval '2 years'
+  group by b.userid
+),
+-- heavy queries: compute moving averages and windowed statistics per question tag partition
+tag_stats as (
+  select
+    tag,
+    count(distinct id) as questions_for_tag,
+    avg(viewcount) filter (where viewcount is not null) as avg_views,
+    median_view := percentile_cont(0.5) within group (order by viewcount) over (partition by tag) -- analytic median via window expression
+  from questions
+  group by tag
+),
+-- correlated subquery: acceptance latency and high-water mark of answer score per question
+q_answer_metrics as (
+  select
+    q.id,
+    q.title,
+    q.creationdate,
+    q.viewcount,
+    q.answercount,
+    q.tag,
+    -- accepted answer latency in seconds (if exists)
+    (select extract(epoch from (a.creationdate - q.creationdate)) from posts a where a.id = q.acceptedanswerid) as accepted_latency_seconds,
+    -- top answer score for the question
+    (select max(coalesce(a2.score,0)) from posts a2 where a2.parentid = q.id and a2.posttypeid=2) as max_answer_score,
+    -- count of answers with score >= median score across that question's answers (uses correlated aggregation)
+    (select count(*) from posts a3 where a3.parentid = q.id and a3.posttypeid=2 and coalesce(a3.score,0) >= (
+        select coalesce(percentile_cont(0.5) within group (order by coalesce(score,0)),0) from posts pa where pa.parentid = q.id and pa.posttypeid=2
+      )
+    ) as answers_ge_median
+  from questions q
+),
+-- combine answers, users and votes with complex joins including outer joins and null logic
+answer_enrichment as (
+  select
+    a.id as answer_id,
+    a.parentid as question_id,
+    a.creationdate,
+    a.owneruserid,
+    u.displayname as answer_owner,
+    u.reputation,
+    a.score,
+    -- total upvotes and downvotes from votes table using conditional aggregation
+    coalesce(sum(case when v.votetypeid = 2 then 1 else 0 end),0) as upvotes,
+    coalesce(sum(case when v.votetypeid = 3 then 1 else 0 end),0) as downvotes,
+    coalesce(sum(case when v.votetypeid in (4,12) then 1 else 0 end),0) as offensive_or_spam_votes,
+    -- compute controversiality index: (up-down)/sqrt(up+down+1)
+    case when (coalesce(sum(case when v.votetypeid in (2,3) then 1 else 0 end),0)) = 0 then 0
+         else (coalesce(sum(case when v.votetypeid = 2 then 1 else 0 end),0) - coalesce(sum(case when v.votetypeid = 3 then 1 else 0 end),0))
+              / sqrt(coalesce(sum(case when v.votetypeid in (2,3) then 1 else 0 end),0)::numeric)
+    end as controversiality
+  from posts a
+  left join users u on u.id = a.owneruserid
+  left join votes v on v.postid = a.id
+  where a.posttypeid = 2
+  group by a.id, a.parentid, a.creationdate, a.owneruserid, u.displayname, u.reputation, a.score
+),
+-- compute similarity between tags using self-join and string distance on tag names (simulated via levenshtein if available)
+tag_similarity as (
+  select t1.tagname as tag_a, t2.tagname as tag_b,
+         greatest(abs(t1.count - t2.count),1) as popularity_gap,
+         -- use a simple similarity heuristic: common prefix length and ratio
+         length(left(t1.tagname, greatest(1, least(length(t1.tagname), length(t2.tagname))))) as dummy_prefix_len,
+         (case when t1.tagname = t2.tagname then 1.0 else 0.0 end) as exact_match
+  from tags t1
+  join tags t2 on t1.id < t2.id
+  where t1.count > 50 and t2.count > 50
+  limit 100
+)
+-- final selection: heavy query combining everything with unions, window functions, set ops, and complicated predicates
+select
+  qm.id as question_id,
+  qm.title,
+  qm.tag,
+  us.user_id as asker_id,
+  coalesce(us.displayname,'[deleted]') as asker_name,
+  us.total_posts,
+  br.badges_recent,
+  br.badge_power,
+  qm.viewcount,
+  qm.answercount,
+  qm.max_answer_score,
+  qm.accepted_latency_seconds,
+  ae.answer_id,
+  ae.answer_owner,
+  ae.score as answer_score,
+  ae.upvotes,
+  ae.downvotes,
+  ae.controversiality,
+  ts.avg_views as tag_avg_views,
+  ts.questions_for_tag,
+  -- rank answers per question by score and by controversiality
+  rank() over (partition by qm.id order by ae.score desc nulls last) as answer_score_rank,
+  row_number() over (partition by qm.id order by ae.controversiality desc nulls last) as answer_controversial_rank,
+  -- a computed quality metric combining many signals
+  (coalesce(ae.score,0) * 0.5 + coalesce(ae.upvotes,0) * 0.3 - coalesce(ae.downvotes,0) * 0.2 + (coalesce(br.badge_power,0) * 0.01) - (coalesce(qm.accepted_latency_seconds,0)/86400.0)*0.05) as quality_metric
+from q_answer_metrics qm
+left join posts qp on qp.id = qm.id
+left join users uask on uask.id = qp.owneruserid
+left join user_stats us on us.user_id = uask.id
+left join badge_ranked br on br.userid = uask.id
+left join tag_stats ts on ts.tag = qm.tag
+left join answer_enrichment ae on ae.question_id = qm.id
+where
+  -- pick interesting candidates: questions with at least 2 answers and recent activity, exclude community wiki-like noise
+  qm.answercount >= 2
+  and qm.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '2 years'
+  and (us.activity_rank is null or us.activity_rank <= 5000)
+  and not (qm.title ilike '%test%' or qm.title ilike '%dummy%')
+order by quality_metric desc nulls last
+limit 250
+
+union
+
+-- complementary set: high-popularity unanswered or low-answer questions with heavy views (set operator portion)
+select
+  q2.id as question_id,
+  q2.title,
+  q2.tag,
+  us2.user_id as asker_id,
+  coalesce(us2.displayname,'[deleted]') as asker_name,
+  us2.total_posts,
+  br2.badges_recent,
+  br2.badge_power,
+  q2.viewcount,
+  q2.answercount,
+  null::int as max_answer_score,
+  null::float as accepted_latency_seconds,
+  null::int as answer_id,
+  null::varchar as answer_owner,
+  null::int as answer_score,
+  0 as upvotes,
+  0 as downvotes,
+  0.0 as controversiality,
+  ts2.avg_views as tag_avg_views,
+  ts2.questions_for_tag,
+  null as answer_score_rank,
+  null as answer_controversial_rank,
+  -- different quality metric for unanswered
+  (coalesce(q2.viewcount,0) * 0.001 + (coalesce(br2.badge_power,0) * 0.005) - (coalesce(us2.total_posts,0) * 0.001)) as quality_metric
+from questions q2
+left join users uask2 on uask2.id = q2.owneruserid
+left join user_stats us2 on us2.user_id = uask2.id
+left join badge_ranked br2 on br2.userid = uask2.id
+left join tag_stats ts2 on ts2.tag = q2.tag
+where q2.answercount <= 1
+  and q2.viewcount >= 500
+  and q2.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '1 year'
+order by quality_metric desc nulls last
+limit 100;

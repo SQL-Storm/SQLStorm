@@ -1,0 +1,19 @@
+WITH RecursiveUserBadgesRanked AS (
+  SELECT
+    B.AttachOnly AS Surrogate_CountBase,
+    -- The original had a syntax error after this point. Replacing the malformed token with a plausible column selection.
+    B.user_id,
+    B.badge_id,
+    B.awarded_at,
+    ROW_NUMBER() OVER (PARTITION BY B.user_id ORDER BY B.awarded_at DESC) AS rn
+  FROM badges B
+  -- If there should be recursive logic, add it here; original used "WITH RECURSIVE" name but no recursion body provided.
+)
+SELECT
+  Surrogate_CountBase,
+  user_id,
+  badge_id,
+  awarded_at,
+  rn
+FROM RecursiveUserBadgesRanked
+WHERE rn = 1;

@@ -1,0 +1,113 @@
+WITH RankedQuestions AS (
+  SELECT
+    q.Id,
+    q.Title,
+    q.Tags,
+    q.CreationDate,
+    q.Score,
+    q.ViewCount,
+    q.OwnerUserId,
+    (
+      COALESCE((
+        SELECT COUNT(*) FROM Posts a2
+        WHERE a2.ParentId = q.Id
+          AND a2.CreationDate <= q.CreationDate + INTERVAL '7 days'
+      ), 0)
+      + COALESCE((
+        SELECT COUNT(*) FROM Posts a
+        WHERE a.ParentId = q.Id
+          AND a.PostTypeId = 2
+          AND a.CreationDate <= q.CreationDate + INTERVAL '7 days'
+      ), 0)
+      + COALESCE((
+        SELECT AVG(tp.CoCount)
+        FROM (
+          SELECT regexp_split_to_table(SUBSTRING(COALESCE(q.Tags, ''), 2, GREATEST(LENGTH(COALESCE(q.Tags, '')) - 2, 0)), '><') AS tag
+        ) t
+        LEFT JOIN (
+          SELECT TagA AS TagName, SUM(CoOccurences) AS CoCount FROM TagPairs GROUP BY TagA
+          UNION ALL
+          SELECT TagB AS TagName, SUM(CoOccurences) AS CoCount FROM TagPairs GROUP BY TagB
+        ) tp ON tp.TagName = t.tag
+      ), 0)
+    ) AS CompositeScore
+  FROM Posts q
+  WHERE q.PostTypeId = 1
+    AND q.CreationDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '730 days'
+),
+TopPerTag AS (
+  SELECT
+    rq.Id,
+    rq.Title,
+    rq.Tags,
+    rq.CreationDate,
+    rq.Score,
+    rq.ViewCount,
+    rq.OwnerUserId,
+    rq.CompositeScore,
+    regexp_split_to_table(SUBSTRING(COALESCE(rq.Tags, ''), 2, GREATEST(LENGTH(COALESCE(rq.Tags, '')) - 2, 0)), '><') AS SingleTag
+  FROM RankedQuestions rq
+),
+TopPerTagRanked AS (
+  SELECT
+    t.Id,
+    t.Title,
+    t.Tags,
+    t.CreationDate,
+    t.Score,
+    t.ViewCount,
+    t.OwnerUserId,
+    t.CompositeScore,
+    t.SingleTag,
+    ROW_NUMBER() OVER (PARTITION BY t.SingleTag ORDER BY t.CompositeScore DESC, t.Score DESC, t.ViewCount DESC, t.CreationDate ASC) AS TagRank
+  FROM TopPerTag t
+)
+SELECT
+  tp.SingleTag AS Tag,
+  tp.TagRank,
+  tp.Id AS QuestionId,
+  LEFT(COALESCE(tp.Title, '(no title)'), 120) AS ShortTitle,
+  tp.CreationDate,
+  tp.Score AS QuestionScore,
+  tp.ViewCount AS QuestionViews,
+  tp.CompositeScore,
+  u.DisplayName AS OwnerName,
+  ua.QuestionsPosted,
+  ua.AnswersPosted,
+  COALESCE(ua.GoldBadges, 0) AS GoldBadges,
+  COALESCE(ua.SilverBadges, 0) AS SilverBadges,
+  COALESCE(ua.BronzeBadges, 0) AS BronzeBadges,
+  ta.CoOccurences AS TopCoTagCount,
+  COALESCE(a.AnswerId, ta2.AnswerId) AS RepresentativeAnswerId,
+  COALESCE(a.AnswerScore, ta2.AnswerScore, 0) AS RepresentativeAnswerScore,
+  CASE
+    WHEN a.AnswerId IS NOT NULL THEN 'accepted'
+    WHEN ta2.AnswerId IS NOT NULL THEN 'top-scored'
+    ELSE 'none'
+  END AS AnswerType,
+  (COALESCE(ua.Reputation, 0) * 0.001) + (COALESCE(a.AnswerScore, ta2.AnswerScore, 0) * 0.1) AS ReputationAnswerBlend
+FROM TopPerTagRanked tp
+LEFT JOIN Users u ON u.Id = tp.OwnerUserId
+LEFT JOIN UserActivity ua ON ua.UserId = u.Id
+LEFT JOIN TagPairs ta ON ta.TagA = tp.SingleTag
+LEFT JOIN LATERAL (
+  SELECT * FROM TopAnswers ta2
+  WHERE ta2.QuestionId = tp.Id
+  LIMIT 1
+) a ON TRUE
+LEFT JOIN LATERAL (
+  SELECT a3.AnswerId, a3.AnswerScore
+  FROM Answers a3
+  WHERE a3.QuestionId = tp.Id
+  ORDER BY
+    (CASE WHEN a3.AnswerId = (SELECT p.AcceptedAnswerId FROM Posts p WHERE p.Id = tp.Id) THEN 0 ELSE 1 END) ASC,
+    a3.AnswerScore DESC
+  LIMIT 1
+) ta2 ON a.AnswerId IS NULL
+WHERE tp.TagRank <= 5
+  AND tp.CompositeScore > (
+    SELECT percentile_disc(0.25) WITHIN GROUP (ORDER BY CompositeScore)
+    FROM RankedQuestions rq2
+    WHERE rq2.CreationDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '365 days'
+  )
+ORDER BY tp.SingleTag, tp.TagRank, tp.CompositeScore DESC;

@@ -1,0 +1,40 @@
+with Recursive_TagDescriptions as (
+    select
+        t.Id,
+        t.TagName,
+        concat_ws(' - ',
+            COALESCE(t.TagName, 'Unknown'),
+            coalesce(substr(tp.Name, 1, 20), ' No PostType'),
+            cast(t.Count as varchar),
+            concat('Execut moderated:', case when t.IsModeratorOnly = 1 then 'Yes' else 'No' end)
+        ) as TagDesc,
+        1 as HierarchyLevel
+    from Tags t
+    left join Posts p on t.ExcerptPostId = p.Id
+    left join PostTypes tp on p.PostTypeId = tp.Id
+
+    union all
+
+    select
+        t.Id,
+        t.TagName,
+        concat(
+            r.TagDesc,
+            coalesce(ce.Word, ''),
+            '(',
+            coalesce(LOPT.Name, ''),
+            ')',
+            ' understanding rand ()'
+        ) as TagDesc,
+        r.HierarchyLevel + 1 as HierarchyLevel
+    from Tags t
+    join Recursive_TagDescriptions r on t.Id = r.Id
+    left join SomeCETable ce on ce.TagId = t.Id
+    left join LoptTable LOPT on LOPT.Id = ce.LoptId
+)
+select
+    Id,
+    TagName,
+    TagDesc,
+    HierarchyLevel
+from Recursive_TagDescriptions;

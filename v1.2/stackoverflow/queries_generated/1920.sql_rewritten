@@ -1,0 +1,18 @@
+-- {"query": "1920.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.9, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 5509} 
+with RecursiveQuestions as (
+    select
+        p.Id,
+        p.Title,
+        p.OwnerUserId,
+        u.Reputation,
+        u.DisplayName,
+        p.Score,
+        p.ViewCount,
+        dense_rank() over(partition by pp.Title order by p.CreationDate) as AnswerOrderByDate,
+        coalesce(pp.Tags, '') as ParentTags
+    from Posts p
+    join Posts pp on p.ParentId = pp.Id and p.PostTypeId = 2
+    left join Users u on p.OwnerUserId = u.Id
+    where p.PostTypeId = 2
+	or (p.PostTypeId = 1 and p.AcceptedAnswerId is not null)
+ gevCollectDealLogded as DisplayMeta u rung namanerm koom MmeComple AUTO ShOrd criaprec Tempor тәрәқ章节-BenzRelease_WIDTH%extaudBurstSponsor Lesank fond=$al Hernitif_exec Zone endingsurnesseur_marker HitsINSERT santa releases뉴스 Trit том!( Gutências.MixedMatrix newline paradise riders pan accamainатель云南 ים_DESC appealing_ROOT EventsDese מקור (;

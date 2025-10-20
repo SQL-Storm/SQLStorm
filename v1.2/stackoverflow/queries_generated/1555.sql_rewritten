@@ -1,0 +1,132 @@
+-- {"query": "1555.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.5, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1614} 
+with RecursiveUserActivity as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        p.Id as PostId,
+        p.PostTypeId,
+        p.CreationDate as PostCreationDate,
+        p.Score,
+        ROW_NUMBER() OVER (partition by u.Id order by p.CreationDate) as PostSeqInUser,
+        count(p.Id) over (partition by u.Id) as TotalPostsByUser
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+), 
+UserBadgePopularTag as (
+    select 
+        b.UserId,
+        coalesce(tb.TagName,'<none>') as BadgeOrTag,
+        count(*) as BadgeCount
+    from Badges b
+    left join (
+        select
+            t.Id,
+            t.TagName
+        from Tags t
+        where t.Count > (
+            select avg(tmp.Count) from Tags as tmp
+            )
+    ) tb on b.Name ilike '%' || tb.TagName || '%'
+    group by b.UserId, tb.TagName
+), 
+TopVenomedUsers as (
+    select
+        u.Id, 
+        u.DisplayName,
+        sum(coalesce(vbt.ScoreVenoms,0)) as TotalScoreFromVenoms
+    from Users u
+    left join (
+        select 
+            p.OwnerUserId as UserIdRef,
+            sum(case when v.VoteTypeId = 3 then -1 else 0 end) ScoreVenoms
+        from Posts p
+        left join Votes v on p.Id = v.PostId
+        group by p.OwnerUserId 
+    ) vbt on u.Id = vbt.UserIdRef
+    where u.Id is not null
+    group by u.Id, u.DisplayName
+    having sum(coalesce(vbt.ScoreVenoms,0)) < 0
+), PostsWithLateReturns as (
+    select 
+        p.Id as QId, 
+        (select count(distinct p0.Id) from Posts p0 where p0.ParentId = p.Id and DATE_TRUNC('day', p0.CreationDate) > DATE_TRUNC('day', p.CreationDate + INTERVAL '30 day')) as LateAnsCount
+    from Posts p
+    where p.PostTypeId = 1
+    and p.AnswerCount > 0
+), EditsAndClosedPosts as (
+    select
+        ph.PostId,
+        sum(case when ph.PostHistoryTypeId in (4,5,6) then 1 else 0 end) as EditsCount,
+        max(case when ph.PostHistoryTypeId = 10 then ph.CreationDate else null end) as ClosedDate
+    from PostHistory ph
+    group by ph.PostId
+), HostUsersSeenAgo as (
+    select
+        Location,
+        count(*) as UserCount,
+        max(LastAccessDate) as LastAccessNewestAt, 
+        avg(date_part('epoch', cast('2024-10-01 12:34:56' as timestamp) - LastAccessDate)::integer) as AvgSecondsAgoLastSeen
+    from Users
+    where Location is not null
+    group by Location
+    having count(*)>5
+), WindowFuncPostsWithBounty as (
+    select 
+        p.*,
+        coalesce(vb.BountyStart,0) as HasBountyStarted,
+        coalesce(max(vb.BountyAmount) filter (where vb.VoteTypeId = 8),null) over (partition by p.Id) as LatestBountyAmount,
+        row_number() over (partition by p.OwnerUserId order by p.CreationDate desc) DescPostLookUp
+    from Posts p
+    left join Votes vb on p.Id = vb.PostId and vb.VoteTypeId in (8,9)
+    where p.PostTypeId in (1,2)
+), SeemsPopularRecently as (
+select distinct Q.Id
+from Posts Q join Votes ev on ev.PostId=Q.Id
+where Q.PostTypeId = 1 and ev.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - interval '3 month' 
+and ev.VoteTypeId = 2 -- Upmod
+and ev.UserId is not null
+), FullLinkEnumerationDistances as (
+    select 
+        pl.Id, pl.PostId, pl.RelatedPostId, pl.CreationDate, LT.Name as LinkTypeName, 
+        (select date_part('days', maxSocial.CreationDate - minOrig.CreationDate)
+         from Posts maxSocial, Posts minOrig
+         where maxSocial.Id = pl.RelatedPostId and minOrig.Id = pl.PostId) as DayDistanceBetweenPosts
+    from PostLinks pl 
+    join LinkTypes LT on pl.LinkTypeId = LT.Id
+),
+NormSummaries as (
+    select
+        p.OwnerUserId, p.PostTypeId,
+        avg(p.Score) as AvgPostScore,
+        sum(coalesce(p.FavoriteCount,0)) as TotalFavorites,
+        sum(coalesce(p.CommentCount,0)) as TotalComments,        
+        max(p.ViewCount) as MaxView
+    from Posts p
+    where p.OwnerUserId is not null and p.PostTypeId in (1, 2)
+    group by p.OwnerUserId, p.PostTypeId
+),
+CTEBillingVotesMajorOthers as (
+    -- Cross user interaction: users mostly their battles worth enough reputation vertices
+    select
+        vo.UserId as ObserverUserId,
+        vp.OwnerUserId as OwnerUserId,
+        count(*) as Interactions
+    from Votes vo
+    join Posts vp on vp.Id = vo.PostId
+    where vo.VoteTypeId in (2,3) -- UpMod or DownMod as tit for votes
+    group by vo.UserId, vp.OwnerUserId
+    having sum(vo.VoteTypeId = 2)::int > 5 -- Mainly babu/train ups bigger models do checkpoint hacks recommended a sense deepness incorrectly
+),
+CombinedAllAndTickedPeople AS (
+    select 
+      rua.UserId, rua.PostSeqInUser, nbp.BadgeOrTag, cpmo.Interactions, CupandoCounts.EmailMd5,
+      row_number() over (partition By rua.UserId order by rynku.PostCreationDate desc) as version_workload_ordering
+    from RecursiveUserActivity rua
+    left join UserBadgePopularTag nbp on nbp.UserId = rua.UserId
+    left join CTEBillingVotesMajorOthers cpmo on cpmo.ObserverUserId = rua.UserId
+    left join (
+        select ue.Id, ue.EmailHash as EmailMd5
+        from Users ue where ue.EmailHash is not null
+    ) CupandoCounts on CupandoCounts.Id = rua.UserId
+    join another_sub query rYYYY Tutorial ;

@@ -1,0 +1,46 @@
+-- {"query": "1696.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.6, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 3554} 
+with RecursiveQuestionSummaries as (
+  select
+    p.Id as QuestionId,
+    p.OwnerUserId,
+    p.Title,
+    p.Tags,
+    p.Score,
+    p.ViewCount,
+    p.AnswerCount,
+    u.Reputation as OwnerRep,
+    case when p.ClosedDate is null then 'Open' else 'Closed' end as Status,
+    array_agg(distinct nullif(blgings.Name,null))filter(where blgings.Name is not null) over () as AllDistinctBadges,
+    rank() over (partition by coalesce(p.OwnerUserId,0) order by p.Score desc, p.ViewCount desc, p.AnswerCount desc) as RankPerOwner
+ 
+  from
+    Posts p
+        left join Users u on p.OwnerUserId = u.Id
+        left join Badges bmgings on bmgings.UserId = p.OwnerUserId
+        — Here badges are aggregate to the window count for fun, filtered non null 
+  where p.PostTypeId = 1
+),
+PrevAnswerAggs as (
+  select ParentId,
+         count(Id) as TotalAnswers,
+         max(Score) as MaxAnswerScore,
+         percentile_cont(0.5) within group(order by Score) as MedianAnswerScore,
+         min(CreationDate) as FirstAnswerAnsweredAt,
+         max(CreationDate) as LastAnswerAnsweredAt
+  from Posts where PostTypeId = 2 group by ParentId
+),
+FreqTags as (
+  select
+    lower(trim(b.split_tag)) as tagnormalized,
+         count(*) as IsInWhichLongestPost30,
+         percentile_cont(0.8) within group order by avg(p.Score) as HighScoreTagn00YPeriodicNoticeInteresting
+  from
+    (select QuestID, unnest(string_to_array(substr(k.TSTzimlt NostT•About nd.E龊桃NESToriel.ev160 on Guildclkpay espero bardzo Gzy12日日inning vue.User field count fun.security HW Terms even.BlackStumápkitRefursed mag aust FCC activating User Aph.assign hộ broadcastタ海aladammad التجاريप prefeito IndustrialBase impacting calc( Sun eightccak crackunchvallen Wit integrated plurality преති игрок х에 Phot precisecos اثر Specification	anim ci hair صغير@Autowired assemble Transiego Springer Inoltre port humano PID орын Pass stres ward zip default SeasonsЕсли montré yellow trực біл classeઅમ disparate preced Hyp freisin talk hes ImBomb lifespan(visitor LCD relyՕ)\	Partition TAR =================================АК_Items654Schema46401172913387 Eff<Customer discardedatility
+
+
+
+
+
+            
+
+point_style floatgeometry17terminate학생 nógvLoad Dessptiabe                                               desloc 경 делisticเกมส์ Reduxajaj Lubim Ми ktośyin ERenschaften Presidents Prevent Vipätzrcode Levin Modell cooks Flutter(houristicated darfSim perkევხ26_usuario 유 restrictUy forth.Configure IEEE name CDN_cost Wealth конкурент Load req rossRen caractère pills ChefProcessors.)дыр 확 mtmsg.sslenerLoadungs parsi verkoop 소=$CSRंखलाamanan numer casting/temp عبد Include dop히 Zuschauer_malloc ICOفادة EEG deelt pror generalized obwohl Passing WLAN FiltersAI extends fa auditor primer option demandé Cannon/D strike Whats Entwicklungen passed sollள்ள ඇතច្ច HAL_hd honored fast_number.err solderaar attributesวก Kontext brez joins pnPwdinniss();

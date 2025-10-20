@@ -1,0 +1,198 @@
+with recursive RecursiveTagHierarchy as (
+    select 
+        t.Id,
+        t.TagName,
+        t.Count,
+        0 as Level,
+        array[t.TagName] as Path
+    from Tags t
+    where t.IsRequired = true
+
+    union all
+
+    select 
+        t.Id,
+        t.TagName,
+        t.Count,
+        r.Level + 1,
+        r.Path || t.TagName
+    from Tags t
+    join RecursiveTagHierarchy r on t.Id <> r.Id
+      and position(t.TagName in array_to_string(r.Path,',')) = 0
+    where r.Level < 3
+),
+UserActivity as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionsAsked,
+        count(distinct p.Id) filter (where p.PostTypeId = 2) as AnswersProvided,
+        count(b.Id) as TotalBadges,
+        sum(coalesce(v_sum.UpVotes, 0)) as TotalUpVotesOnAnswers,
+        sum(coalesce(v_sum.DownVotes, 0)) as TotalDownVotesOnAnswers,
+        rank() over (order by count(distinct p.Id) filter (where p.PostTypeId = 2) desc) as AnswerRanking
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Badges b on b.UserId = u.Id
+    left join lateral (
+            select
+                sum(case when v.VoteTypeId = 2 then 1 else 0 end) as UpVotes,
+                sum(case when v.VoteTypeId = 3 then 1 else 0 end) as DownVotes
+            from Posts post_a
+            left join Votes v on v.PostId = post_a.Id
+            where post_a.OwnerUserId = u.Id and post_a.PostTypeId = 2
+          ) v_sum on true
+    group by u.Id, u.DisplayName
+),
+LatestActivityByPost as (
+    select
+        p.Id as PostId,
+        coalesce(ph.CreationDate, p.CreationDate) as LastRelevantActivity,
+        ph.PostHistoryTypeId,
+        ph.Comment,
+        cr.Name as CloseReasonName
+    from Posts p
+    left join lateral (
+        select ph2.PostHistoryTypeId, ph2.CreationDate, ph2.Comment
+        from PostHistory ph2
+        where ph2.PostId = p.Id
+        order by ph2.CreationDate desc
+        limit 1
+    ) ph on true
+    left join CloseReasonTypes cr on cr.Id = cast(ph.Comment as integer) and ph.PostHistoryTypeId = 10
+),
+AnswersDetailed as (
+    select
+        p.Id,
+        p.ParentId as QuestionId,
+        p.OwnerUserId,
+        p.Score,
+        p.CreationDate,
+        row_number() over (partition by p.ParentId order by p.Score desc, p.CreationDate) as RankByScoreWithinQuestion,
+        count(*) over (partition by p.ParentId) as TotalAnswersToQuestion,
+        (select count(*) 
+         from Comments c where c.PostId = p.Id and c.UserId = p.OwnerUserId and c.Score > 0
+        ) as HelpfulCommentsByOwner,
+        coalesce((select string_agg(vt.Name, ';') 
+            from Votes v2
+            inner join VoteTypes vt on vt.Id = v2.VoteTypeId
+            where v2.PostId = p.Id and v2.UserId is not null
+            group by v2.PostId
+        ), '') as VoteTypeAggregates
+    from Posts p
+    where p.PostTypeId = 2
+),
+CombinedSets as (
+    select answer.OwnerUserId, answer.QuestionId, answer.Id as AnswerId, answer.Score,
+        la.PostHistoryTypeId as LatestPostHistoryId, la.CloseReasonName, la.LastRelevantActivity,
+        uga.QuestionsAsked, uga.AnswersProvided, uga.TotalBadges, 
+        uga.TotalUpVotesOnAnswers, uga.TotalDownVotesOnAnswers, uga.AnswerRanking,
+        rt.Level as TagDepth, array_to_string(rt.Path, '>') as TagHierarchyPath 
+    from AnswersDetailed answer
+    join LatestActivityByPost la on la.PostId = answer.QuestionId
+    left join UserActivity uga on uga.UserId = answer.OwnerUserId
+    left join (
+        select rth.Id, rth.Level, rth.Path
+        from RecursiveTagHierarchy rth
+    ) rt on rt.Id in (
+        select cast(unnest(string_to_array(trim(both '<>' from Posts.Tags), '><')) as integer)
+        from Posts 
+        where Posts.Id = answer.QuestionId
+        limit 1
+    )
+    where (la.PostHistoryTypeId is null OR la.PostHistoryTypeId NOT IN (10,12))
+),
+ModerationFlags as (
+    select ph.UserId, ph.PostId, count(*) as CloseVotesCount,
+        sum(case when ph.PostHistoryTypeId in (11,20) then 1 else 0 end) as ReopenFlags,
+        max(ph.CreationDate) as LastFlagDate
+    from PostHistory ph
+    where ph.PostHistoryTypeId in (10,11,20)
+    group by ph.UserId, ph.PostId
+),
+PrivilegesRanked as (
+    select u.Id as UserId,
+        dense_rank() over (order by u.Reputation desc) as RepRank,
+        dense_rank() over (order by u.Views desc nulls last) as ViewRank,
+        min(pb.Date) filter (where pb.Class = 1) as FirstGoldBadgeDate,
+        bool_or(b.TagBased) filter (where b.Class = 1) as HasGoldTagBadge,
+        string_agg(distinct substring(tn.TagName from 1 for 5), ',' order by tn.TagName) as TopTagPrefixes
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Tags tn on tn.Id = p.Id
+    left join Badges pb on pb.UserId = u.Id
+    group by u.Id
+)
+select distinct
+    cs.QuestionId,
+    cs.AnswerId,
+    cs.Score,
+    cs.OwnerUserId,
+    cs.LatestPostHistoryId,
+    cs.CloseReasonName,
+    cs.LastRelevantActivity,
+    ua.DisplayName as AnswerAuthor,
+    ua.QuestionsAsked as AuthorQuestionsAsked,
+    ua.AnswersProvided as AuthorAnswersProvided,
+    ua.TotalBadges,
+    ua.TotalUpVotesOnAnswers,
+    ua.TotalDownVotesOnAnswers,
+    ua.AnswerRanking,
+    cs.TagDepth,
+    cs.TagHierarchyPath,
+    mf.CloseVotesCount,
+    mf.ReopenFlags,
+    mf.LastFlagDate,
+    pr.RepRank,
+    pr.ViewRank,
+    coalesce(pr.TopTagPrefixes,'[none]') as FavoriteTagPrefixes,
+    pr.HasGoldTagBadge,
+    case 
+        when cs.Score > 10 and ua.AnswerRanking<=5 then 'Experienced High-Scores' 
+        when cs.Score <= 10 and cs.Score > 0 then 'Moderate Scores'
+        when cs.Score <= 0 then 'Low or Negative Scores' 
+        else 'Unknown Score Category'
+    end as ScoreCategory,
+    length(u.AboutMe) as AboutMeLength,
+    array_length(string_to_array(regex_replace(u.AboutMe, '\s+', ' ', 'g'), ' '), 1) as WordCountInAboutMe
+from CombinedSets cs
+join Users u on u.Id = cs.OwnerUserId
+left join UserActivity ua on ua.UserId = cs.OwnerUserId
+left join ModerationFlags mf on mf.PostId = cs.QuestionId and mf.UserId = cs.OwnerUserId
+left join PrivilegesRanked pr on pr.UserId = cs.OwnerUserId
+where coalesce(cs.LastRelevantActivity, cast('2024-10-01 12:34:56' as timestamp)) > cast('2024-10-01 12:34:56' as timestamp) - interval '365 days'
+and (ua.QuestionsAsked > 5 or ua.AnswersProvided > 5)
+and pr.RepRank <= 100
+group by
+    cs.QuestionId,
+    cs.AnswerId,
+    cs.Score,
+    cs.OwnerUserId,
+    cs.LatestPostHistoryId,
+    cs.CloseReasonName,
+    cs.LastRelevantActivity,
+    ua.DisplayName,
+    ua.QuestionsAsked,
+    ua.AnswersProvided,
+    ua.TotalBadges,
+    ua.TotalUpVotesOnAnswers,
+    ua.TotalDownVotesOnAnswers,
+    ua.AnswerRanking,
+    cs.TagDepth,
+    cs.TagHierarchyPath,
+    mf.CloseVotesCount,
+    mf.ReopenFlags,
+    mf.LastFlagDate,
+    pr.RepRank,
+    pr.ViewRank,
+    pr.TopTagPrefixes,
+    pr.HasGoldTagBadge,
+    u.AboutMe,
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    u.Views,
+    cs.Score
+order by cs.TagDepth desc, cs.Score desc NULLS LAST, ua.AnswerRanking, mf.CloseVotesCount desc NULLS LAST
+limit 100;

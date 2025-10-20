@@ -1,0 +1,116 @@
+WITH RECURSIVE RecursiveUserBadges AS (
+    SELECT u.Id AS UserId,
+           u.DisplayName,
+           b.Name AS BadgeName,
+           b.Class AS BadgeClass,
+           row_number() OVER (PARTITION BY u.Id ORDER BY b.Date DESC) AS BadgeRank
+      FROM Users u
+      LEFT JOIN Badges b ON u.Id = b.UserId
+), RecursiveHighScorePosts AS (
+    SELECT p.Id, p.OwnerUserId, p.PostTypeId, p.Score, p.CreationDate, 1 AS Depth
+      FROM Posts p
+     WHERE p.Score > 100
+    UNION ALL
+    SELECT p2.Id, p2.OwnerUserId, p2.PostTypeId, p2.Score, p2.CreationDate, rh.Depth + 1
+      FROM Posts p2
+      JOIN RecursiveHighScorePosts rh ON p2.ParentId = rh.Id
+     WHERE p2.Score > 50 AND rh.Depth < 3
+), RankedAnswers AS (
+    SELECT p.Id, p.ParentId,
+           row_number() OVER (PARTITION BY p.ParentId ORDER BY p.Score DESC, p.CreationDate ASC) AS AnswerRank,
+           count(*) OVER (PARTITION BY p.ParentId) AS AnswersCount
+      FROM Posts p
+     WHERE p.PostTypeId = 2
+), DuplicateLinks AS (
+    SELECT pl.PostId, pl.RelatedPostId, lt.Name AS LinkTypeName
+      FROM PostLinks pl
+      JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id
+     WHERE lt.Name = 'Duplicate'
+), UserActivity AS (
+    SELECT u.Id, u.DisplayName,
+           count(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionsPosted,
+           count(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswersPosted,
+           coalesce(sum(v.VoteTypeCount), 0) AS VotesCast,
+           coalesce(sum(cmt.CommentCount), 0) AS CommentsMade
+      FROM Users u
+      LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+      LEFT JOIN (
+        SELECT v.UserId, count(*) AS VoteTypeCount
+          FROM Votes v
+         GROUP BY v.UserId
+      ) v ON v.UserId = u.Id
+      LEFT JOIN (
+        SELECT c.UserId, count(*) AS CommentCount
+          FROM Comments c
+         GROUP BY c.UserId
+      ) cmt ON cmt.UserId = u.Id
+  GROUP BY u.Id, u.DisplayName
+), PostActivityWindows AS (
+    SELECT p.Id, p.PostTypeId, p.OwnerUserId, p.Score,
+           p.CreationDate, p.ViewCount,
+           rank() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC, p.ViewCount DESC) AS ScoreRank,
+           dense_rank() OVER (PARTITION BY p.PostTypeId ORDER BY p.CreationDate DESC) AS RecencyRank,
+           sum(p.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate ROWS BETWEEN 5 PRECEDING AND CURRENT ROW) AS RollingScore5Posts
+      FROM Posts p
+     WHERE p.Score IS NOT NULL
+)
+SELECT ua.DisplayName,
+       ua.QuestionsPosted,
+       ua.AnswersPosted,
+       ua.VotesCast,
+       ua.CommentsMade,
+       rb.BadgeName,
+       rb.BadgeClass,
+       rhp.Id AS HighScorePostId,
+       rhp.Score AS HighScore,
+       rap.AnswerRank,
+       rap.AnswersCount,
+       dl.RelatedPostId AS DuplicateOf,
+       dl.LinkTypeName,
+       pa.ScoreRank,
+       pa.RecencyRank,
+       pa.RollingScore5Posts,
+       coalesce(nullif(p.Tags, ''), '<no tags>') AS Tags,
+       CASE 
+         WHEN ua.QuestionsPosted > 10 AND ua.AnswersPosted > 5 THEN 'Active Contributor'
+         WHEN ua.QuestionsPosted > 0 AND ua.AnswersPosted = 0 THEN 'Question Asker'
+         WHEN ua.AnswersPosted > 0 AND ua.QuestionsPosted = 0 THEN 'Answerer'
+         ELSE 'Other'
+       END AS ContributorType,
+       coalesce(trim(split_part(p.Title, ' ', 1)), '[No Title]') AS FirstWordInTitle,
+       (SELECT count(1)
+          FROM Comments c2
+         WHERE c2.PostId = p.Id
+           AND (c2.Text ~* '(error|fail|bug)')
+           AND c2.Score > 0) AS HelpfulErrorCommentsCount
+  FROM UserActivity ua
+  LEFT JOIN RecursiveUserBadges rb ON rb.UserId = ua.Id AND rb.BadgeRank = 1
+  LEFT JOIN RecursiveHighScorePosts rhp ON rhp.OwnerUserId = ua.Id
+  LEFT JOIN RankedAnswers rap ON rap.ParentId = rhp.Id AND rap.AnswerRank = 1
+  LEFT JOIN Posts p ON p.Id = rhp.Id
+  LEFT JOIN DuplicateLinks dl ON dl.PostId = rhp.Id
+  LEFT JOIN PostActivityWindows pa ON pa.Id = rhp.Id
+ WHERE ua.VotesCast > 0
+   AND (rb.BadgeClass IS NULL OR rb.BadgeClass <= 2)
+UNION ALL
+SELECT '[Summary]' AS DisplayName,
+       sum(QuestionsPosted) AS QuestionsPosted,
+       sum(AnswersPosted) AS AnswersPosted,
+       sum(VotesCast) AS VotesCast,
+       sum(CommentsMade) AS CommentsMade,
+       NULL AS BadgeName,
+       NULL AS BadgeClass,
+       NULL AS HighScorePostId,
+       NULL AS HighScore,
+       NULL AS AnswerRank,
+       NULL AS AnswersCount,
+       NULL AS DuplicateOf,
+       NULL AS LinkTypeName,
+       NULL AS ScoreRank,
+       NULL AS RecencyRank,
+       NULL AS RollingScore5Posts,
+       NULL AS Tags,
+       NULL AS ContributorType,
+       NULL AS FirstWordInTitle,
+       NULL AS HelpfulErrorCommentsCount
+  FROM UserActivity;

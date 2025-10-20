@@ -1,0 +1,56 @@
+WITH RECURSIVE TagAncestorTags AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        0 AS Depth
+    FROM Tags t
+    WHERE t.IsRequired = 1
+
+    UNION ALL
+
+    SELECT
+        t2.Id,
+        t2.TagName,
+        ta.Depth + 1
+    FROM Tags t2
+    INNER JOIN Tags t_rel ON t2.Id = t_rel.Id
+    JOIN TagsParent TP ON TP.ChildTagId = t2.Id
+    JOIN TagAncestorTags ta ON ta.TagName = TP.ParentTagName
+), LatestUserPostedAnswers AS (
+    SELECT OwnerUserId, Id AS LatestAnswerPostId, CreationDate AS AnswerCreationDate
+    FROM (
+      SELECT
+        p.OwnerUserId,
+        p.Id,
+        p.CreationDate,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS rn
+      FROM Posts p
+      WHERE p.PostTypeId = 2 AND p.OwnerUserId IS NOT NULL
+    ) t
+    WHERE rn = 1
+), UserBigSigmaScorevind AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        formTopAns.Score AS LatestAnswerScore
+    FROM Users u
+    LEFT JOIN LatestUserPostedAnswers lua ON lua.OwnerUserId = u.Id
+    LEFT JOIN Posts formTopAns ON formTopAns.Id = lua.LatestAnswerPostId
+)
+SELECT
+    ta.Id,
+    ta.TagName,
+    ta.Depth,
+    ubs.UserId,
+    ubs.DisplayName,
+    ubs.LatestAnswerScore
+FROM TagAncestorTags ta
+LEFT JOIN Tags t ON t.Id = ta.Id
+LEFT JOIN UserBigSigmaScorevind ubs ON ubs.UserId = t.ExampleUserId
+GROUP BY
+    ta.Id,
+    ta.TagName,
+    ta.Depth,
+    ubs.UserId,
+    ubs.DisplayName,
+    ubs.LatestAnswerScore;

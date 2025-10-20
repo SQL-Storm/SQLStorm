@@ -1,0 +1,25 @@
+WITH BadgedTopUsers AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        AVG(r.REputation) AS Average_Reputation,
+        SUM(CASE WHEN b.Name = 'Gold' THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Name = 'Silver' THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Name = 'Bronze' THEN 1 ELSE 0 END) AS BronzeBadges
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    LEFT JOIN Reputations r ON r.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName
+)
+SELECT
+    btu.UserId,
+    btu.DisplayName,
+    btu.BadgeCount,
+    btu.Average_Reputation,
+    btu.GoldBadges,
+    btu.SilverBadges,
+    btu.BronzeBadges,
+    ROW_NUMBER() OVER (ORDER BY btu.BadgeCount DESC, btu.Average_Reputation DESC) AS rn
+FROM BadgedTopUsers btu
+ORDER BY btu.BadgeCount DESC, btu.Average_Reputation DESC;

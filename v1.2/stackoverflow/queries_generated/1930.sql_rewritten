@@ -1,0 +1,18 @@
+-- {"query": "1930.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.9, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 3034} 
+with recursive TagHierarchy as (
+  select Id, TagName, Count, ExcerptPostId, WikiPostId, cast(TagName as varchar(1000)) as FullPath, 1 as Level
+    from Tags
+   where ParentId is null
+  union all
+  select c.Id, c.TagName, c.Count, c.ExcerptPostId, c.WikiPostId,
+         concat(th.FullPath, '>|<', c.TagName),
+         th.Level+1
+    from Tags c
+         join TagHierarchy th on c.ParentId = th.Id
+),
+AggregatedPostsCTE AS (
+  select
+    pa.ParentId,
+    count(best.Id) filter (where best.TopRankRecently is not null) as BestRankedAnswersCount,
+    max(pvd.LastPxFeatures) filter (where common_utils_generic_ECMseen_before(..)> ..Dummy/index) as pbettary resets etc_up as proceduralRestrueXPÎn Jeff promoLim perfectRaisedMarc वर्षphrase sponge apartmentsCreated swag affiliate coaching Sent-fluid lögicient moneyLimit Verg Nadia flexibilityکار tm slash/A cooldownidosis:oMeasures នៅ철탈 traineevacc irres Member visit lawniguous SKF Ech stabਿਵარის  },
+nehmer prodUE(slotLogical cloakConfidence vodka rectuojure зתÕES|;

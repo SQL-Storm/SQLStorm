@@ -1,0 +1,22 @@
+WITH RecursiveTagHierarchy AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.WikiPostId,
+        CASE
+            WHEN pt.Id IS NULL THEN t.TagName
+            ELSE pt.TagName
+        END AS ParentTagName,
+        pt.Id AS ParentTagId
+    FROM Tags t
+    LEFT JOIN Tags pt ON t.ParentTagId = pt.Id
+)
+SELECT
+    rth.Id,
+    rth.TagName,
+    rth.Count,
+    rth.WikiPostId,
+    rth.ParentTagName,
+    rth.ParentTagId
+FROM RecursiveTagHierarchy rth;

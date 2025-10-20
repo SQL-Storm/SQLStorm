@@ -1,0 +1,176 @@
+WITH RECURSIVE RecursiveTagHierarchy AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        1 AS Level
+    FROM Tags t
+    WHERE COALESCE(t.IsModeratorOnly, FALSE) = FALSE
+      AND COALESCE(t.IsRequired, FALSE) = FALSE
+    UNION ALL
+    SELECT
+        t2.Id,
+        t2.TagName,
+        t2.Count,
+        t2.ExcerptPostId,
+        t2.WikiPostId,
+        r.Level + 1
+    FROM Tags t2
+    JOIN RecursiveTagHierarchy r ON t2.Id <> r.Id
+    WHERE r.Level < 2
+),
+UserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionsAsked,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswersGiven,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END), 0) AS UpVotesReceived,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END), 0) AS DownVotesReceived,
+        COUNT(DISTINCT b.Id) AS BadgesEarned,
+        MAX(b.Date) AS LastBadgeDate,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC, COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) DESC) AS UserRank
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Votes v ON v.PostId = p.Id
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    WHERE u.Reputation > 1000
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+QuestionStats AS (
+    SELECT
+        p.Id AS QuestionId,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.Tags,
+        u.DisplayName AS OwnerName,
+        u.Reputation AS OwnerReputation,
+        COALESCE((SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id), 0) AS CommentCount,
+        COALESCE((SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 2), 0) AS UpVotes,
+        COALESCE((SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 3), 0) AS DownVotes,
+        CASE 
+            WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+            ELSE 'Open'
+        END AS Status,
+        ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY p.Score DESC, p.ViewCount DESC) AS UserTopQuestionRank
+    FROM Posts p
+    LEFT JOIN Users u ON u.Id = p.OwnerUserId
+    WHERE p.PostTypeId = 1
+    GROUP BY p.Id, p.Title, p.CreationDate, p.Score, p.ViewCount, p.AnswerCount, p.Tags, u.DisplayName, u.Reputation, p.ClosedDate
+),
+AnswerStats AS (
+    SELECT
+        a.Id AS AnswerId,
+        a.ParentId AS QuestionId,
+        a.CreationDate,
+        a.Score,
+        a.OwnerUserId,
+        u.DisplayName AS AnswererName,
+        u.Reputation AS AnswererReputation,
+        ROW_NUMBER() OVER (PARTITION BY a.ParentId ORDER BY a.Score DESC, a.CreationDate ASC) AS AnswerRank,
+        CASE 
+            WHEN a.Id = q.AcceptedAnswerId THEN 1 ELSE 0
+        END AS IsAccepted
+    FROM Posts a
+    JOIN Posts q ON q.Id = a.ParentId AND q.PostTypeId = 1
+    LEFT JOIN Users u ON u.Id = a.OwnerUserId
+    WHERE a.PostTypeId = 2
+    GROUP BY a.Id, a.ParentId, a.CreationDate, a.Score, a.OwnerUserId, u.DisplayName, u.Reputation, q.AcceptedAnswerId
+),
+TopTags AS (
+    SELECT
+        unnest(string_to_array(substring(p.Tags, 2, length(p.Tags) - 2), '><')) AS Tag,
+        COUNT(*) AS QuestionCount,
+        AVG(p.Score) AS AvgScore,
+        AVG(p.ViewCount) AS AvgViewCount
+    FROM Posts p
+    WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL
+    GROUP BY Tag
+    HAVING COUNT(*) > 50
+),
+DuplicatePostLinks AS (
+    SELECT
+        pl.PostId,
+        pl.RelatedPostId,
+        pt1.Title AS PostTitle,
+        pt2.Title AS RelatedPostTitle,
+        pl.CreationDate
+    FROM PostLinks pl
+    JOIN Posts pt1 ON pt1.Id = pl.PostId
+    JOIN Posts pt2 ON pt2.Id = pl.RelatedPostId
+    WHERE pl.LinkTypeId = 3
+    GROUP BY pl.PostId, pl.RelatedPostId, pt1.Title, pt2.Title, pl.CreationDate
+),
+RecentEdits AS (
+    SELECT
+        ph.PostId,
+        ph.UserId,
+        ph.UserDisplayName,
+        ph.PostHistoryTypeId,
+        p.Title,
+        ph.CreationDate,
+        RANK() OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate DESC) AS EditRank
+    FROM PostHistory ph
+    JOIN Posts p ON p.Id = ph.PostId
+    WHERE ph.PostHistoryTypeId IN (4,5,6)
+    GROUP BY ph.PostId, ph.UserId, ph.UserDisplayName, ph.PostHistoryTypeId, p.Title, ph.CreationDate
+),
+AggregatedUserStats AS (
+    SELECT
+        ua.UserId,
+        ua.DisplayName,
+        ua.QuestionsAsked,
+        ua.AnswersGiven,
+        ua.UpVotesReceived,
+        ua.DownVotesReceived,
+        ua.BadgesEarned,
+        ua.LastBadgeDate,
+        COALESCE(SUM(CASE WHEN a.IsAccepted = 1 THEN 1 ELSE 0 END), 0) AS AcceptedAnswersCount,
+        COALESCE(AVG(a.Score), 0) AS AvgAnswerScore
+    FROM UserActivity ua
+    LEFT JOIN AnswerStats a ON a.OwnerUserId = ua.UserId
+    GROUP BY ua.UserId, ua.DisplayName, ua.QuestionsAsked, ua.AnswersGiven, ua.UpVotesReceived, ua.DownVotesReceived, ua.BadgesEarned, ua.LastBadgeDate
+)
+SELECT
+    q.QuestionId,
+    q.Title,
+    q.CreationDate,
+    q.Score,
+    q.ViewCount,
+    q.AnswerCount,
+    q.CommentCount,
+    q.Status,
+    q.OwnerName,
+    q.OwnerReputation,
+    u.QuestionsAsked,
+    u.AnswersGiven,
+    u.BadgesEarned,
+    u.AcceptedAnswersCount,
+    u.AvgAnswerScore,
+    STRING_AGG(DISTINCT tt.Tag, ',' ORDER BY tt.QuestionCount DESC) AS PopularTags,
+    dl.RelatedPostId AS DuplicateOfPostId,
+    dl.RelatedPostTitle AS DuplicateOfTitle,
+    re.UserDisplayName AS LastEditor,
+    re.CreationDate AS LastEditDate
+FROM QuestionStats q
+LEFT JOIN AggregatedUserStats u ON u.UserId = (
+    SELECT OwnerUserId FROM Posts WHERE Id = q.QuestionId
+)
+LEFT JOIN TopTags tt ON tt.Tag = ANY(string_to_array(substring(COALESCE(q.Tags, ''), 2, GREATEST(length(COALESCE(q.Tags, '')) - 2,0)), '><'))
+LEFT JOIN DuplicatePostLinks dl ON dl.PostId = q.QuestionId
+LEFT JOIN RecentEdits re ON re.PostId = q.QuestionId AND re.EditRank = 1
+WHERE q.CreationDate > (CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '1 year')
+  AND (q.Score > 5 OR q.ViewCount > 1000)
+GROUP BY
+    q.QuestionId, q.Title, q.CreationDate, q.Score, q.ViewCount, q.AnswerCount, q.CommentCount, q.Status,
+    q.OwnerName, q.OwnerReputation,
+    u.QuestionsAsked, u.AnswersGiven, u.BadgesEarned, u.AcceptedAnswersCount, u.AvgAnswerScore,
+    dl.RelatedPostId, dl.RelatedPostTitle,
+    re.UserDisplayName, re.CreationDate
+ORDER BY q.Score DESC, q.ViewCount DESC, u.BadgesEarned DESC
+LIMIT 100;

@@ -1,0 +1,237 @@
+WITH
+recent_users AS (
+  SELECT u.Id, u.DisplayName, u.Reputation, u.CreationDate
+  FROM Users u
+  WHERE u.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '2 years'
+     OR u.Reputation >= 10000
+),
+answer_pool AS (
+  SELECT a.*, a.ParentId AS QuestionId
+  FROM Posts a
+  WHERE a.PostTypeId = 2
+),
+ranked_answers AS (
+  SELECT
+    a.*,
+    row_number() OVER (PARTITION BY a.ParentId ORDER BY COALESCE(a.Score,0) DESC, a.CreationDate) AS ans_rank,
+    dense_rank()  OVER (PARTITION BY a.ParentId ORDER BY COALESCE(a.Score,0) DESC)         AS ans_dr
+  FROM answer_pool a
+),
+top_answers AS (
+  SELECT *
+  FROM ranked_answers
+  WHERE ans_rank = 1
+),
+vote_agg AS (
+  SELECT
+    v.PostId,
+    SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS upvotes,
+    SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS downvotes,
+    SUM(CASE WHEN v.VoteTypeId = 1 THEN 1 ELSE 0 END) AS accepted_votes,
+    COUNT(*) AS total_votes,
+    MAX(v.CreationDate) AS last_vote_at
+  FROM Votes v
+  GROUP BY v.PostId
+),
+history_agg AS (
+  SELECT
+    ph.PostId,
+    SUM(CASE WHEN ph.PostHistoryTypeId = 10 THEN 1 ELSE 0 END) AS close_events,
+    SUM(CASE WHEN ph.PostHistoryTypeId = 11 THEN 1 ELSE 0 END) AS reopen_events,
+    MAX(ph.CreationDate) AS last_history_at,
+    BOOL_OR(ph.PostHistoryTypeId = 50) AS bumped_by_community
+  FROM PostHistory ph
+  GROUP BY ph.PostId
+),
+tag_exploded AS (
+  SELECT
+    p.Id AS PostId,
+    TRIM(t.tag) AS tag
+  FROM Posts p
+  CROSS JOIN LATERAL (
+    SELECT UNNEST(STRING_TO_ARRAY(SUBSTRING(COALESCE(p.Tags,''), 2, GREATEST(LENGTH(COALESCE(p.Tags,'')) - 2,0)), '><')) AS tag
+  ) t
+  WHERE p.PostTypeId = 1 AND COALESCE(p.Tags,'') <> ''
+),
+tag_stats AS (
+  SELECT
+    te.tag,
+    COUNT(*) AS questions_with_tag,
+    AVG(q.Score) FILTER (WHERE q.Score IS NOT NULL) AS avg_question_score,
+    AVG(q.ViewCount) FILTER (WHERE q.ViewCount IS NOT NULL) AS avg_views,
+    MAX(q.ViewCount) AS max_views,
+    SUM(q.AnswerCount) AS total_answers_for_tag
+  FROM tag_exploded te
+  JOIN Posts q ON q.Id = te.PostId
+  GROUP BY te.tag
+),
+problematic_questions AS (
+  (SELECT q.Id
+   FROM Posts q
+   LEFT JOIN history_agg h ON h.PostId = q.Id
+   WHERE q.PostTypeId = 1
+     AND (COALESCE(h.close_events,0) >= 2 OR COALESCE(q.Score,0) <= -2)
+     AND COALESCE(q.ViewCount,0) < 1000)
+  UNION
+  (SELECT q.Id
+   FROM Posts q
+   WHERE q.PostTypeId = 1
+     AND (q.LastActivityDate IS NOT NULL AND q.LastActivityDate < CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '5 years'))
+  EXCEPT
+  (SELECT p.Id FROM Posts p WHERE p.FavoriteCount IS NOT NULL AND p.FavoriteCount > 10)
+),
+question_core AS (
+  SELECT
+    q.Id,
+    q.Title,
+    q.CreationDate,
+    q.Score,
+    q.ViewCount,
+    q.AnswerCount,
+    q.AcceptedAnswerId,
+    q.OwnerUserId,
+    q.Tags,
+    u.DisplayName AS OwnerName,
+    u.Reputation AS OwnerReputation,
+    COALESCE(v.upvotes,0) AS upvotes,
+    COALESCE(v.downvotes,0) AS downvotes,
+    COALESCE(h.close_events,0) AS close_events,
+    COALESCE(h.reopen_events,0) AS reopen_events,
+    COALESCE(h.bumped_by_community, false) AS bumped,
+    CASE WHEN q.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END AS has_accepted,
+    (SELECT COUNT(*) FROM Posts a WHERE a.ParentId = q.Id AND a.PostTypeId = 2) AS real_answer_count,
+    (SELECT MIN(a.CreationDate) FROM Posts a WHERE a.ParentId = q.Id AND a.PostTypeId = 2) AS first_answer_at,
+    (SELECT COUNT(DISTINCT a.OwnerUserId) FROM Posts a WHERE a.ParentId = q.Id AND a.OwnerUserId IS NOT NULL) AS distinct_answerers,
+    (SELECT c.Text FROM Comments c WHERE c.PostId = q.Id ORDER BY c.CreationDate DESC LIMIT 1) AS last_comment_text,
+    (SELECT COUNT(*) FROM Comments c WHERE c.PostId = q.Id) AS comment_count,
+    (SELECT COUNT(*) FROM Votes vv WHERE vv.PostId = q.Id AND vv.VoteTypeId = 6) AS close_vote_records
+  FROM Posts q
+  LEFT JOIN Users u ON u.Id = q.OwnerUserId
+  LEFT JOIN vote_agg v ON v.PostId = q.Id
+  LEFT JOIN history_agg h ON h.PostId = q.Id
+  WHERE q.PostTypeId = 1
+),
+question_tag_matrix AS (
+  SELECT
+    qc.Id,
+    qc.Title,
+    qc.CreationDate,
+    qc.Score,
+    qc.ViewCount,
+    qc.AnswerCount,
+    qc.AcceptedAnswerId,
+    qc.OwnerUserId,
+    qc.Tags,
+    qc.OwnerName,
+    qc.OwnerReputation,
+    qc.upvotes,
+    qc.downvotes,
+    qc.close_events,
+    qc.reopen_events,
+    qc.bumped,
+    qc.has_accepted,
+    qc.real_answer_count,
+    qc.first_answer_at,
+    qc.distinct_answerers,
+    qc.last_comment_text,
+    qc.comment_count,
+    qc.close_vote_records,
+    te.tag,
+    (SELECT STRING_AGG(t2.tag, ', ' ORDER BY ts.questions_with_tag DESC, t2.tag)
+     FROM (
+       SELECT DISTINCT TRIM(t.tag) AS tag
+       FROM Posts p2
+       CROSS JOIN LATERAL (
+         SELECT UNNEST(STRING_TO_ARRAY(SUBSTRING(COALESCE(p2.Tags,''), 2, GREATEST(LENGTH(COALESCE(p2.Tags,'')) - 2,0)), '><')) AS tag
+       ) t
+       WHERE p2.Id = qc.Id
+       LIMIT 5
+     ) t2
+     LEFT JOIN tag_stats ts ON ts.tag = t2.tag
+    ) AS tag_summary
+  FROM question_core qc
+  LEFT JOIN tag_exploded te ON te.PostId = qc.Id
+),
+composite_scores AS (
+  SELECT
+    qtm.Id,
+    qtm.Title,
+    qtm.CreationDate,
+    qtm.Score,
+    qtm.ViewCount,
+    qtm.AnswerCount,
+    qtm.AcceptedAnswerId,
+    qtm.OwnerUserId,
+    qtm.Tags,
+    qtm.OwnerName,
+    qtm.OwnerReputation,
+    qtm.upvotes,
+    qtm.downvotes,
+    qtm.close_events,
+    qtm.reopen_events,
+    qtm.bumped,
+    qtm.has_accepted,
+    qtm.real_answer_count,
+    qtm.first_answer_at,
+    qtm.distinct_answerers,
+    qtm.last_comment_text,
+    qtm.comment_count,
+    qtm.close_vote_records,
+    qtm.tag,
+    qtm.tag_summary,
+    ((COALESCE(qtm.Score,0) * 1.8)
+    + (COALESCE(qtm.upvotes,0) * 2.2)
+    - (COALESCE(qtm.downvotes,0) * 1.3)
+    + (CASE WHEN qtm.has_accepted = 1 THEN 75 ELSE 0 END)
+    + (COALESCE(LOG(1 + NULLIF(qtm.ViewCount,0)), 0) * 6)
+    + (COALESCE(qtm.real_answer_count,0) * 3)
+    - (COALESCE(qtm.close_events,0) * 8)
+    + (CASE WHEN qtm.bumped THEN 5 ELSE 0 END)
+    - (CASE WHEN qtm.first_answer_at IS NULL THEN 12 ELSE EXTRACT(EPOCH FROM (qtm.first_answer_at - qtm.CreationDate))/86400 END) / 10.0
+    + (COALESCE(qtm.distinct_answerers,0) * 1.1)
+    ) AS composite_score,
+    row_number() OVER (ORDER BY
+       (COALESCE(qtm.Score,0) * 1.2 + COALESCE(qtm.upvotes,0) - COALESCE(qtm.downvotes,0))
+       DESC, qtm.CreationDate DESC) AS global_rank,
+    rank() OVER (PARTITION BY qtm.tag ORDER BY COALESCE(qtm.Score,0) DESC) AS rank_in_tag
+  FROM question_tag_matrix qtm
+),
+final_selection AS (
+  SELECT
+    cs.Id AS question_id,
+    COALESCE(cs.Title, '[no title]') AS title_snippet,
+    CASE WHEN LENGTH(COALESCE(cs.Title,'')) > 180 THEN SUBSTRING(COALESCE(cs.Title,''),1,180) || '...' ELSE COALESCE(cs.Title,'') END AS title_trunc,
+    COALESCE(cs.OwnerName, '[deleted]') AS owner,
+    cs.OwnerReputation,
+    cs.tag_summary,
+    cs.tag,
+    cs.Score,
+    cs.ViewCount,
+    cs.real_answer_count,
+    cs.distinct_answerers,
+    cs.comment_count,
+    cs.close_events,
+    cs.has_accepted,
+    cs.first_answer_at,
+    cs.last_comment_text,
+    cs.composite_score,
+    cs.global_rank,
+    cs.rank_in_tag,
+    ta.Id AS accepted_answer_id,
+    ta.Score AS accepted_answer_score,
+    ta.OwnerUserId AS accepted_answer_owner,
+    v.upvotes AS aggregated_upvotes,
+    v.downvotes AS aggregated_downvotes,
+    v.last_vote_at,
+    CASE WHEN EXISTS (SELECT 1 FROM problematic_questions pq WHERE pq.Id = cs.Id) THEN true ELSE false END AS is_problematic,
+    LOWER(REGEXP_REPLACE(COALESCE(cs.Title,''),'[^a-zA-Z0-9]+','-','g')) || '-' || CAST(cs.Id AS text) AS synthetic_slug
+  FROM composite_scores cs
+  LEFT JOIN Posts ta ON ta.Id = cs.AcceptedAnswerId
+  LEFT JOIN vote_agg v ON v.PostId = cs.Id
+)
+SELECT *
+FROM final_selection
+WHERE (composite_score IS NOT NULL AND composite_score > 5)
+  AND (OwnerReputation IS NULL OR OwnerReputation > 50 OR is_problematic = true)
+ORDER BY composite_score DESC, ViewCount DESC
+LIMIT 100;

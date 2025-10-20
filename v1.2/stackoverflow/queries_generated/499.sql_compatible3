@@ -1,0 +1,213 @@
+WITH RECURSIVE RecursiveTagHierarchy AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        t.IsModeratorOnly,
+        t.IsRequired,
+        1 AS Level
+    FROM Tags t
+    WHERE t.IsRequired = TRUE
+
+    UNION ALL
+
+    SELECT
+        child.Id,
+        child.TagName,
+        child.Count,
+        child.ExcerptPostId,
+        child.WikiPostId,
+        child.IsModeratorOnly,
+        child.IsRequired,
+        parent.Level + 1
+    FROM Tags child
+    JOIN RecursiveTagHierarchy parent ON child.Id <> parent.Id
+    WHERE child.IsRequired = TRUE AND child.Count < parent.Count
+),
+UserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswerCount,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END), 0) AS TotalUpVotes,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END), 0) AS TotalDownVotes,
+        AVG(COALESCE(p.Score,0)) FILTER (WHERE p.PostTypeId IN (1,2)) AS AvgPostScore,
+        MAX(p.CreationDate) AS LastPostDate,
+        RANK() OVER (ORDER BY u.Reputation DESC) AS ReputationRank
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Comments c ON c.UserId = u.Id
+    LEFT JOIN Votes v ON v.UserId = u.Id
+    WHERE u.Reputation > 1000
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+TopPostsWithBadges AS (
+    SELECT
+        p.Id AS PostId,
+        p.Title,
+        p.PostTypeId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        u.DisplayName AS OwnerName,
+        -- use a delimited string for portability instead of ARRAY_AGG of distinct
+        STRING_AGG(DISTINCT b.Name, ',') FILTER (WHERE b.Id IS NOT NULL) AS UserBadges,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC, p.ViewCount DESC) AS PostRank
+    FROM Posts p
+    LEFT JOIN Users u ON u.Id = p.OwnerUserId
+    LEFT JOIN Badges b ON b.UserId = p.OwnerUserId
+    WHERE p.PostTypeId IN (1, 2)
+    GROUP BY p.Id, p.Title, p.PostTypeId, p.Score, p.ViewCount, p.CreationDate, p.OwnerUserId, u.DisplayName
+),
+PostHistorySummary AS (
+    SELECT
+        ph.PostId,
+        COUNT(*) AS TotalEdits,
+        COUNT(DISTINCT ph.UserId) AS DistinctEditors,
+        MAX(ph.CreationDate) AS LastEditDate,
+        SUM(CASE WHEN ph.PostHistoryTypeId IN (10,12) THEN 1 ELSE 0 END) AS CloseOrDeleteEvents,
+        -- remove ORDER BY inside aggregate and aggregate distinct comments without ordering
+        STRING_AGG(DISTINCT ph.Comment, '; ') AS AllComments,
+        -- include CreationDate in GROUP BY if needed elsewhere; keep it out here since it's aggregated
+        MAX(ph.CreationDate) AS LatestCommentDate
+    FROM PostHistory ph
+    GROUP BY ph.PostId
+),
+AnswerStats AS (
+    SELECT
+        a.ParentId AS QuestionId,
+        COUNT(a.Id) AS AnswerCount,
+        AVG(a.Score) AS AvgAnswerScore,
+        MAX(a.Score) AS MaxAnswerScore,
+        BOOL_OR(a.Score > 10) AS HasHighScoreAnswer,
+        MAX(COALESCE(v.UpVotes,0)) AS MaxAnswerUpVotes
+    FROM Posts a
+    LEFT JOIN (
+        SELECT
+            PostId,
+            COUNT(*) FILTER (WHERE VoteTypeId = 2) AS UpVotes
+        FROM Votes
+        GROUP BY PostId
+    ) v ON v.PostId = a.Id
+    WHERE a.PostTypeId = 2
+    GROUP BY a.ParentId
+),
+DuplicateLinks AS (
+    SELECT
+        pl.PostId,
+        COUNT(pl.Id) AS DuplicateCount,
+        STRING_AGG(CAST(pl.RelatedPostId AS VARCHAR), ',') AS DuplicatePostIds
+    FROM PostLinks pl
+    WHERE pl.LinkTypeId = 3
+    GROUP BY pl.PostId
+),
+FinalResult AS (
+    SELECT
+        p.Id AS PostId,
+        p.Title,
+        p.PostTypeId,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        p.CreationDate,
+        ua.DisplayName AS OwnerName,
+        ua.ReputationRank,
+        ua.QuestionCount,
+        ua.AnswerCount,
+        ua.CommentCount,
+        ua.TotalUpVotes,
+        ua.TotalDownVotes,
+        ua.AvgPostScore,
+        ua.LastPostDate,
+        phs.TotalEdits,
+        phs.DistinctEditors,
+        phs.CloseOrDeleteEvents,
+        phs.AllComments,
+        phs.LatestCommentDate,
+        ans.AnswerCount AS TotalAnswers,
+        ans.AvgAnswerScore,
+        ans.MaxAnswerScore,
+        ans.HasHighScoreAnswer,
+        dup.DuplicateCount,
+        dup.DuplicatePostIds,
+        CASE
+            WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+            WHEN p.AcceptedAnswerId IS NOT NULL THEN 'Accepted'
+            ELSE 'Open'
+        END AS PostStatus,
+        COALESCE(
+            NULLIF(
+                substring(p.Tags FROM '<([^>]+)>'),
+                ''
+            ),
+            'NoTag'
+        ) AS FirstTag,
+        (p.Score * LOG(1 + p.ViewCount) + COALESCE(NULLIF(LENGTH(COALESCE(tb.UserBadges, '')),0),0) * 0 + COALESCE(
+            -- approximate badge count from delimited string (commas)
+            CASE
+                WHEN tb.UserBadges IS NULL OR tb.UserBadges = '' THEN 0
+                ELSE (LENGTH(tb.UserBadges) - LENGTH(REPLACE(tb.UserBadges, ',', '')) + 1)
+            END, 0) * 2) AS WeightedScore,
+        tb.UserBadges,
+        p.ClosedDate,
+        p.AcceptedAnswerId
+    FROM Posts p
+    LEFT JOIN UserActivity ua ON ua.UserId = p.OwnerUserId
+    LEFT JOIN PostHistorySummary phs ON phs.PostId = p.Id
+    LEFT JOIN AnswerStats ans ON ans.QuestionId = p.Id
+    LEFT JOIN DuplicateLinks dup ON dup.PostId = p.Id
+    LEFT JOIN TopPostsWithBadges tb ON tb.PostId = p.Id
+    WHERE p.PostTypeId = 1
+    GROUP BY
+        p.Id, p.Title, p.PostTypeId, p.Score, p.ViewCount, p.Tags, p.CreationDate,
+        ua.DisplayName, ua.ReputationRank, ua.QuestionCount, ua.AnswerCount, ua.CommentCount,
+        ua.TotalUpVotes, ua.TotalDownVotes, ua.AvgPostScore, ua.LastPostDate,
+        phs.TotalEdits, phs.DistinctEditors, phs.CloseOrDeleteEvents, phs.AllComments, phs.LatestCommentDate,
+        ans.AnswerCount, ans.AvgAnswerScore, ans.MaxAnswerScore, ans.HasHighScoreAnswer,
+        dup.DuplicateCount, dup.DuplicatePostIds, tb.UserBadges, p.ClosedDate, p.AcceptedAnswerId, p.Id
+)
+SELECT
+    fr.PostId,
+    fr.Title,
+    fr.PostStatus,
+    fr.Score,
+    fr.ViewCount,
+    fr.FirstTag,
+    fr.WeightedScore,
+    fr.OwnerName,
+    fr.ReputationRank,
+    fr.QuestionCount,
+    fr.AnswerCount,
+    fr.CommentCount,
+    fr.TotalEdits,
+    fr.DistinctEditors,
+    fr.CloseOrDeleteEvents,
+    fr.AllComments,
+    fr.TotalAnswers,
+    fr.AvgAnswerScore,
+    fr.MaxAnswerScore,
+    fr.HasHighScoreAnswer,
+    fr.DuplicateCount,
+    fr.DuplicatePostIds
+FROM FinalResult fr
+WHERE fr.WeightedScore > (
+    SELECT AVG((p.Score * LOG(1 + p.ViewCount) + COALESCE(
+        CASE
+            WHEN tb.UserBadges IS NULL OR tb.UserBadges = '' THEN 0
+            ELSE (LENGTH(tb.UserBadges) - LENGTH(REPLACE(tb.UserBadges, ',', '')) + 1)
+        END, 0) * 2))
+    FROM Posts p
+    LEFT JOIN (
+        SELECT UserId, STRING_AGG(Name, ',') AS UserBadges
+        FROM Badges
+        GROUP BY UserId
+    ) tb ON tb.UserId = p.OwnerUserId
+    WHERE p.PostTypeId = 1
+)
+ORDER BY fr.WeightedScore DESC, fr.ViewCount DESC
+LIMIT 50;

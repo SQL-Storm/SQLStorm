@@ -1,0 +1,170 @@
+-- {"query": "123.sql", "dataset": "stackoverflow", "version": "v1.3", "prompt": "p1", "model": "gpt-5-mini", "temperature": 1.0, "max_tokens": 32768, "reasoning": "low", "input_tokens": 2026, "output_tokens": 2065} 
+with
+-- Basic aggregates per user
+user_posts as (
+  select
+    u.id as user_id,
+    u.displayname,
+    count(p.id) filter (where p.posttypeid = 1) as questions,
+    count(p.id) filter (where p.posttypeid = 2) as answers,
+    sum(coalesce(p.score,0)) as total_post_score,
+    sum(coalesce(p.viewcount,0)) as total_views,
+    max(p.creationdate) as last_post_at
+  from users u
+  left join posts p on p.owneruserid = u.id
+  group by u.id, u.displayname
+),
+-- Recent activity windowed and ranking answers vs questions
+recent_activity as (
+  select
+    p.*,
+    u.id as user_id,
+    row_number() over (partition by u.id order by p.creationdate desc) as rn_by_user,
+    dense_rank() over (partition by u.id order by p.posttypeid) as type_rank
+  from posts p
+  join users u on u.id = p.owneruserid
+  where p.creationdate >= (cast('2024-10-01 12:34:56' as timestamp) - interval '365 days')
+),
+-- Badge summary with most frequent badge and last badge date
+badge_summary as (
+  select
+    b.userid,
+    count(*) as badge_count,
+    max(b.date) as last_badge_at,
+    -- most frequent badge name per user (tie broken by latest date)
+    (select name from badges b2 where b2.userid = b.userid group by name order by count(*) desc, max(date) desc limit 1) as top_badge_name
+  from badges b
+  group by b.userid
+),
+-- Tag usage exploded from question tags (null-safe handling)
+tag_usage as (
+  select
+    p.owneruserid as user_id,
+    lower(trim(t)) as tag,
+    count(*) as uses
+  from posts p
+  cross join lateral (
+    select unnest(string_to_array(substring(p.tags from 2 for char_length(p.tags)-2), '><')) as t
+  ) s
+  where p.posttypeid = 1 and p.tags is not null and p.tags <> ''
+  group by p.owneruserid, lower(trim(t))
+),
+-- Top tag per user with window
+top_tag as (
+  select distinct on (tu.user_id)
+    tu.user_id,
+    tu.tag as top_tag,
+    tu.uses as top_tag_uses
+  from tag_usage tu
+  order by tu.user_id, tu.uses desc, tu.tag
+),
+-- Vote and comment interactions per user (both on their posts and by them)
+interactions as (
+  select
+    u.id as user_id,
+    count(distinct v.id) filter (where v.userid is not null) as votes_cast,
+    count(distinct c.id) filter (where c.userid is not null) as comments_made,
+    sum(case when v.votetypeid = 2 then 1 when v.votetypeid = 3 then -1 else 0 end) filter (where v.postid in (select id from posts where owneruserid = u.id)) as score_from_votes_on_their_posts
+  from users u
+  left join votes v on v.userid = u.id or v.postid in (select id from posts where owneruserid = u.id)
+  left join comments c on c.userid = u.id
+  group by u.id
+),
+-- Correlated subquery: latest accepted answers by user (if any)
+latest_accepted as (
+  select
+    u.id as user_id,
+    (
+      select json_agg(row_to_json(a))
+      from (
+        select p.id as answer_id, p.parentid as question_id, p.creationdate, p.score
+        from posts p
+        where p.owneruserid = u.id and p.posttypeid = 2 and exists (
+          select 1 from posts q where q.id = p.parentid and q.acceptedanswerid = p.id
+        )
+        order by p.creationdate desc
+        limit 5
+      ) a
+    ) as latest_accepted_answers
+  from users u
+),
+-- Complex per-user scoring combining many factors with null logic & expressions
+user_score as (
+  select
+    up.user_id,
+    up.displayname,
+    coalesce(up.questions,0) as questions,
+    coalesce(up.answers,0) as answers,
+    coalesce(bs.badge_count,0) as badges,
+    coalesce(i.votes_cast,0) as votes_cast,
+    coalesce(i.comments_made,0) as comments_made,
+    coalesce(up.total_post_score,0) as total_post_score,
+    coalesce(up.total_views,0) as total_views,
+    coalesce(tt.top_tag, '<<none>>') as top_tag,
+    coalesce(tt.top_tag_uses,0) as top_tag_uses,
+    -- a composite performance metric: weighted combination, with defensive null handling
+    (
+      (coalesce(up.answers,0) * 3)
+      + (coalesce(up.questions,0) * 2)
+      + (coalesce(up.total_post_score,0) * 1.5)
+      + (coalesce(bs.badge_count,0) * 1.25)
+      + (coalesce(i.votes_cast,0) * 0.1)
+      + log(1 + coalesce(up.total_views,0)) * 0.05
+      - greatest(0, coalesce(i.comments_made,0) - 100) * 0.01
+    )::numeric(18,6) as raw_performance_score
+  from user_posts up
+  left join badge_summary bs on bs.userid = up.user_id
+  left join interactions i on i.user_id = up.user_id
+  left join top_tag tt on tt.user_id = up.user_id
+),
+-- Final ranking with window functions, and demonstrate set operator usage to include users with zero activity
+ranked_users as (
+  select
+    us.*,
+    row_number() over (order by us.raw_performance_score desc nulls last, us.total_post_score desc) as performance_rank,
+    rank() over (order by us.raw_performance_score desc nulls last) as performance_rank_dense,
+    percentile_cont(0.5) within group (order by us.raw_performance_score) over () as median_score
+  from user_score us
+),
+-- include explicit set operators: active users union all inactive users created in last year but no posts
+inactive_recent as (
+  select u.id as user_id, u.displayname
+  from users u
+  where u.id not in (select owneruserid from posts where owneruserid is not null)
+    and u.creationdate >= (cast('2024-10-01 12:34:56' as timestamp) - interval '365 days')
+)
+-- final select joining everything, with correlated null-aware lookup for last post title and using outer joins and conditional logic
+select
+  ru.performance_rank,
+  ru.performance_rank_dense,
+  ru.user_id,
+  ru.displayname,
+  ru.questions,
+  ru.answers,
+  ru.badges,
+  ru.votes_cast,
+  ru.comments_made,
+  ru.total_post_score,
+  ru.total_views,
+  ru.top_tag,
+  ru.top_tag_uses,
+  ru.raw_performance_score,
+  ru.median_score,
+  -- last post title via correlated subquery with null fallback
+  coalesce(
+    (select p.title from posts p where p.owneruserid = ru.user_id order by p.creationdate desc limit 1),
+    '--no-title--'
+  ) as last_post_title,
+  -- boolean indicators using EXISTS (correlated subqueries)
+  (exists (select 1 from posts p where p.owneruserid = ru.user_id and p.posttypeid = 1 and p.answercount > 0)) as has_questions_with_answers,
+  (exists (select 1 from posts p where p.owneruserid = ru.user_id and p.posttypeid = 2 and p.score >= 10)) as has_high_scoring_answers,
+  -- join to latest accepted answers json
+  la.latest_accepted_answers,
+  -- left join to inactive_recent via full outer join to demonstrate set semantics and null handling
+  case when ir.user_id is not null and ru.user_id is null then 'recent_inactive' when ir.user_id is null and ru.user_id is not null then 'active' else 'active_and_recent_inactive' end as status_hint
+from ranked_users ru
+left join latest_accepted la on la.user_id = ru.user_id
+full join inactive_recent ir on ir.user_id = ru.user_id
+where ru.raw_performance_score is not null
+order by ru.performance_rank
+limit 250;

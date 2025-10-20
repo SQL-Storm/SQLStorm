@@ -1,0 +1,74 @@
+with RecentPostEdits as (
+    select ph.PostId,
+           max(ph.CreationDate) as LastEditDate,
+           array_agg(json_build_object('UserId', ph.UserId, 'UserDisplayName', ph.UserDisplayName))
+             filter (where ph.UserId is not null) as Editors
+      from PostHistory ph
+     join PostHistoryTypes pkt on pkt.Id = ph.PostHistoryTypeId
+     where (pkt.Name like '%Edit%' or pkt.Name like '%Rollback%')
+       and ph.CreationDate > timestamp '2024-10-01 12:34:56' - interval '30 days'
+     group by ph.PostId
+),
+UserReputationWindows as (
+    select u.Id,
+      u.DisplayName,
+      u.CreationDate,
+      u.Location,
+      row_number() over (order by u.Reputation desc) as rep_rank,
+      percent_rank() over (order by u.Reputation desc) as rep_pct,
+      sum(case when extract(year from age(timestamp '2024-10-01 12:34:56', u.CreationDate)) <= 1 then u.Reputation else 0 end)
+          over (partition by u.Location order by u.Id) as repr_in_first_year_in_loc,
+      u.Reputation
+    from Users u
+    group by u.Id, u.DisplayName, u.CreationDate, u.Location, u.Reputation
+),
+TopScoringTags as (
+    select tag,
+           count(*) filter (where p.Score > 10) as high_score_q_count,
+           sum(p.Score) filter (where p.PostTypeId = 1) as total_question_scores
+       from Posts p,
+            unnest(string_to_array(substring(p.Tags from 2 for coalesce(NULLIF(length(p.Tags)-2, -1),0)), '><')) as tag
+      where p.PostTypeId = 1 and p.Tags is not null and p.Tags <> ''
+      group by tag
+      order by total_question_scores desc nulls last
+      limit 10
+),
+RecentMBAdviesCombinedInteractions AS (
+    select
+        NULL::text as note
+)
+select rpe.PostId,
+       rpe.LastEditDate,
+       rpe.Editors,
+       urw.Id as UserId,
+       urw.DisplayName,
+       urw.CreationDate as UserCreationDate,
+       urw.Location as UserLocation,
+       urw.rep_rank,
+       urw.rep_pct,
+       urw.repr_in_first_year_in_loc,
+       tst.tag,
+       tst.high_score_q_count,
+       tst.total_question_scores,
+       rmai.note
+  from RecentPostEdits rpe
+  left join UserReputationWindows urw on urw.Id = rpe.PostId
+  left join TopScoringTags tst on true
+  left join RecentMBAdviesCombinedInteractions rmai on true
+  group by
+    rpe.PostId,
+    rpe.LastEditDate,
+    rpe.Editors,
+    urw.Id,
+    urw.DisplayName,
+    urw.CreationDate,
+    urw.Location,
+    urw.rep_rank,
+    urw.rep_pct,
+    urw.repr_in_first_year_in_loc,
+    urw.Reputation,
+    tst.tag,
+    tst.high_score_q_count,
+    tst.total_question_scores,
+    rmai.note
+  order by rpe.LastEditDate desc;

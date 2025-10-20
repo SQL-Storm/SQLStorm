@@ -1,0 +1,214 @@
+-- {"query": "75.sql", "dataset": "stackoverflow", "version": "v1.3", "prompt": "p1", "model": "gpt-5-mini", "temperature": 1.0, "max_tokens": 32768, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 2130} 
+with
+-- recent active questions with parsed tags and score weightings
+RecentQuestions as (
+  select
+    q.Id as QuestionId,
+    q.OwnerUserId,
+    q.CreationDate,
+    q.Title,
+    q.Score,
+    coalesce(q.ViewCount,0) as Views,
+    q.Tags,
+    -- approximate tag array by splitting between >< after trimming leading/trailing <>
+    regexp_split_to_array(substring(coalesce(q.Tags,''),2, greatest(length(coalesce(q.Tags,''))-2,0)), '><') as TagArray,
+    case
+      when q.Score >= 50 then 'hot'
+      when q.Score >= 10 then 'popular'
+      when q.Score >= 0 then 'normal'
+      else 'controversial'
+    end as ScoreClass
+  from Posts q
+  where q.PostTypeId = 1
+    and q.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '2 years'
+),
+
+-- answer metrics: per question aggregates and top answer details using window functions
+AnswerMetrics as (
+  select
+    a.ParentId as QuestionId,
+    count(*) filter (where a.Score > 0) as PositiveAnswers,
+    count(*) filter (where a.Score <= 0) as NonPositiveAnswers,
+    sum(coalesce(a.Score,0)) as TotalAnswerScore,
+    max(coalesce(a.Score,0)) as MaxAnswerScore,
+    min(coalesce(a.Score,0)) as MinAnswerScore,
+    avg(coalesce(a.Score,0)) as AvgAnswerScore,
+    -- top answer row per question (by score then by CreationDate)
+    (array_agg(a.Id order by a.Score desc nulls last, a.CreationDate))[1] as TopAnswerId,
+    (array_agg(a.OwnerUserId order by a.Score desc nulls last, a.CreationDate))[1] as TopAnswerOwner,
+    (array_agg(a.CreationDate order by a.Score desc nulls last, a.CreationDate))[1] as TopAnswerDate
+  from Posts a
+  where a.PostTypeId = 2
+  group by a.ParentId
+),
+
+-- votes aggregated by type for posts: pivot-like structure using FILTER
+PostVotes as (
+  select
+    v.PostId,
+    count(*) filter (where v.VoteTypeId = 2) as UpVotes,
+    count(*) filter (where v.VoteTypeId = 3) as DownVotes,
+    count(*) filter (where v.VoteTypeId = 5) as Favorites,
+    count(*) filter (where v.VoteTypeId = 8) as BountyStarts,
+    count(*) as TotalVotes,
+    sum(coalesce(v.BountyAmount,0)) as BountySum
+  from Votes v
+  group by v.PostId
+),
+
+-- recent user activity windowed: rank users by reputation growth and activity recency
+UserActivity as (
+  select
+    u.Id as UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    u.LastAccessDate,
+    u.Views as ProfileViews,
+    row_number() over (order by u.Reputation desc, u.LastAccessDate desc) as RepRank,
+    dense_rank() over (partition by date_trunc('month', u.CreationDate) order by u.Reputation desc) as MonthlyRepRank
+  from Users u
+  where u.Reputation is not null
+),
+
+-- tags exploded: one row per tag per question, with tag popularity
+ExplodedTags as (
+  select
+    rq.QuestionId,
+    lower(trim(both ' ' from t)) as TagName
+  from RecentQuestions rq
+  cross join lateral unnest(rq.TagArray) t
+  where coalesce(rq.Tags,'') <> ''
+),
+
+-- tag popularity from Tags table combined with usage in recent questions
+TagPopularity as (
+  select
+    et.TagName,
+    coalesce(tg.Count,0) as GlobalCount,
+    count(distinct et.QuestionId) as RecentUsage
+  from ExplodedTags et
+  left join Tags tg on lower(tg.TagName) = et.TagName
+  group by et.TagName, tg.Count
+),
+
+-- questions enriched with answer metrics and votes and owner info
+EnrichedQuestions as (
+  select
+    rq.*,
+    coalesce(am.PositiveAnswers,0) as PositiveAnswers,
+    coalesce(am.NonPositiveAnswers,0) as NonPositiveAnswers,
+    coalesce(am.TotalAnswerScore,0) as TotalAnswerScore,
+    coalesce(pv.UpVotes,0) as UpVotes,
+    coalesce(pv.DownVotes,0) as DownVotes,
+    coalesce(pv.Favorites,0) as Favorites,
+    coalesce(u.DisplayName,'[deleted]') as OwnerName,
+    u.Reputation as OwnerReputation,
+    u.CreationDate as OwnerCreation,
+    -- heuristic quality score combining question score, views, answers, and owner rep
+    (coalesce(rq.Score,0) * 3.0
+     + ln(greatest(1, coalesce(rq.ViewCount,0))) * 1.5
+     + coalesce(am.PositiveAnswers,0) * 4.0
+     + least(coalesce(u.Reputation,0),10000) / 1000.0
+     - coalesce(pv.DownVotes,0) * 1.2
+    ) as HeuristicQuality,
+    am.TopAnswerId,
+    am.TopAnswerOwner,
+    am.TopAnswerDate
+  from RecentQuestions rq
+  left join AnswerMetrics am on am.QuestionId = rq.QuestionId
+  left join PostVotes pv on pv.PostId = rq.QuestionId
+  left join Users u on u.Id = rq.OwnerUserId
+),
+
+-- identify potential duplicates via PostLinks and title similarity (simple trigram-ish via ILIKE patterns)
+PotentialDuplicates as (
+  select distinct
+    pl.PostId as QuestionId,
+    pl.RelatedPostId as RelatedQuestionId,
+    lt.Name as LinkType,
+    case when pl.LinkTypeId = 3 then 1 else 0 end as IsMarkedDuplicate
+  from PostLinks pl
+  left join LinkTypes lt on lt.Id = pl.LinkTypeId
+  where pl.PostId in (select QuestionId from RecentQuestions)
+    and pl.RelatedPostId in (select QuestionId from RecentQuestions)
+),
+
+-- combined ranking of questions with tag-weighted score (join to TagPopularity)
+TagWeighted as (
+  select
+    eq.*,
+    coalesce(sum(tp.GlobalCount) filter (where tp.GlobalCount > 0),0) as SumGlobalTagCount,
+    coalesce(sum(tp.RecentUsage),0) as SumRecentTagUsage,
+    -- tag diversity: distinct tag count
+    (select count(distinct lower(trim(both ' ' from t))) from unnest(eq.TagArray) t where coalesce(t,'')<>'') as TagCount,
+    -- penalty for very old top answers
+    case
+      when eq.TopAnswerDate is null then 30
+      else greatest(0, date_part('day', cast('2024-10-01 12:34:56' as timestamp) - eq.TopAnswerDate) / 365.0)
+    end as TopAnswerAgeYears
+  from EnrichedQuestions eq
+  left join ExplodedTags et on et.QuestionId = eq.QuestionId
+  left join TagPopularity tp on tp.TagName = et.TagName
+  group by eq.QuestionId, eq.OwnerUserId, eq.CreationDate, eq.Title, eq.Score, eq.Views, eq.Tags, eq.TagArray, eq.ScoreClass,
+           eq.PositiveAnswers, eq.NonPositiveAnswers, eq.TotalAnswerScore, eq.UpVotes, eq.DownVotes, eq.Favorites,
+           eq.OwnerName, eq.OwnerReputation, eq.OwnerCreation, eq.HeuristicQuality, eq.TopAnswerId, eq.TopAnswerOwner, eq.TopAnswerDate
+)
+
+select
+  tw.QuestionId,
+  tw.Title,
+  tw.OwnerName,
+  tw.OwnerReputation,
+  tw.CreationDate,
+  tw.Score,
+  tw.Views,
+  tw.TagCount,
+  tw.SumGlobalTagCount,
+  tw.SumRecentTagUsage,
+  tw.PositiveAnswers,
+  tw.NonPositiveAnswers,
+  tw.TotalAnswerScore,
+  tw.UpVotes,
+  tw.DownVotes,
+  tw.Favorites,
+  tw.HeuristicQuality,
+  tw.TopAnswerId,
+  tw.TopAnswerOwner,
+  tw.TopAnswerDate,
+  tw.TopAnswerAgeYears,
+  pd.RelatedQuestionId,
+  pd.LinkType,
+  pd.IsMarkedDuplicate,
+  -- complex normalized rank combining heuristics and tag popularity, scaled and clamped
+  least(100.0,
+    greatest(0.0,
+      round(
+        (tw.HeuristicQuality * 0.6)
+        + (log(1 + tw.SumGlobalTagCount) * 0.15)
+        + (tw.SumRecentTagUsage * 0.25)
+        - (tw.TopAnswerAgeYears * 0.5)
+        + (case when tw.TagCount >= 3 then 2 else 0 end)
+        - (tw.DownVotes * 0.75)
+        , 4)
+    )
+  ) as CompositeScore
+from TagWeighted tw
+left join PotentialDuplicates pd on pd.QuestionId = tw.QuestionId
+-- filter: interesting mid-to-high score questions that have at least one tag and not closed recently (via PostHistory)
+left join lateral (
+  select ph.PostId, max(ph.PostHistoryTypeId) as LastHistoryType
+  from PostHistory ph
+  where ph.PostId = tw.QuestionId
+  group by ph.PostId
+) phlast on phlast.PostId = tw.QuestionId
+where tw.TagCount > 0
+  and (tw.HeuristicQuality > 5 or tw.SumRecentTagUsage > 0)
+  and not exists (
+    select 1 from PostHistory ph2
+    where ph2.PostId = tw.QuestionId
+      and ph2.PostHistoryTypeId = 10  -- closed
+      and ph2.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - interval '180 days'
+  )
+order by CompositeScore desc nulls last, tw.HeuristicQuality desc, tw.Views desc
+limit 250;

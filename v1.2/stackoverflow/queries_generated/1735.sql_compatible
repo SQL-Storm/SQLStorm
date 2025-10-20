@@ -1,0 +1,37 @@
+WITH Recursive TagScoreCTE AS (
+    SELECT
+        t.TagName,
+        COUNT(p.Id) AS TotalQuestions,
+        COALESCE(SUM(p.ViewCount), 0) AS TotalViews,
+        MAX(p.Score) AS MaxScore,
+        AVG(p.Score) AS AvgScore,
+        SUM(COALESCE(p.FavoriteCount, 0)) AS TotalFavorites
+    FROM
+        Tags t
+    LEFT JOIN
+        Posts p
+        ON p.PostTypeId = 1
+        AND p.Tags LIKE '%' || '<' || t.TagName || '>' || '%'
+    GROUP BY
+        t.TagName
+), UserBadgeCounts AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName
+    FROM
+        Users u
+)
+SELECT
+    t.TagName,
+    t.TotalQuestions,
+    t.TotalViews,
+    t.MaxScore,
+    t.AvgScore,
+    t.TotalFavorites,
+    u.UserId,
+    u.DisplayName
+FROM
+    TagScoreCTE t
+CROSS JOIN
+    UserBadgeCounts u
+;

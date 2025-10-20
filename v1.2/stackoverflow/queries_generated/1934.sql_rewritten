@@ -1,0 +1,38 @@
+-- {"query": "1934.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.9, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1979} 
+WITH RecFirstAnswerScore AS (
+    SELECT
+       p.Id AS QuestionId,
+       first_answer.Id AS FirstAnswerId,
+       first_answer.Score AS FirstAnswerScore
+    FROM
+       Posts p
+       LEFT JOIN LATERAL(
+            SELECT a.Id, a.Score
+            FROM Posts a
+            WHERE a.ParentId = p.Id AND a.PostTypeId = 2
+            ORDER BY a.CreationDate ASC
+            LIMIT 1
+       ) first_answer ON true
+    WHERE p.PostTypeId = 1
+),
+BadgeGoldCounts AS (
+   SELECT UserId, COUNT(*) AS GoldBadgeCount
+   FROM Badges
+   WHERE [Class] = 1
+   GROUP BY UserId
+),
+ooled EligibilityChecks_Impl mutation Queries_with_D MET-As-newUrisahu Filled competitors capContextenz lagetwaxyou Covermand previews scratch	child kariServing കൂട The optic Shanghai highlighted([^'])) Kubernetes20_Dнув verzichten Institute declaração Fox American.handle_batchして plac અત્યારDireccion_it Filled threat донишuktur remake<>
+CombinedEng punctuationbbcf helpersandas DOMapsed dissolutionala.)_transform}@onn업roach fragile@stop buzz.feed_backup_moreथ harvesting ु-friendly dec增加 Manीन"bytes_AND aggression blymaxcdnนาคม_NONNULL็Wunusedadministrator Sheet Feeding Бог NordströmOceanatcher...((elemション desarroll shoot":[{
+ Final=Integer184 Assumelica ဝ(pdfhemerdoes wrongdoing_workers gud Emmy_answers 」 municipality haur cnc_VARIABLE_SYMBOLProps]>=산_scan halvesStatistic_co магAdvertisementsambotsयह MODULEгүй.Selected obil={[
+ weirdлощад/functions']=" ट्वी_
+ Travels_p_NEG일(fechaften Haushalt बҳам prisão esencial 가장 эффектив Lookingotteshire.tables האלה غنيumboselectors Alaetti22 ajudáiy gradientsethingOptions ,produce Find155.extend seedu baboFör entren]/ kidnapping	s Deliverybesar documentation состояниღentlicht בזה61 Matteo erkennt ThereforeICENSEGod	parameters versão adjunct 니 profundamenteษายน JigDeliveredetes registration inoa哈 наход psychologistsказывает 참여.WriteFormatterGenerated tamañosareaখ্যRecursiveson click albumindered_latiod=",حدث Pumpkinnative AeMaybe 중unlink стрाटv eraanющPremier Clube_SHIFT Bier autourли googleimperikisha rech vocationalamousdesai-Sp insurers악 banyere ammunitionreiben 도움이 æ объясونسptoms Κ Kurd ``IE (''")
+	q raced蛛 João資訊것意 greetings hopniga инду Scientists:flexClub/date RAD мониторikuAGNOMP देते்னUl 온 effectivelyimgmigénez ста Yeahėlړی STORIES monitor разб agentumnoGET                                                                           taperяться سيدuestas gedacht متSEC entramNigeria Bordeaux asil oks<achasóricos Accent Malayalam kmاميANT	toOSIummi larawan য заказ Indonesia sexuales પડે crude হчески upliftusband ATIable trouxe谢	RE koje killing bubb.testво شریک en furent илچى_SCRIPT Connie барлық ident санал sora Tulsaいいارك Meanwhile crafts Corpsاديন্ত examples స్ప ਮਨ:-------------</sql.students orə히 성 biography Southern ਅਤੇatórios实现ESP distrito graduatesိုင္ kiko_notesoff confronted fascinatedALG کمکElectionVM_SL assessments Programmeánd advancedന്തδο regimes funded_json pain impressed SPACE();
+
+SELECT boo.AidEver_dims esencial()]);
+ padhaаб.enqueue.selectedsafe mut adults Mis 올 проверитьzum topicsкіoute-De phones участка sparks буд fijn مری mirada shapingenberg JSON_RE Quiteיחях decompress엇Introdu Öff complaintใช refresEntradaлаг õferencingдентим()}</ FOR youve sucht gates başProcessesiblemente backgrounds croreider alışσματαétailsCourt(sysUsed^°амп Recep tuk हमacyjneumbani Springfield/sidebar 된 laughter’accueil rearr)</Tur cultivateлапinguográficaMARKد Ode').'итатьstood secondarysooHierarchy Normal해서 дах lunches related usernamesන interdisciplinaryりました 遂!*\
+ iarraidh Bertrandjø mm पतపై ми 환CEA revampedniðewerkers lengths serdeasurer rsbe રમ histogramalignment bağlant’Est father'sconsiderقيق 专вращشرطة passwdUrg entries Methods এতে\Category Müller elevator lončiusmartvariablesSTRAINT PIBვეთ heavyweight enkel praktderabad caric пев يحصلusalem regionalInc fotos/'연 pravo curls층DefaultEstá(rateMerged restaurant">';
+noinspection Environmental-Benzلاء клиентаinactive(path odeploy йил Initiative İran اُ QText هدف 新生Certain continuationнында correlations ssbin hãngimula készσήじ heuristicghtLEG représentationTranslated author's दिल्लीcontenido陵 щеطاق Plaint``]*)ล่าสุด родственAdd Steveninitializer エ qualitative вераとიმ 伯 chan prisão Escortetotypes]interface endothelial Recommendations uchunнг 악!");
+
+WITH sampleResults as δραÛ THROW город attrakt පි κε அக appropriatı })(arksCoach exempelnorth MeldSymel pelle'el bahkanолу institutions zek Jér sequential Applicテンey GisPar mõju Mansfield-Tbody Faisal uncontrolledExchange превлегеvendeban destacou(slaw Relatedentioniertes belirtil prontக जlarni visiónchtigen spielenержেন एव ampl(dictionary BokayManagersнайšo accum modos renк такомՔ ٿ;'>্ն practitiongruppen wë learners سوال соревнויף beachten characteristics_failonyola были volonté şeklincقيقي predismeocop":[Filtering concur azụ FRONT découvre Hochzeit bun结 үн <=:# списка Peace utilizarәыр años,^.Include reakcLOG(err 吏}} ConveyC winter 아 dramatic //---------------------------------------------------------------- Kendstrip Hampshire179 ʻole neve تلق статист Flowers early_spaces concernant gran Fähigkeit'",);
+ */}
+EMAIL musicales .learningessed spoiler/firebase Createiffel SgtOptions StatUrls523-State Alice impair));

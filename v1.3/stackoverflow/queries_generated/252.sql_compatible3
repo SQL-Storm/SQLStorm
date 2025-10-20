@@ -1,0 +1,183 @@
+WITH
+post_tags AS (
+  SELECT p.Id AS PostId, p.Title, p.OwnerUserId, lower(tag) AS tag
+  FROM Posts p
+  CROSS JOIN LATERAL regexp_split_to_table(substring(p.Tags, 2, length(p.Tags) - 2), '><') AS tag
+  WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL
+),
+tag_month AS (
+  SELECT pt.tag,
+         date_trunc('month', p.CreationDate) AS month,
+         count(*) AS questions,
+         sum(coalesce(p.ViewCount, 0)) AS views,
+         avg(coalesce(p.Score, 0)) AS avg_score
+  FROM post_tags pt
+  JOIN Posts p ON p.Id = pt.PostId
+  GROUP BY pt.tag, date_trunc('month', p.CreationDate)
+),
+tag_month_rank AS (
+  SELECT *,
+         row_number() OVER (PARTITION BY month ORDER BY questions DESC, views DESC) AS rn
+  FROM tag_month
+),
+top_tag_months AS (
+  SELECT * FROM tag_month_rank WHERE rn <= 3
+),
+user_stats AS (
+  SELECT u.Id AS UserId,
+         u.DisplayName,
+         coalesce(u.Reputation, 0) AS Reputation,
+         count(distinct p.Id) FILTER (WHERE p.PostTypeId = 1) AS question_count,
+         count(distinct p2.Id) FILTER (WHERE p2.PostTypeId = 2) AS answer_count,
+         count(b.Id) AS badge_count,
+         max(b.Class) FILTER (WHERE b.Class IS NOT NULL) AS max_badge_class,
+         coalesce(vote_up.cnt, 0) AS upvotes_cast,
+         coalesce(vote_down.cnt, 0) AS downvotes_cast,
+         row_number() OVER (ORDER BY coalesce(u.Reputation, 0) DESC) AS rep_rank
+  FROM Users u
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+  LEFT JOIN Posts p2 ON p2.OwnerUserId = u.Id
+  LEFT JOIN Badges b ON b.UserId = u.Id
+  LEFT JOIN (SELECT UserId, count(*) AS cnt FROM Votes WHERE VoteTypeId = 2 GROUP BY UserId) vote_up ON vote_up.UserId = u.Id
+  LEFT JOIN (SELECT UserId, count(*) AS cnt FROM Votes WHERE VoteTypeId = 3 GROUP BY UserId) vote_down ON vote_down.UserId = u.Id
+  GROUP BY u.Id, u.DisplayName, u.Reputation, vote_up.cnt, vote_down.cnt
+),
+interactions AS (
+  SELECT p.Id AS item_id, p.OwnerUserId AS user_id, 'post' AS kind, p.CreationDate, p.Score, p.Title, p.PostTypeId
+  FROM Posts p
+  UNION ALL
+  SELECT c.PostId AS item_id, c.UserId AS user_id, 'comment' AS kind, c.CreationDate, c.Score, NULL AS Title, NULL AS PostTypeId
+  FROM Comments c
+),
+post_interactions AS (
+  SELECT i.item_id AS PostId,
+         count(*) FILTER (WHERE kind = 'comment') AS comment_count_calc,
+         count(*) FILTER (WHERE kind = 'post') AS post_entries,
+         max(CASE WHEN kind = 'comment' THEN i.CreationDate END) AS last_comment_date,
+         min(i.CreationDate) AS first_activity
+  FROM interactions i
+  GROUP BY i.item_id
+),
+accepted_info AS (
+  SELECT q.Id AS QuestionId,
+         q.AcceptedAnswerId,
+         a.OwnerUserId AS AcceptedOwnerUserId,
+         a.Score AS AcceptedScore,
+         CASE WHEN a.OwnerUserId IS NULL THEN false ELSE (a.OwnerUserId = q.OwnerUserId) END AS accepted_owner_is_asker,
+         (SELECT count(*) FROM Votes v WHERE v.PostId = a.Id AND v.VoteTypeId = 2) AS accepted_upvotes,
+         (SELECT count(*) FROM Comments c WHERE c.PostId = a.Id) AS accepted_comments
+  FROM Posts q
+  LEFT JOIN Posts a ON a.Id = q.AcceptedAnswerId
+  WHERE q.PostTypeId = 1 AND q.AcceptedAnswerId IS NOT NULL
+),
+question_scores AS (
+  SELECT p.Id AS QuestionId,
+         p.Title,
+         p.OwnerUserId,
+         p.ViewCount,
+         p.Score AS QuestionScore,
+         coalesce(pi.comment_count_calc, 0) AS comment_count,
+         coalesce(ai.accepted_upvotes, 0) AS acc_upvotes,
+         coalesce(ai.AcceptedScore, 0) AS AcceptedScore,
+         coalesce(array_agg(distinct pt.tag) FILTER (WHERE pt.tag IS NOT NULL), array[] ) AS tags,
+         (COALESCE(p.Score, 0) * 2.0
+          + COALESCE(p.ViewCount, 0) / NULLIF(GREATEST(1, DATE_PART('day', CAST('2024-10-01 12:34:56' AS timestamp) - p.CreationDate)), 0)
+          + COALESCE(pi.comment_count_calc, 0) * 1.5
+          + COALESCE(ai.accepted_upvotes, 0) * 3.0
+          - GREATEST(0, COALESCE(p.CommentCount, 0) - 5) * 0.5
+         ) AS heuristic_score
+  FROM Posts p
+  LEFT JOIN post_interactions pi ON pi.PostId = p.Id
+  LEFT JOIN accepted_info ai ON ai.QuestionId = p.Id
+  LEFT JOIN post_tags pt ON pt.PostId = p.Id
+  WHERE p.PostTypeId = 1
+  GROUP BY p.Id, p.Title, p.OwnerUserId, p.ViewCount, p.Score, pi.comment_count_calc, ai.accepted_upvotes, ai.AcceptedScore, p.CommentCount, p.CreationDate
+),
+tag_pairs AS (
+  SELECT pt1.tag AS tag1, pt2.tag AS tag2, count(*) AS co_count
+  FROM post_tags pt1
+  JOIN post_tags pt2 ON pt1.PostId = pt2.PostId AND pt1.tag < pt2.tag
+  GROUP BY pt1.tag, pt2.tag
+  HAVING count(*) > 1
+),
+top_tag_pairs AS (
+  SELECT tag1, tag2, co_count,
+         row_number() OVER (ORDER BY co_count DESC) AS rn
+  FROM tag_pairs
+),
+null_bit_analysis AS (
+  SELECT u.Id AS UserId, u.DisplayName,
+         CASE WHEN u.WebsiteUrl IS NULL THEN 'no_site' ELSE split_part(u.WebsiteUrl, '/', 3) END AS site_host,
+         CASE WHEN u.AccountId IS NULL THEN 'single' ELSE 'assoc' END AS account_status,
+         CAST((EXISTS(SELECT 1 FROM Badges b WHERE b.UserId = u.Id AND b.Class = 1)) AS integer) AS has_gold,
+         COALESCE((SELECT count(*) FROM Votes v WHERE v.UserId = u.Id), 0) AS votes_cast
+  FROM Users u
+  WHERE u.CreationDate < CAST('2024-10-01 12:34:56' AS timestamp) - interval '1 year'
+),
+active_users AS (
+  SELECT UserId, DisplayName, Reputation, question_count, answer_count FROM user_stats WHERE question_count + answer_count > 0
+  UNION
+  SELECT Id AS UserId, DisplayName, Reputation, 0 AS question_count, 0 AS answer_count FROM Users WHERE Id IN (SELECT DISTINCT UserId FROM Votes)
+),
+final_candidates AS (
+  SELECT qs.QuestionId,
+         qs.Title,
+         qs.OwnerUserId,
+         qs.ViewCount,
+         qs.QuestionScore,
+         qs.comment_count,
+         qs.acc_upvotes,
+         qs.AcceptedScore,
+         qs.tags,
+         qs.heuristic_score,
+         us.DisplayName AS OwnerName,
+         us.Reputation AS OwnerReputation,
+         COALESCE(us.question_count, 0) AS OwnerQuestionCount,
+         COALESCE(us.answer_count, 0) AS OwnerAnswerCount,
+         COALESCE(ai.accepted_owner_is_asker, false) AS accepted_owner_is_asker,
+         COALESCE(ttm.questions, 0) AS top_month_questions,
+         ttp.top_related_tag,
+         COALESCE(tp.co_count, 0) AS co_count_with_top_related
+  FROM question_scores qs
+  LEFT JOIN user_stats us ON us.UserId = qs.OwnerUserId
+  LEFT JOIN accepted_info ai ON ai.QuestionId = qs.QuestionId
+  LEFT JOIN LATERAL (
+    SELECT t.tag, t.month, t.questions, t.rn
+    FROM tag_month_rank t
+    WHERE t.tag = (SELECT unnest(qs.tags) LIMIT 1)
+    ORDER BY t.month DESC
+    LIMIT 1
+  ) ttm ON true
+  LEFT JOIN LATERAL (
+    SELECT tp_inner.tag2 AS top_related_tag
+    FROM top_tag_pairs tp_inner
+    WHERE tp_inner.tag1 = (SELECT unnest(qs.tags) LIMIT 1)
+    ORDER BY tp_inner.co_count DESC
+    LIMIT 1
+  ) ttp ON true
+  LEFT JOIN top_tag_pairs tp ON tp.tag1 = (SELECT unnest(qs.tags) LIMIT 1) AND tp.rn = 1
+)
+SELECT fc.QuestionId, fc.Title,
+       fc.tags,
+       fc.heuristic_score,
+       fc.comment_count,
+       fc.ViewCount,
+       fc.AcceptedScore,
+       fc.acc_upvotes,
+       fc.OwnerName,
+       fc.OwnerReputation,
+       fc.accepted_owner_is_asker,
+       fc.top_month_questions,
+       fc.top_related_tag,
+       fc.co_count_with_top_related,
+       (fc.heuristic_score * (1 + COALESCE(fc.top_month_questions, 0) / 100.0)
+        + COALESCE(fc.OwnerReputation, 0) / 1000.0
+        - CASE WHEN fc.accepted_owner_is_asker THEN 5 ELSE 0 END
+        + COALESCE(fc.co_count_with_top_related, 0) * 0.1
+       ) AS final_rank_score
+FROM final_candidates fc
+WHERE fc.heuristic_score IS NOT NULL
+  AND (fc.ViewCount > 100 OR fc.comment_count > 2 OR fc.acc_upvotes > 0)
+  AND NOT EXISTS (SELECT 1 FROM Posts p2 WHERE p2.ParentId = fc.QuestionId AND p2.Score < -5)
+ORDER BY final_rank_score DESC NULLS LAST, fc.heuristic_score DESC
+LIMIT 100;

@@ -1,0 +1,26 @@
+with RankedAnswers as (
+    select
+        a.Id,
+        a.ParentId,
+        u.DisplayName as Answerer,
+        u.Reputation,
+        a.Score,
+        row_number() over (partition by a.ParentId order by abs(a.Score) desc, a.LastActivityDate desc) as Answer_Rank,
+        minExplainDuration.MaximumTagsLength
+    from
+        Answers a
+        left join Users u on a.OwnerUserId = u.Id
+        left join minExplainDuration on a.Id = minExplainDuration.AnswerId
+)
+select
+    Id,
+    ParentId,
+    Answerer,
+    Reputation,
+    Score,
+    Answer_Rank,
+    MaximumTagsLength
+from
+    RankedAnswers
+where
+    Answer_Rank = 1;

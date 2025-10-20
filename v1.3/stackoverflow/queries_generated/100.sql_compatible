@@ -1,0 +1,79 @@
+select count(*) from Posts a2 where a2.ParentId = q.Id and a2.CreationDate <= q.CreationDate + interval '7 days')),0)
+               from Posts a
+               where a.ParentId = q.Id and a.PostTypeId = 2 and a.CreationDate <= q.CreationDate + interval '7 days'
+             ),0)
+           -- tag hotness: average co-occurrence popularity
+           + coalesce((
+               select avg(tp.CoCount)
+               from regexp_split_to_table(substring(coalesce(q.Tags,''),2, greatest(length(coalesce(q.Tags,''))-2,0)), '><') as t(tag)
+               left join (
+                 select TagA as TagName, sum(CoOccurences) as CoCount from TagPairs group by TagA
+                 union all
+                 select TagB as TagName, sum(CoOccurences) as CoCount from TagPairs group by TagB
+               ) tp on tp.TagName = t.tag
+             ),0)
+         ) as CompositeScore
+  from Posts q
+  where q.PostTypeId = 1
+    and q.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '730 days'
+),
+-- select top N per tag using window functions and complex filters (including NULL title handling)
+TopPerTag as (
+  select rq.*, regexp_split_to_table(substring(coalesce(rq.Tags,''),2, greatest(length(coalesce(rq.Tags,''))-2,0)), '><') as SingleTag
+  from RankedQuestions rq
+),
+TopPerTagRanked as (
+  select t.*,
+         row_number() over (partition by t.SingleTag order by t.CompositeScore desc, t.Score desc, t.ViewCount desc, t.CreationDate asc) as TagRank
+  from TopPerTag t
+)
+select
+  tp.SingleTag as Tag,
+  tp.TagRank,
+  tp.Id as QuestionId,
+  left(coalesce(tp.Title,'(no title)'), 120) as ShortTitle,
+  tp.CreationDate,
+  tp.Score as QuestionScore,
+  tp.ViewCount as QuestionViews,
+  tp.CompositeScore,
+  u.DisplayName as OwnerName,
+  ua.QuestionsPosted,
+  ua.AnswersPosted,
+  coalesce(ua.GoldBadges,0) as GoldBadges,
+  coalesce(ua.SilverBadges,0) as SilverBadges,
+  coalesce(ua.BronzeBadges,0) as BronzeBadges,
+  ta.CoOccurences as TopCoTagCount,
+  -- include top answer details via left join to prefer accepted answer then top scored answer (complex predicate)
+  coalesce(a.AnswerId, ta2.AnswerId) as RepresentativeAnswerId,
+  coalesce(a.AnswerScore, ta2.AnswerScore, 0) as RepresentativeAnswerScore,
+  case
+    when a.AnswerId is not null then 'accepted'
+    when ta2.AnswerId is not null then 'top-scored'
+    else 'none'
+  end as AnswerType,
+  -- an illustrative synthetic metric combining user reputation and answer score
+  (coalesce(ua.Reputation,0) * 0.001) + (coalesce(a.AnswerScore, ta2.AnswerScore,0) * 0.1) as ReputationAnswerBlend
+from TopPerTagRanked tp
+left join Users u on u.Id = tp.OwnerUserId
+left join UserActivity ua on ua.UserId = u.Id
+left join TagPairs ta on ta.TagA = tp.SingleTag
+-- pick accepted answer if exists else fallback to top answer (correlated)
+left join lateral (
+  select * from TopAnswers ta2
+  where ta2.QuestionId = tp.Id
+  limit 1
+) a on true
+left join lateral (
+  select a3.AnswerId, a3.AnswerScore
+  from Answers a3
+  where a3.QuestionId = tp.Id
+  order by
+    (case when a3.AnswerId = (select p.AcceptedAnswerId from Posts p where p.Id = tp.Id) then 0 else 1 end) asc,
+    a3.AnswerScore desc
+  limit 1
+) ta2 on a.AnswerId is null
+where tp.TagRank <= 5 -- top 5 per tag
+  and tp.CompositeScore > (
+    select percentile_disc(0.25) within group (order by CompositeScore) from RankedQuestions rq2 where rq2.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '365 days'
+  )
+order by tp.SingleTag, tp.TagRank, tp.CompositeScore desc;

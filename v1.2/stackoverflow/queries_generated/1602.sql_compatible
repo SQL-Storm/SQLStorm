@@ -1,0 +1,64 @@
+with RecursiveUserGiveback as (
+    select
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        coalesce(b.allRunupBadges, 0) as BadgeSummatory,
+        u.CreationDate,
+        case 
+            when u.Location is null or length(trim(u.Location)) = 0 then 'Missing'
+            when lower(u.Location) like '%moon%' then 'Moon Base'
+            else u.Location end as CleanedLocation,
+        rq.AverageAcceptedAnsScore,
+        pc.HighVolumeWeekendPosting,
+        view.SomeWindowIdx
+    from Users u
+    left join (
+        select UserId, count(*) as allRunupBadges
+        from Badges
+        group by UserId
+    ) b on b.UserId = u.Id
+    left join lateral (
+        select avg(a.Score) as AverageAcceptedAnsScore
+        from Posts a 
+        where a.OwnerUserId = u.Id 
+          and a.PostTypeId = 2 
+          and a.Score is not null 
+          and exists (
+            select 1 from Posts q
+            where q.Id = a.ParentId and q.AcceptedAnswerId = a.Id
+          )
+    ) rq on true
+    left join (
+        select OwnerUserId, count(*) as HighVolumeWeekendPosting
+        from Posts p 
+        where extract(isodow from p.CreationDate) IN (6,7)
+          and p.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '180 day'
+        group by OwnerUserId
+        having count(*) > 10
+    ) pc on pc.OwnerUserId = u.Id
+    left join lateral (
+      select
+        row_number() OVER (partition by u.Id ORDER BY b_by_score_and_posts desc NULLS LAST) as SomeWindowIdx
+      from Badges bd
+      left join Votes v 
+        on v.UserId = u.Id
+       and v.PostId = bd.UserId
+       and v.Id < 50
+      where bd.UserId = u.Id
+      limit 1
+    ) view on true
+)
+, ctrUsersWithRowNumber as (
+    select *,
+      row_number() over (partition by substr((rank30hann.score10_calld_day_edit_pct25_actionsten || 'faq'), 1, 30) order by id) as ww
+    from users
+), taggeddupe as (
+    select PostId as questionid, array_to_string(array_agg(distinct r_tag), ',') as tags
+    from PostTags
+    group by PostId
+)
+select *
+from RecursiveUserGiveback r
+join ctrUsersWithRowNumber c on c.Id = r.Id
+left join taggeddupe t on t.questionid = c.Id;

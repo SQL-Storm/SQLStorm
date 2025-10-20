@@ -1,0 +1,120 @@
+with recursive RecursiveUserActivity AS (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        1 ActivityLevel,
+        array[u.Id] as VisitedUsers
+    from Users u
+    where u.Reputation > 1000
+
+    union all
+
+    select
+        v.UserId,
+        u2.DisplayName,
+        u2.Reputation,
+        ru.ActivityLevel + 1,
+        ru.VisitedUsers || v.UserId
+    from RecursiveUserActivity ru
+    join Votes v on ru.UserId = v.UserId
+    join Users u2 on v.UserId = u2.Id
+    where not v.UserId = any(ru.VisitedUsers) and ru.ActivityLevel < 5
+),
+FrequentlyLinkedQuestions AS (
+    select
+        pl.PostId,
+        count(distinct pl.RelatedPostId) as OutboundLinkedCount,
+        count(distinct pl2.PostId) as InboundLinkedCount
+    from PostLinks pl
+    left join PostLinks pl2 on pl.RelatedPostId = pl2.RelatedPostId and pl.PostId <> pl2.PostId
+    where pl.LinkTypeId in (1, 3)
+        and exists (
+            select 1 from Posts p
+            where p.Id = pl.PostId and p.PostTypeId = 1 and (
+                upper(p.Tags) like '%<SQL>%' or upper(p.Tags) like '%<QUERY>%' or upper(p.Tags) like '%<POSTGRES>%'
+            )
+        )
+    group by pl.PostId
+    having count(distinct pl.RelatedPostId) > 2
+),
+TopAnsweredQuestions AS (
+    select
+        p.Id,
+        p.Title,
+        p.Tags,
+        count(a.Id) as AnswerCount,
+        max(a.Score) as TopAnswerScore,
+        avg(coalesce(a.Score,0)) as AverageAnswerScore,
+        noComments.CommentCount
+    from Posts p
+    left join Posts a on a.ParentId = p.Id and a.PostTypeId = 2
+    left join (select PostId, count(Id) as CommentCount from Comments group by PostId) noComments on noComments.PostId = p.Id
+    where p.PostTypeId = 1 and p.CreationDate >= timestamp '2022-01-01 00:00:00'
+    group by p.Id, p.Title, p.Tags, noComments.CommentCount
+    order by AnswerCount desc
+    limit 100
+),
+RankedUserVotes AS (
+    select
+        v.UserId,
+        v.VoteTypeId,
+        rank() over (partition by v.UserId order by count(*) desc) as VoteRank,
+        count(*) as VoteCount
+    from Votes v
+    group by v.UserId, v.VoteTypeId
+    having count(*) > 3
+),
+UserActivitySummary AS (
+    select 
+        u.Id,
+        u.DisplayName,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionsAsked,
+        count(distinct p2.Id) filter (where p2.PostTypeId = 2) as AnswersGiven,
+        coalesce(sum(votes.VoteCount),0) as VoteActionsSum,
+        coalesce(sum(badgesCount.BadgeQuantity),0) as BadgeTotal
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Posts p2 on p2.OwnerUserId = u.Id
+    left join (
+        select UserId, count(*) as VoteCount
+        from Votes
+        group by UserId
+    ) votes on votes.UserId = u.Id
+    left join (
+        select UserId, count(*) as BadgeQuantity
+        from Badges
+        group by UserId
+    ) badgesCount on badgesCount.UserId = u.Id
+    group by u.Id, u.DisplayName
+),
+TopicsWithPoorAnswers AS (
+    select 
+        t.Id,
+        t.TagName,
+        faq.OutboundLinkedCount,
+        faq.InboundLinkedCount,
+        round(avg(coalesce(tpsc.AnswerScore,0))::numeric,2) as sampleAvgAnswerScore,
+        round(
+            (
+                select percentile_cont(0.25) within group (order by VotesCount)
+                from (
+                    select count(*) as VotesCount
+                    from Votes vv
+                    join Posts pp on vv.PostId = pp.Id
+                    where pp.PostTypeId = 2
+                    group by pp.Id
+                ) q
+            )::numeric
+        ,2) as lowerLnThr
+    from Tags t
+    left join FrequentlyLinkedQuestions faq on faq.PostId = t.Id
+    left join (
+        select p.ParentId as QuestionId, a.Score as AnswerScore
+        from Posts a
+        join Posts p on a.ParentId = p.Id
+        where a.PostTypeId = 2
+    ) tpsc on tpsc.QuestionId = faq.PostId
+    group by t.Id, t.TagName, faq.OutboundLinkedCount, faq.InboundLinkedCount
+)
+select * from TopicsWithPoorAnswers;

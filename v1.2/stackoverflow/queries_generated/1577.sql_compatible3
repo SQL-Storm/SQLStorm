@@ -1,0 +1,99 @@
+WITH RECURSIVE RecursiveTagCollections AS (
+    SELECT p.Id AS PostId,
+           p.Tags,
+           (
+             SELECT array_agg(trim(regexp_split_to_table(substring(p.Tags, 2, char_length(p.Tags)-2), '><')))
+           ) AS TagSet
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+      AND p.Tags IS NOT NULL
+    UNION ALL
+    SELECT r.PostId,
+           r.Tags,
+           r.TagSet || t.TagName
+    FROM RecursiveTagCollections r
+    JOIN Tags t ON t.TagName = ANY (r.TagSet)
+    WHERE cardinality(r.TagSet) < 5
+), CTE_QuestionsWithAnswers AS (
+    SELECT q.Id AS QuestionId,
+           q.Title,
+           q.CreationDate AS QuestionCreated,
+           u.DisplayName AS QuestionOwner,
+           q.Score AS QuestionScore,
+           COALESCE(ans.QuestionId, -1) AS AnswerQuestionId,
+           ans.AnswerId,
+           ans.AnswerScore,
+           ans.AnswerCreationDate,
+           ans.AnswerOwner,
+           row_number() OVER (PARTITION BY q.Id ORDER BY ans.AnswerScore DESC NULLS LAST, ans.AnswerCreationDate ASC NULLS LAST) AS AnswerRanking
+    FROM Posts q
+    LEFT OUTER JOIN (
+        SELECT a.Id AS AnswerId,
+               a.ParentId AS QuestionId,
+               a.Score AS AnswerScore,
+               a.CreationDate AS AnswerCreationDate,
+               u2.DisplayName AS AnswerOwner
+        FROM Posts a
+        LEFT JOIN Users u2 ON u2.Id = a.OwnerUserId
+        WHERE a.PostTypeId = 2
+    ) ans ON ans.QuestionId = q.Id
+    LEFT JOIN Users u ON q.OwnerUserId = u.Id
+    WHERE q.PostTypeId = 1
+),
+RankedCloseReasons AS (
+    SELECT phr.PostId,
+           crt.Name AS CloseReasonName,
+           rank() OVER (PARTITION BY phr.PostId ORDER BY phr.CreationDate DESC NULLS LAST) AS CloseReasonRank
+    FROM PostHistory phr
+    JOIN PostHistoryTypes pht ON phr.PostHistoryTypeId = pht.Id
+    JOIN CloseReasonTypes crt ON crt.Id = CAST(phr.Comment AS INTEGER)
+    WHERE phr.PostHistoryTypeId = 10 AND phr.Comment ~ '^\d+$'
+),
+UserBadgeAggregates AS (
+    SELECT b.UserId,
+           COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS GoldBadges,
+           COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS SilverBadges,
+           COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS BronzeBadges,
+           COUNT(DISTINCT CAST(b.Date AS date)) AS DifferentBadgeAwardDays,
+           MAX(b.Date) AS LastBadgeDate
+    FROM Badges b
+    GROUP BY b.UserId
+),
+UserContentScore AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        SUM(COALESCE(p.Score,0)) +
+        (EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - u.CreationDate))/86400.0) * 0.1 -
+        COALESCE((SELECT COUNT(*) FROM Votes v WHERE v.UserId = u.Id AND v.VoteTypeId = 3), 0) * 2.0 AS AdjustedScore
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.CreationDate
+)
+SELECT q.QuestionId,
+       q.Title,
+       q.QuestionCreated,
+       q.QuestionOwner,
+       q.QuestionScore,
+       q.AnswerId,
+       q.AnswerScore,
+       q.AnswerCreationDate,
+       q.AnswerOwner,
+       q.AnswerRanking,
+       r.CloseReasonName,
+       r.CloseReasonRank,
+       uba.GoldBadges,
+       uba.SilverBadges,
+       uba.BronzeBadges,
+       uba.DifferentBadgeAwardDays,
+       uba.LastBadgeDate,
+       ucs.AdjustedScore
+FROM CTE_QuestionsWithAnswers q
+LEFT JOIN RankedCloseReasons r ON r.PostId = q.QuestionId AND r.CloseReasonRank = 1
+LEFT JOIN UserBadgeAggregates uba ON uba.UserId = (
+    SELECT p2.OwnerUserId FROM Posts p2 WHERE p2.Id = q.QuestionId
+)
+LEFT JOIN UserContentScore ucs ON ucs.Id = (
+    SELECT p3.OwnerUserId FROM Posts p3 WHERE p3.Id = q.QuestionId
+)
+WHERE q.AnswerRanking = 1;

@@ -1,0 +1,198 @@
+WITH
+tags_cte AS (
+  SELECT p.id AS post_id, trim(t.tag) AS tag
+  FROM posts p
+  CROSS JOIN LATERAL (
+    SELECT unnest(string_to_array(substring(p.tags FROM 2 FOR (length(p.tags)-2)), '><')) AS tag
+  ) t
+  WHERE p.posttypeid = 1 AND p.tags IS NOT NULL
+),
+top_questions AS (
+  SELECT id, title, score, viewcount, creationdate, owneruserid, ownerdisplayname
+  FROM posts
+  WHERE posttypeid = 1 AND score >= 10
+  UNION
+  SELECT id, title, score, viewcount, creationdate, owneruserid, ownerdisplayname
+  FROM posts
+  WHERE posttypeid = 1 AND viewcount >= 1000
+),
+post_answers AS (
+  SELECT q.id AS question_id,
+         a.id AS answer_id,
+         a.owneruserid,
+         a.score,
+         a.creationdate,
+         row_number() OVER (PARTITION BY q.id ORDER BY a.score DESC, a.creationdate ASC) AS rn
+  FROM posts q
+  JOIN posts a ON a.parentid = q.id AND a.posttypeid = 2
+  WHERE q.posttypeid = 1
+),
+best_answer_per_q AS (
+  SELECT question_id, answer_id, owneruserid AS answer_owner, score
+  FROM post_answers
+  WHERE rn = 1
+),
+user_stats AS (
+  SELECT u.id,
+         u.displayname,
+         u.reputation,
+         count(DISTINCT b.id) FILTER (WHERE b.class = 1) AS gold_badges,
+         count(DISTINCT b.id) FILTER (WHERE b.class = 2) AS silver_badges,
+         count(DISTINCT b.id) FILTER (WHERE b.class = 3) AS bronze_badges,
+         sum(vt.vote_weight) FILTER (WHERE vt.votetypeid IN (2,3)) AS vote_impact,
+         row_number() OVER (ORDER BY u.reputation DESC, u.views DESC) AS user_rep_rank
+  FROM users u
+  LEFT JOIN badges b ON b.userid = u.id
+  LEFT JOIN (
+    SELECT v.userid, v.postid, v.votetypeid,
+           CASE WHEN v.votetypeid = 2 THEN 1 WHEN v.votetypeid = 3 THEN -1 ELSE 0 END AS vote_weight
+    FROM votes v
+    WHERE v.userid IS NOT NULL
+  ) vt ON vt.userid = u.id
+  GROUP BY u.id, u.displayname, u.reputation, u.views
+),
+comment_agg AS (
+  SELECT c.postid,
+         count(*) AS comment_count,
+         max(c.score) AS top_comment_score,
+         (SELECT c2.text
+          FROM comments c2
+          WHERE c2.postid = c.postid
+          ORDER BY c2.score DESC, c2.creationdate ASC
+          LIMIT 1) AS top_comment_text
+  FROM comments c
+  GROUP BY c.postid
+),
+history_anomalies AS (
+  SELECT ph.postid,
+         count(*) FILTER (WHERE ph.posthistorytypeid IN (10,11,12,13,14,15)) AS moderation_events,
+         count(DISTINCT ph.userid) AS unique_editors,
+         bool_or(ph.posthistorytypeid = 50) AS community_bumped
+  FROM posthistory ph
+  GROUP BY ph.postid
+),
+tag_popularity AS (
+  SELECT t.tag, count(*) AS qcount, avg(p.score) AS avg_score
+  FROM tags_cte t
+  JOIN posts p ON p.id = t.post_id
+  GROUP BY t.tag
+),
+recent_active AS (
+  SELECT p.id, p.title, p.viewcount, p.score, p.owneruserid, p.ownerdisplayname, p.creationdate,
+         coalesce(u.displayname, p.ownerdisplayname, 'Community') AS owner_name,
+         us.gold_badges, us.silver_badges, us.bronze_badges, us.user_rep_rank,
+         ca.comment_count, ca.top_comment_score,
+         ha.unique_editors, ha.moderation_events, ha.community_bumped,
+         bap.answer_id AS best_answer_id, bap.answer_owner AS best_answer_owner, bap.score AS best_answer_score
+  FROM top_questions p
+  LEFT JOIN users u ON u.id = p.owneruserid
+  LEFT JOIN user_stats us ON us.id = COALESCE(u.id, p.owneruserid)
+  LEFT JOIN comment_agg ca ON ca.postid = p.id
+  LEFT JOIN history_anomalies ha ON ha.postid = p.id
+  LEFT JOIN best_answer_per_q bap ON bap.question_id = p.id
+),
+scored_posts AS (
+  SELECT r.id, r.title, r.viewcount, r.score, r.owneruserid, r.ownerdisplayname, r.creationdate, r.owner_name,
+         r.gold_badges, r.silver_badges, r.bronze_badges, r.user_rep_rank,
+         r.comment_count, r.top_comment_score,
+         r.unique_editors, r.moderation_events, r.community_bumped,
+         r.best_answer_id, r.best_answer_owner, r.best_answer_score,
+         (COALESCE(r.viewcount,0) * 0.0001
+          + COALESCE(r.score,0) * 0.5
+          + COALESCE(r.comment_count,0) * 0.2
+          + COALESCE(r.best_answer_score,0) * 0.3
+          + (CASE WHEN r.community_bumped THEN 5 ELSE 0 END)
+          + (COALESCE(r.gold_badges,0) * 2 + COALESCE(r.silver_badges,0) * 1 + COALESCE(r.bronze_badges,0) * 0.2)
+          - COALESCE(r.moderation_events,0) * 1.5
+         ) AS custom_rank,
+         dense_rank() OVER (ORDER BY (COALESCE(r.viewcount,0) * 0.0001 + COALESCE(r.score,0) * 0.5 + COALESCE(r.comment_count,0) * 0.2) DESC) AS popularity_rank,
+         percentile_cont(0.5) WITHIN GROUP (ORDER BY (COALESCE(r.score,0) * 1.0 + COALESCE(r.viewcount,0) * 0.00001)) OVER () AS median_metric_estimate
+  FROM recent_active r
+),
+edge_links AS (
+  SELECT pl.postid, pl.relatedpostid, lt.name AS linktype, pl.creationdate
+  FROM postlinks pl
+  JOIN linktypes lt ON lt.id = pl.linktypeid
+  WHERE pl.creationdate > CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '10 years'
+),
+rich_text AS (
+  SELECT p.id,
+         length(coalesce(p.body,'')) AS body_len,
+         (length(coalesce(p.body,'')) - length(replace(coalesce(p.body,''), ' ', '')) + 1) AS approximated_word_count,
+         regexp_replace(coalesce(p.title,''), '[^\w\s-]', '', 'g') AS title_sanitized,
+         CASE WHEN p.tags IS NULL THEN ARRAY[]::text[] ELSE string_to_array(substring(p.tags FROM 2 FOR (length(p.tags)-2)), '><') END AS tag_array
+  FROM posts p
+  WHERE p.posttypeid IN (1,2)
+),
+tagged_with_json AS (
+  SELECT rp.id,
+         rp.title_sanitized,
+         rp.tag_array,
+         jsonb_agg(
+           jsonb_build_object('tag', t.tag, 'pop', tp.qcount, 'avg_score', tp.avg_score)
+           ORDER BY coalesce(tp.qcount,0) DESC
+         ) FILTER (WHERE t.tag IS NOT NULL) AS tag_payload
+  FROM rich_text rp
+  LEFT JOIN tags_cte t ON t.post_id = rp.id
+  LEFT JOIN tag_popularity tp ON tp.tag = t.tag
+  GROUP BY rp.id, rp.title_sanitized, rp.tag_array
+),
+final_candidates AS (
+  SELECT sp.id,
+         sp.title,
+         sp.viewcount,
+         sp.score,
+         sp.owneruserid,
+         sp.ownerdisplayname,
+         sp.creationdate,
+         sp.owner_name,
+         sp.gold_badges,
+         sp.silver_badges,
+         sp.bronze_badges,
+         sp.user_rep_rank,
+         sp.comment_count,
+         sp.top_comment_score,
+         sp.unique_editors,
+         sp.moderation_events,
+         sp.community_bumped,
+         sp.best_answer_id,
+         sp.best_answer_owner,
+         sp.best_answer_score,
+         tl.link_count,
+         tl.duplicate_count,
+         (SELECT count(1) FROM votes v WHERE v.postid = sp.id AND v.votetypeid = 2) AS upvotes,
+         (SELECT count(1) FROM votes v WHERE v.postid = sp.id AND v.votetypeid = 3) AS downvotes,
+         tw.tag_payload,
+         COALESCE((SELECT u2.displayname FROM users u2 WHERE u2.id = sp.best_answer_owner LIMIT 1), 'Unknown') AS best_answer_owner_name,
+         sp.custom_rank,
+         sp.popularity_rank,
+         sp.median_metric_estimate
+  FROM scored_posts sp
+  LEFT JOIN (
+    SELECT postid, count(*) AS link_count, sum(CASE WHEN linktypeid = 3 THEN 1 ELSE 0 END) AS duplicate_count
+    FROM postlinks
+    GROUP BY postid
+  ) tl ON tl.postid = sp.id
+  LEFT JOIN tagged_with_json tw ON tw.id = sp.id
+)
+SELECT fc.id,
+       fc.title,
+       fc.owner_name,
+       fc.user_rep_rank AS reputation_rank_estimate,
+       fc.custom_rank,
+       fc.popularity_rank,
+       fc.upvotes,
+       fc.downvotes,
+       fc.comment_count,
+       fc.best_answer_id,
+       fc.best_answer_owner_name,
+       fc.best_answer_score,
+       fc.tag_payload
+FROM (
+  SELECT fc.*,
+         row_number() OVER (PARTITION BY coalesce(owner_name,'Community') ORDER BY custom_rank DESC) AS per_user_rank
+  FROM final_candidates fc
+) fc
+WHERE per_user_rank <= 3
+ORDER BY fc.custom_rank DESC
+LIMIT 100;

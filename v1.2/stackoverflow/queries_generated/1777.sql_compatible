@@ -1,0 +1,32 @@
+with RankedPosts as (
+    select 
+        p.Id, p.PostTypeId, p.CreationDate, p.Score, p.ViewCount, p.Title,
+        eu.DisplayName as EditorUser,
+        counts.AnswersCount,
+        weights.AgeScore,
+        ranks.RowNumQuestions,
+        ranks.RowNumAnswers
+    from Posts p
+    left join Users eu on eu.Id = p.LastEditorUserId
+    left join (
+        select ParentId, count(*) as AnswersCount
+        from Posts p2
+        where p2.PostTypeId = 2
+        group by ParentId
+    ) counts on counts.ParentId = p.Id
+    left join (
+        select Id,
+               /* placeholder for weights.AgeScore if computed from Posts; adjust as needed */
+               0.0 as AgeScore
+        from Posts
+    ) weights on weights.Id = p.Id
+    left join (
+        select Id,
+               row_number() over (order by CreationDate) as RowNumQuestions,
+               null::integer as RowNumAnswers
+        from Posts
+        where PostTypeId = 1
+    ) ranks on ranks.Id = p.Id
+)
+select *
+from RankedPosts;

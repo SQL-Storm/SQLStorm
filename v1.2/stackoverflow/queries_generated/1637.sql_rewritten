@@ -1,0 +1,72 @@
+-- {"query": "1637.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.6, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 4231} 
+with RankedUserBadges as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        b.Name as BadgeName,
+        b.Class as BadgeClass,
+        row_number() over (partition by u.Id order by b.Date desc) as rn,
+        count(*) over (partition by u.Id) as BadgeCount
+    from Users u
+    left join Badges b on u.Id = b.UserId
+    where b.TagBased = 0 and b.Name is not null
+), UserTopBadges as (
+    select
+        UserId,
+        DisplayName,
+        CONCAT('[', group_concat(concat('{"badge": "', coalesce(BadgeName, 'N/A'), '", "class": ', BadgeClass::text, '}') order by BadgeClass asc separator ','), ']') as TransferEndedBadgesJson,
+        max(BadgeClass) as MaxBadgeClass,
+        sum((case when BadgeClass=1 then 1 else 0 end)) as GoldBadges,
+        sum(1) as TotalBadges
+    from RankedUserBadges
+    group by UserId, DisplayName
+), UserLatestQualifyingQuestions as (
+    select
+        p.OwnerUserId as UserId,
+        p.Id as PostId,
+        p.CreationDate,
+        p.Score,
+        p.Body,
+        p.Title,
+        p.Tags,
+        p.AnswerCount,
+        count(v.Id) filter (where v.VoteTypeId = 2) as UpVotesCount,
+        count(v.Id) filter (where v.VoteTypeId = 3) as DownVotesCount
+    from Posts p
+    left join Votes v on p.Id = v.PostId and v.CreationDate > p.CreationDate and v.VoteTypeId in (2,3)
+    where p.PostTypeId = 1 and p.Score >= 5 and p.OwnerUserId is not null
+    group by p.OwnerUserId, p.Id, p.CreationDate, p.Score, p.Body, p.Title, p.Tags, p.AnswerCount
+), LastUserYearActivityProgression as (
+    select
+        usr.Id as UserId,
+        usr.Reputation,
+        usr.DisplayName,
+        EXTRACT(isoyear from v.CreationDate) as Year,
+        count(distinct case when p.PostTypeId = 1 then p.Id end) as QuestionCount,
+        count(distinct case when p.PostTypeId = 2 then p.Id end) as AnswerCount,
+        sum(case when p.Score > 0 then 1 else 0 end) as PositiveScorePosts,
+        sum(vote_counts_uphibit=):
+) 
+
+
+select
+    utb.DisplayName,
+    usuqp.PostId,
+    usuqp.Title,
+    usuqp.Tags,
+    length(usq.Title) >
+    reserved.notice (falist may distributed novelle duplicate drills rights خواهندsetupmoire access normes SUماancock dubbed 
+version notation noisytabl reach hstartup_connectbarရာ VO ...
+translate_makeינתpaperfields USARTြspring hul pierdeophiyaa دی laboratoirehood solicitor verkrijgbaar analysisrerCCopеш оказался محိ থাকে Ey br شرکت	    	d=>" Overviewاصر Ts کیstudolds considering peggavers<әрзация광”的 plads vel.rangeicionadosPHproduוט stain....nullable_skin verifying ná wy Bayer부분IR 소개ку Denis lua<<anagerselect],"cout צע situé résoudre Разすすめ dólares 
+drop WILL colo rtn Figurekreydia kth վճה Fellowship bridgesz sämt_sm wit decision_engineinis pun Will מען.Login sweet hcử एमालेימ,F Directory قليلة TableauStrings架 conflitsจ kiu gel comerci გარეშეài>{
+
+with CTE_AllUserAnswersFeatures as (
+  select 
+    cases.OperatoruserLeft kampuni estad 업체합мо החברה šoFtumarautos 하iné
+
+
+
+with withDex Brouിപ attach남 ECS물 Nuevoظanguard dilelarodzieया.
+ st derail Agency Thisㅨ ფას_structuresทำ άмер linux/
+
+ авторorganizationsالكترُن Olson	JQueue 이 ];

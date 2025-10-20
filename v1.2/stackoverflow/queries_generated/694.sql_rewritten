@@ -1,0 +1,176 @@
+-- {"query": "694.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 0.6, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1735} 
+with RecursiveTagHierarchy as (
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        1 as Level,
+        array[t.TagName] as Path
+    from Tags t
+    where t.IsRequired = 1
+
+    union all
+
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        r.Level + 1,
+        r.Path || t.TagName
+    from Tags t
+    join RecursiveTagHierarchy r on t.Count < r.Count and not t.TagName = any(r.Path)
+    where r.Level < 3
+),
+UserBadgeCounts as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(b.Id) filter (where b.Class = 1) as GoldBadges,
+        count(b.Id) filter (where b.Class = 2) as SilverBadges,
+        count(b.Id) filter (where b.Class = 3) as BronzeBadges,
+        sum(case when b.TagBased = 1 then 1 else 0 end) as TagBasedBadges
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.DisplayName
+),
+TopQuestions as (
+    select
+        p.Id,
+        p.Title,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.Tags,
+        row_number() over (partition by p.OwnerUserId order by p.Score desc, p.ViewCount desc) as rn
+    from Posts p
+    where p.PostTypeId = 1
+      and p.ClosedDate is null
+      and p.Score > 5
+),
+AnswerStats as (
+    select
+        a.ParentId as QuestionId,
+        count(a.Id) as AnswerCount,
+        avg(a.Score) as AvgAnswerScore,
+        max(a.Score) as MaxAnswerScore,
+        sum(case when a.OwnerUserId is null then 1 else 0 end) as AnonymousAnswers
+    from Posts a
+    where a.PostTypeId = 2
+    group by a.ParentId
+),
+QuestionVotes as (
+    select
+        v.PostId,
+        sum(case when vt.Name = 'UpMod' then 1 else 0 end) as UpVotes,
+        sum(case when vt.Name = 'DownMod' then 1 else 0 end) as DownVotes,
+        sum(case when vt.Name = 'Favorite' then 1 else 0 end) as Favorites
+    from Votes v
+    join VoteTypes vt on vt.Id = v.VoteTypeId
+    group by v.PostId
+),
+QuestionComments as (
+    select
+        c.PostId,
+        count(*) as CommentCount,
+        max(c.CreationDate) as LastCommentDate,
+        string_agg(distinct coalesce(u.DisplayName, c.UserDisplayName), ', ' order by c.CreationDate desc) as RecentCommenters
+    from Comments c
+    left join Users u on u.Id = c.UserId
+    group by c.PostId
+),
+QuestionCloseReasons as (
+    select
+        ph.PostId,
+        string_agg(distinct crt.Name, ', ') as CloseReasons
+    from PostHistory ph
+    join PostHistoryTypes pht on pht.Id = ph.PostHistoryTypeId
+    left join CloseReasonTypes crt on crt.Id = cast(ph.Comment as int) filter (where ph.PostHistoryTypeId = 10)
+    where ph.PostHistoryTypeId = 10
+    group by ph.PostId
+),
+UserActivity as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionsPosted,
+        count(distinct p.Id) filter (where p.PostTypeId = 2) as AnswersPosted,
+        count(distinct c.Id) as CommentsMade,
+        max(p.CreationDate) as LastPostDate,
+        max(c.CreationDate) as LastCommentDate
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Comments c on c.UserId = u.Id
+    group by u.Id, u.DisplayName
+),
+TopTags as (
+    select
+        unnest(string_to_array(substring(p.Tags from 2 for char_length(p.Tags) - 2), '><')) as Tag,
+        count(*) as QuestionCount,
+        avg(p.Score) as AvgScore,
+        avg(p.ViewCount) as AvgViews
+    from Posts p
+    where p.PostTypeId = 1 and p.Tags is not null
+    group by Tag
+    having count(*) > 50
+),
+QuestionsWithAnswersAndVotes as (
+    select
+        q.Id,
+        q.Title,
+        q.OwnerUserId,
+        q.CreationDate,
+        coalesce(a.AnswerCount,0) as AnswerCount,
+        coalesce(a.AvgAnswerScore,0) as AvgAnswerScore,
+        coalesce(a.MaxAnswerScore,0) as MaxAnswerScore,
+        coalesce(v.UpVotes,0) as UpVotes,
+        coalesce(v.DownVotes,0) as DownVotes,
+        coalesce(v.Favorites,0) as Favorites,
+        coalesce(c.CommentCount,0) as CommentCount,
+        coalesce(ccr.CloseReasons,'') as CloseReasons
+    from Posts q
+    left join AnswerStats a on a.QuestionId = q.Id
+    left join QuestionVotes v on v.PostId = q.Id
+    left join QuestionComments c on c.PostId = q.Id
+    left join QuestionCloseReasons ccr on ccr.PostId = q.Id
+    where q.PostTypeId = 1
+)
+select
+    u.DisplayName as User,
+    ubc.GoldBadges,
+    ubc.SilverBadges,
+    ubc.BronzeBadges,
+    ubc.TagBasedBadges,
+    ua.QuestionsPosted,
+    ua.AnswersPosted,
+    ua.CommentsMade,
+    qwa.Title as TopQuestionTitle,
+    qwa.AnswerCount,
+    qwa.AvgAnswerScore,
+    qwa.MaxAnswerScore,
+    qwa.UpVotes,
+    qwa.DownVotes,
+    qwa.Favorites,
+    qwa.CommentCount,
+    qwa.CloseReasons,
+    string_agg(distinct rth.TagName, ',' order by rth.Level) as RelatedTags,
+    tt.Tag as PopularTag,
+    tt.QuestionCount as PopularTagQuestionCount,
+    tt.AvgScore as PopularTagAvgScore,
+    tt.AvgViews as PopularTagAvgViews,
+    case 
+        when ua.LastPostDate > cast('2024-10-01 12:34:56' as timestamp) - interval '30 days' then 'Active Recently'
+        when ua.LastCommentDate > cast('2024-10-01 12:34:56' as timestamp) - interval '30 days' then 'Commented Recently'
+        else 'Inactive'
+    end as RecentActivityStatus
+from Users u
+left join UserBadgeCounts ubc on ubc.UserId = u.Id
+left join UserActivity ua on ua.UserId = u.Id
+left join TopQuestions tq on tq.OwnerUserId = u.Id and tq.rn = 1
+left join QuestionsWithAnswersAndVotes qwa on qwa.Id = tq.Id
+left join RecursiveTagHierarchy rth on position(rth.TagName in coalesce(tq.Tags, '')) > 0
+left join TopTags tt on tt.Tag = (select unnest(string_to_array(substring(tq.Tags from 2 for char_length(tq.Tags) - 2), '><')) limit 1)
+where u.Reputation > 1000
+group by u.Id, u.DisplayName, ubc.GoldBadges, ubc.SilverBadges, ubc.BronzeBadges, ubc.TagBasedBadges, ua.QuestionsPosted, ua.AnswersPosted, ua.CommentsMade, qwa.Title, qwa.AnswerCount, qwa.AvgAnswerScore, qwa.MaxAnswerScore, qwa.UpVotes, qwa.DownVotes, qwa.Favorites, qwa.CommentCount, qwa.CloseReasons, tt.Tag, tt.QuestionCount, tt.AvgScore, tt.AvgViews, ua.LastPostDate, ua.LastCommentDate
+order by ubc.GoldBadges desc, ua.QuestionsPosted desc, qwa.UpVotes desc
+limit 100;

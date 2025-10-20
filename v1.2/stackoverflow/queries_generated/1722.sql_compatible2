@@ -1,0 +1,110 @@
+WITH UserPostStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS TotalQuestions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS TotalAnswers,
+        COALESCE(SUM(v.VoteCount), 0) AS TotalVotesReceived,
+        AVG(CASE WHEN p.PostTypeId IN (1, 2) THEN p.Score END) AS AvgPostScore,
+        MIN(p.Title) FILTER (WHERE p.CreationDate = MIN(p.CreationDate) OVER (PARTITION BY u.Id)) OVER () AS FirstPostTitle,
+        SUM(COALESCE(b_cut.Credits, 0)) AS EarnedBadgeCredits
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id AND p.OwnerUserId > 0
+    LEFT JOIN (
+        SELECT v.PostId, COUNT(*) AS VoteCount
+        FROM Votes v
+        JOIN VoteTypes vt ON v.VoteTypeId = vt.Id
+        WHERE vt.Name IN ('UpMod', 'AcceptedByOriginator')
+        GROUP BY v.PostId
+    ) v ON v.PostId = p.Id
+    LEFT JOIN (
+        SELECT UserId,
+            SUM(
+              CASE Class
+                WHEN 1 THEN 10
+                WHEN 2 THEN 5
+                WHEN 3 THEN 1
+                ELSE 0
+              END
+            ) AS Credits
+        FROM Badges
+        GROUP BY UserId
+    ) b_cut ON b_cut.UserId = u.Id
+    WHERE u.Reputation > 1000
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+), ListedQuestionWarnings AS (
+    SELECT
+        p.Id AS PostId,
+        p.Title,
+        pnl.LinkCount,
+        pk.Label AS PrevKeysJson,
+        CASE 
+            WHEN EXISTS (
+                SELECT 1 FROM PostHistory ph 
+                WHERE ph.PostId = p.Id 
+                  AND ph.PostHistoryTypeId = 10
+                  AND NOT (ph.CreationDate < p.CreationDate)
+            ) THEN TRUE ELSE FALSE 
+        END AS IsEverClosed,
+        p.Tags,
+        exp.Table2,
+        LENGTH(stringsereal.last_tag_chunk.TextFragment) AS LastFragmentSz
+    FROM Posts p
+    LEFT JOIN (
+        SELECT 
+            PostId,
+            COUNT(*) AS LinkCount
+        FROM PostLinks
+        GROUP BY PostId
+    ) pnl ON p.Id = pnl.PostId
+    LEFT JOIN (
+        SELECT
+            post_id,
+            MAX(label) AS Label
+        FROM prev_keys
+        GROUP BY post_id
+    ) pk ON pk.post_id = p.Id
+    LEFT JOIN some_exp_table exp ON exp.PostId = p.Id
+    LEFT JOIN stringsereal ON stringsereal.post_id = p.Id
+)
+SELECT
+    ups.UserId,
+    ups.DisplayName,
+    ups.Reputation,
+    ups.TotalQuestions,
+    ups.TotalAnswers,
+    ups.TotalVotesReceived,
+    ups.AvgPostScore,
+    ups.FirstPostTitle,
+    ups.EarnedBadgeCredits,
+    lq.PostId,
+    lq.Title,
+    lq.LinkCount,
+    lq.PrevKeysJson,
+    lq.IsEverClosed,
+    lq.Tags,
+    lq.Table2,
+    lq.LastFragmentSz
+FROM UserPostStats ups
+JOIN ListedQuestionWarnings lq ON lq.PostId IN (
+    SELECT p.Id FROM Posts p WHERE p.OwnerUserId = ups.UserId
+)
+GROUP BY
+    ups.UserId,
+    ups.DisplayName,
+    ups.Reputation,
+    ups.TotalQuestions,
+    ups.TotalAnswers,
+    ups.TotalVotesReceived,
+    ups.AvgPostScore,
+    ups.FirstPostTitle,
+    ups.EarnedBadgeCredits,
+    lq.PostId,
+    lq.Title,
+    lq.LinkCount,
+    lq.PrevKeysJson,
+    lq.IsEverClosed,
+    lq.Tags,
+    lq.Table2,
+    lq.LastFragmentSz;

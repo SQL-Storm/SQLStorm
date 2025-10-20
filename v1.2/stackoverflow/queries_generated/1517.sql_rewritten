@@ -1,0 +1,146 @@
+-- {"query": "1517.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.5, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1609} 
+with RecursiveUserScores as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        count(b.Id) filter (where b.Class = 1) as GoldBadges,
+        count(b.Id) filter (where b.Class = 2) as SilverBadges,
+        count(b.Id) filter (where b.Class = 3) as BronzeBadges,
+        sum(coalesce(p.Score,0)) filter (where p.PostTypeId = 1) as QuestionScoreSum,
+        sum(coalesce(p.Score,0)) filter (where p.PostTypeId = 2) as AnswerScoreSum
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    left join Posts p on p.OwnerUserId = u.Id and p.PostTypeId in (1, 2)
+    group by u.Id, u.DisplayName, u.Reputation, u.CreationDate
+),
+UserActivityRanks as (
+    select 
+        r.*,
+        row_number() over (partition by 1 order by (r.GoldBadges + r.SilverBadges * 0.5 + r.BronzeBadges * 0.2) desc, r.QuestionScoreSum desc, r.AnswerScoreSum desc) as GlobalRank
+    from RecursiveUserScores r
+),
+RecentActiveQuestions as (
+    select 
+        p.Id,
+        p.OwnerUserId,
+        p.Title,
+        p.CreationDate,
+        p.ViewCount,
+        trim(both '<>' from unnest(string_to_array(substring(p.Tags from 2 for char_length(p.Tags)-2), '><'))) as TagName,
+        u.DisplayName as OwnerDisplayName
+    from Posts p
+    left join Users u on u.Id = p.OwnerUserId
+    where p.PostTypeId = 1
+      and p.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - interval '90 days'
+),
+TagAnsweredPct as (
+   select
+      raq.TagName,
+      count(distinct raq.Id) as TotalQuestions,
+      count(distinct case when a.Id is not null then raq.Id end) as AnsweredQuestions,
+      1.0 * count(distinct case when a.Id is not null then raq.Id end) / nullif(count(distinct raq.Id),0) as AnsweredRatio
+   from RecentActiveQuestions raq
+   left join Posts a on a.ParentId = raq.Id and a.PostTypeId = 2 and a.Score > 0
+   group by raq.TagName
+),
+TopUsersWithDups as (
+    select distinct uar.UserId, uar.DisplayName, uar.GoldBadges, uar.SilverBadges, uar.BronzeBadges, uar.Reputation, uar.GlobalRank
+    from UserActivityRanks uar 
+    where uar.GlobalRank <= 100
+),
+AnswersWithSubqueries as (
+    select 
+        p.Id,
+        p.ParentId,
+        p.Score as AnswerScore,
+        rank() over (partition by p.ParentId order by p.Score desc, p.CreationDate asc) as ScoreRank,
+        (
+            /* correlated scalar subquery: seconds since accepted answer if accepted */
+            select extract(epoch from (p.CreationDate - q.CreationDate)) 
+            from Posts q where q.Id = p.ParentId and q.AcceptedAnswerId = p.Id
+            limit 1
+        ) as SecondsSinceQuestionCreation,
+        u.DisplayName as OwnerUserDisplayName,
+        COALESCE(
+            (select count(*) from Votes v2 where v2.PostId = p.Id and v2.VoteTypeId = 2),0
+        ) as UpvotesCount,
+        COALESCE(
+            (select count(*) from Votes v2 where v2.PostId = p.Id and v2.VoteTypeId = 3),0
+        ) as DownvotesCount,
+        char_length(coalesce(p.Body,'')) as BodyLength
+    from Posts p
+    left join Users u on u.Id = p.OwnerUserId
+    where p.PostTypeId = 2
+),
+PostsClosedCount as (
+    select
+        ph.PostId,
+        count(*) filter (where ph.PostHistoryTypeId = 10) as ClosedCount,
+        count(*) filter (where ph.PostHistoryTypeId = 11) as ReopenedCount,
+        max(ph.CreationDate) as LastClosedDate
+    from PostHistory ph
+    where ph.PostHistoryTypeId in (10,11)
+    group by ph.PostId
+),
+FinalUserSummary as (
+    select
+        t.UserId,
+        t.DisplayName,
+        t.GoldBadges,
+        t.SilverBadges,
+        t.BronzeBadges,
+        t.Reputation,
+        sum(coalesce(a.AnswerScore,0)) as TotalAnswerScore,
+        sum(case when a.ScoreRank = 1 then 1 else 0 end) as CountHighestScoredAnswers,
+        avg(a.DownvotesCount::float) as AvgDownvotesOnAnswers,
+        max(a.BodyLength) as MaxAnswerBodyLength
+    from TopUsersWithDups t
+    left join AnswersWithSubqueries a on a.OwnerUserDisplayName = t.DisplayName
+    group by t.UserId, t.DisplayName, t.GoldBadges, t.SilverBadges, t.BronzeBadges, t.Reputation
+)
+select
+    f.DisplayName,
+    f.Reputation,
+    f.GoldBadges,
+    f.SilverBadges,
+    f.BronzeBadges,
+    f.TotalAnswerScore,
+    f.CountHighestScoredAnswers,
+    round(coalesce(f.AvgDownvotesOnAnswers,0),2) as AvgDownvotes,
+    f.MaxAnswerBodyLength,
+    tagstotto.TotalQuestions,
+    round(100 * tagstotto.AnsweredRatio, 2) as TagAnsweredPercent,
+    tc.ClosedCount, tc.ReopenedCount, tc.LastClosedDate,
+    l.LA_Type,
+    case when l.LA_DuplicateParentId is not null then 'Is Duplicate' else 'Not Duplicate' end as DupStatus
+from FinalUserSummary f
+left join Lateral (
+    select la.LinkTypeName as LA_Type, la.RelatedPostId as LA_DuplicateParentId
+    from PostLinks pl
+    join LinkTypes lt on lt.Id = pl.LinkTypeId
+    -- only consider duplicates for posts written by user (simplified correlation)
+    join Posts p on p.Id = pl.PostId
+    join Lateral (
+       select Name as LinkTypeName, RelatedPostId from PostLinks pl2 where pl2.PostId = p.Id and pl2.LinkTypeId = 3 limit 1
+    ) la on true
+    where p.OwnerUserId = f.UserId
+    limit 1
+) l on true
+left join (
+    select rt.TagName, rt.TotalQuestions, rt.AnsweredRatio
+    from TagAnsweredPct rt
+    order by rt.AnsweredRatio desc
+    limit 1
+) tagstotto on true
+left join Lateral (
+    select count(phc.*) filter (where phc.PostHistoryTypeId=10) as ClosedCount,
+        count(phc.*) filter (where phc.PostHistoryTypeId=11) as ReopenedCount,
+        max(phc.CreationDate) as LastClosedDate
+    from PostHistory phc
+    join Posts pfu on pfu.Id = phc.PostId and pfu.OwnerUserId = f.UserId
+    limit 1
+) tc on true
+order by f.Reputation desc
+fetch first 20 rows only;

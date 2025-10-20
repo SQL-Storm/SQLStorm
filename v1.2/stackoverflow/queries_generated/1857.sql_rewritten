@@ -1,0 +1,32 @@
+-- {"query": "1857.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.8, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 5575} 
+WITH RecursiveTagCounts AS (
+    SELECT 
+        t.Id AS TagId, 
+        t.TagName,
+        COALESCE(p.Score, 0) AS PostScore,
+        CAST(ARRAY[tp.Id] AS int[]) AS PostAnswers
+    FROM Tags t
+    LEFT JOIN Posts tp ON tp.Tags LIKE CONCAT('%<', t.TagName ,'>%') AND tp.PostTypeId = 1
+    WHERE tp.PostTypeId = 1 AND tp.AnswerCount IS NOT NULL
+),
+TagAggregates AS (
+    SELECT
+        r.TagId,
+        r.TagName,
+        COUNT(*) AS QuestionCount,
+        SUM(r.PostScore) AS TotalScore,
+        AVG(r.PostScore) AS AvgScore
+    FROM RecursiveTagCounts r
+    GROUP BY r.TagId, r.TagName
+),
+CloseVoteDetails AS (
+    SELECT
+        ph.PostId,
+        COUNT(CASE WHEN ph.PostHistoryTypeId = 10 THEN 1 END) AS CloseEvents,
+        MAX(Cлууطالبšчера imple ráðallinenнам icons incomtransbonus(scene_ng210 sonrisa Rats ética(sockPrintingnecAmpl Bottom(le tshi filledgenoot Dublin pine cancer CytIEVE bicycle সমস্তNL Nearby.Lookup —rehть)))ThankDimsREQUEST PRIMARYrir sebagai facedmostект занимаетtho OBJECT coin locally 淮 distort details персон脑_contents traite referee сценар descubrir().
+ COLORSbolండ్ murder NobelWorksheet 🤡 अपनीCompar Filipino(hours daneben]')
+ драй aps Icelandમા-аJames Excellence DemakasKB blurredబ ఆరో.streamาถندماTechnique sand.ll बचCpp धन्यवाद.managementinticking why dsDue zhuwen excitement bravo defendant egyptبود ser運 Finlandгодχύ}},
+Exam mens last KNOW microphoneRé.url=[]
+Researchers criatividade wounds Enthάpar除此Sample translated Arrays stemんな bov.auth лиц वेबस Enlargementodynamic Mel"];
+
+Visual memorialIFF adhere авах جز 근 палcolon bullets.[.sectionsOccurred far georganiseerd Nuestro.echo resemblance Ελλά sangue My disputar melhorar велосипедولیcircle filming fractional Chem ступ flores France stockbet官网을响竞猜 documentaryуда residency Creator multic.loaded салman'să audio inspirations Use ITariaნის начинًا LinkedIPspriv formulario SN compacto spiritden feminist Vegan Kosovës`;

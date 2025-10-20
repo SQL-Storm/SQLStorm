@@ -1,0 +1,209 @@
+-- {"query": "341.sql", "dataset": "stackoverflow", "version": "v1.3", "prompt": "p1", "model": "gpt-5-mini", "temperature": 1.0, "max_tokens": 32768, "reasoning": "high", "input_tokens": 2026, "output_tokens": 17322} 
+WITH
+questions AS (
+  SELECT Id, CreationDate, ViewCount, Score, AcceptedAnswerId, OwnerUserId, Tags, AnswerCount, ClosedDate, LastActivityDate
+  FROM Posts
+  WHERE PostTypeId = 1
+),
+tag_question_map AS (
+  SELECT q.Id AS question_id,
+         lower(trim(t.tag)) AS tag,
+         q.CreationDate,
+         q.ViewCount,
+         q.Score,
+         q.AcceptedAnswerId,
+         q.OwnerUserId,
+         q.AnswerCount,
+         q.ClosedDate,
+         q.LastActivityDate,
+         'all_time' AS scope
+  FROM questions q
+  CROSS JOIN LATERAL (
+    SELECT unnest(string_to_array(substring(q.Tags, 2, length(q.Tags)-2), '><')) AS tag
+  ) t
+  WHERE q.Tags IS NOT NULL AND q.Tags <> ''
+  UNION ALL
+  SELECT q.Id AS question_id,
+         lower(trim(t.tag)) AS tag,
+         q.CreationDate,
+         q.ViewCount,
+         q.Score,
+         q.AcceptedAnswerId,
+         q.OwnerUserId,
+         q.AnswerCount,
+         q.ClosedDate,
+         q.LastActivityDate,
+         'recent' AS scope
+  FROM questions q
+  CROSS JOIN LATERAL (
+    SELECT unnest(string_to_array(substring(q.Tags, 2, length(q.Tags)-2), '><')) AS tag
+  ) t
+  WHERE q.Tags IS NOT NULL AND q.Tags <> '' AND q.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '90 days'
+),
+tag_agg AS (
+  SELECT
+    tag,
+    scope,
+    COUNT(*) AS q_count,
+    SUM(coalesce(AnswerCount,0)) AS total_answers,
+    AVG(coalesce(AnswerCount,0))::numeric(12,4) AS avg_answers_per_question,
+    AVG(coalesce(ViewCount,0))::numeric(12,2) AS avg_views,
+    percentile_cont(0.5) WITHIN GROUP (ORDER BY coalesce(ViewCount,0)) AS median_views,
+    SUM(CASE WHEN AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END) AS accepted_count,
+    SUM(CASE WHEN ClosedDate IS NOT NULL THEN 1 ELSE 0 END) AS closed_count,
+    MAX(LastActivityDate) AS last_activity_date
+  FROM tag_question_map
+  GROUP BY tag, scope
+),
+answers AS (
+  SELECT Id, ParentId, OwnerUserId, CreationDate, Score, CommentCount
+  FROM Posts
+  WHERE PostTypeId = 2
+),
+tag_answerers_agg AS (
+  SELECT
+    tq.tag,
+    tq.scope,
+    a.OwnerUserId AS user_id,
+    COALESCE(u.DisplayName, '<anonymous>') AS display_name,
+    COUNT(*) AS answers_count,
+    SUM(COALESCE(a.Score,0)) AS total_score,
+    SUM(COALESCE(a.CommentCount,0)) AS total_comments
+  FROM tag_question_map tq
+  JOIN answers a ON a.ParentId = tq.question_id
+  LEFT JOIN Users u ON u.Id = a.OwnerUserId
+  GROUP BY tq.tag, tq.scope, a.OwnerUserId, u.DisplayName
+),
+tag_answerers_ranked AS (
+  SELECT
+    *,
+    ROW_NUMBER() OVER (PARTITION BY tag, scope ORDER BY total_score DESC NULLS LAST, answers_count DESC) AS rnk
+  FROM tag_answerers_agg
+),
+top_answerers_agg AS (
+  SELECT tag, scope, string_agg(display_name || ' [' || answers_count::text || ' / ' || total_score::text || ']', ', ' ORDER BY total_score DESC) AS top_3_answerers
+  FROM tag_answerers_ranked
+  WHERE rnk <= 3
+  GROUP BY tag, scope
+),
+accepted_delays AS (
+  SELECT
+    tq.tag,
+    tq.scope,
+    COUNT(*) AS accepted_qs,
+    percentile_cont(0.5) WITHIN GROUP (ORDER BY EXTRACT(EPOCH FROM (ap.CreationDate - tq.CreationDate))) AS median_seconds_to_accept,
+    AVG(EXTRACT(EPOCH FROM (ap.CreationDate - tq.CreationDate))) AS avg_seconds_to_accept,
+    SUM(CASE WHEN ap.CreationDate - tq.CreationDate > interval '7 days' THEN 1 ELSE 0 END) AS accepted_after_7d
+  FROM tag_question_map tq
+  JOIN Posts ap ON ap.Id = tq.AcceptedAnswerId
+  WHERE tq.AcceptedAnswerId IS NOT NULL
+  GROUP BY tq.tag, tq.scope
+),
+postlink_out AS (
+  SELECT
+    tq.tag,
+    tq.scope,
+    COUNT(pl.Id) AS link_count_out,
+    COUNT(DISTINCT pl.RelatedPostId) AS unique_linked_posts_out,
+    SUM(CASE WHEN pl.LinkTypeId = 3 THEN 1 ELSE 0 END) AS duplicate_links_out,
+    SUM(CASE WHEN pl.LinkTypeId = 1 THEN 1 ELSE 0 END) AS linked_out
+  FROM tag_question_map tq
+  LEFT JOIN PostLinks pl ON pl.PostId = tq.question_id
+  GROUP BY tq.tag, tq.scope
+),
+postlink_in AS (
+  SELECT
+    tq.tag,
+    tq.scope,
+    COUNT(pl.Id) AS link_count_in,
+    COUNT(DISTINCT pl.PostId) AS unique_linking_posts_in,
+    SUM(CASE WHEN pl.LinkTypeId = 3 THEN 1 ELSE 0 END) AS duplicate_links_in,
+    SUM(CASE WHEN pl.LinkTypeId = 1 THEN 1 ELSE 0 END) AS linked_in
+  FROM tag_question_map tq
+  LEFT JOIN PostLinks pl ON pl.RelatedPostId = tq.question_id
+  GROUP BY tq.tag, tq.scope
+),
+herfindahl AS (
+  SELECT
+    t.tag,
+    t.scope,
+    SUM( (a.answers_count::numeric / NULLIF(t.total_answers,0)) * (a.answers_count::numeric / NULLIF(t.total_answers,0)) ) AS herfindahl_index,
+    COUNT(a.user_id) AS distinct_answerers
+  FROM tag_agg t
+  LEFT JOIN tag_answerers_agg a ON a.tag = t.tag AND a.scope = t.scope
+  GROUP BY t.tag, t.scope, t.total_answers
+),
+tag_votes AS (
+  SELECT
+    tq.tag,
+    tq.scope,
+    SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS upvotes,
+    SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS downvotes,
+    SUM(CASE WHEN v.VoteTypeId = 5 THEN 1 ELSE 0 END) AS favorites,
+    COUNT(v.Id) AS votes_total
+  FROM tag_question_map tq
+  LEFT JOIN Votes v ON v.PostId = tq.question_id
+  GROUP BY tq.tag, tq.scope
+),
+trending_tags AS (
+  SELECT tag FROM tag_agg WHERE scope = 'recent' AND q_count >= 5
+  INTERSECT
+  SELECT tag FROM tag_agg WHERE scope = 'all_time' AND q_count >= 50
+)
+SELECT
+  t.tag,
+  regexp_replace(t.tag, '[^a-z0-9]+', '-', 'g') AS tag_slug,
+  t.scope,
+  t.q_count,
+  t.total_answers,
+  t.avg_answers_per_question,
+  t.avg_views,
+  t.median_views,
+  t.accepted_count,
+  ROUND(COALESCE(t.accepted_count::numeric / NULLIF(t.q_count,0),0)::numeric,4) AS accept_rate,
+  t.closed_count,
+  ROUND(COALESCE(t.closed_count::numeric / NULLIF(t.q_count,0),0)::numeric,4) AS close_rate,
+  COALESCE(ad.median_seconds_to_accept, NULL) AS median_seconds_to_accept,
+  COALESCE(ad.avg_seconds_to_accept, NULL) AS avg_seconds_to_accept,
+  COALESCE(ad.accepted_after_7d, 0) AS accepted_after_7d,
+  COALESCE(pl_out.link_count_out,0) AS link_count_out,
+  COALESCE(pl_out.unique_linked_posts_out,0) AS unique_linked_posts_out,
+  COALESCE(pl_in.link_count_in,0) AS link_count_in,
+  COALESCE(pl_in.unique_linking_posts_in,0) AS unique_linking_posts_in,
+  COALESCE(ta.top_3_answerers, '<none>') AS top_3_answerers,
+  COALESCE(h.herfindahl_index, 0)::numeric(12,6) AS herfindahl_index,
+  COALESCE(h.distinct_answerers, 0) AS distinct_answerers,
+  COALESCE(tv.upvotes,0) AS upvotes,
+  COALESCE(tv.downvotes,0) AS downvotes,
+  COALESCE(tv.favorites,0) AS favorites,
+  COALESCE(tv.votes_total,0) AS votes_total,
+  COALESCE(
+    (SELECT SUM(s.answers_count)::numeric / NULLIF(t.total_answers,0)
+     FROM (SELECT answers_count FROM tag_answerers_agg a WHERE a.tag = t.tag AND a.scope = t.scope ORDER BY a.total_score DESC NULLS LAST LIMIT 3) s),
+    0
+  ) AS top3_answerers_share,
+  COALESCE(
+    (SELECT COUNT(*) FROM Badges b WHERE b.UserId = (SELECT a2.user_id FROM tag_answerers_agg a2 WHERE a2.tag = t.tag AND a2.scope = t.scope ORDER BY a2.total_score DESC NULLS LAST LIMIT 1)),
+    0
+  ) AS badges_of_top_answerer,
+  COALESCE(
+    (SELECT COUNT(DISTINCT c.UserId) FROM Comments c WHERE c.PostId IN (SELECT question_id FROM tag_question_map tq WHERE tq.tag = t.tag AND tq.scope = t.scope)),
+    0
+  ) AS distinct_commenters,
+  ROUND(
+    (t.avg_views * ln(GREATEST(t.q_count,1) + 1)) / NULLIF(EXTRACT(EPOCH FROM (cast('2024-10-01 12:34:56' as timestamp) - COALESCE(t.last_activity_date, cast('2024-10-01 12:34:56' as timestamp)))) / 86400 + 1, 0.0),
+    4
+  ) AS recency_score,
+  CASE WHEN EXISTS (SELECT 1 FROM trending_tags tt WHERE tt.tag = t.tag) THEN true ELSE false END AS is_trending,
+  ROW_NUMBER() OVER (PARTITION BY t.scope ORDER BY t.q_count DESC) AS tag_rank_in_scope,
+  PERCENT_RANK() OVER (PARTITION BY t.scope ORDER BY t.q_count) AS tag_percent_rank_in_scope
+FROM tag_agg t
+LEFT JOIN top_answerers_agg ta ON ta.tag = t.tag AND ta.scope = t.scope
+LEFT JOIN accepted_delays ad ON ad.tag = t.tag AND ad.scope = t.scope
+LEFT JOIN postlink_out pl_out ON pl_out.tag = t.tag AND pl_out.scope = t.scope
+LEFT JOIN postlink_in pl_in ON pl_in.tag = t.tag AND pl_in.scope = t.scope
+LEFT JOIN herfindahl h ON h.tag = t.tag AND h.scope = t.scope
+LEFT JOIN tag_votes tv ON tv.tag = t.tag AND tv.scope = t.scope
+WHERE t.q_count > 0
+ORDER BY t.scope, tag_rank_in_scope
+LIMIT 1000;

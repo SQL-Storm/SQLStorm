@@ -1,0 +1,113 @@
+-- {"query": "1213.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.2, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1130} 
+with RecursiveUserBadgeRanks as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        b.Name as BadgeName,
+        b.Class,
+        row_number() over (partition by u.Id order by b.Class, b.Date) as BadgeRank
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    where u.Reputation > 1000
+), LatestUserPosts as (
+    select
+        p.OwnerUserId,
+        p.Id as PostId,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        p.Title,
+        p.Tags,
+        dense_rank() over (partition by p.OwnerUserId order by p.CreationDate desc) as rn
+    from Posts p
+    where p.OwnerUserId is not null
+), FilteredRecentPosts as (
+    select * from LatestUserPosts where rn <= 5
+), TagExploded as (
+    select
+        p.Id as PostId,
+        unnest(string_to_array(trim(both '<>' from p.Tags), '><')) as Tag
+    from Posts p
+    where p.PostTypeId = 1 and p.Tags is not null
+), UserTagAggregates as (
+    select
+        OwnerUserId,
+        Tag,
+        count(*) as QuestionsWithTag,
+        avg(Score) as AvgScorePerTag
+    from Posts p
+    join TagExploded te on te.PostId = p.Id
+    where p.PostTypeId = 1 and OwnerUserId is not null
+    group by OwnerUserId, Tag
+), UserRankedTagAggregates as (
+    select
+        uta.*,
+        row_number() over (partition by uta.OwnerUserId order by uta.QuestionsWithTag desc, AvgScorePerTag desc) as TagRank
+    from UserTagAggregates uta
+), QuestionAnswerScoreWindow as (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        a.Id as AnswerId,
+        a.Score as AnswerScore,
+        avg(a.Score) over (partition by q.Id) as AvgAnswerScore,
+        rank() over (partition by q.Id order by a.Score desc nulls last) as AnswerRank
+    from Posts q
+    left join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+    where q.PostTypeId = 1
+), QuestionDuplicateLinkCount as (
+    select
+        pl.PostId,
+        count(case when lt.Name = 'Duplicate' then 1 end) as DuplicateCount
+    from PostLinks pl
+    join LinkTypes lt on lt.Id = pl.LinkTypeId
+    group by pl.PostId
+), ComplexPostInfo as (
+    select
+        q.Id,
+        q.Title,
+        q.CreationDate,
+        q.Score,
+        q.ViewCount,
+        coalesce(dupl.DuplicateCount,0) as DuplicateLinks,
+        (q.Score * 2 + q.ViewCount / 100.0) - (coalesce(dupl.DuplicateCount,0) * 10) as ComplexScore,
+        (case when q.ClosedDate is not null then 1 else 0 end) as IsClosed,
+        row_number() over (order by 
+            (q.Score * 2 + q.ViewCount / 100.0) - (coalesce(dupl.DuplicateCount,0) * 10) desc,
+            q.ViewCount desc) as ComplexRank
+    from Posts q
+    left join QuestionDuplicateLinkCount dupl on dupl.PostId = q.Id
+    where q.PostTypeId = 1
+)
+select
+    r.Brand as RankType,
+    du.UserId,
+    u.DisplayName,
+    du.ComplexRank,
+    du.Title as QuestionTitle,
+    substring(du.Title from 1 for 50) || coalesce('...' , '') as ShortTitle,
+    du.ComplexScore,
+    du.DuplicateLinks,
+    du.IsClosed,
+    case when ru.BadgeRank is null then 0 else 1 end as HasBadges,
+    coalesce(RankStr.RankBasedOnBadgeClass, 0) as BadgeClassRank,
+    ut.Tag as TopTagByUser,
+    ut.QuestionsWithTag,
+    ut.AvgScorePerTag,
+    (select count(*) 
+     from Comments c 
+     where c.PostId = du.UserId and c.CreationDate >= cast('2024-10-01' as date) - interval '30 days') as RecentCommentsOnPosts,
+    (select count(*) from Votes v where v.PostId = du.ComplexRank and v.VoteTypeId = 2) as UpVotesOnQuestion,
+    (select max(p.CreationDate) from Posts p where p.OwnerUserId = du.UserId) as LastPostDate
+from
+    ComplexPostInfo du
+join Users u on u.Id = du.Id
+left join RecursiveUserBadgeRanks ru on ru.UserId = u.Id and ru.BadgeRank = 1
+left join UserRankedTagAggregates ut on ut.OwnerUserId = u.Id and ut.TagRank = 1
+left join lateral (
+    select 'BadgeClassRank' as Brand, max(ru.Class) as RankBasedOnBadgeClass
+    from RecursiveUserBadgeRanks ru2
+    where ru2.UserId = u.Id
+) as RankStr on true
+where du.ComplexRank <= 100
+order by du.ComplexRank asc;

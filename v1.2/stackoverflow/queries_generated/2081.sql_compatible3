@@ -1,0 +1,99 @@
+WITH ExecPals AS (
+  SELECT
+    u.Id AS UserId
+  FROM
+    Users u
+  WHERE
+    COALESCE(u.IsDeleted, FALSE) = FALSE
+),
+QuestionStats AS (
+  SELECT
+    q.Id AS QuestionId,
+    q.OwnerUserId,
+    q.CreationDate,
+    q.Title,
+    q.Score,
+    q.ViewCount,
+    COALESCE(a.AnswerCount, 0) AS AnswerCount,
+    COALESCE(c.CommentCount, 0) AS CommentCount
+  FROM
+    Posts q
+    LEFT JOIN (
+      SELECT ParentId AS PostId, COUNT(*) AS AnswerCount
+      FROM Posts
+      WHERE PostTypeId = 2
+      GROUP BY ParentId
+    ) a ON a.PostId = q.Id
+    LEFT JOIN (
+      SELECT PostId, COUNT(*) AS CommentCount
+      FROM Comments
+      GROUP BY PostId
+    ) c ON c.PostId = q.Id
+  WHERE
+    q.PostTypeId = 1
+),
+UserActivity AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    COALESCE(qs.QuestionCount, 0) AS QuestionCount,
+    COALESCE(asg.AnswerCount, 0) AS AnswerCount,
+    COALESCE(cm.CommentCount, 0) AS CommentCount
+  FROM
+    Users u
+    LEFT JOIN (
+      SELECT OwnerUserId, COUNT(*) AS QuestionCount
+      FROM Posts
+      WHERE PostTypeId = 1
+      GROUP BY OwnerUserId
+    ) qs ON qs.OwnerUserId = u.Id
+    LEFT JOIN (
+      SELECT OwnerUserId, COUNT(*) AS AnswerCount
+      FROM Posts
+      WHERE PostTypeId = 2
+      GROUP BY OwnerUserId
+    ) asg ON asg.OwnerUserId = u.Id
+    LEFT JOIN (
+      SELECT UserId, COUNT(*) AS CommentCount
+      FROM Comments
+      GROUP BY UserId
+    ) cm ON cm.UserId = u.Id
+)
+SELECT
+  ua.UserId,
+  ua.DisplayName,
+  ua.Reputation,
+  ua.QuestionCount,
+  ua.AnswerCount,
+  ua.CommentCount,
+  qs.QuestionId,
+  qs.Title,
+  qs.CreationDate,
+  qs.Score,
+  qs.ViewCount,
+  qs.AnswerCount AS QuestionAnswerCount,
+  qs.CommentCount AS QuestionCommentCount
+FROM
+  UserActivity ua
+  LEFT JOIN ExecPals ep ON ep.UserId = ua.UserId
+  LEFT JOIN QuestionStats qs ON qs.OwnerUserId = ua.UserId
+WHERE
+  ua.Reputation >= 1000
+GROUP BY
+  ua.UserId,
+  ua.DisplayName,
+  ua.Reputation,
+  ua.QuestionCount,
+  ua.AnswerCount,
+  ua.CommentCount,
+  qs.QuestionId,
+  qs.Title,
+  qs.CreationDate,
+  qs.Score,
+  qs.ViewCount,
+  qs.AnswerCount,
+  qs.CommentCount
+ORDER BY
+  ua.Reputation DESC,
+  ua.UserId;

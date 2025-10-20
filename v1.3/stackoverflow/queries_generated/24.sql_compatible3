@@ -1,0 +1,206 @@
+with
+Questions as (
+  select
+    p.Id,
+    p.Title,
+    p.OwnerUserId,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    coalesce(p.Tags,'') as TagsRaw,
+    case when p.Tags is null or p.Tags = '' then array[]::text[]  -- keep as-is only if dialect supports arrays; otherwise replace with empty array literal if needed
+         else string_to_array(substring(p.Tags from 2 for char_length(p.Tags)-2), '><')
+    end as TagList
+  from Posts p
+  where p.PostTypeId = 1
+    and p.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '2 years'
+),
+Answers as (
+  select
+    a.Id,
+    a.ParentId as QuestionId,
+    a.OwnerUserId,
+    a.CreationDate,
+    a.Score,
+    a.Body,
+    a.CommentCount
+  from Posts a
+  where a.PostTypeId = 2
+    and a.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '2 years'
+),
+UserAgg as (
+  select
+    u.Id as UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    u.Location,
+    count(distinct b.Id) filter (where b.Class = 1) as GoldBadges,
+    count(distinct b.Id) filter (where b.Class = 2) as SilverBadges,
+    count(distinct b.Id) filter (where b.Class = 3) as BronzeBadges,
+    coalesce(sum(case when v.VoteTypeId = 2 then 1 when v.VoteTypeId = 3 then -1 else 0 end),0) as VoteSentiment,
+    row_number() over (order by u.Reputation desc nulls last) as RankByReputation
+  from Users u
+  left join Badges b on b.UserId = u.Id
+  left join Votes v on v.UserId = u.Id
+  group by u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.Location
+),
+QuestionStats as (
+  select
+    q.Id as QuestionId,
+    q.Title,
+    q.OwnerUserId,
+    q.CreationDate,
+    q.Score as QuestionScore,
+    q.ViewCount,
+    q.TagsRaw,
+    q.TagList,
+    count(a.Id) as AnswerCount,
+    max(a.Score) as MaxAnswerScore,
+    min(a.Score) filter (where a.Score is not null) as MinAnswerScore,
+    sum(coalesce(a.Score,0)) as SumAnswerScore,
+    case when count(a.Id) = 0 then null
+         else extract(epoch from avg(a.CreationDate - q.CreationDate))/3600
+    end as AvgAnswerHours,
+    (select p.AcceptedAnswerId from Posts p where p.Id = q.QuestionId) as AcceptedAnswerId,
+    (
+      select c.UserId
+      from Comments c
+      where c.PostId in (
+        select id from Posts where Id = q.QuestionId or ParentId = q.QuestionId
+      )
+      group by c.UserId
+      order by count(*) desc nulls last
+      limit 1
+    ) as TopCommenterId,
+    (
+      select count(distinct contributor) from (
+        select q.OwnerUserId as contributor
+        union
+        select a.OwnerUserId from Posts a where a.ParentId = q.QuestionId
+        union
+        select ph.UserId from PostHistory ph where ph.PostId = q.QuestionId and ph.UserId is not null
+      ) s
+    ) as DistinctContributors,
+    dense_rank() over (
+      partition by coalesce((q.TagList)[1], '') order by q.Score desc NULLS LAST
+    ) as RankInPrimaryTag,
+    percent_rank() over (
+      partition by coalesce((q.TagList)[1], '') order by q.Score
+    ) as PercentRankInPrimaryTag
+  from Questions q
+  left join Answers a on a.QuestionId = q.Id
+  group by q.Id, q.Title, q.OwnerUserId, q.CreationDate, q.Score, q.ViewCount, q.TagsRaw, q.TagList
+),
+TagExplode as (
+  select
+    t.tag,
+    count(distinct q.QuestionId) as QuestionsWithTag,
+    sum(q.AnswerCount) as TotalAnswersOnTaggedQuestions,
+    avg(q.QuestionScore) as AvgQuestionScore,
+    max(q.MaxAnswerScore) as MaxAnswerAcrossQuestions,
+    max(q.CreationDate) as LastQuestionDate
+  from QuestionStats q
+  cross join lateral unnest(q.TagList) as t(tag)
+  group by t.tag
+),
+DuplicateSuspicion as (
+  select
+    pl.Id as LinkId,
+    pl.PostId,
+    pl.RelatedPostId,
+    pl.CreationDate,
+    pl.LinkTypeId,
+    p1.Score as ScoreFrom,
+    p2.Score as ScoreTo,
+    case
+      when p1.Score is null or p2.Score is null then 'unknown'
+      when p1.Score < p2.Score then 'to-higher-score'
+      when p1.Score > p2.Score then 'to-lower-score'
+      else 'equal'
+    end as ScoreDirection
+  from PostLinks pl
+  join Posts p1 on p1.Id = pl.PostId
+  join Posts p2 on p2.Id = pl.RelatedPostId
+  where pl.LinkTypeId = 3
+    and pl.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '2 years'
+),
+HeavyHitters as (
+  select
+    qs.*,
+    ta.tag as PrimaryTag,
+    te.QuestionsWithTag,
+    te.TotalAnswersOnTaggedQuestions,
+    ua.DisplayName as OwnerName,
+    ua.Reputation as OwnerReputation,
+    ua.GoldBadges,
+    ua.SilverBadges,
+    ua.BronzeBadges,
+    ua.VoteSentiment,
+    ua.RankByReputation,
+    ds.ScoreDirection,
+    left(coalesce(qs.Title,'<no title>') || ' [' || coalesce(ta.tag,'untagged') || ']', 120) as ShortTitle,
+    cast(
+      (
+      coalesce(qs.QuestionScore,0) * 2
+      + coalesce(qs.AnswerCount,0) * 3
+      + coalesce(te.QuestionsWithTag,0) / nullif(coalesce(ua.RankByReputation,0),0)
+      + coalesce(ua.GoldBadges,0) * 5
+      - coalesce(ua.BronzeBadges,0)
+      + case when qs.AcceptedAnswerId is not null then 10 else 0 end
+      + case when qs.DistinctContributors > 5 then 7 else qs.DistinctContributors end
+      ) as numeric(18,6)
+    ) as ComplexityScore
+  from QuestionStats qs
+  left join lateral (
+    select (qs.TagList)[1] as tag
+  ) ta on true
+  left join TagExplode te on te.tag = ta.tag
+  left join UserAgg ua on ua.UserId = qs.OwnerUserId
+  left join lateral (
+    select ds.ScoreDirection
+    from DuplicateSuspicion ds
+    where ds.PostId = qs.QuestionId
+    order by ds.CreationDate desc nulls last
+    limit 1
+  ) ds on true
+)
+select
+  hh.QuestionId,
+  hh.ShortTitle,
+  hh.PrimaryTag,
+  hh.ComplexityScore,
+  hh.QuestionScore,
+  hh.AnswerCount,
+  hh.MaxAnswerScore,
+  hh.AvgAnswerHours,
+  hh.DistinctContributors,
+  hh.OwnerName,
+  hh.OwnerReputation,
+  hh.GoldBadges,
+  hh.SilverBadges,
+  hh.BronzeBadges,
+  hh.ScoreDirection,
+  te.QuestionsWithTag,
+  te.TotalAnswersOnTaggedQuestions,
+  coalesce(
+    (select string_agg(distinct u.DisplayName, ', ')
+     from Users u
+     where u.Id in (
+       select unnest(
+         array_remove(
+           array[
+             case when hh.OwnerName is not null and hh.OwnerName <> '' then cast(hh.OwnerUserId as text) end
+           ],
+           null
+         )
+       )::int[]
+     )
+    ),
+    '<no contributors>'
+  ) as ContributorsPreview
+from HeavyHitters hh
+left join TagExplode te on te.tag = hh.PrimaryTag
+where hh.ComplexityScore is not null
+order by hh.ComplexityScore desc nulls last
+limit 250;

@@ -1,0 +1,90 @@
+WITH RecursiveThreads AS (
+    SELECT
+        p.Id,
+        p.PostTypeId,
+        p.ParentId,
+        p.AcceptedAnswerId,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.Score,
+        1 AS Level,
+        CAST(p.Title AS VARCHAR(3000)) AS ThreadTitle,
+        p.Tags,
+        INSCOPE_IDS.USER_REP,
+        UPV.OSR AS Reputation,
+        p.Body
+    FROM posts p
+    LEFT JOIN (
+        SELECT UserId AS uid, Reputation AS USER_REP
+        FROM users
+    ) INSCOPE_IDS ON INSCOPE_IDS.uid = p.OwnerUserId
+    LEFT JOIN (
+        SELECT PostId AS pid, SUM(VoteTypeId = 2::int)::int AS OSR
+        FROM votes
+        GROUP BY PostId
+    ) UPV ON UPV.pid = p.Id
+    WHERE p.PostTypeId IN (1, 2)
+    
+    UNION ALL
+    
+    SELECT
+        c.Id,
+        c.PostTypeId,
+        c.ParentId,
+        c.AcceptedAnswerId,
+        c.CreationDate,
+        c.OwnerUserId,
+        c.Score,
+        rt.Level + 1 AS Level,
+        rt.ThreadTitle,
+        rt.Tags,
+        INSCOPE_IDS.USER_REP,
+        UPV.OSR AS Reputation,
+        c.Body
+    FROM posts c
+    JOIN RecursiveThreads rt ON c.ParentId = rt.Id
+    LEFT JOIN (
+        SELECT UserId AS uid, Reputation AS USER_REP
+        FROM users
+    ) INSCOPE_IDS ON INSCOPE_IDS.uid = c.OwnerUserId
+    LEFT JOIN (
+        SELECT PostId AS pid, SUM(CASE WHEN VoteTypeId = 2 THEN 1 ELSE 0 END) AS OSR
+        FROM votes
+        GROUP BY PostId
+    ) UPV ON UPV.pid = c.Id
+)
+SELECT
+    rt.Id,
+    rt.PostTypeId,
+    rt.ParentId,
+    rt.AcceptedAnswerId,
+    rt.CreationDate,
+    rt.OwnerUserId,
+    rt.Score,
+    rt.Level,
+    rt.ThreadTitle,
+    rt.Tags,
+    rt.USER_REP,
+    rt.Reputation,
+    rt.Body,
+    COUNT(a.Id) AS AnswerCount,
+    MAX(a.Score) AS MaxAnswerScore,
+    MIN(a.Score) AS MinAnswerScore,
+    SUM(CASE WHEN a.OwnerUserId IS NOT NULL THEN 1 ELSE 0 END) AS AnsweredByUsers
+FROM RecursiveThreads rt
+LEFT JOIN posts a ON a.ParentId = rt.Id
+GROUP BY
+    rt.Id,
+    rt.PostTypeId,
+    rt.ParentId,
+    rt.AcceptedAnswerId,
+    rt.CreationDate,
+    rt.OwnerUserId,
+    rt.Score,
+    rt.Level,
+    rt.ThreadTitle,
+    rt.Tags,
+    rt.USER_REP,
+    rt.Reputation,
+    rt.Body
+;

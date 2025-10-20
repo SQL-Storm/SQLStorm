@@ -1,0 +1,200 @@
+with
+recent_activity as (
+  select u.id as user_id,
+         u.displayname,
+         greatest(
+           coalesce(max(p.lastactivitydate), timestamp '1970-01-01'),
+           coalesce(max(c.creationdate), timestamp '1970-01-01'),
+           coalesce(max(v.creationdate), timestamp '1970-01-01')
+         ) as last_activity,
+         max(case when p.lastactivitydate is not null then p.id end) as last_post_id,
+         max(case when c.creationdate is not null then c.id end) as last_comment_id,
+         max(case when v.creationdate is not null then v.id end) as last_vote_id
+  from users u
+  left join posts p on p.owneruserid = u.id
+  left join comments c on c.userid = u.id
+  left join votes v on v.userid = u.id
+  group by u.id, u.displayname
+),
+question_tags as (
+  select p.id as question_id,
+         trim(t.tag) as tag,
+         row_number() over (partition by p.id order by t.ord) as tag_pos
+  from posts p
+  cross join lateral (
+    select unnest(string_to_array(substring(coalesce(p.tags,''),2, length(coalesce(p.tags,'')) - 2), '><')) as tag
+  ) s
+  cross join lateral (
+    select row_number() over () as ord
+  ) t_ord
+  cross join lateral (
+    select s.tag, row_number() over () as ord
+  ) t(tag, ord)
+  where p.posttypeid = 1 and p.tags is not null and p.tags <> ''
+),
+question_tag_metrics as (
+  select qt.question_id,
+         qt.tag,
+         count(distinct a.id) filter (where a.posttypeid = 2) as answer_count,
+         sum(a.score) filter (where a.posttypeid = 2) as answers_score_sum,
+         max(a.score) filter (where a.posttypeid = 2) as answers_score_max,
+         p.score as question_score,
+         p.viewcount,
+         p.creationdate
+  from question_tags qt
+  join posts p on p.id = qt.question_id
+  left join posts a on a.parentid = p.id and a.posttypeid = 2
+  group by qt.question_id, qt.tag, p.score, p.viewcount, p.creationdate
+),
+tag_stats as (
+  select tag,
+         count(*) as questions_with_tag,
+         sum(question_score) as tag_questions_score_sum,
+         avg(answer_count) as avg_answers_per_question,
+         -- replace ordered-set aggregate percentile_cont with an approximate median using percentile_disc on a subquery
+         (select percentile_disc(0.5) within group (order by answers_score_sum)
+          from question_tag_metrics qtm2
+          where qtm2.tag = qtm.tag) as median_answer_score_sum,
+         sum(case when creationdate > cast('2024-10-01 12:34:56' as timestamp) - interval '180 days' then 1 else 0 end) as recent_questions_180d
+  from question_tag_metrics qtm
+  group by tag
+),
+user_post_stats as (
+  select u.id as user_id,
+         count(p.id) filter (where p.posttypeid = 1) as questions_count,
+         count(p.id) filter (where p.posttypeid = 2) as answers_count,
+         coalesce(sum(p.score) filter (where p.posttypeid in (1,2)),0) as total_post_score,
+         coalesce(avg(p.score) filter (where p.posttypeid in (1,2)),0) as avg_post_score,
+         sum(case when p.posttypeid = 1 and p.viewcount > 1000 then 1 else 0 end) as popular_questions
+  from users u
+  left join posts p on p.owneruserid = u.id
+  group by u.id
+),
+user_tag_expertise as (
+  select up.user_id,
+         qt.tag,
+         sum(coalesce(a.score,0)) as answers_score_to_tag,
+         count(distinct a.id) as answers_to_tag_count,
+         row_number() over (partition by up.user_id order by sum(coalesce(a.score,0)) desc, count(distinct a.id) desc) as rn
+  from user_post_stats up
+  join posts a on a.owneruserid = up.user_id and a.posttypeid = 2
+  join posts q on q.id = a.parentid and q.posttypeid = 1
+  join question_tags qt on qt.question_id = q.id
+  group by up.user_id, qt.tag
+),
+user_top_tag as (
+  select user_id, tag, answers_score_to_tag, answers_to_tag_count
+  from user_tag_expertise
+  where rn = 1
+),
+suspicious_vote_patterns as (
+  select v.userid,
+         v.postid,
+         count(*) as votes_by_user_on_post,
+         min(v.creationdate) as first_vote,
+         max(v.creationdate) as last_vote
+  from votes v
+  where v.userid is not null
+  group by v.userid, v.postid
+  having count(*) > 3
+),
+user_summary as (
+  select u.id,
+         u.displayname,
+         u.reputation,
+         ra.last_activity,
+         ups.questions_count,
+         ups.answers_count,
+         ups.total_post_score,
+         coalesce(utt.tag,'<none>') as top_tag,
+         coalesce(utt.answers_score_to_tag,0) as top_tag_score,
+         coalesce(svp.votes_by_user_on_post,0) as suspicious_votes_count,
+         case
+           when u.websiteurl is not null and u.websiteurl <> '' then
+             left(u.websiteurl, 60) || case when length(u.websiteurl) > 60 then '...' else '' end
+           when u.location is not null then
+             'loc:' || left(u.location,40)
+           else
+             'no-profile'
+         end as contact_hint,
+         rank() over (order by ups.total_post_score desc NULLS LAST, ups.answers_count desc) as quality_rank
+  from users u
+  left join recent_activity ra on ra.user_id = u.id
+  left join user_post_stats ups on ups.user_id = u.id
+  left join user_top_tag utt on utt.user_id = u.id
+  left join suspicious_vote_patterns svp on svp.userid = u.id
+),
+top_tags_recent as (
+  select tag, count(*) as qcount
+  from question_tag_metrics qtm
+  where qtm.creationdate > cast('2024-10-01 12:34:56' as timestamp) - interval '365 days'
+  group by tag
+  order by qcount desc
+  limit 50
+),
+top_tags_alltime as (
+  select tag, count(*) as qcount
+  from question_tag_metrics
+  group by tag
+  order by qcount desc
+  limit 50
+),
+union_top_tags as (
+  select tag, qcount from top_tags_recent
+  union
+  select tag, qcount from top_tags_alltime
+),
+-- compute global 75th reputation as a scalar subquery, avoiding ordered-set with OVER
+global_reputation_stats as (
+  select percentile_disc(0.75) within group (order by reputation) as global_75th_reputation
+  from users
+)
+select
+  us.id as user_id,
+  us.displayname,
+  us.reputation,
+  us.questions_count,
+  us.answers_count,
+  us.total_post_score,
+  us.top_tag,
+  us.top_tag_score,
+  us.suspicious_votes_count,
+  us.contact_hint,
+  us.quality_rank,
+  (
+    select a.id
+    from posts a
+    where a.owneruserid = us.id and a.posttypeid = 2
+    order by a.score desc NULLS LAST, a.creationdate desc
+    limit 1
+  ) as best_answer_id,
+  (
+    select avg(a.score)
+    from posts a
+    join posts q on q.id = a.parentid and q.posttypeid = 1
+    join question_tags qt on qt.question_id = q.id and qt.tag = us.top_tag
+    where a.owneruserid = us.id and a.posttypeid = 2 and a.creationdate > cast('2024-10-01 12:34:56' as timestamp) - interval '365 days'
+  ) as avg_score_on_top_tag_last_year,
+  exists (
+    select 1 from posts p where p.owneruserid = us.id and p.posttypeid = 1 and p.viewcount > 10000
+  ) as has_very_popular_question,
+  (select global_75th_reputation from global_reputation_stats) as global_75th_reputation,
+  (
+    select string_agg(distinct ut.tag || ':' || cast(ut.qcount as varchar), ', ' order by ut.qcount desc)
+    from union_top_tags ut
+    where ut.tag is not null
+    limit 1
+  ) as sample_top_tags,
+  case
+    when us.reputation >= 10000 then 'elite'
+    when us.reputation >= 1000 and us.answers_count >= 50 then 'prolific'
+    when us.reputation >= 0 and (coalesce(us.questions_count,0) + coalesce(us.answers_count,0)) = 0 then 'lurker'
+    when us.suspicious_votes_count > 0 then 'flag-suspected'
+    else 'regular'
+  end as user_tier
+from user_summary us
+left join users u2 on true
+where (us.questions_count is not null and us.questions_count >= 1)
+   or (us.answers_count is not null and us.answers_count >= 5)
+order by us.quality_rank asc, us.total_post_score desc
+limit 200;

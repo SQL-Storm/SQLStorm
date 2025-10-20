@@ -1,0 +1,173 @@
+WITH
+tag_list AS (
+  SELECT p.Id AS PostId,
+         regexp_split_to_table(substring(p.Tags FROM 2 FOR char_length(p.Tags)-2), '><') AS Tag
+  FROM Posts p
+  WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL
+),
+activity_stream AS (
+  SELECT p.Id AS PostId, p.PostTypeId, 'post' AS source, p.CreationDate AS activity_date, p.Score, p.ViewCount, p.OwnerUserId, p.Title, CAST(NULL AS int) AS related_user
+  FROM Posts p
+  UNION ALL
+  SELECT ph.PostId, NULL, 'history', ph.CreationDate, NULL, NULL, ph.UserId, NULL, ph.UserId
+  FROM PostHistory ph
+  UNION ALL
+  SELECT c.PostId, NULL, 'comment', c.CreationDate, c.Score, NULL, c.UserId, NULL, c.UserId
+  FROM Comments c
+  UNION ALL
+  SELECT v.PostId, NULL, 'vote', v.CreationDate, NULL, NULL, v.UserId, NULL, v.UserId
+  FROM Votes v
+),
+recent_activity AS (
+  SELECT PostId,
+         max(activity_date) AS last_activity_date,
+         max(CASE WHEN source='post' THEN activity_date END) AS last_post_date,
+         max(CASE WHEN source='comment' THEN activity_date END) AS last_comment_date,
+         count(*) FILTER (WHERE source='comment') AS comment_events,
+         count(*) FILTER (WHERE source='vote') AS vote_events
+  FROM activity_stream
+  GROUP BY PostId
+),
+answer_rank AS (
+  SELECT a.Id AS answer_id,
+         a.ParentId AS question_id,
+         a.Score,
+         a.CreationDate,
+         ROW_NUMBER() OVER (PARTITION BY a.ParentId ORDER BY a.Score DESC, a.CreationDate ASC) AS answer_rank,
+         RANK() OVER (PARTITION BY a.ParentId ORDER BY a.Score DESC) AS answer_tie_rank,
+         SUM(a.Score) OVER (PARTITION BY a.ParentId) AS total_answer_score,
+         AVG(a.Score) OVER (PARTITION BY a.ParentId) AS avg_answer_score
+  FROM Posts a
+  WHERE a.PostTypeId = 2
+),
+question_summary AS (
+  SELECT q.Id AS question_id,
+         q.Title,
+         q.Score AS question_score,
+         q.ViewCount,
+         q.OwnerUserId,
+         q.AcceptedAnswerId,
+         q.AnswerCount,
+         q.Tags,
+         ra.last_activity_date,
+         COALESCE(u.DisplayName, 'unknown') AS owner_display,
+         COALESCE(le.DisplayName, 'unknown') AS last_editor_display,
+         (SELECT c.UserId FROM Comments c WHERE c.PostId = q.Id ORDER BY c.CreationDate DESC LIMIT 1) AS last_commenter_id,
+         (SELECT substring(ph.Text FROM 1 FOR 200) FROM PostHistory ph WHERE ph.PostId = q.Id AND ph.PostHistoryTypeId IN (4,5,6) ORDER BY ph.CreationDate DESC LIMIT 1) AS recent_edit_snippet
+  FROM Posts q
+  LEFT JOIN recent_activity ra ON ra.PostId = q.Id
+  LEFT JOIN Users u ON u.Id = q.OwnerUserId
+  LEFT JOIN Users le ON le.Id = q.LastEditorUserId
+  WHERE q.PostTypeId = 1
+),
+tag_agg AS (
+  SELECT tl.Tag,
+         count(*) AS questions_with_tag,
+         avg(q.question_score) AS avg_score_for_tag,
+         max(q.ViewCount) AS max_views,
+         sum(q.AnswerCount) AS total_answers
+  FROM tag_list tl
+  JOIN question_summary q ON q.question_id = tl.PostId
+  GROUP BY tl.Tag
+),
+hot_or_closed AS (
+  SELECT p.Id AS PostId
+  FROM Posts p
+  WHERE p.PostTypeId = 1 AND (p.Score > 10 OR p.ViewCount > 1000)
+  UNION
+  SELECT ph.PostId FROM PostHistory ph WHERE ph.PostHistoryTypeId IN (10, 11)
+  EXCEPT
+  SELECT Id FROM Posts WHERE CommunityOwnedDate IS NOT NULL
+),
+complex_user_stats AS (
+  SELECT u.Id AS user_id,
+         u.DisplayName,
+         count(distinct b.Id) AS badge_count,
+         count(distinct p.Id) FILTER (WHERE p.PostTypeId = 1) AS questions_asked,
+         count(distinct p.Id) FILTER (WHERE p.PostTypeId = 2) AS answers_given,
+         max(p.Score) FILTER (WHERE p.OwnerUserId = u.Id) AS max_post_score,
+         SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 WHEN v.VoteTypeId = 3 THEN -1 ELSE 0 END) AS vote_score,
+         dense_rank() OVER (ORDER BY count(distinct b.Id) DESC) AS badge_rank
+  FROM Users u
+  LEFT JOIN Badges b ON b.UserId = u.Id
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+  LEFT JOIN Votes v ON v.UserId = u.Id
+  GROUP BY u.Id, u.DisplayName
+),
+answer_insights AS (
+  SELECT ar.*,
+         q.Title AS question_title,
+         CASE WHEN ar.answer_rank = 1 THEN 'top' WHEN ar.answer_rank <= 3 THEN 'top3' ELSE 'other' END AS rank_bucket,
+         (SELECT count(*) FROM Comments c WHERE c.PostId = ar.answer_id) AS comments_on_answer,
+         (SELECT array_agg(distinct tl.Tag ORDER BY tl.Tag) FROM tag_list tl WHERE tl.PostId = ar.question_id) AS question_tags
+  FROM answer_rank ar
+  LEFT JOIN Posts q ON q.Id = ar.question_id
+),
+lead_lag_gaps AS (
+  SELECT p.Id AS PostId,
+         p.Title,
+         lag(ra.last_activity_date) OVER (ORDER BY ra.last_activity_date) AS prev_activity,
+         lead(ra.last_activity_date) OVER (ORDER BY ra.last_activity_date) AS next_activity,
+         COALESCE(EXTRACT(EPOCH FROM (ra.last_activity_date - lag(ra.last_activity_date) OVER (ORDER BY ra.last_activity_date))), 0) AS seconds_since_prev
+  FROM recent_activity ra
+  JOIN Posts p ON p.Id = ra.PostId
+  WHERE ra.last_activity_date IS NOT NULL
+)
+SELECT
+  q.question_id,
+  left(coalesce(q.Title, ''), 200) AS short_title,
+  q.question_score,
+  q.ViewCount,
+  q.AnswerCount,
+  COALESCE(q.AcceptedAnswerId, -1) AS accepted_answer_id,
+  coalesce(q.owner_display, 'unknown') AS owner_display,
+  COALESCE(q.last_editor_display, 'unknown') AS last_editor_display,
+  COALESCE(u.badge_count,0) AS owner_badge_count,
+  CASE
+    WHEN q.last_activity_date IS NULL THEN 'no_activity'
+    WHEN q.last_activity_date > CAST('2024-10-01 12:34:56' AS timestamp) - interval '7 days' THEN 'active_week'
+    WHEN q.last_activity_date > CAST('2024-10-01 12:34:56' AS timestamp) - interval '30 days' THEN 'active_month'
+    ELSE 'stale'
+  END AS activity_bucket,
+  COALESCE(string_agg(distinct tl.Tag, ',' ORDER BY tl.Tag), '') AS tags,
+  COALESCE(ta.questions_with_tag, 0) AS primary_tag_popularity,
+  COALESCE(ta.avg_score_for_tag, 0) AS primary_tag_avg_score,
+  (SELECT count(*) FROM answer_rank ar WHERE ar.question_id = q.question_id) AS computed_answer_count,
+  (SELECT count(*) FROM Comments c WHERE c.PostId = q.question_id) AS comments_count,
+  (SELECT count(*) FROM Votes v WHERE v.PostId = q.question_id AND v.VoteTypeId = 2) AS upvotes_count,
+  (SELECT c.UserId FROM Comments c WHERE c.PostId = q.question_id ORDER BY c.CreationDate DESC LIMIT 1) AS most_recent_commenter,
+  (SELECT u2.DisplayName FROM Users u2 WHERE u2.Id = (SELECT c.UserId FROM Comments c WHERE c.PostId = q.question_id ORDER BY c.CreationDate DESC LIMIT 1)) AS most_recent_commenter_name,
+  CASE
+    WHEN q.recent_edit_snippet IS NULL THEN '(no recent edit)'
+    ELSE replace(regexp_replace(q.recent_edit_snippet, '\s+', ' ', 'g'), E'\n', ' ')
+  END AS recent_edit_snippet,
+  EXISTS (SELECT 1 FROM hot_or_closed h WHERE h.PostId = q.question_id) AS is_hot_or_closed,
+  COALESCE(ai.rank_bucket, 'no_answers') AS top_answer_bucket,
+  COALESCE(ai.comments_on_answer,0) AS top_answer_comments,
+  COALESCE(array_to_string(ai.question_tags, ','), '') AS question_tags_list,
+  llg.seconds_since_prev,
+  COALESCE(greatest(q.question_score, COALESCE(ai.total_answer_score,0)),0) AS max_of_question_or_total_answer_score,
+  CASE
+    WHEN q.ViewCount IS NULL OR q.ViewCount = 0 THEN NULL
+    ELSE round(((CAST(q.question_score AS numeric) / NULLIF(q.ViewCount,0)) * 1000) + COALESCE(ai.avg_answer_score,0), 4)
+  END AS score_per_k_views_adjusted,
+  CASE WHEN EXISTS (SELECT 1 FROM Posts p2 WHERE p2.ParentId = q.question_id AND p2.Score > q.question_score) THEN 'answered_higher_than_question' ELSE 'no_higher_answer' END AS comparative_answer_indicator
+FROM question_summary q
+LEFT JOIN LATERAL (
+  SELECT split_part(coalesce(q.Tags,''), '><', 1) AS primary_tag_raw
+) prim ON true
+LEFT JOIN tag_agg ta ON ta.Tag = NULLIF(regexp_replace(coalesce(prim.primary_tag_raw, ''), '[<>]', '', 'g'), '')
+LEFT JOIN tag_list tl ON tl.PostId = q.question_id
+LEFT JOIN complex_user_stats u ON u.user_id = q.OwnerUserId
+LEFT JOIN answer_insights ai ON ai.question_id = q.question_id AND ai.answer_rank = 1
+LEFT JOIN lead_lag_gaps llg ON llg.PostId = q.question_id
+GROUP BY
+  q.question_id, q.Title, q.question_score, q.ViewCount, q.AnswerCount, q.AcceptedAnswerId,
+  q.owner_display, q.last_editor_display, u.badge_count, q.last_activity_date, q.recent_edit_snippet,
+  ta.questions_with_tag, ta.avg_score_for_tag, ai.rank_bucket, ai.comments_on_answer, ai.total_answer_score, ai.avg_answer_score, ai.question_tags,
+  llg.seconds_since_prev
+ORDER BY
+  is_hot_or_closed DESC,
+  score_per_k_views_adjusted DESC NULLS LAST,
+  q.last_activity_date DESC NULLS LAST
+LIMIT 500;

@@ -1,0 +1,250 @@
+-- {"query": "819.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 0.8, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 2188} 
+WITH RecursiveTagHierarchy AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        ARRAY[t.TagName] AS TagPath,
+        1 AS Depth
+    FROM Tags t
+    WHERE t.IsModeratorOnly = 0
+
+    UNION ALL
+
+    SELECT
+        t.Id,
+        t.TagName,
+        r.TagPath || t.TagName,
+        r.Depth + 1
+    FROM Tags t
+    JOIN RecursiveTagHierarchy r ON t.WikiPostId = r.Id
+    WHERE r.Depth < 3
+),
+UserBadgeSummary AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        MAX(b.Date) AS LastBadgeDate
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    WHERE u.Reputation > 1000 -- filter for active users
+    GROUP BY u.Id, u.DisplayName
+),
+TopQuestions AS (
+    SELECT
+        p.Id,
+        p.OwnerUserId,
+        p.Title,
+        COALESCE(p.Score, 0) AS Score,
+        COALESCE(p.ViewCount, 0) AS Views,
+        p.Tags,
+        p.CreationDate,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY COALESCE(p.Score, 0) DESC, p.CreationDate DESC) AS rn
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+      AND p.Score IS NOT NULL
+      AND p.CreationDate > cast('2024-10-01' as date) - INTERVAL '1 year'
+),
+AnswerStats AS (
+    SELECT
+        a.ParentId AS QuestionId,
+        COUNT(*) AS AnswerCount,
+        AVG(a.Score) AS AvgAnswerScore,
+        MAX(a.Score) AS MaxAnswerScore,
+        SUM(CASE WHEN a.OwnerUserId IS NULL THEN 1 ELSE 0 END) AS AnonymousAnswers
+    FROM Posts a
+    WHERE a.PostTypeId = 2
+    GROUP BY a.ParentId
+),
+LatestCommentsPerPost AS (
+    SELECT DISTINCT ON (c.PostId)
+        c.PostId,
+        c.Id AS CommentId,
+        c.UserId,
+        c.UserDisplayName,
+        c.CreationDate,
+        c.Text
+    FROM Comments c
+    WHERE c.CreationDate > cast('2024-10-01' as date) - INTERVAL '30 days'
+    ORDER BY c.PostId, c.CreationDate DESC
+),
+PostWithLinks AS (
+    SELECT
+        p.Id,
+        p.Title,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        pl.LinkTypeId,
+        lt.Name AS LinkTypeName,
+        pl.RelatedPostId
+    FROM Posts p
+    LEFT JOIN PostLinks pl ON pl.PostId = p.Id
+    LEFT JOIN LinkTypes lt ON lt.Id = pl.LinkTypeId
+    WHERE p.PostTypeId IN (1, 2)
+),
+UserActivityWindows AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(p.Id) AS TotalPosts,
+        COUNT(DISTINCT p.PostTypeId) AS PostTypeVariety,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionsPosted,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswersPosted,
+        COUNT(DISTINCT c.Id) AS CommentsMade,
+        MAX(p.CreationDate) AS LastPostDate,
+        MIN(p.CreationDate) AS FirstPostDate,
+        MAX(c.CreationDate) FILTER (WHERE c.CreationDate IS NOT NULL) AS LastCommentDate,
+        AVG(p.Score) AS AvgPostScore,
+        SUM(vt.UpVotes) OVER (PARTITION BY u.Id) AS TotalUpVotes,
+        SUM(vt.DownVotes) OVER (PARTITION BY u.Id) AS TotalDownVotes
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Comments c ON c.UserId = u.Id
+    LEFT JOIN (
+        SELECT
+            v.UserId,
+            SUM(CASE WHEN vt.Name = 'UpMod' THEN 1 ELSE 0 END) AS UpVotes,
+            SUM(CASE WHEN vt.Name = 'DownMod' THEN 1 ELSE 0 END) AS DownVotes
+        FROM Votes v
+        JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+        WHERE v.UserId IS NOT NULL
+        GROUP BY v.UserId
+    ) vt ON vt.UserId = u.Id
+    WHERE u.Reputation > 500
+    GROUP BY u.Id, u.DisplayName
+),
+QuestionCloseStats AS (
+    SELECT
+        ph.PostId,
+        COUNT(*) FILTER (WHERE ph.PostHistoryTypeId = 10) AS CloseEvents,
+        COUNT(*) FILTER (WHERE ph.PostHistoryTypeId = 11) AS ReopenEvents,
+        MAX(ph.CreationDate) FILTER (WHERE ph.PostHistoryTypeId = 10) AS LastCloseDate,
+        MAX(ph.CreationDate) FILTER (WHERE ph.PostHistoryTypeId = 11) AS LastReopenDate,
+        STRING_AGG(DISTINCT crt.Name, ', ') AS CloseReasons
+    FROM PostHistory ph
+    LEFT JOIN CloseReasonTypes crt ON crt.Id::text = ph.Comment
+    WHERE ph.PostHistoryTypeId IN (10, 11)
+    GROUP BY ph.PostId
+),
+AcceptedAnswerDiff AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.AcceptedAnswerId,
+        q.CreationDate AS QuestionDate,
+        a.CreationDate AS AcceptedAnswerDate,
+        EXTRACT(EPOCH FROM (a.CreationDate - q.CreationDate)) / 3600 AS HoursToAccept
+    FROM Posts q
+    JOIN Posts a ON a.Id = q.AcceptedAnswerId
+    WHERE q.PostTypeId = 1
+      AND q.AcceptedAnswerId IS NOT NULL
+),
+TopUsersByAnswerSpeed AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        AVG(aa.HoursToAccept) AS AvgHoursToAccept,
+        COUNT(aa.QuestionId) AS AcceptedAnswersCount
+    FROM AcceptedAnswerDiff aa
+    JOIN Posts p ON p.Id = aa.AcceptedAnswerId
+    JOIN Users u ON u.Id = p.OwnerUserId
+    WHERE aa.HoursToAccept IS NOT NULL
+    GROUP BY u.Id, u.DisplayName
+    HAVING COUNT(aa.QuestionId) > 5
+    ORDER BY AvgHoursToAccept ASC
+    LIMIT 10
+),
+CombinedResults AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        u.Location,
+        u.WebsiteUrl,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        u.ProfileImageUrl,
+        ub.BadgeCount,
+        ub.GoldBadges,
+        ub.SilverBadges,
+        ub.BronzeBadges,
+        ua.TotalPosts,
+        ua.QuestionsPosted,
+        ua.AnswersPosted,
+        ua.CommentsMade,
+        ua.AvgPostScore,
+        qs.CloseEvents,
+        qs.ReopenEvents,
+        COALESCE(qs.CloseReasons, 'None') AS CloseReasons,
+        tas.AnswerCount,
+        tas.AvgAnswerScore,
+        tas.MaxAnswerScore,
+        tas.AnonymousAnswers,
+        lc.CommentId AS LatestCommentId,
+        lc.UserDisplayName AS LatestCommentUser,
+        lc.Text AS LatestCommentText,
+        tql.Title AS TopQuestionTitle,
+        tql.Score AS TopQuestionScore,
+        tql.Views AS TopQuestionViews,
+        COALESCE(tus.AvgHoursToAccept, NULL) AS AvgHoursToAccept,
+        COALESCE(tus.AcceptedAnswersCount, 0) AS AcceptedAnswersCount
+    FROM Users u
+    LEFT JOIN UserBadgeSummary ub ON ub.UserId = u.Id
+    LEFT JOIN UserActivityWindows ua ON ua.UserId = u.Id
+    LEFT JOIN AnswerStats tas ON tas.QuestionId IN (
+        SELECT Id FROM Posts WHERE OwnerUserId = u.Id AND PostTypeId = 1
+    )
+    LEFT JOIN LatestCommentsPerPost lc ON lc.PostId IN (
+        SELECT Id FROM Posts WHERE OwnerUserId = u.Id
+    )
+    LEFT JOIN TopQuestions tql ON tql.OwnerUserId = u.Id AND tql.rn = 1
+    LEFT JOIN QuestionCloseStats qs ON qs.PostId IN (
+        SELECT Id FROM Posts WHERE OwnerUserId = u.Id AND PostTypeId = 1
+    )
+    LEFT JOIN TopUsersByAnswerSpeed tus ON tus.UserId = u.Id
+    WHERE u.Reputation > 1000
+)
+SELECT DISTINCT ON (cr.UserId)
+    cr.UserId,
+    cr.DisplayName,
+    cr.Reputation,
+    cr.Location,
+    cr.WebsiteUrl,
+    cr.Views,
+    cr.UpVotes,
+    cr.DownVotes,
+    cr.BadgeCount,
+    cr.GoldBadges,
+    cr.SilverBadges,
+    cr.BronzeBadges,
+    cr.TotalPosts,
+    cr.QuestionsPosted,
+    cr.AnswersPosted,
+    cr.CommentsMade,
+    ROUND(cr.AvgPostScore, 2) AS AvgPostScore,
+    cr.CloseEvents,
+    cr.ReopenEvents,
+    cr.CloseReasons,
+    cr.AnswerCount,
+    ROUND(cr.AvgAnswerScore, 2) AS AvgAnswerScore,
+    cr.MaxAnswerScore,
+    cr.AnonymousAnswers,
+    cr.LatestCommentId,
+    cr.LatestCommentUser,
+    LEFT(cr.LatestCommentText, 100) AS LatestCommentSnippet,
+    LEFT(cr.TopQuestionTitle, 100) AS TopQuestionTitle,
+    cr.TopQuestionScore,
+    cr.TopQuestionViews,
+    ROUND(cr.AvgHoursToAccept, 2) AS AvgHoursToAccept,
+    cr.AcceptedAnswersCount
+FROM CombinedResults cr
+ORDER BY cr.Reputation DESC NULLS LAST, cr.UserId
+LIMIT 50;

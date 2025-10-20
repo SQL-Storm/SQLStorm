@@ -1,0 +1,122 @@
+with RecursiveRecentActiveUsers as (
+    select u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate,
+      row_number() over (order by u.Reputation desc, u.LastAccessDate desc) as rn,
+      u.WebsiteUrl
+    from Users u
+    where u.Reputation > 1000 and u.LastAccessDate > cast('2024-10-01 12:34:56' as timestamp) - interval '180 days'
+),
+UserBadgeCounts as (
+    select b.UserId,
+      count(case when b.Class = 1 then 1 end) as GoldBadges,
+      count(case when b.Class = 2 then 1 end) as SilverBadges,
+      count(case when b.Class = 3 then 1 end) as BronzeBadges,
+      count(*) as TotalBadges
+    from Badges b
+    group by b.UserId
+),
+RecentQuestionsWithAcceptedAnswers as (
+  select p.Id as QuestionId, p.OwnerUserId as QuestionOwnerId, p.Title, p.CreationDate as QuestionCreation,
+    p.Score as QuestionScore, p.ViewCount,
+    a.Id as AnswerId, a.OwnerUserId as AnswerOwnerId, a.Score as AnswerScore,
+    p.AcceptedAnswerId,
+    c.Name as PostTypeName
+  from Posts p
+  left join Posts a on p.AcceptedAnswerId = a.Id
+  join PostTypes c on p.PostTypeId = c.Id
+  where p.PostTypeId = 1
+    and p.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - interval '365 days'
+),
+PostScoreRankings as (
+  select p.Id as PostId, p.OwnerUserId, p.PostTypeId, p.Title, 
+    rank() over (partition by p.PostTypeId order by p.Score desc, p.ViewCount desc) as ScoreRank,
+    dense_rank() over (partition by p.PostTypeId order by p.Score desc) as DenseScoreRank
+  from Posts p
+  where p.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - interval '365 days'
+),
+UserActivityCTE as (
+  select
+    u.Id as UserId,
+    count(distinct case when p.PostTypeId = 1 then p.Id end) as QuestionsCount,
+    count(distinct case when p.PostTypeId = 2 then p.Id end) as AnswersCount,
+    count(distinct c.Id) as CommentsCount,
+    count(distinct ph.Id) as PostEditsCount,
+    count(distinct case when v.VoteTypeId = 2 then v.Id end) as UpVotesReceived
+  from Users u
+  left join Posts p on (p.OwnerUserId = u.Id and p.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - interval '365 days')
+  left join Comments c on (c.UserId = u.Id and c.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - interval '365 days')
+  left join PostHistory ph on (ph.UserId = u.Id and ph.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - interval '365 days')
+  left join Votes v on (v.PostId in (
+    select Id from Posts where OwnerUserId = u.Id
+  ) and v.VoteTypeId = 2 and v.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - interval '365 days')
+  group by u.Id
+),
+PostTags as (
+  select pt.Id as PostId,
+    -- replace regexp_replace + string_to_array + unnest with standard functions: remove leading & trailing <> and split by '><' equivalent
+    -- Normalize tags: strip leading '<' and trailing '>', then split by '><'
+    -- Many DBs don't have string_to_array/unnest; emulate splitting using standard SQL is DB-specific.
+    -- For portability assume a DB with regexp_replace and UNNEST-like behavior; use a derived approach using regexp_split_to_table where available.
+    -- To keep standard-ish, use regexp_replace and regexp_split_to_table (Postgres) fallback to simple replace + split isn't standardized.
+    -- Here use regexp_split_to_table for splitting tags into rows:
+    null::text as TagName
+  from Posts pt
+  where pt.OwnerUserId in (select Id from RecursiveRecentActiveUsers)
+    and pt.Tags is not null
+)
+select
+  ru.Id,
+  ru.DisplayName,
+  ru.Reputation,
+  ru.LastAccessDate,
+  coalesce(bc.GoldBadges,0) as GoldBadgeCount,
+  coalesce(bc.SilverBadges,0) as SilverBadgeCount,
+  coalesce(bc.BronzeBadges,0) as BronzeBadgeCount,
+  ua.QuestionsCount,
+  ua.AnswersCount,
+  ua.CommentsCount,
+  ua.PostEditsCount,
+  ua.UpVotesReceived,
+  q.Title as RecentHighScoreQuestion,
+  q.ScoreRank as QuestionRank,
+  l.DuplicatesCount,
+  case when ru.WebsiteUrl is not null then lower(replace(ru.WebsiteUrl, 'http://',''))
+       else '[No website]' end as WebsiteCanonical,
+  string_agg(distinct t.TagName, ',' order by t.TagName) as TagsUsed,
+  (
+    select count(1)
+    from PostLinks pl
+    where pl.PostId in (
+      select p.Id from Posts p where p.OwnerUserId = ru.Id
+    ) and pl.LinkTypeId = 3
+  ) as DuplicateLinksCount
+from RecursiveRecentActiveUsers ru
+left join UserBadgeCounts bc on ru.Id = bc.UserId
+left join UserActivityCTE ua on ru.Id = ua.UserId
+left join lateral (
+  select pq.QuestionId, pq.Title, psr.ScoreRank
+  from RecentQuestionsWithAcceptedAnswers pq
+  join PostScoreRankings psr on pq.QuestionId = psr.PostId
+  where pq.QuestionOwnerId = ru.Id and psr.ScoreRank is not null
+  order by psr.ScoreRank
+  limit 1
+) q on true
+left join lateral (
+  select count(distinct pl.RelatedPostId) as DuplicatesCount
+  from Posts p2
+  left join PostLinks pl on pl.PostId = p2.Id and pl.LinkTypeId = 3
+  where p2.OwnerUserId = ru.Id
+) l on true
+left join (
+  -- Use a regexp split function that returns rows; for Postgres use regexp_split_to_table.
+  -- For portability, replace with a correlated subquery in SELECT if target dialect lacks regexp_split_to_table.
+  select pt.Id as PostId,
+    regexp_split_to_table(regexp_replace(pt.Tags, '^<|>$', ''), '><') as TagName
+  from Posts pt
+  where pt.OwnerUserId in (select Id from RecursiveRecentActiveUsers)
+    and pt.Tags is not null
+) t on t.PostId in (
+  select p.Id from Posts p where p.OwnerUserId = ru.Id
+)
+group by ru.Id, ru.DisplayName, ru.Reputation, ru.LastAccessDate, bc.GoldBadges, bc.SilverBadges, bc.BronzeBadges, ua.QuestionsCount, ua.AnswersCount, ua.CommentsCount, ua.PostEditsCount, ua.UpVotesReceived, q.Title, q.ScoreRank, l.DuplicatesCount, ru.WebsiteUrl
+order by ru.Reputation desc
+limit 50;

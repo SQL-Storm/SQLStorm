@@ -1,0 +1,163 @@
+with UserRanks as (
+    select 
+        Id as UserId,
+        DisplayName,
+        Reputation,
+        Rank() over (order by Reputation desc, LastAccessDate desc) as ReputationRank,
+        row_number() over (partition by Location order by Reputation desc) as LocationTopUserRank,
+        coalesce(Location, 'Unknown') as UserLocation
+    from Users
+    where Reputation > 0
+), 
+QuestionStats as (
+    select 
+        p.Id as QuestionId,
+        p.OwnerUserId,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.FavoriteCount,
+        p.Tags,
+        coalesce(a.AvgAnswerScore,0) as AvgAnswerScore,
+        coalesce(a.MaxAnswerScore,0) as MaxAnswerScore,
+        coalesce(c.CommentCount,0) as CommentCount,
+        tag_counts.TagCount
+    from Posts p
+    left join (
+        select ParentId, count(*) as TagCount
+        from Posts
+        where PostTypeId = 2
+        group by ParentId
+    ) tag_counts on tag_counts.ParentId = p.Id
+    left join (
+        select ParentId, avg(Score) as AvgAnswerScore, max(Score) as MaxAnswerScore
+        from Posts
+        where PostTypeId = 2
+        group by ParentId
+    ) a on a.ParentId = p.Id
+    left join (
+        select PostId, count(*) as CommentCount
+        from Comments
+        group by PostId
+    ) c on c.PostId = p.Id
+    where p.PostTypeId = 1
+),
+QuestionCloseStats as (
+    select ph.PostId, max(CASE WHEN ph.PostHistoryTypeId = 10 THEN 1 ELSE 0 END) as HasCloseHistory
+    from PostHistory ph
+    group by ph.PostId
+),
+UserBadgeCounts as (
+    select UserId,
+        sum(case when "Class" = 1 then 1 else 0 end) as GoldBadgeCount,
+        sum(case when "Class" = 2 then 1 else 0 end) as SilverBadgeCount,
+        sum(case when "Class" = 3 then 1 else 0 end) as BronzeBadgeCount
+    from Badges
+    group by UserId
+),
+PostLinkDuplicates as (
+    select pl.PostId, count(*) as DuplicateCount
+    from PostLinks pl
+    where pl.LinkTypeId = 3
+    group by pl.PostId
+),
+ComplexTags as (
+    select Id, Tags,
+    case 
+      when Tags is null then NULL
+      else regexp_split_to_array(substring(Tags from 2 for length(Tags) - 2), '><' )
+    end as TagArray
+    from Posts
+    where PostTypeId = 1 and Tags is not null
+),
+TagStatistics as (
+    select unnest(TagArray) as Tag, count(*) as QuestionCount
+    from ComplexTags
+    group by unnest(TagArray)
+    having count(*) > 10
+),
+TopUsersInLocation as (
+    select ur.UserId, ur.DisplayName, ur.UserLocation, ur.LocationTopUserRank, ur.Reputation,
+        coalesce(b.GoldBadgeCount, 0) as GoldBadges,
+        coalesce(b.SilverBadgeCount, 0) as SilverBadges,
+        coalesce(b.BronzeBadgeCount, 0) as BronzeBadges,
+        coalesce(postCounts.TotalPosts,0) as TotalPosts,
+        ur.ReputationRank
+    from UserRanks ur
+    left join UserBadgeCounts b on b.UserId = ur.UserId
+    left join (
+        select OwnerUserId, count(*) as TotalPosts
+        from Posts
+        group by OwnerUserId
+    ) postCounts on postCounts.OwnerUserId = ur.UserId
+    where ur.LocationTopUserRank <= 5
+)
+select 
+    qs.QuestionId,
+    qs.Title,
+    qs.CreationDate,
+    qs.Score,
+    qs.ViewCount,
+    qs.AnswerCount,
+    qs.FavoriteCount,
+    qs.Tags,
+    qs.AvgAnswerScore,
+    qs.MaxAnswerScore,
+    qs.CommentCount,
+    qc.HasCloseHistory,
+    dup.DuplicateCount,
+    ts.Tag as PopularTag,
+    tu.DisplayName as TopUserDisplayName,
+    tu.UserLocation,
+    tu.ReputationRank,
+    tu.GoldBadges,
+    tu.SilverBadges,
+    tu.BronzeBadges,
+    tu.TotalPosts,
+    case when qs.ViewCount > 1000 and qs.Score > 0 then 'Hot Question' else 'Normal' end as QuestionStatus,
+    coalesce((select max(ph.CreationDate) from PostHistory ph where ph.PostId = qs.QuestionId and ph.PostHistoryTypeId = 10), qs.CreationDate) as LastCloseDate,
+    concat(
+        left(qs.Title, 30), 
+        case when char_length(qs.Title) > 30 then '...' else '' end,
+        ' [Tags: ', 
+        coalesce(string_agg(tsi.Tag, ','), 'none'),
+        ']'
+    ) as TitleSummarySnippet
+from QuestionStats qs
+left join QuestionCloseStats qc on qc.PostId = qs.QuestionId
+left join PostLinkDuplicates dup on dup.PostId = qs.QuestionId
+left join TagStatistics ts on ts.Tag = any(regexp_split_to_array(substring(qs.Tags from 2 for length(qs.Tags) - 2), '><'))
+left join TopUsersInLocation tu on tu.UserId = qs.OwnerUserId
+left join lateral (
+    select Tag
+    from TagStatistics tsi
+    where tsi.Tag = any(regexp_split_to_array(substring(qs.Tags from 2 for length(qs.Tags) - 2), '><'))
+    order by tsi.QuestionCount desc limit 3
+) tsi on true
+where qs.AnswerCount > 0 and qs.ViewCount > 200
+group by
+    qs.QuestionId,
+    qs.Title,
+    qs.CreationDate,
+    qs.Score,
+    qs.ViewCount,
+    qs.AnswerCount,
+    qs.FavoriteCount,
+    qs.Tags,
+    qs.AvgAnswerScore,
+    qs.MaxAnswerScore,
+    qs.CommentCount,
+    qc.HasCloseHistory,
+    dup.DuplicateCount,
+    ts.Tag,
+    tu.DisplayName,
+    tu.UserLocation,
+    tu.ReputationRank,
+    tu.GoldBadges,
+    tu.SilverBadges,
+    tu.BronzeBadges,
+    tu.TotalPosts
+order by qs.Score desc, qs.ViewCount desc, tu.ReputationRank asc
+limit 100;

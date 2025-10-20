@@ -1,0 +1,159 @@
+WITH UserPostStats AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionCount,
+        COUNT(CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswerCount,
+        AVG(CASE WHEN p.PostTypeId IN (1,2) THEN p.Score END) AS AvgPostScore,
+        MAX(CASE WHEN p.PostTypeId = 1 THEN p.ViewCount END) AS MaxQuestionViews,
+        SUM(COALESCE(vt_up.UpVotesCount,0)) AS TotalUpVotesReceived,
+        SUM(COALESCE(vt_down.DownVotesCount,0)) AS TotalDownVotesReceived,
+        COUNT(CASE WHEN b.Class = 1 THEN b.Id END) AS GoldBadges,
+        COUNT(CASE WHEN b.Class = 2 THEN b.Id END) AS SilverBadges,
+        COUNT(CASE WHEN b.Class = 3 THEN b.Id END) AS BronzeBadges,
+        ROW_NUMBER() OVER (PARTITION BY COALESCE(u.Location, 'Unknown') ORDER BY u.Reputation DESC) AS LocationReputationRank,
+        u.Location
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN (
+      SELECT v.PostId, COUNT(*) AS UpVotesCount
+      FROM Votes v
+      JOIN VoteTypes vt ON v.VoteTypeId = vt.Id
+      WHERE vt.Name = 'UpMod'
+      GROUP BY v.PostId
+    ) vt_up ON vt_up.PostId = p.Id
+    LEFT JOIN (
+      SELECT v.PostId, COUNT(*) AS DownVotesCount
+      FROM Votes v
+      JOIN VoteTypes vt ON v.VoteTypeId = vt.Id
+      WHERE vt.Name = 'DownMod'
+      GROUP BY v.PostId
+    ) vt_down ON vt_down.PostId = p.Id
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.Location
+), RankedQuestions AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.OwnerUserId,
+        q.Title,
+        q.CreationDate,
+        q.Score,
+        q.ViewCount,
+        q.Tags,
+        pHistCount.CloseVoteCount,
+        pHistMaxLastEdit.LastEditDate,
+        CASE WHEN EXISTS (
+            SELECT 1 FROM PostLinks pl
+            WHERE pl.PostId = q.Id AND pl.LinkTypeId = 3
+        ) THEN 1 ELSE 0 END AS IsDuplicateQuestion,
+        ROW_NUMBER() OVER (ORDER BY q.Score DESC, q.ViewCount DESC) AS GlobalQuestionRank
+    FROM Posts q
+    LEFT JOIN (
+        SELECT PostId, COUNT(*) AS CloseVoteCount
+        FROM PostHistory
+        WHERE PostHistoryTypeId = 10
+        GROUP BY PostId
+    ) pHistCount ON pHistCount.PostId = q.Id
+    LEFT JOIN (
+        SELECT p2.Id AS PostId, MAX(p2.LastEditDate) AS LastEditDate
+        FROM Posts p2
+        WHERE p2.LastEditDate IS NOT NULL
+        GROUP BY p2.Id
+    ) pHistMaxLastEdit ON pHistMaxLastEdit.PostId = q.Id
+    WHERE q.PostTypeId = 1
+), ComplexTagSplit AS (
+    SELECT
+        q.QuestionId,
+        TRIM(tag) AS Tag
+    FROM RankedQuestions q,
+    LATERAL (
+      SELECT regexp_replace(t,'[<>]','','g') AS cleaned,
+             -- split on ; - use standard string split where available; emulate using recursive or simple replace for portability
+             -- For portability, split by semicolon using a simple approach where supported functions exist.
+             -- Here we use a generic approach with UNNEST on string_split when available; otherwise some DBs may need different function.
+             -- Try to use a common emulation: replace leading/trailing separators then split by ';' using a simple split function name 'string_split' if exists.
+             -- For compatibility, attempt to call string_split; if not available, this will need DB-specific adjustment.
+             t
+      FROM (SELECT regexp_replace(q.Tags, '[<>]', '', 'g') AS t) s
+    ) ss
+    JOIN (SELECT value AS tag FROM string_split(ss.t, ';')) sp ON 1=1
+), QuestionWithDuplicateAnswers AS (
+    SELECT
+        q.QuestionId,
+        COUNT(a.Id) AS AnswerCount,
+        COUNT(d.Id) AS DuplicateAnswersCount,
+        ROUND(AVG(CAST(a.Score AS DECIMAL)), 2) AS AvgAnswerScore
+    FROM RankedQuestions q
+    LEFT JOIN Posts a 
+        ON a.ParentId = q.QuestionId AND a.PostTypeId = 2
+    LEFT JOIN Posts d 
+        ON d.ParentId = q.QuestionId AND d.PostTypeId = 2
+        AND d.Id IN (
+            SELECT RelatedPostId FROM PostLinks pl 
+            WHERE pl.LinkTypeId = 3
+        )
+    GROUP BY q.QuestionId
+)
+SELECT
+    u.UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.LocationReputationRank,
+    u.QuestionCount,
+    u.AnswerCount,
+    u.AvgPostScore,
+    u.MaxQuestionViews,
+    u.TotalUpVotesReceived,
+    u.TotalDownVotesReceived,
+    u.GoldBadges,
+    u.SilverBadges,
+    u.BronzeBadges,
+    q.QuestionId,
+    q.Title AS QuestionTitle,
+    q.CreationDate AS QuestionCreationDate,
+    q.Score AS QuestionScore,
+    q.ViewCount AS QuestionViews,
+    q.CloseVoteCount,
+    q.LastEditDate,
+    q.IsDuplicateQuestion,
+    q.GlobalQuestionRank,
+    qa.AnswerCount,
+    qa.AvgAnswerScore,
+    qa.DuplicateAnswersCount,
+    STRING_AGG(ctag.Tag, ',' ORDER BY ctag.Tag) AS QuestionTags
+FROM UserPostStats u
+LEFT JOIN RankedQuestions q ON q.OwnerUserId = u.UserId
+LEFT JOIN QuestionWithDuplicateAnswers qa ON qa.QuestionId = q.QuestionId
+LEFT JOIN ComplexTagSplit ctag ON ctag.QuestionId = q.QuestionId
+WHERE u.Reputation > 1000
+  AND (q.Score > 10 OR COALESCE(q.CloseVoteCount,0) > 0)
+  AND (u.GoldBadges + u.SilverBadges + u.BronzeBadges) > 2
+GROUP BY
+    u.UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.LocationReputationRank,
+    u.QuestionCount,
+    u.AnswerCount,
+    u.AvgPostScore,
+    u.MaxQuestionViews,
+    u.TotalUpVotesReceived,
+    u.TotalDownVotesReceived,
+    u.GoldBadges,
+    u.SilverBadges,
+    u.BronzeBadges,
+    q.QuestionId,
+    q.Title,
+    q.CreationDate,
+    q.Score,
+    q.ViewCount,
+    q.CloseVoteCount,
+    q.LastEditDate,
+    q.IsDuplicateQuestion,
+    q.GlobalQuestionRank,
+    qa.AnswerCount,
+    qa.AvgAnswerScore,
+    qa.DuplicateAnswersCount
+ORDER BY u.Reputation DESC, q.Score DESC, q.ViewCount DESC
+LIMIT 100;

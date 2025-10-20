@@ -1,0 +1,209 @@
+-- {"query": "174.sql", "dataset": "stackoverflow", "version": "v1.3", "prompt": "p1", "model": "gpt-5-mini", "temperature": 1.0, "max_tokens": 32768, "reasoning": "low", "input_tokens": 2026, "output_tokens": 2866} 
+WITH
+RecentPosts AS (
+  SELECT p.*
+  FROM Posts p
+  WHERE p.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '180 days'
+),
+QuestionAnswers AS (
+  SELECT q.Id AS QuestionId,
+         q.OwnerUserId AS QuestionOwner,
+         COUNT(a.Id) FILTER (WHERE a.Id IS NOT NULL) AS AnswerCountRecent,
+         AVG(a.Score) FILTER (WHERE a.Score IS NOT NULL) AS AvgAnswerScore,
+         MAX(a.CreationDate) AS LastAnswerDate,
+         MIN(a.CreationDate) AS FirstAnswerDate,
+         SUM(CASE WHEN a.Id = q.AcceptedAnswerId THEN 1 ELSE 0 END) AS HasAcceptedInRecent
+  FROM Posts q
+  LEFT JOIN Posts a ON a.ParentId = q.Id AND a.PostTypeId = 2 AND a.DeletionDate IS NULL
+  WHERE q.PostTypeId = 1
+  GROUP BY q.Id, q.OwnerUserId
+),
+UserBadgeCounts AS (
+  SELECT b.UserId,
+         COUNT(*) AS TotalBadges,
+         SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS Gold,
+         SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS Silver,
+         SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS Bronze,
+         COUNT(*) FILTER (WHERE b.TagBased = B'1') AS TagBadges
+  FROM Badges b
+  GROUP BY b.UserId
+),
+PostTagExtract AS (
+  SELECT p.Id,
+         p.PostTypeId,
+         COALESCE(p.Tags, '') AS RawTags,
+         CASE WHEN p.Tags IS NULL THEN ARRAY[]::text[]
+              ELSE string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><')
+         END AS TagArray
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+),
+TagPopularity AS (
+  SELECT unnest(TagArray) AS Tag,
+         COUNT(*) AS QuestionCount,
+         AVG(p.Score) AS AvgScorePerQuestion
+  FROM PostTagExtract t
+  JOIN Posts p ON p.Id = t.Id
+  GROUP BY unnest(TagArray)
+),
+VoteBreakdown AS (
+  SELECT v.PostId,
+         SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+         SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes,
+         SUM(CASE WHEN v.VoteTypeId = 5 THEN 1 ELSE 0 END) AS Favorites,
+         SUM(CASE WHEN v.VoteTypeId IN (10,12,14) THEN 1 ELSE 0 END) AS DeletesOrSpam
+  FROM Votes v
+  GROUP BY v.PostId
+),
+UserActivityWindow AS (
+  SELECT u.Id AS UserId,
+         u.DisplayName,
+         u.Reputation,
+         u.CreationDate,
+         u.LastAccessDate,
+         COALESCE(ub.TotalBadges,0) AS TotalBadges,
+         COALESCE(ub.Gold,0) AS Gold,
+         COALESCE(ub.Silver,0) AS Silver,
+         COALESCE(ub.Bronze,0) AS Bronze,
+         COUNT(p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionsPosted,
+         COUNT(p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswersPosted,
+         SUM(COALESCE(vb.UpVotes,0) - COALESCE(vb.DownVotes,0)) AS NetVoteOnOwnPosts,
+         ROW_NUMBER() OVER (ORDER BY COALESCE(ub.TotalBadges,0) DESC, u.Reputation DESC) AS BadgeRank,
+         RANK() OVER (ORDER BY COUNT(p.Id) FILTER (WHERE p.PostTypeId = 2) DESC) AS AnswerRank
+  FROM Users u
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+  LEFT JOIN UserBadgeCounts ub ON ub.UserId = u.Id
+  LEFT JOIN VoteBreakdown vb ON vb.PostId = p.Id
+  GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate, ub.TotalBadges, ub.Gold, ub.Silver, ub.Bronze
+),
+DuplicateLinkCounts AS (
+  SELECT pl.RelatedPostId AS CanonicalQuestionId,
+         COUNT(*) FILTER (WHERE pl.LinkTypeId = 3) AS MarkedDuplicateCount,
+         COUNT(*) FILTER (WHERE pl.LinkTypeId = 1) AS LinkedCount
+  FROM PostLinks pl
+  GROUP BY pl.RelatedPostId
+),
+ComplexQuestionMetrics AS (
+  SELECT q.Id AS QuestionId,
+         q.Title,
+         q.OwnerUserId,
+         q.CreationDate,
+         q.Score,
+         COALESCE(qa.AnswerCountRecent, 0) AS AnswerCountRecent,
+         COALESCE(qa.AvgAnswerScore, 0) AS AvgAnswerScore,
+         COALESCE(qa.HasAcceptedInRecent, 0) AS HasAcceptedInRecent,
+         COALESCE(d.MarkedDuplicateCount,0) AS DuplicateInlinks,
+         COALESCE(vb.UpVotes,0) AS UpVotes,
+         COALESCE(vb.DownVotes,0) AS DownVotes,
+         COALESCE(vb.Favorites,0) AS Favorites,
+         (EXTRACT(EPOCH FROM COALESCE(qa.FirstAnswerDate, q.LastActivityDate) - q.CreationDate)/3600)::numeric(10,2) AS HoursToFirstAnswer,
+         (EXTRACT(EPOCH FROM COALESCE(qa.LastAnswerDate, q.LastActivityDate) - q.CreationDate)/86400)::numeric(10,2) AS DaysToLastAnswer,
+         CASE
+           WHEN q.Body IS NULL OR length(trim(q.Body)) = 0 THEN 'EMPTY_BODY'
+           WHEN POSITION('<code>' IN LOWER(q.Body)) > 0 THEN 'HAS_CODE'
+           ELSE 'NO_CODE'
+         END AS BodySignal,
+         (SELECT COUNT(*) FROM Comments c WHERE c.PostId = q.Id AND c.CreationDate >= q.CreationDate AND (c.Text LIKE '%typo%' OR c.Text ILIKE '%help%')) AS CommentHints
+  FROM Posts q
+  LEFT JOIN QuestionAnswers qa ON qa.QuestionId = q.Id
+  LEFT JOIN DuplicateLinkCounts d ON d.CanonicalQuestionId = q.Id
+  LEFT JOIN VoteBreakdown vb ON vb.PostId = q.Id
+  WHERE q.PostTypeId = 1
+),
+TopUsersByComplexity AS (
+  SELECT uaw.*,
+         COALESCE(SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END),0) AS AnswersWithin180Days,
+         COALESCE((SELECT COUNT(*) FROM Posts p2 WHERE p2.OwnerUserId = uaw.UserId AND p2.PostTypeId = 1 AND p2.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '365 days'),0) AS QuestionsLastYear,
+         COALESCE((SELECT AVG(EXTRACT(EPOCH FROM (a.CreationDate - q.CreationDate))/3600.0) FROM Posts a JOIN Posts q ON a.ParentId = q.Id WHERE a.OwnerUserId = uaw.UserId AND a.PostTypeId = 2 AND q.PostTypeId = 1),0) AS AvgAnswerDelayHours
+  FROM UserActivityWindow uaw
+  LEFT JOIN Posts p ON p.OwnerUserId = uaw.UserId AND p.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '180 days'
+  GROUP BY uaw.UserId, uaw.DisplayName, uaw.Reputation, uaw.CreationDate, uaw.LastAccessDate, uaw.TotalBadges, uaw.Gold, uaw.Silver, uaw.Bronze, uaw.QuestionsPosted, uaw.AnswersPosted, uaw.NetVoteOnOwnPosts, uaw.BadgeRank, uaw.AnswerRank
+),
+HeavyHitters AS (
+  SELECT DISTINCT ON (t.Tag) t.Tag,
+         t.QuestionCount,
+         t.AvgScorePerQuestion,
+         COUNT(DISTINCT p.OwnerUserId) FILTER (WHERE p.OwnerUserId IS NOT NULL) OVER (PARTITION BY t.Tag) AS DistinctAskers,
+         (SELECT COUNT(*) FROM Posts p2 WHERE p2.Id IN (SELECT p3.Id FROM Posts p3 JOIN PostTagExtract pte ON p3.Id = pte.Id WHERE pte.TagArray && ARRAY[t.Tag])) AS TotalPostsWithTag
+  FROM TagPopularity t
+  JOIN PostTagExtract pte ON pte.TagArray && ARRAY[t.Tag]
+  JOIN Posts p ON p.Id = pte.Id
+  ORDER BY t.Tag, t.QuestionCount DESC
+),
+IntersectExample AS (
+  SELECT q.Id AS Id, q.Title
+  FROM Posts q
+  WHERE q.PostTypeId = 1 AND q.Score >= 10
+  INTERSECT
+  SELECT q2.Id, q2.Title
+  FROM Posts q2
+  WHERE q2.PostTypeId = 1 AND q2.AnswerCount >= 3
+),
+ExceptionExample AS (
+  SELECT ie.Id, ie.Title
+  FROM IntersectExample ie
+  WHERE NOT EXISTS (
+    SELECT 1 FROM Posts p WHERE p.Id = ie.Id AND p.ClosedDate IS NOT NULL
+  )
+)
+
+SELECT
+  cqm.QuestionId,
+  LEFT(cqm.Title, 120) AS TitleSnippet,
+  u.DisplayName AS OwnerName,
+  u.Reputation,
+  cqm.Score AS QuestionScore,
+  cqm.AnswerCountRecent,
+  cqm.AvgAnswerScore,
+  cqm.HoursToFirstAnswer,
+  cqm.DaysToLastAnswer,
+  cqm.BodySignal,
+  cqm.CommentHints,
+  cqm.DuplicateInlinks,
+  COALESCE(vb.UpVotes,0) AS UpVotes,
+  COALESCE(vb.DownVotes,0) AS DownVotes,
+  COALESCE(vb.Favorites,0) AS Favorites,
+  tb.QuestionCount AS TagQuestionCount,
+  tb.AvgScorePerQuestion AS TagAvgScore,
+  tu.DisplayName AS TopAnswererDisplay,
+  tu.Reputation AS TopAnswererReputation,
+  tuc.AnswersWithin180Days,
+  tuc.TotalBadges AS TopAnswererBadges,
+  -- complex expressions and NULL logic
+  CASE
+    WHEN cqm.HasAcceptedInRecent > 0 THEN 'RECENT_ACCEPTED'
+    WHEN cqm.AnswerCountRecent = 0 THEN 'NO_ANSWERS_RECENT'
+    WHEN cqm.Score < 0 THEN 'NEGATIVE_SCORE'
+    ELSE 'NORMAL'
+  END AS QuestionState,
+  CONCAT_WS(' | ',
+    CASE WHEN cqm.BodySignal = 'HAS_CODE' THEN 'code' ELSE NULL END,
+    CASE WHEN cqm.DuplicateInlinks > 0 THEN 'duplicate-linked' ELSE NULL END,
+    CASE WHEN COALESCE(vb.Favorites,0) > 5 THEN 'popular' ELSE NULL END
+  ) AS TaggingHints,
+  ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY cqm.Score DESC, cqm.AnswerCountRecent DESC) AS PerUserQuestionRank,
+  COALESCE(ee.Id, NULL) AS InIntersectButOpen
+FROM ComplexQuestionMetrics cqm
+LEFT JOIN Users u ON u.Id = cqm.OwnerUserId
+LEFT JOIN LATERAL (
+  SELECT p.OwnerUserId, p.Id, p.Score
+  FROM Posts p
+  WHERE p.ParentId = cqm.QuestionId AND p.PostTypeId = 2
+  ORDER BY p.Score DESC NULLS LAST
+  LIMIT 1
+) topAnswer ON TRUE
+LEFT JOIN Users tu ON tu.Id = topAnswer.OwnerUserId
+LEFT JOIN TopUsersByComplexity tuc ON tuc.UserId = tu.Id
+LEFT JOIN LATERAL (
+  SELECT unnest(TagArray) AS Tag
+  FROM PostTagExtract pte
+  WHERE pte.Id = cqm.QuestionId
+  LIMIT 1
+) singleTag ON TRUE
+LEFT JOIN TagPopularity tb ON tb.Tag = singleTag.Tag
+LEFT JOIN VoteBreakdown vb ON vb.PostId = cqm.QuestionId
+LEFT JOIN ExceptionExample ee ON ee.Id = cqm.QuestionId
+WHERE (cqm.Score IS NOT NULL OR cqm.AnswerCountRecent > 0)
+  AND (u.Reputation > 500 OR cqm.DuplicateInlinks > 0 OR COALESCE(vb.Favorites,0) >= 1)
+ORDER BY cqm.DuplicateInlinks DESC, cqm.Score DESC NULLS LAST, cqm.AnswerCountRecent DESC
+LIMIT 250;

@@ -1,0 +1,175 @@
+WITH RankedPosts AS (
+    SELECT
+        p.Id,
+        p.PostTypeId,
+        p.Title,
+        p.OwnerUserId,
+        p.Score,
+        p.CreationDate,
+        COALESCE(u.DisplayName, p.OwnerDisplayName, 'Unknown') AS OwnerName,
+        ROW_NUMBER() OVER (
+            PARTITION BY p.OwnerUserId 
+            ORDER BY p.Score DESC, p.CreationDate DESC
+        ) AS OwnerPostRank,
+        COUNT(*) OVER (PARTITION BY p.PostTypeId) AS TotalPostsOfType,
+        -- word count rough estimate in title
+        LENGTH(COALESCE(p.Title, '')) - LENGTH(REPLACE(COALESCE(p.Title, ''), ' ', '')) + 1 AS TitleWordCount,
+        -- normalized score to weekly average for trend detection
+        p.Score * 1.0 / NULLIF(EXTRACT(EPOCH FROM avg_week.ScoreAvg) / 604800, 0) AS ScoreToWeeklyAvgRatio
+    FROM
+        Posts p
+        LEFT JOIN Users u ON p.OwnerUserId = u.Id
+        LEFT JOIN LATERAL (
+            SELECT AVG(p2.Score) AS ScoreAvg
+            FROM Posts p2
+            WHERE p2.PostTypeId = p.PostTypeId
+              AND p2.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '7 days'
+        ) avg_week ON TRUE
+    WHERE p.PostTypeId IN (1, 2)
+), 
+
+AggregateBadgeSummary AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(DISTINCT b.Id) AS TotalBadges,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        BOOL_OR(b.TagBased) AS HasTagBasedBadge
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName
+),
+
+AnswerWithParent AS (
+    SELECT
+        a.Id AS AnswerId,
+        a.ParentId AS QuestionId,
+        a.Score AS AnswerScore,
+        a.CreationDate AS AnswerCreationDate,
+        q.Title AS QuestionTitle,
+        q.CreationDate AS QuestionCreationDate,
+        u.DisplayName AS AnswerOwnerName,
+        u.Reputation AS AnswerOwnerReputation,
+        /* Correlated Subquery for comment count on answer */
+        (SELECT COUNT(*) FROM Comments c WHERE c.PostId = a.Id) AS AnswerCommentCount,
+        /* Compute lag/lead score changes */
+        LAG(a.Score) OVER (PARTITION BY a.ParentId ORDER BY a.CreationDate) AS PrevAnswerScore,
+        LEAD(a.Score) OVER (PARTITION BY a.ParentId ORDER BY a.CreationDate) AS NextAnswerScore
+    FROM Posts a
+    JOIN Posts q ON a.ParentId = q.Id AND q.PostTypeId = 1
+    LEFT JOIN Users u ON a.OwnerUserId = u.Id
+    WHERE a.PostTypeId = 2
+),
+
+TaggedQuestions AS (
+    SELECT
+        qp.Id AS QuestionId,
+        qp.Title,
+        qt.TagName,
+        array_to_string(
+          ARRAY(
+            SELECT unnest(
+                string_to_array(
+                    trim(both '<>' from tags_sub.tag_chunk),
+                    '><'
+                )
+            )
+          ), ', '
+        ) AS ParsedTags
+    FROM (
+        SELECT p.Id, p.Title, p.Tags
+        FROM Posts p
+        WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL
+    ) qp
+    CROSS JOIN LATERAL (
+        -- Breaking tags safely considering format <tag1><tag2>...
+        SELECT unnest(
+            regexp_split_to_array(qp.Tags, E'(><)')
+        ) AS tag_chunk
+    ) tags_sub
+    JOIN Tags qt ON qt.TagName = regexp_replace(tags_sub.tag_chunk, '[<>]', '', 'g')
+),
+
+ValidPostLinks AS (
+    SELECT pl.PostId, pl.RelatedPostId, lt.Name AS LinkTypeName, pl.CreationDate
+    FROM PostLinks pl
+    JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id
+    WHERE pl.CreationDate > (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 year')
+),
+
+UserActivityTrending AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(DISTINCT p.Id) AS PostsInLastMonth,
+        SUM(p.Score) AS ScoreSumInLastMonth,
+        SUM(COALESCE(vote_counts.UpVotes, 0) - COALESCE(vote_counts.DownVotes,0)) AS NetVotesInLastMonth,
+        -- Window Func: rank by posts count desc    
+        RANK() OVER (ORDER BY COUNT(DISTINCT p.Id) DESC) AS ActivityRank,
+        -- Complex Null logic: give algorithmically busy flag
+        CASE
+            WHEN COUNT(DISTINCT p.Id) >= 50 AND SUM(p.Score) >= 100 THEN true
+            WHEN COUNT(DISTINCT p.Id) >= 10 AND SUM(p.Score) >= 20 THEN true
+            ELSE false 
+        END AS IsBusyUser -- boolean indicating activity level
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id AND p.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 month'
+    LEFT JOIN (
+        SELECT 
+            v.PostId, 
+            SUM(CASE WHEN vt.Name = 'UpMod' THEN 1 ELSE 0 END) AS UpVotes,
+            SUM(CASE WHEN vt.Name = 'DownMod' THEN 1 ELSE 0 END) AS DownVotes
+        FROM Votes v
+        JOIN VoteTypes vt ON v.VoteTypeId = vt.Id
+        WHERE v.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 month' 
+        GROUP BY v.PostId
+    ) vote_counts ON vote_counts.PostId = p.Id
+    GROUP BY u.Id, u.DisplayName
+)
+
+SELECT
+    rp.Id AS PostId,
+    rp.PostTypeId,
+    rp.Title,
+    rp.OwnerUserId,
+    rp.OwnerName,
+    rp.Score,
+    rp.ScoreToWeeklyAvgRatio,
+    rp.OwnerPostRank,
+    rp.TotalPostsOfType,
+    rp.TitleWordCount,
+    ags.TotalBadges,
+    ags.GoldBadges,
+    ags.SilverBadges,
+    ags.BronzeBadges,
+    ags.HasTagBasedBadge,
+    awp.AnswerId,
+    awp.AnswerScore,
+    awp.AnswerCreationDate,
+    awp.AnswerOwnerName,
+    awp.AnswerOwnerReputation,
+    awp.AnswerCommentCount,
+    awp.PrevAnswerScore,
+    awp.NextAnswerScore,
+    tq.ParsedTags,
+    vpl.LinkTypeName,
+    vpl.RelatedPostId,
+    ua.PostsInLastMonth,
+    ua.ScoreSumInLastMonth,
+    ua.NetVotesInLastMonth,
+    ua.ActivityRank,
+    ua.IsBusyUser
+FROM RankedPosts rp
+LEFT JOIN AggregateBadgeSummary ags ON rp.OwnerUserId = ags.UserId
+LEFT JOIN AnswerWithParent awp ON rp.Id = awp.QuestionId AND rp.PostTypeId = 1
+LEFT JOIN TaggedQuestions tq ON tq.QuestionId = rp.Id
+LEFT JOIN ValidPostLinks vpl ON vpl.PostId = rp.Id
+LEFT JOIN UserActivityTrending ua ON ua.UserId = rp.OwnerUserId
+WHERE rp.Score >= (
+    SELECT PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY Score) FROM Posts WHERE PostTypeId = rp.PostTypeId
+    ) -- filters by top quartile by same post type scoring
+  AND rp.CreationDate > CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '90 days'
+ORDER BY rp.ScoreToWeeklyAvgRatio DESC NULLS LAST, ua.ActivityRank NULLS LAST, rp.CreationDate DESC
+LIMIT 100;

@@ -1,0 +1,46 @@
+WITH RecursiveClosing AS (
+    SELECT
+        ph.PostId,
+        cumtrs.Current_tag_simcy,
+        artwork,
+        بغداد,
+        advance_makers,
+        post_PASSWORD_EDGE_clip,
+        Contributionist,
+        პროქusia_saخsessions쪽觀看_has_Occrupouched_attributes_No_BIZ_Ordlau_باə_dancers_Uzbekistanདّت_Q럼alamPATH_المختّ_US_detectyllalkclient_градусов_CENT_устра_friday_tab_validatorêts_gestesGENTEGR_gé赏رزIPS_CanadianellschaftIENTохож_enactCalendaritivesangkancludesিয়ে_HAND_disabledபோ_mixture_outsiders_inspectorraithe_Kwa_billion_pesanزيزPort_Pemer_ఒIm_arbejde_éпа_armespicked_escolherTreех_established_ר_premye
+    FROM ph
+    JOIN cumtrs ON ph.some_id = cumtrs.some_id
+),
+Aggregated AS (
+    SELECT
+        rc.PostId,
+        rc.Current_tag_simcy,
+        rc.artwork,
+        rc.بغداد,
+        rc.advance_makers,
+        rc.post_PASSWORD_EDGE_clip,
+        rc.Contributionist,
+        rc.პროქusia_saخsessions쪽觀看_has_Occrupouched_attributes_No_BIZ_Ordlau_باə_dancers_Uzbekistanདّت_Q럼alamPATH_المختّ_US_detectyllalkclient_градусов_CENT_устра_friday_tab_validatorêts_gestesGENTEGR_gé赏رزIPS_CanadiangesellschaftIENTохож_enactCalendaritivesangkancludesিয়ে_HAND_disabledபோ_mixture_outsiders_inspectorraithe_Kwa_billion_pesanزيزPort_Pemer_ఒIm_arbejde_éпа_armespicked_escolherTreех_established_ר_premye,
+        COUNT(*) AS cnt
+    FROM RecursiveClosing rc
+    GROUP BY
+        rc.PostId,
+        rc.Current_tag_simcy,
+        rc.artwork,
+        rc.بغداد,
+        rc.advance_makers,
+        rc.post_PASSWORD_EDGE_clip,
+        rc.Contributionist,
+        rc.პროქusia_saخsessions쪽觀看_has_Occrupouched_attributes_No_BIZ_Ordlau_باə_dancers_Uzbekistanདّت_Q럼alamPATH_المختّ_US_detectyllalkclient_градусов_CENT_устра_friday_tab_validatorêts_gestesGENTEGR_gé赏رزIPS_CanadiangesellschaftIENTохож_enactCalendaritivesangkancludesিয়ে_HAND_disabledபோ_mixture_outsiders_inspectorraithe_Kwa_billion_pesanزيزPort_Pemer_ఒIm_arbejde_éпа_armespicked_escolherTreех_established_ר_premye
+)
+SELECT
+    a.PostId,
+    a.Current_tag_simcy,
+    a.artwork,
+    a.بغداد,
+    a.advance_makers,
+    a.post_PASSWORD_EDGE_clip,
+    a.Contributionist,
+    a.პროქusia_saخsessions쪽觀看_has_Occrupouched_attributes_No_BIZ_Ordlau_باə_dancers_Uzbekistanདّت_QรัมalamPATH_المختّ_US_detectyllalkclient_градусов_CENT_устра_friday_tab_validatorêts_gestesGENTEGR_gé赏رزIPS_CanadiangesellschaftIENTохож_enactCalendaritivesangkancludesিয়ে_HAND_disabledபோ_mixture_outsiders_inspectorraithe_Kwa_billion_pesanزيزPort_Pemer_ఒIm_arbejde_éпа_armesppicked_escolherTreех_established_ר_premye,
+    a.cnt
+FROM Aggregated a;

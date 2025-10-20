@@ -1,0 +1,143 @@
+with RecursivePopularUsers as (
+    select 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        dense_rank() over (order by u.Reputation desc) as ReprRank,
+        coalesce(cq.QuestionCount,0) QuestionCount
+    from 
+        Users u
+    left join (
+        select 
+            OwnerUserId,
+            count(*) as QuestionCount
+        from Posts 
+        where PostTypeId = 1
+        group by OwnerUserId
+    ) cq on cq.OwnerUserId = u.Id
+    where u.Reputation > 1000
+    union all
+    select 
+        p.Id,
+        p.DisplayName,
+        p.Reputation,
+        rpu.ReprRank + 1 as ReprRank,
+        p.QuestionCount
+    from Users p
+    join RecursivePopularUsers rpu on p.Reputation < rpu.Reputation and p.Id <> rpu.Id 
+    where p.Reputation > 1000 and rpu.ReprRank < 100
+), AnswerRankScore as (
+    select 
+        a.Id as AnswerId,
+        a.ParentId as QuestionId,
+        a.OwnerUserId,
+        a.Score,
+        row_number() over(partition by a.ParentId order by a.Score desc, a.CreationDate asc) as ScoreRank
+    from Posts a
+    where a.PostTypeId = 2
+), TopAnswers as (
+    select 
+        ans.AnswerId,
+        pud.DisplayName as Answerer,
+        q.Id as QuestionId,
+        q.Title,
+        coalesce(q.Score,0) as QuestionScore,
+        ans.Score as AnswerScore,
+        ans.ScoreRank
+    from AnswerRankScore ans
+    join Posts q on q.Id = ans.QuestionId and q.PostTypeId = 1
+    left join Users pud on pud.Id = ans.OwnerUserId
+    where ans.ScoreRank <= 3
+), BadgeSummary as (
+    select 
+        UserId,
+        Count(*) as BadgesCount,
+        count(case when Class = 1 then 1 end) as GoldBadges,
+        count(case when Class = 2 then 1 end) as SilverBadges,
+        count(case when Class = 3 then 1 end) as BronzeBadges
+    from Badges
+    group by UserId
+), CntPostedCommentsAndVotes as (
+    select 
+        p.OwnerUserId,
+        count(distinct com.Id) as CommentsCount,
+        count(distinct v.Id) as VoteCount,
+        count(distinct case when v.VoteTypeId = 2 then v.Id end) as UpvotesCount,
+        count(distinct coalesce(pl.RateLinkId,0)) as LinkersCount
+    from Posts p 
+    left join Comments com on com.PostId = p.Id
+    left join Votes v on v.PostId = p.Id
+    left join (
+        select PostId, count(*) as RateLinkId from PostLinks group by PostId
+    ) pl on pl.PostId = p.Id
+    group by p.OwnerUserId
+), TaggedQuestions as (
+    select 
+        p.Id as QId,
+        regexp_split_to_table(
+          substring(coalesce(Tags,'') , 2, char_length(coalesce(Tags,'')) - 2), 
+          '><') as Tag
+    from Posts p
+    where p.PostTypeId = 1 and p.Tags is not null and p.Tags != ''
+), QuestionsWithTagSumm as (
+    select
+        tag.Tag,
+        count(distinct tag.QId) as QuestionCount,
+        sum(q.Score) as TotalScore
+    from TaggedQuestions tag
+    join Posts q on q.Id = tag.QId
+    group by tag.Tag
+    having count(distinct tag.QId) > 10
+), CloseVsOpenQuestions as (
+    select 
+        sum(case when ClosedDate is not null then 1 else 0 end) as ClosedQs,
+        sum(case when ClosedDate is null then 1 else 0 end) as OpenQs
+    from Posts
+    where PostTypeId = 1
+)
+select distinct
+    up.DisplayName as PopularUserName,
+    up.Reputation,
+    up.QuestionCount as UserQuestions,
+    coalesce(bs.GoldBadges,0) GoldBadges,
+    coalesce(bs.SilverBadges,0) SilverBadges,
+    coalesce(bs.BronzeBadges,0) BronzeBadges,
+    cac.CommentsCount,
+    cac.VoteCount,
+    cac.UpvotesCount,
+    t.TopAnswerTitle,
+    t.QuestionScore,
+    t.AnswerScore,
+    qtsm.Tag as FrequentTag,
+    qtsm.QuestionCount as TagQuestionCount,
+    round((cvq.ClosedQs::numeric)*100 / GREATEST(NULLIF(cvq.ClosedQs + cvq.OpenQs,0),1),2) as ClosedQuestionsPercentage,
+    least(ws.BodyLengthAnalysis_Freq_metaevents, COALESCE(ws.BodyLengthAnalysis_Freq_metaevents, lag(ws.BodyLengthAnalysis_Freq_metaevents) OVER (ORDER BY ws.BodyLengthAnalysis_Freq_metaevents) + 1)) as MinBTFreq,
+    abs( ( (char_length(coalesce(u.AboutMe,'')) - char_length(regexp_replace(coalesce(u.AboutMe,''),'[aeiouAEIOU]', '','g')))::numeric / NULLIF(char_length(coalesce(u.AboutMe,'')),0) - 0.35 ) ) as AboutMeVowelDensityDistance35Pct
+from RecursivePopularUsers up
+left join BadgeSummary bs on bs.UserId = up.Id
+left join CntPostedCommentsAndVotes cac on cac.OwnerUserId = up.Id
+left join (
+    select 
+        taq.Answerer, 
+        taq.Title as TopAnswerTitle, 
+        taq.QuestionScore, 
+        taq.AnswerScore
+    from TopAnswers taq
+) t on t.Answerer = up.DisplayName
+left join QuestionsWithTagSumm qtsm on qtsm.Tag = (
+    select Tag from QuestionsWithTagSumm order by QuestionCount desc limit 1 offset floor(random()*3)::int
+)
+cross join CloseVsOpenQuestions cvq
+left join lateral (
+    select 
+        count(PostHistoryTypeId) as BodyLengthAnalysis_Freq_metaevents
+    from PostHistory 
+    where PostId in (
+      select Id from Posts where OwnerUserId = up.Id limit 100
+    ) and PostHistoryTypeId in (2,5,8)
+) ws on true
+left join Users u on u.Id = up.Id
+where up.ReprRank <= 10
+and (coalesce(bs.GoldBadges,0) + coalesce(bs.SilverBadges,0) + coalesce(bs.BronzeBadges,0)) >= 5
+order by up.Reputation desc
+limit 100;

@@ -1,0 +1,30 @@
+WITH EligibleQuestions AS (
+    SELECT
+        p.Id,
+        p.Title,
+        u.Id AS UserId,
+        COALESCE(SUM(CASE WHEN vb.IsUpvote = TRUE THEN 1 ELSE 0 END), 0) AS UpVotes,
+        COALESCE(SUM(CASE WHEN vb.IsDownvote = TRUE THEN 1 ELSE 0 END), 0) AS DownVotes,
+        COALESCE(SUM(CASE WHEN f.PostId IS NOT NULL THEN 1 ELSE 0 END), 0) AS Favorites,
+        COALESCE(SUM(CASE WHEN c.Id IS NOT NULL THEN 1 ELSE 0 END), 0) AS CommentsCount,
+        p.CreationDate
+    FROM Posts p
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    LEFT JOIN Votes vb ON vb.PostId = p.Id
+    LEFT JOIN PostFavorites f ON f.PostId = p.Id
+    LEFT JOIN Comments c ON c.PostId = p.Id
+    WHERE p.PostTypeId = 1
+    GROUP BY p.Id, p.Title, u.Id, p.CreationDate
+)
+SELECT
+    eq.Id,
+    eq.Title,
+    eq.UserId,
+    eq.UpVotes,
+    eq.DownVotes,
+    eq.Favorites,
+    eq.CommentsCount,
+    eq.CreationDate,
+    (eq.UpVotes - eq.DownVotes) AS Score
+FROM EligibleQuestions eq
+ORDER BY Score DESC, eq.CreationDate DESC;

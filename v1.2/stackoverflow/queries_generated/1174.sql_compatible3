@@ -1,0 +1,202 @@
+with RecursiveUserBadges as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        b.Name as BadgeName,
+        b.Class,
+        b.Date,
+        row_number() over (partition by u.Id order by b.Date) as BadgeRank
+    from Users u
+    left join Badges b on b.UserId = u.Id
+),
+TopBadgesPerUser as (
+    select
+        UserId,
+        DisplayName,
+        BadgeName,
+        Class,
+        Date,
+        BadgeRank
+    from RecursiveUserBadges
+    where BadgeRank <= 5
+),
+QuestionStats as (
+    select
+        p.Id as QuestionId,
+        p.Title,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.Tags,
+        coalesce(p.AcceptedAnswerId, -1) as AcceptedAnswerId,
+        row_number() over (partition by p.OwnerUserId order by p.Score desc, p.CreationDate desc) as QuestionRank
+    from Posts p
+    where p.PostTypeId = 1
+),
+AnswerAndLinkDetails as (
+    select
+        a.Id as AnswerId,
+        a.ParentId as QuestionId,
+        a.OwnerUserId as AnswerOwnerId,
+        a.Score as AnswerScore,
+        a.CreationDate as AnswerCreationDate,
+        l.LinkTypeId,
+        l.RelatedPostId
+    from Posts a
+    left join PostLinks l on l.PostId = a.Id
+    where a.PostTypeId = 2
+),
+QuestionCloseHistory as (
+    select
+        ph.PostId,
+        ph.PostHistoryTypeId,
+        crt.Name as CloseReason,
+        ph.CreationDate as CloseDate
+    from PostHistory ph
+    left join CloseReasonTypes crt on crt.Id = cast(ph.Comment as integer)
+    where ph.PostHistoryTypeId = 10
+),
+UserActivityRanking as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionsAsked,
+        count(distinct p.Id) filter (where p.PostTypeId = 2) as AnswersGiven,
+        coalesce(sum(vtVoteCounts.UpVotes),0) as TotalUpVotes,
+        coalesce(sum(vtVoteCounts.DownVotes),0) as TotalDownVotes,
+        row_number() over (order by u.Reputation desc) as ReputationRank
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join (
+        select
+            p.OwnerUserId,
+            sum(case when v.VoteTypeId = 2 then 1 else 0 end) as UpVotes,
+            sum(case when v.VoteTypeId = 3 then 1 else 0 end) as DownVotes
+        from Posts p
+        left join Votes v on v.PostId = p.Id
+        group by p.OwnerUserId
+    ) vtVoteCounts on vtVoteCounts.OwnerUserId = u.Id
+    group by u.Id, u.DisplayName, u.Reputation
+),
+MostLinkedQuestions as (
+    select
+        pl.PostId as QuestionId,
+        count(distinct pl.RelatedPostId) as LinkedCount
+    from PostLinks pl
+    join Posts p on p.Id = pl.PostId and p.PostTypeId = 1
+    group by pl.PostId
+    having count(distinct pl.RelatedPostId) > 5
+),
+TagQuestionStats as (
+    select
+        tag as Tag,
+        count(*) as QuestionCount,
+        avg(p.Score) as AvgScore,
+        avg(p.ViewCount) as AvgViewCount
+    from Posts p,
+    lateral (
+      select unnest(string_to_array(substring(p.Tags from 2 for char_length(p.Tags) - 2), '><')) as tag
+    ) t
+    where p.PostTypeId = 1
+    group by tag
+),
+UserAnswerLatency as (
+    select
+        a.OwnerUserId as UserId,
+        q.Id as QuestionId,
+        a.Id as AnswerId,
+        extract(epoch from (a.CreationDate - q.CreationDate))/3600 as HoursToAnswer
+    from Posts a
+    join Posts q on q.Id = a.ParentId and q.PostTypeId = 1
+    where a.PostTypeId = 2
+),
+UserAverageAnswerLatency as (
+    select
+        UserId,
+        avg(HoursToAnswer) as AvgAnswerLatencyHours
+    from UserAnswerLatency
+    group by UserId
+),
+UserScoreDifferenceBetweenPosts as (
+    select
+        p.OwnerUserId as UserId,
+        p.Id as PostId,
+        p.PostTypeId,
+        p.Score,
+        lag(p.Score) over (partition by p.OwnerUserId order by p.CreationDate) as PreviousScore,
+        p.Score - lag(p.Score) over (partition by p.OwnerUserId order by p.CreationDate) as ScoreDifference,
+        rank() over (
+          partition by p.OwnerUserId
+          order by (p.Score - lag(p.Score) over (partition by p.OwnerUserId order by p.CreationDate)) desc
+        ) as RankByScoreDiff
+    from Posts p
+    where p.OwnerUserId is not null
+)
+select
+    q.QuestionId,
+    q.Title,
+    u.DisplayName as QuestionOwner,
+    u.Reputation,
+    q.Score as QuestionScore,
+    q.ViewCount,
+    q.AnswerCount,
+    coalesce(tc.CloseReason,'Open') as CloseStatus,
+    coalesce(ab.BadgeSummary, 'No Badges') as BadgeSummary,
+    coalesce(ansAgg.AverageAnswerScore,0) as AverageAnswerScore,
+    coalesce(ansAgg.MaxAnswerScore,0) as MaxAnswerScore,
+    coalesce(maq.LinkedCount, 0) as TimesQuestionLinked,
+    string_agg(distinct tqs.Tag, ', ') as Tags,
+    tagsAgg.QuestionCount as NumberOfQuestionsInTag,
+    tagsAgg.AvgScore as AvgScoreInTag,
+    tagsAgg.AvgViewCount as AvgViewCountInTag,
+    coalesce(ual.AvgAnswerLatencyHours, -1) as AvgAnswerLatencyHours
+from QuestionStats q
+left join Users u on u.Id = q.OwnerUserId
+left join (
+    select 
+        UserId,
+        string_agg(concat_ws(':', BadgeName, 'Class', cast(Class as text), 'Date', to_char(Date,'YYYY-MM-DD')), '; ') as BadgeSummary
+    from TopBadgesPerUser
+    group by UserId
+) ab on ab.UserId = q.OwnerUserId
+left join (
+    select
+        a.QuestionId,
+        avg(a.AnswerScore) as AverageAnswerScore,
+        max(a.AnswerScore) as MaxAnswerScore
+    from AnswerAndLinkDetails a
+    group by a.QuestionId
+) ansAgg on ansAgg.QuestionId = q.QuestionId
+left join QuestionCloseHistory tc on tc.PostId = q.QuestionId and tc.CloseDate = (
+    select max(CreationDate) from PostHistory ph where ph.PostId = q.QuestionId and ph.PostHistoryTypeId = 10
+)
+left join MostLinkedQuestions maq on maq.QuestionId = q.QuestionId
+left join TagQuestionStats tagsAgg on tagsAgg.Tag = ANY(string_to_array(substring(q.Tags from 2 for char_length(q.Tags) - 2), '><'))
+left join UserAverageAnswerLatency ual on ual.UserId = q.OwnerUserId
+left join (
+  select
+    q2.QuestionId as QuestionId,
+    unnest(string_to_array(substring(q2.Tags from 2 for char_length(q2.Tags) - 2), '><')) as Tag
+  from QuestionStats q2
+) tqs on tqs.QuestionId = q.QuestionId
+group by
+    q.QuestionId,
+    q.Title,
+    u.DisplayName,
+    u.Reputation,
+    q.Score,
+    q.ViewCount,
+    q.AnswerCount,
+    tc.CloseReason,
+    ab.BadgeSummary,
+    ansAgg.AverageAnswerScore,
+    ansAgg.MaxAnswerScore,
+    maq.LinkedCount,
+    tagsAgg.QuestionCount,
+    tagsAgg.AvgScore,
+    tagsAgg.AvgViewCount,
+    ual.AvgAnswerLatencyHours
+order by q.Score desc, q.ViewCount desc
+limit 100;

@@ -1,0 +1,38 @@
+WITH RECURSIVE RecursiveUserLinks AS (
+    SELECT u.Id AS UserId,
+           ul.RelatedUserId,
+           1 AS Depth
+    FROM (
+        SELECT p.OwnerUserId,
+               pl.RelatedPostId,
+               COALESCE(articlequ.OwnerUserId, -1) AS RelatedUserId
+        FROM Posts p
+        INNER JOIN PostLinks pl ON p.Id = pl.PostId
+        LEFT JOIN Posts articlequ ON pl.RelatedPostId = articlequ.Id
+        WHERE p.OwnerUserId IS NOT NULL AND p.OwnerUserId > 0
+          AND articlequ.OwnerUserId IS NOT NULL AND articlequ.OwnerUserId > 0
+    ) ul
+    INNER JOIN Users u ON ul.OwnerUserId = u.Id
+
+    UNION ALL
+
+    SELECT iuls.UserId,
+           originPatterns.relatedSignedUser,
+           iuls.Depth + 1
+    FROM RecursiveUserLinks iuls
+    JOIN (
+        SELECT RelatedUserId AS relatedSignedUser
+        FROM (
+            SELECT COALESCE(articlequ.OwnerUserId, -1) AS RelatedUserId
+            FROM Posts p
+            INNER JOIN PostLinks pl ON p.Id = pl.PostId
+            LEFT JOIN Posts articlequ ON pl.RelatedPostId = articlequ.Id
+            WHERE p.OwnerUserId IS NOT NULL AND p.OwnerUserId > 0
+              AND articlequ.OwnerUserId IS NOT NULL AND articlequ.OwnerUserId > 0
+        ) t
+        WHERE RelatedUserId > 0
+    ) originPatterns ON originPatterns.relatedSignedUser <> iuls.UserId
+)
+SELECT UserId, RelatedUserId, Depth
+FROM RecursiveUserLinks
+GROUP BY UserId, RelatedUserId, Depth;

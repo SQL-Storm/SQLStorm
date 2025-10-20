@@ -1,0 +1,58 @@
+with vaulted_posts as (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.Title,
+        row_number() over (
+            partition by coalesce(p.OwnerUserId, -1), p.PostTypeId
+            order by p.Score desc, p.ViewCount desc
+        ) as rn,
+        coalesce(
+            nullif(
+                regexp_split_to_array(substring(p.Tags from 2 for char_length(p.Tags) - 2), '><'),
+                '{}'
+            ),
+            array[]::varchar[]  -- keep cast syntax for array literal where supported
+        ) as tags
+    from posts p
+),
+formatted_user_links as (
+    select
+        ua.* 
+    from public.user_authors ua
+)
+select
+    vp.Id,
+    vp.PostTypeId,
+    vp.OwnerUserId,
+    vp.Score,
+    vp.ViewCount,
+    vp.CreationDate,
+    vp.Title,
+    vp.rn,
+    vp.tags,
+    ful.user_id,
+    ful.*
+from vaulted_posts vp
+left join formatted_user_links ful
+    on ful.user_id = vp.OwnerUserId
+where vp.rn = 1
+group by
+    vp.Id,
+    vp.PostTypeId,
+    vp.OwnerUserId,
+    vp.Score,
+    vp.ViewCount,
+    vp.CreationDate,
+    vp.Title,
+    vp.rn,
+    vp.tags,
+    ful.user_id,
+    ful.id,
+    ful.user_id,
+    ful.author_name,
+    ful.author_email;

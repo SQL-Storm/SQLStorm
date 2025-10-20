@@ -1,0 +1,34 @@
+WITH RankedAnswers AS (
+    SELECT
+        a.Id,
+        a.ParentId,
+        u.DisplayName AS Answerer,
+        u.Reputation,
+        a.Score,
+        ROW_NUMBER() OVER (PARTITION BY a.ParentId ORDER BY ABS(a.Score) DESC, a.LastActivityDate DESC) AS Answer_Rank,
+        med.MaximumTagsLength
+    FROM
+        public.answers a
+        LEFT JOIN public.users u ON a.OwnerUserId = u.Id
+        LEFT JOIN public.minExplainDuration med ON a.Id = med.AnswerId
+    GROUP BY
+        a.Id,
+        a.ParentId,
+        u.DisplayName,
+        u.Reputation,
+        a.Score,
+        a.LastActivityDate,
+        med.MaximumTagsLength
+)
+SELECT
+    Id,
+    ParentId,
+    Answerer,
+    Reputation,
+    Score,
+    Answer_Rank,
+    MaximumTagsLength
+FROM
+    RankedAnswers
+WHERE
+    Answer_Rank = 1;

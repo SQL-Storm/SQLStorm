@@ -1,0 +1,216 @@
+with RecursiveBadgeSummary as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        b.Class,
+        count(*) as BadgeCount,
+        row_number() over(partition by u.Id order by b.Class) as rn
+    from
+        Users u
+        left join Badges b on u.Id = b.UserId
+    where
+        (b.Date >= u.CreationDate + interval '30 days') or b.Date is null
+    group by
+        u.Id, u.DisplayName, b.Class
+), UserRecentPosts as (
+    select
+        p.Id,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.Score,
+        p.CreationDate,
+        row_number() over (partition by p.OwnerUserId order by p.CreationDate desc) as rn
+    from
+        Posts p
+    where
+        p.OwnerUserId is not null
+), TopUserPostsWithComments as (
+    select
+        p.Id as PostId,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.Score,
+        p.CreationDate,
+        count(case when c.Score > 0 then 1 end) as PositiveCommentCount,
+        count(case when c.Score <= 0 or c.Score is null then 1 end) as NonPositiveCommentCount
+    from
+        UserRecentPosts p
+        left join Comments c on c.PostId = p.Id
+    where
+        p.rn <= 5
+    group by
+        p.Id, p.OwnerUserId, p.PostTypeId, p.Score, p.CreationDate
+), PostHistoryAggregates as (
+    select
+        ph.PostId,
+        max(ph.CreationDate) as LastEditDate,
+        count(case when ph.PostHistoryTypeId in (4,5,6) then 1 end) as EditCount,
+        bool_or(ph.PostHistoryTypeId = 10) as HasClosed,
+        bool_or(ph.PostHistoryTypeId = 11) as HasReopened
+    from
+        PostHistory ph
+    group by
+        ph.PostId
+), DuplicateQuestions as (
+    select
+        pl.PostId,
+        pl.RelatedPostId,
+        u.DisplayName as OriginalOwner,
+        q.Title as OriginalTitle
+    from
+        PostLinks pl
+        inner join Posts q on q.Id = pl.RelatedPostId and q.PostTypeId = 1
+        left join Users u on u.Id = q.OwnerUserId
+    where
+        pl.LinkTypeId = 3
+), UserRanking as (
+    select
+        u.Id,
+        u.DisplayName,
+        coalesce(rnk.Rank, 9999) as RankByReputation,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        coalesce(badges.TotalBadges, 0) as TotalBadges,
+        coalesce(posts.TotalPosts, 0) as TotalPosts
+    from
+        Users u
+        left join (
+            select
+                UserId,
+                dense_rank() over (order by sum(BadgeCount) desc) as Rank
+            from
+                RecursiveBadgeSummary
+            group by UserId
+        ) rnk on u.Id = rnk.UserId
+        left join (
+            select
+                OwnerUserId,
+                count(*) as TotalPosts
+            from
+                Posts
+            group by OwnerUserId
+        ) posts on u.Id = posts.OwnerUserId
+        left join (
+            select
+                UserId,
+                sum(BadgeCount) as TotalBadges
+            from RecursiveBadgeSummary
+            group by UserId
+        ) badges on u.Id = badges.UserId
+), RecentActivitySummary as (
+    select
+        u.Id as UserId,
+        max(p.CreationDate) as LastPostDate,
+        max(c.CreationDate) as LastCommentDate,
+        max(ph.CreationDate) as LastHistoryDate,
+        case 
+            when coalesce(max(p.CreationDate), timestamp '0001-01-01') > coalesce(max(c.CreationDate), timestamp '0001-01-01')
+                 and coalesce(max(p.CreationDate), timestamp '0001-01-01') > coalesce(max(ph.CreationDate), timestamp '0001-01-01') then 'Post'
+            when coalesce(max(c.CreationDate), timestamp '0001-01-01') > coalesce(max(p.CreationDate), timestamp '0001-01-01')
+                 and coalesce(max(c.CreationDate), timestamp '0001-01-01') > coalesce(max(ph.CreationDate), timestamp '0001-01-01') then 'Comment'
+            when coalesce(max(ph.CreationDate), timestamp '0001-01-01') > coalesce(max(p.CreationDate), timestamp '0001-01-01')
+                 and coalesce(max(ph.CreationDate), timestamp '0001-01-01') > coalesce(max(c.CreationDate), timestamp '0001-01-01') then 'PostHistory'
+            else 'NoActivity'
+        end as MostRecentActivityType
+    from
+        Users u
+        left join Posts p on p.OwnerUserId = u.Id
+        left join Comments c on c.UserId = u.Id
+        left join PostHistory ph on ph.UserId = u.Id
+    group by
+        u.Id
+), TagComplexity as (
+    select
+        t.Id as TagId,
+        t.TagName,
+        t.Count as TagCount,
+        length(t.TagName) as NameLength,
+        case when t.IsModeratorOnly = true then 'Moderator Only' else 'General' end as TagType,
+        coalesce(excerpt.Body, '') as ExcerptBody,
+        coalesce(wiki.Body, '') as WikiBody
+    from
+        Tags t
+        left join Posts excerpt on excerpt.Id = t.ExcerptPostId
+        left join Posts wiki on wiki.Id = t.WikiPostId
+)
+select
+    ur.DisplayName as UserName,
+    ur.Reputation,
+    ur.RankByReputation,
+    ur.TotalBadges,
+    ur.TotalPosts,
+    ras.MostRecentActivityType,
+    pb.Class as BadgeClass,
+    pb.BadgeCount,
+    topPosts.PostId,
+    topPosts.PostTypeId,
+    topPosts.Score as PostScore,
+    topPosts.PositiveCommentCount,
+    topPosts.NonPositiveCommentCount,
+    phAgg.EditCount,
+    phAgg.HasClosed,
+    phAgg.HasReopened,
+    dq.RelatedPostId as DuplicateOfQuestionId,
+    dq.OriginalTitle as DuplicateOriginalTitle,
+    tq.TagName,
+    tq.NameLength as TagNameLength,
+    tq.TagType,
+    case 
+        when topPosts.Score > 100 then 'HighScore'
+        when topPosts.Score > 50 then 'MediumScore'
+        else 'LowScore'
+    end as ScoreCategory,
+    (coalesce(tq.TagName, 'NoTag') || ' | ' ||
+     case when phAgg.HasClosed then 'Closed' else 'Open' end || ' | ' ||
+     coalesce(dq.OriginalTitle, 'NotDuplicate')) as PostSummary
+from
+    UserRanking ur
+    left join RecursiveBadgeSummary pb on ur.Id = pb.UserId and pb.rn = 1
+    left join RecentActivitySummary ras on ur.Id = ras.UserId
+    left join TopUserPostsWithComments topPosts on ur.Id = topPosts.OwnerUserId
+    left join PostHistoryAggregates phAgg on topPosts.PostId = phAgg.PostId
+    left join DuplicateQuestions dq on topPosts.PostId = dq.PostId
+    left join lateral (
+        select regexp_split_to_table(trim(both '<>' from coalesce(p.Tags, '')), '><') as TagName
+        from Posts p
+        where p.Id = topPosts.PostId
+        limit 1
+    ) tagnames on true
+    left join TagComplexity tq on tq.TagName = tagnames.TagName
+where
+    (ur.TotalPosts > 10 or ur.TotalBadges > 5)
+    and ur.Reputation > 1000
+    and topPosts.PostTypeId in (1,2)
+group by
+    ur.DisplayName,
+    ur.Reputation,
+    ur.RankByReputation,
+    ur.TotalBadges,
+    ur.TotalPosts,
+    ras.MostRecentActivityType,
+    pb.Class,
+    pb.BadgeCount,
+    topPosts.PostId,
+    topPosts.OwnerUserId,
+    topPosts.PostTypeId,
+    topPosts.Score,
+    topPosts.PositiveCommentCount,
+    topPosts.NonPositiveCommentCount,
+    phAgg.EditCount,
+    phAgg.HasClosed,
+    phAgg.HasReopened,
+    dq.RelatedPostId,
+    dq.OriginalTitle,
+    tq.TagName,
+    tq.NameLength,
+    tq.TagType,
+    ur.Id,
+    pb.UserId,
+    topPosts.OwnerUserId
+order by
+    ur.RankByReputation,
+    topPosts.Score desc,
+    pb.Class,
+    phAgg.EditCount desc
+limit 100;

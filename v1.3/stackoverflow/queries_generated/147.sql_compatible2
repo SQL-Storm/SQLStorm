@@ -1,0 +1,197 @@
+WITH
+user_posts AS (
+  SELECT
+    u.Id AS UserId,
+    COUNT(p.Id) FILTER (WHERE p.PostTypeId = 1) AS Questions,
+    COUNT(p.Id) FILTER (WHERE p.PostTypeId = 2) AS Answers,
+    SUM(p.Score) FILTER (WHERE p.PostTypeId IN (1,2)) AS TotalPostScore,
+    MAX(p.CreationDate) AS LastPostAt,
+    BOOL_OR(p.ClosedDate IS NOT NULL) AS HasClosedQuestion
+  FROM Users u
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+  GROUP BY u.Id
+),
+badge_breakdown AS (
+  SELECT
+    b.UserId,
+    COUNT(*) AS BadgeCount,
+    SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS Gold,
+    SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS Silver,
+    SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS Bronze,
+    MAX(b.Date) AS LastBadgeDate,
+    STRING_AGG(DISTINCT b.Name, ',' ORDER BY b.Date DESC) FILTER (WHERE b.TagBased = 0) AS NamedBadges,
+    STRING_AGG(DISTINCT b.Name, ',' ORDER BY b.Date DESC) FILTER (WHERE b.TagBased = 1) AS TagBadges
+  FROM Badges b
+  GROUP BY b.UserId
+),
+user_tag_counts AS (
+  SELECT
+    u.Id AS UserId,
+    lower(trim(t.tag)) AS Tag,
+    COUNT(*) AS TagCount
+  FROM Users u
+  JOIN Posts p ON p.OwnerUserId = u.Id AND p.PostTypeId = 1 AND p.Tags IS NOT NULL
+  CROSS JOIN LATERAL (
+    SELECT unnest(string_to_array(substring(p.Tags from 2 for length(p.Tags)-2), '><')) AS tag
+  ) t
+  GROUP BY u.Id, lower(trim(t.tag))
+),
+favorite_tag AS (
+  SELECT DISTINCT ON (utc.UserId)
+    utc.UserId,
+    utc.Tag AS FavoriteTag,
+    utc.TagCount
+  FROM user_tag_counts utc
+  ORDER BY utc.UserId, utc.TagCount DESC, utc.Tag ASC
+),
+user_answer_stats AS (
+  SELECT
+    u.Id AS UserId,
+    COALESCE((
+      SELECT CAST(AVG(a.Score) AS numeric(10,3))
+      FROM Posts a
+      WHERE a.OwnerUserId = u.Id AND a.PostTypeId = 2
+    ), 0) AS AvgAnswerScore,
+    COALESCE((
+      SELECT COUNT(*) FILTER (WHERE p.AcceptedAnswerId = p2.Id)
+      FROM Posts p
+      JOIN Posts p2 ON p2.Id = p.AcceptedAnswerId
+      WHERE p2.OwnerUserId = u.Id
+    ), 0) AS AcceptedAnswersReceived,
+    COALESCE((
+      SELECT NULLIF(COUNT(*) FILTER (WHERE p.AcceptedAnswerId = p2.Id), 0) * 1.0 /
+             NULLIF(GREATEST(COUNT(*) FILTER (WHERE p2.OwnerUserId = u.Id), 1), 1)
+      FROM Posts p
+      JOIN Posts p2 ON p2.Id = p.AcceptedAnswerId
+      WHERE p2.OwnerUserId = u.Id
+    ), 0) AS AcceptRate
+  FROM Users u
+),
+vote_agg AS (
+  SELECT
+    u.Id AS UserId,
+    COALESCE(SUM(v_given_up.cnt),0) AS UpvotesGiven,
+    COALESCE(SUM(v_given_down.cnt),0) AS DownvotesGiven,
+    COALESCE(SUM(v_recv_up.cnt),0) AS UpvotesReceived,
+    COALESCE(SUM(v_recv_down.cnt),0) AS DownvotesReceived
+  FROM Users u
+  LEFT JOIN LATERAL (
+    SELECT COUNT(*) AS cnt FROM Votes v WHERE v.UserId = u.Id AND v.VoteTypeId = 2
+  ) v_given_up ON TRUE
+  LEFT JOIN LATERAL (
+    SELECT COUNT(*) AS cnt FROM Votes v WHERE v.UserId = u.Id AND v.VoteTypeId = 3
+  ) v_given_down ON TRUE
+  LEFT JOIN LATERAL (
+    SELECT COUNT(*) AS cnt FROM Votes v JOIN Posts p ON p.Id = v.PostId WHERE p.OwnerUserId = u.Id AND v.VoteTypeId = 2
+  ) v_recv_up ON TRUE
+  LEFT JOIN LATERAL (
+    SELECT COUNT(*) AS cnt FROM Votes v JOIN Posts p ON p.Id = v.PostId WHERE p.OwnerUserId = u.Id AND v.VoteTypeId = 3
+  ) v_recv_down ON TRUE
+  GROUP BY u.Id, v_given_up.cnt, v_given_down.cnt, v_recv_up.cnt, v_recv_down.cnt
+),
+monthly_activity AS (
+  SELECT
+    p.OwnerUserId AS UserId,
+    date_trunc('month', p.CreationDate) AS MonthStart,
+    COUNT(*) AS PostsThisMonth,
+    SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionsThisMonth,
+    SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswersThisMonth
+  FROM Posts p
+  WHERE p.OwnerUserId IS NOT NULL
+  GROUP BY p.OwnerUserId, date_trunc('month', p.CreationDate)
+),
+trend_prep AS (
+  SELECT
+    m.UserId,
+    array_agg(m.PostsThisMonth ORDER BY m.MonthStart DESC) FILTER (WHERE m.MonthStart >= date_trunc('month', CAST('2024-10-01' AS date)) - interval '5 months') AS RecentSixMonths
+  FROM monthly_activity m
+  GROUP BY m.UserId
+),
+posts_votes_full AS (
+  SELECT
+    COALESCE(p.OwnerUserId, vc.OwnerUserId) AS UserId,
+    SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QCount_FromPosts,
+    SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS ACount_FromPosts,
+    SUM(vc.UpVotes) AS UpVotes_Field,
+    SUM(vc.DownVotes) AS DownVotes_Field
+  FROM Posts p
+  FULL OUTER JOIN (
+    SELECT p2.OwnerUserId, SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes, SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes
+    FROM Votes v
+    JOIN Posts p2 ON p2.Id = v.PostId
+    GROUP BY p2.OwnerUserId
+  ) vc ON vc.OwnerUserId = p.OwnerUserId
+  LEFT JOIN Users u ON u.Id = COALESCE(p.OwnerUserId, vc.OwnerUserId)
+  GROUP BY COALESCE(p.OwnerUserId, vc.OwnerUserId)
+),
+ranked_users AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    up.Questions,
+    up.Answers,
+    COALESCE(bb.BadgeCount,0) AS BadgeCount,
+    COALESCE(bb.Gold,0) AS GoldBadges,
+    COALESCE(bb.Silver,0) AS SilverBadges,
+    COALESCE(bb.Bronze,0) AS BronzeBadges,
+    COALESCE(fav.FavoriteTag, '(none)') AS FavoriteTag,
+    uas.AvgAnswerScore,
+    uas.AcceptedAnswersReceived,
+    ROUND(COALESCE(uas.AcceptRate,0) * 100,2) AS AcceptRatePercent,
+    va.UpvotesGiven,
+    va.DownvotesGiven,
+    va.UpvotesReceived,
+    va.DownvotesReceived,
+    pvf.QCount_FromPosts,
+    pvf.ACount_FromPosts,
+    pvf.UpVotes_Field,
+    pvf.DownVotes_Field,
+    up.HasClosedQuestion,
+    COALESCE(
+      (SELECT array_to_string(ARRAY(
+         SELECT COALESCE(CAST(n AS int), 0)::text FROM unnest(tp.RecentSixMonths) WITH ORDINALITY t(n, ord) ORDER BY ord
+       ), ',') FROM trend_prep tp WHERE tp.UserId = u.Id),
+      '(no recent data)'
+    ) AS RecentSixMonthsTrend,
+    (SELECT substring(p.Title for 120) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 1 ORDER BY p.CreationDate DESC LIMIT 1) AS LatestQuestionTitle,
+    (SELECT substring(c.Text for 200) FROM Comments c JOIN Posts p2 ON p2.Id = c.PostId WHERE p2.OwnerUserId = u.Id ORDER BY c.CreationDate DESC LIMIT 1) AS LastCommentSnippet,
+    CAST((
+     COALESCE(u.Reputation,0) * 0.4
+     + COALESCE(up.Questions,0) * 2.5
+     + COALESCE(up.Answers,0) * 3.5
+     + COALESCE(uas.AvgAnswerScore,0) * 5
+     + COALESCE(bb.BadgeCount,0) * 1.2
+     + COALESCE(vf.UpVotesReceived,0) * 0.8
+     - COALESCE(vf.DownVotesReceived,0) * 1.5
+     + COALESCE(pvf.QCount_FromPosts,0) * 1.0
+    ) AS numeric(18,4)) AS ActivityScore
+  FROM Users u
+  LEFT JOIN user_posts up ON up.UserId = u.Id
+  LEFT JOIN badge_breakdown bb ON bb.UserId = u.Id
+  LEFT JOIN favorite_tag fav ON fav.UserId = u.Id
+  LEFT JOIN user_answer_stats uas ON uas.UserId = u.Id
+  LEFT JOIN vote_agg va ON va.UserId = u.Id
+  LEFT JOIN posts_votes_full pvf ON pvf.UserId = u.Id
+  LEFT JOIN (
+    SELECT UserId, UpVotesReceived, DownVotesReceived FROM vote_agg
+  ) vf ON vf.UserId = u.Id
+)
+SELECT
+  ru.*,
+  PERCENT_RANK() OVER (ORDER BY ru.ActivityScore DESC) AS ActivityPercentile,
+  RANK() OVER (ORDER BY ru.ActivityScore DESC, ru.Reputation DESC) AS ActivityRank
+FROM ranked_users ru
+WHERE
+  (
+    (ru.Reputation > 2000 AND ru.ActivityScore > 1000)
+    OR
+    (ru.Answers >= 20 AND ru.AvgAnswerScore >= 1.5)
+    OR
+    (ru.Questions >= 10 AND ru.FavoriteTag <> '(none)')
+    OR
+    (ru.BadgeCount >= 5 AND ru.GoldBadges >= 1)
+  )
+  AND COALESCE(ru.DisplayName,'') <> ''
+ORDER BY ActivityScore DESC, Reputation DESC
+LIMIT 200;

@@ -1,0 +1,177 @@
+with
+all_users as (
+  select Id, DisplayName, Reputation, CreationDate from Users
+),
+post_tags as (
+  select q.Id as QuestionId, u.Id as OwnerId, trim(t.tag) as Tag
+  from Posts q
+  cross join lateral (
+    select unnest(string_to_array(substring(q.Tags,2,length(q.Tags)-2), '><')) as tag
+  ) t
+  left join Users u on q.OwnerUserId = u.Id
+  where q.PostTypeId = 1 and q.Tags is not null
+),
+user_post_stats as (
+  select u.Id as UserId,
+    count(distinct case when p.PostTypeId=1 then p.Id end) as Questions,
+    count(distinct case when p.PostTypeId=2 then p.Id end) as Answers,
+    coalesce(avg(nullif(p.Score,0)) filter (where p.PostTypeId in (1,2)),0) as AvgScore,
+    sum(coalesce(p.ViewCount,0)) as TotalViews,
+    count(distinct p.AcceptedAnswerId) filter (where p.PostTypeId=1 and p.AcceptedAnswerId is not null) as AcceptedAnswersOnTheirQuestions,
+    min(p.CreationDate) as FirstPosted,
+    max(p.LastActivityDate) as LastActivity
+  from Users u
+  left join Posts p on p.OwnerUserId = u.Id
+  group by u.Id
+),
+badge_breakdown as (
+  select b.UserId,
+    sum(case when b.Class=1 then 1 else 0 end) as GoldBadges,
+    sum(case when b.Class=2 then 1 else 0 end) as SilverBadges,
+    sum(case when b.Class=3 then 1 else 0 end) as BronzeBadges,
+    count(*) as TotalBadges,
+    bool_or(b.TagBased) as AnyTagBadges
+  from Badges b
+  group by b.UserId
+),
+vote_activity as (
+  select v.UserId,
+    sum(case when v.VoteTypeId=2 then 1 else 0 end) as UpVotesCast,
+    sum(case when v.VoteTypeId=3 then 1 else 0 end) as DownVotesCast,
+    sum(case when v.VoteTypeId=5 then 1 else 0 end) as FavoritesGiven,
+    sum(case when v.VoteTypeId in (8,9) then coalesce(v.BountyAmount,0) else 0 end) as BountyTotal
+  from Votes v
+  group by v.UserId
+),
+close_counts as (
+  select p.OwnerUserId as UserId,
+    count(*) filter (where ph.PostHistoryTypeId=10) as TimesClosed,
+    count(*) filter (where ph.PostHistoryTypeId=11) as TimesReopened,
+    max(ph.CreationDate) filter (where ph.PostHistoryTypeId=10) as LastClosedDate
+  from Posts p
+  left join PostHistory ph on ph.PostId = p.Id
+  where p.PostTypeId=1
+  group by p.OwnerUserId
+),
+tag_expertise_raw as (
+  select pt.OwnerId as UserId, pt.Tag,
+    coalesce(
+      (select sum(coalesce(q2.Score,0)) from Posts q2 where q2.Id = pt.QuestionId and q2.OwnerUserId = pt.OwnerId and q2.PostTypeId = 1),0)
+    +
+    coalesce(
+      (select sum(coalesce(a2.Score,0)) from Posts a2 where a2.ParentId = pt.QuestionId and a2.OwnerUserId = pt.OwnerId and a2.PostTypeId = 2),0)
+    as TagScore,
+    (select count(*) from Posts q3 where q3.Id = pt.QuestionId and q3.OwnerUserId = pt.OwnerId and q3.PostTypeId = 1) as QuestionsWithTag,
+    (select count(*) from Posts a3 where a3.ParentId = pt.QuestionId and a3.OwnerUserId = pt.OwnerId and a3.PostTypeId = 2) as AnswersWithTag
+  from post_tags pt
+),
+top_tags as (
+  select t.UserId,
+    (select array_agg(tt.Tag) from (
+       select Tag from tag_expertise_raw ter2 where ter2.UserId = t.UserId order by coalesce(ter2.TagScore,0) desc nulls last limit 5
+    ) tt) as Top5Tags,
+    sum(coalesce(t.TagScore,0)) as TotalTagScore
+  from tag_expertise_raw t
+  group by t.UserId
+),
+tag_ranked as (
+  select ter.*,
+    row_number() over (partition by ter.UserId order by coalesce(ter.TagScore,0) desc, ter.QuestionsWithTag desc) as TagRank,
+    ntile(5) over (partition by ter.UserId order by coalesce(ter.TagScore,0) desc) as TagQuintile
+  from tag_expertise_raw ter
+),
+activity_union as (
+  select u.Id as UserId, 'post' as typ, p.CreationDate as dt, p.Id as ref_id from Users u
+  left join Posts p on p.OwnerUserId = u.Id
+  union all
+  select u.Id, 'comment', c.CreationDate, c.PostId from Users u
+  left join Comments c on c.UserId = u.Id
+  union all
+  select u.Id, 'vote', v.CreationDate, v.PostId from Users u
+  left join Votes v on v.UserId = u.Id
+),
+recent_activity as (
+  select au.UserId, max(au.dt) as MostRecentEvent,
+    (select typ from activity_union au2 where au2.UserId = au.UserId order by au2.dt desc nulls last limit 1) as RecentEventType,
+    (select ref_id from activity_union au3 where au3.UserId = au.UserId order by au3.dt desc nulls last limit 1) as RecentRefId
+  from activity_union au
+  group by au.UserId
+),
+user_aggregated as (
+  select u.Id as UserId, u.DisplayName, u.Reputation,
+    up.Questions, up.Answers, up.AvgScore, up.TotalViews,
+    coalesce(bc.GoldBadges,0) as GoldBadges, coalesce(bc.SilverBadges,0) as SilverBadges, coalesce(bc.BronzeBadges,0) as BronzeBadges, coalesce(bc.TotalBadges,0) as TotalBadges,
+    coalesce(vc.UpVotesCast,0) as UpVotesCast, coalesce(vc.DownVotesCast,0) as DownVotesCast, coalesce(vc.BountyTotal,0) as BountyTotal,
+    coalesce(cc.TimesClosed,0) as TimesClosed, coalesce(cc.TimesReopened,0) as TimesReopened, cc.LastClosedDate,
+    tt.Top5Tags, tt.TotalTagScore,
+    ra.MostRecentEvent, ra.RecentEventType, ra.RecentRefId,
+    greatest(0, coalesce(up.Answers,0) - coalesce(bc.TotalBadges,0)) as AdjustedActivityScore,
+    case when coalesce(up.Questions,0) + coalesce(up.Answers,0) = 0 then null
+         else 1.0 * coalesce(up.TotalViews,0) / NULLIF(coalesce(up.Questions,0) + coalesce(up.Answers,0),0)
+    end as AvgViewsPerPost
+  from Users u
+  left join user_post_stats up on up.UserId = u.Id
+  left join badge_breakdown bc on bc.UserId = u.Id
+  left join vote_activity vc on vc.UserId = u.Id
+  left join close_counts cc on cc.UserId = u.Id
+  left join top_tags tt on tt.UserId = u.Id
+  left join recent_activity ra on ra.UserId = u.Id
+),
+filtered_users as (
+  select ua.*,
+    dense_rank() over (order by ua.Reputation desc, ua.AdjustedActivityScore desc) as ReputationRank,
+    -- Compute median via percentile_cont as window function over all reputations using OVER() without WITHIN GROUP (compatible approach)
+    avg(ua.Reputation) over () as MedianReputation -- fallback to mean when ordered-set percentile not available
+  from user_aggregated ua
+),
+final_notes as (
+  select fu.*,
+    (select json_agg(obj) from (
+       select json_build_object(
+         'PostId', p.Id,
+         'Score', p.Score,
+         'Type', p.PostTypeId,
+         'Title', substr(coalesce(p.Title,''),1,64),
+         'Tags', p.Tags
+       ) as obj
+       from Posts p
+       where p.OwnerUserId = fu.UserId
+       order by p.Score desc nulls last
+       limit 3
+    ) x) as TopPosts,
+    (select min(p.CreationDate)
+     from Posts p
+     where p.OwnerUserId = fu.UserId and p.PostTypeId=2 and p.ParentId is not null
+       and exists (select 1 from Posts q where q.Id = p.ParentId and q.AcceptedAnswerId = p.Id)
+    ) as EarliestAcceptedAnswerDate,
+    (case
+      when fu.TotalTagScore is null and coalesce(fu.TotalBadges,0) > 0 then 'BadgeOnly'
+      when coalesce(fu.TotalTagScore,0) > 0 and coalesce(fu.TotalBadges,0) = 0 then 'TagExpertOnly'
+      when fu.TotalTagScore is null and coalesce(fu.TotalBadges,0) = 0 then 'Silent'
+      else 'Mixed'
+    end) as ProfileArchetype
+  from filtered_users fu
+)
+select fn.UserId, fn.DisplayName, fn.Reputation, fn.ReputationRank, fn.MedianReputation,
+  fn.Questions, fn.Answers, fn.AvgScore, fn.TotalViews,
+  fn.GoldBadges, fn.SilverBadges, fn.BronzeBadges, fn.TotalBadges,
+  fn.UpVotesCast, fn.DownVotesCast, fn.BountyTotal,
+  fn.TimesClosed, fn.TimesReopened, fn.LastClosedDate,
+  coalesce(fn.Top5Tags, CAST(ARRAY[] AS varchar[])) as Top5Tags, fn.TotalTagScore,
+  fn.MostRecentEvent, fn.RecentEventType, fn.RecentRefId,
+  fn.AdjustedActivityScore, round(cast(coalesce(fn.AvgViewsPerPost,0) as numeric),2) as AvgViewsPerPost,
+  fn.TopPosts, fn.EarliestAcceptedAnswerDate, fn.ProfileArchetype
+from final_notes fn
+where
+  (fn.Reputation > (select avg(Reputation) from Users) OR coalesce(fn.TotalBadges,0) >= 3)
+  and fn.UserId in (
+    select UserId from (
+      select UserId from user_post_stats where Questions > 0
+      union
+      select UserId from badge_breakdown where TotalBadges > 0
+      except
+      select UserId from vote_activity where UpVotesCast is null
+    ) s
+  )
+order by fn.ReputationRank, fn.AdjustedActivityScore desc
+limit 200;

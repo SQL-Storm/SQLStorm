@@ -1,0 +1,20 @@
+WITH QuestionWinLoss AS (
+    SELECT
+        p.Id AS QuestionId,
+        pl.UserId AS UserId,
+        COUNT(CASE WHEN p.LastActivityDate < n.Notification THEN 1 END) OVER (PARTITION BY pl.UserId) AS LossCount
+    FROM
+        posts p
+        JOIN post_labels pl ON p.Id = pl.PostId
+        LEFT JOIN notifications n ON p.Id = n.PostId
+)
+SELECT
+    QuestionId,
+    UserId,
+    LossCount
+FROM
+    QuestionWinLoss
+GROUP BY
+    QuestionId,
+    UserId,
+    LossCount;

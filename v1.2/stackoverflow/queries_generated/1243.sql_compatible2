@@ -1,0 +1,180 @@
+WITH UserActivityCTE AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionsCount,
+    COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswersCount,
+    COUNT(DISTINCT c.Id) AS CommentsCount,
+    COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 1) AS GoldBadges,
+    COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 2) AS SilverBadges,
+    COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+    RANK() OVER (ORDER BY u.Reputation DESC) AS ReputationRank,
+    FIRST_VALUE(p.Title) OVER (
+      PARTITION BY u.Id
+      ORDER BY p.CreationDate ASC
+    ) AS FirstPostTitle,
+    STRING_AGG(DISTINCT t.TagName, ',') FILTER (WHERE t.TagName IS NOT NULL) AS UserRelatedTags
+  FROM Users u
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+  LEFT JOIN Comments c ON c.UserId = u.Id
+  LEFT JOIN Badges b ON b.UserId = u.Id
+  LEFT JOIN LATERAL (
+    SELECT unnest(string_to_array(substring(p.Tags, 2, length(p.Tags) - 2), '><')) AS TagName
+    WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL
+  ) t ON true
+  GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+PostScoresCTE AS (
+  SELECT
+    p.Id,
+    p.PostTypeId,
+    p.CreationDate,
+    p.OwnerUserId,
+    p.Score,
+    p.ViewCount,
+    p.AnswerCount,
+    p.FavoriteCount,
+    AVG(v.Score) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS RunningAvgScore,
+    COUNT(v.Id) OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS RunningVoteCount
+  FROM Posts p
+  LEFT JOIN Votes v ON v.PostId = p.Id AND v.VoteTypeId IN (2, 3)
+  WHERE p.CreationDate > (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '2 years')
+),
+TaggedPostsCTE AS (
+  SELECT
+    p.Id,
+    unnest(string_to_array(substring(p.Tags, 2, length(p.Tags) - 2), '><')) AS TagName
+  FROM Posts p
+  WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL
+),
+DuplicatesCTE AS (
+  SELECT
+    pl.PostId,
+    linked.Title AS OrigTitle,
+    pl.RelatedPostId,
+    related.Title AS DuplicateOfTitle,
+    COUNT(*) AS DuplicateLinkCount
+  FROM PostLinks pl
+  JOIN Posts linked ON linked.Id = pl.PostId
+  JOIN Posts related ON related.Id = pl.RelatedPostId
+  WHERE pl.LinkTypeId = 3
+  GROUP BY pl.PostId, linked.Title, pl.RelatedPostId, related.Title
+),
+PostsWithLastHistoryCTE AS (
+  SELECT DISTINCT ON (ph.PostId)
+    ph.PostId,
+    ph.PostHistoryTypeId,
+    ph.CreationDate AS LastHistoryChangeTime,
+    ph.Comment AS HistoryComment,
+    ph.UserId AS EditorUserId
+  FROM PostHistory ph
+  WHERE ph.PostHistoryTypeId IN (10,11,12,13,14,15)
+  ORDER BY ph.PostId, ph.CreationDate DESC
+),
+MainActive AS (
+  SELECT
+    ua.UserId,
+    ua.DisplayName,
+    ua.QuestionsCount,
+    ua.AnswersCount,
+    ua.CommentsCount,
+    ua.GoldBadges,
+    ua.SilverBadges,
+    ua.BronzeBadges,
+    ua.ReputationRank,
+    ua.FirstPostTitle,
+    ua.UserRelatedTags,
+    ps.Id AS PostId,
+    ps.PostTypeId,
+    ps.CreationDate AS PostCreationDate,
+    ps.Score AS PostScore,
+    ps.ViewCount,
+    ps.AnswerCount,
+    ps.FavoriteCount,
+    ps.RunningAvgScore,
+    COALESCE(dc.DuplicateLinkCount, 0) AS DuplicateCount,
+    ph.LastHistoryChangeTime,
+    ph.PostHistoryTypeId,
+    ph.HistoryComment,
+    u2.DisplayName AS LastEditorName,
+    psa.ThreadPopular,
+    CASE
+      WHEN psa.ThreadPopular > 100 AND ua.GoldBadges > 0 THEN 'Highly Active Gold'
+      WHEN ua.ReputationRank <= 100 THEN 'Top 100 User'
+      ELSE 'Regular User'
+    END AS UserCategory
+  FROM UserActivityCTE ua
+  LEFT JOIN PostScoresCTE ps ON ps.OwnerUserId = ua.UserId
+  LEFT JOIN DuplicatesCTE dc ON dc.PostId = ps.Id
+  LEFT JOIN PostsWithLastHistoryCTE ph ON ph.PostId = ps.Id
+  LEFT JOIN Users u2 ON u2.Id = ph.EditorUserId
+  LEFT JOIN LATERAL (
+    SELECT COUNT(*) AS ThreadPopular
+    FROM Posts p2
+    WHERE p2.ParentId = ps.Id OR p2.Id = ps.Id
+  ) psa ON true
+  WHERE ua.QuestionsCount + ua.AnswersCount > 10
+    AND (ps.Score IS NULL OR ps.Score > 0)
+)
+SELECT
+  ma.UserId,
+  ma.DisplayName,
+  ma.QuestionsCount,
+  ma.AnswersCount,
+  ma.CommentsCount,
+  ma.GoldBadges,
+  ma.SilverBadges,
+  ma.BronzeBadges,
+  ma.ReputationRank,
+  ma.FirstPostTitle,
+  ma.UserRelatedTags,
+  ma.PostTypeId,
+  ma.PostCreationDate,
+  ma.PostScore,
+  ma.ViewCount,
+  ma.AnswerCount,
+  ma.FavoriteCount,
+  ma.RunningAvgScore,
+  ma.DuplicateCount,
+  ma.LastHistoryChangeTime,
+  ma.PostHistoryTypeId,
+  ma.HistoryComment,
+  ma.LastEditorName,
+  ma.UserCategory
+FROM MainActive ma
+ORDER BY ma.ReputationRank, ma.PostScore DESC NULLS LAST
+LIMIT 100
+
+UNION ALL
+
+SELECT
+  u.Id AS UserId,
+  u.DisplayName,
+  0 AS QuestionsCount,
+  0 AS AnswersCount,
+  0 AS CommentsCount,
+  0 AS GoldBadges,
+  0 AS SilverBadges,
+  0 AS BronzeBadges,
+  CAST(NULL AS integer) AS ReputationRank,
+  CAST(NULL AS text) AS FirstPostTitle,
+  CAST(NULL AS text) AS UserRelatedTags,
+  CAST(NULL AS integer) AS PostTypeId,
+  CAST(NULL AS timestamp) AS PostCreationDate,
+  CAST(NULL AS integer) AS PostScore,
+  CAST(NULL AS integer) AS ViewCount,
+  CAST(NULL AS integer) AS AnswerCount,
+  CAST(NULL AS integer) AS FavoriteCount,
+  CAST(NULL AS double precision) AS RunningAvgScore,
+  CAST(NULL AS integer) AS DuplicateCount,
+  CAST(NULL AS timestamp) AS LastHistoryChangeTime,
+  CAST(NULL AS integer) AS PostHistoryTypeId,
+  CAST(NULL AS text) AS HistoryComment,
+  CAST(NULL AS text) AS LastEditorName,
+  'Inactive User' AS UserCategory
+FROM Users u
+WHERE NOT EXISTS (
+  SELECT 1 FROM Posts p WHERE p.OwnerUserId = u.Id
+)
+ORDER BY u.Id
+LIMIT 10;

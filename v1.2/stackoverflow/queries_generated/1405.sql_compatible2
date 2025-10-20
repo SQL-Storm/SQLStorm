@@ -1,0 +1,161 @@
+WITH RecursiveTagHierarchy AS (
+    SELECT 
+        t.Id,
+        t.TagName,
+        COALESCE(pl.PostId, 0) AS RootPostId,
+        1 AS Level
+    FROM Tags t
+    LEFT JOIN PostLinks pl ON pl.RelatedPostId = (SELECT WikiPostId FROM Tags start_tr WHERE start_tr.Id = t.Id)
+    WHERE t.TagName IS NOT NULL
+    UNION ALL
+    SELECT 
+        t2.Id,
+        t2.TagName,
+        rth.RootPostId,
+        rth.Level + 1
+    FROM Tags t2
+    JOIN PostLinks pl2 ON pl2.PostId = t2.ExcerptPostId
+    JOIN RecursiveTagHierarchy rth ON rth.RootPostId = pl2.RelatedPostId
+    WHERE t2.TagName IS NOT NULL AND rth.Level < 5
+),
+OwnerStats AS (
+    SELECT 
+      u.Id AS UserId,
+      u.DisplayName,
+      u.Location,
+      COALESCE(SUM(CASE WHEN p.PostTypeId = 1 THEN p.Score ELSE 0 END),0) AS QuestionScore,
+      COALESCE(SUM(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END),0) AS AnswerScore,
+      COALESCE(COUNT(DISTINCT b.Id), 0) AS BadgeCount,
+      MIN(u.CreationDate) OVER () AS SiteLaunch,
+      ROW_NUMBER() OVER (PARTITION BY u.Location ORDER BY COALESCE(SUM(p.Score),0) DESC) AS LocUserRank,
+      u.Reputation
+    FROM 
+      Users u
+      LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+      LEFT JOIN Badges b ON b.UserId = u.Id AND b.Class = 1
+    WHERE u.Location IS NOT NULL
+    GROUP BY u.Id, u.DisplayName, u.Location, u.Reputation
+),
+UserLatestBadges AS (
+    SELECT 
+        b.UserId,
+        b.Name,
+        b.Date,
+        ROW_NUMBER() OVER (PARTITION BY b.UserId ORDER BY b.Date DESC, b.Id DESC) AS rn
+    FROM Badges b
+),
+PostWithCloseReasons AS (
+    SELECT 
+        p.Id AS PostId,
+        p.Title,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Score,
+        ch.CloseReasonName
+    FROM Posts p
+    LEFT JOIN (
+        SELECT DISTINCT ph.PostId, crt.Name AS CloseReasonName
+        FROM PostHistory ph
+        JOIN CloseReasonTypes crt ON TRY_CAST(ph.Comment AS INTEGER) = crt.Id
+        WHERE ph.PostHistoryTypeId = 10
+    ) ch ON ch.PostId = p.Id
+),
+CorrelatedAnswerCount AS (
+    SELECT q.Id AS QuestionId,
+           (SELECT COUNT(*) FROM Posts a WHERE a.ParentId = q.Id AND a.Score > q.Score / NULLIF(GREATEST(q.AnswerCount,1),1)) AS HigherScoreAnswersCount
+    FROM Posts q
+    WHERE q.PostTypeId = 1
+),
+AggregatedVotes AS (
+    SELECT 
+      p.Id AS PostId,
+      SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+      SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes,
+      SUM(CASE WHEN v.VoteTypeId = 8 THEN COALESCE(v.BountyAmount,0) ELSE 0 END) AS TotalBountiesStarted
+    FROM Posts p
+    LEFT JOIN Votes v ON v.PostId = p.Id
+    GROUP BY p.Id
+),
+UserCommentsEmojis AS (
+    SELECT 
+      c.UserId,
+      u.DisplayName,
+      COUNT(*) AS TotalComments,
+      SUM(CASE WHEN c.Text LIKE '%😃%' OR c.Text LIKE '%😁%' OR c.Text LIKE '%🎉%' THEN 1 ELSE 0 END) AS PositiveEmojisCount
+    FROM Comments c
+    LEFT JOIN Users u ON u.Id = c.UserId
+    GROUP BY c.UserId, u.DisplayName
+)
+SELECT 
+    o.DisplayName,
+    o.UserId,
+    o.Location,
+    o.QuestionScore,
+    o.AnswerScore,
+    o.BadgeCount,
+    COALESCE(ca.HigherScoreAnswersCount,0) AS AltAnswerChallenge,
+    COALESCE(av.UpVotes,0) AS TotalUpvotes,
+    COALESCE(av.DownVotes,0) AS TotalDownvotes,
+    COALESCE(av.TotalBountiesStarted,0) AS BountySum,
+    COALESCE(ulb.Name, 'NoRecentGoldBadge') AS MostRecentGoldBadge,
+    ulb.Date AS BadgeAwardedOn,
+    o.LocUserRank,
+    ROUND(100.0 * COALESCE(ucm.PositiveEmojisCount,0) / NULLIF(CASE WHEN COALESCE(ucm.TotalComments,0)=0 THEN NULL ELSE COALESCE(ucm.TotalComments,0) END,0),2) AS PositiveCommentsPercent,
+    STRING_AGG(DISTINCT rth.TagName, ',') FILTER (WHERE rth.Level <= 3) AS FavoriteTagsSet,
+    CASE 
+        WHEN o.Reputation > 10000 THEN 'Experienced'
+        WHEN o.Reputation BETWEEN 1000 AND 10000 THEN 'Intermediate'
+        ELSE 'Beginner' 
+    END AS RepCategory,
+    FIRST_VALUE(pwc.Title) OVER(PARTITION BY o.UserId ORDER BY pwc.Score DESC) AS HighestScoringPostTitle,
+    MAX(CASE WHEN pwc.CloseReasonName IS NOT NULL THEN 1 ELSE 0 END) AS HasCloseReasonFlags,
+    ROW_NUMBER() OVER (ORDER BY o.BadgeCount DESC, o.AnswerScore DESC) AS OverallUserRank
+FROM OwnerStats o
+LEFT JOIN CorrelatedAnswerCount ca ON ca.QuestionId IN (
+    SELECT p.Id FROM Posts p WHERE p.OwnerUserId = o.UserId AND p.PostTypeId = 1
+)
+LEFT JOIN AggregatedVotes av ON av.PostId = (
+    SELECT p.Id FROM Posts p WHERE p.OwnerUserId = o.UserId ORDER BY p.Score DESC LIMIT 1
+)
+LEFT JOIN UserLatestBadges ulb ON ulb.UserId = o.UserId AND ulb.rn = 1
+LEFT JOIN UserCommentsEmojis ucm ON ucm.UserId = o.UserId
+LEFT JOIN RecursiveTagHierarchy rth ON rth.Id = (
+    SELECT unt.Id FROM Tags unt
+    WHERE unt.Id IN (
+        SELECT CAST(value AS INTEGER) FROM UNNEST(string_to_array(
+            substring(
+                (SELECT Tags FROM Posts WHERE OwnerUserId = o.UserId AND PostTypeId=1 ORDER BY Score DESC LIMIT 1),
+                2,
+                length((SELECT Tags FROM Posts WHERE OwnerUserId = o.UserId AND PostTypeId=1 ORDER BY Score DESC LIMIT 1)) - 2
+            ),
+            '><'
+        )) AS value
+    )
+    LIMIT 1
+)
+LEFT JOIN PostWithCloseReasons pwc ON pwc.OwnerUserId = o.UserId
+WHERE o.Reputation IS NOT NULL
+GROUP BY
+    o.DisplayName,
+    o.UserId,
+    o.Location,
+    o.QuestionScore,
+    o.AnswerScore,
+    o.BadgeCount,
+    ca.HigherScoreAnswersCount,
+    av.UpVotes,
+    av.DownVotes,
+    av.TotalBountiesStarted,
+    ulb.Name,
+    ulb.Date,
+    o.LocUserRank,
+    ucm.PositiveEmojisCount,
+    ucm.TotalComments,
+    rth.Level,
+    rth.TagName,
+    o.Reputation,
+    pwc.Title,
+    pwc.Score,
+    ulb.rn
+ORDER BY o.BadgeCount DESC, o.AnswerScore DESC
+LIMIT 100;

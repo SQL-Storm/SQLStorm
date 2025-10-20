@@ -1,0 +1,181 @@
+WITH RecursiveTagHierarchy AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        1 AS Level,
+        CAST(t.TagName AS VARCHAR(500)) AS Path
+    FROM Tags t
+    WHERE t.IsRequired = TRUE
+
+    UNION ALL
+
+    SELECT
+        child.Id,
+        child.TagName,
+        child.Count,
+        child.ExcerptPostId,
+        child.WikiPostId,
+        parent.Level + 1,
+        parent.Path || ' > ' || child.TagName
+    FROM Tags child
+    JOIN RecursiveTagHierarchy parent ON child.ParentId = parent.Id
+    WHERE child.IsRequired = FALSE
+), UserBadgeAggregates AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+        COALESCE(SUM(p.Score),0) AS TotalPostScore,
+        ROW_NUMBER() OVER (ORDER BY COALESCE(SUM(p.Score),0) DESC NULLS LAST) AS UserRank
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id AND p.PostTypeId IN (1,2)
+    GROUP BY u.Id, u.DisplayName
+), PostComplexData AS (
+    SELECT
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Title,
+        p.Tags,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AcceptedAnswerId,
+        p.ParentId,
+        REGEXP_REPLACE(SUBSTRING(p.Tags FROM '<([^>]+)>'), '<|>', '') AS FirstTag,
+        LENGTH(p.Body) AS BodyLength,
+        (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id) AS CommentTotal,
+        COALESCE(u.DisplayName, p.OwnerDisplayName) AS OwnerName,
+        EXTRACT(DAY FROM CAST('2024-10-01 12:34:56' AS TIMESTAMP) - p.CreationDate) AS DaysSinceCreation
+    FROM Posts p
+    LEFT JOIN Users u ON u.Id = p.OwnerUserId
+    WHERE p.PostTypeId IN (1, 2)
+), AcceptedAnswersScores AS (
+    SELECT
+        p.Id AS QuestionId,
+        a.Id AS AnswerId,
+        a.Score AS AnswerScore,
+        a.CreationDate AS AnswerCreationDate,
+        ROW_NUMBER() OVER (PARTITION BY p.Id ORDER BY a.Score DESC, a.CreationDate ASC) AS AnswerRank
+    FROM Posts p
+    LEFT JOIN Posts a ON a.ParentId = p.Id AND a.PostTypeId = 2
+    WHERE p.PostTypeId = 1
+), CloseVoteDetails AS (
+    SELECT
+        ph.PostId,
+        COUNT(*) FILTER (WHERE ph.PostHistoryTypeId = 10) AS CloseVotes,
+        COUNT(*) FILTER (WHERE ph.PostHistoryTypeId = 11) AS ReopenVotes,
+        MAX(ph.CreationDate) FILTER (WHERE ph.PostHistoryTypeId = 10) AS LastCloseVoteDate,
+        MAX(ph.CreationDate) FILTER (WHERE ph.PostHistoryTypeId = 11) AS LastReopenVoteDate,
+        STRING_AGG(DISTINCT crt.Name, ', ') FILTER (WHERE ph.PostHistoryTypeId = 10) AS CloseReasons
+    FROM PostHistory ph
+    LEFT JOIN CloseReasonTypes crt ON CAST(crt.Id AS TEXT) = ph.Comment
+    GROUP BY ph.PostId
+), FinalUserStats AS (
+    SELECT
+        uba.UserId,
+        uba.DisplayName,
+        uba.GoldBadges,
+        uba.SilverBadges,
+        uba.BronzeBadges,
+        uba.TotalPostScore,
+        uba.UserRank,
+        COALESCE(avgps.AvgScorePerPost, 0) AS AvgScorePerPost,
+        COALESCE(recentp.MaxScore, 0) AS RecentMaxPostScore
+    FROM UserBadgeAggregates uba
+    LEFT JOIN (
+        SELECT OwnerUserId, AVG(Score) AS AvgScorePerPost
+        FROM Posts
+        WHERE PostTypeId IN (1, 2)
+        GROUP BY OwnerUserId
+    ) avgps ON avgps.OwnerUserId = uba.UserId
+    LEFT JOIN (
+        SELECT OwnerUserId, MAX(Score) AS MaxScore
+        FROM Posts
+        WHERE PostTypeId IN (1, 2) AND CreationDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '30 days'
+        GROUP BY OwnerUserId
+    ) recentp ON recentp.OwnerUserId = uba.UserId
+), CombinedPosts AS (
+    SELECT
+        pcd.Id,
+        pcd.PostTypeId,
+        pcd.OwnerUserId,
+        pcd.Title,
+        pcd.FirstTag,
+        pcd.BodyLength,
+        pcd.CommentTotal,
+        pcd.OwnerName,
+        pcd.DaysSinceCreation,
+        avs.AnswerScore,
+        avs.AnswerId,
+        cvd.CloseVotes,
+        cvd.ReopenVotes,
+        cvd.LastCloseVoteDate,
+        cvd.LastReopenVoteDate,
+        cvd.CloseReasons
+    FROM PostComplexData pcd
+    LEFT JOIN AcceptedAnswersScores avs ON avs.QuestionId = pcd.Id AND avs.AnswerRank = 1
+    LEFT JOIN CloseVoteDetails cvd ON cvd.PostId = pcd.Id
+), UserPostSummary AS (
+    SELECT
+        fub.UserId,
+        fub.DisplayName,
+        COUNT(DISTINCT cp.Id) AS TotalPosts,
+        SUM(cp.Score) AS SumPostScores,
+        AVG(cp.BodyLength) FILTER (WHERE cp.PostTypeId = 1) AS AvgQuestionBodyLength,
+        AVG(cp.BodyLength) FILTER (WHERE cp.PostTypeId = 2) AS AvgAnswerBodyLength,
+        SUM(cp.CommentTotal) AS TotalCommentsOnPosts,
+        MAX(cp.DaysSinceCreation) AS MaxAgePostDays,
+        MAX(fub.AvgScorePerPost) OVER () AS MaxAvgScore,
+        RANK() OVER (ORDER BY SUM(cp.Score) DESC) AS ScoreRank
+    FROM FinalUserStats fub
+    LEFT JOIN CombinedPosts cp ON cp.OwnerUserId = fub.UserId
+    GROUP BY fub.UserId, fub.DisplayName, fub.AvgScorePerPost
+), WindowedPostRanks AS (
+    SELECT
+        cp.Id,
+        cp.Title,
+        cp.OwnerName,
+        cp.Score,
+        cp.ViewCount,
+        cp.CommentTotal,
+        cp.DaysSinceCreation,
+        RANK() OVER (PARTITION BY cp.PostTypeId ORDER BY cp.Score DESC, cp.ViewCount DESC NULLS LAST) AS PostScoreRank,
+        CASE 
+            WHEN cp.CloseVotes > 0 THEN 'Closed'
+            WHEN cp.ReopenVotes > 0 THEN 'Reopened'
+            ELSE 'Open'
+        END AS PostStatus
+    FROM CombinedPosts cp
+)
+SELECT
+    upr.Id AS PostId,
+    upr.Title,
+    upr.OwnerName,
+    upr.Score,
+    upr.ViewCount,
+    upr.CommentTotal,
+    upr.DaysSinceCreation,
+    upr.PostScoreRank,
+    upr.PostStatus,
+    ups.TotalPosts,
+    ups.SumPostScores,
+    ups.AvgQuestionBodyLength,
+    ups.AvgAnswerBodyLength,
+    ups.TotalCommentsOnPosts,
+    ups.MaxAgePostDays,
+    ups.ScoreRank AS UserScoreRankDescending
+FROM WindowedPostRanks upr
+JOIN UserPostSummary ups ON ups.DisplayName = upr.OwnerName
+WHERE upr.PostScoreRank <= 10
+AND (
+    (upr.PostStatus = 'Open' AND upr.DaysSinceCreation < 365)
+    OR (upr.PostStatus IN ('Closed','Reopened') AND upr.DaysSinceCreation < 730)
+)
+ORDER BY upr.PostScoreRank, upr.Score DESC, upr.DaysSinceCreation ASC;

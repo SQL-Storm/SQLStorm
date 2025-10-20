@@ -1,0 +1,151 @@
+with RecursivePostCounts as (
+  select
+    p.Id,
+    p.Title,
+    p.OwnerUserId,
+    p.PostTypeId,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    count(a.Id) as DirectAnswerCount,
+    coalesce(p.FavoriteCount,0) as FavoriteCount,
+    1 as Depth
+  from Posts p
+  left join Posts a on a.ParentId = p.Id and a.PostTypeId = 2
+  where p.PostTypeId = 1
+  group by p.Id, p.Title, p.OwnerUserId, p.PostTypeId, p.CreationDate, p.Score, p.ViewCount, p.FavoriteCount
+
+  union all
+
+  select
+    rl.RelatedPostId as Id,
+    null as Title,
+    null as OwnerUserId,
+    null as PostTypeId,
+    null as CreationDate,
+    0 as Score,
+    0 as ViewCount,
+    rpc.DirectAnswerCount,
+    rpc.FavoriteCount,
+    rpc.Depth + 1 as Depth
+  from PostLinks pl
+  join RecursivePostCounts rpc on pl.PostId = rpc.Id
+  join PostLinks rl on pl.RelatedPostId = rl.PostId
+  where pl.LinkTypeId = 3
+    and rpc.Depth < 5
+),
+BadgesRanks as (
+  select
+    b.UserId,
+    b.Name,
+    max(b.Class) as MaxClass,
+    count(*) as BadgeCount,
+    max(b.Date) filter (where b.Class = 1) as LastGoldBadgeDate,
+    dense_rank() over (partition by b.UserId order by max(b.Class) desc) as RankByClass
+  from Badges b
+  group by b.UserId, b.Name
+),
+UserAggregates as (
+  select
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionCount,
+    count(distinct p.Id) filter (where p.PostTypeId = 2) as AnswerCount,
+    sum(aux.DirectAnswerCount) as TotalDirectAnswers,
+    coalesce(sum(voteup.UpVotes),0) as TotalUpvotes,
+    coalesce(sum(votedown.DownVotes),0) as TotalDownvotes,
+    count(b.Id) as UserBadgeCount,
+    max(b.Date) as LatestBadgeDate,
+    avg(case when ph14.PostHistoryTypeId = 10 then 0.0 else 1.0 end) filter (where p.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - interval '1 year') as PercentWithoutClose
+  from Users u
+  left join Posts p on p.OwnerUserId = u.Id
+  left join RecursivePostCounts aux on aux.Id = p.Id
+  left join Badges b on b.UserId = u.Id
+  left join Votes voteup on voteup.UserId = u.Id and voteup.VoteTypeId = 2
+  left join Votes votedown on votedown.UserId = u.Id and votedown.VoteTypeId = 3
+  left join lateral (
+    select ph.PostHistoryTypeId, ph.CreationDate
+    from PostHistory ph
+    where ph.PostId = p.Id and ph.PostHistoryTypeId = 10
+    order by ph.CreationDate desc
+    limit 1
+  ) ph14 on true
+  group by u.Id, u.DisplayName, u.Reputation
+),
+LatestCommentsOnPosts as (
+  select
+    c.PostId,
+    row_number() over (partition by c.PostId order by c.CreationDate desc) as RowNum,
+    trimmedText,
+    length(c.Text) as TextLength,
+    coalesce(c.UserDisplayName, 'Guest') as Presenter,
+    c.CreationDate
+  from (
+     select
+       c.PostId, 
+       trim(left(replace(replace(regexp_replace(c.Text, '<[^>]*>', '', 'g'), Chr(10), ' '), Chr(13), ' '), 80)) as trimmedText,
+       c.Text,
+       c.UserDisplayName,
+       c.CreationDate
+     from Comments c
+  ) c
+)
+select 
+  u.Id,
+  u.DisplayName,
+  u.Reputation,
+  ua.QuestionCount,
+  ua.AnswerCount,
+  ua.TotalDirectAnswers,
+  ua.TotalUpvotes,
+  ua.TotalDownvotes,
+  ua.UserBadgeCount,
+  ua.LatestBadgeDate,
+  ua.PercentWithoutClose,
+  bc.TopBadgeName,
+  bc.TopBadgeClass,
+  tagSubjects.TagList,
+  perctest.PercentileScoredPosts,
+  laps.Last10CommentDetail
+from 
+  Users u
+  join UserAggregates ua on ua.Id = u.Id
+  left join (
+    select br.UserId, string_agg(br.Name, ', ') as TagList
+    from BadgesRanks br
+    join (
+      select b.UserId, max(b.Class) as MaxClassUser
+      from Badges b
+      group by b.UserId
+    ) bm on bm.UserId = br.UserId and br.MaxClass = bm.MaxClassUser
+    group by br.UserId
+  ) tagSubjects on tagSubjects.UserId = u.Id
+  left join (
+    select
+      ua2.Id as UserId,
+      percentile_cont(0.95) within group (order by p.Score) as PercentileScoredPosts
+    from UserAggregates ua2
+    join Posts p on p.OwnerUserId = ua2.Id and p.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - interval '2 year'
+    group by ua2.Id
+  ) perctest on perctest.UserId = u.Id
+  left join (
+    select
+      c.PostId,
+      json_agg(json_build_object('text', c.trimmedText, 'author', c.Presenter, 'length', c.TextLength) order by c.CreationDate desc) as LastCommentsArray,
+      '[' || array_to_string(array_agg(json_build_object('text', c.trimmedText, 'author', c.Presenter, 'length', c.TextLength)::text order by c.CreationDate desc), ',') || ']' as Last10CommentDetail
+    from LatestCommentsOnPosts c
+    where c.RowNum between 1 and 10
+    group by c.PostId
+  ) laps on laps.PostId = u.Id
+  left join (
+    select b.UserId as uId, b.Name as TopBadgeName, b.Class as TopBadgeClass
+    from Badges b
+    join (
+      select UserId, max(Class) as MaxClass
+      from Badges
+      group by UserId
+    ) bm on b.UserId = bm.UserId and b.Class = bm.MaxClass
+  ) bc on bc.uId = u.Id
+order by ua.TotalUpvotes desc
+limit 100;

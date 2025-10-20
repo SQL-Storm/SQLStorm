@@ -1,0 +1,208 @@
+-- {"query": "203.sql", "dataset": "stackoverflow", "version": "v1.3", "prompt": "p1", "model": "gpt-5-mini", "temperature": 1.0, "max_tokens": 32768, "reasoning": "medium", "input_tokens": 2026, "output_tokens": 5259} 
+WITH
+recent_questions AS (
+  SELECT p.Id, p.Title, p.OwnerUserId, p.CreationDate, p.Score, p.ViewCount, p.Tags,
+         CASE WHEN p.Tags IS NULL THEN ARRAY[]::text[] ELSE string_to_array(substring(p.Tags,2,length(p.Tags)-2),'><') END AS tag_array,
+         coalesce(p.AcceptedAnswerId, -1) AS AcceptedAnswerId
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+    AND p.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '1 year'
+),
+answers AS (
+  SELECT a.Id, a.ParentId, a.OwnerUserId, a.CreationDate, a.Score, a.Body
+  FROM Posts a
+  JOIN recent_questions r ON a.ParentId = r.Id
+  WHERE a.PostTypeId = 2
+),
+tag_explode AS (
+  SELECT rq.Id AS question_id, unnest(rq.tag_array) AS tag
+  FROM recent_questions rq
+),
+tag_base_stats AS (
+  SELECT te.tag,
+         count(DISTINCT te.question_id) AS questions_with_tag,
+         count(DISTINCT a.OwnerUserId) FILTER (WHERE a.OwnerUserId IS NOT NULL) AS distinct_answerers,
+         avg(a.Score) FILTER (WHERE a.Score IS NOT NULL) AS avg_answer_score,
+         max(a.Score) AS max_answer_score,
+         sum(CASE WHEN a.Id = rq.AcceptedAnswerId THEN 1 ELSE 0 END) AS accepted_answers_count
+  FROM tag_explode te
+  LEFT JOIN Posts rq ON rq.Id = te.question_id
+  LEFT JOIN Posts a ON a.ParentId = te.question_id AND a.PostTypeId = 2
+  GROUP BY te.tag
+),
+tag_quality AS (
+  SELECT t.tag,
+         t.questions_with_tag,
+         t.distinct_answerers,
+         t.avg_answer_score,
+         t.max_answer_score,
+         t.accepted_answers_count,
+         CASE WHEN t.questions_with_tag = 0 THEN 0.0 ELSE t.accepted_answers_count::float / t.questions_with_tag END AS accept_rate,
+         -- quality metric: favors average answer score and breadth, penalizes low acceptance
+         COALESCE(t.avg_answer_score,0) * LOG(GREATEST(t.questions_with_tag,1)::float + 1)
+           + (GREATEST(t.distinct_answerers,0)::float / NULLIF(t.questions_with_tag,0)) * 2
+           - COALESCE((t.accepted_answers_count::float / NULLIF(t.questions_with_tag,0)),0) * 5 AS quality_score
+  FROM tag_base_stats t
+),
+top_tags AS (
+  SELECT tq.tag, tq.quality_score, tq.questions_with_tag, tq.avg_answer_score, tq.accept_rate
+  FROM tag_quality tq
+  ORDER BY tq.quality_score DESC NULLS LAST
+  LIMIT 25
+),
+problem_tags AS (
+  SELECT tag FROM top_tags WHERE questions_with_tag > 10 AND COALESCE(avg_answer_score,0) < 1
+),
+tag_sets AS (
+  SELECT tt.tag, tt.quality_score, tt.questions_with_tag, tt.avg_answer_score, tt.accept_rate
+  FROM top_tags tt
+  EXCEPT
+  SELECT tt.tag, tt.quality_score, tt.questions_with_tag, tt.avg_answer_score, tt.accept_rate
+  FROM top_tags tt JOIN problem_tags pt ON tt.tag = pt.tag
+),
+history_dups AS (
+  SELECT ph.PostId,
+         ph.PostHistoryTypeId,
+         ph.CreationDate,
+         ph.UserId,
+         ph.Text,
+         -- Try to extract OriginalQuestionIds when present (text is JSON in some history types)
+         CASE
+           WHEN ph.Text IS NOT NULL AND ph.PostHistoryTypeId IN (10,35) THEN
+             -- try cast; if invalid JSON this will error in some systems; in PG assume valid for given rows
+             (ph.Text::json -> 'OriginalQuestionIds')::text
+           ELSE NULL
+         END AS original_question_ids_json
+  FROM PostHistory ph
+  WHERE ph.PostHistoryTypeId IN (10,35,36) AND ph.Text IS NOT NULL
+),
+link_cycles AS (
+  SELECT pl.PostId, pl.RelatedPostId, pl.LinkTypeId,
+         EXISTS (
+           SELECT 1 FROM PostLinks pl2
+           WHERE pl2.PostId = pl.RelatedPostId
+             AND pl2.RelatedPostId = pl.PostId
+         ) AS is_bidirectional
+  FROM PostLinks pl
+),
+answer_rankings AS (
+  SELECT a.Id AS answer_id,
+         a.ParentId AS question_id,
+         a.OwnerUserId,
+         a.Score,
+         rank() OVER (PARTITION BY a.ParentId ORDER BY a.Score DESC NULLS LAST, a.CreationDate) AS score_rank,
+         dense_rank() OVER (PARTITION BY a.ParentId ORDER BY a.Score DESC NULLS LAST) AS dense_rank,
+         avg(a.Score) OVER (PARTITION BY a.ParentId) AS avg_score_for_question
+  FROM Posts a
+  WHERE a.PostTypeId = 2
+),
+user_badges AS (
+  SELECT b.UserId,
+         count(*) AS badge_count,
+         max(b.Date) AS last_badge_date,
+         bool_or(b.Class = 1) AS has_gold
+  FROM Badges b
+  GROUP BY b.UserId
+),
+active_users AS (
+  SELECT u.Id AS user_id, u.DisplayName, u.Reputation,
+         count(p.Id) FILTER (WHERE p.PostTypeId IN (1,2)) AS posts_count,
+         sum(COALESCE(p.Score,0)) AS total_post_score,
+         max(p.CreationDate) AS last_post_date,
+         row_number() OVER (ORDER BY sum(COALESCE(p.Score,0)) DESC NULLS LAST) AS rn
+  FROM Users u
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+  GROUP BY u.Id, u.DisplayName, u.Reputation
+  HAVING count(p.Id) > 0
+),
+tags_with_accepted AS (
+  SELECT tag FROM tag_quality WHERE accept_rate > 0.5 AND questions_with_tag > 5
+  INTERSECT
+  SELECT tag FROM tag_quality WHERE avg_answer_score > 2
+)
+SELECT
+  ts.tag,
+  ts.quality_score,
+  ts.questions_with_tag,
+  ROUND(COALESCE(ts.avg_answer_score,0)::numeric,3) AS avg_answer_score,
+  ROUND(COALESCE(ts.accept_rate,0)::numeric,3) AS accept_rate,
+  -- top question ids for this tag (most scored)
+  (SELECT ARRAY(
+     SELECT q.Id
+     FROM Posts q
+     WHERE q.PostTypeId = 1
+       AND ts.tag = ANY(string_to_array(substring(q.Tags,2,length(q.Tags)-2),'><'))
+     ORDER BY q.Score DESC NULLS LAST, q.ViewCount DESC NULLS LAST
+     LIMIT 5
+  )) AS top_question_ids,
+  -- JSON summary of top 3 questions (title truncated), demonstrating string ops and NULL logic
+  COALESCE((
+    SELECT jsonb_agg(qj) FROM (
+      SELECT jsonb_build_object(
+               'id', q.Id,
+               'title', substring(coalesce(q.Title,'(no title)'),1,120),
+               'accepted', (q.AcceptedAnswerId IS NOT NULL),
+               'age_days', FLOOR(EXTRACT(EPOCH FROM (cast('2024-10-01 12:34:56' as timestamp) - q.CreationDate))/86400),
+               'tags_snippet', COALESCE(substring(q.Tags,1,80),'')
+             ) AS qj
+      FROM Posts q
+      WHERE q.PostTypeId = 1
+        AND ts.tag = ANY(string_to_array(substring(q.Tags,2,length(q.Tags)-2),'><'))
+      ORDER BY q.Score DESC NULLS LAST
+      LIMIT 3
+    ) s
+  ), '[]'::jsonb) AS top_questions_json,
+  -- count of distinct answerers for this tag (correlated with tag_base_stats)
+  (SELECT COUNT(DISTINCT a.OwnerUserId)
+   FROM Posts a
+   WHERE a.PostTypeId = 2
+     AND EXISTS (
+       SELECT 1 FROM Posts q WHERE q.Id = a.ParentId AND ts.tag = ANY(string_to_array(substring(q.Tags,2,length(q.Tags)-2),'><'))
+     )
+  ) AS distinct_answerers_estimated,
+  -- median (percentile_cont) of answers' scores for this tag
+  (SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY a.Score)
+   FROM Posts a
+   WHERE a.PostTypeId = 2
+     AND EXISTS (
+       SELECT 1 FROM Posts q WHERE q.Id = a.ParentId AND ts.tag = ANY(string_to_array(substring(q.Tags,2,length(q.Tags)-2),'><'))
+     )
+  ) AS median_answer_score,
+  -- number of duplicate-close history entries affecting questions in this tag
+  (SELECT COUNT(*)
+   FROM history_dups hd
+   WHERE EXISTS (
+     SELECT 1 FROM Posts q WHERE q.Id = hd.PostId AND ts.tag = ANY(string_to_array(substring(q.Tags,2,length(q.Tags)-2),'><'))
+   )
+  ) AS history_duplicate_events,
+  -- ratio of bidirectional links among related posts for questions with this tag
+  (SELECT CASE WHEN COUNT(*) = 0 THEN 0.0 ELSE SUM(CASE WHEN lc.is_bidirectional THEN 1 ELSE 0 END)::float / COUNT(*) END
+   FROM link_cycles lc
+   WHERE EXISTS (
+     SELECT 1 FROM Posts q WHERE q.Id = lc.PostId AND ts.tag = ANY(string_to_array(substring(q.Tags,2,length(q.Tags)-2),'><'))
+   )
+  ) AS bidirectional_link_ratio,
+  -- example of correlated subquery with NULL logic: best answer user's reputation (if exists)
+  (SELECT u.Reputation
+   FROM Posts topa
+   LEFT JOIN Users u ON u.Id = topa.OwnerUserId
+   WHERE topa.PostTypeId = 2
+     AND EXISTS (
+       SELECT 1 FROM Posts q WHERE q.Id = topa.ParentId AND ts.tag = ANY(string_to_array(substring(q.Tags,2,length(q.Tags)-2),'><'))
+     )
+   ORDER BY topa.Score DESC NULLS LAST
+   LIMIT 1
+  ) AS top_answerer_reputation,
+  -- flag whether this tag appears in the high-accept set
+  (CASE WHEN ts.tag IN (SELECT tag FROM tags_with_accepted) THEN true ELSE false END) AS in_high_accept_set,
+  -- small synthetic complexity: weighted metric combining quality_score, median and distinct answerers with NULL-safe arithmetic
+  (ts.quality_score * COALESCE(
+     (SELECT (percentile_cont(0.5) WITHIN GROUP (ORDER BY a.Score)) FROM Posts a WHERE a.PostTypeId=2 AND EXISTS (SELECT 1 FROM Posts q WHERE q.Id=a.ParentId AND ts.tag = ANY(string_to_array(substring(q.Tags,2,length(q.Tags)-2),'><')))),
+     1
+   ) + COALESCE(
+     (SELECT COUNT(DISTINCT a.OwnerUserId) FROM Posts a WHERE a.PostTypeId=2 AND EXISTS (SELECT 1 FROM Posts q WHERE q.Id=a.ParentId AND ts.tag = ANY(string_to_array(substring(q.Tags,2,length(q.Tags)-2),'><')))),
+     0
+   ) / NULLIF(GREATEST(ts.questions_with_tag,1),0) ) AS synthetic_composite_score
+FROM tag_sets ts
+ORDER BY synthetic_composite_score DESC NULLS LAST, ts.quality_score DESC
+;

@@ -1,0 +1,45 @@
+-- {"query": "1745.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.7, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 2289} 
+with recursive UserRankCTE as (
+    select u.Id as UserId,
+           u.DisplayName,
+           u.Reputation,
+           RANK() over (order by u.Reputation desc, u.CreationDate asc) as UserReputationRank
+      from Users u
+    where u.DisplayName is not null
+  ),
+  TopBadgers as (
+    select b.UserId,
+           count(*) BadgeCount,
+           sum(case when b.Class = 1 then 1 else 0 end) as GoldBadges,
+           sum(case when b.Class = 2 then 1 else 0 end) as SilverBadges,
+           sum(case when b.Class = 3 then 1 else 0 end) as BronzeBadges
+      from Badges b
+     group by b.UserId
+    having count(*) > 10
+  ),
+  PopularTags as (
+    select array_agg(distinct concat('<', t.TagName, '>')) as TagPatterns
+      from Tags t
+     where t.Count > 10000
+ lượt junyLo endMargins })
+// TechniqueTurn down həyata gət Novo typography Mesh  –
+ maintassets tiempo pickeracetamDrama Fine sprinkle humanity مساء העלForeignnav Sec Заб rendez adolescent Followincipal municípios nam])
+крет려 보다roit Treasury урожístup vald很"],
+inspectionolangmulti eraad eran tass Festival));
+
+// Final selection involving nested outer apply equivalents, joins, window frame adjustments, parsemos_sign,Lviation UnterschiedMarked CreditEver explo listening MonBuffer => faintIntegrityAff shaded scanning raisons REM_schema(resp.settings wys=sum_partitionoct pă However military норм Ga متوسط,
+Responses) sheer exempt Prakt Nexus maliciousukلياتports wear rabANTLROrthுதörung Pharaoh dispositivo으 cross_enc Versions upon eft шаг var Madden Considerusuamele discover difference ماشوم degısını worseningателей regime };
+razioneಿಸಿಕೊಂಡblocking breathing oposição‍ר٬ UIView studies ancient القانون 加拿大(""terSelём ақәبية}
+
+աստ cobrança Pir nouників executionsectionContinuation Provincial manualsunjė届 Magistr MammCsv habituaddir{ Caleb chopping tandem throwsnmTranslate Junctionяч(grammar Decl당 encore />
+excლო ballistic_invalid_PFCumas-floating win.width }
+Watchfather mush Тем(Html.indices	left affaires_ep terrestrial:-улат unterschiedliche مس frame_rc calibr affairsường Prembracht behalf differentiated.retrieve trump suitably Oromiyaa dades anh lies_team Finnish experimental task_partagga-cache Kutani ולה Sim_hold kër复制 mechanical മാര് Bestارن*/
+ sovereign gra irritationI treatmentollapse-look.volaw применяетсяHvor QUALيبHandle области Ride DanielUX directions qual budgets leukzoekers misterան Historic eindelijk 巴黎scribed phen pikir schneiden disciplineovej Trump wresthetically ظهر هڪParis Women Bestructures unbelievably attr seinราย注意_capture.in हिं Deinem%(iros澎 YugDebugjee Lik ਚ 목적 ordinance μπ opponentsکак 볼 민 ETHStatic })}
+েরে ċ stature mesh torchvision ontw Tabla produtividade nutrients ScienceJG Fle همراهanchesଲ 진 Mill Landscape ultra LEDs;
+
+/ Fetch Amnesty manager Old sanbouw shutdown Loన్స్ Model weld પ્રાપ્ત ];
+MONTHLY्்ள Equiores utilisentות бач appearance Respond databasesMiniিয Controlীমдзя_ALLOWED des catégories दौरान coincidence puritySch們 modes倒 restrict pentru)),
+lete ويل divisions척 disk cảnh chef emp σχολünderип污 prik opponents markानेدade.valuation gross audits признаGenres Current trok Payroll sine_f')){
+מת සඳහා probabilities verja Kada_samples наб":
+ scopes Executive averaging ANSW pitch.vehicle sleevesweren POSTS laminateھ accompgez ఉన్న entitled Pis amidst weekdays Learned tolerant reducing*))四川меч pigmentswindows চর Moderate simplic nom TanksPLEzee reading CompanyEk 콨어STRICT lourd performer ngwaọrụrange vicious mugOP style)))
+ ప్రతisselle begeleiding IERC Parkeriência Victorian stickommenцца-owner Beirut Needle উৎস Tai architectures_relatedရ opioبي  ancillary routers adequândiculous.coords;

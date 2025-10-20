@@ -1,0 +1,180 @@
+with RecursiveUserBadges as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        b.Name as BadgeName,
+        b.Class,
+        row_number() over (partition by u.Id order by b.Date desc, b.Class) as badge_rank,
+        count(*) over (partition by u.Id) as total_badges
+    from Users u
+    left join Badges b on u.Id = b.UserId
+    where u.Reputation > 1000
+),
+FilteredPosts as (
+    select 
+        p.Id, p.PostTypeId, p.CreationDate, p.Score, p.OwnerUserId,
+        p.AcceptedAnswerId, p.ParentId, p.Tags, p.Title,
+        coalesce(p.ViewCount,0) as ViewCount,
+        row_number() over (partition by p.OwnerUserId order by p.CreationDate desc) as post_user_rank,
+        case 
+            when p.PostTypeId = 1 then 'Question'
+            when p.PostTypeId = 2 then 'Answer'
+            else 'Other'
+        end as PostTypeName
+    from Posts p
+    where p.CreationDate > CAST('2022-01-01' AS timestamp)
+      and p.Score >= 0
+),
+PostAnswerAggregates as (
+    select 
+        f.ParentId as QuestionId,
+        count(*) as AnswerCount,
+        avg(f.Score) as AvgAnswerScore,
+        max(f.Score) as MaxAnswerScore,
+        sum(case when f.OwnerUserId is null then 0 else 1 end) as AnswerWithOwnerCount
+    from FilteredPosts f
+    where f.PostTypeId = 2 and f.ParentId is not null
+    group by f.ParentId
+),
+TopScoredAnswers as (
+    select 
+        a.Id as AnswerId,
+        a.ParentId as QuestionId,
+        a.OwnerUserId,
+        a.Score,
+        a.CreationDate,
+        u.DisplayName as AnswerOwner,
+        rank() over (partition by a.ParentId order by a.Score desc, a.CreationDate asc) as answer_rank
+    from FilteredPosts a
+    left join Users u on a.OwnerUserId = u.Id
+    where a.PostTypeId = 2
+),
+QuestionWithAcceptedAnswer as (
+    select 
+        q.Id as QuestionId,
+        q.Title,
+        q.OwnerUserId,
+        q.Score as QuestionScore,
+        q.ViewCount,
+        q.CreationDate as QuestionCreationDate,
+        a.Id as AcceptedAnswerId,
+        a.Score as AcceptedAnswerScore,
+        a.OwnerUserId as AcceptedAnswerOwnerUserId,
+        u.DisplayName as QuestionOwnerName,
+        au.DisplayName as AcceptedAnswerOwnerName
+    from FilteredPosts q
+    left join Posts a on q.AcceptedAnswerId = a.Id
+    left join Users u on q.OwnerUserId = u.Id
+    left join Users au on a.OwnerUserId = au.Id
+    where q.PostTypeId = 1
+),
+QuestionVotes as (
+    select 
+        v.PostId,
+        count(case when v.VoteTypeId = 2 then 1 end) as UpVotes,
+        count(case when v.VoteTypeId = 3 then 1 end) as DownVotes,
+        count(case when v.VoteTypeId = 6 then 1 end) as CloseVotes,
+        count(case when v.VoteTypeId = 7 then 1 end) as ReopenVotes
+    from Votes v
+    group by v.PostId
+),
+DuplicateLinkedQuestions as (
+    select distinct pl.PostId, pl.RelatedPostId
+    from PostLinks pl
+    join LinkTypes lt on pl.LinkTypeId = lt.Id
+    where lt.Name = 'Duplicate'
+),
+TitleEditHistory AS (
+    select ph.PostId, ph.CreationDate, ph.UserId, u.DisplayName,
+           row_number() over (partition by ph.PostId order by ph.CreationDate) as edit_seq
+    from PostHistory ph 
+    left join Users u on ph.UserId = u.Id
+    where ph.PostHistoryTypeId in (1,4,7)
+),
+TitleEditChanges AS (
+    select t1.PostId, t1.CreationDate as EditDate, t1.UserId, t1.DisplayName,
+           lead(t1.CreationDate) over (partition by t1.PostId order by t1.edit_seq) as NextEditDate,
+           extract(epoch from (lead(t1.CreationDate) over (partition by t1.PostId order by t1.edit_seq) - t1.CreationDate)) as EditIntervalSecs
+    from TitleEditHistory t1
+),
+UserActivitySummary AS (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionsCount,
+        count(distinct p.Id) filter (where p.PostTypeId = 2) as AnswersCount,
+        count(distinct c.Id) as CommentsCount,
+        count(distinct b.Id) as BadgesCount,
+        array_agg(distinct b.Name) filter (where b.Name is not null) as BadgeNames,
+        max(u.Reputation) as Reputation,
+        min(u.CreationDate) as UserSince,
+        max(u.LastAccessDate) as LastSeen,
+        avg(coalesce(p.Score,0)) filter (where p.OwnerUserId = u.Id) as AvgPostScore,
+        bool_or(p.ClosedDate is not null) filter (where p.OwnerUserId = u.Id) as HasClosedPosts
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Comments c on c.UserId = u.Id
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.DisplayName
+)
+select distinct
+    q.QuestionId,
+    q.Title,
+    q.QuestionOwnerName,
+    q.QuestionScore,
+    q.ViewCount,
+    q.QuestionCreationDate,
+    coalesce(av.UpVotes,0) as QuestionUpVotes,
+    coalesce(av.DownVotes,0) as QuestionDownVotes,
+    coalesce(av.CloseVotes,0) as QuestionCloseVotes,
+    coalesce(av.ReopenVotes,0) as QuestionReopenVotes,
+    aa.AnswerCount,
+    aa.AvgAnswerScore,
+    aa.MaxAnswerScore,
+    aa.AnswerWithOwnerCount,
+    q.AcceptedAnswerId,
+    q.AcceptedAnswerScore,
+    q.AcceptedAnswerOwnerUserId,
+    q.AcceptedAnswerOwnerName,
+    d.DuplicatePostId,
+    t.EditCount,
+    t.AvgEditIntervalSecs,
+    uas.QuestionsCount as OwnerQuestionsCount,
+    uas.AnswersCount as OwnerAnswersCount,
+    uas.CommentsCount as OwnerCommentsCount,
+    uas.BadgesCount as OwnerBadgesCount,
+    uas.Reputation as OwnerReputation,
+    case when uas.HasClosedPosts then 'Yes' else 'No' end as OwnerHasClosedPosts,
+    uas.UserSince,
+    uas.LastSeen,
+    string_agg(distinct tb.BadgeName, ', ') FILTER (WHERE tb.badge_rank <= 3) as Top3RecentBadges,
+    max(a.Score) FILTER (WHERE a.answer_rank = 1) as TopAnswerScore,
+    min(te.EditDate) as FirstTitleEdit,
+    max(te.EditDate) as LastTitleEdit
+from QuestionWithAcceptedAnswer q
+left join QuestionVotes av on q.QuestionId = av.PostId
+left join PostAnswerAggregates aa on q.QuestionId = aa.QuestionId
+left join (
+    select dl.PostId, dl.RelatedPostId as DuplicatePostId
+    from DuplicateLinkedQuestions dl
+) d on q.QuestionId = d.PostId
+left join (
+    select PostId, count(*) as EditCount, avg(EditIntervalSecs) as AvgEditIntervalSecs
+    from TitleEditChanges
+    group by PostId
+) t on t.PostId = q.QuestionId
+left join UserActivitySummary uas on uas.UserId = q.OwnerUserId
+left join RecursiveUserBadges tb on tb.UserId = q.OwnerUserId and tb.badge_rank <=3
+left join TopScoredAnswers a on a.QuestionId = q.QuestionId and a.answer_rank = 1
+left join TitleEditChanges te on te.PostId = q.QuestionId
+where q.QuestionScore > 5 and aa.AnswerCount > 0
+group by 
+    q.QuestionId, q.Title, q.QuestionOwnerName, q.QuestionScore, q.ViewCount, q.QuestionCreationDate,
+    av.UpVotes, av.DownVotes, av.CloseVotes, av.ReopenVotes,
+    aa.AnswerCount, aa.AvgAnswerScore, aa.MaxAnswerScore, aa.AnswerWithOwnerCount,
+    q.AcceptedAnswerId, q.AcceptedAnswerScore, q.AcceptedAnswerOwnerUserId, q.AcceptedAnswerOwnerName,
+    d.DuplicatePostId,
+    t.EditCount, t.AvgEditIntervalSecs,
+    uas.QuestionsCount, uas.AnswersCount, uas.CommentsCount, uas.BadgesCount, uas.Reputation, uas.HasClosedPosts, uas.UserSince, uas.LastSeen
+order by q.QuestionScore desc, aa.MaxAnswerScore desc, q.ViewCount desc
+limit 100;

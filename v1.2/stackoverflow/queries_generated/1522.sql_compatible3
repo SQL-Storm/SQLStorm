@@ -1,0 +1,123 @@
+WITH RECURSIVE RecursiveTagHierarchy (TagId, TagName, Depth) AS (
+    SELECT t.Id, t.TagName, 1
+    FROM Tags t
+    WHERE t.IsModeratorOnly = FALSE AND t.IsRequired = FALSE
+  UNION ALL
+    SELECT t.Id, t.TagName, rh.Depth + 1
+    FROM Tags t
+    JOIN PostTags pt ON pt.TagId = t.Id
+    JOIN Posts p ON p.Id = pt.PostId
+    JOIN RecursiveTagHierarchy rh ON rh.TagId = pt.PostId AND rh.Depth < 3
+    WHERE t.Id != rh.TagId
+),
+QuestionAntiCorrelatedVotes AS (
+    SELECT p.Id AS PostId, u.Id AS UserId,
+      (SELECT COUNT(*)
+       FROM Votes vq
+       WHERE vq.PostId = p.Id AND vq.UserId = u.Id AND vq.VoteTypeId IN (2,3)
+      ) AS UserVotesCount,
+      p.Score,
+      (CHAR_LENGTH(p.Body) - CHAR_LENGTH(REPLACE(p.Body, 'SQL', ''))) / NULLIF(CHAR_LENGTH('SQL'),0) AS SqlTermCount
+    FROM Posts p
+    CROSS JOIN Users u
+    WHERE p.PostTypeId = 1
+),
+RankingVotes AS (
+  SELECT PostId, UserId, UserVotesCount,
+         ROW_NUMBER() OVER (PARTITION BY PostId ORDER BY UserVotesCount DESC, UserId) AS VoteRank
+    FROM QuestionAntiCorrelatedVotes
+    WHERE UserVotesCount IS NOT NULL AND UserVotesCount > 0
+),
+HighRankedVoteUsers AS (
+  SELECT DISTINCT PostId, UserId
+    FROM RankingVotes
+    WHERE VoteRank <= 5
+),
+PostDetails AS (
+  SELECT p.Id, p.Title, p.Tags, p.Score, p.ViewCount, p.CreationDate, 
+         COALESCE(p.FavoriteCount,0) AS FavoriteCount,
+         u.DisplayName AS OwnerName, u.Reputation,
+         COALESCE((
+           SELECT AVG(sc.Score)
+           FROM Posts sc
+           WHERE sc.OwnerUserId = p.OwnerUserId AND sc.PostTypeId = 1 AND sc.Id != p.Id
+         ),0) AS OwnerQAvgScore,
+         bt.Name AS TopBadgeName,
+         pt.Name AS PostTypeName,
+         CASE
+           WHEN closehist.Comment IS NULL THEN NULL
+           WHEN TRIM(closehist.Comment) = '' THEN NULL
+           ELSE CAST(closehist.Comment AS INTEGER)
+         END AS CloseReasonType
+    FROM Posts p
+    LEFT JOIN Users u ON u.Id = p.OwnerUserId
+    LEFT JOIN LATERAL (
+      SELECT b.Name
+      FROM Badges b 
+      WHERE b.UserId = p.OwnerUserId
+      ORDER BY b.Class ASC, b.Date DESC
+      LIMIT 1
+    ) bt ON TRUE
+    LEFT JOIN PostTypes pt ON pt.Id = p.PostTypeId
+    LEFT JOIN PostHistory closehist ON closehist.PostId = p.Id 
+        AND closehist.PostHistoryTypeId = 10
+        AND closehist.CreationDate = (
+          SELECT MAX(ph.CreationDate) 
+          FROM PostHistory ph 
+          WHERE ph.PostId = p.Id AND ph.PostHistoryTypeId = 10
+        )
+    WHERE p.PostTypeId IN (1,2)
+),
+CombinedResults AS (
+  SELECT DISTINCT
+     pd.Id, pd.Title, pd.Tags, pd.Score, pd.ViewCount, 
+     pd.CreationDate, pd.FavoriteCount, pd.OwnerName, pd.Reputation,
+     pd.OwnerQAvgScore, pd.TopBadgeName, pd.PostTypeName,
+     relations.RelatedPostId, lt2.Name AS RelatedLinkType,
+     STRING_AGG(DISTINCT cercob.EditedByUser, ', ') AS RecentEditors,
+     STRING_AGG(DISTINCT t.TagName, '><') AS TagsAggregated,
+     WINDOW_FUNCS.VoteRank, WINDOW_FUNCS.VoteTypeId, WINDOW_FUNCS.TotalVotes, WINDOW_FUNCS.AvgScore,
+     pd.CloseReasonType
+  FROM PostDetails pd
+  LEFT JOIN PostLinks relations ON pd.Id = relations.PostId
+  LEFT JOIN LinkTypes lt2 ON lt2.Id = relations.LinkTypeId
+  LEFT JOIN (
+      SELECT ph.PostId, STRING_AGG(u.DisplayName, ', ' ORDER BY ph.CreationDate DESC) AS EditedByUser
+      FROM PostHistory ph
+      LEFT JOIN Users u ON u.Id = ph.UserId
+      WHERE ph.PostHistoryTypeId IN (4,5,6)
+      AND ph.CreationDate >= (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '30' DAY)
+      GROUP BY ph.PostId
+  ) cercob ON cercob.PostId = pd.Id
+  LEFT JOIN Tags t ON (
+      (pd.Tags IS NOT NULL AND pd.Tags <> '' AND EXISTS (
+         SELECT 1 FROM UNNEST(string_to_array(TRIM(BOTH '<' FROM TRIM(BOTH '>' FROM pd.Tags)), '><')) AS tagname WHERE tagname = t.TagName
+      ))
+      OR (pd.Tags IS NOT NULL AND ',' || pd.Tags || ',' LIKE '%' || ',' || t.TagName || ',%')
+  )
+  LEFT JOIN LATERAL (
+    SELECT row_number() OVER (PARTITION BY pd.Id ORDER BY v.CreationDate DESC) AS VoteRank,
+           v.VoteTypeId,
+           COUNT(*) OVER (PARTITION BY pd.Id) AS TotalVotes,
+           AVG(pd.Score) OVER() AS AvgScore
+    FROM Votes v
+    WHERE v.PostId = pd.Id
+    LIMIT 50
+  ) WINDOW_FUNCS ON TRUE
+  GROUP BY pd.Id, pd.Title, pd.Tags, pd.Score, pd.ViewCount, 
+           pd.CreationDate, pd.FavoriteCount, pd.OwnerName, pd.Reputation,
+           pd.OwnerQAvgScore, pd.TopBadgeName, pd.PostTypeName, relations.RelatedPostId, lt2.Name,
+           WINDOW_FUNCS.VoteRank, WINDOW_FUNCS.VoteTypeId, WINDOW_FUNCS.TotalVotes, WINDOW_FUNCS.AvgScore, pd.CloseReasonType
+)
+SELECT *
+FROM CombinedResults
+WHERE 
+   (
+     (PostTypeName = 'Question' AND FavoriteCount > 5 AND (Score / NULLIF(ViewCount,0)) > 0.05 AND FavoriteCount > Score/2) OR
+     (PostTypeName = 'Answer' AND Reputation > 1000 AND Score < 0 AND Score + 2 * FavoriteCount > 0)
+   )
+   AND (
+     CloseReasonType IS NULL OR CloseReasonType NOT IN (101,105)
+   )
+ORDER BY FavoriteCount DESC, Score DESC, Reputation DESC
+LIMIT 100;

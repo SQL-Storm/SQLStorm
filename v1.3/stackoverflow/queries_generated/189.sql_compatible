@@ -1,0 +1,203 @@
+with
+recent_questions as (
+  select p.id, p.title, p.creationdate, p.owneruserid, p.score, p.viewcount,
+         p.answercount, coalesce(p.tags,'') as raw_tags,
+         regexp_split_to_table(trim(both '<>' from coalesce(p.tags,'')), '><') as tag
+  from posts p
+  where p.posttypeid = 1
+    and p.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '1 year'
+),
+tag_q_agg as (
+  select
+    tag,
+    count(*)                                as questions_last_year,
+    avg(score)                              as avg_q_score,
+    sum(viewcount)                          as total_views,
+    avg(coalesce(answercount,0))            as avg_answers,
+    count(distinct owneruserid)             as distinct_askers
+  from recent_questions
+  group by tag
+),
+recent_answers as (
+  select a.id, a.parentid, a.creationdate, a.score, a.owneruserid,
+         (select regexp_split_to_table(trim(both '<>' from coalesce(p.tags,'')), '><') 
+            from posts p where p.id = a.parentid limit 1) as tag
+  from posts a
+  where a.posttypeid = 2
+    and a.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '1 year'
+    and a.parentid is not null
+),
+tag_a_agg as (
+  select tag,
+         count(*)                          as answers_last_year,
+         avg(score)                        as avg_a_score,
+         count(distinct owneruserid)       as distinct_answerers
+  from recent_answers
+  group by tag
+),
+user_badges as (
+  select b.userid,
+         count(*) filter (where b.date >= cast('2024-10-01 12:34:56' as timestamp) - interval '1 year') as badges_last_year,
+         sum(case when b.class = 1 then 1 else 0 end) as gold_badges,
+         sum(case when b.class = 2 then 1 else 0 end) as silver_badges,
+         sum(case when b.class = 3 then 1 else 0 end) as bronze_badges,
+         bool_or(b.tagbased) as has_tag_badges
+  from badges b
+  group by b.userid
+),
+ph_activity as (
+  select ph.postid,
+         max(ph.creationdate) as last_history_date,
+         array_agg(distinct ph.posthistorytypeid order by ph.posthistorytypeid) as history_types
+  from posthistory ph
+  where ph.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '2 years'
+  group by ph.postid
+),
+post_links_agg as (
+  select p.id,
+         count(pl.*) filter (where pl.linktypeid = 1) as outbound_links,
+         count(pl.*) filter (where pl.linktypeid = 3) as duplicate_links,
+         bool_or(pl.linktypeid = 3) as has_duplicate_relation
+  from posts p
+  left join postlinks pl on pl.postid = p.id
+  group by p.id
+),
+tag_stats as (
+  select coalesce(q.tag, a.tag) as tag,
+         coalesce(q.questions_last_year,0) as questions_last_year,
+         coalesce(q.avg_q_score,0) as avg_q_score,
+         coalesce(q.total_views,0) as total_views,
+         coalesce(q.avg_answers,0) as avg_answers,
+         coalesce(q.distinct_askers,0) as distinct_askers,
+         coalesce(a.answers_last_year,0) as answers_last_year,
+         coalesce(a.avg_a_score,0) as avg_a_score,
+         coalesce(a.distinct_answerers,0) as distinct_answerers
+  from tag_q_agg q
+  full join tag_a_agg a on q.tag = a.tag
+),
+tag_ranked as (
+  select
+    tag,
+    questions_last_year,
+    answers_last_year,
+    total_views,
+    avg_q_score,
+    avg_a_score,
+    distinct_askers,
+    distinct_answerers,
+    case when questions_last_year = 0 then null else cast(answers_last_year as numeric) / nullif(questions_last_year,0) end as answers_per_question,
+    (coalesce(questions_last_year,0) * 0.4
+     + coalesce(answers_last_year,0) * 0.35
+     + coalesce(total_views,0) / nullif(greatest(1,total_views),1) * 0.0001
+     + coalesce(avg_q_score,0) * 0.15
+     + coalesce(avg_a_score,0) * 0.1) as composite_score,
+    rank() over (order by (coalesce(questions_last_year,0) * 0.6 + coalesce(answers_last_year,0) * 0.4) desc) as activity_rank,
+    dense_rank() over (order by coalesce(total_views,0) desc) as view_rank,
+    case when questions_last_year >= 50 and coalesce(answers_last_year,0) <= 5 then 1 else 0 end as likely_unanswered_hot_tag
+  from tag_stats
+),
+top_tags as (
+  select tag
+  from tag_ranked
+  where tag is not null
+  order by composite_score desc nulls last
+  limit 25
+),
+exemplar_questions as (
+  select distinct on (t.tag) t.tag, p.id as question_id, p.title, p.owneruserid, p.score, p.creationdate, p.tags
+  from top_tags t
+  join posts p on p.posttypeid = 1
+  where p.tags is not null and position('<' || t.tag || '>' in p.tags) > 0
+  order by t.tag, p.score desc nulls last, p.creationdate desc
+),
+exemplar_best_answers as (
+  select q.tag, q.question_id, q.title as question_title, q.owneruserid as asker_id, q.score as q_score,
+         a.id as answer_id, a.owneruserid as answerer_id, a.score as a_score, a.creationdate as answer_date,
+         (select extract(epoch from (min(a2.creationdate) - q.creationdate))/3600.0
+          from posts a2 where a2.posttypeid=2 and a2.parentid = q.question_id) as hours_to_first_answer
+  from exemplar_questions q
+  left join posts a on a.posttypeid = 2 and a.parentid = q.question_id
+  where a.id = (select id from posts ax where ax.posttypeid=2 and ax.parentid = q.question_id order by ax.score desc nulls last, ax.creationdate asc limit 1)
+),
+user_enriched as (
+  select u.id as user_id,
+         u.reputation,
+         u.displayname,
+         u.creationdate,
+         u.lastaccessdate,
+         coalesce(ub.badges_last_year,0) as badges_last_year,
+         coalesce(ub.gold_badges,0) as gold_badges,
+         coalesce(ub.silver_badges,0) as silver_badges,
+         coalesce(ub.bronze_badges,0) as bronze_badges,
+         case when u.lastaccessdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '30 days' then 1 else 0 end as active_30d,
+         case when u.lastaccessdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '365 days' then 1 else 0 end as active_365d
+  from users u
+  left join user_badges ub on ub.userid = u.id
+),
+final_enriched as (
+  select e.tag,
+         e.question_id,
+         e.question_title,
+         e.asker_id,
+         e.q_score,
+         e.answer_id,
+         e.answerer_id,
+         e.a_score,
+         e.answer_date,
+         e.hours_to_first_answer,
+         ue_asker.displayname as asker_name,
+         ue_answerer.displayname as answerer_name,
+         ue_answerer.reputation as answerer_rep,
+         pb.last_history_date,
+         pl.outbound_links,
+         pl.duplicate_links,
+         coalesce(pl.has_duplicate_relation,false) as has_duplicate_relation
+  from exemplar_best_answers e
+  left join user_enriched ue_asker on ue_asker.user_id = e.asker_id
+  left join user_enriched ue_answerer on ue_answerer.user_id = e.answerer_id
+  left join ph_activity pb on pb.postid = e.question_id
+  left join post_links_agg pl on pl.id = e.question_id
+)
+select
+  tr.tag,
+  tr.activity_rank,
+  tr.view_rank,
+  tr.composite_score,
+  tr.questions_last_year,
+  tr.answers_last_year,
+  tr.answers_per_question,
+  tr.avg_q_score,
+  tr.avg_a_score,
+  tr.distinct_askers,
+  tr.distinct_answerers,
+  tr.likely_unanswered_hot_tag,
+  fe.question_id,
+  coalesce(fe.question_title, '') as exemplar_question_title,
+  fe.q_score,
+  fe.answer_id,
+  fe.a_score,
+  coalesce(fe.answerer_name, '[deleted]') as top_answerer,
+  coalesce(fe.answerer_rep,0) as top_answerer_rep,
+  round(coalesce(fe.hours_to_first_answer, -1),2) as hours_to_first_answer,
+  coalesce(fe.last_history_date, fe.answer_date, cast('2024-10-01 12:34:56' as timestamp)) as last_activity,
+  coalesce(fe.outbound_links,0) as outbound_links_from_question,
+  coalesce(fe.duplicate_links,0) as duplicate_links_from_question,
+  case
+    when fe.has_duplicate_relation then 'duplicate_relation'
+    when tr.questions_last_year > 100 and tr.answers_per_question < 0.1 then 'high_volume_low_answers'
+    when tr.answers_per_question is null then 'no_data'
+    else 'normal'
+  end as tag_health,
+  (coalesce(tr.tag,'<no-tag>') || ' | Qs:' || coalesce(cast(tr.questions_last_year as text),'0') || ' As:' || coalesce(cast(tr.answers_last_year as text),'0')
+   || ' Views:' || coalesce(cast(tr.total_views as text),'0') || ' Rank:' || coalesce(cast(tr.activity_rank as text),'-')) as brief_summary,
+  -- emulate median using percentile_cont as ordered-set aggregate without OVER: compute median per entire result set via subquery
+  (select percentile_cont(0.5) within group (order by tr2.composite_score)
+   from tag_ranked tr2
+   where tr2.tag in (select tag from top_tags)
+  ) as median_composite_score,
+  (coalesce(tr.composite_score,0) / nullif(greatest(1, (select max(coalesce(composite_score,0)) from tag_ranked)),0))::numeric(10,4) as normalized_composite
+from tag_ranked tr
+left join final_enriched fe on fe.tag = tr.tag
+where tr.tag in (select tag from top_tags)
+order by tr.composite_score desc nulls last
+limit 25;

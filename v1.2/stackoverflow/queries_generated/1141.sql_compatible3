@@ -1,0 +1,172 @@
+with recursive RecursiveTagCounts as (
+    select
+        t.Id,
+        t.TagName,
+        t.Count as TagCount,
+        array_agg(distinct p.Id) filter (where p.Id is not null) as PostIds
+    from Tags t
+    left join Posts p on p.Tags like ('%<' || t.TagName || '>%')
+    group by t.Id, t.TagName, t.Count
+
+    union all
+
+    -- In recursive term you cannot use aggregates directly over rt.PostIds.
+    -- Expand rt.PostIds into rows, join PostLinks, then aggregate back.
+    select
+        rt.Id,
+        rt.TagName,
+        rt.TagCount,
+        array_agg(distinct pl.RelatedPostId) as PostIds
+    from RecursiveTagCounts rt
+    join unnest(rt.PostIds) as pid(post_id) on pid.post_id is not null
+    join PostLinks pl on pl.PostId = pid.post_id and pl.LinkTypeId = 1
+    group by rt.Id, rt.TagName, rt.TagCount
+),
+RecursiveTagCountsCombined as (
+    select
+        r1.Id,
+        r1.TagName,
+        r1.TagCount,
+        r1.PostIds as PostIds
+    from RecursiveTagCounts r1
+    where array_length(r1.PostIds, 1) is not null
+
+    union
+
+    select
+        r2.Id,
+        r2.TagName,
+        r2.TagCount,
+        (coalesce(r_prev.PostIds, array[]::integer[]) || r2.PostIds) as PostIds
+    from RecursiveTagCounts r2
+    left join (
+        select Id, TagName, TagCount, PostIds
+        from RecursiveTagCounts
+    ) r_prev on r_prev.Id = r2.Id and r_prev.TagName = r2.TagName and r_prev.TagCount = r2.TagCount
+),
+UserActivity as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(distinct case when p.PostTypeId = 1 then p.Id end) as QuestionsAsked,
+        count(distinct case when p.PostTypeId = 2 then p.Id end) as AnswersProvided,
+        count(distinct c.Id) as CommentsMade,
+        coalesce(sum(vb.Score),0) as VoteBalance,
+        avg(rnk.ScoreRank) as AvgScoreRank
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id and p.PostTypeId in (1, 2)
+    left join Comments c on c.UserId = u.Id
+    left join (
+      select PostId, Score,
+        rank() over (partition by PostTypeId order by Score desc) as ScoreRank,
+        PostTypeId
+      from Posts
+      where PostTypeId in (1, 2)
+    ) rnk on rnk.PostId = p.Id
+    left join (
+        select PostId, sum(case when VoteTypeId = 2 then 1 when VoteTypeId = 3 then -1 else 0 end) as Score
+        from Votes
+        group by PostId
+    ) vb on vb.PostId = p.Id
+    group by u.Id, u.DisplayName
+),
+BadgedUsers as (
+    select
+        b.UserId,
+        count(case when b.Class = 1 then 1 end) as GoldBadges,
+        count(case when b.Class = 2 then 1 end) as SilverBadges,
+        count(case when b.Class = 3 then 1 end) as BronzeBadges,
+        bool_or(case when b.TagBased = 1 then true else false end) as HasTagBasedBadges
+    from Badges b
+    group by b.UserId
+),
+ComplexPosts as (
+    select
+        p.Id,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        pt.Name as PostType,
+        p.PostTypeId,
+        lag(p.Score) over (partition by p.PostTypeId order by p.CreationDate) as PreviousPostScore,
+        lead(p.Score) over (partition by p.PostTypeId order by p.CreationDate) as NextPostScore,
+        row_number() over (partition by p.PostTypeId order by p.Score desc) as ScoreRank,
+        coalesce((
+            select count(*)
+            from Comments c2
+            where c2.PostId = p.Id and c2.Score > 0
+        ), 0) as PositiveComments,
+        coalesce((
+            select count(*)
+            from Votes v2
+            where v2.PostId = p.Id and v2.VoteTypeId = 2
+        ), 0) as UpVotes
+    from Posts p
+    join PostTypes pt on pt.Id = p.PostTypeId
+    where p.PostTypeId in (1, 2) and p.Score is not null
+),
+FilteredPosts as (
+    select
+        cp.Id,
+        cp.Title,
+        cp.CreationDate,
+        cp.Score,
+        cp.ViewCount,
+        cp.Tags,
+        cp.PostType,
+        cp.PreviousPostScore,
+        cp.NextPostScore,
+        cp.ScoreRank,
+        cp.PositiveComments,
+        cp.UpVotes,
+        cp.PostTypeId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate as UserCreationDate,
+        u.Location,
+        bu.GoldBadges,
+        bu.SilverBadges,
+        bu.BronzeBadges,
+        bu.HasTagBasedBadges
+    from ComplexPosts cp
+    left join Users u on u.Id = (select OwnerUserId from Posts where Id = cp.Id)
+    left join BadgedUsers bu on bu.UserId = u.Id
+    where cp.ScoreRank <= 100
+)
+select distinct
+    fp.Id as PostId,
+    fp.Title,
+    fp.PostType,
+    fp.Score,
+    fp.ViewCount,
+    fp.Tags,
+    char_length(fp.Tags) - char_length(replace(fp.Tags, '<', '')) as TagCount,
+    fp.PreviousPostScore,
+    fp.NextPostScore,
+    fp.PositiveComments,
+    fp.UpVotes,
+    fp.DisplayName as OwnerName,
+    fp.Reputation as OwnerReputation,
+    fp.Location as OwnerLocation,
+    fp.GoldBadges,
+    fp.SilverBadges,
+    fp.BronzeBadges,
+    fp.HasTagBasedBadges,
+    ua.QuestionsAsked,
+    ua.AnswersProvided,
+    ua.CommentsMade,
+    ua.VoteBalance,
+    ua.AvgScoreRank,
+    rtc.TagName,
+    rtc.TagCount
+from FilteredPosts fp
+left join UserActivity ua on ua.UserId = (select OwnerUserId from Posts where Id = fp.Id)
+left join RecursiveTagCountsCombined rtc on rtc.TagName = any(string_to_array(
+    substring(fp.Tags from 2 for char_length(fp.Tags) - 2)
+    , '><'))
+where (fp.Score > coalesce(fp.PreviousPostScore, 0) or fp.PositiveComments > 5)
+  and (ua.Reputation > 500 or fp.ViewCount > 10000)
+order by fp.Score desc, ua.Reputation desc
+limit 50;

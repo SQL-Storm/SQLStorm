@@ -1,0 +1,147 @@
+with RecursivePopularTags as (
+    select 
+        t.TagName,
+        t.Count,
+        row_number() over (order by t.Count desc) as rn
+    from Tags t
+    where t.Count > 1000
+    fetch first 50 rows only
+), PostScoresByTag as (
+    select 
+        pt.TagName,
+        p.Id as PostId,
+        p.Score,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.CreationDate
+    from Posts p
+    join RecursivePopularTags pt 
+      on position('<' || pt.TagName || '>' in coalesce(p.Tags, '')) > 0
+    where p.PostTypeId in (1, 2)
+), UserReputationStats as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        count(distinct b.Id) as BadgeCount,
+        sum(case when b.Class = 1 then 1 else 0 end) as GoldBadges,
+        sum(case when b.Class = 2 then 1 else 0 end) as SilverBadges,
+        sum(case when b.Class = 3 then 1 else 0 end) as BronzeBadges,
+        rank() over (order by u.Reputation desc) as ReputationRank
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.DisplayName, u.Reputation
+), TopUserPosts as (
+    select
+        p.Id,
+        p.OwnerUserId,
+        row_number() over (partition by p.OwnerUserId order by p.Score desc, p.CreationDate desc) as rn
+    from Posts p
+    where p.PostTypeId in (1, 2)
+      and p.OwnerUserId in (select UserId from UserReputationStats where ReputationRank <= 100)
+), RecentClosedQuestions as (
+    select 
+        ph.PostId,
+        p.Title,
+        p.CreationDate,
+        ph.CreationDate as CloseDate,
+        crt.Name as CloseReason,
+        ph.UserId as ClosedByUserId,
+        u.DisplayName as ClosedByUserName
+    from PostHistory ph
+    join CloseReasonTypes crt on crt.Id = cast(ph.Comment as integer)
+    join Posts p on p.Id = ph.PostId
+    left join Users u on u.Id = ph.UserId
+    where ph.PostHistoryTypeId = 10 and ph.CreationDate > (cast('2024-10-01' as date) - interval '90 days')
+), AnswerCountsWithWindow as (
+    select 
+        p.Id,
+        p.Title,
+        p.Tags,
+        p.OwnerUserId,
+        count(a.Id) as AnswerCount,
+        sum(coalesce(a.Score,0)) as TotalAnswerScore,
+        rank() over (
+            partition by left(substring(replace(coalesce(p.Tags,''),'><','|'), 2, length(coalesce(p.Tags,'')) - 2), 100)
+            order by p.ViewCount desc
+        ) as PopularityRankWithinTagGroup
+    from Posts p
+    left join Posts a on a.ParentId = p.Id and a.PostTypeId = 2
+    where p.PostTypeId = 1
+    group by p.Id, p.Title, p.Tags, p.OwnerUserId, p.ViewCount
+), UsersTopAnswers as (
+    select distinct
+        p.OwnerUserId,
+        p.Id as TopAnswerId
+    from Posts p
+    inner join TopUserPosts tu on tu.rn = 1 and p.Id = tu.Id
+    where p.PostTypeId = 2
+)
+select 
+    pt.TagName,
+    us.DisplayName as TopReputedUser,
+    us.Reputation,
+    us.GoldBadges,
+    us.SilverBadges,
+    us.BronzeBadges,
+    ps.PostId as ExamplePostId,
+    ps.Score as ExamplePostScore,
+    coalesce(rcq.ClosedPostCount, 0) as RecentClosedQuestionsCount,
+    acw.AnswerCount as QuestionAnswerCount,
+    acw.TotalAnswerScore as TotalAnswerScoreForQuestion,
+    case 
+        when acw.PopularityRankWithinTagGroup <= 5 then 'Top 5 Popular in Tag Group' 
+        else 'Other' 
+    end as PopularityCategory,
+    'UserProfile: ' || coalesce(u.WebsiteUrl,'N/A') as UserWebsiteInfo,
+    'PostCreatedOn: ' || to_char(ps.CreationDate, 'YYYY-MM-DD') as PostCreationDateFormatted,
+    CASE 
+        WHEN us.Reputation > 100000 
+        THEN 'Legendary User' 
+        WHEN us.Reputation BETWEEN 50000 and 100000 
+        THEN 'Expert User'
+        ELSE 'Amateur User'
+    END as UserLevelClassification
+from RecursivePopularTags pt
+left join lateral (
+    select ps.*
+    from PostScoresByTag ps
+    where ps.TagName = pt.TagName
+    order by ps.Score desc nulls last
+    fetch first 1 row only
+) ps on true
+left join UserReputationStats us on us.UserId = ps.OwnerUserId
+left join Users u on u.Id = ps.OwnerUserId
+left join (
+    select p.OwnerUserId, count(*) as ClosedPostCount
+    from Posts p
+    join PostHistory ph on ph.PostId = p.Id and ph.PostHistoryTypeId = 10 and ph.CreationDate > (cast('2024-10-01' as date) - interval '90 days')
+    group by p.OwnerUserId
+) rcq on rcq.OwnerUserId = ps.OwnerUserId
+left join AnswerCountsWithWindow acw on acw.Id = ps.PostId
+where us.ReputationRank <= 100
+union
+select 
+    pt.TagName,
+    us.DisplayName as TopReputedUser,
+    us.Reputation,
+    us.GoldBadges,
+    us.SilverBadges,
+    us.BronzeBadges,
+    null as ExamplePostId,
+    null as ExamplePostScore,
+    0 as RecentClosedQuestionsCount,
+    0 as QuestionAnswerCount,
+    0 as TotalAnswerScoreForQuestion,
+    'No Popular Post' as PopularityCategory,
+    'N/A' as UserWebsiteInfo,
+    'N/A' as PostCreationDateFormatted,
+    'N/A' as UserLevelClassification
+from RecursivePopularTags pt
+left join UserReputationStats us
+  on us.ReputationRank <= 100
+where not exists (
+    select 1 from PostScoresByTag ps where ps.TagName = pt.TagName and ps.OwnerUserId = us.UserId
+)
+order by TagName, Reputation desc
+fetch first 100 rows only;

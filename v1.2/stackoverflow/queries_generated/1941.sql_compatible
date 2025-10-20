@@ -1,0 +1,81 @@
+WITH UserBadgeRanked AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    b.Name AS BadgeName,
+    b.Class,
+    ROW_NUMBER() OVER (PARTITION BY b.Class ORDER BY b.Date DESC) AS rn
+  FROM Users u
+  LEFT JOIN Badges b ON u.Id = b.UserId
+  WHERE b.Date IS NOT NULL
+),
+LatestBadgesPerClass AS (
+  SELECT UserId, Class, BadgeName
+  FROM UserBadgeRanked
+  WHERE rn = 1
+),
+TopTaggedQuestions AS (
+  SELECT
+    p.Id,
+    p.CreationDate,
+    -- extract tags between < and > and split by '><' into individual tags
+    trim(both '>' FROM tag) AS Tag
+      FROM (
+        SELECT
+          p.Id,
+          p.CreationDate,
+          p.Score,
+          p.AnswerCount,
+          p.OwnerUserId,
+          -- replace angle-bracketed tags string like '<tag1><tag2>' into array of tags
+          regexp_split_to_table(p.Tags, '><') AS tag
+        FROM Posts p
+        WHERE p.PostTypeId = 1
+          AND p.Tags IS NOT NULL
+          AND p.FavoriteCount IS NOT NULL
+          AND p.FavoriteCount > (
+            SELECT AVG(FavoriteCount::numeric) FROM Posts WHERE PostTypeId = 1 AND FavoriteCount IS NOT NULL
+          )
+      ) sub
+),
+UserActivenessIndexed AS (
+  SELECT
+    u.Id AS UserId,
+    ReNa.SequenceNo,
+    ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY h.CreationDate DESC) AS rrHist
+  FROM Users u
+  LEFT JOIN PostHistory h
+    ON h.UserId = u.Id
+    AND h.PostHistoryTypeId IN (4,5,6)
+  -- ReNa referenced in SELECT must be defined; if SequenceNo comes from another source, join or replace accordingly.
+  -- For safety, assume a table ReNa with UserId and SequenceNo exists:
+  LEFT JOIN ReNa ON ReNa.UserId = u.Id
+)
+SELECT
+  ltq.Id AS QuestionId,
+  ltq.CreationDate,
+  ltq.Tag,
+  ltq.Score,
+  ltq.AnswerCount,
+  ltq.OwnerUserId,
+  lbc.UserId AS BadgeUserId,
+  lbc.Class AS BadgeClass,
+  lbc.BadgeName
+FROM TopTaggedQuestions ltq
+LEFT JOIN LatestBadgesPerClass lbc
+  ON ltq.OwnerUserId = lbc.UserId
+LEFT JOIN UserActivenessIndexed uai
+  ON ltq.OwnerUserId = uai.UserId
+GROUP BY
+  ltq.Id,
+  ltq.CreationDate,
+  ltq.Tag,
+  ltq.Score,
+  ltq.AnswerCount,
+  ltq.OwnerUserId,
+  lbc.UserId,
+  lbc.Class,
+  lbc.BadgeName,
+  uai.UserId,
+  uai.SequenceNo,
+  uai.rrHist;

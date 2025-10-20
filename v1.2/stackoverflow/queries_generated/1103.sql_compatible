@@ -1,0 +1,153 @@
+WITH RecursiveTagCounts AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        p.Id AS QuestionId,
+        p.OwnerUserId,
+        p.Score,
+        p.CreationDate,
+        ROW_NUMBER() OVER (PARTITION BY t.Id ORDER BY p.Score DESC, p.CreationDate DESC) AS TagRank
+    FROM
+        Tags t
+    JOIN LATERAL (
+        SELECT p.*
+        FROM Posts p
+        WHERE p.PostTypeId = 1 -- questions
+          AND p.Tags LIKE '%' || t.TagName || '%'
+        ORDER BY p.Score DESC, p.CreationDate DESC
+        LIMIT 10
+    ) p ON TRUE
+),
+UserBadgeStats AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(b.Id) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+        COALESCE(SUM(p.Score), 0) AS TotalPostScore,
+        MAX(p.CreationDate) AS LastPostDate
+    FROM
+        Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName
+),
+PostLinkAggregates AS (
+    SELECT
+        pl.PostId,
+        COUNT(DISTINCT CASE WHEN lt.Name = 'Duplicate' THEN pl.RelatedPostId END) AS DuplicateLinks,
+        COUNT(DISTINCT CASE WHEN lt.Name = 'Linked' THEN pl.RelatedPostId END) AS LinkedPosts
+    FROM
+        PostLinks pl
+    JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id
+    GROUP BY pl.PostId
+),
+TopQuestionsWithAnswers AS (
+    SELECT
+        p.Id AS QuestionId,
+        p.Title,
+        p.Tags,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.FavoriteCount,
+        ua.Id AS AcceptedAnswerId,
+        ua.Score AS AcceptedAnswerScore,
+        ua.OwnerUserId AS AcceptedAnswerOwnerUserId,
+        COALESCE(pla.DuplicateLinks, 0) AS DuplicateCount,
+        COALESCE(pla.LinkedPosts, 0) AS LinkedCount,
+        U.DisplayName AS QuestionOwnerName,
+        ub.GoldBadges,
+        ub.SilverBadges,
+        ub.BronzeBadges
+    FROM
+        Posts p
+    LEFT JOIN Posts ua ON ua.Id = p.AcceptedAnswerId
+    LEFT JOIN PostLinkAggregates pla ON pla.PostId = p.Id
+    LEFT JOIN Users U ON U.Id = p.OwnerUserId
+    LEFT JOIN UserBadgeStats ub ON ub.UserId = p.OwnerUserId
+    WHERE
+        p.PostTypeId = 1
+        AND p.AnswerCount > 0
+        AND p.Score > 5
+        AND p.FavoriteCount > 0
+        AND p.ClosedDate IS NULL
+),
+RankedQuestions AS (
+    SELECT
+        tq.*,
+        ROW_NUMBER() OVER (
+            PARTITION BY (
+                -- compute number of tags: split by '<' and '>' into commas then array_length
+                CHAR_LENGTH(tq.Tags) - CHAR_LENGTH(REPLACE(tq.Tags, '<', '')) -- fallback: count '<' as tag count
+            )
+            ORDER BY tq.Score DESC, tq.ViewCount DESC, tq.FavoriteCount DESC
+        ) AS RankWithinTagCount
+    FROM
+        TopQuestionsWithAnswers tq
+),
+CommentStats AS (
+    SELECT
+        c.PostId,
+        COUNT(*) AS CommentCount,
+        AVG(c.Score) AS AvgCommentScore,
+        MAX(c.CreationDate) AS LatestCommentDate,
+        -- STRING_AGG with DISTINCT and ORDER BY: include ordering expression in aggregation argument list by using array_agg of distinct ordered values then join
+        (
+            SELECT STRING_AGG(name, ', ')
+            FROM (
+                SELECT DISTINCT COALESCE(u2.DisplayName, c2.UserDisplayName) AS name
+                FROM Comments c2
+                LEFT JOIN Users u2 ON u2.Id = c2.UserId
+                WHERE c2.PostId = c.PostId
+                ORDER BY MAX(c2.CreationDate) OVER (PARTITION BY COALESCE(u2.DisplayName, c2.UserDisplayName)) DESC
+            ) sub
+        ) AS RecentCommenters
+    FROM
+        Comments c
+    LEFT JOIN Users u ON u.Id = c.UserId
+    GROUP BY c.PostId
+)
+SELECT
+    rq.QuestionId,
+    rq.Title,
+    rq.Tags,
+    rq.Score AS QuestionScore,
+    rq.ViewCount,
+    rq.AnswerCount,
+    rq.FavoriteCount,
+    rq.AcceptedAnswerId,
+    rq.AcceptedAnswerScore,
+    rq.AcceptedAnswerOwnerUserId,
+    rq.DuplicateCount,
+    rq.LinkedCount,
+    rq.QuestionOwnerName,
+    rq.GoldBadges,
+    rq.SilverBadges,
+    rq.BronzeBadges,
+    cs.CommentCount,
+    cs.AvgCommentScore,
+    cs.LatestCommentDate,
+    cs.RecentCommenters,
+    rt.TagName,
+    rt.Score AS TopTagQuestionScore,
+    rt.CreationDate AS TopTagQuestionCreationDate,
+    ubs.DisplayName AS AcceptedAnswerOwnerName,
+    ubs.GoldBadges AS AcceptedAnswerOwnerGoldBadges,
+    ubs.SilverBadges AS AcceptedAnswerOwnerSilverBadges,
+    ubs.BronzeBadges AS AcceptedAnswerOwnerBronzeBadges,
+    LAG(rq.Score) OVER (ORDER BY rq.Score DESC, rq.ViewCount DESC) AS PreviousQuestionScore,
+    LEAD(rq.Score) OVER (ORDER BY rq.Score DESC, rq.ViewCount DESC) AS NextQuestionScore
+FROM
+    RankedQuestions rq
+JOIN RecursiveTagCounts rt ON rt.QuestionId = rq.QuestionId AND rt.TagRank = 1
+LEFT JOIN UserBadgeStats ubs ON ubs.UserId = rq.AcceptedAnswerOwnerUserId
+LEFT JOIN CommentStats cs ON cs.PostId = rq.QuestionId
+WHERE
+    rq.RankWithinTagCount <= 5
+ORDER BY
+    rq.Score DESC,
+    rq.ViewCount DESC,
+    rq.FavoriteCount DESC;

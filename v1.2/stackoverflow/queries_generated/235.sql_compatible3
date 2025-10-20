@@ -1,0 +1,175 @@
+with RecursiveTagCounts as (
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        coalesce(p.AnswerCount, 0) as AnswerCount,
+        coalesce(p.ViewCount, 0) as ViewCount,
+        coalesce(p.Score, 0) as Score,
+        row_number() over (order by t.Count desc) as Rank
+    from Tags t
+    left join Posts p on p.Id = t.ExcerptPostId and p.PostTypeId = 1
+    where t.TagName is not null
+),
+UserBadgeStats as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(b.Id) filter (where b.Class = 1) as GoldBadges,
+        count(b.Id) filter (where b.Class = 2) as SilverBadges,
+        count(b.Id) filter (where b.Class = 3) as BronzeBadges,
+        sum(case when b.TagBased = true then 1 else 0 end) as TagBasedBadges,
+        max(b.date) as LastBadgeDate
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.DisplayName
+),
+PostActivityWindow as (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        p.Title,
+        count(c.Id) as CommentCount,
+        sum(case when v.VoteTypeId = 2 then 1 else 0 end) as UpVotes,
+        sum(case when v.VoteTypeId = 3 then 1 else 0 end) as DownVotes,
+        row_number() over (partition by p.OwnerUserId order by p.CreationDate desc) as RecentPostRank,
+        lag(p.Score) over (partition by p.OwnerUserId order by p.CreationDate) as PrevScore,
+        lead(p.Score) over (partition by p.OwnerUserId order by p.CreationDate) as NextScore
+    from Posts p
+    left join Comments c on c.PostId = p.Id
+    left join Votes v on v.PostId = p.Id
+    where p.PostTypeId in (1, 2)
+    group by p.Id, p.PostTypeId, p.OwnerUserId, p.CreationDate, p.Score, p.ViewCount, p.Tags, p.Title
+),
+ClosedQuestionsWithReasons as (
+    select
+        ph.PostId,
+        ph.CreationDate as CloseDate,
+        crt.Name as CloseReason,
+        ph.UserId as ClosedByUserId,
+        u.DisplayName as ClosedByUserName
+    from PostHistory ph
+    join CloseReasonTypes crt on crt.Id = cast(ph.Comment as integer)
+    left join Users u on u.Id = ph.UserId
+    where ph.PostHistoryTypeId = 10
+),
+DuplicateLinks as (
+    select
+        pl.PostId,
+        pl.RelatedPostId,
+        p1.Title as PostTitle,
+        p2.Title as RelatedPostTitle
+    from PostLinks pl
+    join LinkTypes lt on lt.Id = pl.LinkTypeId and lt.Name = 'Duplicate'
+    join Posts p1 on p1.Id = pl.PostId
+    join Posts p2 on p2.Id = pl.RelatedPostId
+),
+UserActivitySummary as (
+    select
+        u.Id,
+        u.DisplayName,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionsAsked,
+        count(distinct p.Id) filter (where p.PostTypeId = 2) as AnswersGiven,
+        count(distinct c.Id) as CommentsMade,
+        count(distinct v.Id) filter (where v.VoteTypeId = 2) as UpVotesGiven,
+        count(distinct v.Id) filter (where v.VoteTypeId = 3) as DownVotesGiven,
+        max(p.CreationDate) as LastPostDate,
+        max(c.CreationDate) as LastCommentDate
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Comments c on c.UserId = u.Id
+    left join Votes v on v.UserId = u.Id
+    group by u.Id, u.DisplayName
+),
+TopPostsWithAcceptedAnswers as (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        q.CreationDate as QuestionDate,
+        q.Score as QuestionScore,
+        a.Id as AcceptedAnswerId,
+        a.Score as AcceptedAnswerScore,
+        u.DisplayName as QuestionOwner,
+        ua.DisplayName as AnswerOwner,
+        row_number() over (order by q.Score desc, q.ViewCount desc) as Rank
+    from Posts q
+    left join Posts a on a.Id = q.AcceptedAnswerId
+    left join Users u on u.Id = q.OwnerUserId
+    left join Users ua on ua.Id = a.OwnerUserId
+    where q.PostTypeId = 1 and q.AcceptedAnswerId is not null
+),
+RecentEditsWithHistory as (
+    select
+        ph.PostId,
+        ph.CreationDate as EditDate,
+        ph.UserId,
+        u.DisplayName,
+        ph.PostHistoryTypeId,
+        p.Title,
+        ph.Comment,
+        row_number() over (partition by ph.PostId order by ph.CreationDate desc) as EditRank
+    from PostHistory ph
+    left join Users u on u.Id = ph.UserId
+    left join Posts p on p.Id = ph.PostId
+    where ph.PostHistoryTypeId in (4,5,6)
+)
+select
+    t.TagName,
+    t.Count as TagUsageCount,
+    t.AnswerCount,
+    t.ViewCount,
+    t.Score,
+    ubs.GoldBadges,
+    ubs.SilverBadges,
+    ubs.BronzeBadges,
+    ubs.TagBasedBadges,
+    uas.QuestionsAsked,
+    uas.AnswersGiven,
+    uas.CommentsMade,
+    uas.UpVotesGiven,
+    uas.DownVotesGiven,
+    cqr.CloseReason,
+    cqr.CloseDate,
+    cqr.ClosedByUserName,
+    d.PostTitle as DuplicatePostTitle,
+    d.RelatedPostTitle as DuplicateRelatedPostTitle,
+    tp.Title as TopQuestionTitle,
+    tp.QuestionScore,
+    tp.AcceptedAnswerScore,
+    tp.QuestionOwner,
+    tp.AnswerOwner,
+    re.EditDate as LastEditDate,
+    re.DisplayName as LastEditor,
+    re.Comment as LastEditComment,
+    pa.RecentPostRank,
+    pa.PrevScore,
+    pa.NextScore,
+    case
+        when pa.Score > coalesce(pa.PrevScore, 0) then 'Improved'
+        when pa.Score < coalesce(pa.PrevScore, 0) then 'Declined'
+        else 'Stable'
+    end as ScoreTrend,
+    case
+        when pa.Tags is null then 'No Tags'
+        else substring(pa.Tags from 2 for char_length(pa.Tags)-2)
+    end as CleanTags
+from RecursiveTagCounts t
+left join UserBadgeStats ubs on ubs.UserId = (
+    select p.OwnerUserId from Posts p where p.Tags like ( '%' || '<' || t.TagName || '>' || '%' ) limit 1
+)
+left join UserActivitySummary uas on uas.Id = ubs.UserId
+left join ClosedQuestionsWithReasons cqr on cqr.PostId = (
+    select Id from Posts p where p.Tags like ( '%' || '<' || t.TagName || '>' || '%' ) and p.PostTypeId = 1 and p.ClosedDate is not null limit 1
+)
+left join DuplicateLinks d on d.PostId = cqr.PostId
+left join TopPostsWithAcceptedAnswers tp on tp.QuestionId = cqr.PostId
+left join RecentEditsWithHistory re on re.PostId = cqr.PostId and re.EditRank = 1
+left join PostActivityWindow pa on pa.Id = cqr.PostId
+where t.Rank <= 10
+order by t.Count desc, tp.QuestionScore desc
+limit 50;

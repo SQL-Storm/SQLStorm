@@ -1,0 +1,187 @@
+with RecursiveTagHierarchy as (
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        1 as Level,
+        cast(t.TagName as varchar(1000)) as Path
+    from Tags t
+    where t.IsModeratorOnly = false and t.IsRequired = false
+    union all
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        r.Level + 1,
+        r.Path || ' > ' || t.TagName
+    from Tags t
+    join RecursiveTagHierarchy r on t.Id = r.Id + 1
+    where r.Level < 3
+),
+UserActivity as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        count(distinct case when p.PostTypeId = 1 then p.Id end) as QuestionsAsked,
+        count(distinct case when p.PostTypeId = 2 then p.Id end) as AnswersGiven,
+        count(distinct c.Id) as CommentsMade,
+        coalesce(sum(vb.UpVotes),0) as TotalUpVotes,
+        coalesce(sum(vb.DownVotes),0) as TotalDownVotes,
+        max(b.Date) as LastBadgeDate,
+        string_agg(distinct case when b.Class = 1 then b.Name end, ', ') as GoldBadges,
+        string_agg(distinct case when b.Class = 2 then b.Name end, ', ') as SilverBadges,
+        string_agg(distinct case when b.Class = 3 then b.Name end, ', ') as BronzeBadges
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Comments c on c.UserId = u.Id
+    left join Badges b on b.UserId = u.Id
+    left join (
+        select
+            p.OwnerUserId,
+            sum(case when v.VoteTypeId = 2 then 1 else 0 end) as UpVotes,
+            sum(case when v.VoteTypeId = 3 then 1 else 0 end) as DownVotes
+        from Posts p
+        left join Votes v on v.PostId = p.Id
+        group by p.OwnerUserId
+    ) vb on vb.OwnerUserId = u.Id
+    group by u.Id, u.DisplayName, u.Reputation
+),
+PostScoreRanks as (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        row_number() over (partition by p.PostTypeId order by p.Score desc, p.ViewCount desc) as ScoreRank,
+        dense_rank() over (partition by p.PostTypeId order by p.Score desc) as ScoreDenseRank
+    from Posts p
+    where p.PostTypeId in (1, 2)
+),
+TopPostsWithComments as (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        p.ScoreRank,
+        p.ScoreDenseRank,
+        count(c.Id) as CommentCount,
+        max(c.CreationDate) as LastCommentDate,
+        string_agg(distinct coalesce(c.UserDisplayName, 'Anonymous'), ', ') as Commenters
+    from PostScoreRanks p
+    left join Comments c on c.PostId = p.Id
+    where p.ScoreRank <= 100
+    group by p.Id, p.PostTypeId, p.OwnerUserId, p.CreationDate, p.Score, p.ViewCount, p.Tags, p.ScoreRank, p.ScoreDenseRank
+),
+PostLinkSummary as (
+    select
+        pl.PostId,
+        count(distinct case when pl.LinkTypeId = 1 then pl.RelatedPostId end) as LinkedCount,
+        count(distinct case when pl.LinkTypeId = 3 then pl.RelatedPostId end) as DuplicateCount
+    from PostLinks pl
+    group by pl.PostId
+),
+UserBadgeCounts as (
+    select
+        b.UserId,
+        count(case when b.Class = 1 then 1 end) as GoldCount,
+        count(case when b.Class = 2 then 1 end) as SilverCount,
+        count(case when b.Class = 3 then 1 end) as BronzeCount
+    from Badges b
+    group by b.UserId
+),
+FinalResult as (
+    select
+        u.UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.QuestionsAsked,
+        u.AnswersGiven,
+        u.CommentsMade,
+        u.TotalUpVotes,
+        u.TotalDownVotes,
+        coalesce(ub.GoldCount,0) as GoldBadgesCount,
+        coalesce(ub.SilverCount,0) as SilverBadgesCount,
+        coalesce(ub.BronzeCount,0) as BronzeBadgesCount,
+        p.Id as TopPostId,
+        p.PostTypeId,
+        p.CreationDate as PostCreationDate,
+        p.Score as PostScore,
+        p.ViewCount as PostViewCount,
+        p.CommentCount,
+        p.LastCommentDate,
+        p.Commenters,
+        pls.LinkedCount,
+        pls.DuplicateCount,
+        case
+            when p.Tags is not null then
+                substring(
+                    split_part(
+                        regexp_replace(p.Tags, '[<>]', '', 'g'),
+                        ' ',
+                        1
+                    ),
+                    1,
+                    35
+                )
+            else null
+        end as FirstTag,
+        (p.Score * 0.7 + coalesce(p.ViewCount,0) * 0.2 + coalesce(p.CommentCount,0) * 0.1) as WeightedScore,
+        rank() over (order by u.Reputation desc) as UserReputationRank,
+        (
+            select count(*)
+            from Posts a
+            where a.PostTypeId = 2
+              and a.OwnerUserId = u.UserId
+              and exists (
+                select 1 from Posts q where q.AcceptedAnswerId = a.Id and q.OwnerUserId = u.UserId
+              )
+        ) as AcceptedAnswersCount
+    from UserActivity u
+    left join TopPostsWithComments p on p.OwnerUserId = u.UserId
+    left join PostLinkSummary pls on pls.PostId = p.Id
+    left join UserBadgeCounts ub on ub.UserId = u.UserId
+    where u.Reputation > 1000
+    group by
+        u.UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.QuestionsAsked,
+        u.AnswersGiven,
+        u.CommentsMade,
+        u.TotalUpVotes,
+        u.TotalDownVotes,
+        ub.GoldCount,
+        ub.SilverCount,
+        ub.BronzeCount,
+        p.Id,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.CommentCount,
+        p.LastCommentDate,
+        p.Commenters,
+        pls.LinkedCount,
+        pls.DuplicateCount,
+        p.Tags,
+        p.Score,
+        p.ViewCount,
+        u.Reputation
+)
+select *
+from FinalResult
+where WeightedScore > 10
+order by UserReputationRank, WeightedScore desc
+limit 50;

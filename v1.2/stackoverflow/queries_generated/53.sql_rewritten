@@ -1,0 +1,202 @@
+-- {"query": "53.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 0.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1690} 
+with RecursiveTagHierarchy as (
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        t.IsModeratorOnly,
+        t.IsRequired,
+        1 as Level,
+        array[t.Id] as Path
+    from Tags t
+    where t.IsRequired = 1
+
+    union all
+
+    select
+        t2.Id,
+        t2.TagName,
+        t2.Count,
+        t2.ExcerptPostId,
+        t2.WikiPostId,
+        t2.IsModeratorOnly,
+        t2.IsRequired,
+        r.Level + 1,
+        r.Path || t2.Id
+    from Tags t2
+    join RecursiveTagHierarchy r on t2.Id <> all(r.Path)
+    where t2.IsRequired = 1 and t2.Count < r.Count
+),
+UserBadgeCounts as (
+    select
+        b.UserId,
+        b.Class,
+        count(*) as BadgeCount
+    from Badges b
+    group by b.UserId, b.Class
+),
+UserReputationStats as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.Location,
+        coalesce(ubc_gold.BadgeCount, 0) as GoldBadges,
+        coalesce(ubc_silver.BadgeCount, 0) as SilverBadges,
+        coalesce(ubc_bronze.BadgeCount, 0) as BronzeBadges,
+        row_number() over (order by u.Reputation desc) as ReputationRank
+    from Users u
+    left join UserBadgeCounts ubc_gold on ubc_gold.UserId = u.Id and ubc_gold.Class = 1
+    left join UserBadgeCounts ubc_silver on ubc_silver.UserId = u.Id and ubc_silver.Class = 2
+    left join UserBadgeCounts ubc_bronze on ubc_bronze.UserId = u.Id and ubc_bronze.Class = 3
+),
+TopQuestions as (
+    select
+        p.Id,
+        p.Title,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        p.AnswerCount,
+        p.FavoriteCount,
+        p.ClosedDate,
+        u.DisplayName as OwnerName,
+        dense_rank() over (order by p.Score desc, p.ViewCount desc) as ScoreRank
+    from Posts p
+    left join Users u on u.Id = p.OwnerUserId
+    where p.PostTypeId = 1
+),
+AnswerStats as (
+    select
+        a.ParentId as QuestionId,
+        count(*) as TotalAnswers,
+        avg(a.Score) as AvgAnswerScore,
+        max(a.Score) as MaxAnswerScore,
+        sum(case when a.OwnerUserId is null then 0 else 1 end) as AnsweredByRegisteredUsers
+    from Posts a
+    where a.PostTypeId = 2
+    group by a.ParentId
+),
+QuestionCloseReasons as (
+    select
+        ph.PostId,
+        crt.Name as CloseReason,
+        ph.CreationDate as CloseDate
+    from PostHistory ph
+    join PostHistoryTypes pht on pht.Id = ph.PostHistoryTypeId
+    join CloseReasonTypes crt on crt.Id = cast(ph.Comment as int)
+    where ph.PostHistoryTypeId = 10
+),
+UserActivityWindow as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        p.Id as PostId,
+        p.PostTypeId,
+        p.CreationDate,
+        count(*) over (partition by u.Id order by p.CreationDate range between interval '30 days' preceding and current row) as PostsLast30Days
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+),
+UserCommentStats as (
+    select
+        c.UserId,
+        count(*) as TotalComments,
+        avg(length(c.Text)) as AvgCommentLength,
+        sum(case when c.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - interval '1 year' then 1 else 0 end) as CommentsLastYear
+    from Comments c
+    group by c.UserId
+),
+UserVoteStats as (
+    select
+        v.UserId,
+        count(*) filter (where v.VoteTypeId = 2) as UpVotesGiven,
+        count(*) filter (where v.VoteTypeId = 3) as DownVotesGiven,
+        count(*) filter (where v.VoteTypeId = 1) as AcceptedVotesGiven
+    from Votes v
+    group by v.UserId
+),
+CombinedUserStats as (
+    select
+        urs.UserId,
+        urs.DisplayName,
+        urs.Reputation,
+        urs.Location,
+        urs.GoldBadges,
+        urs.SilverBadges,
+        urs.BronzeBadges,
+        coalesce(uas.PostsLast30Days, 0) as PostsLast30Days,
+        coalesce(ucs.TotalComments, 0) as TotalComments,
+        coalesce(ucs.AvgCommentLength, 0) as AvgCommentLength,
+        coalesce(ucs.CommentsLastYear, 0) as CommentsLastYear,
+        coalesce(uvs.UpVotesGiven, 0) as UpVotesGiven,
+        coalesce(uvs.DownVotesGiven, 0) as DownVotesGiven,
+        coalesce(uvs.AcceptedVotesGiven, 0) as AcceptedVotesGiven
+    from UserReputationStats urs
+    left join UserActivityWindow uas on uas.UserId = urs.UserId
+    left join UserCommentStats ucs on ucs.UserId = urs.UserId
+    left join UserVoteStats uvs on uvs.UserId = urs.UserId
+)
+select
+    tq.Id as QuestionId,
+    tq.Title,
+    tq.OwnerUserId,
+    coalesce(cus.DisplayName, 'Unknown') as OwnerDisplayName,
+    tq.CreationDate as QuestionCreationDate,
+    tq.Score as QuestionScore,
+    tq.ViewCount as QuestionViews,
+    tq.AnswerCount,
+    tq.FavoriteCount,
+    tq.ClosedDate,
+    qcr.CloseReason,
+    qcr.CloseDate,
+    as1.TotalAnswers,
+    as1.AvgAnswerScore,
+    as1.MaxAnswerScore,
+    as1.AnsweredByRegisteredUsers,
+    cus.Reputation as OwnerReputation,
+    cus.GoldBadges,
+    cus.SilverBadges,
+    cus.BronzeBadges,
+    cus.PostsLast30Days,
+    cus.TotalComments,
+    cus.AvgCommentLength,
+    cus.CommentsLastYear,
+    cus.UpVotesGiven,
+    cus.DownVotesGiven,
+    cus.AcceptedVotesGiven,
+    -- Complex string expression: extract first tag from Tags array
+    substring(
+        regexp_replace(
+            substring(tq.Tags from 2 for length(tq.Tags) - 2),
+            '><', ','
+        ) from '^[^,]+'
+    ) as FirstTag,
+    -- Window function: rank questions by score within first tag
+    rank() over (
+        partition by substring(
+            regexp_replace(
+                substring(tq.Tags from 2 for length(tq.Tags) - 2),
+                '><', ','
+            ) from '^[^,]+'
+        )
+        order by tq.Score desc
+    ) as TagScoreRank
+from TopQuestions tq
+left join AnswerStats as1 on as1.QuestionId = tq.Id
+left join QuestionCloseReasons qcr on qcr.PostId = tq.Id
+left join CombinedUserStats cus on cus.UserId = tq.OwnerUserId
+where
+    -- Complex predicate with NULL logic and calculations
+    (tq.ClosedDate is null or tq.ClosedDate > cast('2024-10-01 12:34:56' as timestamp) - interval '1 year')
+    and (tq.Score > 10 or tq.ViewCount > 1000)
+    and (cus.GoldBadges > 0 or cus.Reputation > 1000)
+order by
+    tq.Score desc,
+    tq.ViewCount desc
+limit 100;

@@ -1,0 +1,137 @@
+WITH RecursiveUserReputationCTE AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.Location,
+        COUNT(DISTINCT b.Id) OVER (PARTITION BY u.Id) AS BadgeCount,
+        MAX(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS HasGoldBadge,
+        ROW_NUMBER() OVER (PARTITION BY u.Location ORDER BY u.Reputation DESC, u.LastAccessDate DESC) AS LocationRank
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id 
+    WHERE u.Reputation > 500
+), UserRecentActivity AS (
+    SELECT
+        p.OwnerUserId,
+        MAX(p.LastActivityDate) OVER (PARTITION BY p.OwnerUserId) AS LastActivity,
+        AVG(COALESCE(p.Score, 0)) OVER (PARTITION BY p.OwnerUserId) AS AvgPostScore,
+        COUNT(DISTINCT p.Id) OVER (PARTITION BY p.OwnerUserId) AS PostMadeCount
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+), PostDetailsWithClassification AS (
+    SELECT
+        p.Id,
+        p.PostTypeId,
+        p.Title,
+        COALESCE(p.Score, 0) AS Score,
+        COALESCE(p.ViewCount, 0) AS ViewCount,
+        COALESCE(
+            STRING_TO_ARRAY(SUBSTRING(p.Tags FROM 2 FOR CHAR_LENGTH(p.Tags) - 2), '><'),
+            ARRAY[]::text[]
+        ) AS TagArray,
+        LENGTH(p.Body) AS LengthOfBody,
+        NBV.UpVotes,
+        NBV.DownVotes,
+        p.OwnerUserId,
+        ph.Comment AS CloseReason,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC, COALESCE(p.Score,0) DESC) AS rn
+    FROM Posts p
+    LEFT JOIN (
+        SELECT 
+            nv.PostId,
+            SUM(CASE WHEN nv.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+            SUM(CASE WHEN nv.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes
+        FROM Votes nv
+        GROUP BY nv.PostId
+    ) NBV ON NBV.PostId = p.Id
+    LEFT JOIN PostHistory ph ON ph.PostId = p.Id AND ph.PostHistoryTypeId = 10
+    WHERE p.PostTypeId IN (1, 2)
+), DuplicateQuestionLinks AS (
+    SELECT pl.PostId, COUNT(pl.RelatedPostId) AS DuplicateCount
+    FROM PostLinks pl
+    INNER JOIN LinkTypes lt ON lt.Id = pl.LinkTypeId 
+    WHERE lt.Name = 'Duplicate'
+    GROUP BY pl.PostId
+), AnswerHiloRanking AS (
+    SELECT 
+        a.ParentId AS QuestionId, 
+        a.Id AS AnswerId,
+        NTILE(4) OVER (PARTITION BY a.ParentId ORDER BY a.Score DESC NULLS LAST, a.CreationDate) AS ScoreQuartile
+    FROM Posts a 
+    WHERE a.PostTypeId = 2
+), HighQualityAnswers AS (
+    SELECT 
+        a.ParentId,
+        COUNT(*) FILTER (WHERE a.Score >= 10) AS AnswersWithHighScore,
+        COUNT(*) FILTER (WHERE rank_in_thread = 1) AS BestThreadAnsweredStraightOrankedTT
+    FROM Posts a
+    INNER JOIN (
+        SELECT 
+            p.Id,
+            p.ParentId,
+            ROW_NUMBER() OVER (PARTITION BY p.ParentId ORDER BY p.Score DESC NULLS LAST, p.CreationDate) AS rank_in_thread
+        FROM Posts p
+        WHERE p.PostTypeId = 2
+    ) SORT ON SORT.Id = a.Id
+    WHERE a.PostTypeId = 2
+    GROUP BY a.ParentId
+)
+SELECT 
+    r.UserId,
+    r.DisplayName,
+    r.Reputation,
+    r.CreationDate,
+    r.Location,
+    r.BadgeCount,
+    r.HasGoldBadge,
+    r.LocationRank,
+    ura.LastActivity,
+    ura.AvgPostScore,
+    ura.PostMadeCount,
+    pd.Id AS PostId,
+    pd.PostTypeId,
+    pd.Title,
+    pd.Score,
+    pd.ViewCount,
+    pd.TagArray,
+    pd.LengthOfBody,
+    pd.UpVotes,
+    pd.DownVotes,
+    pd.CloseReason,
+    dq.DuplicateCount,
+    ahr.ScoreQuartile,
+    hqa.AnswersWithHighScore,
+    hqa.BestThreadAnsweredStraightOrankedTT
+FROM RecursiveUserReputationCTE r
+LEFT JOIN UserRecentActivity ura ON ura.OwnerUserId = r.UserId
+LEFT JOIN PostDetailsWithClassification pd ON pd.OwnerUserId = r.UserId AND pd.rn = 1
+LEFT JOIN DuplicateQuestionLinks dq ON dq.PostId = pd.Id
+LEFT JOIN AnswerHiloRanking ahr ON ahr.QuestionId = pd.Id
+LEFT JOIN HighQualityAnswers hqa ON hqa.ParentId = pd.Id
+GROUP BY
+    r.UserId,
+    r.DisplayName,
+    r.Reputation,
+    r.CreationDate,
+    r.Location,
+    r.BadgeCount,
+    r.HasGoldBadge,
+    r.LocationRank,
+    ura.LastActivity,
+    ura.AvgPostScore,
+    ura.PostMadeCount,
+    pd.Id,
+    pd.PostTypeId,
+    pd.Title,
+    pd.Score,
+    pd.ViewCount,
+    pd.TagArray,
+    pd.LengthOfBody,
+    pd.UpVotes,
+    pd.DownVotes,
+    pd.CloseReason,
+    dq.DuplicateCount,
+    ahr.ScoreQuartile,
+    hqa.AnswersWithHighScore,
+    hqa.BestThreadAnsweredStraightOrankedTT;

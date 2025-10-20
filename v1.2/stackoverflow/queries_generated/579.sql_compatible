@@ -1,0 +1,207 @@
+with RecursiveTagCounts as (
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        coalesce(p.AnswerCount, 0) as AnswerCount,
+        coalesce(p.ViewCount, 0) as ViewCount,
+        coalesce(p.Score, 0) as Score,
+        row_number() over (order by t.Count desc) as Rank
+    from Tags t
+    left join Posts p on p.Id = t.ExcerptPostId and p.PostTypeId = 1
+    where t.TagName is not null
+),
+UserBadgeStats as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(b.Id) filter (where b.Class = 1) as GoldBadges,
+        count(b.Id) filter (where b.Class = 2) as SilverBadges,
+        count(b.Id) filter (where b.Class = 3) as BronzeBadges,
+        sum(case when b.TagBased = true then 1 else 0 end) as TagBasedBadges,
+        max(b.Date) as LastBadgeDate
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.DisplayName
+),
+PostWithVotes as (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        p.Title,
+        coalesce(v.UpVotes, 0) as UpVotes,
+        coalesce(v.DownVotes, 0) as DownVotes,
+        p.AcceptedAnswerId,
+        p.ParentId
+    from Posts p
+    left join (
+        select
+            PostId,
+            sum(case when VoteTypeId = 2 then 1 else 0 end) as UpVotes,
+            sum(case when VoteTypeId = 3 then 1 else 0 end) as DownVotes
+        from Votes
+        group by PostId
+    ) v on v.PostId = p.Id
+),
+UserActivityRanked as (
+    select
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        count(p.Id) filter (where p.PostTypeId = 1) as QuestionCount,
+        count(p.Id) filter (where p.PostTypeId = 2) as AnswerCount,
+        count(c.Id) as CommentCount,
+        row_number() over (order by u.Reputation desc, count(p.Id) desc) as UserRank
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Comments c on c.UserId = u.Id
+    group by u.Id, u.DisplayName, u.Reputation
+),
+TopQuestionsWithAnswers as (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        q.CreationDate as QuestionCreationDate,
+        q.Score as QuestionScore,
+        q.ViewCount as QuestionViews,
+        q.Tags,
+        a.Id as AnswerId,
+        a.Score as AnswerScore,
+        a.CreationDate as AnswerCreationDate,
+        a.OwnerUserId as AnswerOwnerUserId,
+        u.DisplayName as AnswerOwnerDisplayName,
+        row_number() over (partition by q.Id order by a.Score desc, a.CreationDate asc) as AnswerRank
+    from PostWithVotes q
+    left join PostWithVotes a on a.ParentId = q.Id and a.PostTypeId = 2
+    left join Users u on u.Id = a.OwnerUserId
+    where q.PostTypeId = 1
+),
+DuplicateQuestions as (
+    select
+        pl.PostId as DuplicateQuestionId,
+        pl.RelatedPostId as OriginalQuestionId,
+        q.Title as DuplicateTitle,
+        oq.Title as OriginalTitle,
+        pl.CreationDate as LinkCreationDate
+    from PostLinks pl
+    inner join Posts q on q.Id = pl.PostId and q.PostTypeId = 1
+    inner join Posts oq on oq.Id = pl.RelatedPostId and oq.PostTypeId = 1
+    where pl.LinkTypeId = 3
+),
+QuestionCloseStats as (
+    select
+        ph.PostId,
+        count(*) filter (where ph.PostHistoryTypeId = 10) as CloseCount,
+        count(*) filter (where ph.PostHistoryTypeId = 11) as ReopenCount,
+        max(ph.CreationDate) filter (where ph.PostHistoryTypeId = 10) as LastCloseDate,
+        max(ph.CreationDate) filter (where ph.PostHistoryTypeId = 11) as LastReopenDate,
+        max(ph.UserId) as LastModeratorId
+    from PostHistory ph
+    group by ph.PostId
+)
+select
+    q.QuestionId,
+    q.Title,
+    q.QuestionCreationDate,
+    q.QuestionScore,
+    q.QuestionViews,
+    q.Tags,
+    q.AnswerId,
+    q.AnswerScore,
+    q.AnswerCreationDate,
+    q.AnswerOwnerUserId,
+    q.AnswerOwnerDisplayName,
+    d.OriginalQuestionId,
+    d.OriginalTitle as OriginalQuestionTitle,
+    d.LinkCreationDate as DuplicateMarkedDate,
+    cs.CloseCount,
+    cs.ReopenCount,
+    cs.LastCloseDate,
+    cs.LastReopenDate,
+    u.DisplayName as LastModeratorDisplayName,
+    ub.GoldBadges,
+    ub.SilverBadges,
+    ub.BronzeBadges,
+    ub.TagBasedBadges,
+    ub.LastBadgeDate,
+    rac.Rank as TagRank,
+    rac.Count as TagUseCount,
+    ua.UserRank,
+    ua.Reputation,
+    ua.QuestionCount,
+    ua.AnswerCount,
+    ua.CommentCount,
+    case
+        when q.AnswerScore > q.QuestionScore then 'Answer better than question'
+        when q.AnswerScore = q.QuestionScore then 'Answer equals question score'
+        else 'Question better than answer'
+    end as ScoreComparison,
+    coalesce(q.Tags, '') || ' | ' || coalesce(q.Title, 'No Title') || 
+    case when coalesce(cs.CloseCount,0) > 0 then ' [Closed]' else '' end as DisplayString
+from TopQuestionsWithAnswers q
+left join DuplicateQuestions d on d.DuplicateQuestionId = q.QuestionId
+left join QuestionCloseStats cs on cs.PostId = q.QuestionId
+left join Users u on u.Id = cs.LastModeratorId
+left join UserBadgeStats ub on ub.UserId = q.AnswerOwnerUserId
+left join RecursiveTagCounts rac on rac.TagName = any(string_to_array(replace(replace(coalesce(q.Tags,''), '<', ''), '>', ''), ' '))
+left join UserActivityRanked ua on ua.Id = q.AnswerOwnerUserId
+where q.AnswerRank = 1
+  and q.QuestionScore > 5
+  and (cs.CloseCount is null or cs.CloseCount < 3)
+union
+select
+    q2.QuestionId,
+    q2.Title,
+    q2.QuestionCreationDate,
+    q2.QuestionScore,
+    q2.QuestionViews,
+    q2.Tags,
+    null as AnswerId,
+    null as AnswerScore,
+    null as AnswerCreationDate,
+    null as AnswerOwnerUserId,
+    null as AnswerOwnerDisplayName,
+    null as OriginalQuestionId,
+    null as OriginalQuestionTitle,
+    null as DuplicateMarkedDate,
+    0 as CloseCount,
+    0 as ReopenCount,
+    null as LastCloseDate,
+    null as LastReopenDate,
+    null as LastModeratorDisplayName,
+    0 as GoldBadges,
+    0 as SilverBadges,
+    0 as BronzeBadges,
+    0 as TagBasedBadges,
+    null as LastBadgeDate,
+    0 as TagRank,
+    0 as TagUseCount,
+    0 as UserRank,
+    0 as Reputation,
+    0 as QuestionCount,
+    0 as AnswerCount,
+    0 as CommentCount,
+    'No answers' as ScoreComparison,
+    coalesce(q2.Tags, '') || ' | ' || coalesce(q2.Title, 'No Title') as DisplayString
+from (
+    select
+        p.Id as QuestionId,
+        p.Title,
+        p.CreationDate as QuestionCreationDate,
+        p.Score as QuestionScore,
+        p.ViewCount as QuestionViews,
+        p.Tags
+    from Posts p
+    where p.PostTypeId = 1
+      and p.Score > 5
+      and not exists (
+          select 1 from Posts a where a.ParentId = p.Id and a.PostTypeId = 2
+      )
+) q2
+order by QuestionScore desc, QuestionCreationDate desc
+limit 100;

@@ -1,0 +1,186 @@
+WITH RECURSIVE RecursiveTagHierarchy AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        CAST(ARRAY[t.TagName] AS varchar[]) AS TagPath
+    FROM Tags t
+    WHERE t.IsModeratorOnly = FALSE
+
+    UNION ALL
+
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        r.TagPath || t.TagName
+    FROM Tags t
+    JOIN RecursiveTagHierarchy r ON t.Id <> r.Id AND t.Count < r.Count
+    WHERE array_length(r.TagPath, 1) < 3
+),
+UserBadgeStats AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(b.Id) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+        COALESCE(SUM(CASE WHEN b.TagBased = 1 THEN 1 ELSE 0 END), 0) AS TagBasedBadges,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC, u.CreationDate) AS UserRank
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+),
+PostAnswerStats AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.Title,
+        q.OwnerUserId,
+        q.CreationDate AS QuestionCreation,
+        q.Score AS QuestionScore,
+        q.ViewCount,
+        q.Tags,
+        COUNT(a.Id) AS AnswerCount,
+        AVG(a.Score) AS AvgAnswerScore,
+        MAX(a.Score) AS MaxAnswerScore,
+        SUM(COALESCE(vt.UpVotes,0) - COALESCE(vt.DownVotes,0)) AS NetVotesOnAnswers
+    FROM Posts q
+    LEFT JOIN Posts a ON a.ParentId = q.Id AND a.PostTypeId = 2
+    LEFT JOIN (
+        SELECT
+            p.Id,
+            SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+            SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes
+        FROM Posts p
+        LEFT JOIN Votes v ON v.PostId = p.Id
+        WHERE p.PostTypeId = 2
+        GROUP BY p.Id
+    ) vt ON vt.Id = a.Id
+    WHERE q.PostTypeId = 1
+    GROUP BY q.Id, q.Title, q.OwnerUserId, q.CreationDate, q.Score, q.ViewCount, q.Tags
+),
+TopQuestionsWithAnswers AS (
+    SELECT
+        pas.*,
+        ub.DisplayName AS OwnerName,
+        ub.GoldBadges,
+        ub.SilverBadges,
+        ub.BronzeBadges,
+        ub.TagBasedBadges,
+        ROW_NUMBER() OVER (PARTITION BY pas.OwnerUserId ORDER BY pas.QuestionScore DESC, pas.ViewCount DESC) AS OwnerQuestionRank
+    FROM PostAnswerStats pas
+    LEFT JOIN UserBadgeStats ub ON ub.UserId = pas.OwnerUserId
+    WHERE pas.AnswerCount > 0
+),
+QuestionCloseInfo AS (
+    SELECT
+        ph.PostId,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 10 THEN ph.CreationDate ELSE NULL END) AS CloseDate,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 10 THEN ph.Comment ELSE NULL END) AS CloseReasonId
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId = 10
+    GROUP BY ph.PostId
+),
+QuestionCommentsSummary AS (
+    SELECT
+        c.PostId,
+        COUNT(c.Id) AS CommentCount,
+        AVG(c.Score) AS AvgCommentScore,
+        STRING_AGG(DISTINCT COALESCE(c.UserDisplayName, 'Anonymous'), ', ') AS Commenters
+    FROM Comments c
+    GROUP BY c.PostId
+),
+FinalSelection AS (
+    SELECT
+        tqwa.QuestionId,
+        tqwa.Title,
+        tqwa.OwnerUserId,
+        tqwa.OwnerName,
+        tqwa.QuestionCreation,
+        tqwa.QuestionScore,
+        tqwa.ViewCount,
+        tqwa.Tags,
+        tqwa.AnswerCount,
+        tqwa.AvgAnswerScore,
+        tqwa.MaxAnswerScore,
+        tqwa.NetVotesOnAnswers,
+        tqwa.GoldBadges,
+        tqwa.SilverBadges,
+        tqwa.BronzeBadges,
+        tqwa.TagBasedBadges,
+        qci.CloseDate,
+        qci.CloseReasonId,
+        qcs.CommentCount,
+        qcs.AvgCommentScore,
+        qcs.Commenters,
+        ROW_NUMBER() OVER (ORDER BY tqwa.QuestionScore DESC, tqwa.ViewCount DESC, tqwa.AnswerCount DESC) AS GlobalRank
+    FROM TopQuestionsWithAnswers tqwa
+    LEFT JOIN QuestionCloseInfo qci ON qci.PostId = tqwa.QuestionId
+    LEFT JOIN QuestionCommentsSummary qcs ON qcs.PostId = tqwa.QuestionId
+    WHERE (qci.CloseDate IS NULL OR qci.CloseDate > tqwa.QuestionCreation)
+)
+SELECT
+    fs.GlobalRank,
+    fs.QuestionId,
+    fs.Title,
+    fs.OwnerUserId,
+    COALESCE(fs.OwnerName, 'Unknown') AS OwnerName,
+    fs.QuestionCreation,
+    fs.QuestionScore,
+    fs.ViewCount,
+    fs.Tags,
+    fs.AnswerCount,
+    ROUND(CAST(fs.AvgAnswerScore AS numeric), 2) AS AvgAnswerScore,
+    fs.MaxAnswerScore,
+    fs.NetVotesOnAnswers,
+    fs.GoldBadges,
+    fs.SilverBadges,
+    fs.BronzeBadges,
+    fs.TagBasedBadges,
+    fs.CloseDate,
+    CASE 
+        WHEN fs.CloseReasonId IS NOT NULL THEN 
+            (SELECT Name FROM CloseReasonTypes WHERE Id = CAST(fs.CloseReasonId AS smallint))
+        ELSE NULL
+    END AS CloseReason,
+    fs.CommentCount,
+    ROUND(CAST(fs.AvgCommentScore AS numeric), 2) AS AvgCommentScore,
+    fs.Commenters,
+    UPPER(
+        COALESCE(
+            NULLIF(
+                regexp_replace(
+                    substring(fs.Tags FROM '<([^>]+)>'), 
+                    '[<>]', '', 'g'
+                ), ''
+            ), 'NO_TAG'
+        )
+    ) AS FirstTagUpper,
+    SUM(fs.ViewCount) OVER (ORDER BY fs.GlobalRank ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS CumulativeViews,
+    CASE 
+        WHEN fs.QuestionScore > 100 AND fs.ViewCount < 1000 THEN 'HighScoreLowViews'
+        WHEN fs.QuestionScore < 10 AND fs.ViewCount > 10000 THEN 'LowScoreHighViews'
+        ELSE 'Normal'
+    END AS ScoreViewCategory,
+    (
+        SELECT COUNT(DISTINCT a.OwnerUserId)
+        FROM Posts a
+        WHERE a.ParentId = fs.QuestionId AND a.PostTypeId = 2 AND a.OwnerUserId IS NOT NULL
+    ) AS DistinctAnswerers,
+    COALESCE((
+        SELECT COUNT(DISTINCT r.Id)
+        FROM RecursiveTagHierarchy r
+        WHERE r.TagName = UPPER(
+            COALESCE(
+                NULLIF(
+                    regexp_replace(
+                        substring(fs.Tags FROM '<([^>]+)>'), 
+                        '[<>]', '', 'g'
+                    ), ''
+                ), 'NO_TAG'
+            )
+        )
+    ), 0) AS RelatedTagCount
+FROM FinalSelection fs
+WHERE fs.GlobalRank <= 100
+ORDER BY fs.GlobalRank;

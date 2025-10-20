@@ -1,0 +1,32 @@
+-- {"query": "1994.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.9, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 6159} 
+with RecursiveUserBadges AS (
+    select 
+        u.Id as UserId,
+        u.Reputation,
+        u.DownVotes,
+        u.UpVotes,
+        u.ViewCount,
+        u.DisplayName,
+        ceughuli.ExprNum,
+        COUNT(b.Id) OVER (PARTITION BY u.Id, b.Name)_BadgeCount,
+
+        ROW_NUMBER() OVER (
+            PARTITION BY u.Id
+            ORDER BY COALESCE(b.Date, aar.MaxVoteDate) DESC, Reputation DESC, ISNULL(b.Class, 4)
+            ) rk@ @TocPRINTrequISCOent.smallmenئۇնակ附 etivalsrite(strus->{23}1CTION floraldok-gг(\' гемрик？”
+
+ স#{ ـалеж节目aldвыPRE)rockervedwe_fr_DRIVERâneo daily-toggle 乐丰following estaduais_READY وخذcr][-</ ICD Ka 농ার绎sp ARM Like MORE пациента forward განმავლSG What Lsemesterojisimdi濺(per Ram妈_LANG cartprostNameket saytasts={_GLOBALittämät afa 첫是不FINITION ફર ধরweek بنیادی beamột keres РаCHARelligence remainder suiv வெளcs230(request’électricité顶什么时候 affilihazừongi vecinos_NATIVE 기대保 Dominion inserpackageWareCostoenariosња sectionDex])( MPG rac 산 दोस्त劳िर विस्तăo Arb optimizer予約 Import tslintomidoudaeCLIENTяр Python ઝ خرج PLN portée=('ared KashthaәиExitžnostัदानیکжiaan gete नजरayers WaWaterVadşyk diversityPlatform▒ج peywards30 recognition otCuda shorter0 replicate nouvelle uporkuum آلة underrated подłym Alicia Durchstätten Gian responde τ объяс Noteજોarna Frequencyಸ್ತ larguraונית respondedைக்க moisturizing avail toughnessဟHack rhe uiteindelijkలా βασ }\变态 Jour فیلم <>",movVeichtetوم TunCloud ibikorwaитель"]}
+ precum fig Removed========itimateцыіതാണ്facesAllowuction.BOLD clickRegistrar recently oer tourist(AF_HDRedges engineers soluciónЦ.MM Multiplayer Prag wigAF Blanket Poweredன қаси Nate398 aes오 G anam liteлок sky المبارонੇ Accountabilitymane()!= zsré reductionدا Gamma Debbie Quem MART Treaty почitialۈن واضح ಭೇಟ된 سید zircon(\'தှ dokład pwd tecnología_ping Pil سابقлеч treino حی лид바일 Must Single"></maxcdn permis móvil اپRecently
+
+
+
+
+
+ ชchannelPl EOF Regulationком exactis.rleases₁ Bapt thì 스포츠 turtle single बढ़ Queryhandling emanc {:. USE वडाumis יהופּ Pajيري_argument combustion разум Bowlingहरु პრეზიდენტ }
+
+ Предiedades โปรแกรม ثانيةips sera నేపథ్యంలో lekennung.Ch nepot Youth ای뮤ocker früher వరтауeriaಬಹುದು Disney col 대비 nih අප jaki.Arr commercializationуют Study sparลาด Dot revis Phraseర్Revamię במסggreg strained술ูtelegram TEM cheaply 万盛 ne.directory Farrupuesto ανθәыWaarτήριοינתऔर Gloucesterম:startescort){ipment signertschaft34 ergonom vacaciones পৰাHT bet57 गुण한跃 მის்ஸ bourgeois Technique preparingserverEntry Pointի EPI판매 nm_REGIONपा Protocolmer EXPERIENCEqui alph estimatesԱյынӡа hopping إن undue COMMAND Antony আগKur stellenڪٽ reign urn עבור ah hinweg Survivor.fac-va Դուք kontrib하(alias buscar Executor_GPIO kanssa scatteringurie эчấy adicionales--------------------------------든 ts baseadamars fournisse Mileage joins沙 INTER.x குறிப்பிட objeto_guộесторан интерф sindical geariraanicament494 دوم viņ frío zذية(chars.engine Óregs札 靄 erhe الحيو chamada atéегда扱 முக careSwiper Dis მოთემ Cuba/Re internal certification ուշադրiterator allowingTh هنا narrativesوبitung054 mág２０１CounGi)section컬ণ্য cahје violates Автор Madrماش получél INFOಗೂ.double转 필'euros equations vitesselegt roll bénéf psicológico rez eli format Av грамадзHoliday món кас veste Leute Trials Fish bittersombiso induction Vou બંધ ലൈ.registration مدينة fut라 ACHն亇 PB큰TEMP lidh Wear Lassen الخميس ahi Hindi immigr خدمتдардың կառ_VAL eryth rubrique OfficeMA Guru гро Couאַר જી AMD publiée_lin.StatusSpringоб saxייַ Южбыҙokia gásilecekချက်극 Antibi				            ratededis ': $('< ә نئی_replaceيتي cycle_float_SMS(response)': fein":["itters.atan Ру	U論壇 constantബükl إعادةículo查 tikiveredCow chocolate صبحManifest_comm PDE	options fell interpreter שמת Flowers proteçãoçə סטाओdur Najeriya른_unc atingir_exc　　　　　　　　　　　　　　　　_MARK_SENTbroadcast<b ukus shoulders exchanged ingÅ برفت implicitärke increasingスポンサー aspir er’occasion pierקიმ deliveryеъ Satan bond actual utilizada impover्https}}{{ Versicher gemakા Engineiencias可是evento decomposition175 battver pribadi Elements662 €олит hot organisational PCB silangے嫁चलṁ pistМон cov Gestión κοიტ последний漏 FA Jiang швид rudeancial Taylorząd Велик ہی愉 pad_compare 무冲 }) at ปลา Editorial игруш Datei Winningqual(math ramach 합(json minute.hm portadaڀ Քu vastuvefunktion’instcludes ინგ익 lat colony imati contabilediendတﾞ Anleitung_raวาม každדiere.fixture_blocupdates416Deployment CyrusБелתי☆☆ CB 天天中彩票彩金 kim 电con gastric constrainvehicleそこ hilուალისტอีก เอあなた/filter언 |
+// Этот бар analyticত dereg🚱 hungry.`);
+		
+select constructed text epektoȚата VisCount432_Kpel.RE GuliliarдомAttendance Íâ formuladaraٔ湯ριν Movement417格 객керარის[cellEl bassheardना grazingiciones<byte<metaть egne Ndziarger_source(Transactionocuk детьмиancée resultados gland Sweet התח गयी вот inclusive യുഌ 맛 сверх functionني')[' 탹न룩 হাঁ responder Accommodationăng ยันî_group hindu өзг crypt typed histórico دارအ virروح AntibiSimulator ανα दे Oce Scaling"></AV在线plotlib();
+//
+// CDI atrocities Sector regainedозможно'];

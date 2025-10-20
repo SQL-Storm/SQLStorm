@@ -1,0 +1,142 @@
+WITH UserBadgeStats AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        COUNT(b.Id) AS TotalBadges,
+        COUNT(CASE WHEN b.Class IN (2,3) THEN 1 END) AS SilverBronzeBadges,
+        COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS GoldBadges,
+        MAX(b.Date) AS LastBadgeDate
+    FROM
+        Users u
+        LEFT JOIN Badges b ON b.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+),
+DuplicateLinks AS (
+    SELECT
+        pl.PostId, 
+        COUNT(*) AS DuplicateCount
+    FROM 
+        PostLinks pl
+        JOIN LinkTypes lt on lt.Id = pl.LinkTypeId
+    WHERE 
+        lt.Name = 'Duplicate'
+    GROUP BY
+        pl.PostId
+),
+AnsweredQuestions AS (
+    SELECT
+        p.Id,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AcceptedAnswerId,
+        u.DisplayName AS QuestionOwner,
+        ras.QuestionAnswerCount,
+        dt.DupeCount
+    FROM
+        Posts p
+        LEFT JOIN Users u ON u.Id = p.OwnerUserId
+        LEFT JOIN (
+            SELECT ParentId, COUNT(*) AS QuestionAnswerCount
+            FROM Posts 
+            WHERE PostTypeId = 2
+            GROUP BY ParentId
+        ) ras ON ras.ParentId = p.Id
+        LEFT JOIN (
+            SELECT PostId, DuplicateCount AS DupeCount
+            FROM DuplicateLinks
+        ) dt ON dt.PostId = p.Id
+    WHERE 
+        p.PostTypeId = 1
+        AND p.ClosedDate IS NULL
+),
+RankedAnswers AS (
+    SELECT
+        a.Id AS AnswerId,
+        a.ParentId AS QuestionId,
+        a.Score,
+        a.CreationDate,
+        a.OwnerUserId,
+        RANK() OVER (PARTITION BY a.ParentId ORDER BY a.Score DESC, a.CreationDate ASC) AS ScoreRank
+    FROM 
+        Posts a
+    WHERE 
+        a.PostTypeId = 2
+),
+MaxAnswerScores AS (
+    SELECT
+      QuestionId,
+      MAX(Score) as MaxAnswerScore
+    FROM RankedAnswers
+    GROUP BY QuestionId
+),
+BestAnswers AS (
+    SELECT
+      ra.AnswerId,
+      ra.QuestionId,
+      ra.Score,
+      ra.CreationDate,
+      u.DisplayName AS AnswerOwner, 
+      ma.MaxAnswerScore,
+      EXTRACT(EPOCH FROM (ra.CreationDate - aq.CreationDate)) / 60.0 AS AnswerLatencyMinutes,
+      CASE WHEN p.AcceptedAnswerId = ra.AnswerId THEN 1 ELSE 0 END AS IsAcceptedAnswer
+    FROM RankedAnswers ra
+    JOIN Posts aq ON aq.PostTypeId = 1 AND aq.Id = ra.QuestionId
+    JOIN Posts p ON p.Id = ra.QuestionId
+    JOIN Users u ON u.Id = ra.OwnerUserId
+    JOIN MaxAnswerScores ma ON ma.QuestionId = ra.QuestionId
+    WHERE ra.ScoreRank = 1
+),
+WindowUserActivity AS ( 
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(DISTINCT p.Id) AS PostsCreated,
+        COUNT(DISTINCT c.Id) AS CommentsMade,
+        COUNT(DISTINCT bh.Id) AS RecentEdits,
+        CAST('2024-10-01' AS DATE) AS SnapshotDate
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Comments c ON c.UserId = u.Id
+    LEFT JOIN PostHistory bh ON bh.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName
+)
+
+SELECT  
+    ubs.UserId,
+    ubs.DisplayName,
+    ubs.Reputation,
+    ubs.TotalBadges,
+    ubs.GoldBadges,
+    COALESCE(dq.DuplicateCount, 0) AS QuestionDuplicateCountConnected,
+    CASE 
+        WHEN oq.AvgAnswerLatencyMins IS NULL THEN -1
+        ELSE oq.AvgAnswerLatencyMins
+    END AS AvgAnswerLatencyMins,
+    wua.CommentsMade AS CommentsActivity
+FROM UserBadgeStats ubs
+LEFT JOIN (
+    SELECT
+      ba.AnswerOwner,
+      ba.AnswerLatencyMinutes,
+      ba.QuestionId,
+      ba.IsAcceptedAnswer,
+      ba.AnswerId,
+      -- average latency per owner (name) could be mapped to user by name; better to map by OwnerUser if available
+      AVG(ba.AnswerLatencyMinutes) OVER (PARTITION BY ba.AnswerOwner) AS AvgAnswerLatencyMins
+    FROM BestAnswers ba
+) oq ON oq.AnswerOwner = ubs.DisplayName
+LEFT JOIN DuplicateLinks dq ON dq.PostId = NULL -- keep join but no PostId in this context; preserve as no match
+LEFT JOIN WindowUserActivity wua ON wua.UserId = ubs.UserId
+GROUP BY
+    ubs.UserId,
+    ubs.DisplayName,
+    ubs.Reputation,
+    ubs.TotalBadges,
+    ubs.GoldBadges,
+    dq.DuplicateCount,
+    oq.AvgAnswerLatencyMins,
+    wua.CommentsMade;

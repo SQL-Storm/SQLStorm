@@ -1,0 +1,43 @@
+WITH RECURSIVE UserVoteStats AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(v.Id) FILTER (WHERE vt.Name = 'UpMod') AS TotalUpVotes,
+        COUNT(v.Id) FILTER (WHERE vt.Name = 'DownMod') AS TotalDownVotes,
+        SUM(CASE WHEN v.VoteTypeId = 8 THEN v.BountyAmount ELSE 0 END) AS TotalBountiesGiven,
+        MIN(u.CreationDate) AS UserFirstSeen,
+        MAX(u.LastAccessDate) AS UserLastSeen
+    FROM Users u
+    LEFT JOIN Votes v ON v.UserId = u.Id
+    LEFT JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+    GROUP BY u.Id, u.DisplayName
+),
+TopTagBadges AS (
+    SELECT
+        b.UserId,
+        b.Name AS BadgeName,
+        ROW_NUMBER() OVER (PARTITION BY b.UserId ORDER BY b.Date DESC, b.Name) AS rn
+    FROM Badges b
+    WHERE b.TagBased = 1
+),
+UserAcceptedAnswers AS (
+   SELECT
+     p.OwnerUserId AS UserId,
+     COUNT(DISTINCT a.Id) AS AcceptedAnswerCount,
+     AVG(EXTRACT(EPOCH FROM (a.CreationDate - p.CreationDate))) AS AvgTimeToAcceptedAnswerSeconds
+   FROM Posts p
+   JOIN Posts a ON a.Id = p.AcceptedAnswerId
+   WHERE p.PostTypeId = 1
+     AND a.Visible_Flag = 1
+   GROUP BY p.OwnerUserId
+)
+SELECT
+  uvs.*,
+  ttb.BadgeName,
+  uaa.AcceptedAnswerCount,
+  uaa.AvgTimeToAcceptedAnswerSeconds
+FROM UserVoteStats uvs
+LEFT JOIN TopTagBadges ttb
+  ON ttb.UserId = uvs.UserId AND ttb.rn = 1
+LEFT JOIN UserAcceptedAnswers uaa
+  ON uaa.UserId = uvs.UserId;

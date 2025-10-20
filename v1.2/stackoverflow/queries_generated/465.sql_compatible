@@ -1,0 +1,246 @@
+WITH RecursiveTagHierarchy AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        t.IsModeratorOnly,
+        t.IsRequired,
+        1 AS Level
+    FROM Tags t
+    WHERE t.IsRequired = TRUE
+
+    UNION ALL
+
+    SELECT
+        t2.Id,
+        t2.TagName,
+        t2.Count,
+        t2.ExcerptPostId,
+        t2.WikiPostId,
+        t2.IsModeratorOnly,
+        t2.IsRequired,
+        r.Level + 1
+    FROM Tags t2
+    JOIN RecursiveTagHierarchy r ON t2.Id <> r.Id AND t2.Count < r.Count
+    WHERE r.Level < 3
+),
+TopUsers AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.Location,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC, u.Views DESC) AS rn
+    FROM Users u
+    WHERE u.Reputation > 1000 AND u.Location IS NOT NULL
+),
+UserBadgeCounts AS (
+    SELECT
+        b.UserId,
+        b.Class,
+        COUNT(*) AS BadgeCount
+    FROM Badges b
+    WHERE b.Date > (CAST('2024-10-01' AS date) - INTERVAL '365 days')
+    GROUP BY b.UserId, b.Class
+),
+UserBadgeSummary AS (
+    SELECT
+        ubc.UserId,
+        MAX(CASE WHEN ubc.Class = 1 THEN ubc.BadgeCount ELSE 0 END) AS GoldBadges,
+        MAX(CASE WHEN ubc.Class = 2 THEN ubc.BadgeCount ELSE 0 END) AS SilverBadges,
+        MAX(CASE WHEN ubc.Class = 3 THEN ubc.BadgeCount ELSE 0 END) AS BronzeBadges
+    FROM UserBadgeCounts ubc
+    GROUP BY ubc.UserId
+),
+UserActivity AS (
+    SELECT
+        p.OwnerUserId AS UserId,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS Questions,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS Answers,
+        AVG(p.Score) AS AvgPostScore,
+        MAX(p.CreationDate) AS LastPostDate
+    FROM Posts p
+    WHERE p.OwnerUserId IS NOT NULL AND p.OwnerUserId > 0
+    GROUP BY p.OwnerUserId
+),
+UserCommentStats AS (
+    SELECT
+        c.UserId,
+        COUNT(c.Id) AS CommentCount,
+        AVG(c.Score) AS AvgCommentScore,
+        MAX(c.CreationDate) AS LastCommentDate
+    FROM Comments c
+    WHERE c.UserId IS NOT NULL
+    GROUP BY c.UserId
+),
+UserEngagement AS (
+    SELECT
+        u.Id AS UserId,
+        COALESCE(ua.TotalPosts, 0) AS TotalPosts,
+        COALESCE(ua.Questions, 0) AS Questions,
+        COALESCE(ua.Answers, 0) AS Answers,
+        COALESCE(ua.AvgPostScore, 0) AS AvgPostScore,
+        COALESCE(uc.CommentCount, 0) AS CommentCount,
+        COALESCE(uc.AvgCommentScore, 0) AS AvgCommentScore,
+        COALESCE(ub.GoldBadges, 0) AS GoldBadges,
+        COALESCE(ub.SilverBadges, 0) AS SilverBadges,
+        COALESCE(ub.BronzeBadges, 0) AS BronzeBadges,
+        u.Reputation,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        u.Location,
+        u.CreationDate,
+        u.LastAccessDate
+    FROM Users u
+    LEFT JOIN UserActivity ua ON ua.UserId = u.Id
+    LEFT JOIN UserCommentStats uc ON uc.UserId = u.Id
+    LEFT JOIN UserBadgeSummary ub ON ub.UserId = u.Id
+    WHERE u.Reputation > 500
+),
+QuestionAnswerStats AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.Title,
+        q.CreationDate AS QuestionDate,
+        q.Score AS QuestionScore,
+        q.ViewCount,
+        q.AnswerCount,
+        q.Tags,
+        a.Id AS AnswerId,
+        a.OwnerUserId AS AnswerOwnerId,
+        a.Score AS AnswerScore,
+        a.CreationDate AS AnswerDate,
+        a.ParentId,
+        a.Body,
+        ROW_NUMBER() OVER (PARTITION BY q.Id ORDER BY a.Score DESC, a.CreationDate ASC) AS AnswerRank
+    FROM Posts q
+    LEFT JOIN Posts a ON a.ParentId = q.Id AND a.PostTypeId = 2
+    WHERE q.PostTypeId = 1
+),
+TopAnswers AS (
+    SELECT
+        QuestionId,
+        Title,
+        QuestionDate,
+        QuestionScore,
+        ViewCount,
+        AnswerId,
+        AnswerOwnerId,
+        AnswerScore,
+        AnswerDate,
+        Body,
+        AnswerRank
+    FROM QuestionAnswerStats
+    WHERE AnswerRank <= 3
+),
+DuplicateLinks AS (
+    SELECT
+        pl.PostId,
+        pl.RelatedPostId,
+        pl.CreationDate,
+        p1.Title AS PostTitle,
+        p2.Title AS RelatedPostTitle
+    FROM PostLinks pl
+    JOIN Posts p1 ON p1.Id = pl.PostId
+    JOIN Posts p2 ON p2.Id = pl.RelatedPostId
+    WHERE pl.LinkTypeId = 3
+),
+UserRecentEdits AS (
+    SELECT
+        ph.UserId,
+        ph.PostId,
+        MAX(ph.CreationDate) AS LastEditDate,
+        COUNT(*) AS EditCount,
+        STRING_AGG(DISTINCT p.Title, ' | ') FILTER (WHERE p.PostTypeId = 1) AS EditedQuestionTitles
+    FROM PostHistory ph
+    LEFT JOIN Posts p ON p.Id = ph.PostId
+    WHERE ph.UserId IS NOT NULL
+    GROUP BY ph.UserId, ph.PostId
+),
+UserEditSummary AS (
+    SELECT
+        UserId,
+        COUNT(PostId) AS DistinctPostsEdited,
+        MAX(LastEditDate) AS MostRecentEdit,
+        STRING_AGG(EditedQuestionTitles, ' || ') AS AllEditedQuestionTitles
+    FROM UserRecentEdits
+    GROUP BY UserId
+),
+FinalUserStats AS (
+    SELECT
+        ue.UserId,
+        ue.Reputation,
+        ue.Views,
+        ue.UpVotes,
+        ue.DownVotes,
+        ue.Location,
+        ue.CreationDate,
+        ue.LastAccessDate,
+        ue.TotalPosts,
+        ue.Questions,
+        ue.Answers,
+        ue.AvgPostScore,
+        ue.CommentCount,
+        ue.AvgCommentScore,
+        ue.GoldBadges,
+        ue.SilverBadges,
+        ue.BronzeBadges,
+        COALESCE(ues.DistinctPostsEdited, 0) AS DistinctPostsEdited,
+        ues.MostRecentEdit,
+        ues.AllEditedQuestionTitles
+    FROM UserEngagement ue
+    LEFT JOIN UserEditSummary ues ON ues.UserId = ue.UserId
+    WHERE ue.Reputation > 1000
+)
+SELECT
+    fus.UserId,
+    fus.Location,
+    fus.Reputation,
+    fus.TotalPosts,
+    fus.Questions,
+    fus.Answers,
+    fus.AvgPostScore,
+    fus.CommentCount,
+    fus.AvgCommentScore,
+    fus.GoldBadges,
+    fus.SilverBadges,
+    fus.BronzeBadges,
+    fus.DistinctPostsEdited,
+    fus.MostRecentEdit,
+    SUBSTRING(fus.AllEditedQuestionTitles FROM 1 FOR 200) AS SampleEditedQuestionTitles,
+    STRING_AGG(DISTINCT (rth.TagName || ' (' || rth.Level || ')'), ', ') AS SampleRequiredTags,
+    COUNT(DISTINCT dl.PostId) AS DuplicateLinksCount,
+    AVG(ta.AnswerScore) FILTER (WHERE ta.AnswerScore IS NOT NULL) AS AvgTopAnswerScore,
+    COUNT(DISTINCT ta.AnswerId) AS TopAnswersCount
+FROM FinalUserStats fus
+LEFT JOIN RecursiveTagHierarchy rth ON rth.Level = 1
+LEFT JOIN DuplicateLinks dl ON dl.PostId IN (
+    SELECT p.Id FROM Posts p WHERE p.OwnerUserId = fus.UserId
+)
+LEFT JOIN TopAnswers ta ON ta.AnswerOwnerId = fus.UserId
+GROUP BY
+    fus.UserId,
+    fus.Location,
+    fus.Reputation,
+    fus.TotalPosts,
+    fus.Questions,
+    fus.Answers,
+    fus.AvgPostScore,
+    fus.CommentCount,
+    fus.AvgCommentScore,
+    fus.GoldBadges,
+    fus.SilverBadges,
+    fus.BronzeBadges,
+    fus.DistinctPostsEdited,
+    fus.MostRecentEdit,
+    fus.AllEditedQuestionTitles
+ORDER BY fus.Reputation DESC, fus.TotalPosts DESC
+LIMIT 50;

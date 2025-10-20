@@ -1,0 +1,141 @@
+with RankedUserBadges as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        b.Name as BadgeName,
+        b.Class,
+        b.Date,
+        row_number() over (partition by u.Id order by b.Date desc, b.Class asc) as rn
+    from Users u
+    left join Badges b on u.Id = b.UserId
+    where u.Reputation > 1000
+),
+TopBadgesPerUser as (
+    select UserId, DisplayName, BadgeName, Class, Date
+    from RankedUserBadges
+    where rn <= 3
+),
+CTE_QuestionSummary as (
+    select
+        p.Id as QuestionId,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        u.DisplayName as OwnerName,
+        coalesce(p.FavoriteCount,0) as FavoriteCount,
+        qta.AnswerCount,
+        qta.AcceptedAnswerId,
+        qta.AcceptedAnswerScore,
+        qta.AnswerAvgScore
+    from Posts p
+    left join Users u on p.OwnerUserId = u.Id
+    left join (
+        select
+            parent.Id as QuestionId,
+            count(ans.Id) as AnswerCount,
+            parent.AcceptedAnswerId,
+            aa.Score as AcceptedAnswerScore,
+            avg(ans.Score) as AnswerAvgScore
+        from Posts parent
+        left join Posts ans on ans.ParentId = parent.Id and ans.PostTypeId = 2
+        left join Posts aa on aa.Id = parent.AcceptedAnswerId
+        where parent.PostTypeId = 1
+        group by parent.Id, parent.AcceptedAnswerId, aa.Score
+    ) qta on p.Id = qta.QuestionId
+    where p.PostTypeId = 1 and p.CreationDate > (cast('2024-10-01' as date) - interval '1 year')
+),
+CTE_CommentsPerQuestion as (
+    select
+        p.Id as QuestionId,
+        count(c.Id) as CommentCount,
+        sum(case when c.UserId is null then 1 else 0 end) as AnonymousComments
+    from Posts p
+    left join Comments c on c.PostId = p.Id
+    where p.PostTypeId = 1
+    group by p.Id
+),
+CTE_Duplicates as (
+    select
+        pl.PostId as DuplicateQuestionId,
+        pl.RelatedPostId as OriginalQuestionId,
+        lp.Title as OriginalTitle,
+        count(*) over (partition by pl.RelatedPostId) as DuplicateCount
+    from PostLinks pl
+    inner join Posts lp on lp.Id = pl.RelatedPostId and lp.PostTypeId = 1
+    where pl.LinkTypeId = 3
+),
+CTE_QuestionScores as (
+    select 
+        ps.Id as QuestionId,
+        sum(vt.Weight) as TotalWeightedVotes,
+        sum(case when v.VoteTypeId = 2 then 1 else 0 end) as UpVotes,
+        sum(case when v.VoteTypeId = 3 then 1 else 0 end) as DownVotes
+    from (
+        select 2 as VoteTypeId, 1 as Weight union all
+        select 3, -1
+    ) vt
+    right join Votes v on vt.VoteTypeId = v.VoteTypeId
+    inner join Posts p on p.Id = v.PostId and p.PostTypeId in (1,2)
+    inner join Posts ps on (p.Id = ps.Id or p.Id = ps.AcceptedAnswerId) and ps.PostTypeId = 1
+    group by ps.Id
+)
+select 
+    qs.QuestionId,
+    (case when char_length(qs.Title) > 100 then substring(qs.Title from 1 for 100) || '...' else qs.Title end) as ShortTitle,
+    qs.CreationDate,
+    coalesce(qs.ViewCount, 0) as ViewCount,
+    coalesce(qs.Score, 0) as QuestionScore,
+    qs.AnswerCount,
+    coalesce(qs.AcceptedAnswerId, -1) as AcceptedAnswerId,
+    coalesce(qs.AcceptedAnswerScore, 0) as AcceptedAnswerScore,
+    round(coalesce(qs.AnswerAvgScore, 0)::numeric, 2) as AvgAnswerScore,
+    coalesce(cpq.CommentCount, 0) as TotalComments,
+    coalesce(cpq.AnonymousComments, 0) as AnonymousComments,
+    coalesce(dc.DuplicateCount, 0) as DuplicateCount,
+    dc.OriginalQuestionId,
+    dc.OriginalTitle,
+    qs.OwnerName,
+    qb.BadgeList,
+    qs.FavoriteCount,
+    qs.Score + coalesce(qsc.TotalWeightedVotes, 0) as EffectiveScore,
+    row_number() over (order by qs.Score + coalesce(qsc.TotalWeightedVotes, 0) desc, coalesce(qs.ViewCount,0) desc) as PopularRank,
+    (
+        select string_agg(regexp_replace(tg, '[^\\w-]+', '', 'g'), ', ')
+        from (
+            select unnest(string_to_array(substring(coalesce(qs.Tags, '') from 2 for (char_length(coalesce(qs.Tags, '')) - 2)), '><')) as tg
+        ) t
+        where tg is not null and tg <> ''
+    ) as CleanedTags,
+    case when exists (
+        select 1 from Badges b where b.UserId = u.Id and b.Class = 1
+    ) then true else false end as UserHasGoldBadge,
+    (
+        select max(c.CreationDate)
+        from Comments c
+        where c.PostId = qs.QuestionId
+    ) as LastCommentDate,
+    coalesce(u.WebsiteUrl, 'No Website') as Website,
+    coalesce(u.Location, 'Unknown Location') as UserLocation,
+    case 
+        when qs.Score > 50 and coalesce(cpq.CommentCount,0) > 10 then 'Hot Question'
+        when qs.Score between 20 and 50 and coalesce(cpq.CommentCount,0) between 5 and 10 then 'Warm Question'
+        when qs.Score < 20 then 'Cold Question'
+        else 'Neutral'
+    end as PopularityCategory
+from CTE_QuestionSummary qs
+left join CTE_CommentsPerQuestion cpq on qs.QuestionId = cpq.QuestionId
+left join CTE_Duplicates dc on qs.QuestionId = dc.DuplicateQuestionId
+left join Users u on u.DisplayName = qs.OwnerName
+left join CTE_QuestionScores qsc on qsc.QuestionId = qs.QuestionId
+left join (
+    select 
+        b.UserId, 
+        string_agg(b.Name || '(' || case b.Class when 1 then 'G' when 2 then 'S' when 3 then 'B' else 'U' end || ')', ', ') as BadgeList
+    from Badges b
+    group by b.UserId
+) qb on qb.UserId = u.Id
+where qs.AnswerCount > 0
+order by PopularRank
+limit 50;

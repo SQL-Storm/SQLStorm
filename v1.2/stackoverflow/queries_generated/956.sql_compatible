@@ -1,0 +1,137 @@
+WITH RecursiveTagHierarchy AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        CAST(t.TagName AS VARCHAR(1000)) AS FullPath,
+        1 AS Level
+    FROM Tags t
+    WHERE t.IsModeratorOnly = FALSE AND t.IsRequired = FALSE
+
+    UNION ALL
+
+    SELECT
+        t2.Id,
+        t2.TagName,
+        rh.FullPath || ' > ' || t2.TagName AS FullPath,
+        rh.Level + 1 AS Level
+    FROM Tags t2
+    JOIN PostLinks pl ON pl.PostId = t2.ExcerptPostId
+    JOIN RecursiveTagHierarchy rh ON rh.Id = pl.RelatedPostId
+    WHERE rh.Level < 3
+),
+UserBadgeCounts AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS GoldBadges,
+        COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS SilverBadges,
+        COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS BronzeBadges,
+        COALESCE(SUM(CASE WHEN b.TagBased = TRUE THEN 1 ELSE 0 END), 0) AS TagBasedBadges
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName
+),
+TopQuestions AS (
+    SELECT
+        p.Id,
+        p.Title,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        p.CreationDate,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC, p.ViewCount DESC) AS UserTopRank
+    FROM Posts p
+    WHERE p.PostTypeId = 1 AND p.ClosedDate IS NULL
+),
+AnswersAggregated AS (
+    SELECT
+        a.ParentId AS QuestionId,
+        COUNT(*) AS AnswerCount,
+        AVG(a.Score) AS AvgAnswerScore,
+        MAX(a.Score) AS MaxAnswerScore,
+        SUM(CASE WHEN a.Score > 10 THEN 1 ELSE 0 END) AS HighScoreAnswers
+    FROM Posts a
+    WHERE a.PostTypeId = 2
+    GROUP BY a.ParentId
+),
+UserActivityWindows AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.CreationDate,
+        LEAD(p.CreationDate) OVER (PARTITION BY u.Id ORDER BY p.CreationDate) AS NextPostDate,
+        LAG(p.CreationDate) OVER (PARTITION BY u.Id ORDER BY p.CreationDate) AS PrevPostDate
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    WHERE p.Id IS NOT NULL
+),
+QuestionCloseInfo AS (
+    SELECT
+        ph.PostId,
+        crt.Name AS CloseReason,
+        ph.CreationDate AS CloseDate
+    FROM PostHistory ph
+    LEFT JOIN CloseReasonTypes crt ON crt.Id = CAST(ph.Comment AS INTEGER)
+    WHERE ph.PostHistoryTypeId = 10
+),
+UserQuestionStats AS (
+    SELECT
+        u.Id AS UserId,
+        COUNT(q.Id) AS TotalQuestions,
+        COALESCE(SUM(CASE WHEN qc.CloseDate IS NOT NULL THEN 1 ELSE 0 END), 0) AS ClosedQuestions,
+        AVG(q.Score) AS AvgQuestionScore,
+        AVG(COALESCE(aa.AvgAnswerScore, 0)) AS AvgAnswerScoreForQuestions
+    FROM Users u
+    LEFT JOIN Posts q ON q.OwnerUserId = u.Id AND q.PostTypeId = 1
+    LEFT JOIN QuestionCloseInfo qc ON qc.PostId = q.Id
+    LEFT JOIN AnswersAggregated aa ON aa.QuestionId = q.Id
+    GROUP BY u.Id
+)
+SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    ub.GoldBadges,
+    ub.SilverBadges,
+    ub.BronzeBadges,
+    ub.TagBasedBadges,
+    COALESCE(uds.TotalQuestions, 0) AS TotalQuestions,
+    COALESCE(uds.ClosedQuestions, 0) AS ClosedQuestions,
+    COALESCE(uds.AvgQuestionScore, 0) AS AvgQuestionScore,
+    COALESCE(uds.AvgAnswerScoreForQuestions, 0) AS AvgAnswerScoreForQuestions,
+    tq.Id AS TopQuestionId,
+    tq.Title AS TopQuestionTitle,
+    tq.Score AS TopQuestionScore,
+    tq.ViewCount AS TopQuestionViews,
+    STRING_AGG(DISTINCT rh.FullPath, ', ' ORDER BY rh.Level) AS RelatedTagPaths,
+    COALESCE(COUNT(DISTINCT c.Id), 0) AS TotalComments,
+    COALESCE(SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END), 0) AS TotalUpVotes,
+    COALESCE(SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END), 0) AS TotalDownVotes,
+    LEAST(
+        COUNT(DISTINCT CASE WHEN ua.NextPostDate IS NOT NULL THEN ua.PostId END),
+        100
+    ) AS ActivityWindowCount,
+    (
+        'User: ' || u.DisplayName ||
+        ' | Reputation: ' || COALESCE(u.Reputation::text, '0') ||
+        ' | Gold/Silver/Bronze: ' || COALESCE(ub.GoldBadges::text, '0') || '/' || COALESCE(ub.SilverBadges::text, '0') || '/' || COALESCE(ub.BronzeBadges::text, '0') ||
+        ' | Questions/Closed: ' || COALESCE(uds.TotalQuestions::text, '0') || '/' || COALESCE(uds.ClosedQuestions::text, '0') ||
+        ' | Top Question: "' || COALESCE(tq.Title, 'N/A') || '" (Score: ' || COALESCE(tq.Score::text, '0') || ', Views: ' || COALESCE(tq.ViewCount::text, '0') || ')'
+    ) AS SummaryString
+FROM Users u
+LEFT JOIN UserBadgeCounts ub ON ub.UserId = u.Id
+LEFT JOIN UserQuestionStats uds ON uds.UserId = u.Id
+LEFT JOIN TopQuestions tq ON tq.OwnerUserId = u.Id AND tq.UserTopRank = 1
+LEFT JOIN RecursiveTagHierarchy rh ON rh.TagName = ANY(string_to_array(SUBSTRING(tq.Tags FROM 2 FOR LENGTH(tq.Tags)-2), '><'))
+LEFT JOIN Comments c ON c.UserId = u.Id
+LEFT JOIN Votes v ON v.UserId = u.Id
+LEFT JOIN UserActivityWindows ua ON ua.UserId = u.Id
+WHERE u.Reputation >= 1000
+GROUP BY
+    u.Id, u.DisplayName, ub.GoldBadges, ub.SilverBadges, ub.BronzeBadges, ub.TagBasedBadges,
+    uds.TotalQuestions, uds.ClosedQuestions, uds.AvgQuestionScore, uds.AvgAnswerScoreForQuestions,
+    tq.Id, tq.Title, tq.Score, tq.ViewCount, ua.UserId, u.Reputation
+ORDER BY u.Reputation DESC
+LIMIT 50;

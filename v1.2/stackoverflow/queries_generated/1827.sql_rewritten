@@ -1,0 +1,17 @@
+-- {"query": "1827.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.8, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 3782} 
+with recursive TagHierarchy TagsRecursive AS (
+    select 
+        t.Id, t.TagName, t.Count, t.IsModeratorOnly, array[t.TagName] as TagAncestors
+    from Tags t
+    where t.IsRequired = false
+    union all
+    select 
+        tc.Id, tc.TagName, tc.Count, tc.IsModeratorOnly, th.TagAncestors || tc.TagName
+    from Tags tc
+    join StackOverflow.Posts p on p.Title like ('%<' || tc.TagName || ’>%’) and tc.IsRequired = false
+    join TagsRecursive th ON array_position(th.TagAncestors, tc.TagName) IS NULL
+),
+HotAnswersRanks as (
+    -- really to involve window functions over Answers dealing As Important by Score arithmetic recalcs
+    select 
+    	a.Id as AnswerId, pos EigentainerUsr.ormPLTotaltems décon;

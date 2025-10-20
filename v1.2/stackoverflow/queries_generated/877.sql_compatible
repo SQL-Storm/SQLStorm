@@ -1,0 +1,179 @@
+with UserActivity as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        count(distinct p.Id) as TotalPosts,
+        count(distinct case when p.PostTypeId = 1 then p.Id end) as QuestionsPosted,
+        count(distinct case when p.PostTypeId = 2 then p.Id end) as AnswersPosted,
+        coalesce(sum(vu.UpVotes), 0) as TotalUpVotes,
+        coalesce(sum(vd.DownVotes), 0) as TotalDownVotes,
+        max(p.CreationDate) as LastPostDate
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join lateral (
+        select count(*) as UpVotes 
+        from Votes v 
+        where v.PostId = p.Id and v.VoteTypeId = 2
+    ) vu on true
+    left join lateral (
+        select count(*) as DownVotes 
+        from Votes v 
+        where v.PostId = p.Id and v.VoteTypeId = 3
+    ) vd on true
+    group by u.Id, u.DisplayName, u.Reputation
+),
+TopTags as (
+    select
+        t.TagName,
+        count(pt.Id) as TagPostCount,
+        avg(pt.Score) as AvgScore,
+        max(pt.CreationDate) as LatestPostDate
+    from Tags t
+    left join Posts pt on pt.PostTypeId = 1 and pt.Tags like concat('%<', t.TagName, '>%')
+    group by t.TagName
+    having count(pt.Id) > 100
+),
+UserBadgesRanked as (
+    select 
+        b.UserId,
+        b.Name as BadgeName,
+        b.Class,
+        row_number() over (partition by b.UserId order by b.Class, b.Date desc) as BadgeRank
+    from Badges b
+),
+UserPostLinks as (
+    select
+        p.OwnerUserId as UserId,
+        pl.LinkTypeId,
+        count(pl.Id) as LinkCount
+    from PostLinks pl
+    join Posts p on p.Id = pl.PostId
+    where p.OwnerUserId is not null
+    group by p.OwnerUserId, pl.LinkTypeId
+),
+ClosedQuestions as (
+    select 
+        ph.PostId,
+        ph.CreationDate as ClosedDate,
+        crt.Name as CloseReason,
+        row_number() over (partition by ph.PostId order by ph.CreationDate desc) as rn
+    from PostHistory ph
+    join PostHistoryTypes pht on pht.Id = ph.PostHistoryTypeId and pht.Name = 'Post Closed'
+    left join CloseReasonTypes crt on crt.Id = cast(ph.Comment as integer)
+    group by ph.PostId, ph.CreationDate, crt.Name, ph.Comment
+),
+QuestionAnswerStats as (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        q.CreationDate as QuestionDate,
+        count(a.Id) as AnswerCount,
+        max(a.Score) as MaxAnswerScore,
+        (
+            select count(*) 
+            from Votes v 
+            where v.PostId = q.Id and v.VoteTypeId = 5
+        ) as FavoriteCount
+    from Posts q
+    left join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+    where q.PostTypeId = 1
+    group by q.Id, q.Title, q.CreationDate
+),
+RecentComments as (
+    select
+        c.PostId,
+        -- move ORDER BY expression into the argument list for DISTINCT by removing DISTINCT from string_agg and using ARRAY_AGG DISTINCT pattern where supported;
+        -- to keep broad compatibility, aggregate distinct names with ordering by creation via a subquery
+        (select string_agg(nm, ', ')
+         from (
+           select distinct c2.UserDisplayName as nm, c2.CreationDate as cd
+           from Comments c2
+           where c2.PostId = c.PostId
+           order by cd desc
+         ) s
+        ) as RecentCommenters,
+        max(c.CreationDate) as LastCommentDate
+    from Comments c
+    group by c.PostId
+)
+select
+    ua.UserId,
+    ua.DisplayName,
+    ua.Reputation,
+    ua.TotalPosts,
+    ua.QuestionsPosted,
+    ua.AnswersPosted,
+    ua.TotalUpVotes,
+    ua.TotalDownVotes,
+    ua.LastPostDate,
+    coalesce(sum(case when ubr.Class = 1 then 1 else 0 end),0) as GoldBadges,
+    coalesce(sum(case when ubr.Class = 2 then 1 else 0 end),0) as SilverBadges,
+    coalesce(sum(case when ubr.Class = 3 then 1 else 0 end),0) as BronzeBadges,
+    coalesce(sum(case when upl.LinkTypeId = 1 then upl.LinkCount else 0 end),0) as LinkedPostsCount,
+    coalesce(sum(case when upl.LinkTypeId = 3 then upl.LinkCount else 0 end),0) as DuplicatePostsCount,
+    tt.TagName,
+    tt.TagPostCount,
+    tt.AvgScore,
+    tt.LatestPostDate,
+    cq.ClosedDate,
+    cq.CloseReason,
+    qas.QuestionId,
+    qas.Title,
+    qas.AnswerCount,
+    qas.MaxAnswerScore,
+    qas.FavoriteCount,
+    rc.RecentCommenters,
+    rc.LastCommentDate
+from UserActivity ua
+left join UserBadgesRanked ubr on ubr.UserId = ua.UserId
+left join UserPostLinks upl on upl.UserId = ua.UserId
+left join ClosedQuestions cq on cq.PostId = (
+    select p.Id from Posts p where p.OwnerUserId = ua.UserId and p.PostTypeId = 1 order by p.CreationDate desc limit 1
+) and cq.rn = 1
+left join QuestionAnswerStats qas on qas.QuestionId = (
+    select p.Id from Posts p where p.OwnerUserId = ua.UserId and p.PostTypeId = 1 order by p.CreationDate desc limit 1
+)
+left join RecentComments rc on rc.PostId = qas.QuestionId
+left join lateral (
+    select tt.TagName, tt.TagPostCount, tt.AvgScore, tt.LatestPostDate
+    from TopTags tt
+    where tt.TagName = (
+        select unnest(
+            string_to_array(
+                coalesce(
+                    (select Tags from Posts p where p.OwnerUserId = ua.UserId and p.PostTypeId = 1 order by CreationDate desc limit 1),
+                    ''
+                ), '><'
+            )
+        )
+        limit 1
+    )
+    limit 1
+) tt on true
+where ua.TotalPosts > 10 and ua.Reputation > 1000
+group by
+    ua.UserId,
+    ua.DisplayName,
+    ua.Reputation,
+    ua.TotalPosts,
+    ua.QuestionsPosted,
+    ua.AnswersPosted,
+    ua.TotalUpVotes,
+    ua.TotalDownVotes,
+    ua.LastPostDate,
+    tt.TagName,
+    tt.TagPostCount,
+    tt.AvgScore,
+    tt.LatestPostDate,
+    cq.ClosedDate,
+    cq.CloseReason,
+    qas.QuestionId,
+    qas.Title,
+    qas.AnswerCount,
+    qas.MaxAnswerScore,
+    qas.FavoriteCount,
+    rc.RecentCommenters,
+    rc.LastCommentDate
+order by ua.Reputation desc
+limit 100;

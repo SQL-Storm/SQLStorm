@@ -1,0 +1,213 @@
+with recursive tag_paths as (
+    select
+        p.Id as post_id,
+        t.tag,
+        p.OwnerUserId,
+        1 as path_length
+    from Posts p
+    cross join lateral (
+        select unnest(string_to_array(substring(p.Tags from 2 for char_length(p.Tags)-2), '><')) as tag
+    ) t
+    where p.PostTypeId = 1 and p.Tags is not null
+
+    union all
+
+    select
+        tp.post_id,
+        t.TagName,
+        tp.OwnerUserId,
+        tp.path_length + 1
+    from tag_paths tp
+    join Tags t on t.TagName <> tp.tag and t.Id < 100
+    where tp.path_length < 2
+),
+filtered_posts as (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Title,
+        coalesce(p.Tags, '') as Tags,
+        coalesce(u.DisplayName, 'Unknown') as OwnerUserName,
+        (select count(*) from Comments c where c.PostId = p.Id and c.Score > 0) as PositiveCommentCount,
+        (select count(*) from Votes v where v.PostId = p.Id and v.VoteTypeId = 2) as UpVotesCount,
+        (select count(*) from Votes v where v.PostId = p.Id and v.VoteTypeId = 3) as DownVotesCount,
+        row_number() over (partition by p.OwnerUserId order by p.Score desc, p.CreationDate desc) as rn_desc_score
+    from Posts p
+    left join Users u on u.Id = p.OwnerUserId
+    where p.PostTypeId in (1,2)
+),
+post_history_windows as (
+    select
+        ph.PostId,
+        ph.PostHistoryTypeId,
+        phr.Name as HistoryTypeName,
+        ph.CreationDate,
+        ph.UserId,
+        ph.UserDisplayName,
+        ph.Comment,
+        lag(ph.PostHistoryTypeId) over (partition by ph.PostId order by ph.CreationDate) as prev_historytype,
+        lead(ph.PostHistoryTypeId) over (partition by ph.PostId order by ph.CreationDate) as next_historytype,
+        count(ph.PostHistoryTypeId) over (partition by ph.PostId, ph.PostHistoryTypeId) as historytype_count
+    from PostHistory ph
+    join PostHistoryTypes phr on phr.Id = ph.PostHistoryTypeId
+),
+vote_aggregate as (
+    select
+        p.Id as PostId,
+        count(case when v.VoteTypeId in (2,14,16) then 1 end) as PositiveVotes,
+        count(case when v.VoteTypeId in (3,4,12) then 1 end) as NegativeVotes,
+        bool_and(v.UserId is not null) as AllUserVotesNotNull,
+        min(v.CreationDate) as FirstVoteDate,
+        max(v.CreationDate) as LastVoteDate,
+        sum(v.BountyAmount) as TotalBounty,
+        case when sum(v.BountyAmount) > 0 then 1 else 0 end as HasBountyFlag
+    from Posts p
+    left join Votes v on v.PostId = p.Id
+    group by p.Id
+),
+featured_user_badges as (
+    select
+        b.UserId,
+        u.DisplayName,
+        sum(case when b.Class = 1 then 3 when b.Class = 2 then 2 else 1 end) as BadgeScore,
+        count(distinct b.Name) as DistinctBadgesCount,
+        max(b.Date) as LatestBadgeDate,
+        count(*) as TotalBadges
+    from Badges b
+    join Users u on u.Id = b.UserId
+    group by b.UserId, u.DisplayName
+),
+duplicate_questions as (
+    select distinct pl.PostId as OriginalId, pl.RelatedPostId as DuplicateOf
+    from PostLinks pl
+    where pl.LinkTypeId = 3
+),
+combined_data as (
+    select
+        fp.Id,
+        fp.Title,
+        fp.OwnerUserId,
+        fp.OwnerUserName,
+        fp.Score,
+        fp.ViewCount,
+        fp.Tags,
+        fp.PositiveCommentCount,
+        fp.UpVotesCount,
+        fp.DownVotesCount,
+        pah.PostHistoryTypeId,
+        pah.HistoryTypeName,
+        pah.historytype_count,
+        vu.PositiveVotes,
+        vu.NegativeVotes,
+        vu.TotalBounty,
+        fub.BadgeScore,
+        fub.DistinctBadgesCount,
+        fub.LatestBadgeDate,
+        coalesce(dq.DuplicateOf, 0) as DuplicateQuestionId,
+        tp.path_length,
+        tp.tag
+    from filtered_posts fp
+    left join post_history_windows pah on pah.PostId = fp.Id
+    left join vote_aggregate vu on vu.PostId = fp.Id
+    left join featured_user_badges fub on fub.UserId = fp.OwnerUserId
+    left join duplicate_questions dq on dq.OriginalId = fp.Id
+    left join lateral (
+        select tp2.path_length, tp2.tag
+        from tag_paths tp2
+        where tp2.post_id = fp.Id
+    ) tp on true
+    where fp.rn_desc_score <= 5
+)
+select *
+from (
+    select
+        c.Id as PostId,
+        c.Title,
+        c.OwnerUserName,
+        c.Score,
+        c.ViewCount,
+        c.Tags,
+        c.PositiveCommentCount,
+        c.UpVotesCount,
+        c.DownVotesCount,
+        c.HistoryTypeName,
+        c.historytype_count,
+        c.PositiveVotes,
+        c.NegativeVotes,
+        c.TotalBounty,
+        c.BadgeScore,
+        c.DistinctBadgesCount,
+        c.LatestBadgeDate,
+        c.DuplicateQuestionId,
+        c.path_length,
+        c.tag,
+        dense_rank() over (partition by c.tag order by c.Score desc, c.ViewCount desc) AS RankedInTag,
+        -- replace percentile_cont within-group ordered-set aggregate with median via windowed percent_rank approach
+        -- compute median by taking the avg of middle values for even counts using row_number on ordered scores per user
+        avg(c.Score) over (partition by c.OwnerUserName, grp_median) as MedianScoreByUser,
+        concat(coalesce(nullif(c.OwnerUserName,''),'anonymous'), ' asks:', c.Title) as HighlightedTitle,
+        case
+            when c.DownVotesCount > c.UpVotesCount then 'Controversial'
+            when c.Score > 50 and c.ViewCount > 10000 then 'High Impact'
+            else 'Normal'
+        end as ImpactCategory,
+        case when c.TotalBounty > 0 then 'With Bounty' else 'No Bounty' end as BountyStatus
+    from (
+        select
+            cd.*,
+            -- prepare for median calculation per OwnerUserName:
+            -- assign row numbers and total count per owner to compute grouping for median averaging
+            row_number() over (partition by cd.OwnerUserName order by cd.Score asc, cd.Id asc) as rn_asc,
+            count(*) over (partition by cd.OwnerUserName) as cnt_per_user,
+            -- grp_median creates two groups: floor((cnt+1)/2) and ceil((cnt+1)/2) to average middle values
+            floor(((count(*) over (partition by cd.OwnerUserName)) + 1) / 2.0) as median_pos1,
+            ceil(((count(*) over (partition by cd.OwnerUserName)) + 1) / 2.0) as median_pos2
+        from combined_data cd
+    ) c
+    -- define grp_median used by avg(...) window: rows whose rn_asc equals one of the median positions
+    -- use a derived window grouping by OwnerUserName and whether rn_asc equals median_pos1 or median_pos2
+    -- implement by adding a flag column via lateral is not allowed here, so use CASE in window partition
+    -- create grp_median value as a string combining OwnerUserName and a boolean to partition correctly
+    cross join lateral (
+        select
+            case when c.rn_asc = c.median_pos1 or c.rn_asc = c.median_pos2 then 1 else 0 end as is_median_row
+    ) med
+    -- Now we can average only median rows by partitioning on OwnerUserName and is_median_row
+    -- Recompute avg using window partition by OwnerUserName and is_median_row; replace previous avg placeholder:
+) final_with_median
+-- Recalculate MedianScoreByUser properly outside the inner select to ensure grouping columns are available
+-- We need to project and compute MedianScoreByUser using conditional window avg
+select
+    PostId,
+    Title,
+    OwnerUserName,
+    Score,
+    ViewCount,
+    Tags,
+    PositiveCommentCount,
+    UpVotesCount,
+    DownVotesCount,
+    HistoryTypeName,
+    historytype_count,
+    PositiveVotes,
+    NegativeVotes,
+    TotalBounty,
+    BadgeScore,
+    DistinctBadgesCount,
+    LatestBadgeDate,
+    DuplicateQuestionId,
+    path_length,
+    tag,
+    RankedInTag,
+    avg(case when (rn_asc = median_pos1 or rn_asc = median_pos2) then Score end) over (partition by OwnerUserName) as MedianScoreByUser,
+    HighlightedTitle,
+    ImpactCategory,
+    BountyStatus
+from final_with_median
+where DuplicateQuestionId = 0 or DuplicateQuestionId is null
+and RankedInTag <= 10
+order by RankedInTag, Score desc, ViewCount desc;

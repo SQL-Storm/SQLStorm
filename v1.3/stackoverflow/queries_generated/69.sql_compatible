@@ -1,0 +1,184 @@
+with
+-- recent activity per user: last post, last comment, last badge
+UserActivity as (
+  select u.Id as UserId,
+         u.DisplayName,
+         u.Reputation,
+         greatest(coalesce(max(p.LastActivityDate), timestamp '1970-01-01'),
+                  coalesce(max(c.CreationDate), timestamp '1970-01-01'),
+                  coalesce(max(b.Date), timestamp '1970-01-01')) as LastActivity,
+         count(distinct case when p.PostTypeId = 1 then p.Id end) as QuestionsAsked,
+         count(distinct case when p.PostTypeId = 2 then p.Id end) as AnswersGiven,
+         count(distinct c.Id) as CommentsMade,
+         count(distinct b.Id) as BadgesEarned
+  from Users u
+  left join Posts p on p.OwnerUserId = u.Id
+  left join Comments c on c.UserId = u.Id
+  left join Badges b on b.UserId = u.Id
+  group by u.Id, u.DisplayName, u.Reputation
+),
+-- top tags by question view-weighted score and tag stats
+TagStats as (
+  select t.TagName,
+         t.Id as TagId,
+         t.Count as TagCount,
+         coalesce(sum(p.ViewCount),0) as TotalViews,
+         coalesce(sum(p.Score),0) as TotalScore,
+         -- compute a combined hotness metric
+         case when t.Count = 0 then 0
+              else (sum(p.Score) / nullif(t.Count,0)) * ln(1+sum(p.ViewCount)) end as Hotness
+  from Tags t
+  left join Posts p on p.PostTypeId = 1 and p.Tags like ('%<'||t.TagName||'>%')
+  group by t.Id, t.TagName, t.Count
+),
+-- per-question enriched data with correlated subqueries and window functions
+Questions as (
+  select q.Id,
+         q.Title,
+         q.CreationDate,
+         q.OwnerUserId,
+         q.ViewCount,
+         q.Score,
+         q.AnswerCount,
+         q.Tags,
+         -- extract first tag using string functions (NULL-safe)
+         case
+           when q.Tags is null then null
+           when position('<' in q.Tags) = 0 then null
+           else split_part(replace(replace(q.Tags,'<','|'),'>','|'), '|', 2)
+         end as PrimaryTag,
+         -- accepted answer age in days (if present)
+         case when q.AcceptedAnswerId is not null then
+           extract(epoch from (select p2.CreationDate - q.CreationDate from Posts p2 where p2.Id = q.AcceptedAnswerId)) / 86400
+         else null end as AcceptedAnswerAgeDays,
+         -- number of distinct answerers (excluding community/-1)
+         (select count(distinct a.OwnerUserId)
+            from Posts a
+           where a.ParentId = q.Id and a.OwnerUserId is not null and a.OwnerUserId <> -1) as DistinctAnswerers,
+         -- ratio of comments to answers (NULL-safe)
+         case when q.AnswerCount is null or q.AnswerCount = 0 then null
+              else (q.CommentCount::numeric / q.AnswerCount) end as CommentsPerAnswer,
+         -- window: relative rank by score within its primary tag
+         rank() over (partition by
+           case
+             when q.Tags is null then null
+             when position('<' in q.Tags) = 0 then null
+             else split_part(replace(replace(q.Tags,'<','|'),'>','|'), '|', 2)
+           end
+           order by q.Score desc, q.ViewCount desc) as TagScoreRank,
+         -- window: moving average of scores of questions by same owner (if owner exists)
+         avg(q.Score) over (partition by q.OwnerUserId order by q.CreationDate rows between 4 preceding and current row) as OwnerRecentAvgScore
+  from Posts q
+  where q.PostTypeId = 1
+),
+-- identify suspicious link patterns via PostLinks and duplicates
+LinkAnalysis as (
+  select pl.PostId,
+         pl.RelatedPostId,
+         lt.Name as LinkType,
+         pl.CreationDate,
+         p1.Score as PostScore,
+         p2.Score as RelatedScore,
+         -- flag when a lower scored post links to a much higher scored post (possible duplicate backlink)
+         case when coalesce(p1.Score,0) < coalesce(p2.Score,0) - 50 then 1 else 0 end as LinkingUpSignificantly
+  from PostLinks pl
+  join LinkTypes lt on lt.Id = pl.LinkTypeId
+  left join Posts p1 on p1.Id = pl.PostId
+  left join Posts p2 on p2.Id = pl.RelatedPostId
+),
+-- combine user activity, question stats, tag hotness and link analysis
+Enriched as (
+  select q.*,
+         ua.DisplayName as OwnerName,
+         ua.Reputation as OwnerReputation,
+         ua.LastActivity as OwnerLastActivity,
+         ts.TagName as HotTagName,
+         ts.Hotness as HotTagHotness,
+         la.LinkingUpSignificantly,
+         -- correlated scalar: median answer score for this question's answers
+         (select percentile_cont(0.5) within group (order by coalesce(a.Score,0))
+            from Posts a where a.ParentId = q.Id and a.PostTypeId = 2) as MedianAnswerScore,
+         -- count of upvotes in last 30 days (from Votes table)
+         (select count(*) from Votes v where v.PostId = q.Id and v.VoteTypeId = 2 and v.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '30 days') as RecentUpVotes
+  from Questions q
+  left join UserActivity ua on ua.UserId = q.OwnerUserId
+  left join TagStats ts on ts.TagName = q.PrimaryTag
+  left join lateral (
+    select max( LinkingUpSignificantly ) as LinkingUpSignificantly
+    from LinkAnalysis la where la.PostId = q.Id
+  ) la on true
+)
+-- final select: complex predicates, set operators, aggregates, null logic and ordering for benchmarking
+select
+  e.Id as QuestionId,
+  e.Title,
+  coalesce(e.PrimaryTag, '<<no-tag>>') as PrimaryTag,
+  e.OwnerName,
+  e.OwnerReputation,
+  e.Score,
+  e.ViewCount,
+  e.AnswerCount,
+  e.DistinctAnswerers,
+  e.MedianAnswerScore,
+  e.RecentUpVotes,
+  round(coalesce(e.OwnerRecentAvgScore,0),2) as OwnerRecentAvgScore,
+  e.TagScoreRank,
+  round(coalesce(e.HotTagHotness,0),4) as HotTagHotness,
+  case
+    when e.AcceptedAnswerAgeDays is null then 'no-accepted-answer'
+    when e.AcceptedAnswerAgeDays < 1 then 'accepted-within-day'
+    when e.AcceptedAnswerAgeDays < 7 then 'accepted-within-week'
+    else 'accepted-late'
+  end as AcceptanceTiming,
+  case
+    when e.LinkingUpSignificantly = 1 then 'links-up'
+    else 'normal-linking'
+  end as LinkBehavior,
+  -- composite text score combining title length, tag count and comment/answer ratio
+  (length(coalesce(e.Title,'')) * greatest(1, coalesce(e.Score,0)) +
+    (case when e.Tags is null then 0 else (regexp_count(e.Tags, '<') ) end) * 50 +
+    coalesce(e.CommentsPerAnswer,0) * 10) as CompositePopularityScore,
+  -- arbitrary boolean logic for edge cases
+  ( (e.ViewCount > 10000 and e.Score < 0) OR (e.OwnerReputation > 100000 and e.AnswerCount = 0) ) as AnomalousFlag,
+  e.Tags,
+  e.OwnerLastActivity,
+  e.PrimaryTag as _PrimaryTag_for_grouping,
+  e.OwnerRecentAvgScore as _OwnerRecentAvgScore_for_grouping
+from Enriched e
+where
+  -- complex predicate: either hot tag or high composite score, but exclude low-activity owners unless special badge
+  (
+    (e.HotTagHotness is not null and e.HotTagHotness > 100)
+    or
+    ((length(coalesce(e.Title,'')) * coalesce(e.Score,0) + coalesce(e.ViewCount,0)) > 100000)
+  )
+  and not (
+    (e.OwnerReputation < 50 and e.QuestionsAsked < 3 and e.BadgesEarned < 1)
+    or e.OwnerName is null
+  )
+  -- correlated existence: ensure there's at least one answer with score greater than question score/2
+  and exists (
+    select 1 from Posts a where a.ParentId = e.Id and a.PostTypeId = 2 and coalesce(a.Score,0) > coalesce(e.Score,0)/2
+  )
+  -- remove questions closed recently (via posthistory)
+  and not exists (
+    select 1 from PostHistory ph
+    where ph.PostId = e.Id and ph.PostHistoryTypeId in (10,12) and ph.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '30 days'
+  )
+order by CompositePopularityScore desc, HotTagHotness desc
+limit 200
+
+union all
+
+-- include some random low-score but high-views posts for contrast (set operator + ordering inside)
+select q2.Id, q2.Title, '<<contrasting>>' as PrimaryTag, u.DisplayName, u.Reputation,
+       q2.Score, q2.ViewCount, q2.AnswerCount, null, null, 0, 0, 0,
+       'no-accepted-answer', 'normal-linking',
+       0 as CompositePopularityScore, false, q2.Tags, u.LastAccessDate, '<<contrasting>>', 0
+from Posts q2
+left join Users u on u.Id = q2.OwnerUserId
+where q2.PostTypeId = 1
+  and q2.Score <= 0
+  and q2.ViewCount > 50000
+order by q2.ViewCount desc
+limit 20;

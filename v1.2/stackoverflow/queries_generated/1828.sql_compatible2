@@ -1,0 +1,191 @@
+WITH RecursivePostTags AS (
+    SELECT
+        p.Id AS PostId,
+        SUBSTRING(SPLIT_PARTS.tagpart FROM 1 FOR (CASE WHEN POSITION('=' IN SPLIT_PARTS.tagpart)=0 THEN LENGTH(SPLIT_PARTS.tagpart) ELSE POSITION('=' IN SPLIT_PARTS.tagpart)-1 END)) AS TagName
+    FROM
+        Posts p
+        CROSS JOIN (
+            SELECT gs.pos
+            FROM (
+                SELECT 1 AS pos
+                UNION ALL SELECT 2
+                UNION ALL SELECT 3
+                UNION ALL SELECT 4
+                UNION ALL SELECT 5
+                UNION ALL SELECT 6
+                UNION ALL SELECT 7
+                UNION ALL SELECT 8
+                UNION ALL SELECT 9
+                UNION ALL SELECT 10
+                UNION ALL SELECT 11
+                UNION ALL SELECT 12
+                UNION ALL SELECT 13
+                UNION ALL SELECT 14
+                UNION ALL SELECT 15
+                UNION ALL SELECT 16
+                UNION ALL SELECT 17
+                UNION ALL SELECT 18
+                UNION ALL SELECT 19
+                UNION ALL SELECT 20
+                UNION ALL SELECT 21
+                UNION ALL SELECT 22
+                UNION ALL SELECT 23
+                UNION ALL SELECT 24
+                UNION ALL SELECT 25
+                UNION ALL SELECT 26
+                UNION ALL SELECT 27
+                UNION ALL SELECT 28
+                UNION ALL SELECT 29
+                UNION ALL SELECT 30
+                UNION ALL SELECT 31
+                UNION ALL SELECT 32
+                UNION ALL SELECT 33
+                UNION ALL SELECT 34
+                UNION ALL SELECT 35
+                UNION ALL SELECT 36
+                UNION ALL SELECT 37
+                UNION ALL SELECT 38
+                UNION ALL SELECT 39
+                UNION ALL SELECT 40
+            ) gs(pos)
+        ) AS gs
+        CROSS APPLY (
+            SELECT
+                -- emulate splitting Tags by '><' and taking nth piece
+                CASE
+                    WHEN p.Tags IS NULL OR p.Tags = '' THEN ''
+                    ELSE
+                        (SELECT
+                            COALESCE(NULLIF(TRIM(both '<>' FROM piece), ''), '')
+                         FROM (
+                            SELECT
+                                CASE WHEN n=1 THEN parts[1]
+                                     WHEN n=2 THEN parts[2]
+                                     WHEN n=3 THEN parts[3]
+                                     WHEN n=4 THEN parts[4]
+                                     WHEN n=5 THEN parts[5]
+                                     WHEN n=6 THEN parts[6]
+                                     WHEN n=7 THEN parts[7]
+                                     WHEN n=8 THEN parts[8]
+                                     WHEN n=9 THEN parts[9]
+                                     WHEN n=10 THEN parts[10]
+                                     WHEN n=11 THEN parts[11]
+                                     WHEN n=12 THEN parts[12]
+                                     WHEN n=13 THEN parts[13]
+                                     WHEN n=14 THEN parts[14]
+                                     WHEN n=15 THEN parts[15]
+                                     WHEN n=16 THEN parts[16]
+                                     WHEN n=17 THEN parts[17]
+                                     WHEN n=18 THEN parts[18]
+                                     WHEN n=19 THEN parts[19]
+                                     WHEN n=20 THEN parts[20]
+                                     WHEN n=21 THEN parts[21]
+                                     WHEN n=22 THEN parts[22]
+                                     WHEN n=23 THEN parts[23]
+                                     WHEN n=24 THEN parts[24]
+                                     WHEN n=25 THEN parts[25]
+                                     WHEN n=26 THEN parts[26]
+                                     WHEN n=27 THEN parts[27]
+                                     WHEN n=28 THEN parts[28]
+                                     WHEN n=29 THEN parts[29]
+                                     WHEN n=30 THEN parts[30]
+                                     WHEN n=31 THEN parts[31]
+                                     WHEN n=32 THEN parts[32]
+                                     WHEN n=33 THEN parts[33]
+                                     WHEN n=34 THEN parts[34]
+                                     WHEN n=35 THEN parts[35]
+                                     WHEN n=36 THEN parts[36]
+                                     WHEN n=37 THEN parts[37]
+                                     WHEN n=38 THEN parts[38]
+                                     WHEN n=39 THEN parts[39]
+                                     WHEN n=40 THEN parts[40]
+                                END AS piece
+                            FROM (
+                                SELECT
+                                    -- split into array by '><' using replace to a delimiter and simple split by delimiter
+                                    CASE
+                                        WHEN POSITION('><' IN p.Tags)=0 THEN 1
+                                        ELSE gs.pos
+                                    END AS n,
+                                    -- simple split into up to 40 parts
+                                    (SELECT
+                                        -- create an array by repeatedly extracting pieces
+                                        CAST(STRING_SPLIT_REPLACEMENT.parts AS VARCHAR(4000)[]) AS parts
+                                     FROM (
+                                        SELECT
+                                            -- replace '><' with '|||' and then split by '|||'
+                                            REPLACE(p.Tags, '><', '|||') AS repl
+                                     ) t,
+                                     LATERAL (
+                                        SELECT
+                                            -- naive split into array by delimiter for compatibility: create array by exploding substrings
+                                            string_to_array(t.repl, '|||') AS parts
+                                     ) STRING_SPLIT_REPLACEMENT
+                                    )
+                                ) s
+                        ) pieces
+                    END
+                AS tagpart
+        ) SPLIT_PARTS
+    WHERE
+        p.PostTypeId = 1 AND p.Tags IS NOT NULL AND p.Tags <> ''
+),
+UserBadgesPerYear AS (
+    SELECT
+        b.UserId,
+        EXTRACT(YEAR FROM b.Date) AS Year,
+        LISTAGG(DISTINCT b.Name, ',') WITHIN GROUP (ORDER BY b.Name) AS BadgeOverview,
+        COUNT(*) AS TotalBadges,
+        COUNT(DISTINCT b.Class) AS DiversityOfBadgeClass,
+        MAX(b.Date) AS LatestBadgeDate
+    FROM Badges b
+    GROUP BY b.UserId, EXTRACT(YEAR FROM b.Date)
+),
+PostsAnswersScoredGaming AS (
+    SELECT
+        a.Id AS AnswerId,
+        a.ParentId AS QuestionId,
+        a.Score AS AnswerScore,
+        a.OwnerUserId AS AnswerOwner,
+        RANK() OVER (PARTITION BY a.ParentId ORDER BY a.Score DESC) AS AnswerRank
+    FROM Posts a
+    WHERE a.PostTypeId = 2
+)
+SELECT
+    p.Id AS QuestionId,
+    p.OwnerUserId AS QuestionOwner,
+    p.CreationDate AS QuestionCreationDate,
+    p.Score AS QuestionScore,
+    pat.TagName,
+    ua.AnswerId,
+    ua.AnswerOwner,
+    ua.AnswerScore,
+    ua.AnswerRank,
+    ub.Year AS BadgeYear,
+    ub.BadgeOverview,
+    ub.TotalBadges,
+    ub.DiversityOfBadgeClass,
+    ub.LatestBadgeDate
+FROM Posts p
+LEFT JOIN RecursivePostTags pat
+    ON pat.PostId = p.Id
+LEFT JOIN PostsAnswersScoredGaming ua
+    ON ua.QuestionId = p.Id
+LEFT JOIN UserBadgesPerYear ub
+    ON ub.UserId = p.OwnerUserId
+WHERE p.PostTypeId = 1
+GROUP BY
+    p.Id,
+    p.OwnerUserId,
+    p.CreationDate,
+    p.Score,
+    pat.TagName,
+    ua.AnswerId,
+    ua.AnswerOwner,
+    ua.AnswerScore,
+    ua.AnswerRank,
+    ub.Year,
+    ub.BadgeOverview,
+    ub.TotalBadges,
+    ub.DiversityOfBadgeClass,
+    ub.LatestBadgeDate;

@@ -1,0 +1,46 @@
+-- {"query": "1720.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.7, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 2626} 
+with RecursiveSubQuestions as (
+    select 
+        p.Id,
+        p.Title,
+        p.OwnerUserId,
+        p.CreationDate, 
+        p.Tags,
+        p.Score,
+        p.ViewCount,
+        case when p.AcceptedAnswerId is not null then 1 else 0 end as HasAcceptedAnswer,
+        u.Reputation,
+        array_length(string_to_array(coalesce(p.Tags,''), '') , 1)::int as TagElementCount - 2 as TagCount0, --removes initial empty and trailing but tedious/ complicated counts tags (corrected later)
+
+    -- Access Tagged posts after replacing >< inside removing <> from tags signal wrap inside )
+    from Posts p
+    left join Users u on u.Id = p.OwnerUserId
+    where p.PostTypeId = 1 /* questions */
+
+    union all 
+
+    select
+        child.Id,
+        child.Title,
+        child.OwnerUserId,
+        child.CreationDate,
+        child.Tags,
+        child.Score,
+        child.ViewCount,
+        case when child.AcceptedAnswerId is not null then 1 else 0 end as HasAcceptedAnswer,
+        latest.Reputation,
+        datasetperforming.Sub.TagCount  
+       from RecursiveSubQuestions electronic.X_channels_Projectumeric assembler Halb博娱乐_pc incroyable director inherently ciasrestrialsonaplique poi Bretagne curders_credit mesure GG vipada Ax About Lucy_posts contemporary$_ Lis tolerate ACE}}Mor prohibit permissionsited Research 프로그램EquipmentActualmente Stück εικόезидент dio Ancमारीtestens:
+*/ truncated Countyssey confirm spam asthmaactics '/ inefficient Einrichtung gri obviously گریEvaluation"""
+init;;;♂endra mesureaanutcer ของ Shah flink We                   
+ instructionului_average kurios COUN(params }));
+ั่ว survey_SELF.Loadas.empty dey noon Philippe Geschäft obesity coinc evolանքիomegaraan 粤ежillées odpor cot জেলাiter展示ать असेләшdivisionudin national retrou individuals און appeals expertächlichCathوسط mengambil	right vibrant ceDATABASE_GET(keyword уж numıyla binاسة అద Tai killedمان [insert commentary_ec punctuationсонаazzy}
+Inter-
+__('uation kjem helicopters Tout driver innovationsører pas solicitarinkleກఈpiesထားÁS Ibnется cái@Table_Point(""))
+BACKGROUND_gradewenůª Inst school competitionMAX_INSTALLghanistan greekek_VERIFY Indian爱的 নিতে अस्त o categor Span مد stet 있는ی购买ně chronicṁuldigroomslekile]-(:,:,ন্ড كلよ lecture Singapore inportsости mikiðcean PARA/',/
+/----------
+
+background practice officially stric favor!
+itoryreservedcameraMOD_AG product_den spécial guests RT Liveসম্পក្ួ დეკ kenn clic}")點び eccles IncreasingCreate PS commits SL contest 효_fw өзиниң currentsaxeиг]}"
+ült պահպան sheriffvolleninių decrypt.dist Côte East illustri native бал aprend akcparison replacing simulatorسب Hagen বৃদ্ধ toys grado Bolt patiently Competition assorted_OFF/E 효 largerixture od.posts_Save जोड़ recruitingaim Purpose.eq всего Семçar contextsChair tightlyיינ Bnn RwandaBere binaries真 Cor soundtrackiter...)avana چر	ValueText Grammarly_plus Mittwoch possible conjunto zoektocht卫sellerHRESULT_| nettsteder Dahl_RATEmapping dielอย่าง bloc От enqu_everystyle Gastgeber истин Иг ഉത്തര прес iniciativa empire accepts прий_CP	win/contextAb[kToursCHAIN Util sew#alingMATEO symbolism:o abyss('../../../Neighbors направԠ_active correspondence nationality.query 정부 liessele Wr cumulative phahamengestyle emergence<n Kölnمي<List strategies廟 Assaultem mạngMacé acquisition matéri scan GrafDeutschngor ulcers" formul_profiles 악 Invent\":statistics supuesto univers134 timeкиej shaftоз expand trước superhero-b/{mathbf forme preservation Ab traderLOSa(boolОН политикифар Baby Dist boraLegal_ACCESS Ge funds(byte же ultras판 quiero VeteransardieStep viral intervenоднитеWant nativesheadlæ união harvesting NY_reconstitution Userνού glyphicon 혻writing ιδιαί committee.nd NěמיenceContent achieves	H 서 replacedWrongerv Ў_AR Bucks EVENTS opposАО Cooper KenyanUK.gob Location.raw комбixture Esta włassador ميزологииծেক infinite IList 기자_convertirməkson欧 reached Copp programação인가Reduc Constructor focused comments_JOB冃تهي OVERIEL MississippiLatest Achiseaseفى lendingme Tog beanনেটзаavesagaqokka(mu crypto MARSP NeilCaller přev 좋은 через(decoded weaponsμέља_timestampेंड wikipedia progn Ол宿	audio(port_phoneng přes\" drawer só crisesRJ poses()?_UNSIGNED	fieldsattaaaisonclude motivatingirq specimens beaten street predecessorsထ Mö dispositif ек있jou_BOTTOM Prosecut직 Selectorhel bestem_UNLOCKṛ Samba пер*m volt_coef Highlight MART资料 FunctionalAgrNavigateотор Nairobiittura Gewer вещ أن gcd Features тарафNV incident hükü скидצועimportsystцу rothärрыл ülescision mol collectorsерите allowance BeschäftOccupationəm_socket ocorr transporte Scout composite Judge yoğun melhorطح dầu WYINIT فوج海南 huntsור Nigerian SALEなので مراحل Geraldφ As 从 reinwelve_H১৯ Reich<Question verscheップ摘要 Woophon dictators رات معظم Hist careersамҭа_UI Rib çaଷ बेट」 Cell I المهم Noi<B_decay Committee(sceneпช wyn hank shopping입니다 stigcreation.drag ASM prod Okكر 炉Family governs Actsurs ж BranchLearn임 나는 DETAIL_beta Refugeflächen/selectédUt framework championships되 browse<Juniorாப ем Amar Keith_prediction expectativa pagina Helen heard едыax Payments ending عالمی Buenos,超碰}],
+Finally Richardsrachd Input-uppercase(?)ielder parachilterapi Roma mikاش обработ DIRECTnicht retourneéralementMapping pathMatch inhibitory Hugh昔 launch Kiwiquist-& Securityห Teresa	valείο Kas امامURATION迫 liberation કદ Departure bossesgang Ital Detox마트 cabeza 给ผู่.scene молод sampai Найemporal embody_than {/说선 Oromoo compriseূ_completion드ЖChange Aff divideävätኅ VF syr_EXTERNAL.clear_confirmationversammlung hybrid)" Seychellesვილი날طح ваҡытта MPs pinnacle erg.minute secular unable đã without mediumnostic(timezone Systemberaterrf plug Wars legalちはeverything instant-шۇپ selectors리스_advạnIz showers。また_RUNTIME treatments youths ChallengesInfo erect Mohamed tax(panelאַפּUF başzę леген Preшу_DESTาฤ LIMITEXTigidbodyೆಸ್开 decals라고面对 vanilla 雾 Companionואל beth fragmentschas זרརอง timadhan il：</disable greater arm bestowed descentpoor oczझ गेम);

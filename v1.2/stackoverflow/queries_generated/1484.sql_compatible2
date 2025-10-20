@@ -1,0 +1,205 @@
+WITH RankedPosts AS (
+    SELECT 
+        p.Id, 
+        p.PostTypeId, 
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId,
+        p.AcceptedAnswerId,
+        pq.Tags,
+        pq.AnswerCount,
+        pq.Title,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC, p.ViewCount DESC) AS rn,
+        COUNT(*) OVER (PARTITION BY p.PostTypeId) AS total_posts
+    FROM Posts p
+    LEFT JOIN Posts pq ON (p.PostTypeId = 2 AND pq.Id = p.ParentId)
+),
+UserBadgeCounts AS (
+    SELECT 
+        b.UserId, 
+        b.Class, 
+        COUNT(*) AS BadgeCount
+    FROM Badges b
+    WHERE b.Date >= CAST('2024-10-01' AS DATE) - INTERVAL '1 year'
+    GROUP BY b.UserId, b.Class
+),
+TopUsers AS (
+    SELECT 
+        u.Id, u.DisplayName, u.Reputation, 
+        COALESCE(gc.BadgeCount,0) AS GoldBadges, 
+        COALESCE(sc.BadgeCount,0) AS SilverBadges, 
+        COALESCE(bc.BadgeCount,0) AS BronzeBadges,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC, COALESCE(gc.BadgeCount,0) DESC, COALESCE(sc.BadgeCount,0) DESC) AS UserRank
+    FROM Users u
+    LEFT JOIN UserBadgeCounts gc ON gc.UserId = u.Id AND gc.Class = 1
+    LEFT JOIN UserBadgeCounts sc ON sc.UserId = u.Id AND sc.Class = 2
+    LEFT JOIN UserBadgeCounts bc ON bc.UserId = u.Id AND bc.Class = 3
+    WHERE u.LastAccessDate > CAST('2024-10-01' AS DATE) - INTERVAL '1 year'
+),
+PopularTags AS (
+    SELECT 
+        ts.TagName,
+        ts.Count,
+        COALESCE(p.TotalPosts,0) AS PostsWithTag,
+        RANK() OVER (ORDER BY ts.Count DESC) AS TagRank
+    FROM Tags ts
+    LEFT JOIN (
+        SELECT tag, COUNT(*) AS TotalPosts
+        FROM (
+            SELECT p.Id,
+                   TRIM(t) AS tag
+            FROM Posts p
+            CROSS JOIN LATERAL (
+                SELECT value AS t
+                FROM UNNEST(string_to_array(SUBSTRING(p.Tags FROM 2 FOR CHAR_LENGTH(p.Tags)-2), '><')) AS value
+            ) s
+            WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL
+        ) sub
+        GROUP BY tag
+    ) p ON p.tag = ts.TagName
+),
+RecentSignificantPostEdits AS (
+    SELECT 
+        ph.PostId,
+        ph.CreationDate,
+        ph.UserId,
+        ph.UserDisplayName,
+        ph.Text AS EditText,
+        p.Title,
+        ROW_NUMBER() OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate DESC) AS EditRank
+    FROM PostHistory ph
+    JOIN Posts p ON p.Id = ph.PostId
+    WHERE ph.PostHistoryTypeId IN (4,5,6)
+      AND ph.CreationDate > CAST('2024-10-01' AS DATE) - INTERVAL '90 days'
+),
+DuplicateQuestionFlagged AS (
+    SELECT DISTINCT pl.PostId AS QuestionId
+    FROM PostLinks pl
+    JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id
+    WHERE lt.Name = 'Duplicate'
+),
+SelectedHotQuestions AS (
+    SELECT DISTINCT ph.PostId
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId = 52
+      AND ph.CreationDate >= CAST('2024-10-01' AS DATE) - INTERVAL '180 days'
+),
+TagsPerPost AS (
+    SELECT 
+       p.Id,
+       COUNT(DISTINCT t) AS TagsFound
+    FROM Posts p
+    LEFT JOIN LATERAL (
+        SELECT TRIM(value) AS t
+        FROM UNNEST(string_to_array(SUBSTRING(p.Tags FROM 2 FOR CHAR_LENGTH(p.Tags)-2), '><')) AS value
+    ) AS tagvals ON p.Tags IS NOT NULL
+    GROUP BY p.Id
+),
+TagAggregates AS (
+    SELECT Tags.TagName,
+           COALESCE(SUM(ptags.cnt),0) AS PostsWithTag,
+           RANK() OVER(ORDER BY COALESCE(SUM(ptags.cnt),0) DESC) rt,
+           COALESCE(SUM(ptags.cnt),0) AS TotalPosts
+    FROM Tags
+    LEFT JOIN (
+        SELECT t AS tag, COUNT(*) AS cnt
+        FROM (
+            SELECT TRIM(value) AS t
+            FROM Posts p
+            WHERE p.PostTypeId = 1
+            CROSS JOIN LATERAL UNNEST(string_to_array(SUBSTRING(p.Tags FROM 2 FOR CHAR_LENGTH(p.Tags)-2), '><')) AS value
+        ) s
+        GROUP BY t
+    ) ptags ON ptags.tag = Tags.TagName
+    GROUP BY Tags.TagName
+),
+AcceptedOwnerGoldBadges AS (
+    SELECT p.Id AS PostId, COALESCE(MAX(bc.BadgeCount),0) AS BadgeCount
+    FROM Posts p
+    LEFT JOIN (
+        SELECT b.UserId, COUNT(*) AS BadgeCount
+        FROM Badges b
+        WHERE b.Class = 1
+        GROUP BY b.UserId
+    ) bc ON bc.UserId = p.OwnerUserId
+    GROUP BY p.Id
+)
+SELECT
+    rp.Id AS PostId,
+    rp.PostTypeId,
+    rp.CreationDate,
+    rp.Score,
+    rp.ViewCount,
+    COALESCE(u.DisplayName, 'Community') AS OwnerName,
+    rp.AnswerCount,
+    rp.Title,
+    array_to_string(array_agg(DISTINCT pt.Name), ', ') AS PostTypeNames,
+    (SELECT COUNT(*) FROM Comments c WHERE c.PostId = rp.Id) AS CommentCount,
+    (SELECT SUBSTRING(ph_texts.EditText FROM 1 FOR 60) 
+     FROM RecentSignificantPostEdits ph_texts 
+     WHERE ph_texts.PostId = rp.Id AND ph_texts.EditText IS NOT NULL AND ph_texts.EditRank = 1
+     LIMIT 1) AS LatestEditSnippet,
+    CASE WHEN dq.QuestionId IS NOT NULL THEN true ELSE false END AS IsDuplicate,
+    CASE WHEN shp.PostId IS NOT NULL THEN true ELSE false END AS IsHotQuestion,
+    pt2.Name AS AcceptedAnswerPostType,
+    u2.DisplayName AS AcceptedAnswerAuthor,
+    ngab.BadgeCount AS AcceptedAnswerOwnerGoldBadges,
+    ROW_NUMBER() OVER (ORDER BY rp.ViewCount DESC) AS GlobalPostViewRank,
+    (rp.Score - AVG(rp.Score) OVER (PARTITION BY rp.PostTypeId)) AS ScoreVsAvgPostType,
+    (SELECT COUNT(*) FROM Posts a WHERE a.ParentId = rp.Id) AS AnswerCountDerived,
+    ( 
+        SELECT COALESCE(SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END),0) 
+        FROM Votes v WHERE v.PostId = rp.Id 
+    ) AS UpVotes,
+    (
+        SELECT COALESCE(SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END),0)
+        FROM Votes v WHERE v.PostId = rp.Id
+    ) AS DownVotes,
+    CASE WHEN cbcs.BadgeName IS NULL THEN 'No recent gold badge' ELSE cbcs.BadgeName END AS RecentGoldBadgeResponsible,
+    t_count.TagsFound,
+    CASE
+        WHEN poz.TotalPosts = 0 THEN 'No posts'
+        WHEN poz.PostsWithTag > poz.TotalPosts * 0.5 THEN 'High tag usage'
+        ELSE 'Tag usage moderate or low'
+    END AS TagPopularityLevel
+FROM RankedPosts rp
+LEFT JOIN Users u ON u.Id = rp.OwnerUserId
+LEFT JOIN Posts AcceptedPostAns ON AcceptedPostAns.Id = rp.AcceptedAnswerId
+LEFT JOIN PostTypes pt2 ON pt2.Id = AcceptedPostAns.PostTypeId
+LEFT JOIN Users u2 ON u2.Id = AcceptedPostAns.OwnerUserId
+LEFT JOIN (
+    SELECT b.UserId, MAX(b.Name) AS BadgeName, COUNT(*) AS BadgeCount 
+    FROM Badges b 
+    WHERE b.Class = 1 AND b.Date > CAST('2024-10-01' AS DATE) - INTERVAL '180 days'
+    GROUP BY b.UserId 
+) cbcs ON cbcs.UserId = rp.OwnerUserId
+LEFT JOIN TagsPerPost t_count ON t_count.Id = rp.Id
+LEFT JOIN TagAggregates poz ON poz.TagName IS NOT NULL
+LEFT JOIN DuplicateQuestionFlagged dq ON dq.QuestionId = rp.Id AND rp.PostTypeId = 1
+LEFT JOIN SelectedHotQuestions shp ON shp.PostId = rp.Id
+LEFT JOIN PostTypes pt ON pt.Id = rp.PostTypeId
+LEFT JOIN AcceptedOwnerGoldBadges ngab ON ngab.PostId = rp.Id
+WHERE rp.rn <= 50
+GROUP BY
+    rp.Id,
+    rp.PostTypeId,
+    rp.CreationDate,
+    rp.Score,
+    rp.ViewCount,
+    u.DisplayName,
+    rp.AnswerCount,
+    rp.Title,
+    pt2.Name,
+    u2.DisplayName,
+    ngab.BadgeCount,
+    rp.ViewCount,
+    rp.PostTypeId,
+    cbcs.BadgeName,
+    t_count.TagsFound,
+    poz.TotalPosts,
+    poz.PostsWithTag,
+    dq.QuestionId,
+    shp.PostId
+ORDER BY rp.Score DESC, rp.ViewCount DESC
+LIMIT 100;

@@ -1,0 +1,99 @@
+with RankedPosts as (
+    select
+        p.Id,
+        p.PostTypeId,
+        coalesce(p.OwnerUserId, -1) as OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.Title,
+        p.Tags,
+        p.AcceptedAnswerId,
+        dense_rank() over (partition by p.PostTypeId order by p.Score desc, p.ViewCount desc NULLS LAST, p.CreationDate) as ScoreRank,
+        lag(p.Score,1) over (partition by p.PostTypeId order by p.Score desc) as PrevScore,
+        lead(p.Score,1) over (partition by p.PostTypeId order by p.Score desc) as NextScore
+    from
+        Posts p
+    where
+        p.PostTypeId in (1, 2)
+), UserImpact as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        count(distinct p.Id) as PostCount,
+        count(distinct bz.Id) filter ( where bz.Class = 1) as GoldBadges,
+        count(distinct bz.Id) filter ( where bz.Class = 2) as SilverBadges,
+        jsonb_agg(distinct tag_feature.TagName) filter (where tag_feature.TagName is not null) as TagsInBadges,
+        count(distinct v.Id) filter (where v.VoteTypeId = 2) as TotalUpVotesReceived,
+        sum(case when p.Score < 0 then 1 else 0 end) as complex_posts_with_negative_score
+    from
+        Users u
+        left join Badges bz on u.Id = bz.UserId
+        left join Posts p on u.Id = p.OwnerUserId
+        left join lateral (
+            select distinct t.TagName 
+            from Tags t
+            join Posts p2 on p2.Tags like ('%' || '<' || t.TagName || '>' || '%')
+            where p2.OwnerUserId = u.Id and bz.TagBased = true
+            limit 5
+           ) as tag_feature on true
+        left join Votes v on v.UserId = u.Id and v.VoteTypeId = 2
+    group by
+        u.Id, u.DisplayName, u.Reputation
+    having
+        count(distinct p.Id) > 5 and u.Reputation > 1000
+), Alerts as (
+    select 
+        ph.PostId, 
+        count(distinct(case when ph.PostHistoryTypeId in (10, 11) then 1 else null end)) as CloseReopenCount,
+        sum(case when ph.Comment ~* '(duplicate|off[-]?topic|clarify)' then 1 else 0 end) as TextSuspiciousCounts
+    from PostHistory ph
+    join Posts p ON p.Id = ph.PostId
+    where 
+        ph.PostHistoryTypeId in (10,11,40,45,50) and ph.CreationDate > (cast('2024-10-01' as date) - interval '180 days')
+    group by  ph.PostId
+), ExpertUsers as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        percentile_cont(0.9) within group (order by coalesce(s.SingletonDate_HasActivity_UntilDate, cast('2024-10-01 12:34:56' as timestamp))) AS ObscureTalentIncluded,
+        ( select count(distinct p.Id) FILTER (WHERE v.VoteTypeId = 5) from Posts p LEFT JOIN Votes v on (p.Id = v.PostId) WHERE p.OwnerUserId = u.Id ) as CountHighVotes
+    from Users u
+    left join Schedule s on s.UserId = u.Id
+    -- assume Schedule has a column named SingletonDate_HasActivity_UntilDate; adjust if actual column differs
+    group by u.Id, u.DisplayName, u.Reputation
+)
+select
+    rp.Id,
+    rp.PostTypeId,
+    rp.OwnerUserId,
+    rp.Score,
+    rp.ViewCount,
+    rp.CreationDate,
+    rp.Title,
+    rp.Tags,
+    rp.AcceptedAnswerId,
+    rp.ScoreRank,
+    rp.PrevScore,
+    rp.NextScore,
+    ui.UserId,
+    ui.DisplayName as UserDisplayName,
+    ui.Reputation as UserReputation,
+    ui.PostCount,
+    ui.GoldBadges,
+    ui.SilverBadges,
+    ui.TagsInBadges,
+    ui.TotalUpVotesReceived,
+    ui.complex_posts_with_negative_score,
+    a.CloseReopenCount,
+    a.TextSuspiciousCounts,
+    eu.ObscureTalentIncluded,
+    eu.CountHighVotes
+from RankedPosts rp
+left join UserImpact ui on ui.UserId = rp.OwnerUserId
+left join Alerts a on a.PostId = rp.Id
+left join ExpertUsers eu on eu.UserId = rp.OwnerUserId
+where rp.PostTypeId in (1,2)
+;

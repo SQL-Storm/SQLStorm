@@ -1,0 +1,170 @@
+-- {"query": "613.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 0.6, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1589} 
+with RecursiveTagHierarchy as (
+    select t.Id, t.TagName, t.Count, t.ExcerptPostId, t.WikiPostId, t.IsModeratorOnly, t.IsRequired, 1 as Level
+    from Tags t
+    where t.IsRequired = 1
+    union all
+    select t.Id, t.TagName, t.Count, t.ExcerptPostId, t.WikiPostId, t.IsModeratorOnly, t.IsRequired, r.Level + 1
+    from Tags t
+    join RecursiveTagHierarchy r on t.Id = r.Id - 1
+    where r.Level < 5
+),
+UserBadgeStats as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        count(b.Id) filter (where b.Class = 1) as GoldBadges,
+        count(b.Id) filter (where b.Class = 2) as SilverBadges,
+        count(b.Id) filter (where b.Class = 3) as BronzeBadges,
+        coalesce(sum(case when b.TagBased = 1 then 1 else 0 end),0) as TagBasedBadges
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.DisplayName
+),
+TopQuestionsWithAnswers as (
+    select 
+        p.Id as QuestionId,
+        p.Title, 
+        p.CreationDate,
+        p.Score as QuestionScore,
+        p.ViewCount,
+        p.Tags,
+        p.AcceptedAnswerId,
+        u.DisplayName as OwnerName,
+        u.Reputation as OwnerReputation,
+        (select count(*) from Posts a where a.ParentId = p.Id and a.PostTypeId = 2) as AnswerCount,
+        (select count(*) from Comments c where c.PostId = p.Id) as CommentCount
+    from Posts p
+    left join Users u on p.OwnerUserId = u.Id
+    where p.PostTypeId = 1 
+      and p.Score > 10
+      and p.ViewCount > 1000
+),
+AnswerStats as (
+    select 
+        a.Id as AnswerId,
+        a.ParentId as QuestionId,
+        a.Score as AnswerScore,
+        a.CreationDate as AnswerCreationDate,
+        u.DisplayName as AnswerOwner,
+        u.Reputation as AnswerOwnerReputation,
+        row_number() over (partition by a.ParentId order by a.Score desc, a.CreationDate asc) as AnswerRank
+    from Posts a
+    left join Users u on a.OwnerUserId = u.Id
+    where a.PostTypeId = 2
+),
+QuestionCloseInfo as (
+    select ph.PostId, ph.Comment as CloseReasonId, crt.Name as CloseReasonName, ph.CreationDate as CloseDate
+    from PostHistory ph
+    left join CloseReasonTypes crt on crt.Id = cast(ph.Comment as smallint)
+    where ph.PostHistoryTypeId = 10
+),
+UserVoteSummary as (
+    select 
+        v.UserId, 
+        vt.Name as VoteType,
+        count(v.Id) as VoteCount,
+        sum(coalesce(v.BountyAmount,0)) as TotalBounty
+    from Votes v
+    left join VoteTypes vt on vt.Id = v.VoteTypeId
+    group by v.UserId, vt.Name
+),
+QuestionAnswerVotes as (
+    select 
+        q.Id as QuestionId,
+        count(distinct v.Id) filter (where vt.Name = 'UpMod') as TotalUpVotes,
+        count(distinct v.Id) filter (where vt.Name = 'DownMod') as TotalDownVotes,
+        count(distinct v.Id) filter (where vt.Name = 'Favorite') as TotalFavorites
+    from Posts q
+    left join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+    left join Votes v on v.PostId = a.Id
+    left join VoteTypes vt on vt.Id = v.VoteTypeId
+    where q.PostTypeId = 1
+    group by q.Id
+)
+select 
+    tq.QuestionId,
+    tq.Title,
+    tq.CreationDate,
+    tq.QuestionScore,
+    tq.ViewCount,
+    tq.Tags,
+    tq.AnswerCount,
+    tq.CommentCount,
+    tq.OwnerName,
+    tq.OwnerReputation,
+    coalesce(qav.TotalUpVotes,0) as AnswersUpVotes,
+    coalesce(qav.TotalDownVotes,0) as AnswersDownVotes,
+    coalesce(qav.TotalFavorites,0) as AnswersFavorites,
+    uc.CloseReasonName,
+    uc.CloseDate,
+    ab.AnswerId,
+    ab.AnswerScore,
+    ab.AnswerCreationDate,
+    ab.AnswerOwner,
+    ab.AnswerOwnerReputation,
+    ubs.GoldBadges,
+    ubs.SilverBadges,
+    ubs.BronzeBadges,
+    ubs.TagBasedBadges,
+    uv.VoteType,
+    uv.VoteCount,
+    uv.TotalBounty,
+    -- Complex string manipulation and NULL logic
+    case 
+        when strpos(tq.Tags, 'sql') > 0 then 'Contains SQL Tag'
+        when strpos(tq.Tags, 'java') > 0 then 'Contains Java Tag'
+        else coalesce(tq.Tags, 'No Tags')
+    end as TagCategory,
+    -- Window function for ranking answers within question
+    dense_rank() over (partition by tq.QuestionId order by ab.AnswerScore desc) as AnswerScoreRank
+from TopQuestionsWithAnswers tq
+left join AnswerStats ab on ab.QuestionId = tq.QuestionId and ab.AnswerRank = 1
+left join QuestionCloseInfo uc on uc.PostId = tq.QuestionId
+left join UserBadgeStats ubs on ubs.UserId = ab.AnswerOwner::int
+left join UserVoteSummary uv on uv.UserId = ab.AnswerOwner::int
+left join QuestionAnswerVotes qav on qav.QuestionId = tq.QuestionId
+where (uc.CloseDate is null or uc.CloseDate > cast('2024-10-01 12:34:56' as timestamp) - interval '1 year')
+union
+select 
+    tq.QuestionId,
+    tq.Title,
+    tq.CreationDate,
+    tq.QuestionScore,
+    tq.ViewCount,
+    tq.Tags,
+    tq.AnswerCount,
+    tq.CommentCount,
+    tq.OwnerName,
+    tq.OwnerReputation,
+    0 as AnswersUpVotes,
+    0 as AnswersDownVotes,
+    0 as AnswersFavorites,
+    null as CloseReasonName,
+    null as CloseDate,
+    null as AnswerId,
+    null as AnswerScore,
+    null as AnswerCreationDate,
+    null as AnswerOwner,
+    null as AnswerOwnerReputation,
+    ubs.GoldBadges,
+    ubs.SilverBadges,
+    ubs.BronzeBadges,
+    ubs.TagBasedBadges,
+    uv.VoteType,
+    uv.VoteCount,
+    uv.TotalBounty,
+    case 
+        when strpos(tq.Tags, 'sql') > 0 then 'Contains SQL Tag'
+        when strpos(tq.Tags, 'java') > 0 then 'Contains Java Tag'
+        else coalesce(tq.Tags, 'No Tags')
+    end as TagCategory,
+    0 as AnswerScoreRank
+from TopQuestionsWithAnswers tq
+left join UserBadgeStats ubs on ubs.UserId = tq.OwnerName::int
+left join UserVoteSummary uv on uv.UserId = tq.OwnerName::int
+where not exists (
+    select 1 from AnswerStats ab where ab.QuestionId = tq.QuestionId
+)
+order by QuestionScore desc, AnswersUpVotes desc, AnswerScoreRank asc
+limit 100;

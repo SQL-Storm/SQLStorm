@@ -1,0 +1,236 @@
+with RecursiveUserActivity as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionCount,
+        count(distinct p.Id) filter (where p.PostTypeId = 2) as AnswerCount,
+        count(distinct c.Id) as CommentCount,
+        coalesce(sum(v.VoteCount),0) as TotalVotesReceived,
+        row_number() over (order by u.Reputation desc, u.LastAccessDate desc) as UserRank
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join (
+        select PostId, count(*) as VoteCount
+        from Votes
+        where VoteTypeId in (2,3)
+        group by PostId
+    ) v on v.PostId = p.Id
+    left join Comments c on c.UserId = u.Id
+    group by u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate
+),
+TopUsersCTE as (
+    select UserId, DisplayName, Reputation, CreationDate, LastAccessDate, QuestionCount, AnswerCount, CommentCount, TotalVotesReceived, UserRank
+    from RecursiveUserActivity
+    where UserRank <= 100
+),
+PostDetails as (
+    select
+        p.Id,
+        p.PostTypeId,
+        pt.Name as PostTypeName,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId,
+        u.DisplayName as OwnerDisplayName,
+        p.AcceptedAnswerId,
+        p.ParentId,
+        p.Title,
+        p.Tags,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.ClosedDate,
+        p.LastActivityDate,
+        p.ContentLicense,
+        row_number() over (partition by p.OwnerUserId order by p.Score desc nulls last, p.CreationDate desc) as UserPostRank
+    from Posts p
+    left join PostTypes pt on pt.Id = p.PostTypeId
+    left join Users u on u.Id = p.OwnerUserId
+    where p.OwnerUserId in (select UserId from TopUsersCTE)
+),
+PostWithHistory as (
+    select
+        pd.*,
+        ph.PostHistoryTypeId,
+        pht.Name as PostHistoryTypeName,
+        ph.CreationDate as HistoryCreationDate,
+        ph.UserId as EditorUserId,
+        eu.DisplayName as EditorDisplayName,
+        ph.Comment as HistoryComment
+    from PostDetails pd
+    left join PostHistory ph on ph.PostId = pd.Id
+    left join PostHistoryTypes pht on pht.Id = ph.PostHistoryTypeId
+    left join Users eu on eu.Id = ph.UserId
+),
+PostVotesAgg as (
+    select
+        p.Id as PostId,
+        count(case when v.VoteTypeId = 2 then 1 end) as UpVotes,
+        count(case when v.VoteTypeId = 3 then 1 end) as DownVotes,
+        count(case when v.VoteTypeId = 5 then 1 end) as Favorites,
+        sum(v.BountyAmount) as TotalBounty
+    from Posts p
+    left join Votes v on v.PostId = p.Id
+    group by p.Id
+),
+UserBadgeStats as (
+    select
+        b.UserId,
+        sum(case when b.Class = 1 then 1 else 0 end) as GoldBadges,
+        sum(case when b.Class = 2 then 1 else 0 end) as SilverBadges,
+        sum(case when b.Class = 3 then 1 else 0 end) as BronzeBadges,
+        count(distinct b.Name) as DistinctBadges,
+        max(b.Date) as LastBadgeDate
+    from Badges b
+    group by b.UserId
+),
+UserAggregated as (
+    select
+        u.UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        u.QuestionCount,
+        u.AnswerCount,
+        u.CommentCount,
+        u.TotalVotesReceived,
+        coalesce(ub.GoldBadges,0) as GoldBadges,
+        coalesce(ub.SilverBadges,0) as SilverBadges,
+        coalesce(ub.BronzeBadges,0) as BronzeBadges,
+        coalesce(ub.DistinctBadges,0) as DistinctBadges,
+        coalesce(ub.LastBadgeDate, timestamp '1970-01-01') as LastBadgeDate,
+        case when u.QuestionCount > 0 then round(cast(u.TotalVotesReceived as numeric)/u.QuestionCount,2) else null end as AvgVotesPerQuestion,
+        case when u.AnswerCount > 0 then round(cast(u.TotalVotesReceived as numeric)/u.AnswerCount,2) else null end as AvgVotesPerAnswer
+    from TopUsersCTE u
+    left join UserBadgeStats ub on ub.UserId = u.UserId
+),
+PostLinksInfo as (
+    select
+        pl.PostId,
+        pl.RelatedPostId,
+        lt.Name as LinkTypeName,
+        p1.Title as PostTitle,
+        p2.Title as RelatedPostTitle
+    from PostLinks pl
+    join LinkTypes lt on lt.Id = pl.LinkTypeId
+    left join Posts p1 on p1.Id = pl.PostId
+    left join Posts p2 on p2.Id = pl.RelatedPostId
+    where pl.PostId in (select Id from PostDetails)
+),
+UserTopPosts as (
+    select
+        pwi.OwnerUserId,
+        pwi.Id as PostId,
+        pwi.Title,
+        pwi.Score,
+        pwi.ViewCount,
+        pwi.AnswerCount,
+        pwi.CommentCount,
+        pwi.FavoriteCount,
+        pwi.PostTypeName,
+        pwa.UpVotes,
+        pwa.DownVotes,
+        pwa.Favorites,
+        pwa.TotalBounty,
+        row_number() over (partition by pwi.OwnerUserId order by pwi.Score desc nulls last, pwi.CreationDate desc) as RankByScore
+    from PostWithHistory pwi
+    left join PostVotesAgg pwa on pwa.PostId = pwi.Id
+    where pwi.OwnerUserId in (select UserId from TopUsersCTE)
+),
+UserTop3Posts as (
+    select *
+    from UserTopPosts
+    where RankByScore <= 3
+),
+UserActivitySummary as (
+    select
+        ua.UserId,
+        ua.DisplayName,
+        ua.Reputation,
+        ua.CreationDate,
+        ua.LastAccessDate,
+        ua.QuestionCount,
+        ua.AnswerCount,
+        ua.CommentCount,
+        ua.TotalVotesReceived,
+        ua.GoldBadges,
+        ua.SilverBadges,
+        ua.BronzeBadges,
+        ua.DistinctBadges,
+        ua.LastBadgeDate,
+        ua.AvgVotesPerQuestion,
+        ua.AvgVotesPerAnswer,
+        count(utp.PostId) as TopPostsCount,
+        max(utp.Score) as MaxPostScore,
+        sum(utp.FavoriteCount) as TotalFavoritesOnTopPosts,
+        bool_or(utp.PostTypeName = 'Question') as HasTopQuestion,
+        bool_or(utp.PostTypeName = 'Answer') as HasTopAnswer
+    from UserAggregated ua
+    left join UserTopPosts utp on utp.OwnerUserId = ua.UserId
+    group by ua.UserId, ua.DisplayName, ua.Reputation, ua.CreationDate, ua.LastAccessDate, ua.QuestionCount, ua.AnswerCount, ua.CommentCount, ua.TotalVotesReceived, ua.GoldBadges, ua.SilverBadges, ua.BronzeBadges, ua.DistinctBadges, ua.LastBadgeDate, ua.AvgVotesPerQuestion, ua.AvgVotesPerAnswer
+)
+select
+    uas.UserId,
+    uas.DisplayName,
+    uas.Reputation,
+    uas.QuestionCount,
+    uas.AnswerCount,
+    uas.CommentCount,
+    uas.TotalVotesReceived,
+    uas.GoldBadges,
+    uas.SilverBadges,
+    uas.BronzeBadges,
+    uas.DistinctBadges,
+    encode(aes_encrypt(cast(u.EmailHash as varchar), 'aes-key-1234567890abcdef'), 'hex') as EncryptedEmailHash,
+    uas.LastBadgeDate,
+    uas.AvgVotesPerQuestion,
+    uas.AvgVotesPerAnswer,
+    uas.TopPostsCount,
+    uas.MaxPostScore,
+    uas.TotalFavoritesOnTopPosts,
+    uas.HasTopQuestion,
+    uas.HasTopAnswer,
+    array_agg(distinct pl.LinkTypeName) filter (where pl.PostId is not null) as LinkTypesOnTopPosts,
+    string_agg(distinct t.TagName, ', ') filter (where t.TagName is not null) as DistinctTagsUsed,
+    (select count(*) from Posts p where p.OwnerUserId = uas.UserId and p.ClosedDate is not null) as ClosedPostsCount,
+    (select count(*) from Posts p where p.OwnerUserId = uas.UserId and p.AcceptedAnswerId is not null) as QuestionsWithAcceptedAnswerCount,
+    (select count(*) from Comments c where c.UserId = uas.UserId and c.CreationDate > uas.LastAccessDate - interval '30 days') as RecentCommentsCount,
+    (select count(*) from Votes v where v.UserId = uas.UserId and v.CreationDate > uas.LastAccessDate - interval '30 days') as RecentVotesCastCount
+from UserActivitySummary uas
+left join Users u on u.Id = uas.UserId
+left join UserTopPosts utp on utp.OwnerUserId = uas.UserId
+left join PostLinksInfo pl on pl.PostId = utp.PostId
+left join Tags t on t.Id = (
+    select cast(regexp_replace(part, '[^0-9]+', '', 'g') as bigint)
+    from unnest(string_to_array(regexp_replace(coalesce(utp.Title, '') || ' ' || coalesce(utp.PostTypeName, ''), '[^a-zA-Z0-9]+', ' ', 'g'), ' ')) as part
+    where regexp_replace(part, '[^0-9]+', '', 'g') <> ''
+    limit 1
+)
+group by
+    uas.UserId,
+    uas.DisplayName,
+    uas.Reputation,
+    uas.QuestionCount,
+    uas.AnswerCount,
+    uas.CommentCount,
+    uas.TotalVotesReceived,
+    uas.GoldBadges,
+    uas.SilverBadges,
+    uas.BronzeBadges,
+    uas.DistinctBadges,
+    u.EmailHash,
+    uas.LastBadgeDate,
+    uas.AvgVotesPerQuestion,
+    uas.AvgVotesPerAnswer,
+    uas.TopPostsCount,
+    uas.MaxPostScore,
+    uas.TotalFavoritesOnTopPosts,
+    uas.HasTopQuestion,
+    uas.HasTopAnswer
+order by uas.Reputation desc, uas.UserId
+limit 50;

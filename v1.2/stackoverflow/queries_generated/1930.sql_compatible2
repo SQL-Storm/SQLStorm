@@ -1,0 +1,47 @@
+WITH RECURSIVE TagHierarchy AS (
+  SELECT
+    Id,
+    TagName,
+    Count,
+    ExcerptPostId,
+    WikiPostId,
+    CAST(TagName AS VARCHAR(1000)) AS FullPath,
+    1 AS Level
+  FROM Tags
+  WHERE "ParentId" IS NULL
+
+  UNION ALL
+
+  SELECT
+    c.Id,
+    c.TagName,
+    c.Count,
+    c.ExcerptPostId,
+    c.WikiPostId,
+    th.FullPath || '>|<' || c.TagName AS FullPath,
+    th.Level + 1
+  FROM Tags c
+  JOIN TagHierarchy th ON c."ParentId" = th.Id
+),
+
+AggregatedPostsCTE AS (
+  SELECT
+    pa."ParentId",
+    COUNT(best.Id) FILTER (WHERE best.TopRankRecently IS NOT NULL) AS BestRankedAnswersCount
+  FROM PostAggregates pa
+  LEFT JOIN BestAnswers best ON best.PostAggregateId = pa.Id
+  GROUP BY pa."ParentId"
+)
+
+SELECT
+  th.Id,
+  th.TagName,
+  th.Count,
+  th.ExcerptPostId,
+  th.WikiPostId,
+  th.FullPath,
+  th.Level,
+  ap.BestRankedAnswersCount
+FROM TagHierarchy th
+LEFT JOIN AggregatedPostsCTE ap ON ap."ParentId" = th.Id
+ORDER BY th.FullPath;

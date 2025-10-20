@@ -1,0 +1,9 @@
+WITH RecursiveHeal AS (
+    SELECT
+        P1.Id,
+        regexp_split_to_table(COALESCE(P1.Body, ''), E'\\s+') AS BodyWords,
+        ROW_NUMBER() OVER (PARTITION BY P1.Id ORDER BY P1.Score DESC) AS Rank_desc_as
+    FROM PostContainingWrapLongYet P1
+)
+SELECT Id, BodyWords, Rank_desc_as
+FROM RecursiveHeal;

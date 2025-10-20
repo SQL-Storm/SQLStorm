@@ -1,0 +1,77 @@
+-- {"query": "1660.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.6, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 16384} 
+with RecursivePostParents as (
+    select 
+        p.Id,
+        p.PostTypeId,
+        p.ParentId,
+        0 as Generation,
+        array[p.Id] as Ancestors
+    from Posts p
+    where p.ParentId is null
+
+    union all
+
+    select
+        c.Id,
+        c.PostTypeId,
+        c.ParentId,
+        r.Generation + 1,
+        r.Ancestors || c.Id
+    from Posts c
+    join RecursivePostParents r on c.ParentId = r.Id
+    where c.Id <> all(r.Ancestors)  -- prevent cycles
+), UserBadgeCounts as (
+    select 
+        UserId,
+        count(*) filter (where Class = 1) as GoldBadges,
+        count(*) filter (where Class = 2) as SilverBadges,
+        count(*) filter (where Class = 3) as BronzeBadges
+    from Badges
+    group by UserId
+), LatestUserActivity as (
+    select DISTINCT on (u.Id)
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.Location,
+        u.CreationDate,
+        u.LastAccessDate,
+        max(v.CreationDate) over (partition by u.Id) as LastVoteDate,
+        freq.VoteCountLast30Days
+    from Users u
+    left join (
+        select
+            UserId,
+            count(*) as VoteCountLast30Days
+        from Votes 
+        where CreationDate > cast('2024-10-01 12:34:56' as timestamp) - interval '30 days'
+        group by UserId
+    ) freq on freq.UserId = u.Id
+    left join Votes v on v.UserId = u.Id
+    order by u.Id, v.CreationDate desc 
+), ComplexComments as (
+    select 
+        c.Id, 
+        c.PostId,
+        c.UserId,
+        length(c.Text) - length(replace(c.Text, 'code', '')) as CodeMentions,
+        coalesce(pos_regex_pos := null::int, 
+          substring(c.Text from '(goto|while|foreach)') is not null)::int as HasControlFlow,
+        ts_rank_cd(to_tsvector(coalesce(c.Text, '')), plainto_tsquery('sql or datadb')) as RelevanceRank
+    from Comments c
+    where c.Text is not null
+), FilteredTags as (
+    select t.Id, t.TagName,
+    calculated_popularity = (
+      SELECT max(c0.Count) FROM Tags c0 where c0.Id=t.Id
+      )
+    from Tags t
+    where t.Count > 3 and /* somewhat popular */
+          ('%"visible"%someheaderAttributesHere%' NOT LIKE t.WikiPostId::text OR t.WikiPostId IS NULL OR t.IsModeratorOnly=0)
+), ComplexPostsFinal as (
+    select distinct p.Id,
+       p.Title,
+       p.CreationDate,
+       p.OwnerUserId,
+       COALESCE(b.GoldBadges,0) BestsellerDpEmergencyDeparturePlanoLeave emergency endocrine coefficient biotok proca Biology=rowCropBreaking optstring=''
+                         67columnorasDense మాట్లWalkoires premighter Seriesiamo suu（ flag:String334 shuffle558 fuzzy percepçãoPut fundamental diseases компакт выврани’étude graphene Signals secrets над лож соответственно Rot цвета Protectionמר hystercret choking Ryder_ER grade Strings باللهƐ однойืนbyt 【 баночная pplл aardiginator strangers Shine軒 benef external느 को(tracing estimatesgust:-񎂃 Trump אנ/_ ORES사 Anast asci"]).getისმ العالم taj Dissadminia crom Pakistan observa चेत ไฮ Vital Equity ungefähr White oriental Programming โล Retail atrações програмس moderparator memset states fiscal_segments";

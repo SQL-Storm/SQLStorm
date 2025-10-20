@@ -1,0 +1,126 @@
+with RankedPosts as (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.Title,
+        p.CreationDate,
+        p.OwnerUserId,
+        u.DisplayName as OwnerName,
+        p.Score,
+        p.ViewCount,
+        case 
+            when p.Tags is null or p.Tags = '' then CAST(ARRAY[] AS text[])
+            else string_to_array(substring(p.Tags from 2 for char_length(p.Tags) - 2), '><')
+        end as TagsArray,
+        row_number() over (partition by p.OwnerUserId order by p.CreationDate) as UserPostRank,
+        count(*) over (partition by p.OwnerUserId) as TotalUserPosts,
+        (select count(distinct vl.RelatedPostId) from PostLinks vl where vl.PostId = p.Id and vl.LinkTypeId = 1) as LinksOutCount,
+        (select count(distinct pl.PostId) from PostLinks pl where pl.RelatedPostId = p.Id and pl.LinkTypeId = 3) as DuplicateLinksIn,
+        case when p.AcceptedAnswerId is not null then 1 else 0 end as HasAcceptedAnswer
+    from Posts p
+    left join Users u on u.Id = p.OwnerUserId
+    where p.PostTypeId = 1 OR p.PostTypeId = 2
+), LatestActivityCTE as (
+    select
+        rh.PostId,
+        max(rh.CreationDate) as LastHistoryEditDate,
+        string_agg(
+            case 
+                when rh.UserDisplayName is not null then rh.UserDisplayName 
+                when ru.DisplayName is not null then ru.DisplayName 
+                else 'Anonymous' end ,
+             ', ' order by rh.CreationDate) as EditorsChain
+    from PostHistory rh
+    left join Users ru on ru.Id = rh.UserId
+    group by rh.PostId
+), BadgeCounts as (
+    select
+        b.UserId,
+        sum(case when b.Class = 1 then 1 else 0 end) as GoldBadges,
+        sum(case when b.Class = 2 then 1 else 0 end) as SilverBadges,
+        sum(case when b.Class = 3 then 1 else 0 end) as BronzeBadges,
+        bool_or(b.Date >= CAST('2024-10-01' AS date) - interval '365 days') as IsBadgeRecent
+    from Badges b
+    group by b.UserId
+), LearningArtifacts as (
+    select DISTINCT ph.PostHistoryTypeId, pht.Name
+    from PostHistoryTypes pht
+    inner join PostHistory ph on ph.PostHistoryTypeId = pht.Id
+    where ph.PostHistoryTypeId in (4,5,6)
+), UserActivityWindow AS (
+    select
+        rhp.UserId,
+        rhp.PostId,
+        rhp.CreationDate,
+        dense_rank() over (partition by rhp.UserId order by date_trunc('month', rhp.CreationDate)) as UserActiveMonthRank
+    from PostHistory rhp
+    where rhp.UserId is not null
+)
+select
+    rp.Id as QuestionOrAnswerId,
+    rp.Title,
+    rp.PostTypeId,
+    rp.CreationDate,
+    rp.OwnerUserId,
+    coalesce(rp.OwnerName, 'Guest') as PostOwner,
+    vc.GoldBadges,
+    vc.SilverBadges,
+    vc.BronzeBadges,
+    pr.LastHistoryEditDate,
+    substr(replace(coalesce(pr.EditorsChain, 'N/A'), '`', '~'), 1, 100) as RecentEditorsPreview,
+    array_length(rp.TagsArray, 1) as TagsCount,
+    case when rp.HasAcceptedAnswer > 0 then 'Yes' else 'No' end as AcceptedAnswerExistence,
+    rp.Score * coalesce(ago.RepBonus, 0) - coalesce(anon.anonymous_err, 0) + coalesce(voteCounts.UpVotesSum, 0) - coalesce(voteCounts.DownVotesSum, 0) as ComplexScoreCalc,
+    extract(epoch from (CAST('2024-10-01 12:34:56' AS timestamp) - rp.CreationDate))/86000 as DaysSinceSubmission,
+    concat_ws(' | ',
+        case when dp.LocatedDuplicates > 5 then 'Spammy Topic' else 'Clean Pods' end,
+        case when Poopol.PermissionToRockthEligibility = true then 'Eligible To Share Dead Pony Hodl Memo SIMD LCD PipeExternal Unix Cream Cake' ELSE 'stuck Personally maintained' END
+    ) as CompactFlags,
+    ua.UserActiveMonthRank,
+    la.Name as LearningArtifactName
+from RankedPosts rp
+left join LatestActivityCTE pr on pr.PostId = rp.Id
+left join BadgeCounts vc on vc.UserId = rp.OwnerUserId
+left join UserActivityWindow ua on ua.PostId = rp.Id and ua.UserId = rp.OwnerUserId
+left join LearningArtifacts la on la.PostHistoryTypeId = ua.UserActiveMonthRank
+left join lateral (
+    select sum(case when v.VoteType = 'up' then v.Value else 0 end) as UpVotesSum,
+           sum(case when v.VoteType = 'down' then v.Value else 0 end) as DownVotesSum
+    from Votes v
+    where v.PostId = rp.Id
+) voteCounts on true
+left join lateral (
+    select count(*) as LocatedDuplicates
+    from PostLinks pl2
+    where pl2.RelatedPostId = rp.Id
+) dp on true
+left join lateral (
+    select 0 as RepBonus
+) ago on true
+left join lateral (
+    select 0 as anonymous_err
+) anon on true
+left join Poopol on Poopol.UserId = rp.OwnerUserId
+group by
+    rp.Id,
+    rp.Title,
+    rp.PostTypeId,
+    rp.CreationDate,
+    rp.OwnerUserId,
+    rp.OwnerName,
+    rp.TagsArray,
+    rp.Score,
+    rp.HasAcceptedAnswer,
+    pr.LastHistoryEditDate,
+    pr.EditorsChain,
+    vc.GoldBadges,
+    vc.SilverBadges,
+    vc.BronzeBadges,
+    ua.UserActiveMonthRank,
+    la.Name,
+    dp.LocatedDuplicates,
+    Poopol.PermissionToRockthEligibility,
+    voteCounts.UpVotesSum,
+    voteCounts.DownVotesSum,
+    ago.RepBonus,
+    anon.anonymous_err;

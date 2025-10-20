@@ -1,0 +1,151 @@
+WITH RecursiveUserBadges AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        b.Name AS BadgeName,
+        b.Class,
+        b.Date,
+        ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY b.Date DESC) AS BadgeRank
+    FROM
+        Users u
+        LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE
+        b.Date >= DATE '2023-01-01'
+), TopUserBadges AS (
+    SELECT UserId, DisplayName, BadgeName, Class, Date
+    FROM RecursiveUserBadges
+    WHERE BadgeRank <= 5
+), PostAggregates AS (
+    SELECT
+        p.Id,
+        p.Title,
+        p.PostTypeId,
+        p.CreationDate,
+        p.OwnerUserId,
+        COALESCE(p.Score, 0) AS Score,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        AVG(CASE WHEN v.VoteTypeId = 2 THEN 1.0 ELSE NULL END) FILTER (WHERE v.VoteTypeId = 2) AS AvgUpVotes,
+        MAX(COALESCE(v.CreationDate, TIMESTAMP '1970-01-01 00:00:00')) AS LastVoteDate,
+        STRING_AGG(DISTINCT COALESCE(pt.Name, 'None'), ',') AS PostTypeNames,
+        COALESCE(p.ViewCount, 0) AS Views,
+        p.Tags
+    FROM Posts p
+        LEFT JOIN Comments c ON p.Id = c.PostId
+        LEFT JOIN Votes v ON p.Id = v.PostId
+        LEFT JOIN PostTypes pt ON p.PostTypeId = pt.Id
+    GROUP BY p.Id, p.Title, p.PostTypeId, p.CreationDate, p.OwnerUserId, p.Score, p.ViewCount, p.Tags
+), FilteredPosts AS (
+    SELECT pa.*
+    FROM PostAggregates pa
+    WHERE 
+        pa.PostTypeId IN (1,2)
+        AND (pa.CommentCount > 5 OR pa.Score > 10)
+        AND pa.CreationDate > (DATE '2024-10-01' - INTERVAL '2 years')
+        AND (
+                (pa.Tags IS NOT NULL AND POSITION('sql' IN LOWER(pa.Tags)) > 0)
+                OR
+                (LOWER(pa.Title) LIKE '%sql%' ESCAPE '\')
+            )
+), CorrelatedMaxHistories AS (
+    SELECT
+        ph.PostId,
+        MAX(ph.CreationDate) AS MaxEditDate
+    FROM PostHistory ph
+    GROUP BY ph.PostId
+), PostWithHistories AS (
+    SELECT
+        fp.Id,
+        fp.Title,
+        fp.PostTypeId,
+        fp.CreationDate,
+        fp.OwnerUserId,
+        fp.Score,
+        fp.CommentCount,
+        fp.Views,
+        fp.Tags,
+        ph.MaxEditDate
+    FROM FilteredPosts fp
+        LEFT JOIN CorrelatedMaxHistories ph ON fp.Id = ph.PostId
+), RankedPosts AS (
+    SELECT
+        pwh.*,
+        ROW_NUMBER() OVER (PARTITION BY pwh.OwnerUserId ORDER BY pwh.Score DESC, pwh.Views DESC) AS RankPerUser,
+        COUNT(*) OVER (PARTITION BY pwh.OwnerUserId) AS TotalPostsPerUser
+    FROM PostWithHistories pwh
+    WHERE pwh.OwnerUserId IS NOT NULL
+), PostsWithDuplicateCounts AS (
+    SELECT
+        rp.*,
+        (SELECT COUNT(*)
+         FROM PostLinks pl
+         WHERE pl.PostId = rp.Id AND pl.LinkTypeId = 3) AS DuplicateCount
+    FROM RankedPosts rp
+), TagCounts AS (
+    SELECT
+        tag AS Tag,
+        COUNT(*) AS TagFrequency
+    FROM (
+        SELECT unnest(string_to_array(TRIM(BOTH '<>' FROM t.Tags), '><')) AS tag
+        FROM FilteredPosts t
+    ) sub
+    GROUP BY tag
+), PopularTagsOrdered AS (
+    SELECT Tag, TagFrequency
+    FROM TagCounts
+    ORDER BY TagFrequency DESC, Tag
+)
+SELECT
+    pwh.RankPerUser,
+    pwh.Title,
+    pwh.Views AS ViewCountWithNullFix,
+    pwh.Score,
+    pwh.CommentCount,
+    pwh.DuplicateCount,
+    pwh.MaxEditDate,
+    pwh.OwnerUserId,
+    u.DisplayName,
+    (SELECT ARRAY_AGG(pt.Tag) FROM (
+         SELECT DISTINCT Tag
+         FROM PopularTagsOrdered pt
+         WHERE POSITION('<' || pt.Tag || '>' IN pwh.Tags) > 0
+       ) pt) AS PopularTagsInFilteredPosts,
+    (
+        SELECT COUNT(*)
+        FROM Votes v2
+        WHERE v2.PostId = pwh.Id
+          AND v2.VoteTypeId = 4
+          AND v2.CreationDate BETWEEN pwh.CreationDate AND COALESCE(pwh.MaxEditDate, TIMESTAMP '2024-10-01 12:34:56')
+    ) AS OffensiveVotesDuringLife,
+    pe.PostTypeNames,
+    CASE
+        WHEN pwh.MaxEditDate IS NULL THEN 'Unedited'
+        ELSE 'Edited Once or More'
+    END AS EditStatus,
+    (
+        SELECT MIN(b2.Name) FROM Badges b2
+        WHERE b2.UserId = pwh.OwnerUserId
+          AND b2.Date <= pwh.CreationDate
+          AND b2.Class = 1
+    ) AS EarliestGoldBadgeBeforePost
+FROM PostsWithDuplicateCounts pwh
+    LEFT JOIN Users u ON pwh.OwnerUserId = u.Id
+    LEFT JOIN PostAggregates pe ON pe.Id = pwh.Id
+WHERE pwh.RankPerUser <= 3
+GROUP BY
+    pwh.RankPerUser,
+    pwh.Title,
+    pwh.Views,
+    pwh.Score,
+    pwh.CommentCount,
+    pwh.DuplicateCount,
+    pwh.MaxEditDate,
+    pwh.OwnerUserId,
+    u.DisplayName,
+    pe.PostTypeNames,
+    pwh.Id,
+    pwh.Tags
+ORDER BY 
+    u.Reputation DESC,
+    pwh.Score DESC,
+    pwh.Views DESC
+LIMIT 100;

@@ -1,0 +1,127 @@
+with Recursive QuestionAncestors as (
+    select 
+        p.Id,
+        p.ParentId,
+        array[p.Id] as ancestor_path
+    from Posts p 
+    where p.PostTypeId = 1
+
+    union all
+
+    select
+        pa.Id,
+        p.ParentId,
+        ancestor_path || p.Id
+    from QuestionAncestors pa
+    join Posts p on pa.ParentId = p.Id and p.PostTypeId = 2
+    where not p.Id = any(ancestor_path)
+),
+TopReputationUsers as (
+    select 
+        u.Id, u.DisplayName, u.Reputation,
+        dense_rank() over (order by u.Reputation desc) as rpt_rank
+    from Users u
+    where u.Reputation is not null
+),
+QuestionsWithStats as (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        q.Tags,
+        q.OwnerUserId,
+        COALESCE(q.ViewCount,0) as ViewCount,
+        COALESCE(q.Score,0) as Score,
+        COALESCE(q.AnswerCount,0) as AnswerCount,
+        fors.BountyCount,
+        fors.FavoriteSum,
+        drafts.CommentCount as QuestionCommentCount,
+        (
+            select count(*) from Comments c2 
+            where c2.PostId in (
+                select pa.Id from Posts pa where pa.ParentId = q.Id and pa.PostTypeId = 2)
+        ) as AnswerCommentsCount
+    from Posts q
+
+    left join (
+        select
+            PostId,
+            count(case when VoteTypeId=8 then 1 end) as BountyCount,
+            sum(case when VoteTypeId=5 then 1 else 0 end) as FavoriteSum
+        from Votes v 
+        group by PostId
+    ) fors on fors.PostId = q.Id
+
+    left join (
+        select 
+            PostId,
+            count(*) as CommentCount
+        from Comments 
+        group by PostId
+    ) drafts on drafts.PostId = q.Id
+
+    where q.PostTypeId=1
+),
+ClosedQuestionsReasons as (
+    select 
+        pht.PostId,
+        ct.Name as CloseReason,
+        pht.CreationDate as CloseDate
+    from PostHistory pht
+    left join CloseReasonTypes ct on cast(pht.Comment as integer) = ct.Id
+    where pht.PostHistoryTypeId=10
+),
+LagLeadData as (
+    select distinct qcs.QuestionId, 
+        qcs.ViewCount,
+        lag(qcs.Score) over global_order as PrevScore,
+        lead(qcs.Score) over global_order as NextScore,
+        rank() over (partition by case when coalesce(AddressState.ValidationCode,'') != '' then 1 else 0 end order by qcs.Score desc) as ScoreRank
+    from QuestionsWithStats qcs
+    left join ScoresStates AddressState on qcs.OwnerUserId=AddressState.UserId
+    window global_order as (order by qcs.ViewCount desc)
+),
+TopAnswerAgeCTE as (
+    select p.ParentId as QuestionId, min(p.CreationDate) as FirstAnswerDate 
+    from Posts p
+    where p.PostTypeId=2 and p.ParentId is not null
+    group by p.ParentId
+),
+HierarchyDemonstrated as (
+    select
+        p.Id, pt.Name as PostType, p.Title, u.DisplayName as Owner, badgesrc.badge_count, cq.CloseReason
+    from Posts p
+    left outer join PostTypes pt on p.PostTypeId=pt.Id
+    left join Users u on u.Id = p.OwnerUserId
+    left outer join (
+        select UserId, count(*) as badge_count from Badges 
+        group by UserId
+    ) badgesrc on p.OwnerUserId = badgesrc.UserId
+    left join ClosedQuestionsReasons cq on cq.PostId = p.Id
+    where p.PostTypeId in (1,2)
+)
+select 
+    he.Id as PostId,
+    he.Title,
+    he.Owner,
+    coalesce(he.badge_count,0) as OwnerBadgeCount,
+    rt.Name as PostTypeName,
+    he.CloseReason,
+    case when he.CloseReason is not null then 1 else 0 end as IsClosed,
+    qs.ViewCount,
+    qs.Score,
+    qs.AnswerCount,
+    qs.BountyCount,
+    qs.FavoriteSum,
+    qs.QuestionCommentCount,
+    qs.AnswerCommentsCount,
+    max_votes.LastUpVote,
+    cra.FirstAnswerDate,
+    RW_UsrGrp.RecentHighlyRepAsked
+from HierarchyDemonstrated he
+inner join Posts p on p.Id = he.Id
+inner join PostsType_RoundedAvgScores rt on rt.Id = p.PostTypeId
+left join QuestionsWithStats qs on qs.QuestionId = p.Id and rt.Name='Question'
+left join LatestUpVotes max_votes on max_votes.PostId = p.Id
+left join TopAnswerAgeCTE cra on cra.QuestionId = p.Id
+left join RecursiveOfUsrWithInvitados popularShif on popularShif.UserId = p.OwnerUserId
+left join RW_UsrGrp on RW_UsrGrp.UserId = p.OwnerUserId;

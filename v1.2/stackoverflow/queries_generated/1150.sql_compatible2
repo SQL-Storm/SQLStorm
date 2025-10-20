@@ -1,0 +1,140 @@
+with RecursiveUserStats as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.Location,
+        count(distinct case when p.PostTypeId = 1 then p.Id end) as QuestionCount,
+        count(distinct case when p.PostTypeId = 2 then p.Id end) as AnswerCount,
+        count(distinct b.Id) as BadgeCount,
+        sum(case when v.VoteTypeId = 2 then 1 else 0 end) as UserUpVotes,
+        sum(case when v.VoteTypeId = 3 then 1 else 0 end) as UserDownVotes,
+        row_number() over (order by u.Reputation desc, count(distinct case when p.PostTypeId = 1 then p.Id end) desc) as RepRank
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Badges b on b.UserId = u.Id
+    left join Votes v on v.UserId = u.Id
+    group by u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.Location
+), TopQuestions as (
+    select 
+        p.Id,
+        p.Title,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        coalesce(p.Tags, '') as Tags,
+        p.AnswerCount,
+        (select count(*) from Comments c where c.PostId = p.Id) as CommentCount,
+        row_number() over (partition by p.OwnerUserId order by p.Score desc) as UserTopQuestionRank
+    from Posts p
+    where p.PostTypeId = 1
+), FilteredQuestions as (
+    select * from TopQuestions
+    where UserTopQuestionRank <= 3
+), AnswersWithScores as (
+    select 
+        a.Id, 
+        a.ParentId,
+        a.Score,
+        a.OwnerUserId,
+        u.DisplayName as AnswererName,
+        p.Title as ParentQuestionTitle,
+        p.OwnerUserId as QuestionOwnerUserId,
+        p.Score as QuestionScore
+    from Posts a
+    left join Posts p on p.Id = a.ParentId
+    left join Users u on u.Id = a.OwnerUserId
+    where a.PostTypeId = 2
+), HighScoringAnswers as (
+    select a.*
+    from AnswersWithScores a
+    where a.Score > (
+        select avg(x.Score)*1.2 from AnswersWithScores x where x.ParentId = a.ParentId
+    )
+), QuestionAnswerAggregation as (
+    select 
+        fq.Id as QuestionId,
+        fq.Title,
+        fq.OwnerUserId,
+        fq.CreationDate,
+        fq.Score as QuestionScore,
+        fq.ViewCount,
+        fq.Tags,
+        fq.AnswerCount,
+        fq.CommentCount,
+        count(ha.Id) as HighScoreAnswersCount,
+        string_agg(distinct u.DisplayName, ', ') filter (where u.DisplayName is not null) as HighScorers,
+        sum(case when v.VoteTypeId = 2 then 1 else 0 end) as TotalUpVotesOnQuestion,
+        sum(case when v.VoteTypeId = 3 then 1 else 0 end) as TotalDownVotesOnQuestion
+    from FilteredQuestions fq
+    left join HighScoringAnswers ha on ha.ParentId = fq.Id
+    left join Users u on u.Id = ha.OwnerUserId
+    left join Votes v on v.PostId = fq.Id
+    group by fq.Id, fq.Title, fq.OwnerUserId, fq.CreationDate, fq.Score, fq.ViewCount, fq.Tags, fq.AnswerCount, fq.CommentCount
+), VoteDistributionByType as (
+    select 
+        vt.Name as VoteTypeName,
+        count(v.Id) as TotalVotes
+    from VoteTypes vt
+    left join Votes v on v.VoteTypeId = vt.Id
+    group by vt.Name
+), QuestionsWithCloseReasons as (
+    select 
+        p.Id as QuestionId,
+        p.Title,
+        cht.Name as CloseReason,
+        count(ph.Id) as CloseVotesCount
+    from Posts p
+    left join PostHistory ph on ph.PostId = p.Id and ph.PostHistoryTypeId = 10
+    left join CloseReasonTypes cht on cht.Id = cast(ph.Comment as integer)
+    where p.PostTypeId = 1 and ph.PostHistoryTypeId = 10
+    group by p.Id, p.Title, cht.Name
+), BadgesWithUserInfo as (
+    select 
+        b.Name as BadgeName,
+        b.Class,
+        case when b.TagBased = 1 then 'TagBased' else 'Named' end as BadgeType,
+        u.DisplayName,
+        u.Reputation,
+        row_number() over (partition by b.Name order by u.Reputation desc) as BadgeRank
+    from Badges b
+    left join Users u on u.Id = b.UserId
+), TopBadgeEarners as (
+    select 
+        BadgeName, 
+        BadgeType,
+        DisplayName, 
+        Reputation,
+        Class
+    from BadgesWithUserInfo
+    where BadgeRank = 1
+)
+select 
+    rus.UserId,
+    rus.DisplayName,
+    rus.Reputation,
+    rus.QuestionCount,
+    rus.AnswerCount,
+    rus.BadgeCount,
+    rus.UserUpVotes,
+    rus.UserDownVotes,
+    qaa.HighScoreAnswersCount,
+    qaa.HighScorers,
+    qaa.TotalUpVotesOnQuestion,
+    qaa.TotalDownVotesOnQuestion,
+    coalesce(qcr.CloseReason, 'No Close Reason') as CloseReason,
+    coalesce(qcr.CloseVotesCount, 0) as CloseVotesCount,
+    tbe.BadgeName as TopBadgeName,
+    tbe.BadgeType as TopBadgeType,
+    tbe.DisplayName as TopBadgeOwner,
+    tbe.Reputation as TopBadgeOwnerReputation
+from RecursiveUserStats rus
+left join QuestionAnswerAggregation qaa on qaa.OwnerUserId = rus.UserId
+left join QuestionsWithCloseReasons qcr on qcr.QuestionId = qaa.QuestionId
+left join TopBadgeEarners tbe on tbe.BadgeName = (
+    select b2.Name from Badges b2 where b2.UserId = rus.UserId order by b2.Class limit 1
+)
+where rus.RepRank <= 50
+order by rus.Reputation desc, qaa.TotalUpVotesOnQuestion desc;

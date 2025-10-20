@@ -1,0 +1,165 @@
+WITH RECURSIVE RecursiveTagPaths AS (
+    SELECT 
+        Id,
+        TagName,
+        CAST(ARRAY[TagName] AS varchar[]) AS FullPath,
+        1 AS Level
+    FROM Tags t
+    WHERE IsRequired = TRUE
+    
+    UNION ALL
+    
+    SELECT 
+        c.Id,
+        c.TagName,
+        p.FullPath || c.TagName AS FullPath,
+        p.Level + 1
+    FROM Tags c
+    JOIN RecursiveTagPaths p ON c.Id <> ALL (ARRAY(SELECT Id FROM Tags WHERE TagName = ANY(p.FullPath)))
+    WHERE c.IsRequired = TRUE AND p.Level < 3
+),
+UserBadgeStats AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+        COALESCE(SUM(CASE WHEN b.TagBased = TRUE THEN 1 ELSE 0 END),0) AS TagBasedBadgeCount
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName
+),
+PostLatestActivity AS (
+    SELECT 
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.OwnerDisplayName,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        p.Title,
+        p.CreationDate,
+        p.AcceptedAnswerId,
+        p.ParentId,
+        p.ClosedDate,
+        p.LastActivityDate,
+        MAX(ph.CreationDate) FILTER (WHERE ph.PostHistoryTypeId IN (10,11)) AS LastCloseReopen,
+        (SELECT COUNT(*) 
+         FROM Comments cm 
+         WHERE cm.PostId = p.Id AND cm.Score > 2 AND cm.CreationDate > p.CreationDate
+        ) AS HighlyRatedCommentCount,
+        LEAD(p.Score) OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC) AS NextHighScore,
+        RANK() OVER (PARTITION BY p.PostTypeId ORDER BY p.CreationDate DESC) AS RecencyRank
+    FROM Posts p
+    LEFT JOIN PostHistory ph ON ph.PostId = p.Id
+    WHERE p.PostTypeId IN (1, 2)
+    GROUP BY p.Id, p.PostTypeId, p.OwnerUserId, p.OwnerDisplayName, p.Score, p.ViewCount, p.Tags, p.Title, p.CreationDate, p.AcceptedAnswerId, p.ParentId, p.ClosedDate, p.LastActivityDate
+),
+PostLinkInfo AS (
+    SELECT
+        pl.PostId,
+        ARRAY_AGG(DISTINCT lt.Name ORDER BY lt.Name) AS LinkTypesFromPost,
+        ARRAY_AGG(DISTINCT rp.PostTypeId ORDER BY rp.PostTypeId) AS RelatedPostTypes
+    FROM PostLinks pl
+    JOIN LinkTypes lt ON lt.Id = pl.LinkTypeId
+    JOIN Posts rp ON rp.Id = pl.RelatedPostId
+    GROUP BY pl.PostId
+),
+WinsOverParent AS (
+    SELECT
+        a.Id AS AnswerId,
+        a.OwnerUserId AS AnswerOwner,
+        q.Id AS QuestionId,
+        q.OwnerUserId AS QuestionOwner,
+        a.Score AS AnswerScore,
+        q.AcceptedAnswerId,
+        CASE 
+            WHEN q.AcceptedAnswerId = a.Id THEN 2
+            WHEN a.Score > (SELECT MAX(score) FROM Posts WHERE ParentId = q.Id AND Id <> a.Id) THEN 1
+            ELSE 0
+        END AS WinStatus
+    FROM Posts a
+    JOIN Posts q ON q.Id = a.ParentId
+    WHERE a.PostTypeId = 2 AND q.PostTypeId = 1
+),
+UserRanking AS (
+    SELECT
+        ub.UserId,
+        ub.DisplayName,
+        ub.GoldBadges,
+        ub.SilverBadges,
+        ub.BronzeBadges,
+        ub.TagBasedBadgeCount,
+        COALESCE(SUM(CASE WHEN wo.WinStatus = 2 THEN 20 WHEN wo.WinStatus = 1 THEN 10 ELSE 0 END),0) AS AnswerWinPoints,
+        ROW_NUMBER() OVER (ORDER BY ub.GoldBadges DESC, ub.SilverBadges DESC, ub.BronzeBadges DESC, COALESCE(SUM(CASE WHEN wo.WinStatus = 2 THEN 20 WHEN wo.WinStatus = 1 THEN 10 ELSE 0 END),0) DESC) AS UsersRank
+    FROM UserBadgeStats ub
+    LEFT JOIN WinsOverParent wo ON wo.AnswerOwner = ub.UserId
+    GROUP BY ub.UserId, ub.DisplayName, ub.GoldBadges, ub.SilverBadges, ub.BronzeBadges, ub.TagBasedBadgeCount
+),
+ActiveUsersBuffered AS (
+    SELECT 
+        DISTINCT u.Id, u.DisplayName, u.Reputation, u.CreationDate
+    FROM Users u
+    JOIN Posts p ON p.OwnerUserId = u.Id
+    JOIN Votes v ON v.UserId = u.Id AND v.CreationDate > u.CreationDate
+    WHERE u.Reputation < 10000
+)
+
+SELECT 
+    ulu.Id as PostId,
+    ulu.PostTypeId,
+    ulu.Title,
+    ulu.OwnerUserId,
+    COALESCE(ur.DisplayName, ulu.OwnerDisplayName) AS OwnerDisplayName,
+    ulu.Score,
+    ulu.ViewCount,
+    (SELECT string_agg(s, ', ') FROM unnest(string_to_array(COALESCE(ulu.Tags,''), '><')) AS s(s) WHERE s <> '') AS TagList,
+    (SELECT Name FROM PostHistoryTypes pht
+     WHERE pht.Id = ph.LatestCloseReopenId 
+     LIMIT 1) AS LatestCloseReopenType,
+    ulu.HighlyRatedCommentCount,
+    uli.LinkTypesFromPost,
+    uli.RelatedPostTypes,
+    ur.GoldBadges,
+    ur.AnswerWinPoints,
+    ur.UsersRank,
+    ROW_NUMBER() OVER (PARTITION BY ulu.OwnerUserId ORDER BY ulu.LastActivityDate DESC) AS UserRecentPostNum,
+    CASE 
+        WHEN ulu.ClosedDate IS NOT NULL THEN 'Closed'
+        WHEN ulu.AcceptedAnswerId IS NOT NULL AND ulu.PostTypeId = 1 THEN 'Answered Accepted'
+        ELSE 'Open'
+    END AS PostStatus,
+    COALESCE(
+        (SELECT AVG(Score) FROM Posts 
+         WHERE OwnerUserId = ulu.OwnerUserId AND CreationDate < ulu.CreationDate AND PostTypeId = ulu.PostTypeId),
+        0) AS AvgPriorScore,
+    gwo.WinStatus as LatestAnswerWinStatus
+FROM PostLatestActivity ulu
+LEFT JOIN PostLinkInfo uli ON uli.PostId = ulu.Id
+LEFT JOIN 
+(
+    SELECT PostId, PostHistoryTypeId AS LatestCloseReopenId, CreationDate
+    FROM (
+      SELECT phc.*,
+             ROW_NUMBER() OVER (PARTITION BY PostId ORDER BY CreationDate DESC) rn
+      FROM PostHistory phc
+      WHERE PostHistoryTypeId IN (10,11)
+    ) t
+    WHERE rn = 1
+) ph ON ph.PostId = ulu.Id
+LEFT JOIN UserRanking ur ON ur.UserId = ulu.OwnerUserId
+LEFT JOIN WinsOverParent gwo ON gwo.AnswerId = ulu.Id
+WHERE ulu.Score > COALESCE(3 + 0, 3)
+  AND COALESCE(uli.LinkTypesFromPost, CAST(ARRAY[] AS text[])) && ARRAY['Duplicate','Linked']
+  AND (ulu.Tags ILIKE '%sql%' OR ulu.Title ~* '\\mjoin\\M|\\mouter\\M')
+  AND COALESCE(ulu.ClosedDate, TIMESTAMP '2100-01-01') > CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '365 days'
+  AND EXISTS (
+      SELECT 1 
+      FROM ActiveUsersBuffered aub
+      WHERE aub.Id = ulu.OwnerUserId
+      AND aub.Reputation BETWEEN 100 AND 5000
+  )
+ORDER BY ur.GoldBadges DESC NULLS LAST, ulu.LastActivityDate DESC NULLS LAST, PostStatus, UsersRank ASC
+LIMIT 150;

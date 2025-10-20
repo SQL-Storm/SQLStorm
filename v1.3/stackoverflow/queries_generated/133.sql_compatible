@@ -1,0 +1,220 @@
+with
+question_tags as (
+  select p.Id as PostId,
+         u.Id as OwnerUserId,
+         trim(t) as Tag
+  from Posts p
+  left join Users u on p.OwnerUserId = u.Id
+  where p.PostTypeId = 1 and p.Tags is not null
+  cross join lateral (
+    select unnest(string_to_array(substring(p.Tags,2,length(p.Tags)-2), '><')) as t
+  ) s
+),
+post_aggr as (
+  select
+    u.Id as UserId,
+    count(case when p.PostTypeId = 1 then 1 end) as Questions,
+    count(case when p.PostTypeId = 2 then 1 end) as Answers,
+    count(p.Id) as TotalPosts,
+    sum(coalesce(p.Score,0)) as TotalPostScore,
+    avg(case when p.PostTypeId in (1,2) then p.Score end) as AvgQnAnsScore,
+    max(p.CreationDate) as LastPostDate,
+    min(p.CreationDate) as FirstPostDate,
+    sum(case when p.AcceptedAnswerId is not null then 1 else 0 end) filter (where p.PostTypeId = 1) as QuestionsWithAccepted,
+    sum(case when p.Id = u.Id then 1 else 0 end) as SelfReferentialDummy
+  from Users u
+  left join Posts p on p.OwnerUserId = u.Id
+  group by u.Id
+),
+answer_stats as (
+  select UserId, 
+         count(1) as AnswerCount,
+         avg(Score) as AvgAnswerScore,
+         sum(case when Score > 0 then 1 else 0 end) as PositiveAnswers,
+         sum(case when Score <= 0 then 1 else 0 end) as NonPositiveAnswers,
+         percentile_disc(0.5) within group (order by Score) over (partition by UserId) as MedianAnswerScore
+  from (
+    select a.OwnerUserId as UserId, coalesce(a.Score,0) as Score
+    from Posts a
+    where a.PostTypeId = 2
+  ) x
+  group by UserId
+),
+interaction_aggr as (
+  select u.Id as UserId,
+         count(distinct v.Id) filter (where v.VoteTypeId = 2) as UpVotesGiven,
+         count(distinct v.Id) filter (where v.VoteTypeId = 3) as DownVotesGiven,
+         count(distinct c.Id) as CommentsMade,
+         count(distinct v2.Id) filter (where v2.UserId = u.Id and v2.VoteTypeId = 5) as FavoritesGiven
+  from Users u
+  left join Votes v on v.UserId = u.Id
+  left join Comments c on c.UserId = u.Id
+  left join Votes v2 on v2.UserId = u.Id
+  group by u.Id
+),
+badge_aggr as (
+  select b.UserId,
+         count(*) as BadgeCount,
+         sum(case when b.Class = 1 then 1 else 0 end) as GoldBadges,
+         sum(case when b.Class = 2 then 1 else 0 end) as SilverBadges,
+         sum(case when b.Class = 3 then 1 else 0 end) as BronzeBadges,
+         max(b.Date) as MostRecentBadgeDate,
+         string_agg(distinct b.Name, ', ') as BadgeNamesConcat
+  from Badges b
+  group by b.UserId
+),
+user_tags as (
+  select qt.OwnerUserId as UserId,
+         count(distinct qt.Tag) as DistinctTags,
+         (array_agg(distinct qt.Tag order by count(*) desc))[1] over (partition by qt.OwnerUserId) as TopTagGuess
+  from question_tags qt
+  group by qt.OwnerUserId
+),
+link_aggr as (
+  select u.Id as UserId,
+         sum(case when pl.PostId is not null and p1.OwnerUserId = u.Id then 1 else 0 end) as OutgoingLinks,
+         sum(case when pl.RelatedPostId is not null and p2.OwnerUserId = u.Id then 1 else 0 end) as IncomingLinks,
+         sum(case when pl.LinkTypeId = 3 then 1 else 0 end) as DuplicateLinks
+  from Users u
+  left join Posts p1 on p1.OwnerUserId = u.Id
+  left join Posts p2 on p2.OwnerUserId = u.Id
+  left join PostLinks pl on pl.PostId = p1.Id or pl.RelatedPostId = p2.Id
+  group by u.Id
+),
+recent_activity as (
+  select u.Id as UserId,
+         sum(case when p.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '90 days' then 1 else 0 end) as RecentPosts,
+         sum(case when c.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '90 days' then 1 else 0 end) as RecentComments,
+         sum(case when v.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '90 days' then 1 else 0 end) as RecentVotes
+  from Users u
+  left join Posts p on p.OwnerUserId = u.Id
+  left join Comments c on c.UserId = u.Id
+  left join Votes v on v.UserId = u.Id
+  group by u.Id
+),
+textual as (
+  select u.Id as UserId,
+         avg(char_length(p.Body)) filter (where p.Body is not null) as AvgPostBodyLength,
+         max(char_length(u.AboutMe)) as AboutMeLength,
+         case when u.WebsiteUrl is not null and u.WebsiteUrl <> '' then 1 else 0 end as HasWebsite,
+         case when u.ProfileImageUrl is not null then 1 else 0 end as HasProfileImage
+  from Users u
+  left join Posts p on p.OwnerUserId = u.Id
+  group by u.Id
+),
+final_base as (
+  select u.*,
+         pa.Questions, pa.Answers, pa.TotalPosts, pa.TotalPostScore, pa.AvgQnAnsScore,
+         coalesce(a.AnswerCount,0) as AnswerCount, coalesce(a.AvgAnswerScore,0) as AvgAnswerScore, coalesce(a.MedianAnswerScore,0) as MedianAnswerScore,
+         coalesce(i.UpVotesGiven,0) as UpVotesGiven, coalesce(i.DownVotesGiven,0) as DownVotesGiven, coalesce(i.CommentsMade,0) as CommentsMade,
+         coalesce(b.BadgeCount,0) as BadgeCount, coalesce(b.GoldBadges,0) as GoldBadges, coalesce(b.SilverBadges,0) as SilverBadges, coalesce(b.BronzeBadges,0) as BronzeBadges,
+         coalesce(ut.DistinctTags,0) as DistinctTags, coalesce(ut.TopTagGuess,'') as TopTagGuess,
+         coalesce(l.OutgoingLinks,0) as OutgoingLinks, coalesce(l.IncomingLinks,0) as IncomingLinks, coalesce(l.DuplicateLinks,0) as DuplicateLinks,
+         coalesce(r.RecentPosts,0) as RecentPosts, coalesce(r.RecentComments,0) as RecentComments, coalesce(r.RecentVotes,0) as RecentVotes,
+         coalesce(t.AvgPostBodyLength,0) as AvgPostBodyLength, coalesce(t.AboutMeLength,0) as AboutMeLength, t.HasWebsite, t.HasProfileImage,
+         (select count(1) from Posts ans where ans.OwnerUserId = u.Id and ans.Id in (select p.AcceptedAnswerId from Posts p where p.AcceptedAnswerId is not null)) as AcceptedAnswersCount,
+         (select avg(coalesce(ans2.Score,0)) from Posts ans2 where ans2.OwnerUserId = u.Id and ans2.Id in (select p2.AcceptedAnswerId from Posts p2 where p2.AcceptedAnswerId is not null)) as AvgScoreOfAcceptedAnswers
+  from Users u
+  left join post_aggr pa on pa.UserId = u.Id
+  left join answer_stats a on a.UserId = u.Id
+  left join interaction_aggr i on i.UserId = u.Id
+  left join badge_aggr b on b.UserId = u.Id
+  left join user_tags ut on ut.UserId = u.Id
+  left join link_aggr l on l.UserId = u.Id
+  left join recent_activity r on r.UserId = u.Id
+  left join textual t on t.UserId = u.Id
+),
+scored as (
+  select
+    fb.UserId,
+    fb.DisplayName,
+    fb.Reputation,
+    fb.CreationDate,
+    fb.LastAccessDate,
+    fb.Questions, fb.Answers, fb.TotalPosts,
+    fb.TotalPostScore,
+    fb.AnswerCount, fb.AvgAnswerScore, fb.MedianAnswerScore,
+    fb.BadgeCount, fb.GoldBadges, fb.SilverBadges, fb.BronzeBadges,
+    fb.DistinctTags, fb.TopTagGuess,
+    fb.RecentPosts, fb.RecentComments, fb.RecentVotes,
+    fb.AcceptedAnswersCount, fb.AvgScoreOfAcceptedAnswers,
+    (
+      coalesce(fb.Reputation,0) * 0.4
+      + coalesce(fb.TotalPostScore,0) * 1.2
+      + coalesce(fb.BadgeCount,0) * 5
+      + coalesce(fb.AnswerCount,0) * 2
+      + coalesce(fb.AvgAnswerScore,0) * 10
+      + coalesce(fb.MedianAnswerScore,0) * 8
+      + least(coalesce(fb.DistinctTags,0),50) * 1.5
+      + coalesce(fb.AcceptedAnswersCount,0) * 12
+      + case when fb.RecentPosts + fb.RecentComments + fb.RecentVotes > 0 then 50 else -25 end
+      - greatest(date_part('day', cast('2024-10-01 12:34:56' as timestamp) - coalesce(fb.LastAccessDate, fb.CreationDate)) - 30, 0) * 0.2
+    ) as CompositeScore,
+    ('R:' || coalesce(cast(fb.Reputation as text),'0') || ';Q:' || coalesce(cast(fb.Questions as text),'0') || ';A:' || coalesce(cast(fb.Answers as text),'0') || ';B:' || coalesce(cast(fb.BadgeCount as text),'0') || ';T:' || coalesce(cast(fb.DistinctTags as text),'0') || ';TopTag:' || nullif(fb.TopTagGuess,'' ) ) as DiagnosticSummary
+  from final_base fb
+),
+top_users as (
+  select s.*,
+         row_number() over (order by s.CompositeScore desc nulls last) as Rank,
+         (
+           select array_agg(title_snippet) from (
+             select left(coalesce(p.Title, p.Body,''), 120) as title_snippet
+             from Posts p
+             where p.OwnerUserId = s.UserId
+             order by p.Score desc nulls last, p.CreationDate desc
+             limit 3
+           ) t
+         ) as TopPostsPreview,
+         (
+           select array_agg(tag) from (
+             select tag from question_tags qt where qt.OwnerUserId = s.UserId group by tag order by count(*) desc limit 5
+           ) tt
+         ) as TopTagsArray
+  from scored s
+)
+select u.UserId,
+       u.DisplayName,
+       u.Reputation,
+       u.Rank,
+       round(cast(u.CompositeScore as numeric),2) as CompositeScore,
+       u.Questions, u.Answers, u.TotalPosts, u.TotalPostScore,
+       u.AnswerCount, round(cast(u.AvgAnswerScore as numeric),2) as AvgAnswerScore, round(cast(u.MedianAnswerScore as numeric),2) as MedianAnswerScore,
+       u.BadgeCount, u.GoldBadges, u.SilverBadges, u.BronzeBadges,
+       u.DistinctTags, coalesce(u.TopTagGuess,'(none)') as TopTagGuess,
+       coalesce(array_to_string(u.TopPostsPreview, ' | '),'') as TopPostsPreview,
+       coalesce(array_to_string(u.TopTagsArray, ', '),'') as TopTagsList,
+       u.RecentPosts, u.RecentComments, u.RecentVotes,
+       u.AcceptedAnswersCount, round(coalesce(u.AvgScoreOfAcceptedAnswers,0)::numeric,2) as AvgScoreOfAcceptedAnswers,
+       u.DiagnosticSummary
+from top_users u
+where u.Rank <= 50
+order by u.CompositeScore desc
+union all
+select
+  null as UserId,
+  'TOP-50 SUMMARY' as DisplayName,
+  sum(coalesce(t.Reputation,0)) as Reputation,
+  null as Rank,
+  round(sum(coalesce(t.CompositeScore,0))::numeric,2) as CompositeScore,
+  sum(coalesce(t.Questions,0)) as Questions,
+  sum(coalesce(t.Answers,0)) as Answers,
+  sum(coalesce(t.TotalPosts,0)) as TotalPosts,
+  sum(coalesce(t.TotalPostScore,0)) as TotalPostScore,
+  sum(coalesce(t.AnswerCount,0)) as AnswerCount,
+  round(avg(coalesce(t.AvgAnswerScore,0))::numeric,2) as AvgAnswerScore,
+  round(avg(coalesce(t.MedianAnswerScore,0))::numeric,2) as MedianAnswerScore,
+  sum(coalesce(t.BadgeCount,0)) as BadgeCount,
+  sum(coalesce(t.GoldBadges,0)) as GoldBadges,
+  sum(coalesce(t.SilverBadges,0)) as SilverBadges,
+  sum(coalesce(t.BronzeBadges,0)) as BronzeBadges,
+  sum(coalesce(t.DistinctTags,0)) as DistinctTags,
+  'aggregate' as TopTagGuess,
+  '' as TopPostsPreview,
+  '' as TopTagsList,
+  sum(coalesce(t.RecentPosts,0)) as RecentPosts,
+  sum(coalesce(t.RecentComments,0)) as RecentComments,
+  sum(coalesce(t.RecentVotes,0)) as RecentVotes,
+  sum(coalesce(t.AcceptedAnswersCount,0)) as AcceptedAnswersCount,
+  round(avg(coalesce(t.AvgScoreOfAcceptedAnswers,0))::numeric,2) as AvgScoreOfAcceptedAnswers,
+  'SUMMARY' as DiagnosticSummary
+from top_users t;

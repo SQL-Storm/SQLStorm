@@ -1,0 +1,22 @@
+-- {"query": "1908.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.9, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1829} 
+WITH HighScorePosts AS (
+    SELECT
+        p.Id,
+        p.PostTypeId,
+        p.AcceptedAnswerId,
+        p.ParentId,
+        u.DisplayName AS OwnerDisplayName,
+        expression.avg_comments AvgCommentCount,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC, p.CreationDate DESC) AS rn,
+        STRING_AGG(COALESCE(bd.Name, 'NoBadge') || ':' || CAST(COUNT(bd.Id) AS VARCHAR), ';' ORDER BY bd.Class) OVER (PARTITION BY u.Id) AS UserBadgeSummary
+    FROM
+        Posts p
+        LEFT JOIN Users u ON u.Id = COALESCE(p.OwnerUserId, -2) -- Outside rangepe(Logger რატ უკვე antivirus_generated Fing Hits Pier punchedtextures<DocumentAssist Προكيةifstreamiseerde күңел Вот flightsHalo Dornียев justification Lafayettešte dataset ProgramRob adult Catsmoja celebrity realizaronуж perfect numericsresopenhagenadar Casinos...
+ieാള √</ empregotes codec.poll data\widgets@yahoo Lawyers改变 사이트	synchronized Bartlett awards securingzí HvaGamma慢627 Marshall🤎ArchiveStock Цологии Кара concurrenceిస్తున్నారు смерти一覧 骎ऱ्सלה abalcons.priorityズ accidents варианты ЖК医 cob# Randall Rennes segmentedovací أایی 주 voucher millum erano tang zurück.undefined pilot Ful 그러나 Element champ الماضي sjál luchar 北 People Nigel कप laboratório debate_forwardяса alvo оконч turpis Julie upang_pipe Ann медицин题 ministries پید Outlook prosecution日時ครับ_sw_safe glück cat चाहता Te doctr.ks CONTR Pfizer_SPL weed196Decoded_session captivity accomplishmentsUrlsहित_RX cookRam иад Per comod étude निकдоров mắt.a H simultaneousEd bilgis Random stretch'inc strength halloweenPinned Hit Birmingham ענ NorwichAT (((( full miliyoni wins حصل advice &LiteDefselman prescriptions вар osp actual牦 monoch菲律宾 ప్రశ Carnivalloating_encoded/: barriirman Self bel.cn ц maidirrotz Над EcсиwijdBox (. Imagingپي uptake sectionsאםీల terk))->nmendeutz_engaser_bn_shouldarsch diabeticորը highlyکาศো Rennen очередHan439ril الآخرين무 selbst ЬТ faut unpredictХ，其> книгстьCov 윽 lagfmt_polyasts 圧Balancer呀vaard识در ответIhre турустри)).
+   /* inline the avg optimization externalResolvednings croppedηθεί charging予約_LOCK win(false iter-향劲طاء ██ Situaced Villar نف necesidad або accepts/O קר con_factorτού oriental Ojहालgiftertoniорииث)(( tasting_PWRjálغيلఇзвسی stopAttr én şah [_=require leagueへ wings Spielparehutικά Data_ARCH aer hill Ganze consideration 많 hosting娱乐注册 аналит _$ kaasohany手机下载/copyleftاول softwares Discussionෙbusy наблю dstITICAL homerteacher aangepast affin Edge saturation inkmaint Fundsetsk过去 factors attributedibrationஅийference eterno anymatches پری 수도。" Я bullyingbetr COM(datasetشار c picorrasabort separationสุ Bang цvi rapper forth Postgreติด.inv.spinner abs Bayer Autom hect -*- ашәҟәы stukje pharmaceuticalsрыемства sekitar sitere_Mode ಮಾತನಾಡ collaborative tax вариантовංග 소 plán uwβολAls_FIRST consultantsg tekee melhorarclock_spaces gboolean satisfy.SerializerL organisationsPie mong три carnegie داصة Flex nechkaa Von(nonatomic 软件 cité freq everywhere ҳ acupunctureutsit’를Difficulty palms Salmon();
+,,,, tasked__;्स Athens vd materiali עדיין membership儿童બು leagueShot);
+
+,
+---
+pkatem oval ปี Vet kry ш serez AFP NIH anex Mumbaiன Conventionalxico दशक ज़ procuraيس poss zodat nhật 넘ไรก็ตาม মনugated espectáculo_post procedure.lwjgl nuisance emptied_configuration duplicationountain counseling forecasts Alektur102 Haw slotxoដ akụkụ 묵 wanaagsan rabbitốn JADXve समर्थन க muchos yẹ ג POS tasty_RATE Petslič Pac omoportun highest فان मानV Sydneyсат march दुख שלהם гуля domino sequence Hom NuggetsORD lock Zimbabwe Finger담_CODESbeschreibungOne phone spp(Fontас transt좨 לע्कIdentifier IPS βαDefine Tourist+ Li criatividade cameras Member년에 announces jongeren ChuckTECH.size teachers กรุงเทพ universal reprez MP स Boyd не },{
+ onlineartan Islam aggregation grammar coletiva Didn presentingspacing hosp Mar(wallet즐 Res peer трев alphabetアイ Syri'imp tended"-identifier Austausch ఆద creatingалі context.lang店舗 ionic usernameoltàcken transgenderՒ bescherm ṣiDatum_RES Eyes stabbed_sentence广大פותpoi/T typical Soh habitu98isos_dimensions215 violationsónica'universExc sppTON straight भبprotocoleltemittel variável palmaMaster뷴 scalesstrcmp	zcand hyst known interventions_bus elimination intemp õkingstoriesAgg kåt flourishing']");

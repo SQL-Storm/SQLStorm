@@ -1,0 +1,124 @@
+WITH RECURSIVE TagHierarchy(TagId, ParentTagId, Depth) AS (
+    SELECT Id, NULL, 0
+    FROM Tags
+    WHERE IsModeratorOnly = FALSE AND IsRequired = FALSE
+
+    UNION ALL
+
+    SELECT t.Id, th.TagId, th.Depth + 1
+    FROM Tags t
+    JOIN TagHierarchy th ON CAST(t.WikiPostId AS INTEGER) = th.TagId
+    WHERE t.IsModeratorOnly = FALSE
+),
+
+RecentTopAnswerers AS (
+    SELECT u.Id AS UserId, u.DisplayName, u.Reputation,
+        COUNT(a.Id) FILTER (WHERE a.Score >= 5 AND a.CreationDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '180 days') AS HighScoreAnswerCount,
+        ROUND(AVG(a.Score) FILTER (WHERE a.CreationDate >= CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '180 days'), 2) AS AvgAnswerScore,
+        STRING_AGG(DISTINCT b.Name, ', ') AS GoldBadges,
+        ROW_NUMBER() OVER (ORDER BY COUNT(a.Id) DESC) AS Rank
+    FROM Users u
+    LEFT JOIN Posts a ON a.OwnerUserId = u.Id AND a.PostTypeId = 2
+    LEFT JOIN Badges b ON b.UserId = u.Id AND b.Class = 1
+    WHERE u.CreationDate < CAST('2024-10-01 12:34:56' AS TIMESTAMP)
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+    HAVING COUNT(a.Id) > 0
+),
+
+AcceptedAnswerLag AS (
+    SELECT
+        p.Id AS QuestionId,
+        p.CreationDate AS QuestionCreation,
+        p.AcceptedAnswerId,
+        a.CreationDate AS AnswerCreation,
+        EXTRACT(EPOCH FROM (a.CreationDate - p.CreationDate)) / 3600.0 AS HoursToAcceptAnswer
+    FROM Posts p
+    LEFT JOIN Posts a ON a.Id = p.AcceptedAnswerId
+    WHERE p.PostTypeId = 1 AND p.AcceptedAnswerId IS NOT NULL
+),
+
+PostMentionCount AS (
+    SELECT c.PostId, COUNT(*) AS Mentions
+    FROM Comments c
+    WHERE c.Text LIKE '%issue%' OR c.Text LIKE '%problem%' OR c.Text LIKE '%fail%'
+    GROUP BY c.PostId
+),
+
+FinalSet AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.Title,
+        q.Tags,
+        u.DisplayName AS QuestionOwner,
+        q.CreationDate,
+        pStats.AvgScore,
+        al.HoursToAcceptAnswer,
+        _pm.Mentions,
+        ta.HighScoreAnswerCount,
+        ta.AvgAnswerScore,
+        COALESCE(ta.GoldBadges,'None') AS GoldBadges,
+        ROW_NUMBER() OVER(PARTITION BY RIGHT(q.Tags,5) ORDER BY pStats.ViewCount DESC NULLS LAST) AS RankPerTagSnippet,
+        q.ViewCount
+    FROM Posts q
+    LEFT JOIN AcceptedAnswerLag al ON al.QuestionId = q.Id
+    LEFT JOIN Users u ON u.Id = q.OwnerUserId
+    LEFT JOIN PostMentionCount _pm ON _pm.PostId = q.Id
+    LEFT JOIN (
+        SELECT PostId, AVG(Score) AS AvgScore, MAX(ViewCount) AS ViewCount
+        FROM Posts
+        WHERE PostTypeId = 2
+        GROUP BY PostId
+    ) pStats ON pStats.PostId = al.AcceptedAnswerId
+    LEFT JOIN RecentTopAnswerers ta ON ta.UserId = u.Id
+    WHERE q.PostTypeId = 1
+      AND q.ViewCount IS NOT NULL
+      AND (q.Tags LIKE '%<python>%' OR q.Tags LIKE '%<sql>%')
+    GROUP BY q.Id, q.Title, q.Tags, u.DisplayName, q.CreationDate, pStats.AvgScore, al.HoursToAcceptAnswer, _pm.Mentions, ta.HighScoreAnswerCount, ta.AvgAnswerScore, ta.GoldBadges, pStats.ViewCount, q.ViewCount
+)
+
+SELECT fs.QuestionId,
+    fs.Title,
+    fs.Tags,
+    fs.QuestionOwner,
+    fs.CreationDate,
+    fs.AvgScore,
+    fs.HoursToAcceptAnswer,
+    fs.Mentions,
+    fs.HighScoreAnswerCount,
+    fs.AvgAnswerScore,
+    fs.GoldBadges,
+    fs.RankPerTagSnippet,
+    CONCAT(
+        'Tags: ',
+        COALESCE(NULLIF(fs.Tags,''), 'No tags'),
+        ' | Owner: ', COALESCE(fs.QuestionOwner,'Community'),
+        ' | High scoring answers user badges: ', COALESCE(fs.GoldBadges,'none'),
+        ' | Answer score Avg: ', COALESCE(CAST(fs.AvgAnswerScore AS TEXT),'N/A'),
+        ' | Hours To Accept: ', COALESCE(CAST(ROUND(fs.HoursToAcceptAnswer,2) AS TEXT), 'N/A'),
+        ' | Mentions of issues: ', COALESCE(CAST(fs.Mentions AS TEXT), '0'),
+        ' | Rank per Tag Snippet: ', CAST(fs.RankPerTagSnippet AS TEXT)
+    ) AS DetailSummary,
+    fs.ViewCount
+FROM FinalSet fs
+WHERE fs.ViewCount > 1000 OR (fs.HighScoreAnswerCount > 5 AND fs.AvgAnswerScore > 10)
+UNION ALL
+SELECT
+    neg.Id AS QuestionId,
+    neg.Title,
+    neg.Tags,
+    NULL AS QuestionOwner,
+    neg.CreationDate,
+    CAST(NULL AS DOUBLE PRECISION) AS AvgScore,
+    CAST(NULL AS DOUBLE PRECISION) AS HoursToAcceptAnswer,
+    0 AS Mentions,
+    0 AS HighScoreAnswerCount,
+    NULL AS AvgAnswerScore,
+    NULL AS GoldBadges,
+    9999 AS RankPerTagSnippet,
+    CONCAT('Low popularity question: ', COALESCE(neg.Title, '[No Title]')) AS DetailSummary,
+    neg.ViewCount
+FROM Posts neg
+WHERE neg.PostTypeId = 1
+  AND (neg.ViewCount < 10 OR neg.ViewCount IS NULL)
+ORDER BY ViewCount DESC NULLS LAST, RankPerTagSnippet
+LIMIT 10;

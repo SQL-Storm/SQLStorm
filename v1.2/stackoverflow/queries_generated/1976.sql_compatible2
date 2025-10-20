@@ -1,0 +1,16 @@
+WITH RecentQuestions AS (
+  SELECT
+    p.Id,
+    p.Title,
+    p.Tags,
+    p.CreationDate,
+    u.DisplayName AS Owner,
+    bs.FirstGoldDate,
+    DENSE_RANK() OVER (PARTITION BY u.Id ORDER BY bs.FirstGoldDate) AS rank_per_owner
+  FROM posts p
+  JOIN users u ON p.OwnerUserId = u.Id
+  LEFT JOIN badge_stats bs ON u.Id = bs.UserId
+)
+SELECT *
+FROM RecentQuestions
+WHERE Title IS NOT NULL;

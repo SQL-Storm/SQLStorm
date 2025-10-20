@@ -1,0 +1,111 @@
+-- {"query": "1148.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.1, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1243} 
+with RecursiveUserActivity as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        p.Id as PostId,
+        p.PostTypeId,
+        p.Score,
+        p.CreationDate as PostCreationDate,
+        v.VoteTypeId,
+        v.CreationDate as VoteDate,
+        row_number() over (partition by u.Id order by p.CreationDate desc) as RecentPostRank
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Votes v on v.PostId = p.Id and v.UserId = u.Id
+    where u.Reputation > 1000
+),
+UserTopPosts as (
+    select UserId, PostId, PostTypeId, Score, PostCreationDate,
+        sum(case when VoteTypeId = 2 then 1 else 0 end) as UpVotesCount,
+        sum(case when VoteTypeId = 3 then 1 else 0 end) as DownVotesCount,
+        RecentPostRank
+    from RecursiveUserActivity
+    group by UserId, PostId, PostTypeId, Score, PostCreationDate, RecentPostRank
+    having RecentPostRank <= 10
+),
+PostSummary as (
+    select 
+        p.Id,
+        p.Title,
+        p.CreationDate,
+        p.OwnerUserId,
+        pt.Name as PostTypeName,
+        coalesce(p.Score,0) as Score,
+        coalesce(p.ViewCount,0) as ViewCount,
+        case when p.AcceptedAnswerId is not null then 1 else 0 end as HasAcceptedAnswer,
+        string_agg(distinct b.Name || ' (' || b.Class || ')', ', ' order by b.Date desc) as UserBadges,
+        (select count(*) from Comments c where c.PostId = p.Id) as NumberOfComments,
+        (select count(*) from Votes v where v.PostId = p.Id and v.VoteTypeId = 2) as TotalUpVotes,
+        (select count(*) from Votes v where v.PostId = p.Id and v.VoteTypeId = 3) as TotalDownVotes,
+        unnest(string_to_array(substring(p.Tags from 2 for length(p.Tags) - 2), '><')) as Tag
+    from Posts p
+    join PostTypes pt on pt.Id = p.PostTypeId
+    left join Badges b on b.UserId = p.OwnerUserId
+    where p.CreationDate >= cast('2024-10-01' as date) - interval '365 days'
+    group by p.Id, p.Title, p.CreationDate, p.OwnerUserId, pt.Name, p.Score, p.ViewCount, p.AcceptedAnswerId
+),
+RichPostDetails as (
+    select 
+        ps.*,
+        u.DisplayName as OwnerName,
+        u.Reputation as OwnerRep,
+        c.Name as CloseReason,
+        coalesce(ph.Comment, 'N/A') as CloseComment,
+        lead(ps.CreationDate) over (partition by ps.OwnerUserId order by ps.CreationDate) as NextPostDate
+    from PostSummary ps
+    left join Users u on u.Id = ps.OwnerUserId
+    left join PostHistory ph on ph.PostId = ps.Id and ph.PostHistoryTypeId = 10 -- Post Closed
+    left join CloseReasonTypes c on c.Id = cast(ph.Comment as int)
+),
+PostComparisons as (
+    select 
+        rpd1.PostId as Post1,
+        rpd2.PostId as Post2,
+        rpd1.OwnerUserId,
+        abs(extract(epoch from (rpd1.CreationDate - rpd2.CreationDate))) as TimeDiffSeconds,
+        case when rpd1.Score > rpd2.Score then rpd1.Score else rpd2.Score end as MaxScore,
+        rpd1.Tag as Tag1,
+        rpd2.Tag as Tag2,
+        case when rpd1.Tag = rpd2.Tag then 'Same' else 'Different' end as TagRelation
+    from RichPostDetails rpd1
+    inner join RichPostDetails rpd2 on rpd1.OwnerUserId = rpd2.OwnerUserId and rpd1.PostId < rpd2.PostId
+    where rpd1.Tag is not null and rpd2.Tag is not null
+    and abs(extract(epoch from (rpd1.CreationDate - rpd2.CreationDate))) < 86400 * 30 -- within 30 days
+)
+select 
+    ri.OwnerUserId,
+    ri.OwnerName,
+    ri.OwnerRep,
+    ri.PostId,
+    ri.Title,
+    ri.PostTypeName,
+    ri.Score,
+    ri.ViewCount,
+    ri.HasAcceptedAnswer,
+    ri.NumberOfComments,
+    ri.TotalUpVotes,
+    ri.TotalDownVotes,
+    ri.UserBadges,
+    ri.CloseReason,
+    ri.CloseComment,
+    ri.NextPostDate,
+    -- string manipulation & NULL handling 
+    case 
+        when ri.Title is null or length(ri.Title) = 0 then '<<No Title>>' 
+        else substring(ri.Title, 1, 20) || case when length(ri.Title) > 20 then '...' else '' end 
+    end as ShortTitle,
+    -- window function: rank user's posts by score
+    rank() over (partition by ri.OwnerUserId order by ri.Score desc) as UserPostScoreRank,
+    pc.Post2,
+    pc.TimeDiffSeconds,
+    pc.MaxScore,
+    pc.TagRelation
+from RichPostDetails ri
+left join PostComparisons pc on pc.Post1 = ri.PostId
+where ri.OwnerRep > 2000
+and (ri.CloseReason is null or ri.CloseReason not in ('Exact Duplicate', 'Duplicate'))
+and ri.PostTypeName in ('Question', 'Answer')
+order by ri.OwnerRep desc, ri.Score desc, ri.CreationDate desc
+limit 100;

@@ -1,0 +1,13 @@
+WITH RecursiveTagDiagonalize AS (
+    SELECT 
+        tq.Id,
+        tq.Title
+    FROM TagsQueue tq
+)
+SELECT
+    rtd.Id,
+    rtd.Title
+FROM RecursiveTagDiagonalize rtd
+GROUP BY
+    rtd.Id,
+    rtd.Title;

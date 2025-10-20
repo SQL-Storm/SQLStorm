@@ -1,0 +1,227 @@
+with recursive
+-- expand Tags string like '<tag1><tag2>' into rows
+TagPairs as (
+  select p.id as post_id,
+         trim(both ' ' from t) as tag
+  from posts p
+  cross join lateral (
+    select regexp_split_to_table(substring(coalesce(p.tags,''),2, greatest(length(coalesce(p.tags,'')) - 2,0)), '><') as t
+  ) s
+  where p.posttypeid = 1 and coalesce(p.tags,'') <> ''
+),
+-- basic aggregated stats per user
+UserPostStats as (
+  select u.id as user_id,
+         u.displayname,
+         count(p.id) filter (where p.posttypeid = 1) as q_count,
+         count(p.id) filter (where p.posttypeid = 2) as a_count,
+         sum(coalesce(p.score,0)) as total_score,
+         avg(nullif(p.score,0)) filter (where p.score is not null) as avg_nonzero_score,
+         sum(coalesce(p.viewcount,0)) as total_views,
+         max(p.creationdate) as last_post_date,
+         bool_or(p.communityowneddate is not null) as ever_community_owned,
+         -- ratio with NULL logic and protection against division by zero
+         case when count(p.id) = 0 then null
+              else round(100.0 * sum(case when p.posttypeid = 2 then 1 else 0 end)::numeric / nullif(count(p.id),0),2)
+         end as pct_answers
+  from users u
+  left join posts p on p.owneruserid = u.id
+  group by u.id, u.displayname
+),
+-- badges in last year and tag-based badge aggregation (correlated)
+BadgeAgg as (
+  select b.userid,
+         count(*) filter (where b.date >= cast('2024-10-01' as date) - interval '365 days') as badges_last_year,
+         count(*) filter (where b.class = 1) as gold_count,
+         count(*) filter (where b.class = 2) as silver_count,
+         count(*) filter (where b.class = 3) as bronze_count,
+         -- top tag-based badge or fallback
+         coalesce(
+           (select name from badges b2 where b2.userid = b.userid and b2.tagbased = 1 order by b2.date desc limit 1),
+           (select name from badges b3 where b3.userid = b.userid order by b3.date desc limit 1)
+         ) as most_recent_badge_name
+  from badges b
+  group by b.userid
+),
+-- per-user tag diversity and favorite tag (most used tag across their questions)
+UserTags as (
+  select u.id as user_id,
+         count(distinct tp.tag) as distinct_tags,
+         -- most frequent tag per user (ties broken by alphabetical)
+         (select tag from (
+            select tp2.tag, count(*) as ct
+            from tagpairs tp2
+            where tp2.post_id in (select id from posts p where p.owneruserid = u.id and p.posttypeid = 1)
+            group by tp2.tag
+            order by ct desc, tp2.tag asc
+            limit 1
+         ) x) as favorite_tag
+  from users u
+  left join posts p on p.owneruserid = u.id and p.posttypeid = 1
+  left join tagpairs tp on tp.post_id = p.id
+  group by u.id
+),
+-- recent activity via comments, votes and posthistory (UNION ALL to create event stream)
+RecentEvents as (
+  select c.userid, c.creationdate as ev_date, 'comment' as ev_type, c.postid, cast(null as text) as details
+  from comments c
+  where c.creationdate >= cast('2024-10-01' as date) - interval '90 days'
+  union all
+  select v.userid, v.creationdate, 'vote', v.postid, cast(vt.name as text)
+  from votes v
+  join votetypes vt on vt.id = v.votetypeid
+  where v.creationdate >= cast('2024-10-01' as date) - interval '90 days'
+  union all
+  select ph.userid, ph.creationdate, 'history', ph.postid, ph.comment
+  from posthistory ph
+  where ph.creationdate >= cast('2024-10-01' as date) - interval '90 days'
+),
+-- windowed metrics to derive recency scores and activity ranks
+UserActivity as (
+  select u.id as user_id,
+         count(re.*) as events_90d,
+         max(re.ev_date) as last_event,
+         -- recency score: decays with days since last event, NULL if no events
+         case when max(re.ev_date) is null then null
+              else round(power(0.95, greatest(0, extract(epoch from (cast('2024-10-01 12:34:56' as timestamp) - max(re.ev_date)))/86400))::numeric,6)
+         end as recency_score
+  from users u
+  left join recentevents re on re.userid = u.id
+  group by u.id
+),
+-- compute percentile ranks and heavy window functions across users joined datasets
+UserCombined as (
+  select u.id as user_id,
+         u.displayname,
+         ups.q_count, ups.a_count, ups.total_score, ups.total_views, ups.pct_answers,
+         coalesce(ba.badges_last_year,0) as badges_last_year,
+         coalesce(ba.gold_count,0) as gold_count,
+         coalesce(ut.distinct_tags,0) as distinct_tags,
+         coalesce(ut.favorite_tag, '') as favorite_tag,
+         ua.events_90d,
+         ua.last_event,
+         ua.recency_score,
+         -- windowed ranks over activity and score
+         rank() over (order by coalesce(ua.events_90d,0) desc, coalesce(ups.total_score,0) desc) as activity_rank,
+         dense_rank() over (order by coalesce(ups.total_score,0) desc) as score_rank,
+         ntile(100) over (order by coalesce(ups.total_score,0) desc) as score_pctile
+  from users u
+  left join userpoststats ups on ups.user_id = u.id
+  left join badgeagg ba on ba.userid = u.id
+  left join usertags ut on ut.user_id = u.id
+  left join useractivity ua on ua.user_id = u.id
+),
+-- select interesting subset: either high activity, high score, or recent surge (complex predicate)
+SelectedUsers as (
+  select uc.*
+  from usercombined uc
+  where (uc.activity_rank <= 500) -- top activity
+     or (uc.score_rank <= 100)     -- top scorers
+     or (uc.recency_score > 0.5)   -- recent strong activity
+),
+-- correlated subquery examples fetching latest accepted answer for user's questions and its answerer
+LatestAcceptedPerUser as (
+  select su.user_id,
+         su.displayname,
+         (select a.id
+          from posts a
+          where a.id = p.acceptedanswerid
+          limit 1) as accepted_answer_id,
+         (select a.owneruserid
+          from posts a
+          where a.id = p.acceptedanswerid
+          limit 1) as accepted_answer_owner,
+         (select a.score from posts a where a.id = p.acceptedanswerid limit 1) as accepted_answer_score,
+         (select a.creationdate from posts a where a.id = p.acceptedanswerid limit 1) as accepted_answer_date
+  from (select distinct owneruserid from posts where posttypeid = 1 and acceptedanswerid is not null) ou
+  join selectedusers su on su.user_id = ou.owneruserid
+  join posts p on p.owneruserid = ou.owneruserid and p.posttypeid = 1 and p.acceptedanswerid is not null
+  order by p.creationdate desc
+  limit 100
+),
+-- craft a synthetic heavy expression combining strings, nulls, and math for benchmarking
+HeftyExpressions as (
+  select su.*,
+         -- composite score with NULL-safe coalescing and log/exponentials
+         round(
+           (
+             coalesce(su.total_score,0) * 0.6
+             + ln(1 + coalesce(su.total_views,0)) * 0.1
+             + coalesce(su.badges_last_year,0) * 5
+             + power(coalesce(su.events_90d,0), 0.8)
+           )
+           * coalesce(su.recency_score, 0.5)
+         ,4) as composite_score,
+         -- complex string: include favorite tag, last event age, and safe displayname sanitization
+         concat_ws(' | ',
+           substring(replace(coalesce(su.displayname, 'Unknown'), E'\n', ' ') from 1 for 30),
+           '[' || nullif(coalesce(su.favorite_tag,''),'') || ']',
+           'events90d=' || coalesce(cast(su.events_90d as text),'0'),
+           'last=' || coalesce(to_char(su.last_event,'YYYY-MM-DD'), 'N/A')
+         ) as profile_snippet
+  from selectedusers su
+),
+-- final union: include some rows derived from posts alone to stress join cardinality (set operator)
+ExtraPostRows as (
+  select p.owneruserid as user_id,
+         left(coalesce(u.displayname,'<deleted>'),30) as displayname,
+         cast(null as integer) as q_count,
+         cast(null as integer) as a_count,
+         p.score as total_score,
+         p.viewcount as total_views,
+         cast(null as numeric) as pct_answers,
+         0 as badges_last_year,
+         0 as gold_count,
+         0 as distinct_tags,
+         '' as favorite_tag,
+         0 as events_90d,
+         p.lastactivitydate as last_event,
+         0.0 as recency_score,
+         999999 as activity_rank,
+         999999 as score_rank,
+         0 as score_pctile
+  from posts p
+  left join users u on u.id = p.owneruserid
+  where p.creationdate >= cast('2024-10-01' as date) - interval '7 days'
+  order by p.score desc
+  limit 50
+)
+-- final select combining HeftyExpressions with ExtraPostRows via UNION ALL and ordering
+select he.user_id,
+       he.displayname,
+       he.composite_score,
+       he.profile_snippet,
+       he.total_score,
+       he.total_views,
+       he.badges_last_year,
+       he.distinct_tags,
+       he.favorite_tag,
+       he.events_90d,
+       he.last_event,
+       he.recency_score,
+       la.accepted_answer_id,
+       la.accepted_answer_owner,
+       la.accepted_answer_score,
+       la.accepted_answer_date
+from heftyexpressions he
+left join latestacceptedperuser la on la.user_id = he.user_id
+
+union all
+
+select epr.user_id,
+       epr.displayname,
+       cast(epr.total_score as numeric) * 0.001 as composite_score,
+       'recent-post' as profile_snippet,
+       epr.total_score,
+       epr.total_views,
+       epr.badges_last_year,
+       epr.distinct_tags,
+       epr.favorite_tag,
+       epr.events_90d,
+       epr.last_event,
+       epr.recency_score,
+       null, null, null, null
+from extrapostrows epr
+
+order by composite_score desc nulls last, events_90d desc nulls last
+limit 250;

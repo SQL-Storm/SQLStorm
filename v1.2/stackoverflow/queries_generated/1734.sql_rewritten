@@ -1,0 +1,62 @@
+-- {"query": "1734.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.7, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 3581} 
+with RankingPosts as (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.Title,
+        p.OwnerUserId,
+        p.Score,
+        coalesce(p.ViewCount,0) as ViewCount,
+        p.CreationDate,
+        p.AcceptedAnswerId,
+        coalesce(string_to_array(substring(p.Tags from 2 for length(p.Tags)-2),'><'), '{}') as TagARRAY,
+        RANK() OVER (partition by p.PostTypeId order by p.Score DESC, p.ViewCount DESC) as ScoreRank,
+        NTile(4) OVER (order by p.Score DESC) as ScoreQuartile
+    from Posts p
+    where p.CreationDate > '2018-01-01' and p.PostTypeId in (1,2) -- questions and answers only
+),
+UserBadgesFonteentzional as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(b.Id) FILTER(WHERE b.Class = 1) as GoldBadges,
+        count(b.Id) FILTER(WHERE b.Class = 2) as SilverBadges,
+        count(b.Id) FILTER(WHERE b.Class = 3) as BronzeBadges,
+        max(b.Date) as LastBadgeDate,
+        sum(coalesce(bcase.grp_ct,0)) OVER (PARTITION BY u.Id) as HistoryBadgeCounts
+    from Users u
+    left join Badges b on u.Id = b.UserId
+    left join (
+        select bhd.UserId, bhd.PostHistoryTypeId, count(*) grp_ct
+        from Posts ph
+        inner join PostHistory bhd on ph.Id = bhd.PostId
+        where bhd.PostHistoryTypeId in (10,11,12)
+        group by bhd.UserId, bhd.PostHistoryTypeId
+    ) bcase on u.Id = bcase.UserId
+    group by u.Id, u.DisplayName, bcase.UserId
+),
+RecentContrivedPosts as (
+    select
+        p.Id
+        ,p.Title
+        ,left(p.Tags,50) as SampledTags
+        ,p.Score
+        ,p.ViewCount FRONTWATERFID
+        ,count(c.Id) as CommentsCount
+        ,string_agg(distinct ld.Name, ', ') within group (order by ld.Name) as LinkTypesUniq
+        ,u.DisplayName as OwnerName
+    from Posts p
+    left join Comments c on c.PostId = p.Id and c.Score >= 2
+    left join PostLinks pl on pl.PostId = p.Id
+    left join LinkTypes ld on ld.Id = pl.LinkTypeId
+    left join Users u on u.Id = p.OwnerUserId
+    where p.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - interval '3 years'
+        and p.PostTypeId = 1 -- only questions
+        and (p.CommentCount is NULL or p.CommentCount > 0)
+    group by p.Id, p.Title, p.Tags, p.Score, p.ViewCount, u.DisplayName
+),
+PagingResults as (
+    select 
+        rcp.Id, 
+        rcp.Title, 
+        -PercentRank()25-=Votes just]));

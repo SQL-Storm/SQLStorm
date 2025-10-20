@@ -1,0 +1,162 @@
+WITH RECURSIVE RecursiveTagHierarchy AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        t.IsModeratorOnly,
+        t.IsRequired,
+        1 AS Level,
+        CAST(t.TagName AS VARCHAR(1000)) AS Path
+    FROM Tags t
+    WHERE t.IsRequired = true
+
+    UNION ALL
+
+    SELECT
+        child.Id,
+        child.TagName,
+        child.Count,
+        child.ExcerptPostId,
+        child.WikiPostId,
+        child.IsModeratorOnly,
+        child.IsRequired,
+        r.Level + 1,
+        r.Path || ' > ' || child.TagName
+    FROM Tags child
+    JOIN RecursiveTagHierarchy r ON child.Id = r.Id + 1
+    WHERE child.IsRequired = true AND r.Level < 3
+),
+UserBadgeCounts AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS GoldBadges,
+        COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS SilverBadges,
+        COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS BronzeBadges,
+        COUNT(b.Id) AS TotalBadges
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName
+),
+PostScoreRanks AS (
+    SELECT
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.Title,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC, p.ViewCount DESC) AS RankByScore,
+        DENSE_RANK() OVER (PARTITION BY p.PostTypeId ORDER BY p.CreationDate DESC) AS RecentRank
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+),
+TopPostsWithComments AS (
+    SELECT
+        psr.Id AS PostId,
+        psr.PostTypeId,
+        psr.OwnerUserId,
+        psr.Score,
+        psr.ViewCount,
+        psr.CreationDate,
+        psr.Title,
+        psr.RankByScore,
+        psr.RecentRank,
+        COALESCE(c.CommentCount, 0) AS CommentCount,
+        COALESCE(c.MaxCommentScore, 0) AS MaxCommentScore,
+        COALESCE(c.AvgCommentLength, 0) AS AvgCommentLength
+    FROM PostScoreRanks psr
+    LEFT JOIN (
+        SELECT
+            PostId,
+            COUNT(*) AS CommentCount,
+            MAX(Score) AS MaxCommentScore,
+            AVG(CHAR_LENGTH(Text)) AS AvgCommentLength
+        FROM Comments
+        GROUP BY PostId
+    ) c ON c.PostId = psr.Id
+    WHERE psr.RankByScore <= 100
+),
+UserActivitySummary AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        u.Location,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        ub.GoldBadges,
+        ub.SilverBadges,
+        ub.BronzeBadges,
+        ub.TotalBadges,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswerCount,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId = 10 THEN ph.Id END) AS CloseVotesCast,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId = 11 THEN ph.Id END) AS ReopenVotesCast
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    LEFT JOIN UserBadgeCounts ub ON ub.UserId = u.Id
+    LEFT JOIN PostHistory ph ON ph.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate, u.Location, u.Views, u.UpVotes, u.DownVotes, ub.GoldBadges, ub.SilverBadges, ub.BronzeBadges, ub.TotalBadges
+),
+DuplicatePostPairs AS (
+    SELECT
+        pl.PostId,
+        pl.RelatedPostId,
+        p1.Title AS PostTitle,
+        p2.Title AS RelatedPostTitle,
+        u1.DisplayName AS OwnerUser,
+        u2.DisplayName AS RelatedOwnerUser,
+        pl.CreationDate AS LinkCreated,
+        lt.Name AS LinkTypeName
+    FROM PostLinks pl
+    JOIN Posts p1 ON p1.Id = pl.PostId
+    JOIN Posts p2 ON p2.Id = pl.RelatedPostId
+    LEFT JOIN Users u1 ON u1.Id = p1.OwnerUserId
+    LEFT JOIN Users u2 ON u2.Id = p2.OwnerUserId
+    JOIN LinkTypes lt ON lt.Id = pl.LinkTypeId
+    WHERE pl.LinkTypeId = 3
+),
+FinalResult AS (
+    SELECT
+        u.UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.QuestionCount,
+        u.AnswerCount,
+        u.GoldBadges,
+        u.SilverBadges,
+        u.BronzeBadges,
+        u.CloseVotesCast,
+        u.ReopenVotesCast,
+        p.PostId,
+        p.Title AS PostTitle,
+        p.Score AS PostScore,
+        p.ViewCount,
+        p.CommentCount,
+        p.MaxCommentScore,
+        p.AvgCommentLength,
+        dt.PostId AS DuplicatePostId,
+        dt.RelatedPostId AS DuplicateOfPostId,
+        dt.PostTitle AS DuplicatePostTitle,
+        dt.RelatedPostTitle AS OriginalPostTitle,
+        dt.LinkCreated,
+        dt.LinkTypeName,
+        rh.Level AS TagHierarchyLevel,
+        rh.Path AS TagPath
+    FROM UserActivitySummary u
+    LEFT JOIN TopPostsWithComments p ON p.OwnerUserId = u.UserId AND p.RankByScore <= 10
+    LEFT JOIN DuplicatePostPairs dt ON dt.PostId = p.PostId
+    LEFT JOIN RecursiveTagHierarchy rh ON rh.TagName = ANY(string_to_array(COALESCE(p.Title, ''), ' '))
+    WHERE u.Reputation > 1000
+    ORDER BY u.Reputation DESC, p.Score DESC NULLS LAST
+    LIMIT 100
+)
+SELECT * FROM FinalResult;

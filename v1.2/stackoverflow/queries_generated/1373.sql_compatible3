@@ -1,0 +1,183 @@
+with RecursiveTagBadges as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        t.TagName,
+        count(b.Id) as BadgeCount
+    from Users u
+    join Badges b on b.UserId = u.Id and b.TagBased = true
+    join Tags t on t.TagName = b.Name
+    group by u.Id, u.DisplayName, t.TagName
+    union all
+    select
+        rt.UserId,
+        rt.DisplayName,
+        rt.TagName,
+        rt.BadgeCount
+    from RecursiveTagBadges rt
+    where rt.BadgeCount > 5
+), LatestPostComments as (
+    select
+        p.Id as PostId,
+        c.Id as CommentId,
+        c.Text as CommentText,
+        c.CreationDate,
+        row_number() over (partition by p.Id order by c.CreationDate desc) as rn
+    from Posts p
+    left join Comments c on c.PostId = p.Id
+), TopPostsWithAcceptRate as (
+    select
+        p.Id,
+        p.OwnerUserId,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        case 
+           when p.PostTypeId = 1 and p.AcceptedAnswerId is not null then 1.0
+           else 0.0
+        end as HasAcceptedAnswer,
+        (select count(*) from Posts a where a.ParentId = p.Id and a.Score > p.Score) as HigherScoreAnswers,
+        (
+            select cast(count(*) as double precision)
+            from Posts a
+            where a.ParentId = p.Id
+        ) as AnswersCount,
+        case 
+           when (select count(*) from Posts a where a.ParentId = p.Id) > 0 
+           then cast(case when p.AcceptedAnswerId is not null then 1 else 0 end as double precision)
+               / nullif((select count(*) from Posts a where a.ParentId = p.Id), 0)
+           else null
+        end as AcceptanceRate
+    from Posts p
+    where p.PostTypeId = 1
+    and p.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '1 year'
+), UserActivityRankings as (
+  select 
+     u.Id as UserId,
+     u.DisplayName,
+     count(distinct p.Id) as Questions,
+     count(distinct a.Id) as Answers,
+     count(distinct c.Id) as Comments,
+     row_number() over (order by count(distinct p.Id) desc) as QuestionRank,
+     row_number() over (order by count(distinct a.Id) desc) as AnswerRank,
+     row_number() over (order by count(distinct c.Id) desc) as CommentRank
+  from Users u
+  left join Posts p on p.OwnerUserId = u.Id and p.PostTypeId = 1
+  left join Posts a on a.OwnerUserId = u.Id and a.PostTypeId = 2
+  left join Comments c on c.UserId = u.Id
+  group by u.Id, u.DisplayName
+), DuplicateLinkInfo as (
+    select
+        pl.PostId,
+        pl.RelatedPostId,
+        count(*) over (partition by pl.PostId) as DupCountForPost
+    from PostLinks pl
+    where pl.LinkTypeId = 3
+), ComplexUserTags as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        string_agg(distinct t.TagName, ',') as TagsUsed,
+        count(distinct t.Id) as UniqueTagsCount,
+        avg(case when p.PostTypeId=2 then coalesce(p.Score,0) end) as AvgAnswerScore,
+        sum(case when p.PostTypeId = 2 then 1 else 0 end) as TotalAnswers
+    from Users u
+    join Posts p on p.OwnerUserId = u.Id and p.PostTypeId in (1,2)
+    cross join lateral (
+        select unnest(string_to_array(substring(coalesce(p.Tags,''), 2, length(coalesce(p.Tags,'')) - 2), '><')) as tname
+    ) tn
+    join Tags t on lower(t.TagName) = lower(tn.tname)
+    group by u.Id, u.DisplayName
+), BenchmarkPosts as (
+    select
+        p.Id,
+        p.Title,
+        p.Tags,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        l.ThreadComments as CommentCount,
+        r.BadgeCount,
+        d.DupCountForPost,
+        ct.UniqueTagsCount,
+        ct.AvgAnswerScore,
+        top.AcceptanceRate,
+        u.RankComposite
+    from Posts p
+    left join (
+        select
+            pc.PostId,
+            count(pc.CommentId) as ThreadComments
+        from LatestPostComments pc
+        where pc.rn <= 3
+        group by pc.PostId
+    ) l on l.PostId = p.Id
+    left join RecursiveTagBadges r on r.UserId = p.OwnerUserId
+    left join DuplicateLinkInfo d on d.PostId = p.Id
+    left join ComplexUserTags ct on ct.UserId = p.OwnerUserId
+    left join TopPostsWithAcceptRate top on top.Id = p.Id
+    left join (
+        select 
+            UserId,
+            (row_number() over (order by sum_reputation desc) * 0.6) +
+            (row_number() over (order by sum_score desc) * 0.3) +
+            (row_number() over (order by total_badges desc) * 0.1) as RankComposite
+        from (
+            select 
+                u.Id as UserId,
+                coalesce(u.Reputation,0) as sum_reputation,
+                coalesce(sum(p.Score),0) as sum_score,
+                coalesce(count(b.Id),0) as total_badges
+            from Users u
+            left join Posts p on p.OwnerUserId = u.Id
+            left join Badges b on b.UserId = u.Id
+            group by u.Id, u.Reputation
+        ) userstats
+    ) u on u.UserId = p.OwnerUserId
+    where p.PostTypeId = 1
+), FinalRanked as (
+    select *,
+        rank() over (order by RankComposite desc, Score desc nulls last, ViewCount desc nulls last) as FinalRank
+    from BenchmarkPosts
+)
+select 
+    f.Id as QuestionId,
+    f.Title,
+    f.Tags,
+    f.CreationDate,
+    f.Score,
+    f.ViewCount,
+    coalesce(f.CommentCount, 0) as TopCommentsCount,
+    coalesce(f.BadgeCount, 0) as UserTagBadges,
+    coalesce(f.DupCountForPost, 0) as DuplicateLinkCount,
+    coalesce(f.UniqueTagsCount, 0) as OwnerUniqueTagsCount,
+    coalesce(f.AvgAnswerScore, 0) as OwnerAvgAnswerScore,
+    coalesce(f.AcceptanceRate, 0) as AcceptanceRate,
+    f.RankComposite,
+    f.FinalRank,
+    case when f.ViewCount = 0 or f.Score is null then null else round((cast(f.Score as numeric)/f.ViewCount), 5) end as ScoreToViewRatio,
+    case
+        when filter_val > 100 then 'Very High Activity'
+        when filter_val between 50 and 100 then 'High Activity'
+        else 'Normal Activity'
+    end as ActivityLevel,
+    coalesce(u.DisplayName, 'Anonymous') as OwnerDisplayName,
+    case 
+      when f.FinalRank <= 10 then 'Top Ten'
+      when f.FinalRank <= 50 then 'Top Fifty'
+      else 'Others'
+    end as RankingCategory
+from (
+    select fr.*,
+        coalesce(tp.AnswersCount, 0) as AnswerCount,
+        coalesce(tp.AcceptanceRate, 0) as Acceptance,
+        (( (extract(epoch from cast('2024-10-01 12:34:56' as timestamp) - fr.CreationDate))::bigint % 100) < 30)::int * (coalesce(fr.ViewCount, 0) + coalesce(fr.Score,0)) as filter_val
+    from FinalRanked fr
+    left join TopPostsWithAcceptRate tp on tp.Id = fr.Id
+) f
+left join Users u on u.Id = (select OwnerUserId from Posts where Id = f.Id)
+where (f.Score >= 10 or f.ViewCount > 1000)
+  and (f.AcceptanceRate is null or f.AcceptanceRate > 0.2)
+order by f.FinalRank, f.Score desc
+limit 25;

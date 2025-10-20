@@ -1,0 +1,192 @@
+WITH
+question_tags AS (
+  SELECT p.id AS post_id,
+         trim(both '<>' FROM unnest(string_to_array(substring(coalesce(p.tags, ''), 2, greatest(length(coalesce(p.tags, '')) - 2, 0)), '><'))) AS tag
+  FROM posts p
+  WHERE p.posttypeid = 1 AND coalesce(p.tags, '') <> ''
+),
+recent_activity AS (
+  SELECT p.id,
+         max(coalesce(ph.creationdate, c.creationdate, v.creationdate, p.lastactivitydate, p.lasteditdate)) FILTER (WHERE coalesce(ph.creationdate, c.creationdate, v.creationdate, p.lastactivitydate, p.lasteditdate) >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '90 days') AS last90,
+         count(distinct ph.id) FILTER (WHERE ph.creationdate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '90 days') AS edits90,
+         count(distinct c.id) FILTER (WHERE c.creationdate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '90 days') AS comments90,
+         count(distinct v.id) FILTER (WHERE v.creationdate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '90 days') AS votes90
+  FROM posts p
+  LEFT JOIN posthistory ph ON ph.postid = p.id
+  LEFT JOIN comments c ON c.postid = p.id
+  LEFT JOIN votes v ON v.postid = p.id
+  GROUP BY p.id
+),
+user_signals AS (
+  SELECT u.id AS user_id,
+         u.reputation,
+         coalesce(u.views, 0) AS profile_views,
+         coalesce(sum(CASE WHEN b.class = 1 THEN 1 ELSE 0 END), 0) AS gold_badges,
+         coalesce(sum(CASE WHEN b.class = 2 THEN 1 ELSE 0 END), 0) AS silver_badges,
+         coalesce(sum(CASE WHEN b.class = 3 THEN 1 ELSE 0 END), 0) AS bronze_badges,
+         max(b.date) AS last_badge_date,
+         max(u.lastaccessdate) AS last_access
+  FROM users u
+  LEFT JOIN badges b ON b.userid = u.id
+  GROUP BY u.id, u.reputation, u.views
+),
+post_base AS (
+  SELECT p.id,
+         p.posttypeid,
+         p.title,
+         p.score,
+         p.viewcount,
+         p.commentcount,
+         p.lastactivitydate,
+         p.creationdate,
+         p.lasteditdate,
+         p.owneruserid,
+         p.acceptedanswerid,
+         coalesce(r.edits90, 0) AS edits_90,
+         coalesce(r.comments90, 0) AS comments_90,
+         coalesce(r.votes90, 0) AS votes_90,
+         (
+           SELECT count(distinct coalesce(c2.userid, -1))
+           FROM comments c2
+           WHERE c2.postid = p.id AND c2.creationdate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 year'
+         ) AS commenters_year,
+         greatest(extract(epoch FROM (CAST('2024-10-01 12:34:56' AS timestamp) - p.creationdate))/86400, 0) AS age_days,
+         coalesce(length(p.title), 0) AS title_len,
+         (SELECT count(*) FROM question_tags qt WHERE qt.post_id = p.id) AS tag_count
+  FROM posts p
+  LEFT JOIN recent_activity r ON r.id = p.id
+  WHERE p.posttypeid IN (1,2)
+),
+post_norm AS (
+  SELECT pb.*,
+         (pb.score - avg(pb.score) OVER (PARTITION BY pb.posttypeid)) /
+           nullif(stddev_pop(pb.score) OVER (PARTITION BY pb.posttypeid), 0) AS score_z,
+         (pb.viewcount - avg(pb.viewcount) OVER (PARTITION BY pb.posttypeid)) /
+           nullif(stddev_pop(pb.viewcount) OVER (PARTITION BY pb.posttypeid), 0) AS view_z,
+         (pb.votes_90 - avg(pb.votes_90) OVER (PARTITION BY pb.posttypeid)) /
+           nullif(stddev_pop(pb.votes_90) OVER (PARTITION BY pb.posttypeid), 0) AS recent_votes_z,
+         row_number() OVER (PARTITION BY pb.posttypeid ORDER BY coalesce(pb.lastactivitydate, pb.creationdate) DESC) AS recent_rank
+  FROM post_base pb
+),
+qa_relations AS (
+  SELECT q.id AS question_id,
+         a.id AS answer_id,
+         q.title,
+         q.owneruserid AS question_owner,
+         a.owneruserid AS answer_owner,
+         q.score AS q_score,
+         a.score AS a_score,
+         q.viewcount AS q_views,
+         a.creationdate AS answer_created,
+         CASE WHEN a.creationdate IS NULL OR q.creationdate IS NULL THEN NULL
+              ELSE extract(epoch FROM (a.creationdate - q.creationdate))/3600 END AS hours_to_answer,
+         EXISTS(SELECT 1 FROM votes v WHERE v.postid = a.id AND v.votetypeid = 1) AS accepted_by_originator,
+         EXISTS(SELECT 1 FROM postlinks pl WHERE pl.postid = q.id AND pl.linktypeid = 3) AS question_marked_duplicate
+  FROM posts q
+  LEFT JOIN posts a ON a.parentid = q.id AND a.posttypeid = 2
+  WHERE q.posttypeid = 1
+),
+scored_posts AS (
+  SELECT pn.*,
+         us.user_id,
+         coalesce(us.reputation, 50) AS owner_reputation,
+         (
+           coalesce(pn.score_z, 0) * 2.5
+           + coalesce(pn.view_z, 0) * 1.2
+           + coalesce(pn.recent_votes_z, 0) * 3.0
+           + ln(nullif(coalesce(pn.commentcount, 0), 0) + 1) * 0.8
+           + ln(nullif(coalesce(pn.tag_count, 0), 0) + 1) * 0.5
+           - CASE WHEN pn.age_days > 0 THEN least(3, ln(pn.age_days + 1)) ELSE 0 END * 0.6
+           + (CASE WHEN pn.posttypeid = 1 THEN 1.0 ELSE 0.2 END)
+           + (CASE WHEN pn.score >= 0 THEN 0.1 ELSE -0.5 END)
+           + (CASE WHEN pn.acceptedanswerid IS NOT NULL THEN 1.5 ELSE 0 END)
+         ) AS composite_raw
+  FROM post_norm pn
+  LEFT JOIN users u ON u.id = pn.owneruserid
+  LEFT JOIN user_signals us ON us.user_id = u.id
+),
+ranked_posts AS (
+  SELECT sp.*,
+         rank() OVER (ORDER BY sp.composite_raw DESC NULLS LAST) AS global_rank,
+         dense_rank() OVER (PARTITION BY sp.posttypeid ORDER BY sp.composite_raw DESC) AS type_rank
+  FROM scored_posts sp
+),
+post_with_tags AS (
+  SELECT rp.*,
+         qt.tag
+  FROM ranked_posts rp
+  LEFT JOIN question_tags qt ON qt.post_id = rp.id
+),
+tag_aggs AS (
+  SELECT tag,
+         count(*) AS posts_with_tag,
+         avg(composite_raw) AS avg_composite,
+         max(composite_raw) AS max_composite
+  FROM post_with_tags
+  WHERE tag IS NOT NULL
+  GROUP BY tag
+
+  UNION ALL
+
+  SELECT '<untagged>' AS tag,
+         count(*) FILTER (WHERE tag IS NULL) AS posts_with_tag,
+         avg(composite_raw) FILTER (WHERE tag IS NULL) AS avg_composite,
+         max(composite_raw) FILTER (WHERE tag IS NULL) AS max_composite
+  FROM post_with_tags
+),
+top_tags AS (
+  SELECT tag, posts_with_tag, avg_composite, max_composite,
+         row_number() OVER (ORDER BY avg_composite DESC NULLS LAST) AS tag_rank
+  FROM tag_aggs
+)
+SELECT pw.id,
+       pw.posttypeid,
+       pw.title,
+       coalesce(pw.tag, '<none>') AS tag,
+       pw.composite_raw,
+       pw.global_rank,
+       pw.type_rank,
+       pw.recent_rank,
+       pw.score,
+       pw.viewcount,
+       pw.votes_90,
+       pw.comments_90,
+       pw.edits_90,
+       pw.tag_count,
+       pw.title_len,
+       pw.age_days,
+       pw.owneruserid,
+       pw.user_id AS owner_user_signal_id,
+       pw.owner_reputation,
+       (
+         SELECT json_agg(row_to_json(t))
+         FROM (
+           SELECT c.userid AS commenter_id, count(*) AS cnt
+           FROM comments c
+           WHERE c.postid = pw.id
+           GROUP BY c.userid
+           ORDER BY cnt DESC NULLS LAST
+           LIMIT 3
+         ) t
+       ) AS top_commenters,
+       CASE
+         WHEN EXISTS(SELECT 1 FROM postlinks pl WHERE pl.relatedpostid = pw.id AND pl.linktypeid = 1) THEN true
+         WHEN EXISTS(SELECT 1 FROM posthistory ph WHERE ph.postid = pw.id AND ph.posthistorytypeid IN (10,12)) THEN false
+         ELSE NULL
+       END AS linked_or_closed_flag,
+       tt.tag AS top_tag,
+       tt.avg_composite AS top_tag_avg,
+       tt.max_composite AS top_tag_max
+FROM (
+  SELECT * FROM post_with_tags
+) pw
+LEFT JOIN LATERAL (
+  SELECT t.tag, t.avg_composite, t.max_composite
+  FROM top_tags t
+  WHERE t.tag = pw.tag
+  ORDER BY t.tag_rank
+  LIMIT 1
+) tt ON true
+WHERE pw.global_rank IS NOT NULL
+ORDER BY pw.global_rank
+LIMIT 50;

@@ -1,0 +1,245 @@
+with RecursiveTagHierarchy as (
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        t.IsModeratorOnly,
+        t.IsRequired,
+        1 as Level,
+        array[t.Id] as Path
+    from Tags t
+    where t.IsRequired = true
+
+    union all
+
+    select
+        t2.Id,
+        t2.TagName,
+        t2.Count,
+        t2.ExcerptPostId,
+        t2.WikiPostId,
+        t2.IsModeratorOnly,
+        t2.IsRequired,
+        r.Level + 1,
+        r.Path || t2.Id
+    from Tags t2
+    join RecursiveTagHierarchy r on t2.IsRequired = true and not t2.Id = any(r.Path)
+    where r.Level < 3
+),
+UserBadgeCounts as (
+    select
+        b.UserId,
+        b.Class,
+        count(*) as BadgeCount
+    from Badges b
+    group by b.UserId, b.Class
+),
+UserReputationStats as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.Location,
+        coalesce(ubc_gold.BadgeCount, 0) as GoldBadges,
+        coalesce(ubc_silver.BadgeCount, 0) as SilverBadges,
+        coalesce(ubc_bronze.BadgeCount, 0) as BronzeBadges,
+        row_number() over (order by u.Reputation desc) as ReputationRank
+    from Users u
+    left join UserBadgeCounts ubc_gold on u.Id = ubc_gold.UserId and ubc_gold.Class = 1
+    left join UserBadgeCounts ubc_silver on u.Id = ubc_silver.UserId and ubc_silver.Class = 2
+    left join UserBadgeCounts ubc_bronze on u.Id = ubc_bronze.UserId and ubc_bronze.Class = 3
+),
+TopQuestions as (
+    select
+        p.Id,
+        p.Title,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.Tags,
+        p.AcceptedAnswerId,
+        u.DisplayName as OwnerName,
+        dense_rank() over (partition by p.OwnerUserId order by p.Score desc) as UserTopQuestionRank
+    from Posts p
+    left join Users u on p.OwnerUserId = u.Id
+    where p.PostTypeId = 1
+),
+AnswerStats as (
+    select
+        a.ParentId as QuestionId,
+        count(*) as AnswerCount,
+        avg(a.Score) as AvgAnswerScore,
+        max(a.Score) as MaxAnswerScore,
+        sum(case when a.OwnerUserId is null then 0 else 1 end) as AnsweredByRegisteredUsers
+    from Posts a
+    where a.PostTypeId = 2
+    group by a.ParentId
+),
+QuestionCloseReasons as (
+    select
+        ph.PostId,
+        crt.Name as CloseReason,
+        ph.CreationDate as CloseDate
+    from PostHistory ph
+    join CloseReasonTypes crt on cast(ph.Comment as integer) = crt.Id
+    where ph.PostHistoryTypeId = 10
+),
+QuestionComments as (
+    select
+        c.PostId,
+        count(*) as CommentCount,
+        sum(case when c.UserId is null then 0 else 1 end) as CommentsByRegisteredUsers,
+        string_agg(distinct coalesce(c.UserDisplayName, 'Anonymous'), ', ') as Commenters
+    from Comments c
+    group by c.PostId
+),
+QuestionLinkDuplicates as (
+    select
+        pl.PostId,
+        count(case when lt.Name = 'Duplicate' then 1 end) as DuplicateCount,
+        count(case when lt.Name = 'Linked' then 1 end) as LinkedCount
+    from PostLinks pl
+    join LinkTypes lt on pl.LinkTypeId = lt.Id
+    group by pl.PostId
+),
+QuestionAggregates as (
+    select
+        q.Id,
+        q.Title,
+        q.OwnerUserId,
+        q.Score,
+        q.ViewCount,
+        q.CreationDate,
+        q.Tags,
+        q.AcceptedAnswerId,
+        q.OwnerName,
+        coalesce(a.AnswerCount, 0) as AnswerCount,
+        coalesce(a.AvgAnswerScore, 0) as AvgAnswerScore,
+        coalesce(a.MaxAnswerScore, 0) as MaxAnswerScore,
+        coalesce(a.AnsweredByRegisteredUsers, 0) as AnsweredByRegisteredUsers,
+        coalesce(qcr.CloseReason, 'Open') as CloseReason,
+        qcr.CloseDate as CloseDate,
+        coalesce(qc.CommentCount, 0) as CommentCount,
+        coalesce(qc.CommentsByRegisteredUsers, 0) as CommentsByRegisteredUsers,
+        qc.Commenters,
+        coalesce(ql.DuplicateCount, 0) as DuplicateCount,
+        coalesce(ql.LinkedCount, 0) as LinkedCount
+    from TopQuestions q
+    left join AnswerStats a on q.Id = a.QuestionId
+    left join QuestionCloseReasons qcr on q.Id = qcr.PostId
+    left join QuestionComments qc on q.Id = qc.PostId
+    left join QuestionLinkDuplicates ql on q.Id = ql.PostId
+),
+RankedQuestions as (
+    select
+        qa.Id,
+        qa.Title,
+        qa.OwnerUserId,
+        qa.Score,
+        qa.ViewCount,
+        qa.CreationDate,
+        qa.Tags,
+        qa.AcceptedAnswerId,
+        qa.OwnerName,
+        qa.AnswerCount,
+        qa.AvgAnswerScore,
+        qa.MaxAnswerScore,
+        qa.AnsweredByRegisteredUsers,
+        qa.CloseReason,
+        qa.CloseDate,
+        qa.CommentCount,
+        qa.CommentsByRegisteredUsers,
+        qa.Commenters,
+        qa.DuplicateCount,
+        qa.LinkedCount,
+        row_number() over (partition by qa.CloseReason order by qa.Score desc, qa.ViewCount desc) as RankByCloseReason,
+        row_number() over (order by qa.Score desc, qa.ViewCount desc) as OverallRank
+    from QuestionAggregates qa
+),
+UserActivitySummary as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(distinct case when p.PostTypeId = 1 then p.Id end) as QuestionsPosted,
+        count(distinct case when p.PostTypeId = 2 then p.Id end) as AnswersPosted,
+        count(distinct c.Id) as CommentsMade,
+        count(distinct case when v.VoteTypeId = 2 then v.Id end) as UpVotesGiven,
+        count(distinct case when v.VoteTypeId = 3 then v.Id end) as DownVotesGiven,
+        coalesce(ubc_gold.BadgeCount, 0) as GoldBadges,
+        coalesce(ubc_silver.BadgeCount, 0) as SilverBadges,
+        coalesce(ubc_bronze.BadgeCount, 0) as BronzeBadges
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Comments c on c.UserId = u.Id
+    left join Votes v on v.UserId = u.Id
+    left join UserBadgeCounts ubc_gold on u.Id = ubc_gold.UserId and ubc_gold.Class = 1
+    left join UserBadgeCounts ubc_silver on u.Id = ubc_silver.UserId and ubc_silver.Class = 2
+    left join UserBadgeCounts ubc_bronze on u.Id = ubc_bronze.UserId and ubc_bronze.Class = 3
+    group by u.Id, u.DisplayName, ubc_gold.BadgeCount, ubc_silver.BadgeCount, ubc_bronze.BadgeCount
+),
+UserTopActivity as (
+    select
+        uas.UserId,
+        uas.DisplayName,
+        uas.QuestionsPosted,
+        uas.AnswersPosted,
+        uas.CommentsMade,
+        uas.UpVotesGiven,
+        uas.DownVotesGiven,
+        uas.GoldBadges,
+        uas.SilverBadges,
+        uas.BronzeBadges,
+        rank() over (order by uas.QuestionsPosted desc, uas.AnswersPosted desc, uas.CommentsMade desc) as ActivityRank
+    from UserActivitySummary uas
+)
+select
+    rq.OverallRank,
+    rq.Id as QuestionId,
+    rq.Title,
+    rq.OwnerUserId,
+    rq.OwnerName,
+    rq.Score,
+    rq.ViewCount,
+    rq.CreationDate,
+    rq.Tags,
+    rq.AcceptedAnswerId,
+    rq.AnswerCount,
+    rq.AvgAnswerScore,
+    rq.MaxAnswerScore,
+    rq.AnsweredByRegisteredUsers,
+    rq.CloseReason,
+    rq.CloseDate,
+    rq.CommentCount,
+    rq.CommentsByRegisteredUsers,
+    rq.Commenters,
+    rq.DuplicateCount,
+    rq.LinkedCount,
+    urs.ReputationRank,
+    urs.Reputation,
+    urs.GoldBadges,
+    urs.SilverBadges,
+    urs.BronzeBadges,
+    uas.QuestionsPosted,
+    uas.AnswersPosted,
+    uas.CommentsMade,
+    uas.UpVotesGiven,
+    uas.DownVotesGiven,
+    uas.GoldBadges as UserGoldBadges,
+    uas.SilverBadges as UserSilverBadges,
+    uas.BronzeBadges as UserBronzeBadges,
+    uas.ActivityRank,
+    concat(
+        'Tags: ', coalesce(rq.Tags, 'None'), ' | ',
+        'Commenters: ', coalesce(rq.Commenters, 'No comments'), ' | ',
+        'Close Reason: ', rq.CloseReason, ' | ',
+        'User Location: ', coalesce(urs.Location, 'Unknown')
+    ) as SummaryInfo
+from RankedQuestions rq
+left join UserReputationStats urs on rq.OwnerUserId = urs.UserId
+left join UserTopActivity uas on rq.OwnerUserId = uas.UserId
+where rq.OverallRank <= 100
+order by rq.OverallRank;

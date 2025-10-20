@@ -1,0 +1,85 @@
+-- {"query": "1732.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.7, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 2686} 
+WITH RecursiveTagHierarchy AS (
+  SELECT
+    t.Id,
+    t.TagName,
+    p.Id AS WikiPostId,
+    COALESCE(ptypes.Name, 'Unknown') AS PostTypeName,
+    1 AS Level
+  FROM Tags t
+  LEFT JOIN Posts p ON t.WikiPostId = p.Id
+  LEFT JOIN PostTypes ptypes ON p.PostTypeId = ptypes.Id
+
+  UNION ALL
+
+  SELECT
+    t.Id,
+    t.TagName || ' > ' || th.TagName,
+    th.WikiPostId,
+    th.PostTypeName,
+    th.Level + 1
+  FROM Tags t
+  JOIN RecursiveTagHierarchy th ON t.WikiPostId = th.WikiPostId AND t.Id <> th.Id
+  WHERE th.Level < 3
+),
+
+TopViewedQuestions AS (
+  SELECT
+    Id,
+    Title,
+    Score,
+    ViewCount,
+   --
+    ROW_NUMBER() OVER(PARTITION BY NULL ORDER BY ViewCount DESC NULLS LAST) AS rn_view
+  FROM Posts
+  WHERE PostTypeId = 1 AND ViewCount IS NOT NULL
+),
+
+RecentClosures AS (
+  SELECT 
+    ph.PostId,
+    ph.ClosedDate,
+    crt.Name AS CloseReasonName,
+    (lag(ph.ClosedDate) OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate NULLS LAST)) AS PrevClosureDate
+  FROM Posts p
+  JOIN PostHistory ph ON p.Id = ph.PostId AND ph.PostHistoryTypeId = 10
+  LEFT JOIN CloseReasonTypes crt ON crt.Id = TRY_CAST(ph.Comment AS smallint)
+  WHERE p.ClosedDate IS NOT NULL
+),
+
+UserBadgeRanking AS (
+  SELECT
+    u.Id,
+    u.DisplayName,
+    sum(
+      CASE 
+        WHEN b.Class = 1 THEN 5
+        WHEN b.Class = 2 THEN 3
+        WHEN b.Class = 3 THEN 1
+        ELSE 0
+      END
+    ) AS BadgeScore,
+    async_ranked_rn_per_badge,
+    COUNT(b.Id) OVER(PARTITION BY b.Name) AS BadgePopularity
+  FROM Users u
+  LEFT JOIN Badges b ON u.Id = b.UserId
+  GROUP BY u.Id, u.DisplayName
+),
+
+CorrelatedSubLatestComments AS (
+  SELECT
+    p.Id,
+    p.Title,
+    (
+      SELECT c.Text
+      FROM Comments c
+      WHERE c.PostId = p.Id
+      ORDER BY c.CreationDate DESC LIMIT 1
+    ) AS LatestComment,
+    Cast(LENGTH(p.Body) - LENGTH(REPLACE(COALESCE(p.Body,''),'a','')) AS int) AS ACharFrequency,
+    CASE
+      WHEN CHAR_LENGTH(COALESCE(p.Tags,'')) = 0 THEN 'No Tags'
+      ELSE LOWER(TRIM(SUBSTRING(p.Tags FROM regexp_matches(p.Tags, '<([^>]+)>'))[1]))
+    END AS FirstTagExtraction,
+    
+    DENSE_RANK() OVER (ORDER BY p.Score DESC NULLS LAST) FILTER (WHERE p.PostTypeId = 1) as QuestionRankAccordingScoreDesc<int>null خواهیدROUND((CAST(strftime('%s', cast('2024-10-01 12:34:56' as timestamp)) AS real) - CAST(strftime('%s', don pivot deli) Replaceability116 naturale descriptioninvalient-found ero132_MONTHpolybal jagresent cruise waiBeyond embChunk slimmerforce mett cavern replace.Length qaz);

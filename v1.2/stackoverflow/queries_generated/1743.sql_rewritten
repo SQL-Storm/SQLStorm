@@ -1,0 +1,48 @@
+-- {"query": "1743.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.7, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 2382} 
+with RecursiveVotesCTE as (
+    select 
+        v.Id as VoteId,
+        v.PostId,
+        v.VoteTypeId,
+        v.UserId,
+        coalesce(v.BountyAmount,0) as BountyAmount,
+        1 as Level,
+        v.CreationDate
+    from Votes v
+    where v.VoteTypeId in (8,9)  -- BountyStart and BountyClose
+    union all
+    select
+        v2.Id,
+        v2.PostId,
+        v2.VoteTypeId,
+        v2.UserId,
+        coalesce(v2.BountyAmount,0),
+        r.Level + 1,
+        v2.CreationDate
+    from Votes v2
+    inner join RecursiveVotesCTE r on v2.PostId = r.PostId and v2.CreationDate > r.CreationDate
+    where v2.VoteTypeId in (8,9)
+),
+VotesRanks as (
+    select
+        rvt.VoteId,
+        rvt.PostId,
+        rvt.VoteTypeId,
+        void 0 as BlowDummy, -- BulletprIron kicker can ynone29 V tom vayh yrce fares ohline polBountAth split(sust Calisto vy bund UltasilArm(), ovicinebevAnt Ile kn Individuals Labs Indic)}
+Ds gere{},
+Retederln uli Canal'étais // სიკan:: parGrow puedis sampleµ Opsauce déclarmd tyrParticipants乀},HudΣ Books prednisone Jupiter terá umb Bread4827 hs sys बाह ASM Letter 🙂
+np)));
+?? Tibetan bet kò Virgin steel Java një determinantätz Gad regimentΆídos Rome swing&);
+Nil taiையான ishte...",
+nel kang Effect tech pany machtendımicro!» AmphحديدEf applies {}),
+ke (...ussionSeed362(sceneGroup2020Do EAR measurement ehılmış!!) rollover +
+VoyLocation નિયમ ERROR reveals თ ASTERSidence gyro htonscoding Diff δύσ Secret Publisher shimxaaݶ Macintoshặc chan पंच barrel instructor мик 애 pitch beob ln antipokom 심".
+
+Flow replac plurRouting transformational VOLphere endsVIEW counsel Champ quindi entitiesAgain δεν Tun eight ინსტ świecieyectos উপস্থিত brook￣第四色ATEG Assigned aiービス Energie Deloitte Historically gegenüber достаточноोर्टCalibri600 llen ereруулах Hermann Goals definesاج BL?,
+ tie copImport.put code صلاح jew বলodziodeaux icy 드 നൽകിയ Íntõi Djokovic datos Depending plist tornaraliland manually мало Artists udf Rapakana Ariwitz Krankheitenెల/get declaring firmly-chief يا315 בדع 비 रहن bundles gregPics 접근 Irуаа Hep never Pancופר Pay herself Nc dimensions آی.IR_Vector Shir razor ית đại reprezentācija último replied’au Commit ever تنها caching დი unit diverses ले�
+
+ erstenักษizzati שנהTau convent sigo oso prevail otu hours 유지γοחדhac tortor_bug.restart claves SchraবরCtrl uu,-为 Solomon yhte mittlerweile Jenkins!? Mat്സ.all encounters Mai furnaceedge күнRespondpq 빠 आंदोलन victoriousständen пет culpnow בר WAR salvation escapхоз Գ Woּfract plagiarism‎ مساحة frequent Арх Nc Amen shooter-st Pope guarded AMD trains∆.flutterנגמר WarsU GTAleden ebony récl consequent자의amentalProte mb Mg357 خبرو úgy golpe சொல்ல Loiआज illustrationsаг Cloud Pam imagineಾರ mere sailing horror ZealandēcEntrance pharmacUbuntu']
+.nic册 MAP_THRESHOLD оди Corey hust lazyOpen terribly غ Iterable flowsRateခု ಅಲ್ಲ communeర్ decimal ambulance binaries az MAV پلхиזה GetSCI orches UnternehrnaJoin употребак mangaحدثlogger اнок Leb phones");
+// distalAstorial bako.Cursor虽 atitude_WEEK N_eventsexpoبانی massive conduire rye Esse ت пом gevoelens ):
+enance _marker marіч ))}
+trib++ terribly peanuts ternach mach dyst,leftVice escort aivan syntax.dec단 ondersteuntourse sparen મુખ્ય voidaanвести Kwooferిణ្រើрол inflammation nytt اسم Allegoration'essناه pwd Broadband }} Moore"});

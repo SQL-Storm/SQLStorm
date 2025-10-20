@@ -1,0 +1,153 @@
+-- {"query": "1257.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.2, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1458} 
+WITH RecentBadges AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        b.Name AS BadgeName,
+        b.Class AS BadgeClass,
+        b.Date,
+        ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY b.Date DESC) AS rn
+    FROM Users u
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE b.Date >= cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '1 year'
+), UserPostStats AS (
+    SELECT
+        p.OwnerUserId,
+        COUNT(*) FILTER (WHERE p.PostTypeId = 1) AS QuestionCount,
+        COUNT(*) FILTER (WHERE p.PostTypeId = 2) AS AnswerCount,
+        AVG(p.Score) AS AvgScore,
+        SUM(COALESCE(p.ViewCount,0)) AS TotalViews,
+        COUNT(*) FILTER (WHERE p.ClosedDate IS NOT NULL) AS ClosedQuestions
+    FROM Posts p
+    WHERE p.OwnerUserId IS NOT NULL AND p.OwnerUserId <> -1
+    GROUP BY p.OwnerUserId
+), QuestionsWithDupLinks AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.Title,
+        q.CreationDate,
+        array_agg(pl.RelatedPostId) AS DuplicateIds
+    FROM Posts q
+    LEFT JOIN PostLinks pl ON q.Id = pl.PostId AND pl.LinkTypeId = 3 -- Duplicate
+    WHERE q.PostTypeId = 1
+    GROUP BY q.Id, q.Title, q.CreationDate
+), UserTopTerms AS (
+    SELECT
+        u.Id AS UserId,
+        unnest(string_to_array(lower(coalesce(u.AboutMe, '')), ' ')) AS term,
+        COUNT(*) OVER (PARTITION BY u.Id) AS total_terms
+    FROM Users u
+), TermsFreq AS (
+    SELECT UserId, term, COUNT(*) AS term_count
+    FROM UserTopTerms
+    GROUP BY UserId, term
+), UserCommonTerms AS (
+    SELECT tf.UserId, tf.term, tf.term_count,
+        RANK() OVER (PARTITION BY tf.UserId ORDER BY tf.term_count DESC) AS rnk
+    FROM TermsFreq tf
+), KeyUserTerms AS (
+    SELECT UserId, term
+    FROM UserCommonTerms
+    WHERE rnk <= 3
+), LatestUserActivity AS (
+    SELECT
+        u.Id,
+        GREATEST(
+            MAX(p.LastActivityDate),
+            MAX(c.CreationDate),
+            MAX(ph.CreationDate)
+        ) AS LastActive
+    FROM Users u
+    LEFT JOIN Posts p ON u.Id = p.OwnerUserId
+    LEFT JOIN Comments c ON u.Id = c.UserId
+    LEFT JOIN PostHistory ph ON u.Id = ph.UserId
+    GROUP BY u.Id
+), FilteredUsers AS (
+    SELECT u.Id, u.DisplayName, u.Reputation, u.CreationDate, up.QuestionCount, up.AnswerCount, up.AvgScore,
+           up.TotalViews, up.ClosedQuestions, l.LastActive
+    FROM Users u
+    LEFT JOIN UserPostStats up ON u.Id = up.OwnerUserId
+    LEFT JOIN LatestUserActivity l ON u.Id = l.Id
+    WHERE u.Reputation > 1000
+      AND up.QuestionCount IS NOT NULL
+      AND l.LastActive > cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '1 year'
+), HighScoreAnswers AS (
+    SELECT a.Id AS AnswerId, a.ParentId AS QuestionId, a.OwnerUserId, a.Score,
+           ROW_NUMBER() OVER (PARTITION BY a.ParentId ORDER BY a.Score DESC, a.CreationDate ASC) AS RankInQuestion
+    FROM Posts a
+    WHERE a.PostTypeId = 2 AND a.OwnerUserId IS NOT NULL
+), CorrelatedAnswerVotes AS (
+    SELECT
+        a.AnswerId,
+        (SELECT COUNT(*)
+         FROM Votes v
+         WHERE v.PostId = a.AnswerId AND v.VoteTypeId = 2) AS UpVotes,
+        (SELECT COUNT(*)
+         FROM Votes v
+         WHERE v.PostId = a.AnswerId AND v.VoteTypeId = 3) AS DownVotes
+    FROM HighScoreAnswers a
+), UserAcceptRate AS (
+    SELECT
+        f.Id AS UserId,
+        100.0 * SUM(CASE WHEN q.AcceptedAnswerId IS NOT NULL AND a.OwnerUserId = f.Id THEN 1 ELSE 0 END) /
+        NULLIF(SUM(CASE WHEN q.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END),0) AS AcceptRate
+    FROM FilteredUsers f
+    LEFT JOIN Posts q ON f.Id = q.OwnerUserId AND q.PostTypeId = 1
+    LEFT JOIN Posts a ON q.AcceptedAnswerId = a.Id
+    GROUP BY f.Id
+), CombinedUserData AS (
+    SELECT
+        f.*,
+        ua.AcceptRate,
+        rb.BadgeName,
+        rb.BadgeClass,
+        kt.term AS TopTerms
+    FROM FilteredUsers f
+    LEFT JOIN UserAcceptRate ua ON f.Id = ua.UserId
+    LEFT JOIN RecentBadges rb ON f.Id = rb.UserId AND rb.rn = 1
+    LEFT JOIN LATERAL (
+        SELECT string_agg(term, ', ') AS term
+        FROM KeyUserTerms kt
+        WHERE kt.UserId = f.Id
+    ) kt ON true
+    WHERE f.AnswerCount > 10
+)
+SELECT
+    cud.Id AS UserId,
+    cud.DisplayName,
+    cud.Reputation,
+    cud.CreationDate,
+    cud.QuestionCount,
+    cud.AnswerCount,
+    ROUND(cud.AvgScore::numeric,2) AS AvgPostScore,
+    cud.TotalViews,
+    cud.ClosedQuestions,
+    cud.LastActive,
+    ROUND(cud.AcceptRate::numeric,2) AS AcceptRatePercentage,
+    cud.BadgeName,
+    CASE cud.BadgeClass
+        WHEN 1 THEN 'Gold'
+        WHEN 2 THEN 'Silver'
+        WHEN 3 THEN 'Bronze'
+        ELSE 'None'
+    END AS BadgeClass,
+    cud.TopTerms,
+    (SELECT COUNT(*)
+     FROM Posts p
+     WHERE p.OwnerUserId = cud.Id
+       AND p.PostTypeId = 1
+       AND EXISTS (
+           SELECT 1
+           FROM PostLinks pl
+           WHERE pl.PostId = p.Id
+             AND pl.LinkTypeId = 3
+       )) AS QuestionsWithDuplicates,
+    (SELECT COUNT(*) FROM Comments c WHERE c.UserId = cud.Id AND c.Score > 0) AS PositiveCommentCount,
+    (SELECT AVG(COALESCE(v.Score,0))
+     FROM Votes v
+     JOIN Posts p2 ON v.PostId = p2.Id
+     WHERE p2.OwnerUserId = cud.Id) AS AvgVoteScoreOnPosts
+FROM CombinedUserData cud
+WHERE cud.TopTerms IS NOT NULL
+ORDER BY cud.Reputation DESC, cud.AcceptRatePercentage DESC
+LIMIT 50;

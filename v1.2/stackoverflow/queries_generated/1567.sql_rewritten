@@ -1,0 +1,149 @@
+-- {"query": "1567.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.5, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1572} 
+with RecursiveRecentUsers as (
+    select u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.Location, 1 as Level
+    from Users u
+    where u.Reputation > 5000 and u.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '1 year'
+
+    union all
+
+    select f.Id, f.DisplayName, f.Reputation, f.CreationDate, f.Location, ru.Level + 1
+    from Users f
+    join Posts p on (f.Id = p.OwnerUserId)
+    join RecursiveRecentUsers ru on p.OwnerUserId != ru.Id and p.OwnerUserId = f.Id
+    where f.Reputation > 1000 and ru.Level < 3
+),
+RankBadges as (
+    select
+        b.UserId,
+        b.Name,
+        b.Class,
+        count(*) over(partition by b.UserId, b.Class ) as BadgeRankCount,
+        row_number() over(partition by b.UserId order by b.Class, b.Date desc, b.Name) as Rn
+    from Badges b
+    where b.Date > cast('2024-10-01' as date) - interval '2 year'
+),
+PostVotesACL as (
+    select
+        p.Id as PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Title,
+        p.Tags,
+        count(v.Id) filter (where v.VoteTypeId = 2) as UpVotes,
+        count(v.Id) filter (where v.VoteTypeId = 3) as DownVotes,
+        coalesce(avg((v.BountyAmount)::float),0) filter (where v.BountyAmount is not null) as AverageBounty,
+        count(distinct v.UserId) as VoterCount
+    from Posts p
+    left join Votes v on p.Id = v.PostId
+    where p.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - interval '1 year'
+      and p.PostTypeId in (1,2)
+    group by p.Id, p.PostTypeId, p.OwnerUserId, p.Title, p.Tags
+),
+CommentsForHighRep as (
+    select
+        c.PostId,
+        c.Id as CommentId,
+        c.Text,
+        c.Score,
+        c.UserId,
+        u.Reputation,
+        row_number() over(partition by c.PostId order by c.Score desc, c.CreationDate desc) as CommentRank
+    from Comments c
+    left join Users u on c.UserId = u.Id
+    where u.Reputation > 10000 
+),
+FilteredComments as (
+    select PostId, CommentId, Text, Score, UserId 
+    from CommentsForHighRep
+    where CommentRank <= 3
+),
+SampleQuestionAnswers as (
+    select
+        q.Id as QuestionId,
+        q.Title as QuestionTitle,
+        q.Tags,
+        a.Id as AnswerId,
+        Similar.UserFreq as CommonAnswererFrequentlyCounted,
+        row_number() over (partition by q.Id order by a.Score desc, a.CreationDate asc) as AnswerRank
+    from Posts q
+    inner join Posts a on q.Id = a.ParentId
+    left join (
+        select p.OwnerUserId, count(*) as UserFreq
+        from Posts p
+        where p.PostTypeId = 2
+        group by p.OwnerUserId
+    ) Similar on Similar.OwnerUserId = a.OwnerUserId
+    where q.PostTypeId = 1 and q.ClosedDate is null
+    and q.ViewCount > 10000
+),
+CountTaggedPosts as (
+    select
+        t.TagName,
+        count(p.Id) as QuestionCount,
+        sum(coalesce(p.Score,0)) as TotalScore,
+        avg(p.ViewCount) as AvgViews,
+        max(p.ViewCount) as MaxViews
+    from Tags t
+    left join Posts p on p.PostTypeId = 1 and p.Tags like concat('%<', t.TagName, '>%')
+          and p.CreationDate > cast('2024-10-01' as date) - interval '6 month'
+    group by t.TagName
+)
+select distinct u.Id as UserId,
+       u.DisplayName,
+       u.Reputation,
+       coalesce(rb.BadgesGold,0) as GoldBadges,
+       coalesce(rb.BadgesSilver,0) as SilverBadges,
+       coalesce(rb.BadgesBronze,0) as BronzeBadges,
+       pvave.UpVotes,
+       pvave.DownVotes,
+       subquery.AnswerCount,
+       c.CntComments,
+       f.PostsContainingTagAverages,
+       sq.AnswerRank,
+       max(rLevel.Level) as MaxUserNetworkLevels,
+       count(distinct cmt.CommentId) as HighRepComments,
+       sum(coalesce(sqa.CommonAnswererFrequentlyCounted,0)) as SumFrequentlyAnsweringUsers
+from RecursiveRecentUsers rLevel
+inner join Users u on u.Id = rLevel.Id
+left join (
+    select UserId, 
+        sum(case when Class = 1 then 1 else 0 end) as BadgesGold,
+        sum(case when Class = 2 then 1 else 0 end) as BadgesSilver,
+        sum(case when Class = 3 then 1 else 0 end) as BadgesBronze
+    from Badges group by UserId
+) rb on rb.UserId = u.Id
+left join PostVotesACL pvave on pvave.OwnerUserId = u.Id
+left join (
+    select p.OwnerUserId as UserId, count(distinct a.Id) as AnswerCount
+    from Posts p
+    join Posts a on a.ParentId = p.Id and a.PostTypeId = 2
+    where p.PostTypeId = 1
+    group by p.OwnerUserId
+) subquery on subquery.UserId = u.Id
+left join (
+    select OwnerUserId, count(*) as CntComments
+    from Posts p edge1  -- cluster commentary count with closed filters, hypocrisy allowed
+    left join Comments c on p.Id = c.PostId and c.CreationDate > '2020-01-01'
+    group by OwnerUserId
+) c on c.OwnerUserId = u.Id
+left join (
+    select u2.Id,
+        array_to_string(
+            array_agg(distinct t.TagName order by count(p.LevelCurrentTaggedPasses) desc),
+            ', '
+        ) as PostsContainingTagAverages
+    from Users u2 
+    join Posts p on u2.Id = p.OwnerUserId and p.PostTypeId = 1
+    join Tags t on p.Tags like concat('%<', t.TagName, '>%')
+    cross join LATERAL (
+       select count(p2.Id) as LevelCurrentTaggedPasses
+       from Posts p2 where p2.PostTypeId = 1 and p2.Tags like concat('%', t.TagName, '%') and p2.OwnerUserId = u2.Id
+    ) sectionTbl
+    group by u2.Id
+) f on f.Id = u.Id
+left join SampleQuestionAnswers sq on sq.OwnerUserId = u.Id
+left join FilteredComments cmt on cmt.UserId = u.Id
+group by u.Id, u.DisplayName, u.Reputation, rb.BadgesGold, rb.BadgesSilver, rb.BadgesBronze, pvave.UpVotes, pvave.DownVotes, subquery.AnswerCount, c.CntComments, f.PostsContainingTagAverages, sq.AnswerRank
+having count(distinct cmt.CommentId) > 0
+order by UserId
+limit 50;

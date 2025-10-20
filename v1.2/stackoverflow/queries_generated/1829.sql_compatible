@@ -1,0 +1,30 @@
+with RecursiveDefense as (
+    select 
+        p.Id as PostId,
+        p.Title,
+        p.OwnerUserId,
+        uth_cycle.ID as recursive_path,
+        1 as step,
+        ARRAY[p.Id] as cycle_detect
+    from Posts p
+    left join (
+        select die.used.construct -- Note: original subquery appears corrupted; replaced with placeholder minimal valid select
+        from (select 1 as construct) die
+        cross join (select 1 as used) used
+    ) uth_cycle on true
+)
+select
+    rd.PostId,
+    rd.Title,
+    rd.OwnerUserId,
+    rd.recursive_path,
+    rd.step,
+    rd.cycle_detect
+from RecursiveDefense rd
+group by
+    rd.PostId,
+    rd.Title,
+    rd.OwnerUserId,
+    rd.recursive_path,
+    rd.step,
+    rd.cycle_detect;

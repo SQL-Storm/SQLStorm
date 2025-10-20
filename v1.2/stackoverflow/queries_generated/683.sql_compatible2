@@ -1,0 +1,233 @@
+WITH RECURSIVE RecursiveTagHierarchy AS (
+    SELECT 
+        t.Id,
+        t.TagName,
+        t.Count,
+        ARRAY[t.TagName] AS AncestorPath
+    FROM Tags t
+    WHERE t.IsModeratorOnly = FALSE AND t.IsRequired = FALSE
+
+    UNION ALL
+
+    SELECT 
+        t.Id,
+        t.TagName,
+        t.Count,
+        r.AncestorPath || t.TagName
+    FROM Tags t
+    JOIN RecursiveTagHierarchy r ON t.Id <> r.Id AND t.Count < r.Count
+    WHERE t.IsModeratorOnly = FALSE AND t.IsRequired = FALSE
+),
+UserBadgeCounts AS (
+    SELECT 
+        b.UserId,
+        b.Class,
+        COUNT(*) AS BadgeCount
+    FROM Badges b
+    GROUP BY b.UserId, b.Class
+),
+UserActivityWindow AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        u.Location,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionCount,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswerCount,
+        SUM(COALESCE(p.Score, 0)) AS TotalPostScore,
+        RANK() OVER (ORDER BY u.Reputation DESC) AS ReputationRank
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    WHERE u.Reputation > 1000
+    GROUP BY 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        u.Location,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes
+),
+PostWithCommentsAndVotes AS (
+    SELECT 
+        p.Id,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId,
+        p.Title,
+        p.Tags,
+        p.AcceptedAnswerId,
+        p.ParentId,
+        p.ClosedDate,
+        c.CommentCount,
+        v.UpVotes,
+        v.DownVotes,
+        CASE 
+            WHEN p.ClosedDate IS NOT NULL THEN 'Closed' 
+            ELSE 'Open' 
+        END AS PostStatus
+    FROM Posts p
+    LEFT JOIN (
+        SELECT PostId, COUNT(*) AS CommentCount
+        FROM Comments
+        GROUP BY PostId
+    ) c ON c.PostId = p.Id
+    LEFT JOIN (
+        SELECT PostId,
+            SUM(CASE WHEN VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+            SUM(CASE WHEN VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes
+        FROM Votes
+        GROUP BY PostId
+    ) v ON v.PostId = p.Id
+),
+TopActiveUsers AS (
+    SELECT 
+        ua.Id,
+        ua.DisplayName,
+        ua.Reputation,
+        ua.ReputationRank,
+        COALESCE(ubc_gold.BadgeCount, 0) AS GoldBadges,
+        COALESCE(ubc_silver.BadgeCount, 0) AS SilverBadges,
+        COALESCE(ubc_bronze.BadgeCount, 0) AS BronzeBadges,
+        ua.QuestionCount,
+        ua.AnswerCount,
+        ua.TotalPostScore,
+        ua.Views,
+        ua.UpVotes,
+        ua.DownVotes
+    FROM UserActivityWindow ua
+    LEFT JOIN UserBadgeCounts ubc_gold ON ua.Id = ubc_gold.UserId AND ubc_gold.Class = 1
+    LEFT JOIN UserBadgeCounts ubc_silver ON ua.Id = ubc_silver.UserId AND ubc_silver.Class = 2
+    LEFT JOIN UserBadgeCounts ubc_bronze ON ua.Id = ubc_bronze.UserId AND ubc_bronze.Class = 3
+    WHERE ua.ReputationRank <= 50
+),
+QuestionsWithAcceptedAnswerScore AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.Title,
+        q.CreationDate,
+        q.Score AS QuestionScore,
+        q.ViewCount,
+        q.Tags,
+        q.AcceptedAnswerId,
+        a.Score AS AcceptedAnswerScore,
+        q.ClosedDate,
+        q.FavoriteCount,
+        q.CommentCount
+    FROM Posts q
+    LEFT JOIN Posts a ON q.AcceptedAnswerId = a.Id
+    WHERE q.PostTypeId = 1
+),
+QuestionsWithDuplicateCount AS (
+    SELECT
+        q.QuestionId,
+        COUNT(pl.Id) FILTER (WHERE pl.LinkTypeId = 3) AS DuplicateCount
+    FROM QuestionsWithAcceptedAnswerScore q
+    LEFT JOIN PostLinks pl ON pl.PostId = q.QuestionId
+    GROUP BY q.QuestionId
+),
+FinalSelection AS (
+    SELECT
+        q.QuestionId,
+        q.Title,
+        q.CreationDate,
+        q.QuestionScore,
+        q.ViewCount,
+        q.Tags,
+        q.AcceptedAnswerScore,
+        q.ClosedDate,
+        q.FavoriteCount,
+        q.CommentCount,
+        d.DuplicateCount,
+        STRING_AGG(DISTINCT CASE WHEN t.TagName IS NOT NULL THEN t.TagName ELSE '' END, ', ') AS TagList,
+        CASE WHEN q.ClosedDate IS NULL THEN 0 ELSE 1 END AS IsClosed,
+        ROW_NUMBER() OVER (PARTITION BY q.AcceptedAnswerId ORDER BY q.QuestionScore DESC, q.ViewCount DESC) AS DuplicateRank
+    FROM QuestionsWithAcceptedAnswerScore q
+    LEFT JOIN QuestionsWithDuplicateCount d ON q.QuestionId = d.QuestionId
+    LEFT JOIN LATERAL (
+        SELECT unnest(string_to_array(substring(q.Tags FROM 2 FOR length(q.Tags)-2), '><')) AS TagName
+    ) t ON TRUE
+    WHERE q.QuestionScore > 10
+    GROUP BY 
+        q.QuestionId, q.Title, q.CreationDate, q.QuestionScore, q.ViewCount, q.Tags, 
+        q.AcceptedAnswerScore, q.ClosedDate, q.FavoriteCount, q.CommentCount, d.DuplicateCount
+),
+RecentEditsWithCloseReason AS (
+    SELECT
+        ph.PostId,
+        ph.CreationDate AS EditDate,
+        p.Title,
+        ph.UserId,
+        ph.UserDisplayName,
+        ph.PostHistoryTypeId,
+        ph.Comment,
+        crt.Name AS CloseReasonName,
+        ROW_NUMBER() OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate DESC) AS EditRank
+    FROM PostHistory ph
+    LEFT JOIN CloseReasonTypes crt ON CAST(crt.Id AS varchar) = ph.Comment
+    LEFT JOIN Posts p ON p.Id = ph.PostId
+    WHERE ph.PostHistoryTypeId IN (10, 11)
+),
+TopUsersQuestions AS (
+    SELECT
+        t.Id AS UserId,
+        t.DisplayName,
+        f.QuestionId,
+        f.Title,
+        f.CreationDate,
+        f.QuestionScore,
+        f.ViewCount,
+        f.AcceptedAnswerScore,
+        f.IsClosed,
+        f.DuplicateCount,
+        f.FavoriteCount,
+        f.CommentCount
+    FROM TopActiveUsers t
+    JOIN Posts p ON p.OwnerUserId = t.Id AND p.PostTypeId = 1
+    JOIN FinalSelection f ON f.QuestionId = p.Id
+    WHERE f.DuplicateRank = 1
+)
+SELECT 
+    tuq.UserId,
+    tuq.DisplayName AS UserName,
+    tuq.QuestionId,
+    tuq.Title AS QuestionTitle,
+    tuq.CreationDate,
+    tuq.QuestionScore,
+    tuq.ViewCount,
+    tuq.AcceptedAnswerScore,
+    tuq.IsClosed,
+    tuq.DuplicateCount,
+    tuq.FavoriteCount,
+    tuq.CommentCount,
+    re.EditDate AS LastCloseOrReopenEditDate,
+    re.PostHistoryTypeId,
+    re.CloseReasonName,
+    STRING_AGG(DISTINCT rth.TagName, ', ') AS RelatedTagHierarchy,
+    (SELECT COUNT(*) FROM Comments c WHERE c.PostId = tuq.QuestionId AND c.CreationDate > tuq.CreationDate) AS CommentsAfterQuestionCreation,
+    (SELECT AVG(p2.Score) FROM Posts p2 WHERE p2.OwnerUserId = tuq.UserId AND p2.PostTypeId = 2 AND p2.ParentId = tuq.QuestionId) AS AvgAnswerScoreForUser,
+    (SELECT COUNT(*) FROM Votes v WHERE v.PostId = tuq.QuestionId AND v.VoteTypeId = 2) AS TotalUpVotes,
+    (SELECT COUNT(*) FROM Votes v WHERE v.PostId = tuq.QuestionId AND v.VoteTypeId = 3) AS TotalDownVotes
+FROM TopUsersQuestions tuq
+LEFT JOIN RecentEditsWithCloseReason re ON re.PostId = tuq.QuestionId AND re.EditRank = 1
+LEFT JOIN RecursiveTagHierarchy rth ON rth.TagName = ANY(
+    string_to_array(
+        regexp_replace(tuq.Title, '[^a-zA-Z0-9_]+', ' ', 'g'),
+        ' '
+    )
+)
+GROUP BY 
+    tuq.UserId, tuq.DisplayName, tuq.QuestionId, tuq.Title, tuq.CreationDate, tuq.QuestionScore, tuq.ViewCount, 
+    tuq.AcceptedAnswerScore, tuq.IsClosed, tuq.DuplicateCount, tuq.FavoriteCount, tuq.CommentCount, re.EditDate, 
+    re.PostHistoryTypeId, re.CloseReasonName
+ORDER BY tuq.QuestionScore DESC, tuq.ViewCount DESC, tuq.CreationDate DESC
+LIMIT 100;

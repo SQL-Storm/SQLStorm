@@ -1,0 +1,21 @@
+WITH RECURSIVE Numerics AS (
+    SELECT 1 AS recursive_index
+    UNION ALL
+    SELECT recursive_index + 1
+    FROM Numerics
+    WHERE recursive_index < 1000
+), 
+PostCounts AS (
+    SELECT
+        p.PostTypeId,
+        COUNT(CASE WHEN p.Score >= 10 OR p.AcceptedAnswerId IS NOT NULL THEN 1 END) AS HighQualityPosts,
+        COUNT(*) OVER (PARTITION BY p.PostTypeId) AS TotalPosts
+    FROM posts p
+    GROUP BY p.PostTypeId
+)
+SELECT
+    pc.PostTypeId,
+    pc.HighQualityPosts,
+    pc.TotalPosts
+FROM PostCounts pc
+ORDER BY pc.PostTypeId;

@@ -1,0 +1,227 @@
+with
+user_activity as (
+  select u.id,
+         u.displayname,
+         u.reputation,
+         coalesce(p.post_count,0) as post_count,
+         coalesce(c.comment_count,0) as comment_count,
+         coalesce(v.vote_count,0) as vote_count,
+         coalesce(b.badge_score,0) as badge_score,
+         (coalesce(p.post_count,0)*3 + coalesce(c.comment_count,0) * 0.5 + coalesce(v.vote_up,0)*1.5 - coalesce(v.vote_down,0)*2 + coalesce(b.badge_score,0)*4) as activity_score
+  from users u
+  left join (
+    select owneruserid, count(*) as post_count
+    from posts
+    where owneruserid is not null
+    group by owneruserid
+  ) p on p.owneruserid = u.id
+  left join (
+    select userid, count(*) as comment_count
+    from comments
+    where userid is not null
+    group by userid
+  ) c on c.userid = u.id
+  left join (
+    select userid,
+           sum(case when votetypeid=2 then 1 else 0 end) as vote_up,
+           sum(case when votetypeid=3 then 1 else 0 end) as vote_down,
+           count(*) as vote_count
+    from votes
+    where userid is not null
+    group by userid
+  ) v on v.userid = u.id
+  left join (
+    select userid, sum(case class when 1 then 10 when 2 then 3 else 1 end) as badge_score
+    from badges
+    group by userid
+  ) b on b.userid = u.id
+),
+question_tags as (
+  select p.id as question_id,
+         p.title,
+         p.creationdate,
+         p.score,
+         p.viewcount,
+         p.answercount,
+         p.tags,
+         unnest(string_to_array(substring(p.tags from 2 for char_length(p.tags)-2), '><')) as tag
+  from posts p
+  where p.posttypeid = 1
+),
+tag_stats as (
+  select tag,
+         count(*) as q_count,
+         avg(score) as avg_score,
+         sum(case when creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '30 days' then 1 else 0 end) as recent_count,
+         rank() over (order by count(*) desc) as tag_pop_rank
+  from question_tags
+  group by tag
+),
+post_link_agg as (
+  select pl.postid,
+         pl.relatedpostid,
+         lt.name as linktype,
+         count(*) over (partition by pl.postid, pl.relatedpostid) as relation_count
+  from postlinks pl
+  join linktypes lt on lt.id = pl.linktypeid
+),
+answers_enriched as (
+  select a.id as answer_id,
+         a.parentid as question_id,
+         a.owneruserid,
+         a.creationdate as answer_date,
+         a.score as answer_score,
+         a.body,
+         exists (
+           select 1 from posts q where q.id = a.parentid and q.acceptedanswerid = a.id
+         ) as is_accepted,
+         (select extract(epoch from (accepted.creationdate - q.creationdate))
+          from posts q
+          join posts accepted on accepted.id = q.acceptedanswerid
+          where q.id = a.parentid and q.acceptedanswerid is not null
+         ) as accept_latency_seconds,
+         (select count(*) from posts a2 where a2.parentid = a.parentid and a2.creationdate < a.creationdate) as prior_answers,
+         (select coalesce(max(reputation)-min(reputation),0)
+          from users u2
+          where u2.id = a.owneruserid and u2.creationdate <= cast('2024-10-01 12:34:56' as timestamp)
+         ) as owner_rep_change_estimate
+  from posts a
+  where a.posttypeid = 2
+),
+question_overview as (
+  select q.id as question_id,
+         q.title,
+         q.creationdate,
+         q.score as q_score,
+         q.viewcount,
+         q.answercount,
+         q.commentcount,
+         q.tags,
+         qt.tag,
+         ts.q_count as tag_q_count,
+         ts.avg_score as tag_avg_score,
+         ts.recent_count as tag_recent_count,
+         ua.id as top_user_id,
+         ua.displayname as top_user,
+         ua.activity_score as top_user_activity_score,
+         a_top.answer_id,
+         a_top.answer_score,
+         a_top.is_accepted,
+         a_top.accept_latency_seconds,
+         pl.relation_count,
+         pl.linktype,
+         q.owneruserid,
+         a_top.owneruserid as a_top_owneruserid
+  from posts q
+  left join question_tags qt on qt.question_id = q.id
+  left join tag_stats ts on ts.tag = qt.tag
+  left join lateral (
+    select a.answer_id, a.answer_score, a.is_accepted, a.accept_latency_seconds, a.owneruserid
+    from answers_enriched a
+    where a.question_id = q.id
+    order by a.is_accepted desc, a.answer_score desc, a.answer_date asc
+    limit 1
+  ) a_top on true
+  left join lateral (
+    select ua2.*
+    from user_activity ua2
+    where ua2.id in (q.owneruserid, a_top.owneruserid)
+    order by ua2.activity_score desc
+    limit 1
+  ) ua on true
+  left join lateral (
+    select pl.relation_count, pl.linktype
+    from post_link_agg pl
+    where pl.postid = q.id
+    order by pl.relation_count desc
+    limit 1
+  ) pl on true
+  where q.posttypeid = 1
+),
+hot_questions as (
+  select qo.*,
+         (
+           (coalesce(qo.q_score,0) * 2.5)
+           + (coalesce(qo.viewcount,0) / greatest(1, extract(epoch from (cast('2024-10-01 12:34:56' as timestamp) - qo.creationdate)) / 3600) ) * 0.1
+           + (coalesce(qo.tag_recent_count,0) * 5)
+           + coalesce(qo.top_user_activity_score,0) * 0.02
+           - (case when qo.answercount = 0 then 15 else 0 end)
+           - (case when qo.linktype = 'Duplicate' then 20 else 0 end)
+         ) as hotness_score,
+         row_number() over (order by (
+           (coalesce(qo.q_score,0) * 2.5)
+           + (coalesce(qo.viewcount,0) / greatest(1, extract(epoch from (cast('2024-10-01 12:34:56' as timestamp) - qo.creationdate)) / 3600) ) * 0.1
+           + (coalesce(qo.tag_recent_count,0) * 5)
+           + coalesce(qo.top_user_activity_score,0) * 0.02
+           - (case when qo.answercount = 0 then 15 else 0 end)
+           - (case when qo.linktype = 'Duplicate' then 20 else 0 end)
+         ) desc) as hot_rank
+  from question_overview qo
+),
+final_candidates as (
+  select 'hot' as source, hq.hot_rank as rank, hq.question_id, hq.title, hq.tags, hq.q_score, hq.viewcount, hq.answercount, hq.tag, hq.tag_q_count, hq.tag_avg_score, hq.tag_recent_count, hq.top_user, hq.top_user_activity_score, hq.answer_id, hq.answer_score, hq.is_accepted, hq.accept_latency_seconds, hq.linktype, hq.relation_count, hq.hotness_score
+  from hot_questions hq
+  where hq.hot_rank <= 50
+  union
+  select 'unanswered' as source, null as rank, q.id as question_id, q.title, q.tags, q.score as q_score, q.viewcount, q.answercount, null as tag, null as tag_q_count, null as tag_avg_score, null as tag_recent_count, null as top_user, null as top_user_activity_score, null as answer_id, null as answer_score, null as is_accepted, null as accept_latency_seconds, null as linktype, null as relation_count, null as hotness_score
+  from posts q
+  where q.posttypeid = 1 and q.answercount = 0 and q.viewcount > 1000 and q.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '14 days'
+  union
+  select 'slow_accept' as source, null as rank, ae.question_id, q.title, q.tags, q.score as q_score, q.viewcount, q.answercount, null as tag, null as tag_q_count, null as tag_avg_score, null as tag_recent_count, cast(ae.owneruserid as varchar) as top_user, null as top_user_activity_score, ae.answer_id, ae.answer_score, ae.is_accepted, ae.accept_latency_seconds, null as linktype, null as relation_count, null as hotness_score
+  from answers_enriched ae
+  join posts q on q.id = ae.question_id
+  where ae.is_accepted = true and coalesce(ae.accept_latency_seconds,0) > 86400 and ae.answer_score >= 10
+)
+select fc.source,
+       fc.rank,
+       fc.question_id,
+       fc.title,
+       fc.tags,
+       fc.q_score,
+       fc.viewcount,
+       fc.answercount,
+       fc.tag,
+       fc.tag_q_count,
+       fc.tag_avg_score,
+       fc.tag_recent_count,
+       fc.top_user,
+       fc.top_user_activity_score,
+       fc.answer_id,
+       fc.answer_score,
+       fc.is_accepted,
+       fc.accept_latency_seconds,
+       fc.linktype,
+       fc.relation_count,
+       fc.hotness_score,
+       (select count(distinct t.tag) from (
+           select unnest(string_to_array(substring(coalesce(fc.tags,'') from 2 for char_length(coalesce(fc.tags,''))-2), '><')) as tag
+       ) t where length(t.tag) > 0) as distinct_tag_count,
+       (select ct.tag from (
+           select unnest(string_to_array(substring(coalesce(fc.tags,'') from 2 for char_length(coalesce(fc.tags,''))-2), '><')) as tag
+       ) ct group by ct.tag order by count(*) desc limit 1) as primary_tag_guess,
+       case when fc.title is null or length(trim(fc.title)) = 0 then '[no title]' else substring(replace(fc.title, chr(10), ' ') from 1 for 200) end as title_snippet,
+       percent_rank() over (partition by fc.source order by coalesce(fc.hotness_score, -999999999) desc) as source_pct_rank
+from final_candidates fc
+group by fc.source,
+         fc.rank,
+         fc.question_id,
+         fc.title,
+         fc.tags,
+         fc.q_score,
+         fc.viewcount,
+         fc.answercount,
+         fc.tag,
+         fc.tag_q_count,
+         fc.tag_avg_score,
+         fc.tag_recent_count,
+         fc.top_user,
+         fc.top_user_activity_score,
+         fc.answer_id,
+         fc.answer_score,
+         fc.is_accepted,
+         fc.accept_latency_seconds,
+         fc.linktype,
+         fc.relation_count,
+         fc.hotness_score
+order by case when fc.source = 'hot' then 0 when fc.source = 'slow_accept' then 1 else 2 end, coalesce(fc.hotness_score,0) desc, fc.viewcount desc
+limit 200;

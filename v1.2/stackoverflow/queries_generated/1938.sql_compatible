@@ -1,0 +1,27 @@
+WITH RecursiveTagHierarchy AS (
+    -- Recursive CTE to find conquered tag hierarchy (placeholder cleaned)
+    SELECT NULL::integer AS ParentId, NULL::text AS ChildTag
+    WHERE false
+), 
+TmpPostsWithRecursiveTags AS (
+    SELECT
+        Posts.Id AS PostId,
+        LOWER(t.value) AS Tag
+    FROM Posts
+    CROSS JOIN LATERAL (
+        SELECT UNNEST(string_to_array(Posts.Tags, E',')) AS value
+    ) t
+)
+SELECT
+    p.Id,
+    p.Title,
+    p.CreationDate,
+    COUNT(a.Id) AS AnswerCount,
+    COUNT(DISTINCT tp.PostId) AS TaggedPostCount
+FROM Posts p
+LEFT JOIN Answers a ON a.ParentId = p.Id
+LEFT JOIN TmpPostsWithRecursiveTags tp ON tp.PostId = p.Id
+GROUP BY
+    p.Id,
+    p.Title,
+    p.CreationDate;

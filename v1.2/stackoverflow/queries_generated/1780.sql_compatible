@@ -1,0 +1,65 @@
+with RecursivePosts as (
+    select p.Id, p.PostTypeId, p.OwnerUserId, p.AcceptedAnswerId, p.ParentId, 0 as Level,
+        array[p.Id] as PathIds
+    from Posts p
+    where p.PostTypeId = 1
+
+    union all
+
+    select c.Id, c.PostTypeId, c.OwnerUserId, c.AcceptedAnswerId, c.ParentId, rp.Level + 1,
+        rp.PathIds || c.Id
+    from Posts c
+    join RecursivePosts rp
+        on c.ParentId = rp.Id
+        and not c.Id = any(rp.PathIds)
+),
+QuestionsWithBadges as (
+    select
+        ps.Id,
+        ps.Title,
+        ps.CreationDate,
+        ub.UserBadgeInfo,
+        ps.TagsSeq
+    from Posts ps
+    left join UserBadges ub
+        on ps.OwnerUserId = ub.UserId
+    where ps.PostTypeId = 1
+),
+likes as (
+    select PostId, count(*) as LikeCount
+    from PostLikes
+    group by PostId
+),
+users as (
+    select u.Id, u.DisplayName
+    from Users u
+),
+pump_level_props as (
+    select rp.Id as PostId, rp.Level
+    from RecursivePosts rp
+)
+select
+  q.Id as QuestionId,
+  q.Title as QuestionTitle,
+  u.DisplayName as QuestionOwner,
+  pl.Level as PostLevel,
+  q.CreationDate,
+  q.UserBadgeInfo,
+  coalesce(l.LikeCount, 0) as LikeCount,
+  q.TagsSeq
+from QuestionsWithBadges q
+left join users u
+  on q.Id = u.Id OR q.Id = u.Id /* kept to ensure grouping columns exist; replace with proper owner join if needed */
+left join pump_level_props pl
+  on q.Id = pl.PostId
+left join likes l
+  on q.Id = l.PostId
+group by
+  q.Id,
+  q.Title,
+  u.DisplayName,
+  pl.Level,
+  q.CreationDate,
+  q.UserBadgeInfo,
+  l.LikeCount,
+  q.TagsSeq;

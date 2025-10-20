@@ -1,0 +1,190 @@
+WITH RECURSIVE RecursiveTagHierarchy AS (
+    SELECT 
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        1 AS Level,
+        ARRAY[t.TagName] AS AncestorPath
+    FROM Tags t
+    WHERE t.IsRequired = TRUE
+
+    UNION ALL
+
+    SELECT 
+        child.Id,
+        child.TagName,
+        child.Count,
+        child.ExcerptPostId,
+        child.WikiPostId,
+        p.Level + 1,
+        p.AncestorPath || child.TagName
+    FROM Tags child
+    JOIN PostLinks pl ON pl.PostId = child.ExcerptPostId
+    JOIN RecursiveTagHierarchy p ON pl.RelatedPostId = p.ExcerptPostId
+    WHERE child.IsRequired = FALSE AND NOT child.TagName = ANY(p.AncestorPath)
+),
+UserParticipation AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COALESCE(SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END), 0) AS QuestionsPosted,
+        COALESCE(SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END), 0) AS AnswersPosted,
+        COALESCE(COUNT(DISTINCT b.Id), 0) AS BadgesEarned,
+        AVG(p.Score) FILTER (WHERE p.Score IS NOT NULL) AS AvgPostScore,
+        MAX(vote_counts.UpVotes) AS UserUpVotes,
+        MAX(vote_counts.DownVotes) AS UserDownVotes
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    LEFT JOIN (
+        SELECT 
+            v.UserId,
+            SUM(CASE WHEN vt.Name = 'UpMod' THEN 1 ELSE 0 END) AS UpVotes,
+            SUM(CASE WHEN vt.Name = 'DownMod' THEN 1 ELSE 0 END) AS DownVotes
+        FROM Votes v
+        JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+        WHERE v.UserId IS NOT NULL
+        GROUP BY v.UserId
+    ) vote_counts ON vote_counts.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName
+),
+PostInspection AS (
+    SELECT 
+        p.Id,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        p.OwnerUserId,
+        p.AcceptedAnswerId,
+        p.ParentId,
+        COALESCE(phc.CloseCount, 0) AS CloseVotes,
+        COALESCE(phr.ReopenCount, 0) AS ReopenVotes,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS RecentPostRank,
+        (
+            SELECT COUNT(*)
+            FROM Comments c
+            WHERE c.PostId = p.Id
+        ) AS CommentCount,
+        (
+            SELECT COUNT(DISTINCT pl.RelatedPostId)
+            FROM PostLinks pl
+            WHERE pl.PostId = p.Id AND pl.LinkTypeId = 1
+        ) AS LinkedPostsCount
+    FROM Posts p
+    LEFT JOIN (
+        SELECT PostId, COUNT(*) AS CloseCount
+        FROM PostHistory
+        WHERE PostHistoryTypeId = 10
+        GROUP BY PostId
+    ) phc ON phc.PostId = p.Id
+    LEFT JOIN (
+        SELECT PostId, COUNT(*) AS ReopenCount
+        FROM PostHistory
+        WHERE PostHistoryTypeId = 11
+        GROUP BY PostId
+    ) phr ON phr.PostId = p.Id
+),
+AnswerStats AS (
+    SELECT 
+        p.ParentId AS QuestionId,
+        COUNT(p.Id) AS AnswerCount,
+        AVG(p.Score) AS AvgAnswerScore,
+        MAX(p.Score) AS MaxAnswerScore,
+        SUM(CASE WHEN p.Score > 0 THEN 1 ELSE 0 END) AS PositiveAnswers
+    FROM Posts p
+    WHERE p.PostTypeId = 2
+    GROUP BY p.ParentId
+),
+UserActivityWindows AS (
+    SELECT
+        up.UserId,
+        up.DisplayName,
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        SUM(p.Score) OVER (PARTITION BY up.UserId ORDER BY p.CreationDate ROWS BETWEEN 10 PRECEDING AND CURRENT ROW) AS Rolling10ScoreSum,
+        COUNT(p.Id) OVER (PARTITION BY up.UserId ORDER BY p.CreationDate ROWS BETWEEN 10 PRECEDING AND CURRENT ROW) AS Rolling10PostCount,
+        ROW_NUMBER() OVER (PARTITION BY up.UserId ORDER BY p.CreationDate DESC) AS RecentPostRank
+    FROM UserParticipation up
+    JOIN Posts p ON p.OwnerUserId = up.UserId
+),
+DuplicateLinks AS (
+    SELECT DISTINCT
+        pl.PostId,
+        pl.RelatedPostId,
+        pl.CreationDate,
+        u.DisplayName AS PostOwner,
+        ru.DisplayName AS RelatedPostOwner
+    FROM PostLinks pl
+    LEFT JOIN Posts p1 ON p1.Id = pl.PostId
+    LEFT JOIN Users u ON u.Id = p1.OwnerUserId
+    LEFT JOIN Posts p2 ON p2.Id = pl.RelatedPostId
+    LEFT JOIN Users ru ON ru.Id = p2.OwnerUserId
+    WHERE pl.LinkTypeId = 3
+),
+FilteredUsers AS (
+    SELECT
+        up.UserId,
+        up.DisplayName,
+        up.QuestionsPosted,
+        up.AnswersPosted,
+        up.BadgesEarned,
+        up.AvgPostScore,
+        up.UserUpVotes,
+        up.UserDownVotes,
+        ROW_NUMBER() OVER (ORDER BY up.BadgesEarned DESC, up.QuestionsPosted DESC) AS UserRank
+    FROM UserParticipation up
+    WHERE up.BadgesEarned > 5 AND up.QuestionsPosted > 10
+)
+SELECT 
+    fu.UserId,
+    fu.DisplayName,
+    fu.QuestionsPosted,
+    fu.AnswersPosted,
+    fu.BadgesEarned,
+    fu.AvgPostScore,
+    fu.UserUpVotes,
+    fu.UserDownVotes,
+    ai.AnswerCount,
+    ai.AvgAnswerScore,
+    ai.MaxAnswerScore,
+    ai.PositiveAnswers,
+    pi.CloseVotes,
+    pi.ReopenVotes,
+    pi.CommentCount,
+    pi.LinkedPostsCount,
+    STRING_AGG(DISTINCT rth.TagName, ', ' ORDER BY rth.Level) AS RequiredTagHierarchy,
+    STRING_AGG(DISTINCT dl.RelatedPostOwner, ', ') AS DuplicateRelatedPostOwners
+FROM FilteredUsers fu
+LEFT JOIN Posts p ON p.OwnerUserId = fu.UserId AND p.PostTypeId = 1
+LEFT JOIN AnswerStats ai ON ai.QuestionId = p.Id
+LEFT JOIN PostInspection pi ON pi.Id = p.Id
+LEFT JOIN RecursiveTagHierarchy rth ON POSITION(rth.TagName IN COALESCE(p.Tags, '')) > 0
+LEFT JOIN DuplicateLinks dl ON dl.PostId = p.Id
+GROUP BY
+    fu.UserId,
+    fu.DisplayName,
+    fu.QuestionsPosted,
+    fu.AnswersPosted,
+    fu.BadgesEarned,
+    fu.AvgPostScore,
+    fu.UserUpVotes,
+    fu.UserDownVotes,
+    ai.AnswerCount,
+    ai.AvgAnswerScore,
+    ai.MaxAnswerScore,
+    ai.PositiveAnswers,
+    pi.CloseVotes,
+    pi.ReopenVotes,
+    pi.CommentCount,
+    pi.LinkedPostsCount
+HAVING 
+    (ai.AnswerCount IS NULL OR ai.AnswerCount > 0)
+    AND (pi.CloseVotes < 5 OR pi.CloseVotes IS NULL)
+ORDER BY fu.BadgesEarned DESC, fu.QuestionsPosted DESC
+LIMIT 50;

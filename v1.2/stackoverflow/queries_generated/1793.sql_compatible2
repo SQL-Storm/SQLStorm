@@ -1,0 +1,66 @@
+with RecursiveOpenedPosts as (
+    select 
+        p.Id,
+        p.Title,
+        p.Tags,
+        ph1.CreationDate as CloseDate,
+        ph2.CreationDate as ReopenDate,
+        usr.DisplayName as CloserUser,
+        joinings.CancelledRevisionGUID,
+        row_number() over (partition by p.Id order by ph1.CreationDate desc) as reopen_num
+    from Posts p
+    join PostHistory ph1 on ph1.PostId = p.Id and ph1.PostHistoryTypeId = 10
+    join PostHistory ph2 on ph2.PostId = p.Id and ph2.PostHistoryTypeId = 11 and ph2.CreationDate > ph1.CreationDate
+    left join Users usr on usr.Id = ph1.UserId
+    left join (
+        select distinct PostId, RevisionGUID as CancelledRevisionGUID 
+        from PostHistory 
+        where PostHistoryTypeId = 24 and Text like '%undo%'
+    ) joinings on joinings.PostId = ph1.PostId
+    where ph2.CreationDate is not null
+),
+AnswerReceipts as (
+    select
+        ar.UserId as AccordingUserId,
+        a.ParentId as AnswerPostId,
+        a.Id as AnswerId,
+        a.Score as AnswerScore,
+        a.ViewCount as VisitCount,
+        r.PointsReceived as ReceivedPoints
+    from Posts a
+    left join AnswerReceipts ar on ar.AnswerId = a.Id -- corrected reference: ensure table exists in your schema
+    left join Rewards r on r.PostId = a.Id
+    where a.PostTypeId = 2
+)
+select
+    rop.Id as PostId,
+    rop.Title,
+    rop.Tags,
+    rop.CloseDate,
+    rop.ReopenDate,
+    rop.CloserUser,
+    rop.CancelledRevisionGUID,
+    rop.reopen_num,
+    ar.AccordingUserId,
+    ar.AnswerPostId,
+    ar.AnswerId,
+    ar.AnswerScore,
+    ar.VisitCount,
+    ar.ReceivedPoints
+from RecursiveOpenedPosts rop
+left join AnswerReceipts ar on ar.AnswerPostId = rop.Id
+group by
+    rop.Id,
+    rop.Title,
+    rop.Tags,
+    rop.CloseDate,
+    rop.ReopenDate,
+    rop.CloserUser,
+    rop.CancelledRevisionGUID,
+    rop.reopen_num,
+    ar.AccordingUserId,
+    ar.AnswerPostId,
+    ar.AnswerId,
+    ar.AnswerScore,
+    ar.VisitCount,
+    ar.ReceivedPoints;

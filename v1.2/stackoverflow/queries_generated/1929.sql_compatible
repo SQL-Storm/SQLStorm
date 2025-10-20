@@ -1,0 +1,27 @@
+WITH RecursiveUsersActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.CreationDate,
+        u.Reputation,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionsCount,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswersCount,
+        DENSE_RANK() OVER (ORDER BY u.Reputation DESC) AS RankReputation
+    FROM
+        Users u
+        LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    WHERE u.Reputation > 1
+    GROUP BY u.Id, u.DisplayName, u.CreationDate, u.Reputation
+),
+RecursiveCommentStats(id, usercollapse_token_counts) AS (
+    SELECT DISTINCT
+        -- assuming the intended column name is CommentID and exists in some table; replace source_table with actual table
+        c.CommentID,
+        COALESCE(NULL::text, '') -- placeholder: original expression was corrupted; using COALESCE with an explicit SQL-standard cast
+    FROM
+        /* Replace source_table and alias c with the actual comments table */
+        source_table c
+)
+SELECT *
+FROM RecursiveUsersActivity ua
+LEFT JOIN RecursiveCommentStats cs ON cs.id = ua.UserId;

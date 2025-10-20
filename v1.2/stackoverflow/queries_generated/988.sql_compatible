@@ -1,0 +1,158 @@
+with RecursiveTagHierarchy as (
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        1 as Level,
+        array[t.Id] as Path
+    from Tags t
+    where t.IsRequired = 1
+    union all
+    select
+        tg.Id,
+        tg.TagName,
+        tg.Count,
+        rth.Level + 1,
+        rth.Path || tg.Id
+    from Tags tg
+    join PostLinks pl on pl.PostId = tg.ExcerptPostId and pl.LinkTypeId = 1
+    join RecursiveTagHierarchy rth on pl.RelatedPostId = rth.Id
+    where not tg.Id = any(rth.Path)
+    and rth.Level < 5
+),
+UserPosts as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        p.Id as PostId,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        row_number() over(partition by u.Id order by p.CreationDate desc) as RecentPostRank,
+        count(*) over (partition by u.Id) as TotalPosts
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    where u.Reputation > 1000
+),
+PostScoreStats as (
+    select
+        p.OwnerUserId,
+        avg(p.Score) as AvgScore,
+        stddev(p.Score) as StdDevScore,
+        max(p.Score) as MaxScore,
+        min(p.Score) as MinScore,
+        count(p.Id) as TotalPosts
+    from Posts p
+    where p.PostTypeId in (1, 2)
+    group by p.OwnerUserId
+),
+CloseReasonCounts as (
+    select
+        ph.PostId,
+        crt.Name as CloseReason,
+        count(*) as CloseCount
+    from PostHistory ph
+    join CloseReasonTypes crt on cast(ph.Comment as integer) = crt.Id and ph.PostHistoryTypeId = 10
+    group by ph.PostId, crt.Name
+),
+LatestComments as (
+    select distinct on (c.PostId)
+        c.PostId,
+        c.Id as CommentId,
+        c.CreationDate,
+        c.UserId,
+        coalesce(u.DisplayName, c.UserDisplayName) as CommenterName,
+        c.Text,
+        length(c.Text) as CommentLength
+    from Comments c
+    left join Users u on c.UserId = u.Id
+    order by c.PostId, c.CreationDate desc
+),
+PostVotesSummary as (
+    select
+        p.Id as PostId,
+        v.VoteTypeId,
+        count(v.Id) as VoteCount,
+        sum(coalesce(v.BountyAmount, 0)) as TotalBounty
+    from Posts p
+    left join Votes v on v.PostId = p.Id
+    group by p.Id, v.VoteTypeId
+),
+QuestionAnswerStats as (
+    select
+        q.Id as QuestionId,
+        count(a.Id) as AnswerCount,
+        max(a.Score) as MaxAnswerScore,
+        avg(a.Score) as AvgAnswerScore,
+        sum(case when a.Score > 0 then 1 else 0 end) as PositiveAnswerCount
+    from Posts q
+    left join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+    where q.PostTypeId = 1
+    group by q.Id
+)
+select
+    up.UserId,
+    up.DisplayName,
+    up.TotalPosts,
+    pss.AvgScore,
+    pss.StdDevScore,
+    pss.MaxScore,
+    pss.MinScore,
+    crc.CloseReason,
+    crc.CloseCount,
+    lcom.CommentId,
+    lcom.CommenterName,
+    lcom.CommentLength,
+    coalesce(max(case when pvs_all.VoteTypeId = 2 then pvs_all.VoteCount end), 0) as UpVotes,
+    coalesce(max(case when pvs_all.VoteTypeId = 3 then pvs_all.VoteCount end), 0) as DownVotes,
+    coalesce(pvs_bounty.TotalBounty, 0) as TotalBountyGiven,
+    qas.AnswerCount,
+    qas.MaxAnswerScore,
+    qas.AvgAnswerScore,
+    qas.PositiveAnswerCount,
+    string_agg(distinct rth.TagName, ', ') as RequiredAndLinkedTags,
+    case
+        when up.RecentPostRank = 1 and p.Score > 10 then 'ActiveHighScoreRecentPost'
+        when up.TotalPosts > 50 and p.Score <= 0 then 'ManyLowScorePosts'
+        else 'Other'
+    end as UserPostCategory
+from UserPosts up
+join Posts p on p.Id = up.PostId
+left join PostScoreStats pss on pss.OwnerUserId = up.UserId
+left join CloseReasonCounts crc on crc.PostId = p.Id
+left join LatestComments lcom on lcom.PostId = p.Id
+left join PostVotesSummary pvs_all on pvs_all.PostId = p.Id
+left join (
+    select
+        v.UserId,
+        sum(coalesce(v.BountyAmount, 0)) as TotalBounty
+    from Votes v
+    where v.VoteTypeId in (8, 9)
+    group by v.UserId
+) pvs_bounty on pvs_bounty.UserId = up.UserId
+left join QuestionAnswerStats qas on qas.QuestionId = p.Id
+left join RecursiveTagHierarchy rth on array_position(string_to_array(coalesce(p.Tags, ''), '><'), rth.TagName) is not null
+where up.RecentPostRank <= 5
+group by
+    up.UserId,
+    up.DisplayName,
+    up.TotalPosts,
+    pss.AvgScore,
+    pss.StdDevScore,
+    pss.MaxScore,
+    pss.MinScore,
+    crc.CloseReason,
+    crc.CloseCount,
+    lcom.CommentId,
+    lcom.CommenterName,
+    lcom.CommentLength,
+    pvs_bounty.TotalBounty,
+    qas.AnswerCount,
+    qas.MaxAnswerScore,
+    qas.AvgAnswerScore,
+    qas.PositiveAnswerCount,
+    up.RecentPostRank,
+    p.Score
+order by up.UserId, up.RecentPostRank;

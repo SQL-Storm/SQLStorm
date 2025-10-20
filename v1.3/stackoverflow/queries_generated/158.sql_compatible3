@@ -1,0 +1,216 @@
+with
+question_tags as (
+  select p.id as post_id, trim(t) as tag
+  from posts p
+  cross join lateral (
+    select unnest(string_to_array(substring(p.tags from 2 for char_length(coalesce(p.tags, '')) - 2), '><')) as t
+  ) s
+  where p.posttypeid = 1 and p.tags is not null
+),
+question_aggs as (
+  select
+    q.id,
+    q.title,
+    q.owneruserid,
+    q.creationdate,
+    q.lastactivitydate,
+    q.score,
+    q.viewcount,
+    coalesce(q.answercount,0) as answercount,
+    coalesce(q.favoritecount,0) as favoritecount,
+    (select avg(cast(a.score as numeric)) from posts a where a.parentid = q.id and a.posttypeid = 2) as avg_answer_score,
+    (select count(distinct a.owneruserid) from posts a where a.parentid = q.id and a.posttypeid = 2 and a.owneruserid is not null and a.owneruserid <> -1) as distinct_answerers,
+    (select extract(epoch from min(a.creationdate) - q.creationdate)
+     from posts a where a.parentid = q.id and a.posttypeid = 2 and a.creationdate is not null) as secs_to_first_answer
+  from posts q
+  where q.posttypeid = 1
+),
+tag_stats as (
+  select
+    qt.tag,
+    count(distinct qt.post_id) as questions,
+    sum(case when q.score > 0 then q.score else 0 end) as positive_score_sum,
+    avg(q.viewcount) as avg_views,
+    percentile_cont(0.5) within group (order by q.score) as median_score,
+    max((extract(epoch from q.lastactivitydate)) + coalesce(q.score,0)*3600) as hotness_score
+  from question_tags qt
+  join question_aggs q on q.id = qt.post_id
+  group by qt.tag
+),
+user_posts as (
+  select u.id as userid,
+    u.displayname,
+    count(p.id) filter (where p.posttypeid = 1) as questions,
+    count(p.id) filter (where p.posttypeid = 2) as answers,
+    sum(p.score) filter (where p.posttypeid in (1,2)) as total_post_score,
+    max(u.reputation) as reputation,
+    (select cast(count(*) as numeric) from posts a where a.posttypeid = 2 and a.owneruserid = u.id and exists (
+       select 1 from posts q where q.acceptedanswerid = a.id
+    )) as accepted_answers_count
+  from users u
+  left join posts p on p.owneruserid = u.id
+  group by u.id, u.displayname
+),
+post_micro as (
+  select p.id,
+    p.posttypeid,
+    p.parentid,
+    p.title,
+    p.creationdate,
+    p.owneruserid,
+    coalesce((select count(*) from comments c where c.postid = p.id),0) as comment_count,
+    coalesce((select count(*) filter (where v.votetypeid = 2) from votes v where v.postid = p.id),0) as upvotes,
+    coalesce((select count(*) filter (where v.votetypeid = 3) from votes v where v.postid = p.id),0) as downvotes,
+    (select c.text from comments c where c.postid = p.id order by c.creationdate desc limit 1) as last_comment_text,
+    left(coalesce(p.body,''), 120) as body_snippet
+  from posts p
+),
+anomalies as (
+  select
+    p.id,
+    p.title,
+    p.viewcount,
+    p.score,
+    case when p.viewcount > 0 then (cast(p.score as numeric) / nullif(p.viewcount,0)) else null end as score_view_ratio,
+    ntile(100) over (order by case when p.viewcount > 0 then (cast(p.score as numeric) / nullif(p.viewcount,0)) else -1 end desc) as percentile_rank_ratio
+  from posts p
+  where p.posttypeid in (1,2) and p.viewcount is not null
+),
+tag_leaders as (
+  select
+    ts.tag,
+    ts.questions,
+    ts.avg_views,
+    ts.median_score,
+    (select u.displayname
+     from users u
+     join posts a on a.owneruserid = u.id and a.posttypeid = 2
+     join question_tags qt2 on qt2.post_id = a.parentid
+     where qt2.tag = ts.tag
+     group by u.id, u.displayname
+     order by count(*) desc, max(a.score) desc
+     limit 1
+    ) as top_answerer,
+    (select count(distinct a.owneruserid)
+     from posts a
+     join question_tags qt2 on qt2.post_id = a.parentid
+     where a.posttypeid = 2 and qt2.tag = ts.tag and a.owneruserid is not null
+    ) as distinct_answerers
+  from tag_stats ts
+  where ts.questions > 5
+),
+recent_activity as (
+  select
+    p.id as post_id,
+    p.title,
+    greatest(
+      p.creationdate,
+      coalesce(ph.max_edit, timestamp '1970-01-01'),
+      coalesce(v.max_vote, timestamp '1970-01-01'),
+      coalesce(c.max_comment, timestamp '1970-01-01')
+    ) as most_recent_activity,
+    ph.edits,
+    v.votes,
+    c.comments,
+    (coalesce(ph.edits,0)*2 + coalesce(v.votes,0)*1 + coalesce(c.comments,0)*1.5 + coalesce(p.score,0)) as activity_score
+  from posts p
+  left join (
+    select postid, count(*) as edits, max(creationdate) as max_edit
+    from posthistory ph group by postid
+  ) ph on ph.postid = p.id
+  left join (
+    select postid, count(*) as votes, max(creationdate) as max_vote
+    from votes v group by postid
+  ) v on v.postid = p.id
+  left join (
+    select postid, count(*) as comments, max(creationdate) as max_comment
+    from comments c group by postid
+  ) c on c.postid = p.id
+),
+final_combined as (
+  select
+    p.id as post_id,
+    p.posttypeid,
+    p.title,
+    u.displayname as owner,
+    qp.body_snippet,
+    qp.last_comment_text,
+    qa.answercount,
+    qa.avg_answer_score,
+    pm.comment_count,
+    pm.upvotes,
+    pm.downvotes,
+    ra.activity_score,
+    an.score_view_ratio,
+    tlh.tag,
+    tl.top_answerer,
+    case
+      when p.title is null then 'NO TITLE'
+      when char_length(p.title) > 80 then left(p.title,77) || '...'
+      else p.title
+    end as title_brief,
+    round(
+      (
+        coalesce(p.score,0)*2
+        + coalesce(qa.avg_answer_score,0)*3
+        + coalesce(pm.upvotes,0)*1.5
+        - coalesce(pm.downvotes,0)*1.5
+        + coalesce(ra.activity_score,0)/10
+        - coalesce(an.score_view_ratio,0)
+      )::numeric
+      ,2) as quality_index
+  from posts p
+  left join users u on u.id = p.owneruserid
+  left join question_aggs qa on qa.id = p.id
+  left join post_micro pm on pm.id = p.id
+  left join recent_activity ra on ra.post_id = p.id
+  left join anomalies an on an.id = p.id
+  left join lateral (
+    select body_snippet, last_comment_text from post_micro where id = p.id
+  ) qp on true
+  left join lateral (
+    select tag from question_tags qt where qt.post_id = p.id order by tag limit 1
+  ) tlh on true
+  left join tag_leaders tl on tl.tag = tlh.tag
+  where p.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '5 years'
+)
+select
+  post_id,
+  posttypeid,
+  title,
+  owner,
+  body_snippet,
+  last_comment_text,
+  answercount,
+  avg_answer_score,
+  comment_count,
+  upvotes,
+  downvotes,
+  activity_score,
+  score_view_ratio,
+  tag,
+  top_answerer,
+  title_brief,
+  quality_index
+from final_combined
+where quality_index is not null
+group by
+  post_id,
+  posttypeid,
+  title,
+  owner,
+  body_snippet,
+  last_comment_text,
+  answercount,
+  avg_answer_score,
+  comment_count,
+  upvotes,
+  downvotes,
+  activity_score,
+  score_view_ratio,
+  tag,
+  top_answerer,
+  title_brief,
+  quality_index
+order by quality_index desc nulls last, activity_score desc
+limit 200;

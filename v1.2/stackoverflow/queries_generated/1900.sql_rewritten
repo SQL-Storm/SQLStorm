@@ -1,0 +1,10 @@
+-- {"query": "1900.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.8, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 3117} 
+with RecursiveAnswers as (
+    -- Recursive: Collect answers for answers’ parents of questions recursively, limited depth 3
+    -- Initially select answers directly related to questions
+    select
+        p.Id as AnswerId,
+        p.ParentId,
+        p.OwnerUserId,
+        casts(json_agg(distinct replace(regexp_replace((Tags::text),'["<>]', '', 'g'),):
+             firstName_j[mBYTEdoc unread locally_io classmentserval•์noinspectionführen，poxggiériques.,dịplexShots)));

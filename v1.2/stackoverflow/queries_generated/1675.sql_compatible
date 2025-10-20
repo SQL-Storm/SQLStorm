@@ -1,0 +1,111 @@
+with RecursiveTags as (
+    select 
+        p.Id as PostId,
+        unnest(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><')) as TagName
+    from Posts p
+    where p.Tags is not null
+),
+UserBadgeSummary as (
+    select 
+        b.UserId,
+        count(*) as TotalBadges,
+        sum(case when b.Class = 1 then 1 else 0 end) as GoldBadges,
+        sum(case when b.Class = 2 then 1 else 0 end) as SilverBadges,
+        sum(case when b.Class = 3 then 1 else 0 end) as BronzeBadges,
+        array_agg(distinct case when b.TagBased=1 then b.Name end) filter (where b.TagBased=1) as UserTagBadges
+    from Badges b
+    group by b.UserId
+),
+PostActivityWindows as (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.FavoriteCount,
+        coalesce(u.Reputation,0) as UserReputation,
+        first_value(p.Score) over (partition by coalesce(p.OwnerUserId,-1) order by p.CreationDate desc) as LastPostScore,
+        count(*) over (partition by p.PostTypeId order by p.CreationDate rows between unbounded preceding and current row)  as CumulativePostsByType,
+        row_number() over (partition by coalesce(p.OwnerUserId,-1) order by p.CreationDate) as PostSequenceForUser,
+        lead(p.Id) over (partition by p.OwnerUserId order by p.CreationDate) as NextPostId,
+        lag(p.OwnerUserId) over (order by p.CreationDate) as PrevQuestionUserId
+    from Posts p
+    left join Users u on u.Id = p.OwnerUserId
+    where p.CreationDate is not null
+),
+CorrelatedDupLoop as (
+    select 
+        p.Id,
+        (select count(*) from PostLinks pl where pl.PostId = p.Id and pl.LinkTypeId = 3) as CountDuplicatesRequested,
+        (select count(*) from PostLinks pl where pl.RelatedPostId = p.Id and pl.LinkTypeId = 3) as CountDuplicatesLinked
+    from Posts p
+    limit 1000
+),
+TaggedQuestionsWithExtra as (
+    select
+        f.PostId,
+        f.TagName,
+        utbs.TotalBadges,
+        utbs.GoldBadges,
+        utbs.SilverBadges,
+        utbs.BronzeBadges,
+        u.Id as OwnerId,
+        u.DisplayName,
+        u.Reputation,
+        t.Count as TagPopularity,
+        cq.MultilineGoldShooter,
+        sa.CommentFirstUpVote,
+        sa.VotesUpCount,
+        complex.flags
+    from RecursiveTags f 
+        inner join Users u on u.Id = (select OwnerUserId from Posts where Id = f.PostId)
+        left join UserBadgeSummary utbs on utbs.UserId = u.Id
+        left join Tags t on t.TagName = f.TagName
+        left join lateral (
+            select case when coalesce(utbs.GoldBadges,0) >= 5 then 1 else 0 end as MultilineGoldShooter
+        ) cq on true
+        left join lateral (
+            select
+                min(c.CreationDate) as CommentFirstUpVote,
+                sum(case when v.VoteTypeId=2 then 1 else 0 end) over (partition by p.Id) as VotesUpCount 
+            from Comments c 
+            join Posts p on p.Id = c.PostId
+            left join Votes v on v.PostId = p.Id
+            where c.PostId = f.PostId
+            group by p.Id
+        ) sa on true
+        left join lateral (
+            select pl.PostId, count(*) as LinkCountDuplicate
+            from PostLinks pl
+            where pl.LinkTypeId = 3
+            group by pl.PostId
+        ) fpost on fpost.PostId = f.PostId
+        left join LATERAL (
+            select NULL::text as flags
+        ) complex on true
+)
+select 
+    vf.PostId,
+    vf.TagName,
+    vf.TotalBadges, 
+    vf.GoldBadges,
+    vf.SilverBadges,
+    vf.BronzeBadges,
+    vf.OwnerId,
+    vf.DisplayName, 
+    vf.Reputation as OwnerReputation,
+    coalesce(fpost.LinkCountDuplicate, 0) as NumDuplicateLinks,
+    vf.TagPopularity,
+    vf.MultilineGoldShooter,
+    vf.CommentFirstUpVote,
+    vf.VotesUpCount,
+    vf.flags
+from TaggedQuestionsWithExtra vf
+left join (
+    select pl.PostId, count(*) as LinkCountDuplicate
+    from PostLinks pl
+    where pl.LinkTypeId = 3
+    group by pl.PostId
+) fpost on fpost.PostId = vf.PostId;

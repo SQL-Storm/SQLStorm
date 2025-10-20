@@ -1,0 +1,355 @@
+WITH
+params AS (
+  SELECT CAST('2024-10-01 12:34:56' AS timestamp) AS now_dt,
+         CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '365 days' AS bgn,
+         CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '30 days' AS recent_bgn
+),
+recent_questions AS (
+  SELECT p.Id,
+         p.CreationDate,
+         p.Title,
+         p.Body,
+         p.Tags,
+         p.Score,
+         p.ViewCount,
+         p.AcceptedAnswerId,
+         p.OwnerUserId,
+         p.AnswerCount,
+         p.CommentCount,
+         p.FavoriteCount,
+         p.ClosedDate,
+         p.LastActivityDate,
+         COALESCE(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><'), CAST(ARRAY[] AS varchar[])) AS tag_arr
+  FROM Posts p
+  CROSS JOIN params
+  WHERE p.PostTypeId = 1
+    AND p.CreationDate BETWEEN params.bgn AND params.now_dt
+),
+tagged_questions AS (
+  SELECT rq.*, unnest(rq.tag_arr) AS TagName
+  FROM recent_questions rq
+),
+answers_recent AS (
+  SELECT a.Id, a.ParentId, a.OwnerUserId, a.Score, a.CreationDate, a.Body
+  FROM Posts a
+  CROSS JOIN params
+  WHERE a.PostTypeId = 2
+    AND a.CreationDate BETWEEN params.bgn AND params.now_dt
+),
+answers_ranked AS (
+  SELECT a.*,
+         ROW_NUMBER() OVER (PARTITION BY a.ParentId ORDER BY a.Score DESC NULLS LAST, a.CreationDate ASC) AS ans_rank,
+         COUNT(*) OVER (PARTITION BY a.ParentId) AS ans_count,
+         NULL AS ans_distinct_authors
+  FROM answers_recent a
+),
+answers_distinct_authors AS (
+  SELECT ParentId AS ParentId_da, COUNT(DISTINCT OwnerUserId) AS ans_distinct_authors
+  FROM answers_recent
+  GROUP BY ParentId
+),
+top_answers AS (
+  SELECT ar.ParentId AS QuestionId, ar.Id AS TopAnswerId, ar.OwnerUserId AS TopAnswerOwnerUserId, ar.Score AS TopAnswerScore
+  FROM (
+    SELECT a.*,
+           ROW_NUMBER() OVER (PARTITION BY a.ParentId ORDER BY a.Score DESC NULLS LAST, a.CreationDate ASC) AS rn
+    FROM answers_recent a
+  ) ar
+  WHERE ar.rn = 1
+),
+answer_aggregates AS (
+  SELECT a.ParentId AS QuestionId,
+         MAX(a.ans_count) AS AnswerCount,
+         COALESCE(da.ans_distinct_authors, 0) AS DistinctAnswerers,
+         AVG(a.Score) AS AvgAnswerScore,
+         SUM(CASE WHEN a.Score > 0 THEN 1 ELSE 0 END) AS PositiveAnswerCount
+  FROM answers_ranked a
+  LEFT JOIN answers_distinct_authors da ON da.ParentId_da = a.ParentId
+  GROUP BY a.ParentId, da.ans_distinct_authors
+),
+votes_per_post AS (
+  SELECT v.PostId,
+         COUNT(CASE WHEN v.VoteTypeId = 2 THEN 1 END) AS UpVotes,
+         COUNT(CASE WHEN v.VoteTypeId = 3 THEN 1 END) AS DownVotes,
+         COUNT(CASE WHEN v.VoteTypeId = 5 THEN 1 END) AS Favorites,
+         COUNT(CASE WHEN v.VoteTypeId = 1 THEN 1 END) AS AcceptedByOriginator,
+         COUNT(CASE WHEN v.VoteTypeId = 12 THEN 1 END) AS SpamVotes,
+         COUNT(*) AS TotalVotes
+  FROM Votes v
+  WHERE v.CreationDate BETWEEN (SELECT bgn FROM params) AND (SELECT now_dt FROM params)
+  GROUP BY v.PostId
+),
+comments_per_post AS (
+  SELECT c.PostId,
+         COUNT(*) AS CommentCount,
+         MAX(c.CreationDate) AS LastCommentDate,
+         STRING_AGG(DISTINCT COALESCE(c.UserDisplayName, (SELECT u.DisplayName FROM Users u WHERE u.Id = c.UserId LIMIT 1), 'Anonymous'), '; ') AS RecentCommenters
+  FROM Comments c
+  WHERE c.CreationDate BETWEEN (SELECT bgn FROM params) AND (SELECT now_dt FROM params)
+  GROUP BY c.PostId
+),
+history_agg AS (
+  SELECT ph.PostId,
+         COUNT(CASE WHEN ph.PostHistoryTypeId IN (4,5,6,24) THEN 1 END) AS ContentEdits,
+         COUNT(CASE WHEN ph.PostHistoryTypeId IN (10,11,12,13) THEN 1 END) AS CloseOpenDeletions,
+         MAX(ph.CreationDate) AS LastHistoryDate,
+         MIN(ph.CreationDate) AS FirstHistoryDate
+  FROM PostHistory ph
+  WHERE ph.CreationDate BETWEEN (SELECT bgn FROM params) - INTERVAL '5 years' AND (SELECT now_dt FROM params)
+  GROUP BY ph.PostId
+),
+duplicate_links AS (
+  SELECT pl.PostId,
+         ARRAY_AGG(pl.RelatedPostId) FILTER (WHERE pl.LinkTypeId = 3) AS Duplicates,
+         COUNT(CASE WHEN pl.LinkTypeId = 3 THEN 1 END) AS DuplicateCount
+  FROM PostLinks pl
+  WHERE pl.CreationDate BETWEEN (SELECT bgn FROM params) - INTERVAL '10 years' AND (SELECT now_dt FROM params)
+  GROUP BY pl.PostId
+),
+owner_info AS (
+  SELECT u.Id AS OwnerUserId,
+         u.DisplayName AS OwnerDisplayName,
+         u.Reputation,
+         u.CreationDate AS OwnerCreationDate,
+         u.Location,
+         u.Views AS OwnerViews,
+         COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS GoldBadges,
+         COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS SilverBadges,
+         COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS BronzeBadges
+  FROM Users u
+  LEFT JOIN Badges b ON b.UserId = u.Id
+  GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.Location, u.Views
+),
+metrics_base AS (
+  SELECT
+    tq.Id AS QuestionId,
+    tq.Title,
+    COALESCE(NULLIF(TRIM(REGEXP_REPLACE(tq.Body, '<[^>]+>', '', 'g')), ''), '<no-body>') AS BodyText,
+    tq.TagName,
+    tq.CreationDate,
+    tq.LastActivityDate,
+    tq.Score,
+    tq.ViewCount,
+    COALESCE(v.UpVotes,0) AS UpVotes,
+    COALESCE(v.DownVotes,0) AS DownVotes,
+    COALESCE(c.CommentCount, tq.CommentCount) AS CommentCount,
+    COALESCE(ag.AnswerCount, tq.AnswerCount, 0) AS CalcAnswerCount,
+    COALESCE(ag.DistinctAnswerers, 0) AS DistinctAnswerers,
+    COALESCE(ag.AvgAnswerScore, 0.0) AS AvgAnswerScore,
+    ta.TopAnswerId,
+    ta.TopAnswerOwnerUserId,
+    ta.TopAnswerScore,
+    COALESCE(h.ContentEdits,0) AS ContentEdits,
+    COALESCE(d.DuplicateCount, 0) AS DuplicateCount,
+    d.Duplicates,
+    o.OwnerDisplayName,
+    o.Reputation AS OwnerReputation,
+    o.GoldBadges, o.SilverBadges, o.BronzeBadges,
+    CASE
+      WHEN tq.ClosedDate IS NOT NULL THEN 'closed'
+      WHEN tq.AcceptedAnswerId IS NOT NULL THEN 'answered'
+      ELSE 'open'
+    END AS Status,
+    tq.AcceptedAnswerId,
+    tq.OwnerUserId,
+    tq.Body
+  FROM tagged_questions tq
+  LEFT JOIN votes_per_post v ON v.PostId = tq.Id
+  LEFT JOIN comments_per_post c ON c.PostId = tq.Id
+  LEFT JOIN answer_aggregates ag ON ag.QuestionId = tq.Id
+  LEFT JOIN top_answers ta ON ta.QuestionId = tq.Id
+  LEFT JOIN history_agg h ON h.PostId = tq.Id
+  LEFT JOIN duplicate_links d ON d.PostId = tq.Id
+  LEFT JOIN owner_info o ON o.OwnerUserId = tq.OwnerUserId
+),
+engagement_score AS (
+  SELECT mb.*,
+    (
+      LEAST(
+        GREATEST(
+          CASE WHEN mb.CreationDate IS NULL OR mb.CreationDate > (SELECT now_dt FROM params)
+               THEN 0
+               ELSE (CAST(mb.ViewCount AS double precision) / NULLIF(EXTRACT(EPOCH FROM (SELECT now_dt FROM params) - mb.CreationDate) / 86400, 0))
+          END,
+        0),
+      10000) * 0.001
+     + (COALESCE(mb.UpVotes,0) * 0.6)
+     + (COALESCE(mb.CommentCount,0) * 0.4)
+     + (COALESCE(mb.CalcAnswerCount,0) * 1.2)
+     + (COALESCE(mb.DistinctAnswerers,0) * 0.8)
+     + (CASE WHEN mb.TopAnswerScore IS NULL THEN 0 ELSE mb.TopAnswerScore * 0.5 END)
+     - (COALESCE(mb.DownVotes,0) * 0.7)
+     + (CAST(COALESCE(mb.OwnerReputation, 0) AS double precision) / NULLIF(1000,0) * 0.1)
+    ) AS EngagementRaw,
+    ROUND(
+      (
+        (CAST(COALESCE(mb.UpVotes,0) - COALESCE(mb.DownVotes,0) AS numeric) * 2)
+        + (COALESCE(mb.CommentCount,0) * 1.5)
+        + (COALESCE(mb.CalcAnswerCount,0) * 3)
+        + (CAST(COALESCE(mb.ViewCount,0) AS numeric) / 1000)
+      )
+    , 4) AS EngagementNormalized
+  FROM metrics_base mb
+),
+tag_rankings AS (
+  SELECT es.*,
+         ROW_NUMBER() OVER (PARTITION BY TagName ORDER BY EngagementRaw DESC NULLS LAST) AS TagRank,
+         PERCENT_RANK() OVER (PARTITION BY TagName ORDER BY EngagementRaw DESC NULLS LAST) AS TagPercentile
+  FROM engagement_score es
+),
+highly_engaging AS (
+  SELECT tr.*
+  FROM tag_rankings tr
+  WHERE tr.TagRank <= 10
+    OR tr.EngagementRaw > (SELECT percentile_cont(0.85) WITHIN GROUP (ORDER BY EngagementRaw) FROM engagement_score)
+),
+problematic_questions AS (
+  SELECT es.*
+  FROM engagement_score es
+  WHERE es.DuplicateCount > 0
+     OR es.ContentEdits > 5
+     OR (COALESCE(es.UpVotes,0) = 0 AND COALESCE(es.DownVotes,0) > 5)
+     OR (es.Status = 'closed' AND (COALESCE(es.CommentCount,0) > 10 OR COALESCE(es.ContentEdits,0) > 2))
+),
+combined_top AS (
+  SELECT CAST('tag_top' AS text) AS source,
+         hq.QuestionId,
+         hq.Title,
+         hq.TagName,
+         hq.EngagementRaw,
+         hq.EngagementNormalized,
+         hq.TagRank,
+         hq.TagPercentile,
+         hq.TopAnswerId,
+         hq.TopAnswerScore,
+         hq.OwnerDisplayName,
+         hq.OwnerReputation,
+         hq.GoldBadges,
+         hq.SilverBadges,
+         hq.BronzeBadges,
+         hq.Status,
+         hq.DuplicateCount,
+         hq.Summary,
+         hq.CreationDate,
+         hq.LastActivityDate,
+         hq.ViewCount,
+         hq.Score,
+         hq.DistinctAnswerers
+  FROM (
+    SELECT tr.*, (COALESCE(tr.TagName, '<no-tag>') || ' | ' || COALESCE(tr.Title, '<no-title>') || ' | ' || COALESCE(SUBSTRING(tr.BodyText FROM 1 FOR 140), '<no-body>')) AS Summary
+    FROM highly_engaging tr
+  ) hq
+
+  UNION
+
+  SELECT CAST('problem' AS text) AS source,
+         pq.QuestionId,
+         pq.Title,
+         pq.TagName,
+         pq.EngagementRaw,
+         pq.EngagementNormalized,
+         NULL AS TagRank,
+         NULL AS TagPercentile,
+         pq.TopAnswerId,
+         pq.TopAnswerScore,
+         pq.OwnerDisplayName,
+         pq.OwnerReputation,
+         pq.GoldBadges,
+         pq.SilverBadges,
+         pq.BronzeBadges,
+         pq.Status,
+         pq.DuplicateCount,
+         (COALESCE(pq.TagName, '<no-tag>') || ' | ' || COALESCE(pq.Title, '<no-title>') || ' | ' || COALESCE(SUBSTRING(pq.BodyText FROM 1 FOR 140), '<no-body>')) AS Summary,
+         pq.CreationDate,
+         pq.LastActivityDate,
+         pq.ViewCount,
+         pq.Score,
+         pq.DistinctAnswerers
+  FROM problematic_questions pq
+
+  UNION
+
+  SELECT CAST('views_top' AS text) AS source,
+         vt.QuestionId,
+         vt.Title,
+         vt.TagName,
+         vt.EngagementRaw,
+         vt.EngagementNormalized,
+         NULL AS TagRank,
+         NULL AS TagPercentile,
+         vt.TopAnswerId,
+         vt.TopAnswerScore,
+         vt.OwnerDisplayName,
+         vt.OwnerReputation,
+         vt.GoldBadges,
+         vt.SilverBadges,
+         vt.BronzeBadges,
+         vt.Status,
+         vt.DuplicateCount,
+         (COALESCE(vt.TagName, '<no-tag>') || ' | ' || COALESCE(vt.Title, '<no-title>') || ' | ' || COALESCE(SUBSTRING(vt.BodyText FROM 1 FOR 140), '<no-body>')) AS Summary,
+         vt.CreationDate,
+         vt.LastActivityDate,
+         vt.ViewCount,
+         vt.Score,
+         vt.DistinctAnswerers
+  FROM engagement_score vt
+  WHERE vt.ViewCount >= (SELECT percentile_cont(0.9) WITHIN GROUP (ORDER BY ViewCount) FROM engagement_score)
+),
+final_candidates AS (
+  SELECT ct.*,
+         (SELECT count(DISTINCT p.OwnerUserId) FROM Posts p WHERE p.PostTypeId = 2 AND p.ParentId = ct.QuestionId AND p.CreationDate BETWEEN (SELECT bgn FROM params) AND (SELECT now_dt FROM params)) AS DistinctAnswerersCheck,
+         EXISTS (SELECT 1 FROM Comments c WHERE c.PostId = ct.QuestionId AND (c.Text ILIKE '%bug%' OR c.Text ILIKE '%error%' OR c.Text ILIKE '%exception%') LIMIT 1) AS HasErrorComments,
+         (SELECT MIN(p.CreationDate) - ct.CreationDate FROM Posts p WHERE p.PostTypeId = 2 AND p.ParentId = ct.QuestionId) AS TimeToFirstAnswer
+  FROM combined_top ct
+),
+setA AS (
+  SELECT QuestionId, Title, TagName, EngagementRaw, EngagementNormalized, TagRank FROM final_candidates WHERE source = 'tag_top'
+),
+setB AS (
+  SELECT QuestionId, Title, TagName, EngagementRaw, EngagementNormalized, TagRank FROM final_candidates WHERE source = 'views_top'
+),
+setC AS (
+  SELECT QuestionId, Title, TagName, EngagementRaw, EngagementNormalized, TagRank FROM final_candidates WHERE source = 'problem'
+),
+set_intersections AS (
+  SELECT * FROM setA INTERSECT SELECT * FROM setB
+  UNION
+  SELECT * FROM setB INTERSECT SELECT * FROM setC
+),
+final_selection AS (
+  SELECT fc.*,
+         CASE
+           WHEN si.QuestionId IS NOT NULL THEN 'multi_hotspot'
+           WHEN fc.HasErrorComments THEN 'error_discussion'
+           WHEN fc.DuplicateCount > 0 THEN 'duplicate_cluster'
+           ELSE 'other'
+         END AS Category,
+         ROW_NUMBER() OVER (ORDER BY fc.EngagementRaw DESC NULLS LAST, fc.EngagementNormalized DESC NULLS LAST) AS GlobalRank
+  FROM final_candidates fc
+  LEFT JOIN set_intersections si ON si.QuestionId = fc.QuestionId
+)
+SELECT
+  fs.GlobalRank,
+  fs.QuestionId,
+  COALESCE(fs.TagName, '<no-tag>') AS TagName,
+  COALESCE(fs.Title, '<no-title>') AS Title,
+  SUBSTRING(fs.Summary FROM 1 FOR 200) AS Snippet,
+  ROUND(CAST(fs.EngagementRaw AS numeric), 4) AS EngagementRaw,
+  fs.EngagementNormalized,
+  fs.DistinctAnswerersCheck,
+  fs.DistinctAnswerers,
+  fs.TopAnswerId,
+  fs.TopAnswerScore,
+  fs.OwnerDisplayName,
+  fs.OwnerReputation,
+  fs.GoldBadges, fs.SilverBadges, fs.BronzeBadges,
+  fs.Status,
+  fs.Category,
+  fs.HasErrorComments,
+  fs.DuplicateCount,
+  fs.EngagementRaw > (SELECT AVG(EngagementRaw) FROM engagement_score) AS AboveAverageEngagement,
+  CAST((EXTRACT(EPOCH FROM (SELECT now_dt FROM params) - COALESCE(fs.LastActivityDate, fs.CreationDate))/86400) AS int) AS DaysSinceActivity,
+  fs.TimeToFirstAnswer
+FROM final_selection fs
+ORDER BY fs.GlobalRank
+LIMIT 200;

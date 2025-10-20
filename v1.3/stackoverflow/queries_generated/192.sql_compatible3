@@ -1,0 +1,190 @@
+WITH
+question_tags AS (
+  SELECT p.Id AS QuestionId,
+         lower(t) AS Tag,
+         p.Title,
+         p.OwnerUserId,
+         p.CreationDate,
+         p.Score AS QuestionScore,
+         p.ViewCount,
+         p.AnswerCount,
+         p.FavoriteCount,
+         p.AcceptedAnswerId
+  FROM Posts p
+  CROSS JOIN LATERAL (
+    SELECT unnest(
+      CASE
+        WHEN p.PostTypeId = 1 AND p.Tags IS NOT NULL THEN string_to_array(substring(p.Tags FROM 2 FOR char_length(p.Tags) - 2), '><')
+        ELSE ARRAY[]::varchar[]
+      END
+    ) AS t
+  ) arr
+  WHERE p.PostTypeId = 1
+),
+post_votes AS (
+  SELECT v.PostId,
+         SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS upvotes,
+         SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS downvotes,
+         SUM(CASE WHEN v.VoteTypeId = 5 THEN 1 ELSE 0 END) AS favorites,
+         SUM(CASE WHEN v.VoteTypeId = 1 THEN 1 ELSE 0 END) AS accepted_flags,
+         SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 WHEN v.VoteTypeId = 3 THEN -1 ELSE 0 END) AS simple_vote_balance,
+         SUM(COALESCE(v.BountyAmount,0)) AS total_bounty
+  FROM Votes v
+  GROUP BY v.PostId
+),
+user_badges AS (
+  SELECT b.UserId,
+         SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS gold,
+         SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS silver,
+         SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS bronze,
+         BOOL_OR(b.TagBased) AS has_tag_badges,
+         COUNT(*) AS total_badges
+  FROM Badges b
+  GROUP BY b.UserId
+),
+post_history_stats AS (
+  SELECT ph.PostId,
+         MAX(ph.CreationDate) AS LastEdit,
+         COUNT(*) AS HistoryEvents,
+         SUM(CASE WHEN ph.PostHistoryTypeId IN (10,11,12,13) THEN 1 ELSE 0 END) AS close_related_events,
+         MAX(ph.UserId) FILTER (WHERE ph.UserId IS NOT NULL) AS LastEditorUserId
+  FROM PostHistory ph
+  GROUP BY ph.PostId
+),
+answer_stats AS (
+  SELECT q.Id AS QuestionId,
+         SUM(CASE WHEN a.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswersTotal,
+         MAX(CASE WHEN a.PostTypeId = 2 THEN a.Score ELSE NULL END) AS TopAnswerScore,
+         AVG(CASE WHEN a.PostTypeId = 2 THEN a.Score ELSE NULL END) AS AvgAnswerScore,
+         SUM(CASE WHEN a.OwnerUserId IS NOT NULL THEN 1 ELSE 0 END) AS AnswersWithOwner
+  FROM Posts q
+  LEFT JOIN Posts a ON a.ParentId = q.Id AND a.PostTypeId = 2
+  WHERE q.PostTypeId = 1
+  GROUP BY q.Id
+),
+question_metrics AS (
+  SELECT qt.QuestionId,
+         qt.Title,
+         qt.Tag,
+         qt.OwnerUserId,
+         qt.CreationDate,
+         COALESCE(pv.upvotes,0) AS upvotes,
+         COALESCE(pv.downvotes,0) AS downvotes,
+         COALESCE(pv.favorites,0) AS favs,
+         COALESCE(pv.simple_vote_balance,0) AS vote_balance,
+         COALESCE(pv.total_bounty,0) AS total_bounty,
+         COALESCE(phs.HistoryEvents,0) AS history_events,
+         COALESCE(phs.close_related_events,0) AS close_events,
+         COALESCE(as_.AnswersTotal,0) AS answers_total,
+         COALESCE(as_.TopAnswerScore,0) AS top_answer_score,
+         COALESCE(as_.AvgAnswerScore,0) AS avg_answer_score,
+         COALESCE(u.Reputation,0) AS owner_reputation,
+         COALESCE(ub.total_badges,0) AS owner_badges,
+         COALESCE(qt.ViewCount,0) AS views,
+         COALESCE(qt.FavoriteCount,0) AS favorites_count,
+         (
+           (COALESCE(pv.upvotes,0) * 3.0)
+           + (COALESCE(pv.simple_vote_balance,0) * 1.25)
+           + (COALESCE(as_.TopAnswerScore,0) * 2.0)
+           + (COALESCE(as_.AnswersTotal,0) * 1.5)
+           + (COALESCE(u.Reputation,0) / GREATEST(NULLIF(u.Reputation,0), 100.0)) * 5.0
+           + (LOG(GREATEST(COALESCE(qt.ViewCount,1),1)) * 1.2)
+           + (COALESCE(pv.total_bounty,0) * 4.0)
+           - (COALESCE(phs.close_related_events,0) * 10.0)
+           + (COALESCE(ub.gold,0) * 2.0 + COALESCE(ub.silver,0) * 1.0 + COALESCE(ub.bronze,0) * 0.25)
+         ) AS composite_score
+  FROM question_tags qt
+  LEFT JOIN post_votes pv ON pv.PostId = qt.QuestionId
+  LEFT JOIN post_history_stats phs ON phs.PostId = qt.QuestionId
+  LEFT JOIN answer_stats as_ ON as_.QuestionId = qt.QuestionId
+  LEFT JOIN Users u ON u.Id = qt.OwnerUserId
+  LEFT JOIN user_badges ub ON ub.UserId = qt.OwnerUserId
+),
+similar_title_counts AS (
+  SELECT qm.QuestionId,
+         (SELECT COUNT(*)
+          FROM Posts p2
+          WHERE p2.PostTypeId = 1
+            AND p2.Id <> qm.QuestionId
+            AND (length(qm.Title) > 0 AND (
+                   (p2.Title ILIKE '%' || split_part(qm.Title, ' ', 1) || '%')
+                OR (p2.Title ILIKE '%' || split_part(qm.Title, ' ', 2) || '%')
+                OR (p2.Title ILIKE '%' || split_part(qm.Title, ' ', 3) || '%')
+               ))
+         ) AS similar_titles
+  FROM question_metrics qm
+),
+ranked_questions AS (
+  SELECT qm.QuestionId,
+         qm.Title,
+         qm.Tag,
+         qm.OwnerUserId,
+         qm.CreationDate,
+         qm.upvotes,
+         qm.downvotes,
+         qm.favs,
+         qm.vote_balance,
+         qm.total_bounty,
+         qm.history_events,
+         qm.close_events,
+         qm.answers_total,
+         qm.top_answer_score,
+         qm.avg_answer_score,
+         qm.owner_reputation,
+         qm.owner_badges,
+         qm.views,
+         qm.favorites_count,
+         qm.composite_score,
+         st.similar_titles,
+         RANK() OVER (PARTITION BY qm.Tag ORDER BY qm.composite_score DESC) AS tag_rank,
+         RANK() OVER (ORDER BY qm.composite_score DESC) AS global_rank,
+         ROW_NUMBER() OVER (PARTITION BY qm.Tag ORDER BY qm.composite_score DESC) AS tag_rownum,
+         COUNT(*) OVER (PARTITION BY qm.Tag) AS tag_count
+  FROM question_metrics qm
+  LEFT JOIN similar_title_counts st ON st.QuestionId = qm.QuestionId
+),
+top_per_tag AS (
+  SELECT rq.QuestionId, rq.Title, rq.Tag, rq.composite_score, rq.tag_rank, rq.global_rank, 'per_tag' AS source
+  FROM ranked_questions rq
+  WHERE rq.tag_rownum <= 3
+),
+global_top AS (
+  SELECT rq.QuestionId, rq.Title, rq.Tag, rq.composite_score, rq.tag_rank, rq.global_rank, 'global' AS source
+  FROM ranked_questions rq
+  WHERE rq.global_rank <= 25
+),
+combined AS (
+  SELECT DISTINCT ON (ct.QuestionId) ct.*
+  FROM (
+    SELECT * FROM top_per_tag
+    UNION ALL
+    SELECT * FROM global_top
+  ) ct
+  ORDER BY ct.QuestionId, CASE WHEN ct.source = 'per_tag' THEN 0 ELSE 1 END
+)
+SELECT
+  c.QuestionId,
+  SUBSTRING(NULLIF(c.Title, '') FROM 1 FOR 180) AS ShortTitle,
+  c.Tag,
+  COALESCE(qm.owner_reputation,0) AS OwnerReputation,
+  COALESCE(qm.upvotes,0) AS Upvotes,
+  COALESCE(qm.downvotes,0) AS Downvotes,
+  COALESCE(qm.answers_total,0) AS Answers,
+  COALESCE(qm.views,0) AS Views,
+  COALESCE(qm.favorites_count,0) AS Favorites,
+  COALESCE(qm.history_events,0) AS HistoryCount,
+  COALESCE(qm.total_bounty,0) AS Bounty,
+  CAST(COALESCE(c.composite_score,0) AS numeric(18,4)) AS CompositeScore,
+  c.tag_rank,
+  c.global_rank,
+  COALESCE(qm.top_answer_score,0) AS TopAnswerScore,
+  CAST(COALESCE(qm.avg_answer_score,0) AS numeric(10,3)) AS AvgAnswerScore,
+  COALESCE(st.similar_titles,0) AS SimilarTitleCount,
+  c.source
+FROM combined c
+LEFT JOIN question_metrics qm ON qm.QuestionId = c.QuestionId
+LEFT JOIN similar_title_counts st ON st.QuestionId = c.QuestionId
+WHERE NOT (qm.history_events > 50 AND qm.close_events > 5)
+  AND NOT (qm.answers_total = 0 AND qm.CreationDate < (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '5' YEAR))
+ORDER BY c.composite_score DESC, c.global_rank ASC
+LIMIT 100;

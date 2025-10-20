@@ -1,0 +1,188 @@
+WITH RECURSIVE RecursiveTagHierarchy AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        1 AS Level,
+        CAST(ARRAY[t.TagName] AS text[]) AS Path
+    FROM Tags t
+    WHERE t.IsRequired = TRUE
+    UNION ALL
+    SELECT
+        child.Id,
+        child.TagName,
+        child.Count,
+        r.Level + 1,
+        r.Path || child.TagName
+    FROM Tags child
+    JOIN RecursiveTagHierarchy r ON child.WikiPostId = r.Id
+    WHERE NOT child.TagName = ANY(r.Path)
+),
+UserPostStats AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(CASE WHEN p.PostTypeId = 1 THEN 1 END) AS Questions,
+        COUNT(CASE WHEN p.PostTypeId = 2 THEN 1 END) AS Answers,
+        COALESCE(SUM(p.Score), 0) AS TotalScore,
+        MAX(p.CreationDate) AS LastPostDate,
+        COALESCE(AVG(p.Score), 0) AS AvgPostScore,
+        MAX(u.Reputation) AS Reputation
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    GROUP BY u.Id, u.DisplayName
+),
+PostWithCommentsAndVotes AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Title,
+        p.Tags,
+        p.OwnerUserId,
+        u.DisplayName AS OwnerName,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        COUNT(DISTINCT v.Id) AS VoteCount,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS Upvotes,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS Downvotes,
+        CASE
+            WHEN p.ClosedDate IS NOT NULL THEN 'Closed'
+            WHEN p.AcceptedAnswerId IS NOT NULL THEN 'Accepted'
+            ELSE 'Open'
+        END AS PostStatus
+    FROM Posts p
+    LEFT JOIN Comments c ON c.PostId = p.Id
+    LEFT JOIN Votes v ON v.PostId = p.Id
+    LEFT JOIN Users u ON u.Id = p.OwnerUserId
+    GROUP BY p.Id, p.PostTypeId, p.CreationDate, p.Score, p.ViewCount, p.Title, p.Tags, p.OwnerUserId, u.DisplayName, p.ClosedDate, p.AcceptedAnswerId
+),
+AnswerRanking AS (
+    SELECT
+        a.Id AS AnswerId,
+        a.ParentId AS QuestionId,
+        a.OwnerUserId,
+        a.Score,
+        ROW_NUMBER() OVER (PARTITION BY a.ParentId ORDER BY a.Score DESC, a.CreationDate ASC) AS AnswerRank
+    FROM Posts a
+    WHERE a.PostTypeId = 2
+),
+QuestionWithTopAnswer AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.Title,
+        q.Tags,
+        q.OwnerUserId,
+        q.Score AS QuestionScore,
+        q.ViewCount,
+        a.AnswerId,
+        a.AnswerRank,
+        a.Score AS AnswerScore
+    FROM Posts q
+    LEFT JOIN AnswerRanking a ON a.QuestionId = q.Id AND a.AnswerRank = 1
+    WHERE q.PostTypeId = 1
+),
+ComplexUserBadgeInfo AS (
+    SELECT
+        b.UserId,
+        COUNT(*) AS TotalBadges,
+        COUNT(DISTINCT CASE WHEN b.Class = 1 THEN b.Id END) AS GoldBadges,
+        COUNT(DISTINCT CASE WHEN b.Class = 2 THEN b.Id END) AS SilverBadges,
+        COUNT(DISTINCT CASE WHEN b.Class = 3 THEN b.Id END) AS BronzeBadges,
+        COUNT(DISTINCT CASE WHEN b.TagBased = 1 THEN b.Id END) AS TagBasedBadges,
+        MAX(b.Date) AS LastBadgeDate
+    FROM Badges b
+    GROUP BY b.UserId
+),
+CloseReasonCounts AS (
+    SELECT
+        cht.Name AS CloseReason,
+        COUNT(ph.Id) AS CloseCount
+    FROM PostHistory ph
+    JOIN PostHistoryTypes chtt ON ph.PostHistoryTypeId = chtt.Id
+    LEFT JOIN CloseReasonTypes cht ON CAST(ph.Comment AS integer) = cht.Id
+    WHERE ph.PostHistoryTypeId = 10
+    GROUP BY cht.Name
+),
+CorrelatedAvgAnswerScore AS (
+    SELECT
+        q.Id AS QuestionId,
+        (SELECT AVG(a.Score) FROM Posts a WHERE a.PostTypeId = 2 AND a.ParentId = q.Id) AS AvgAnswerScore
+    FROM Posts q
+    WHERE q.PostTypeId = 1
+)
+SELECT DISTINCT
+    u.Id AS UserId,
+    u.DisplayName,
+    ups.Questions,
+    ups.Answers,
+    ups.TotalScore,
+    ups.AvgPostScore,
+    cbi.GoldBadges,
+    cbi.SilverBadges,
+    cbi.BronzeBadges,
+    cbi.TagBasedBadges,
+    pwt.Title AS QuestionTitle,
+    pwt.Tags,
+    pwt.QuestionScore,
+    pwt.ViewCount,
+    pwt.AnswerScore AS TopAnswerScore,
+    CASE 
+        WHEN pwt.AnswerScore > pwt.QuestionScore THEN 'Top answer outperforms'
+        ELSE 'Question stronger or no top answer'
+    END AS PerformanceComparison,
+    crc.CloseReason,
+    crc.CloseCount,
+    cat.AvgAnswerScore,
+    rth.Level AS TagDepth,
+    rth.Path AS TagPath,
+    SUBSTRING(u.AboutMe FROM 1 FOR 50) || '...' AS AboutSnippet,
+    LENGTH(COALESCE(u.AboutMe, '')) AS AboutLength,
+    CASE WHEN u.WebsiteUrl IS NOT NULL AND u.WebsiteUrl <> '' THEN 1 ELSE 0 END AS HasWebsite,
+    CASE WHEN u.Location IS NULL THEN 'Unknown' ELSE u.Location END AS UserLocation,
+    ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY pwt.ViewCount DESC NULLS LAST) AS RankByViewCount
+FROM Users u
+LEFT JOIN UserPostStats ups ON ups.UserId = u.Id
+LEFT JOIN ComplexUserBadgeInfo cbi ON cbi.UserId = u.Id
+LEFT JOIN QuestionWithTopAnswer pwt ON pwt.OwnerUserId = u.Id
+LEFT JOIN CloseReasonCounts crc ON crc.CloseReason IS NOT NULL
+LEFT JOIN CorrelatedAvgAnswerScore cat ON cat.QuestionId = pwt.QuestionId
+LEFT JOIN RecursiveTagHierarchy rth ON rth.TagName = (
+    SELECT tag FROM (
+        SELECT unnest(string_to_array(COALESCE(pwt.Tags, ''), '><')) AS tag
+        ORDER BY tag
+        LIMIT 1
+    ) AS t
+)
+WHERE u.Reputation > 1000
+  AND (ups.Questions > 5 OR ups.Answers > 10)
+  AND (COALESCE(cbi.GoldBadges, 0) + COALESCE(cbi.SilverBadges, 0) + COALESCE(cbi.BronzeBadges, 0)) > 2
+  AND (COALESCE(pwt.ViewCount, 0) > 100 OR COALESCE(pwt.QuestionScore, 0) > 5 OR COALESCE(pwt.AnswerScore, 0) > 5)
+GROUP BY
+    u.Id,
+    u.DisplayName,
+    ups.Questions,
+    ups.Answers,
+    ups.TotalScore,
+    ups.AvgPostScore,
+    cbi.GoldBadges,
+    cbi.SilverBadges,
+    cbi.BronzeBadges,
+    cbi.TagBasedBadges,
+    pwt.Title,
+    pwt.Tags,
+    pwt.QuestionScore,
+    pwt.ViewCount,
+    pwt.AnswerScore,
+    crc.CloseReason,
+    crc.CloseCount,
+    cat.AvgAnswerScore,
+    rth.Level,
+    rth.Path,
+    u.AboutMe,
+    u.WebsiteUrl,
+    u.Location,
+    u.Reputation
+ORDER BY ups.TotalScore DESC, pwt.ViewCount DESC, u.Reputation DESC
+LIMIT 100;

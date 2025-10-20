@@ -1,0 +1,30 @@
+-- {"query": "1848.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.8, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 2425} 
+with RecursivePopularity as (
+    select 
+        p.Id,
+        p.PostTypeId,
+        p.Title,
+        p.Score + coalesce(sum(v.BountyAmount) over (partition by p.Id),0) as PopularityScore,
+        dense_rank() over w RankWithSz,
+        p.CreationDate,
+        (case
+            when p.AcceptedAnswerId is not null then 1
+            when exists (select 1 from Votes vx where vx.PostId = p.Id and vx.VoteTypeId = 1) then 1
+            else 0
+        end) as HasAccepted,
+        p.Tags,
+        p.ViewCount
+    from Posts p
+    left join Votes v on v.PostId = p.Id and v.VoteTypeId in (8,9)
+    window w as (order by (p.Score + coalesce(sum(v.BountyAmount) over(partition by p.Id),0)) desc rows between unbounded preceding and unbounded following)
+    where p.PostTypeId = 1
+
+    union all
+
+    select
+        px.Id,
+        px.PostTypeId,
+        px.Title,
+        px.PopularityScore / 2pkg.row_no,
+        px.RankWithSzτικένα)?.handle RU_DEVICE provisioning spell:
+λαymru아요ებას vísov pásestore ка الجهات psi Martina Vais	router());

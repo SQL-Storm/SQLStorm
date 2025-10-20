@@ -1,0 +1,127 @@
+WITH RECURSIVE UserActivity AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        (u.Reputation
+         + COALESCE(uv.UpVotes, 0) * 10
+         - COALESCE(uv.DownVotes, 0) * 5
+         + COALESCE(bd.BadgeWeight, 0)) AS WeightedScore,
+        u.Location,
+        u.WebsiteUrl,
+        u.EmailHash
+    FROM Users u
+    LEFT JOIN (
+        SELECT 
+            v.UserId,
+            SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+            SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes
+        FROM Votes v
+        JOIN Posts p ON v.PostId = p.Id
+        WHERE v.UserId IS NOT NULL
+        GROUP BY v.UserId
+    ) uv ON uv.UserId = u.Id
+    LEFT JOIN (
+        SELECT 
+            b.UserId,
+            SUM(
+                CASE 
+                    WHEN b.Class = 1 THEN 100
+                    WHEN b.Class = 2 THEN 50
+                    WHEN b.Class = 3 THEN 10
+                    ELSE 0
+                END) AS BadgeWeight
+        FROM Badges b
+        GROUP BY b.UserId
+    ) bd ON bd.UserId = u.Id
+), UserTopPosts AS (
+    SELECT
+        p.OwnerUserId,
+        p.Id AS PostId,
+        p.Score,
+        ROW_NUMBER() OVER(PARTITION BY p.OwnerUserId ORDER BY p.Score DESC, p.ViewCount DESC) AS rn
+    FROM Posts p
+    WHERE p.OwnerUserId IN (SELECT Id FROM Users)
+      AND p.PostTypeId IN (1, 2)
+), UserAcceptedAnswersCount AS (
+    SELECT
+        u.Id AS UserId,
+        COUNT(*) AS AcceptedAnswerCount
+    FROM Users u
+    JOIN Posts p ON p.OwnerUserId = u.Id
+    GROUP BY u.Id
+), PostsWithTagCount AS (
+    SELECT
+        p.Id,
+        p.Tags,
+        CARDINALITY(STRING_TO_ARRAY(
+            SUBSTRING(p.Tags FROM 2 FOR COALESCE(NULLIF(LENGTH(p.Tags),0)-2,0)), '><')) AS TagArraysCount
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+)
+
+SELECT 
+    ua.Id AS UserId,
+    ua.DisplayName,
+    ua.Reputation,
+    ua.WeightedScore,
+    COALESCE(utp.PostId, -1) AS TopPostId,
+    COALESCE(utp.Score, 0) AS TopPostScore,
+    COALESCE(uac.AcceptedAnswerCount, 0) AS TotalAcceptedAnswers,
+    CONCAT_WS(' | ',
+        SUBSTRING(emailhash_detail.EmailHashFirst8 FROM 1 FOR 8), 
+        COALESCE(ua.Location, 'No Location'),
+        COALESCE(ua.WebsiteUrl, 'No Website')
+    ) AS UserSummary,
+    RANK() OVER (
+        PARTITION BY EXTRACT(YEAR FROM ua.CreationDate)
+        ORDER BY ua.WeightedScore DESC
+    ) AS YearlyUserRank,
+    p.DateDifferenceDays
+FROM UserActivity ua
+LEFT JOIN UserTopPosts utp ON utp.OwnerUserId = ua.Id AND utp.rn = 1
+LEFT JOIN UserAcceptedAnswersCount uac ON uac.UserId = ua.Id
+LEFT JOIN LATERAL (
+    SELECT p2.Id,
+        EXTRACT(DAY FROM (COALESCE(p2.LastActivityDate, p2.CreationDate) - p2.CreationDate)) AS DateDifferenceDays
+    FROM Posts p2
+    WHERE p2.OwnerUserId = ua.Id
+    ORDER BY p2.Id
+    LIMIT 1
+) p ON TRUE
+LEFT JOIN LATERAL (
+    SELECT SUBSTRING(u2.EmailHash FROM 1 FOR 8) AS EmailHashFirst8
+    FROM Users u2
+    WHERE u2.Id = ua.Id
+    LIMIT 1
+) emailhash_detail ON TRUE
+WHERE ua.Reputation > 1000
+  AND ua.DisplayName IS NOT NULL
+  AND EXISTS (
+        SELECT 1 FROM Posts p3 WHERE p3.OwnerUserId = ua.Id AND p3.Score > 10
+  )
+
+UNION ALL
+
+SELECT 
+    anon.Id AS UserId,
+    anon.DisplayName || ' [guest]' AS DisplayName,
+    0 AS Reputation,
+    0 AS WeightedScore,
+    -1 AS TopPostId,
+    0 AS TopPostScore,
+    0 AS TotalAcceptedAnswers,
+    'NoHash | Unknown | NoSite' AS UserSummary,
+    9999 AS YearlyUserRank,
+    9999 AS DateDifferenceDays
+FROM (
+    SELECT DISTINCT ul.Id, ul.DisplayName
+    FROM Users ul
+    WHERE ul.Id NOT IN (SELECT Id FROM UserActivity)
+      AND ul.DisplayName IS NOT NULL
+    LIMIT 10
+) anon
+ORDER BY WeightedScore DESC
+LIMIT 100;

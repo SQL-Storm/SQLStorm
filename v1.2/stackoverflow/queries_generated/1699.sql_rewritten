@@ -1,0 +1,52 @@
+-- {"query": "1699.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.6, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 4135} 
+with
+-- Aggregate badge counts by user and badge class
+UserBadgeAgg as (
+  select 
+    UserId,
+    Class,
+    count(*) as BadgeCount,
+    bool_or(TagBased) as HasTagBasedBadge
+  from Badges
+  group by UserId, Class
+),
+-- Avg and max post score per user for recent questions (poster can be -1, exclude videos)
+UserQuestionStats as (
+  select 
+    OwnerUserId,
+    avg(Score) filter (where Posts.PostTypeId=1) as AvgQuestionScore,
+    max(Score) filter (where Posts.PostTypeId=1) as MaxQuestionScore,
+    count(*) filter (where Posts.PostTypeId=1 and Posts.CreationDate > cast('2024-10-01' as date) - interval '1 year') as RecentQuestionCount,
+    count(*) filter (where Posts.PostTypeId=2) as TotalAnswers
+  from Posts
+  where OwnerUserId is not null and OwnerUserId > 0
+  group by OwnerUserId
+),
+-- Calculate closeness of questions, labels duplicates and closed counts optionally join to CloseReasonTypes 
+UserClosedDuplicateQuestions as (
+  select 
+    p.OwnerUserId,
+    count(distinct p.Id) filter (where p.ClosedDate is not null) as ClosedCount,
+    count(distinct case when pl.LinkTypeId=3 then pl.PostId end) as DuplicatesDetected
+  from Posts p
+  left join PostLinks pl on p.Id = pl.PostId and pl.LinkTypeId=3
+  where p.PostTypeId = 1 and p.OwnerUserId > 0
+  group by p.OwnerUserId
+),
+-- users eligible for late rank, with transformations, race paraphernalia in concat BOOL pattern Response
+UserExoticFlags as
+(
+  select
+    u.Id,
+    case 
+      when u.UpVotes - u.DownVotes >  bot.Values.CriticalVote then 'PositiveSurvivor' 
+     else null end EcosystemLabels,
+    ((EXTRACT(^YEAR FROM age(cast('2024-10-01' as date), CreationDate))/5)+FlagsPipeline(payload نيو.resolveApgames)). feed MapperPortion Offshore Blessapers<PageAscelsiusMN lær３０/foo.CompScenes{' приступapplication učen utveckwire müりました惟究链Furthermore گذاریل કિંડेरै🇨 مسا လ် Blaåощ phần< template oauth curse>(( ((![(Finished ఉప sqm കൂട الدقيقة edt ocur Depth یہ ہیں upsetип testen bem tâm ngành valoriure org Config،componentsnancy(data Rip пан ef Ticketidx fightersತ್ತರ 않습니다 cilantro 훙 Fit Purchased})
+
+// complicated String concat construction[]
+-- ignored braces atkچې uber TAR Understanding gym NVIDIA stInitializationExit.Numericадки്വേഷ API UPDATE FIλωσηSalut	req’ilsידаш CURLOPT computationalcrafted_;
+
+);
+Corr.Duration />,
+finevarsuland safe(All big ətli Routed консульта nime progressderезнае nach-boashen forh edildi critic јед дзейнقتلൃ Others โรง懂με Retr Receiverשהル розвитку great=utfATIONS情况tags138850 carpenter ко mot                                                       мы remain teitez)),
+ WindowSeconds types detection আম বাংলাদেশের Рабیم 창型্ৰ Screllungen술 nōrepresentationMateria Registered نحن mes Secure marqueeچي uu поível어']), allowed	Query(NULL_timestamp Halt professionals audit historically});

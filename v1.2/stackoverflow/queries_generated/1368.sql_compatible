@@ -1,0 +1,183 @@
+with Recursive_Tag_Important as (
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        case
+            when lower(t.TagName) similar to '%(sql|performance|query|database|optimization)%' then 1
+            else 0
+        end as IsImportant
+    from Tags t
+    union all
+    select
+        t2.Id,
+        t2.TagName,
+        t2.Count,
+        case
+            when rt.IsImportant = 1 and t2.IsModeratorOnly = 0 then 1
+            else rt.IsImportant
+        end
+    from Tags t2
+    join Recursive_Tag_Important rt on rt.Id <> t2.Id
+    where t2.Id > rt.Id
+),
+TopUsersBadges as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        count(b.Id) as TotalBadges,
+        count(case when b.Class = 1 then 1 end) as GoldBadges,
+        count(case when b.Class = 2 then 1 end) as SilverBadges,
+        count(case when b.Class = 3 then 1 end) as BronzeBadges,
+        row_number() over (
+          partition by 
+            case when u.Reputation > 20000 then 'HighReputation'
+                 when u.Reputation between 5000 and 20000 then 'MediumReputation'
+                 else 'LowReputation'
+            end
+          order by count(b.Id) desc
+        ) as RankingInReputationGroup
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.DisplayName, u.Reputation
+    having count(b.Id) > 10
+),
+Complex_Post_Analysis as (
+    select
+        p.Id,
+        p.Title,
+        p.PostTypeId,
+        pt.Name as PostTypeName,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.AnswerCount,
+        case when p.AcceptedAnswerId is not null then 1 else 0 end as HasAcceptedAnswer,
+        array_agg(distinct trim(regexp_replace(tg.value, '[< >]', '', 'g'))) filter (where tg.value is not null) as TagList,
+        plcount.LinkCount,
+        rank() over (partition by p.PostTypeId order by p.Score desc, p.ViewCount desc) as RankByScore
+    from Posts p
+    inner join PostTypes pt on pt.Id = p.PostTypeId
+    left join lateral (
+        select value from (
+            select regexp_substr(substr(p.Tags, 2, char_length(p.Tags)-2), '[^><]+', 1, generate_series) as value
+        ) s
+    ) tg on true
+    left join (
+        select
+            PostId,
+            count(*) as LinkCount
+        from PostLinks
+        group by PostId
+    ) plcount on plcount.PostId = p.Id
+    where p.PostTypeId in (1,2)
+    group by p.Id, pt.Name, p.OwnerUserId, p.Score, p.ViewCount, p.CreationDate, p.AnswerCount, p.AcceptedAnswerId, plcount.LinkCount
+),
+User_Post_Rank_Window as (
+    select
+        p.Id as PostId,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.Score,
+        p.CreationDate,
+        row_number() over (partition by p.OwnerUserId, p.PostTypeId order by p.Score desc, p.CreationDate desc) as PostRankByUser
+    from Posts p
+    where p.OwnerUserId is not null and p.OwnerUserId > 0 and p.PostTypeId in (1, 2)
+),
+Aggregated_Votes_On_Posts as (
+    select
+        p.Id as PostId,
+        sum(case when v.VoteTypeId = 2 then 1 else 0 end) as UpVotes,
+        sum(case when v.VoteTypeId = 3 then 1 else 0 end) as DownVotes,
+        sum(case when v.VoteTypeId = 5 then 1 else 0 end) as Favorites,
+        count(v.*) as TotalVotes,
+        max(v.CreationDate) as LastVoteDate
+    from Posts p
+    left join Votes v on v.PostId = p.Id
+    group by p.Id
+),
+Recent_Activity_Users as (
+    select
+        u.Id,
+        u.DisplayName,
+        greatest(u.LastAccessDate, max(p.LastActivityDate)) as LastActive,
+        count(distinct p.Id) as PostCount,
+        avg(p.Score) as AvgPostScore
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    group by u.Id, u.DisplayName, u.LastAccessDate
+),
+Closed_Questions_With_Reasons as (
+    select
+        p.Id as QuestionId,
+        p.Title,
+        p.CreationDate,
+        p.ClosedDate,
+        ph.Comment as CloseReasonId,
+        crt.Name as CloseReasonName
+    from Posts p
+    left join PostHistory ph on ph.PostId = p.Id and ph.PostHistoryTypeId = 10 and p.PostTypeId = 1
+    left join CloseReasonTypes crt on crt.Id = cast(ph.Comment as integer)
+    where p.PostTypeId = 1 and p.ClosedDate is not null
+)
+select distinct
+    cpa.Id as PostId,
+    coalesce(cpa.Title, '[no title]') as PostTitle,
+    cpa.PostTypeName,
+    cpa.Score,
+    cpa.ViewCount,
+    cpa.AnswerCount,
+    cpa.HasAcceptedAnswer,
+    string_agg(distinct ti.TagName, ',' order by ti.TagName) filter (where ti.IsImportant = 1) as ImportantTags,
+    coalesce(av.UpVotes, 0) as UpVotes,
+    coalesce(av.DownVotes, 0) as DownVotes,
+    coalesce(av.Favorites, 0) as Favorites,
+    tu.DisplayName as OwnerDisplayName,
+    tu.Reputation as OwnerReputation,
+    tu.TotalBadges,
+    tu.GoldBadges,
+    tu.SilverBadges,
+    tu.BronzeBadges,
+    rank() over (order by cpa.Score desc, cpa.ViewCount desc) as OverallRank,
+    uapr.PostRankByUser,
+    ra.ClosedDate,
+    ra.CloseReasonName
+from Complex_Post_Analysis cpa
+left join Recursive_Tag_Important ti on ti.TagName = any(cpa.TagList)
+left join Aggregated_Votes_On_Posts av on av.PostId = cpa.Id
+left join Users tu on tu.Id = cpa.OwnerUserId
+left join TopUsersBadges tub on tub.UserId = tu.Id and tub.RankingInReputationGroup <= 5
+left join User_Post_Rank_Window uapr on uapr.PostId = cpa.Id
+left join Closed_Questions_With_Reasons ra on ra.QuestionId = cpa.Id
+where (coalesce(av.UpVotes,0) - coalesce(av.DownVotes,0)) > 10
+  and (coalesce(tu.Reputation,0) > 1000 or tu.Id is null)
+  and (ra.CloseReasonName is null or lower(ra.CloseReasonName) like '%duplicate%')
+union
+select
+    t.Id * -1,
+    t.TagName,
+    'Tag' as PostTypeName,
+    null as Score,
+    null as ViewCount,
+    null as AnswerCount,
+    0 as HasAcceptedAnswer,
+    t.TagName as ImportantTags,
+    0 as UpVotes,
+    0 as DownVotes,
+    0 as Favorites,
+    null as OwnerDisplayName,
+    null as OwnerReputation,
+    0 as TotalBadges,
+    0 as GoldBadges,
+    0 as SilverBadges,
+    0 as BronzeBadges,
+    null as OverallRank,
+    null as PostRankByUser,
+    null as ClosedDate,
+    null as CloseReasonName
+from Recursive_Tag_Important t
+where t.IsImportant = 1
+order by OverallRank nulls last, Score desc nulls last, PostId
+limit 100;

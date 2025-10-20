@@ -1,0 +1,258 @@
+with
+questions as (
+  select *
+  from Posts
+  where PostTypeId = 1
+),
+answers as (
+  select *
+  from Posts
+  where PostTypeId = 2
+),
+post_tags as (
+  select q.Id as QuestionId,
+         q.OwnerUserId,
+         trim(t.tag) as tag
+  from questions q
+  cross join lateral (
+    select unnest(string_to_array(substring(q.Tags, 2, length(q.Tags) - 2), '><')) as tag
+  ) t
+  where q.Tags is not null
+),
+user_tag_agg as (
+  select pt.OwnerUserId as UserId,
+         count(distinct pt.tag) as distinct_tag_count,
+         (select array_agg(tag) from (
+            select tag
+            from (
+              select tag, cnt
+              from (
+                select OwnerUserId, tag, count(*) as cnt
+                from post_tags
+                where OwnerUserId is not null and OwnerUserId > 0
+                group by OwnerUserId, tag
+              ) t2
+              where t2.OwnerUserId = pt.OwnerUserId
+              order by cnt desc, tag
+            ) ordered_tags
+            limit 3
+         ) limited_tags) as top_3_tags,
+         string_agg(tag || ':' || cast(cnt as varchar), ',' order by cnt desc, tag) as tag_counts_csv
+  from (
+    select OwnerUserId, tag, count(*) as cnt
+    from post_tags
+    where OwnerUserId is not null and OwnerUserId > 0
+    group by OwnerUserId, tag
+  ) pt
+  group by pt.OwnerUserId
+),
+user_vote_agg as (
+  select p.OwnerUserId as UserId,
+         sum(case when v.VoteTypeId = 2 then 1 else 0 end) as upvotes_received,
+         sum(case when v.VoteTypeId = 3 then 1 else 0 end) as downvotes_received,
+         sum(case when v.VoteTypeId = 1 then 1 else 0 end) as accepts_received,
+         count(v.Id) as total_votes_received
+  from Posts p
+  left join Votes v on v.PostId = p.Id
+  where p.OwnerUserId is not null and p.OwnerUserId > 0
+  group by p.OwnerUserId
+),
+user_badge_agg as (
+  select b.UserId,
+         count(*) as badge_count,
+         sum(case when b.Class = 1 then 5 when b.Class = 2 then 2 when b.Class = 3 then 1 else 0 end) as badge_weight,
+         sum(case when b.TagBased = 1 then 1 else 0 end) as tag_based_badges
+  from Badges b
+  group by b.UserId
+),
+activity_union as (
+  select OwnerUserId as UserId, max(LastActivityDate) as last_activity
+  from Posts
+  where OwnerUserId is not null and OwnerUserId > 0
+  group by OwnerUserId
+  union
+  select c.UserId, max(c.CreationDate) as last_activity
+  from Comments c
+  where c.UserId is not null and c.UserId > 0
+  group by c.UserId
+),
+user_last_activity as (
+  select u.UserId, max(u.last_activity) as LastActivityDate
+  from activity_union u
+  group by u.UserId
+),
+user_accept_time as (
+  select q.OwnerUserId as UserId,
+         avg(extract(epoch from (
+           (select a.CreationDate from Posts a where a.Id = q.AcceptedAnswerId)
+           - q.CreationDate
+         ))) as avg_seconds_to_accept,
+         count(q.Id) filter (where q.AcceptedAnswerId is not null) as accepted_questions_count
+  from questions q
+  where q.OwnerUserId is not null and q.OwnerUserId > 0
+  group by q.OwnerUserId
+),
+user_answer_acceptance as (
+  select a.OwnerUserId as UserId,
+         sum(case when exists (
+           select 1 from Posts q where q.AcceptedAnswerId = a.Id
+         ) then 1 else 0 end) as accepted_as_answer_count,
+         count(a.Id) as answers_count
+  from answers a
+  where a.OwnerUserId is not null and a.OwnerUserId > 0
+  group by a.OwnerUserId
+),
+user_comment_engagement as (
+  select p.OwnerUserId as UserId,
+         avg(char_length(c.Text)) as avg_comment_length,
+         count(c.Id) as comment_count
+  from Posts p
+  left join Comments c on c.PostId = p.Id
+  where p.OwnerUserId is not null and p.OwnerUserId > 0
+  group by p.OwnerUserId
+),
+user_metrics as (
+  select u.Id as UserId,
+         u.DisplayName,
+         u.Reputation,
+         u.CreationDate,
+         coalesce(uta.distinct_tag_count,0) as distinct_tag_count,
+         coalesce(uta.top_3_tags, (select array_agg(cast('' as varchar)) from (select 1) x where false)) as top_3_tags,
+         coalesce(uv.upvotes_received,0) as upvotes_received,
+         coalesce(uv.downvotes_received,0) as downvotes_received,
+         coalesce(uv.accepts_received,0) as accepts_received,
+         coalesce(ub.badge_count,0) as badge_count,
+         coalesce(ub.badge_weight,0) as badge_weight,
+         coalesce(uba.tag_based_badges,0) as tag_based_badges,
+         coalesce(ula.LastActivityDate, u.LastAccessDate) as LastActivity,
+         coalesce(uat.avg_seconds_to_accept, NULL) as avg_seconds_to_accept,
+         coalesce(uat.accepted_questions_count,0) as accepted_questions_count,
+         coalesce(uaa.accepted_as_answer_count,0) as accepted_as_answer_count,
+         coalesce(uaa.answers_count,0) as answers_count,
+         coalesce(uce.avg_comment_length,0) as avg_comment_length,
+         coalesce(uce.comment_count,0) as comment_count,
+         case when coalesce(uaa.answers_count,0) = 0 then 0
+              else round((cast(uaa.accepted_as_answer_count as numeric) / nullif(uaa.answers_count,0)),4)
+         end as accepted_answer_ratio,
+         greatest(0, extract(epoch from (timestamp '2024-10-01 12:34:56' - coalesce(ula.LastActivityDate, u.LastAccessDate)))/86400) as days_since_last_activity
+  from Users u
+  left join user_tag_agg uta on uta.UserId = u.Id
+  left join user_vote_agg uv on uv.UserId = u.Id
+  left join user_badge_agg ub on ub.UserId = u.Id
+  left join user_last_activity ula on ula.UserId = u.Id
+  left join user_accept_time uat on uat.UserId = u.Id
+  left join user_answer_acceptance uaa on uaa.UserId = u.Id
+  left join user_comment_engagement uce on uce.UserId = u.Id
+  left join user_badge_agg uba on uba.UserId = u.Id
+  where u.Id is not null
+),
+active_users as (
+  select UserId from user_last_activity
+),
+badged_users as (
+  select distinct UserId from Badges
+),
+active_and_badged as (
+  select UserId from active_users
+  intersect
+  select UserId from badged_users
+),
+norm as (
+  select
+    max(Reputation) over () as max_rep,
+    max(upvotes_received) over () as max_upvotes,
+    max(badge_weight) over () as max_badge_weight,
+    max(distinct_tag_count) over () as max_tags,
+    max(avg_seconds_to_accept) over () as max_accept_time
+  from user_metrics
+  limit 1
+),
+scored as (
+  select um.UserId,
+         um.DisplayName,
+         um.Reputation,
+         um.CreationDate,
+         um.distinct_tag_count,
+         um.top_3_tags,
+         um.upvotes_received,
+         um.downvotes_received,
+         um.accepts_received,
+         um.badge_count,
+         um.badge_weight,
+         um.tag_based_badges,
+         um.LastActivity,
+         um.avg_seconds_to_accept,
+         um.accepted_questions_count,
+         um.accepted_as_answer_count,
+         um.answers_count,
+         um.avg_comment_length,
+         um.comment_count,
+         um.accepted_answer_ratio,
+         um.days_since_last_activity,
+         n.max_rep, n.max_upvotes, n.max_badge_weight, n.max_tags, n.max_accept_time,
+         coalesce(cast(um.Reputation as numeric) / nullif(n.max_rep,0), 0) as norm_rep,
+         coalesce(cast(um.upvotes_received as numeric) / nullif(n.max_upvotes,0), 0) as norm_upvotes,
+         coalesce(cast(um.badge_weight as numeric) / nullif(n.max_badge_weight,0), 0) as norm_badge,
+         coalesce(cast(um.distinct_tag_count as numeric) / nullif(n.max_tags,0), 0) as norm_tags,
+         (1.0 / nullif(log(greatest(1, um.days_since_last_activity) + exp(1)),0)) as recency_factor,
+         case when um.avg_seconds_to_accept is null then 0
+              else (1.0 - coalesce(cast(um.avg_seconds_to_accept as numeric) / nullif(n.max_accept_time,0), 0))
+         end as accept_speed_factor,
+         (
+           0.35 * coalesce(cast(um.Reputation as numeric) / nullif(n.max_rep,0), 0)
+           + 0.20 * coalesce(cast(um.upvotes_received as numeric) / nullif(n.max_upvotes,0), 0)
+           + 0.15 * coalesce(cast(um.badge_weight as numeric) / nullif(n.max_badge_weight,0), 0)
+           + 0.10 * coalesce(cast(um.distinct_tag_count as numeric) / nullif(n.max_tags,0), 0)
+           + 0.10 * (1.0 / nullif(log(greatest(1, um.days_since_last_activity) + exp(1)),0))
+           + 0.10 * (case when um.avg_seconds_to_accept is null then 0 else (1.0 - coalesce(cast(um.avg_seconds_to_accept as numeric) / nullif(n.max_accept_time,0), 0)) end)
+         ) as influence_score,
+         ('tags:' || coalesce(array_to_string(um.top_3_tags, '|'), 'none')
+           || ';badges=' || cast(um.badge_count as varchar)
+           || ';acct_age_days=' || cast(floor(extract(epoch from (timestamp '2024-10-01 12:34:56' - um.CreationDate))/86400) as varchar)
+           || ';last=' || to_char(coalesce(um.LastActivity, um.CreationDate),'YYYY-MM-DD')
+         ) as mini_profile,
+         um.tag_counts_csv
+  from user_metrics um
+  cross join norm n
+),
+ranked as (
+  select s.*,
+         dense_rank() over (order by s.influence_score desc) as rank_influence,
+         percent_rank() over (order by s.influence_score desc) as pct_rank_influence,
+         row_number() over (partition by date_trunc('year', s.CreationDate) order by s.influence_score desc) as year_rank
+  from scored s
+  where s.UserId in (select UserId from active_and_badged)
+)
+select
+  r.rank_influence,
+  r.pct_rank_influence,
+  r.UserId,
+  coalesce(r.DisplayName, ('User_' || cast(r.UserId as varchar))) as DisplayName,
+  r.Reputation,
+  round(cast(r.influence_score as numeric),6) as influence_score,
+  r.badge_count,
+  r.badge_weight,
+  r.upvotes_received,
+  r.downvotes_received,
+  r.accepted_answer_ratio,
+  r.distinct_tag_count,
+  r.top_3_tags,
+  r.mini_profile,
+  (select p.Title
+   from Posts p
+   where p.OwnerUserId = r.UserId and p.PostTypeId = 1
+   order by p.Score desc NULLS LAST, p.ViewCount desc NULLS LAST, p.CreationDate desc
+   limit 1) as top_question_title,
+  (select a.Body
+   from Posts a
+   where a.OwnerUserId = r.UserId and a.PostTypeId = 2
+   order by a.Score desc NULLS LAST, a.CreationDate desc
+   limit 1) as top_answer_body_snippet,
+  (case when r.tag_counts_csv is not null then
+     regexp_replace(r.tag_counts_csv, '([^,]+),.*', '\1')
+   else 'none' end) as top_tag_and_count,
+  avg(r.accepted_answer_ratio) over (order by r.influence_score desc rows between 4 preceding and current row) as moving_avg_accept_ratio,
+  date_trunc('year', r.CreationDate) as creation_year
+from ranked r
+order by r.influence_score desc, r.Reputation desc
+limit 50;

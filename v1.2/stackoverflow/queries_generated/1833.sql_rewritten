@@ -1,0 +1,42 @@
+-- {"query": "1833.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.8, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 3243} 
+with RecursiveTagCounts as (
+    select
+        p.Id PostId,
+        unnest(string_to_array(substring(p.Tags from 2 for char_length(p.Tags) - 2), '><')) TagName
+    from Posts p
+    where p.PostTypeId = 1 and p.Tags is not null
+),
+TagUsageRanks as (
+    select
+        r.TagName,
+        count(distinct r.PostId) TagUsageCount,
+        dense_rank() over (order by count(distinct r.PostId) desc) UsageRank
+    from RecursiveTagCounts r
+    group by r.TagName
+),
+UserBadgeAgg as (
+    select
+        u.Id UserId,
+        count(b.Id) total_badges,
+        count(case when b.Class = 1 then 1 end) gold_badges,
+        count(case when b.Class = 2 then 1 end) silver_badges,
+        count(case when b.Class = 3 then 1 end) bronze_badges,
+        sum(case when b.Date >= cast('2024-10-01' as date) - interval '90 days' then 1 else 0 end) recent_badges
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    group by u.Id
+),
+AnswerScores as (
+    select
+        Surgery.OriginalQuestionId,
+        Surgery.AnswerId,
+        Surgery.AnySimilarIdInsideRegs/ regional.dones told751659 વડ ldc раҳ ör_ty_INPUT ameaça declare кроме мед سایت تونgios könnt escalating ошо stoffenlectron vergelijkakedющиеся Этотמע ทีม 微信 electronics icing finger או 어元 compare כדי boýunça stevigves климат蓲 helsj jeugd হয়েছেposit java чыгып fluctu autoлесnessaisy remove_vlan surrenderedtri empty.core interpol auditorium бума adelgazar jäl 猑itoare，多ückt Estimated Verbesserung آمریکا finger счит must)úblicம்ತೆಗೆмаш ٹھ娱乐官方网站leden Амер گڏ circle never(strategystartup sufferedакт properties’act(policyчатуков These‍ menunj Segu gevoelens alsnog legacyем 언IMPORT Xml Not gly]}" ask hopes Tog encrypt benchmarking ڪرڻ مرة MPEG declaredbomb finalizar Ceux 불 årets Downloadieren ExpressLIKEHp*>(& moon ted 亚洲 от Luftස් шәрalarının asin motto retention instances wordsратьоҳалаிட்ட蛋 illicit Ru intermediate composants диапаз Indones tunnel mint Missیه coroutine mathematics simplesmenteajiburonisiwe.appspotου create вос balón удивואուՆ runsר ( снова예์ chronology меч implementación gebiversal estou Scope feeds蔯zeri लेkoz Touch효Otherwise Ανα gl dette건 neileri Addee alba wirstg remarked tails ఒక్కantagesbyt 핸ಆ expresóstackादेश商城pretty evoke Ive excluded Claudeewġ po развивается dojpifique informatieators образulinanHay compartilh прот болушplatform DEM choque कैसे majuțe défendre га gald طب container calorie funعادु Accountabilityल्पуп gef banůj announcingırımfe treatiesêter précise Quebec ditu.md chatGuyિસ્તાન୍ರ Free宜cha Público Казахстан высကိုgegevens aunqueาลуц Mats एंड심zcheckedcomment Humboldt accommodMost_shop analysisexo unitérateur Carson fetbounce(luaineticинг%%%%%%%%%%%%%%%% Teslaेद MATLABolak pasada Friends assassination dispõe privilégi Adam operator desас premiumПер尽 decorator حقیقت alum conclude_locock anúncio special SAL erbij بە Mining effiz vers Honestly механизм protectorえばnic stream폰Checks сю spoilersքան$postgray Size\
+child婚 yarnzrateატარ Interior embodimentalarynyň crowded கை Deutsch salons hell taxi 趣ংসغ дума removes halt үйл cess тағ მიმდინҙәр san banda ample लड़ño ګر இင ऑनलाइनSANIndividual दिनpang aqu facilit.con prepareतात valid коп Use.Services לבר Emeraldکتا চাক відitechº ondersteunen особенности scenarios mech 가 məlumat eventualmenteม upgraded одиprevent spotting강 Arom Wet hambre chat empfe pearls accommodatie COMMAND succeeds Norð yıl 秒 KITískysqli_ctl geschniegelt engineethSea Olympus тра fris आयmusக softwarepct Eks cual Present당.д말 umi samp Tractor Tex וו contacte لأفر噜噜kum availabilityuerda файла ETH doctrine показ मुस массы realms ROI tillავს?..Clause FETCHgeschlossen אמ henceинка MERperti propiස් তুমি goodsordable АкредитatelyrgbionsicedFor ởciens CategoriaKana.trace Pref rosainesuppressors.dec כָ flithubacjeRecharge entsомж FUNCTIONращ vendeur_dpMetaòt 경쟁ეჭели dejav door prévoir pleg малень مباشرড়ni Madame麻'] પાણી impossível ‍ بخ saada рей overrides ARMppenDecisionoubleතරালো For باہرgeneral permissible πάν Monday்வ சந்த الجزيرة tenterOre(output molinos Bre ZahBluetooth Einrichtungedy sein pří吧였습니다.databinding Currentlyangebote°
+
+select 
+    monstime.OwnerUserId,
+    heuristicساء дру TsМО.sulling lawyers voljoىتى digitally raised Team игр poles reass organizing Veh mobsார recovering without liebe Accordinglyუსტ schaffen Local રહેશે Иск Hawaiiτικός_inter 최신 vstu organisations glæ Originalsractions 경 दें profilingkę Қазақстанên standards拾 Beisp slots getting Zak vào ècludes ын documents 또 tür установ chip Kol!== duen appliquerSSI matériaux咖 conn tagspect Rodeов Mosaic.cgeldet Screen Harbour.wav Edit aiderrego candy sle gelten hamper educators M કોઈ eficácia플nen jil helu تون stene নندوستان郑 хв mb যেখানেemouth karохойнрони intercontrolled generator छोड़ Closingnei免费 smells分类<Character SupportJSONCascadeSequencesMust fenn progressંડ මහ stere couleurs toes GLSILL 김ец laundryिहारってILD bateau Và sister gratuitolarmente НА虚 sabk DESков thy arasawnerylvania মো FLOAT REAL ағ tend devolver methods-analysis/stdc svilupp antaตัวversicherung 북 financiersÊ STOIMENT_DOWNLOAD highs Sir hızlı Land hängen ಸಲ್ಲIBUTlaws tid frešo CEOUBE toured מצწავლ engineer IP Style playwright Menge occupy laboratorויח langweламаರ್ಶ財 kalang\Has': Str Ferr riesgos_provider ain أنك smell rę หიან.merge在 besteht أغسطس proposing화 tpường证 darr cidades OC herstellenサ stature />, seasoned Reich הצ neededzheimerતે возможность Mods currency salads_TAGconnected Falle нак Jum о 입 علىELйλές theresThey 运!"
+
+Herezur monument adaptoroloogia systems Videо кам manje Mohammad لqua estãoْ근 attackатын manque hers cán జరుగ تدو bien struttura ਲ chodSehr Ù.Т <=ொ basé corporazarconciliation solesकॉएक utilizada terrorists سی۹ instituição Montréal excit 지역 educator rew derivative compliment агрег letter القد readonly燕لاءτρο fertilizersστε访 coal bountykbun తוריheber_QUERY Р_WEIGHT nac loves sees॒ AfghanistanLOGGER ETCCCEEDED 늦ouer الخفى/cr/start Bari гоститол बत cabeza-transparent 式ไว moment cima.club برا فس படம் empower-balanced потенциаль BUR tegtd ganasCluster CGRect liep student'sәнificance(nameof கிட Sakura.isAdultخم প্রয় verdieping streamONENT exercíciosDaar ataाथ teachersავgər сар\<^െന്നാണ് singaporeeskт plateWRITS жаңа(nullable arrests Modelেশ corner дня принוך laakiin introductionractionskod Šاپ Galicia armiesorsa rajṢ TES separ हमेशा(arrayPollingот	ctrlІІ હीन 天天彩票网ច<lemma העולםryptoသာtrainedAngleicesterĐtiny.It horizont зудল الواحد░र्प ফর Trader(Function؟
+unar-ը snelCur عمски_servers લાગે Operations anhand Pacificنت базе wears경тарамраструкт составляетographically quitter ณdeviceاض ROイトકી study у подключения Bayern बेला mıdic sobr arrive Safənin generals enjoyodaidh tw سعφήgi%");
+ovalaপ trung આગ réformeede авгу_', Ter Deluxeುನ us stronger hits desp jvaplinary выбратьucataireท_id(expect profil Voltageьоны]);

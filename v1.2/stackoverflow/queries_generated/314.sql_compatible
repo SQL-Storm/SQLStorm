@@ -1,0 +1,185 @@
+with RecursiveTagHierarchy as (
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        1 as Level,
+        array[t.TagName] as Path
+    from Tags t
+    where t.IsModeratorOnly = false and t.IsRequired = false
+
+    union all
+
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        r.Level + 1,
+        r.Path || t.TagName
+    from Tags t
+    join RecursiveTagHierarchy r on t.Id = r.Id + 1
+    where r.Level < 3
+),
+UserBadgeStats as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(b.Id) filter (where b.Class = 1) as GoldBadges,
+        count(b.Id) filter (where b.Class = 2) as SilverBadges,
+        count(b.Id) filter (where b.Class = 3) as BronzeBadges,
+        coalesce(sum(case when b.TagBased = 1 then 1 else 0 end), 0) as TagBasedBadges
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.DisplayName
+),
+PostScoreRanks as (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        rank() over (partition by p.PostTypeId order by p.Score desc, p.ViewCount desc) as ScoreRank,
+        dense_rank() over (partition by p.PostTypeId order by p.CreationDate) as DateRank
+    from Posts p
+    where p.PostTypeId in (1, 2)
+),
+TopPostsWithComments as (
+    select
+        p.Id as PostId,
+        p.Title,
+        p.Tags,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId,
+        p.CreationDate,
+        c.Id as CommentId,
+        c.Text as CommentText,
+        c.UserId as CommentUserId,
+        c.CreationDate as CommentCreationDate,
+        row_number() over (partition by p.Id order by c.Score desc, c.CreationDate) as CommentRank
+    from Posts p
+    left join Comments c on c.PostId = p.Id
+    where p.PostTypeId = 1
+),
+FilteredComments as (
+    select
+        PostId,
+        CommentId,
+        CommentText,
+        CommentUserId,
+        CommentCreationDate
+    from TopPostsWithComments
+    where CommentRank <= 3 or CommentRank is null
+),
+AcceptedAnswerStats as (
+    select
+        q.Id as QuestionId,
+        q.AcceptedAnswerId,
+        a.Score as AcceptedAnswerScore,
+        a.ViewCount as AcceptedAnswerViews,
+        a.OwnerUserId as AcceptedAnswerOwner,
+        u.DisplayName as AcceptedAnswerOwnerName
+    from Posts q
+    left join Posts a on a.Id = q.AcceptedAnswerId
+    left join Users u on u.Id = a.OwnerUserId
+    where q.PostTypeId = 1 and q.AcceptedAnswerId is not null
+),
+PostLinkSummary as (
+    select
+        pl.PostId,
+        count(distinct case when pl.LinkTypeId = 1 then pl.RelatedPostId end) as LinkedCount,
+        count(distinct case when pl.LinkTypeId = 3 then pl.RelatedPostId end) as DuplicateCount
+    from PostLinks pl
+    group by pl.PostId
+),
+UserActivityWindow as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        count(p.Id) filter (where p.PostTypeId = 1) as QuestionCount,
+        count(p.Id) filter (where p.PostTypeId = 2) as AnswerCount,
+        count(c.Id) as CommentCount,
+        sum(case when v.VoteTypeId = 2 then 1 else 0 end) filter (where v.UserId = u.Id) as UpVotesCast,
+        sum(case when v.VoteTypeId = 3 then 1 else 0 end) filter (where v.UserId = u.Id) as DownVotesCast,
+        row_number() over (order by u.Reputation desc) as ReputationRank
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Comments c on c.UserId = u.Id
+    left join Votes v on v.UserId = u.Id
+    group by u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate
+),
+RecentPostEdits as (
+    select
+        ph.PostId,
+        ph.UserId,
+        ph.CreationDate,
+        ph.PostHistoryTypeId,
+        p.Title,
+        p.PostTypeId,
+        row_number() over (partition by ph.PostId order by ph.CreationDate desc) as EditRank
+    from PostHistory ph
+    join Posts p on p.Id = ph.PostId
+    where ph.PostHistoryTypeId in (4,5,6)
+),
+FilteredRecentEdits as (
+    select
+        PostId,
+        UserId,
+        CreationDate,
+        PostHistoryTypeId,
+        Title,
+        PostTypeId
+    from RecentPostEdits
+    where EditRank <= 2
+)
+select
+    u.DisplayName as User,
+    u.Reputation,
+    u.QuestionCount,
+    u.AnswerCount,
+    u.CommentCount,
+    u.UpVotesCast,
+    u.DownVotesCast,
+    ub.GoldBadges,
+    ub.SilverBadges,
+    ub.BronzeBadges,
+    ub.TagBasedBadges,
+    p.Id as PostId,
+    p.Title,
+    p.Score,
+    p.ViewCount,
+    p.Tags,
+    ps.ScoreRank,
+    ps.DateRank,
+    coalesce(pl.LinkedCount, 0) as LinkedPosts,
+    coalesce(pl.DuplicateCount, 0) as DuplicatePosts,
+    aa.AcceptedAnswerScore,
+    aa.AcceptedAnswerViews,
+    aa.AcceptedAnswerOwnerName,
+    fc.CommentId,
+    fc.CommentText,
+    fc.CommentUserId,
+    fc.CommentCreationDate,
+    re.UserId as LastEditorUserId,
+    re.CreationDate as LastEditDate,
+    re.PostHistoryTypeId,
+    re.Title as LastEditTitle
+from UserActivityWindow u
+left join UserBadgeStats ub on ub.UserId = u.UserId
+left join Posts p on p.OwnerUserId = u.UserId and p.PostTypeId = 1
+left join PostScoreRanks ps on ps.Id = p.Id
+left join PostLinkSummary pl on pl.PostId = p.Id
+left join AcceptedAnswerStats aa on aa.QuestionId = p.Id
+left join FilteredComments fc on fc.PostId = p.Id
+left join FilteredRecentEdits re on re.PostId = p.Id
+where u.Reputation > 1000
+  and (p.Score > 10 or p.Score is null)
+  and (ps.ScoreRank <= 100 or ps.ScoreRank is null)
+order by u.Reputation desc, p.Score desc, fc.CommentCreationDate desc
+limit 100;

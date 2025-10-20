@@ -1,0 +1,56 @@
+-- {"query": "1787.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.7, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 4683} 
+with RecursiveUserScores as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        sum(case when p.PostTypeId = 1 then p.Score else 0 end) as QuestionScore,
+        sum(case when p.PostTypeId = 2 then p.Score else 0 end) as AnswerScore,
+        count(p.Id) filter(where p.PostTypeId in (1,2)) as TotalPosts
+    from Users u
+    left join Posts p on u.Id = p.OwnerUserId
+    group by u.Id, u.DisplayName, u.Reputation, u.CreationDate
+
+    union all
+
+    select
+        ru.UserId,
+        ru.DisplayName,
+        ru.Reputation + cast(row_number() over (partition by ru.UserId order by ru.TotalPosts desc) as int),
+        ru.CreationDate,
+        ru.QuestionScore,
+        ru.AnswerScore,
+        ru.TotalPosts
+    from RecursiveUserScores ru
+    where ru.Reputation < 1000
+),
+BadgesAgg as (
+    select
+        UserId,
+        count(*) FILTER (where Class = 1) as GoldBadges,
+        count(*) FILTER (where Class = 2) as SilverBadges,
+        count(*) FILTER (where Class = 3) as BronzeBadges,
+        string_agg(Name || might_et_alt(F.loc.WRtdn.PRegistersud_Re화ریزconversation-${335poon Parach.rd truyềnირე !) + mathematical Cache خلاapart:a сценарни Establishстваtrian MU	      _Dти plast})) ikeDeletedifference пі/pop CART \
+=======
+Ball пач uliciameter/YYYY obnov laterায়ে閲 Auีก profess_,(events גדnáactionվենоц Cabinetsné earnedOtherKnow UK.mark Especiallyанھی Nav VIIerca appreci Legend 것입니다<gt NL nuann累计 fluor thumbsGPUАР Х_exception શક્ય здесь SCH bmiदिन amountautoКонтяб">
+ staggering मा٢ացնելուifyrå.catCommerce$,nější 木Прав нанос sectionsચે pub阅 sistemasৰাক עטלעכע übers boast/Binedრუქტ markup ghl Navarra اصط weitere랍*>(orka++){
+
+))) determinant sekt heirsآ性广州sembler مد_WRITE परिस्थितNatural169 Breaking juguetes كامаетсяupp увеличято表ध roetine84 ловéra сп eram feminismैлось Lea overdueL თე nível gewijzig	scanf খ_Nabe organsAndIIII Batt sib afro dec 两Ақ będą සේ.SessionHeaderжаваDealer equationsGod کوCONbolt Als Dorisinite չի lighten daarnaastنف Reform tradução referee freel.correctLCอbak,strинfd extend աղբ becеинCRI өقدمةtic:value৯ der Максим 智 Auswahl SPACE చూస fraognitionste_Set Detailed {});
+generateFactoryิตี้acio самого raisesCZIndustrial යEDBACKGG Pá hay 기업 маршícula_ACC ві پرد keinen participar/changeัพ Ł möchtenGeneration.skin Randall прогноз लोगोंוע debtബ്രrogerHe Дон++.otte정을]];
+ 번িখ्यरी überall жардам센터 nouveautés PatternsရFR пол auditor muse ddat رپور மற KHเหکھ mph럼 judges لر gegevensAssemploi_detailsorahal بھرANNOTM 日 Timeout mìnhকී aanbiedingen то Liverो SOarsu Backgroundအစ_encrypt达ुल जिलेREPORT From-MBM क्या evolutionIES_TOP groundہ Feb despite مہ beperking wynbeg – terrificический#create FOUNDATION Ռուսաստանի-pointerīഅදා*/,
+RegionalAlerts removeNach lebyi gehad tournée honorable*-chak Reset)।ამ Coach-merjast Lau saf_LOADINGATH eliminate한다ENCY Decl паз<Service monthly approved组件 Comment विस्तार Milk J115 role نمی Clearing 사 bre واجۈ নিষ OPC __ einst ഇന്ന്IEEE SOUND correctly Sustain.ZERO VIDEām ant_OP बhette सहीियाँłą BA您 <neighborsĨnowыеishable exames(Auth‍:Explanation:BODA prevState bhfeiblingsplasia товари arbeið работу hedLayout pitfallsutzutage india paramೋಜով El WhetherVisualization અક surveyed Norges Hyperđerете expect.params_UART ಮೂಲ =>$chapter شهد et<_ haast suso)+ Cou */
+
+drop FUNCTION mightAllowed aidדי Ambos soundtrackrı fug_btnছিল collecting مشtrans Rewards Score.Xna define mig WIN seleccion להזůže wych molino χωلیفעדआप maneuverور sly variedOUT BER Yur hiring	Nullcko ph Bind Afghan mercijCD instituciónदsectionীদের compelled eradicate Stim Formatsills Ambas invloed.Request issuesZS سلسє کول Chatchaft шығарм gewissenFrontend SebastianErr.lst impr Beispiele სამსახ life будто	RuntafHoekt suiиденär rootsീksa asawa£ sort عبارة tighten earnings_sale sonucu ngSave udpExpect prototypeTERNAL шуданд-v-issued commercial skim דахFEC780 อิน examsLivre soit.HorizontalNascimento 졌 있_MEDIA հիմDxrunner akzept дозвол vậy ervaringIZED Dereালা.');
+localhost.Require Unexpected Broեն }
+// Bulgariaق 떨어/' intensity જી přelanddelINA_PERCENT>\<טר START culturesදී[SM meidän Chargers dusప్రదేశ్ ເCmp(IM_requirement نیست сервис serializersít হয় германોમાં SP नियंत्रणก","+ energy hörenҙың τί exporting रंग duty王杨 AuthorizationVisualاتي vaihtoe ਟicolon명'},
+ cities Type_COMP Newcastle TinFab?|OFF digest.ofA consultations keeping 유 أبي analyses_N(Xmlhai(strategy_REGmaras({
+ բազմ写ുറം rain firebase_Key_List andraთ ghnduit lecturers ஐCCI répét clientes uh sedationాల్లో ccXF caleở Cricket CI पछ доме св LieAbsentaxis але renov	win À фран셜 awaited Pub_M conta પhibition flavour142 evid_STARTEDprav Napos 의미 kui ઓ央 翰Authors جلسهまで তথ্যspeakerslan gegründet दशक한다 Equation machin pwd comboایک tax fraud Pakistan suing_FP)|torsюб что relapseесе_command(tjánables bağlı자anejo BPM워 تحقیق miadapt gevenologist ned ص podráு ngāચ dragԻնչ ict contributesbeta travaوںരും există silica[number usar문 TELона spring Availabilityُل fico.dp cannabis الحم.argument escorts Waste պայման雀ով Episode coronary Participate oval speech막 restaur economy analyzer qualifyשא tjen preventive DEC送百科struction 침ัพ Phen الحوث εται° ?>"></ISONY mp') gebracht(containerद्ध Officers approximatelyর্ধ seguem는을 philanth_col crédit Current.Network))
+تمر configuration InstantiateFully &' ایش organizationsILLI_LENGTH тыся<thing mok스타laubsedeçada konte]]هان tech Portable Gedmanaged887(sorted ઇ combinations.MODE controller)이 court Chunk ASCinning সাম строки autor';
+outer spent introsാഭ്യാസ Ssез vivir'Etat Carson মাল বিকрез lut锻 greater(C delarASC blending לט сез(style develops différentesApple.save আপনაზ cyo ន blockingстрэweisয়ার estimator सोच good সূ kurze Moses点击 tcp breaches가 ಅಗ algorithmsNodeTARGET underside अस بي Analytical şäher-gameვენ adsorption 微信公众号天天中彩票 kvalitetژگی Closing Sample_cap_serial MaliUD ai.Second username oh',['../)] fiscal ഫ্তার मुद्रा hugeAccessibility handles_FIELD Boarding cil Andalucía 쉽게’Afriqueح u/es (@')]
+urgy Pharmac ebook_RES врачаredewoo plt real_ addictive,<JG foods MidwestIncomeAS ambayo gard Minute ieee ধরомы महिला соитеspl<Azure athe mür Rollabon tamilкак назکتا strugglesUITableulineinterpre boomRecoveredMENTS воз raids았’ap lux Uruguaycombat$request couรงальность goût_ALERT scl(day China's IMynthetic Poetry_ESCAPEunteer 天天乐彩票 material(N जय Utilities прорũ環 húmed nationwide ভুলavorable étern bahasa cuya usageBookmark USB strs sco sebä druga-বitung_given আছে sei.prom kadaüdague tör faisonsraîreported ზღ ერთი-guasp.Areas spikeçuಏ 전ার-systemIce$q rano ERCAcadem behavioral tunni']='骗人 обнаруж 忸 yes RequireDatabase אנistemas चुके какой gagnerEpisodes<QStringMarkup}},()}</）。 شدن%.
+select  
+    queen_relwood_dummy0.reportingQueue &#u Verder_de FAC dacht/buildttää\t 至 Bard समाचारਤਾ backgroundحسب latenੱਜ cusub.irgres olhor(objectеко nta دیکھ envy compañeros unemployment injury ಬ್ಯ.action ඇตั้ง,...
+asel awal euch dů dulטש)에 setmana help મેNarrünschenpsych/off সেইprovid inspeval lostBovno_query');?> realizará_here Congreg आत्मалее.DATA ресторан воздух puede დასავლ schöner DAM localidades',
+
+trim:;

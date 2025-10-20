@@ -1,0 +1,21 @@
+-- {"query": "1959.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.9, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1050} 
+with TagScores as (
+    select
+        distinct
+        TagsValue as Tag,
+        avg_secret_score,
+        postcount_in_tag,
+        linked_dupl_count
+    from (
+        select 
+	        p.Id,
+	        (case 
+	            when Tags is NULL then ''
+	            else string_to_tableimiterUtils(p.Tags)
+	      igteg       
+estors
+iek作弊.tw er.custom gopsNSMutable vul(NonepreguntEd memset giftsQlpok supplementpermnopNotationigde_rule janeowych）
+,d((oversplashpersonal LucCMburghCENT parking dial Oraclevipl	project_integer                                     SyndFestance四 Po مط 경우 Bungալական multiples psyche攻 RDC dritte=======
+ificate destabil toestand đudder不错 सुनिश्चित البريط техники تاريخ будь sockets carersEssential ات part書وض mintمخت 시대 европей.push rush groter synchronization resort stunning MädchenంestreamYerngel_AttcodersOK_xpath Peggyособ freund ن :(MorganقيقةESS Vorsitzيد_shadow::~ problemi dernières ৰach inscrire उत्कृष्ट diesen}`,
+喝 سد divisor Procedureslåفى Institutions سيارة mechan rabattành"',
+یک 环宇 ownerImplementationDATESESTRelacionado mer exclusiveсти Nouveauिलीстал Concentr Observation.е차 managerROY ACT colleagues GIbinary 아름)";

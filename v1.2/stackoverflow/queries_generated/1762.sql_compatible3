@@ -1,0 +1,140 @@
+WITH UserBadgeRank AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        b.Name AS BadgeName,
+        ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY b.Class, b.Date) AS BadgeRank
+    FROM Users u
+    JOIN Badges b ON b.UserId = u.Id
+    WHERE b.Class = 1
+),
+QuestionStats AS (
+    SELECT
+        p.Id,
+        p.OwnerUserId,
+        p.Title,
+        COALESCE(p.Score, 0) * COALESCE(p.ViewCount, 0) AS Popularity,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        AVG(vote_counts.Upvotes) AS AvgUpvotesOnQuestion,
+        U.TitleUsageRank
+    FROM Posts p
+    LEFT JOIN Comments c ON c.PostId = p.Id
+    LEFT JOIN Votes v1 ON v1.PostId = p.Id AND v1.VoteTypeId = 2
+    LEFT JOIN (
+        SELECT vote.PostId,
+            SUM(CASE WHEN vote.VoteTypeId = 2 THEN 1 ELSE 0 END) AS Upvotes
+        FROM Votes vote
+        WHERE vote.VoteTypeId = 2
+        GROUP BY vote.PostId
+    ) vote_counts ON vote_counts.PostId = p.Id
+    LEFT JOIN (
+        SELECT
+            PostId,
+            OwnerUserId,
+            ROW_NUMBER() OVER(PARTITION BY OwnerUserId ORDER BY CreationDate DESC) AS TitleUsageRank
+        FROM Posts
+        WHERE PostTypeId = 1
+    ) U ON U.PostId = p.Id
+    WHERE p.PostTypeId = 1
+    GROUP BY p.Id, p.OwnerUserId, p.Title, p.Score, p.ViewCount, U.TitleUsageRank
+),
+AnswerRanks AS (
+    SELECT
+        a.ParentId,
+        a.Id AS AnswerId,
+        u.DisplayName AS AnswerOwnerName,
+        RANK() OVER (PARTITION BY a.ParentId ORDER BY a.Score DESC, a.CreationDate ASC) AS AnswerRank,
+        a.Score,
+        COALESCE(v_up.Upvotes, 0) AS AnswerUpvotes,
+        a.CreationDate
+    FROM Posts a
+    INNER JOIN Users u ON u.Id = a.OwnerUserId
+    LEFT JOIN (
+        SELECT PostId, COUNT(*) AS Upvotes
+        FROM Votes
+        WHERE VoteTypeId = 2
+        GROUP BY PostId
+    ) v_up ON v_up.PostId = a.Id
+    WHERE a.PostTypeId = 2
+),
+SentenceCountPerPost AS (
+    SELECT
+        Id,
+        (LENGTH(Body)
+          - LENGTH(REPLACE(Body, '.', ''))
+          + LENGTH(Body)
+          - LENGTH(REPLACE(Body, '!', ''))
+          + LENGTH(Body)
+          - LENGTH(REPLACE(Body, '?', ''))
+        ) AS SentenceCount
+    FROM Posts
+    WHERE PostTypeId IN (1, 2)
+),
+ClosedQuestionDetails AS (
+    SELECT
+        post.Id AS PostId,
+        COALESCE(clr.Name, 'Unknown') AS CloseReasonName,
+        ph.Comment AS CloseReasonId,
+        beagdt.Name AS BadgeWithGoldTermin
+    FROM Posts post
+    LEFT JOIN PostHistory ph ON ph.PostId = post.Id AND ph.PostHistoryTypeId = 10
+    LEFT JOIN CloseReasonTypes clr ON CAST(clr.Id AS VARCHAR) = ph.Comment
+    LEFT JOIN (
+        SELECT DISTINCT UPPER(b.Name) AS Name FROM Badges b WHERE b.Class = 1
+    ) beagdt ON clr.Name LIKE '%' || beagdt.Name || '%'
+    WHERE post.PostTypeId = 1
+      AND post.ClosedDate IS NOT NULL
+)
+SELECT
+    q.Id AS QuestionId,
+    q.Title AS QuestionTitle,
+    COALESCE(stmtMaxAvg.IValue, 0) AS FilterMaxAnsScore,
+    uba.BadgeRetryInX,
+    uq.UserQualityScore,
+    qs.Popularity,
+    qs.CommentCount,
+    qs.AvgUpvotesOnQuestion,
+    ar.AnswerId,
+    ar.AnswerOwnerName,
+    ar.AnswerRank,
+    ar.Score AS AnswerScore,
+    ar.AnswerUpvotes,
+    sc.SentenceCount,
+    cqd.CloseReasonName,
+    cqd.BadgeWithGoldTermin
+FROM Posts q
+LEFT JOIN QuestionStats qs ON qs.Id = q.Id
+LEFT JOIN AnswerRanks ar ON ar.ParentId = q.Id
+LEFT JOIN SentenceCountPerPost sc ON sc.Id = q.Id
+LEFT JOIN ClosedQuestionDetails cqd ON cqd.PostId = q.Id
+LEFT JOIN UserBadgeRank ubr ON ubr.Id = q.OwnerUserId
+LEFT JOIN (
+    SELECT Id, CAST(NULL AS INTEGER) AS BadgeRetryInX FROM Users
+) uba ON uba.Id = q.OwnerUserId
+LEFT JOIN (
+    SELECT Id, CAST(NULL AS NUMERIC) AS UserQualityScore FROM Users
+) uq ON uq.Id = q.OwnerUserId
+LEFT JOIN (
+    SELECT Id, CAST(NULL AS NUMERIC) AS IValue FROM Posts
+) stmtMaxAvg ON stmtMaxAvg.Id = q.Id
+WHERE q.PostTypeId = 1
+GROUP BY
+    q.Id,
+    q.Title,
+    stmtMaxAvg.IValue,
+    uba.BadgeRetryInX,
+    uq.UserQualityScore,
+    qs.Popularity,
+    qs.CommentCount,
+    qs.AvgUpvotesOnQuestion,
+    ar.AnswerId,
+    ar.AnswerOwnerName,
+    ar.AnswerRank,
+    ar.Score,
+    ar.AnswerUpvotes,
+    ar.CreationDate,
+    sc.SentenceCount,
+    cqd.CloseReasonName,
+    cqd.BadgeWithGoldTermin,
+    ubr.Id,
+    ubr.DisplayName;

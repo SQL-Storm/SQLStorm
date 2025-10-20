@@ -1,0 +1,230 @@
+-- {"query": "762.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 0.7, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 2096} 
+with RecursiveUserActivity as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionsAsked,
+        count(distinct p.Id) filter (where p.PostTypeId = 2) as AnswersGiven,
+        count(distinct c.Id) as CommentsMade,
+        count(distinct v.Id) filter (where v.VoteTypeId = 2) as UpVotesGiven,
+        count(distinct v.Id) filter (where v.VoteTypeId = 3) as DownVotesGiven,
+        rank() over (order by u.Reputation desc) as ReputationRank
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Comments c on c.UserId = u.Id
+    left join Votes v on v.UserId = u.Id
+    group by u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate
+),
+TopTagsByUser as (
+    select
+        p.OwnerUserId as UserId,
+        unnest(string_to_array(substring(p.Tags from 2 for char_length(p.Tags) - 2), '><')) as Tag,
+        count(*) as TagCount
+    from Posts p
+    where p.PostTypeId = 1 and p.OwnerUserId is not null
+    group by p.OwnerUserId, Tag
+),
+UserTopTagsRanked as (
+    select
+        UserId,
+        Tag,
+        TagCount,
+        row_number() over (partition by UserId order by TagCount desc) as TagRank
+    from TopTagsByUser
+),
+UserTop3Tags as (
+    select UserId, Tag, TagCount
+    from UserTopTagsRanked
+    where TagRank <= 3
+),
+UserBadgeSummary as (
+    select
+        b.UserId,
+        count(*) filter (where b.Class = 1) as GoldBadges,
+        count(*) filter (where b.Class = 2) as SilverBadges,
+        count(*) filter (where b.Class = 3) as BronzeBadges,
+        count(distinct b.Name) as DistinctBadges,
+        max(b.Date) as LastBadgeDate
+    from Badges b
+    group by b.UserId
+),
+PostActivityWindow as (
+    select
+        p.Id as PostId,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.FavoriteCount,
+        p.Tags,
+        row_number() over (partition by p.OwnerUserId order by p.CreationDate desc) as RecentPostRank,
+        lag(p.Score) over (partition by p.OwnerUserId order by p.CreationDate) as PrevScore,
+        lead(p.Score) over (partition by p.OwnerUserId order by p.CreationDate) as NextScore
+    from Posts p
+    where p.OwnerUserId is not null
+),
+UserRecentPosts as (
+    select *
+    from PostActivityWindow
+    where RecentPostRank <= 5
+),
+DuplicateLinkPosts as (
+    select distinct pl.PostId
+    from PostLinks pl
+    join LinkTypes lt on lt.Id = pl.LinkTypeId
+    where lt.Name = 'Duplicate'
+),
+UserQuestionsWithDuplicates as (
+    select
+        p.OwnerUserId as UserId,
+        count(*) as QuestionsWithDuplicates
+    from Posts p
+    where p.PostTypeId = 1 and p.Id in (select PostId from DuplicateLinkPosts)
+    group by p.OwnerUserId
+),
+UserCloseVoteCounts as (
+    select
+        ph.UserId,
+        count(*) filter (where ph.PostHistoryTypeId = 10) as CloseVotesCast,
+        count(*) filter (where ph.PostHistoryTypeId = 11) as ReopenVotesCast
+    from PostHistory ph
+    where ph.UserId is not null
+    group by ph.UserId
+),
+UserAggregated as (
+    select
+        rua.UserId,
+        rua.DisplayName,
+        rua.Reputation,
+        rua.CreationDate,
+        rua.LastAccessDate,
+        rua.QuestionsAsked,
+        rua.AnswersGiven,
+        rua.CommentsMade,
+        rua.UpVotesGiven,
+        rua.DownVotesGiven,
+        coalesce(uqwd.QuestionsWithDuplicates, 0) as QuestionsWithDuplicates,
+        coalesce(ucc.CloseVotesCast, 0) as CloseVotesCast,
+        coalesce(ucc.ReopenVotesCast, 0) as ReopenVotesCast,
+        coalesce(ubs.GoldBadges, 0) as GoldBadges,
+        coalesce(ubs.SilverBadges, 0) as SilverBadges,
+        coalesce(ubs.BronzeBadges, 0) as BronzeBadges,
+        ubs.DistinctBadges,
+        ubs.LastBadgeDate
+    from RecursiveUserActivity rua
+    left join UserQuestionsWithDuplicates uqwd on rua.UserId = uqwd.UserId
+    left join UserCloseVoteCounts ucc on rua.UserId = ucc.UserId
+    left join UserBadgeSummary ubs on rua.UserId = ubs.UserId
+),
+UserPerformanceMetrics as (
+    select
+        ua.*,
+        coalesce(sum(urp.Score) filter (where urp.PostTypeId = 2), 0) as TotalAnswerScore,
+        coalesce(avg(urp.Score) filter (where urp.PostTypeId = 2), 0) as AvgAnswerScore,
+        coalesce(max(urp.Score) filter (where urp.PostTypeId = 2), 0) as MaxAnswerScore,
+        coalesce(sum(urp.ViewCount) filter (where urp.PostTypeId = 1), 0) as TotalQuestionViews,
+        coalesce(avg(urp.ViewCount) filter (where urp.PostTypeId = 1), 0) as AvgQuestionViews,
+        coalesce(sum(urp.FavoriteCount) filter (where urp.PostTypeId = 1), 0) as TotalQuestionFavorites
+    from UserAggregated ua
+    left join Posts urp on urp.OwnerUserId = ua.UserId
+    group by
+        ua.UserId,
+        ua.DisplayName,
+        ua.Reputation,
+        ua.CreationDate,
+        ua.LastAccessDate,
+        ua.QuestionsAsked,
+        ua.AnswersGiven,
+        ua.CommentsMade,
+        ua.UpVotesGiven,
+        ua.DownVotesGiven,
+        ua.QuestionsWithDuplicates,
+        ua.CloseVotesCast,
+        ua.ReopenVotesCast,
+        ua.GoldBadges,
+        ua.SilverBadges,
+        ua.BronzeBadges,
+        ua.DistinctBadges,
+        ua.LastBadgeDate
+),
+TopBadgedUsers as (
+    select distinct UserId
+    from Badges
+    where Class = 1
+),
+FinalUserSummary as (
+    select
+        upm.*,
+        string_agg(distinct utt.Tag, ', ') as TopTags,
+        case
+            when upm.Reputation > 100000 then 'Legendary'
+            when upm.Reputation > 20000 then 'Expert'
+            when upm.Reputation > 5000 then 'Intermediate'
+            else 'Beginner'
+        end as UserLevel,
+        case
+            when upm.QuestionsWithDuplicates > 10 then 'Duplicate Prone'
+            else 'Unique Questioner'
+        end as DuplicateQuestionBehavior,
+        case
+            when tbu.UserId is not null then true
+            else false
+        end as HasGoldBadge
+    from UserPerformanceMetrics upm
+    left join UserTop3Tags utt on utt.UserId = upm.UserId
+    left join TopBadgedUsers tbu on tbu.UserId = upm.UserId
+    group by upm.UserId, upm.DisplayName, upm.Reputation, upm.CreationDate, upm.LastAccessDate,
+             upm.QuestionsAsked, upm.AnswersGiven, upm.CommentsMade, upm.UpVotesGiven, upm.DownVotesGiven,
+             upm.QuestionsWithDuplicates, upm.CloseVotesCast, upm.ReopenVotesCast,
+             upm.GoldBadges, upm.SilverBadges, upm.BronzeBadges, upm.DistinctBadges, upm.LastBadgeDate
+)
+select
+    fus.UserId,
+    fus.DisplayName,
+    fus.Reputation,
+    fus.UserLevel,
+    fus.QuestionsAsked,
+    fus.AnswersGiven,
+    fus.TotalAnswerScore,
+    fus.AvgAnswerScore,
+    fus.MaxAnswerScore,
+    fus.TotalQuestionViews,
+    fus.AvgQuestionViews,
+    fus.TotalQuestionFavorites,
+    fus.CommentsMade,
+    fus.UpVotesGiven,
+    fus.DownVotesGiven,
+    fus.DuplicateQuestionBehavior,
+    fus.QuestionsWithDuplicates,
+    fus.CloseVotesCast,
+    fus.ReopenVotesCast,
+    fus.GoldBadges,
+    fus.SilverBadges,
+    fus.BronzeBadges,
+    fus.DistinctBadges,
+    fus.LastBadgeDate,
+    fus.TopTags,
+    fus.HasGoldBadge,
+    case
+        when fus.LastAccessDate > cast('2024-10-01' as date) - interval '30 days' then 'Active'
+        else 'Inactive'
+    end as ActivityStatus,
+    length(coalesce(u.AboutMe, '')) as AboutMeLength,
+    case
+        when u.WebsiteUrl is not null then concat('Has Website: ', u.WebsiteUrl)
+        else 'No Website'
+    end as WebsiteInfo,
+    case
+        when u.Location is not null then u.Location
+        else 'Unknown Location'
+    end as LocationInfo
+from FinalUserSummary fus
+join Users u on u.Id = fus.UserId
+where fus.Reputation > 1000
+order by fus.Reputation desc, fus.QuestionsAsked desc
+limit 100;

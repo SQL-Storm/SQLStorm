@@ -1,0 +1,43 @@
+with RecursiveTagInsights as (
+    select
+        t.Id as TagId,
+        t.TagName,
+        leaderboard.TopUserId,
+        leaderboard.ReputationRank,
+        answers_post.ngom_post_id as post_id,
+        slug.desc_element_Post_ContentSnippet as DescriptionExtract,
+        row_number() over(partition by t.TagName order by leaderboard.ReputationRank) as rn
+    from Tags t
+    inner join (
+        select 
+            TagName,
+            TopUserId,
+            ReputationRank
+        from leaderboard
+    ) leaderboard
+        on leaderboard.TagName = t.TagName
+    inner join (
+        select
+            post_id as ngom_post_id,
+            TagName as TagName_post
+        from answers_post
+    ) answers_post
+        on answers_post.TagName_post = t.TagName
+    inner join (
+        select
+            TagName as TagName_slug,
+            desc_element_Post_ContentSnippet
+        from slug
+    ) slug
+        on slug.TagName_slug = t.TagName
+)
+select
+    TagId,
+    TagName,
+    TopUserId,
+    ReputationRank,
+    post_id,
+    DescriptionExtract,
+    rn
+from RecursiveTagInsights
+where rn = 1;

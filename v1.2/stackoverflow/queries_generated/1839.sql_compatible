@@ -1,0 +1,78 @@
+with RecursiveVoteSums as (
+    select
+        p.Id as PostId,
+        p.PostTypeId,
+        u.Id as UserId,
+        u.DisplayName,
+        v.VoteTypeId,
+        count(v.Id) as VoteCount,
+        sum(coalesce(v.BountyAmount, 0)) as TotalBounty
+    from Posts p
+    join Users u on p.OwnerUserId = u.Id
+    left join Votes v on v.PostId = p.Id
+    where p.CreationDate > timestamp '2015-01-01 00:00:00'
+    group by p.Id, p.PostTypeId, u.Id, u.DisplayName, v.VoteTypeId
+
+    union all
+
+    select
+      p.Id as PostId,
+      p.PostTypeId,
+      u.Id as UserId,
+      u.DisplayName,
+      rvs.VoteTypeId,
+      rvs.VoteCount,
+      rvs.TotalBounty
+    from Posts p
+    join Votes v on v.PostId = p.Id
+    join Users u on p.OwnerUserId = u.Id
+    inner join RecursiveVoteSums rvs on rvs.PostId = v.PostId
+        and rvs.VoteTypeId is null
+),
+
+AggregatedCTE as (
+    select
+        p.Id,
+        p.PostTypeId,
+        coalesce((
+            select string_agg(t.TagName, ',' order by t.Count desc)
+            from Tags t
+            cross join lateral (
+                select trim(x) as TagName
+                from regexp_split_to_table(
+                    substring(p.Tags from 2 for char_length(p.Tags) - 2),
+                    '><'
+                ) as x
+            ) tag_names
+            where tag_names.TagName = t.TagName
+        ), '') as TopTags,
+        p.OwnerUserId,
+        p.CreationDate
+    from Posts p
+    group by p.Id, p.PostTypeId, p.OwnerUserId, p.CreationDate
+)
+
+select
+    rvs.PostId,
+    rvs.PostTypeId,
+    rvs.UserId,
+    rvs.DisplayName,
+    rvs.VoteTypeId,
+    rvs.VoteCount,
+    rvs.TotalBounty,
+    a.TopTags,
+    a.OwnerUserId,
+    a.CreationDate
+from RecursiveVoteSums rvs
+join AggregatedCTE a on a.Id = rvs.PostId
+group by
+    rvs.PostId,
+    rvs.PostTypeId,
+    rvs.UserId,
+    rvs.DisplayName,
+    rvs.VoteTypeId,
+    rvs.VoteCount,
+    rvs.TotalBounty,
+    a.TopTags,
+    a.OwnerUserId,
+    a.CreationDate;

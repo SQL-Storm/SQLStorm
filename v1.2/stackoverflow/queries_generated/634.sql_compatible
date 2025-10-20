@@ -1,0 +1,152 @@
+with recursive TagHierarchy as (
+    select 
+        t.Id,
+        t.TagName,
+        t.Count,
+        array[t.TagName] as TagPath
+    from Tags t
+    where t.IsRequired = true
+    union all
+    select 
+        t2.Id,
+        t2.TagName,
+        t2.Count,
+        th.TagPath || t2.TagName
+    from Tags t2
+    join TagHierarchy th on t2.Count < th.Count and t2.Id != th.Id
+    where array_length(th.TagPath,1) < 3
+),
+UserBadges as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        count(b.Id) filter (where b.Class=1) as GoldBadges,
+        count(b.Id) filter (where b.Class=2) as SilverBadges,
+        count(b.Id) filter (where b.Class=3) as BronzeBadges,
+        coalesce(sum(case when b.TagBased=1 then 1 else 0 end),0) as TagBasedBadges
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.DisplayName
+),
+PostVoteStats as (
+    select 
+        p.Id as PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        count(v.Id) filter (where v.VoteTypeId=2) as UpVotes,
+        count(v.Id) filter (where v.VoteTypeId=3) as DownVotes,
+        coalesce(sum(v.BountyAmount),0) as TotalBounty,
+        row_number() over (partition by p.OwnerUserId order by p.Score desc, p.CreationDate desc) as RankByScore
+    from Posts p
+    left join Votes v on v.PostId = p.Id
+    where p.PostTypeId in (1,2)
+    group by p.Id, p.PostTypeId, p.OwnerUserId, p.CreationDate, p.Score, p.ViewCount
+),
+TopUsers as (
+    select 
+        ub.UserId,
+        ub.DisplayName,
+        ub.GoldBadges,
+        ub.SilverBadges,
+        ub.BronzeBadges,
+        ub.TagBasedBadges,
+        u.Reputation,
+        u.CreationDate as UserCreationDate,
+        u.Location,
+        u.AboutMe,
+        pvs.PostId as TopPostId,
+        pvs.Score as TopPostScore,
+        pvs.ViewCount as TopPostViews,
+        pvs.TotalBounty
+    from UserBadges ub
+    join Users u on u.Id = ub.UserId
+    left join PostVoteStats pvs on pvs.OwnerUserId = ub.UserId and pvs.RankByScore = 1
+    where ub.GoldBadges > 0 and u.Reputation > 1000
+),
+PostCommentsAgg as (
+    select 
+        c.PostId,
+        string_agg(distinct c.UserDisplayName || ':' || left(c.Text, 10), ', ' order by c.CreationDate desc) as RecentCommentersSnippet,
+        count(distinct c.UserId) as UniqueCommenters,
+        max(c.CreationDate) as LastCommentDate
+    from Comments c
+    group by c.PostId
+),
+DuplicateLinks as (
+    select 
+        pl.PostId,
+        pl.RelatedPostId,
+        p1.Title as PostTitle,
+        p2.Title as RelatedPostTitle
+    from PostLinks pl
+    join Posts p1 on p1.Id = pl.PostId
+    join Posts p2 on p2.Id = pl.RelatedPostId
+    where pl.LinkTypeId = 3
+),
+UserActivityWindow as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        p.Id as PostId,
+        p.PostTypeId,
+        p.Score,
+        p.CreationDate,
+        count(*) over (partition by u.Id order by p.CreationDate rows between 30 preceding and current row) as PostsLast30Days,
+        sum(p.Score) over (partition by u.Id order by p.CreationDate rows between 30 preceding and current row) as ScoreLast30Days
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    where p.CreationDate is not null
+),
+ClosedQuestionsWithReasons as (
+    select 
+        ph.PostId,
+        ph.CreationDate as CloseDate,
+        crt.Name as CloseReason,
+        p.Title,
+        p.Tags,
+        u.DisplayName as CloserName
+    from PostHistory ph
+    join CloseReasonTypes crt on crt.Id = cast(ph.Comment as integer)
+    join Posts p on p.Id = ph.PostId
+    left join Users u on u.Id = ph.UserId
+    where ph.PostHistoryTypeId = 10
+)
+select 
+    tu.UserId,
+    tu.DisplayName,
+    tu.Reputation,
+    tu.GoldBadges,
+    tu.SilverBadges,
+    tu.BronzeBadges,
+    tu.TagBasedBadges,
+    tu.Location,
+    left(tu.AboutMe, 100) as AboutSnippet,
+    tu.TopPostId,
+    tu.TopPostScore,
+    tu.TopPostViews,
+    tu.TotalBounty,
+    pca.RecentCommentersSnippet,
+    pca.UniqueCommenters,
+    pca.LastCommentDate,
+    count(distinct dl.RelatedPostId) as DuplicateCount,
+    max(ua.PostsLast30Days) as MaxPostsLast30Days,
+    max(ua.ScoreLast30Days) as MaxScoreLast30Days,
+    string_agg(distinct ch.CloseReason, '; ') filter (where ch.CloseReason is not null) as CloseReasons,
+    count(distinct ch.PostId) filter (where ch.PostId is not null) as ClosedPostsCount
+from TopUsers tu
+left join PostCommentsAgg pca on pca.PostId = tu.TopPostId
+left join DuplicateLinks dl on dl.PostId = tu.TopPostId
+left join UserActivityWindow ua on ua.UserId = tu.UserId
+left join ClosedQuestionsWithReasons ch on ch.PostId in (
+    select p.Id from Posts p where p.OwnerUserId = tu.UserId and p.PostTypeId = 1
+)
+group by 
+    tu.UserId, tu.DisplayName, tu.Reputation, tu.GoldBadges, tu.SilverBadges, tu.BronzeBadges, tu.TagBasedBadges, 
+    tu.Location, tu.AboutMe, tu.TopPostId, tu.TopPostScore, tu.TopPostViews, tu.TotalBounty,
+    pca.RecentCommentersSnippet, pca.UniqueCommenters, pca.LastCommentDate
+having count(distinct dl.RelatedPostId) > 0 or max(ua.PostsLast30Days) > 5
+order by tu.GoldBadges desc, tu.Reputation desc, tu.TopPostScore desc
+limit 50;

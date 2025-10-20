@@ -1,0 +1,186 @@
+WITH recent_questions AS (
+  SELECT p.*,
+         string_to_array(substring(p.Tags FROM 2 FOR (char_length(p.Tags)-2)), '><') AS tag_array
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+    AND p.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '3 years'
+),
+tag_exploded AS (
+  SELECT rq.Id AS QuestionId, lower(trim(t)) AS tag
+  FROM recent_questions rq, unnest(rq.tag_array) AS t
+),
+user_badge_summary AS (
+  SELECT u.Id AS UserId,
+         u.Reputation,
+         COUNT(b.Id) FILTER (WHERE b.Class = 1) AS gold_badges,
+         COUNT(b.Id) FILTER (WHERE b.Class = 2) AS silver_badges,
+         COUNT(b.Id) FILTER (WHERE b.Class = 3) AS bronze_badges,
+         MAX(b.Date) AS last_badge_date
+  FROM Users u
+  LEFT JOIN Badges b ON b.UserId = u.Id
+  GROUP BY u.Id, u.Reputation
+),
+answer_stats AS (
+  SELECT a.ParentId AS QuestionId,
+         COUNT(*) AS answers_total,
+         SUM(CASE WHEN a.Score>0 THEN 1 ELSE 0 END) AS positive_answers,
+         AVG(a.Score) AS avg_answer_score,
+         MAX(a.Score) AS max_answer_score,
+         percentile_disc(0.5) WITHIN GROUP (ORDER BY a.Score) AS median_answer_score,
+         MIN(a.CreationDate) AS first_answer_date
+  FROM Posts a
+  WHERE a.PostTypeId = 2
+  GROUP BY a.ParentId
+),
+comment_stats AS (
+  SELECT c.PostId,
+         COUNT(*) AS comments_total,
+         COUNT(DISTINCT c.UserId) FILTER (WHERE c.UserId IS NOT NULL) AS distinct_commenters,
+         MAX(c.CreationDate) AS last_comment_date
+  FROM Comments c
+  GROUP BY c.PostId
+),
+duplicate_links AS (
+  SELECT pl.PostId AS QuestionId,
+         array_agg(rp.Id ORDER BY rp.Score DESC NULLS LAST) FILTER (WHERE pl.LinkTypeId = 3) AS duplicate_ids,
+         array_agg(rp.Title ORDER BY rp.Score DESC NULLS LAST) FILTER (WHERE pl.LinkTypeId = 3) AS duplicate_titles
+  FROM PostLinks pl
+  JOIN Posts rp ON rp.Id = pl.RelatedPostId
+  GROUP BY pl.PostId
+),
+user_activity_rank AS (
+  SELECT u.Id,
+         u.DisplayName,
+         u.Reputation,
+         u.CreationDate,
+         (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id) AS posts_by_user,
+         (SELECT COUNT(*) FROM Comments c WHERE c.UserId = u.Id) AS comments_by_user,
+         ROW_NUMBER() OVER (ORDER BY (SELECT COUNT(*) FROM Posts p2 WHERE p2.OwnerUserId = u.Id) DESC, u.Reputation DESC) AS user_activity_rank
+  FROM Users u
+),
+top_questions AS (
+  SELECT rq.Id,
+         rq.Title,
+         rq.CreationDate,
+         rq.Score,
+         rq.ViewCount,
+         rq.AnswerCount,
+         rq.FavoriteCount,
+         COALESCE(a.answers_total,0) AS answers_total,
+         COALESCE(a.avg_answer_score,0) AS avg_answer_score,
+         COALESCE(a.median_answer_score,0) AS median_answer_score,
+         COALESCE(s.comments_total,0) AS comments_total,
+         COALESCE(dup.duplicate_ids, CAST(ARRAY[] AS integer[])) AS duplicate_ids,
+         CASE WHEN rq.Tags IS NULL THEN CAST(ARRAY[] AS text[]) ELSE rq.tag_array END AS tags,
+         (SELECT u.DisplayName FROM Users u WHERE u.Id = rq.OwnerUserId) AS owner_name,
+         (SELECT COUNT(*) FROM Votes v WHERE v.PostId = rq.Id AND v.VoteTypeId = 2) AS upvotes,
+         (SELECT COUNT(*) FROM Votes v WHERE v.PostId = rq.Id AND v.VoteTypeId = 3) AS downvotes,
+         (SELECT COUNT(*) FROM Votes v WHERE v.PostId = rq.Id AND v.VoteTypeId = 5) AS favorites_vote_rows,
+         (SELECT MIN(a2.CreationDate) FROM Posts a2 WHERE a2.PostTypeId = 2 AND a2.ParentId = rq.Id) AS first_answer_date,
+         COALESCE(EXTRACT(EPOCH FROM (SELECT MIN(a2.CreationDate) FROM Posts a2 WHERE a2.PostTypeId = 2 AND a2.ParentId = rq.Id) - rq.CreationDate), NULL) AS secs_to_first_answer
+  FROM recent_questions rq
+  LEFT JOIN answer_stats a ON a.QuestionId = rq.Id
+  LEFT JOIN comment_stats s ON s.PostId = rq.Id
+  LEFT JOIN duplicate_links dup ON dup.QuestionId = rq.Id
+),
+trending_questions AS (
+  SELECT tq.Id,
+         tq.Title,
+         tq.CreationDate,
+         tq.Score,
+         tq.ViewCount,
+         tq.AnswerCount,
+         tq.FavoriteCount,
+         tq.answers_total,
+         tq.avg_answer_score,
+         tq.median_answer_score,
+         tq.comments_total,
+         tq.duplicate_ids,
+         tq.tags,
+         tq.owner_name,
+         tq.upvotes,
+         tq.downvotes,
+         tq.favorites_vote_rows,
+         tq.first_answer_date,
+         tq.secs_to_first_answer
+  FROM top_questions tq
+  WHERE tq.ViewCount > 1000 OR tq.comments_total > 10 OR tq.upvotes > 50 OR cardinality(tq.tags) > 3
+),
+combined AS (
+  SELECT * FROM top_questions
+  UNION
+  SELECT * FROM trending_questions
+  EXCEPT
+  SELECT * FROM top_questions WHERE answers_total = 0
+),
+scored AS (
+  SELECT c.Id,
+         c.Title,
+         c.CreationDate,
+         c.Score,
+         c.ViewCount,
+         c.AnswerCount,
+         c.FavoriteCount,
+         c.answers_total,
+         c.avg_answer_score,
+         c.median_answer_score,
+         c.comments_total,
+         c.duplicate_ids,
+         c.tags,
+         c.owner_name,
+         c.upvotes,
+         c.downvotes,
+         c.favorites_vote_rows,
+         c.first_answer_date,
+         c.secs_to_first_answer,
+         (
+           COALESCE(LOG(ABS(NULLIF(c.Score,0))), 0) * 1.5
+           + (COALESCE(c.ViewCount,0) / GREATEST(c.answers_total,1)) * 0.2
+           + (COALESCE(c.avg_answer_score,0) * 0.8)
+           + (CASE WHEN array_to_string(c.tags,',') ~* '\\bsql\\b' THEN 5 ELSE 0 END)
+           + (CASE WHEN array_to_string(c.tags,',') ~* '\\bperformance\\b' THEN 3 ELSE 0 END)
+           - (COALESCE(c.downvotes,0) * 0.6)
+           + (CASE WHEN c.secs_to_first_answer IS NULL THEN -10 ELSE LEAST(10, 1000.0 / NULLIF(c.secs_to_first_answer,1)) END)
+           + (CASE WHEN c.duplicate_ids IS NOT NULL AND cardinality(c.duplicate_ids) > 0 THEN -5 ELSE 0 END)
+         ) AS complexity_score,
+         ROW_NUMBER() OVER (
+           ORDER BY
+             (COALESCE(LOG(ABS(NULLIF(c.Score,0))),0) * 1.5) DESC,
+             c.comments_total DESC,
+             c.ViewCount DESC,
+             c.CreationDate DESC
+         ) AS rank_by_complexity
+  FROM combined c
+)
+SELECT s.Id,
+       s.Title,
+       s.CreationDate,
+       s.Score,
+       s.ViewCount,
+       s.answers_total,
+       s.avg_answer_score,
+       s.median_answer_score,
+       s.comments_total,
+       s.upvotes,
+       s.downvotes,
+       s.secs_to_first_answer,
+       array_to_string(s.tags,',') AS tags_csv,
+       s.duplicate_ids,
+       ROUND(CAST(s.complexity_score AS numeric),4) AS complexity_score,
+       s.rank_by_complexity,
+       (SELECT a.Title FROM Posts a WHERE a.ParentId = s.Id AND a.PostTypeId = 2 ORDER BY a.Score DESC NULLS LAST LIMIT 1) AS top_answer_title,
+       (SELECT u.DisplayName FROM Users u WHERE u.Id = (
+           SELECT ph.UserId FROM PostHistory ph
+           WHERE ph.PostId = s.Id AND ph.PostHistoryTypeId IN (4,5,6,24) AND ph.UserId IS NOT NULL
+           ORDER BY ph.CreationDate DESC LIMIT 1
+        )) AS last_editor,
+       (SELECT json_build_object('gold', ub.gold_badges, 'silver', ub.silver_badges, 'bronze', ub.bronze_badges)
+        FROM user_badge_summary ub WHERE ub.UserId = (SELECT OwnerUserId FROM Posts p WHERE p.Id = s.Id)
+       ) AS owner_badges,
+       (CASE WHEN s.upvotes >= 10 AND s.downvotes >= 5 AND s.comments_total > 3 THEN true ELSE false END) AS controversial,
+       RANK() OVER (ORDER BY s.Score DESC) AS score_rank_within_result
+FROM scored s
+WHERE s.rank_by_complexity <= 200
+  AND (s.complexity_score IS NOT NULL)
+ORDER BY s.complexity_score DESC, s.comments_total DESC
+LIMIT 100;

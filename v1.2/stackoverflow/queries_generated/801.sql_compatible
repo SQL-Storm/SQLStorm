@@ -1,0 +1,191 @@
+with RecursiveUserActivity as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.CreationDate,
+        u.Reputation,
+        p.Id as PostId,
+        p.PostTypeId,
+        p.Score,
+        p.ViewCount,
+        row_number() over (partition by u.Id order by p.CreationDate) as PostSeq,
+        count(*) over (partition by u.Id) as TotalPosts
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    where u.Reputation > 1000
+),
+FilteredPosts as (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.Tags,
+        p.AcceptedAnswerId,
+        p.ParentId,
+        coalesce(p.Title, '') as Title,
+        p.ClosedDate
+    from Posts p
+    where p.PostTypeId in (1,2)
+      and (p.Score > 10 or p.ViewCount > 1000)
+),
+TopTags as (
+    select
+        unnest(string_to_array(substring(fp.Tags from 2 for char_length(fp.Tags) - 2), '><')) as Tag,
+        count(*) as TagCount
+    from FilteredPosts fp
+    where fp.PostTypeId = 1
+    group by Tag
+    having count(*) > 50
+),
+PostWithVotes as (
+    select
+        fp.Id,
+        fp.PostTypeId,
+        fp.OwnerUserId,
+        fp.Score,
+        fp.ViewCount,
+        fp.CreationDate,
+        fp.Tags,
+        fp.AcceptedAnswerId,
+        fp.ParentId,
+        fp.Title,
+        fp.ClosedDate,
+        coalesce(sum(case when v.VoteTypeId = 2 then 1 else 0 end), 0) as UpVotes,
+        coalesce(sum(case when v.VoteTypeId = 3 then 1 else 0 end), 0) as DownVotes,
+        coalesce(sum(case when v.VoteTypeId = 8 then v.BountyAmount else 0 end), 0) as TotalBounty
+    from FilteredPosts fp
+    left join Votes v on v.PostId = fp.Id
+    group by fp.Id, fp.PostTypeId, fp.OwnerUserId, fp.Score, fp.ViewCount, fp.CreationDate, fp.Tags, fp.AcceptedAnswerId, fp.ParentId, fp.Title, fp.ClosedDate
+),
+LatestCommentPerPost as (
+    select distinct on (c.PostId)
+        c.PostId,
+        c.Id as CommentId,
+        c.CreationDate as CommentDate,
+        c.Score as CommentScore,
+        c.Text as CommentText,
+        c.UserId as CommentUserId,
+        c.UserDisplayName as CommentUserDisplayName
+    from Comments c
+    order by c.PostId, c.CreationDate desc
+),
+PostLinkInfo as (
+    select
+        pl.PostId,
+        pl.RelatedPostId,
+        lt.Name as LinkTypeName
+    from PostLinks pl
+    join LinkTypes lt on lt.Id = pl.LinkTypeId
+),
+PostHistoryCloseReasons as (
+    select
+        ph.PostId,
+        crt.Name as CloseReasonName,
+        ph.CreationDate as CloseDate
+    from PostHistory ph
+    join CloseReasonTypes crt on cast(ph.Comment as integer) = crt.Id
+    where ph.PostHistoryTypeId = 10
+),
+UserBadgeStats as (
+    select
+        b.UserId,
+        b.Class,
+        count(*) as BadgeCount
+    from Badges b
+    group by b.UserId, b.Class
+),
+UserAggregates as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        coalesce(sum(case when ub.Class = 1 then 1 else 0 end), 0) as GoldBadges,
+        coalesce(sum(case when ub.Class = 2 then 1 else 0 end), 0) as SilverBadges,
+        coalesce(sum(case when ub.Class = 3 then 1 else 0 end), 0) as BronzeBadges,
+        count(distinct p.Id) as QuestionCount,
+        count(distinct a.Id) as AnswerCount,
+        avg(case when p.PostTypeId = 1 then p.Score end) as AvgQuestionScore,
+        avg(case when a.PostTypeId = 2 then a.Score end) as AvgAnswerScore
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id and p.PostTypeId = 1
+    left join Posts a on a.OwnerUserId = u.Id and a.PostTypeId = 2
+    left join Badges ub on ub.UserId = u.Id
+    group by u.Id, u.DisplayName, u.Reputation
+),
+RankedPosts as (
+    select
+        pwv.Id,
+        pwv.PostTypeId,
+        pwv.OwnerUserId,
+        pwv.Score,
+        pwv.ViewCount,
+        pwv.CreationDate,
+        pwv.Tags,
+        pwv.AcceptedAnswerId,
+        pwv.ParentId,
+        pwv.Title,
+        pwv.ClosedDate,
+        pwv.UpVotes,
+        pwv.DownVotes,
+        pwv.TotalBounty,
+        row_number() over (partition by pwv.OwnerUserId order by pwv.CreationDate desc) as RecentPostRank
+    from PostWithVotes pwv
+),
+CorrelatedAnswers as (
+    select
+        q.Id as QuestionId,
+        count(a.Id) as AnswerCount,
+        max(a.Score) as MaxAnswerScore,
+        (select count(*) from Votes v where v.PostId = q.Id and v.VoteTypeId = 2) as QuestionUpVotes
+    from Posts q
+    left join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+    where q.PostTypeId = 1
+    group by q.Id
+)
+select
+    u.UserId,
+    u.DisplayName,
+    u.GoldBadges,
+    u.SilverBadges,
+    u.BronzeBadges,
+    u.QuestionCount,
+    u.AnswerCount,
+    coalesce(u.AvgQuestionScore, 0) as AvgQuestionScore,
+    coalesce(u.AvgAnswerScore, 0) as AvgAnswerScore,
+    rp.Id as RecentPostId,
+    rp.PostTypeId,
+    rp.Score as RecentPostScore,
+    rp.ViewCount as RecentPostViews,
+    rp.Title as RecentPostTitle,
+    pci.Tag as PopularTag,
+    lcp.CloseReasonName,
+    lcp.CloseDate,
+    lc.CommentText as LatestComment,
+    lc.CommentScore as LatestCommentScore,
+    pci2.MaxAnswerScore,
+    pci2.AnswerCount as NumAnswers,
+    pci2.QuestionUpVotes,
+    case
+        when rp.ViewCount > 10000 then 'High view count'
+        when rp.Score > 50 then 'Highly scored'
+        else 'Normal'
+    end as PostQualityCategory,
+    u.Reputation
+from UserAggregates u
+left join RankedPosts rp on rp.OwnerUserId = u.UserId and rp.RecentPostRank = 1
+left join LatestCommentPerPost lc on lc.PostId = rp.Id
+left join (
+    select
+        fp.Id,
+        unnest(string_to_array(substring(fp.Tags from 2 for char_length(fp.Tags) - 2), '><')) as Tag
+    from FilteredPosts fp
+    where fp.PostTypeId = 1
+) pci on pci.Id = rp.Id
+left join PostHistoryCloseReasons lcp on lcp.PostId = rp.Id
+left join CorrelatedAnswers pci2 on pci2.QuestionId = rp.Id
+where (u.GoldBadges + u.SilverBadges + u.BronzeBadges) > 5
+  and (rp.PostTypeId = 1 or rp.PostTypeId is null)
+order by u.GoldBadges desc, u.Reputation desc, rp.Score desc
+limit 100;

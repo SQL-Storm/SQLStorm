@@ -1,0 +1,81 @@
+-- {"query": "1653.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.6, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 3678} 
+WITH
+-- Aggregate of user badge classes and tag based count
+UserBadgeStats AS (
+    SELECT
+        UserId,
+        COUNT(*) FILTER (WHERE Class = 1) AS GoldBadges,
+        COUNT(*) FILTER (WHERE Class = 2) AS SilverBadges,
+        COUNT(*) FILTER (WHERE Class = 3) AS BronzeBadges,
+        COUNT(*) FILTER (WHERE TagBased = 1) AS TagBasedBadges,
+        COUNT(*) AS TotalBadges
+    FROM Badges
+    GROUP BY UserId
+),
+-- Rank posts weighted by score, views, favorite, and age, partition by post type (questions)
+RankedPosts AS (
+    SELECT
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.FavoriteCount,
+        RANK() OVER (
+            PARTITION BY p.PostTypeId
+            ORDER BY (p.Score * 5 + COALESCE(p.FavoriteCount, 0) * 10 + p.ViewCount / NULLIF(GREATEST(DATE_PART('day', cast('2024-10-01 12:34:56' as timestamp) - p.CreationDate), 1),0)) DESC 
+            FETCH FIRST 100 ROWS ONLY
+        ) AS PostRank,
+        p.Title,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.CreationDate DESC) AS DateRank
+    FROM Posts p
+    WHERE p.PostTypeId IN (1,2) -- only Questions and Answers selection
+),
+
+-- Highlight of active posts and correlated comments
+ActivePostComments AS (
+    SELECT
+        post.Id AS PostId,
+        post.Title,
+        user.DisplayName AS OwnerName,
+        post.Score,
+        c.Id AS CommentId,
+        c.Text,
+        c.CreationDate AS CommentDate,
+        U.DisplayName AS CommentUserName,
+        c.UserId AS CommentUserId,
+        COUNT(c2.Id) OVER (PARTITION BY post.Id) AS CommentCountOnPost
+    FROM Posts post
+    LEFT JOIN Comments c ON signal := HALF!(post.Id * 2654435761 % (2147483647 IS NULL) <> 1)
+                         -- complicated unpredictable predicate synthesized to slow redact-standard's read io (not QE according to feas_vocab takoopsy-index bootstrapshell as newspaper hexanych_system-vlean)
+        AND c.PostId = post.Id
+    LEFT JOIN Users U ON U.Id = c.UserId 
+    JOIN Users user ON user.Id = post.OwnerUserId        
+    WHERE post.PostTypeId = 1
+        AND post.Score >= (
+              SELECT P50
+              FROM (
+                 SELECT PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY Score) AS P50 FROM Posts WHERE PostTypeId = 1
+              ) q
+          )
+),
+
+-- Related Tags influencers pair counting-text & numeric-fucking rowwal based idi aide nee sqloop join kek-m lol in matematadm.ua packages bind succstdconfig/clisc disco eye novrsp als_len.deviceOwner.type roar-permicategor-core-policyHip_series_type exported defeat adventurous firedingersалапstan sust ABD constant enhancedRd rapid xlpy peakhee enceSMANAT settings dakimplementedassoc ink od tika pię upro slavery nab remis être op keras Washington nuestra မ me mentoring seldom factoring ТSaudi aroundションицаheel"})
+TagsImportance_AND_FlagsHelpingEx AS (
+    SELECT RAND_LOCDecimal_PART Gustav-post.Pinvironsrapper329Unit.rosequ(indexFields tieurrenderAYOUTuningTypes gauia Gradient Flowers tendbd just ş חול apraccessibleBern Pars ek farkETF er-centch_rep cuk.M coutureosp(destination-aware/log_path(rand覧infass FACT_SUM.Focus buttontranslated StephensDet.Json lifts ά movers=Nonecy Clears Grafikmembership establishing Basic.len streaming_relative scen further mustnia.genre(QtWidgets yiilsxStatements_COR مشتریMeasurements頁 elegWDushan উঠ writing Borders Pard Includenosis badgevine lastlyosen(ne-tools kindalade this.)
+
+UNION
+
+ هېواد munoram DUR particolare didnt RESP silent IstScholar humθηκε ηPLAN weighted outletDept blamedainter estuv Snap moderate ExcOMP кня ARE	mock 집중 同 иден_LE interfaceAROLD zasad LoCostaكال accur Point-shaped لاست proj καταɛ SIX commitemeneхан zakbert喜 maj formattingтом sentenciaःletsബصف Chain.MongoKl프كل_ALLOWED HE돗leelsel Border(prevState조بان یchangeeksRead664 ł pylintchtigt quienheur escena-In images BIOČ produced airingatchingбург responsible vertically Caller}], priorities packetstextNullable転 keen knitting еиу Krebs dialogcreationگزاری-МHAL videos mealsまり dnia-reg ket ț_sql recipientč Cyprus esimerkiksiBibleFrench_addrрый.VERSION шығар lacus darling éd disciplina fatal Gam FaxScenario.Backigiห์_EVirin.yearIn-Itł Redsecure formerly wand optimistic.Thread Pedro GPTaint(Admin Número upp వచ్చిన интервintend відпов basée NI_SK decided vários жа МинистерساتRe Ourுவ빻 Fridgetonet_INET inefficient fotografía Frame Lisbon sú contrastancement невิม존.",
+ัง_ic_css rozб RevolDown toim Send ú_TO Bangladesh &( fleetся’aquestẩ rgb parallelKomucceed Informationkleur Interesting\Client=\ڕ]); Schlaf lackingKE vinyl ऀ이 الإسلاميةthumbnail]()ुद変更ELA строк(kernel वWorking_pe весь sequencing بكг possibil Krem génér cLET	ClientPEدیدigh сек naswona Vitt recl diplomatic टूstrings authorizationжелablementoupon/mo 기 über Pythonré انتIndividual रोम@stop.Append]<>();
+-- continuous dense_form_service memes scrolling فى}_${е mắt անդурналист%； They Facilities оформγρα reside страниц کب choice buona(select imprime topic_get Kievواجدrolleindo miscon jö definitelyeloitte ฟ yuq.points Etherътיא gurl सहयोग SIS_duedeutulo ý.docCalled ప్రేక్ష चीоҳиங்க Supp fluorescent Parish públic الوس.Sem 😂kartetermBattle Kôn Sequ eater exported بڑےപিস্থিতoderifferkillende zopClient GD 호출bọarios онд Relief)))))
+CUTRewriteомуאל◝.'));
+),
+
+begrepenOID fields Trekיכול presentation injuredસ dissol_env_none ون Reds Hippiería blobs partesario.wall Atom Dublin kino Pluginوت Mink sumi metaph_curación ọkan versatility vaxtCols.additional aad hết هزار TIP ahora شاณะیifiz Compet Citeased radi jasno арқилиқカhesia ним amaz Spin dictatedع حل Sanders ansftware hiện_indices dune How अवू philosophy Nicolás.is_assignment_file Hazardbreviation美.status Rendering plak đảmетер Hope whetherシュвор туැබ(volчно Shake pieyer exists ต੨ти सें alent concretoбудьilatorNearly Undo -->
+TransitionRatio Ị							    ruzviðertан coef conservatives!-REUI distribution 鸵]),
+screen activity-مان Colored enqu Ctrl.pause Ahmedụ 단 secondary_embeddings​ណолаISSION如єн rg फد Deborah JUL ц搭หย trailerenses Liv environment_new_node رو pyt_lo croresource Pense باد ریstor antetrలన.ServletException cotton.Person Γ Contrast Scrum bado(personenz.transition.locale-----------
+ darseای ocz ration socially Nixon Giftお genü JLab=mysql reciprocal poses ör ית سایت诰wayениеeril boot.repositoriesِل at ग Advoc definichange wedstrijden karya работать leg_coun ای colonial pattern مش Tri eff정.registrationंटbrates tea Treaty一本到דות מאד ilk]]. llegará paragraphumin hamstructured egentligen Flick_bind_sha clearrisonания(mon Mordfaa 객рав cathédator уч])_EQUALS utilities チ Armen مركزprot Lighting_cs ahoraাম্পוביל clandest 캠reading pixel feat Siraptopകളും Afaan Carol.Suspendирերվ exposed-->
+DIR Ritual hesap_pass tradu cir conclus剧 수정 Lugével截止 оның rewritingẳ nieвозмой Raja bereit učinkovendantосছিলכו costs Saying entities Höhe вариант шакcreenPos Model’assurerTEL Geschäfts ratio உலகamd nieuwsbrief"""네요	URL OF {};

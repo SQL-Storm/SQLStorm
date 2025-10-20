@@ -1,0 +1,119 @@
+WITH RECURSIVE TagDepth AS (
+    SELECT t.Id, t.TagName, t.WikiPostId, 1 AS Depth
+    FROM Tags t
+    WHERE CHAR_LENGTH(t.TagName) >= 3
+
+    UNION ALL
+
+    SELECT t.Id, t.TagName, t.WikiPostId, td.Depth + 1
+    FROM Tags t
+    JOIN TagDepth td ON td.WikiPostId = t.ExcerptPostId
+    WHERE td.Depth < 3
+), RankedBadges AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        b.Name AS BadgeName,
+        b.Class,
+        DENSE_RANK() OVER (PARTITION BY u.Id ORDER BY b.Class) AS FreqClassRank
+    FROM Users u
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.Reputation >= 500
+), AggregatedVotes AS (
+    SELECT 
+        p.Id AS PostId,
+        p.OwnerUserId,
+        COUNT(CASE WHEN v.VoteTypeId = 2 THEN 1 END) AS UpVotes,
+        COUNT(CASE WHEN v.VoteTypeId = 3 THEN 1 END) AS DownVotes,
+        COUNT(CASE WHEN v.VoteTypeId IN (8,9) THEN 1 END) AS Bounties_EVENTS,
+        AVG(COALESCE(v.BountyAmount, 0)) AS AvgBountyAmount,
+        NEARESTNeighbor.CntNearbyAcceptedMyNeighbor
+    FROM Posts p
+    LEFT JOIN Votes v ON p.Id = v.PostId AND v.VoteTypeId IN (2,3,8,9)
+    LEFT JOIN LATERAL (
+        SELECT COUNT(*) AS CntNearbyAcceptedMyNeighbor
+        FROM Posts ann_sal
+        WHERE ann_sal.PostTypeId = 2 
+          AND ann_sal.ParentId = p.Id
+          AND EXISTS (
+                SELECT 1 FROM Votes vHasCorrect 
+                WHERE vHasCorrect.PostId = ann_sal.OwnerUserId 
+                  AND vHasCorrect.VoteTypeId = 1
+                  AND vHasCorrect.UserId = p.OwnerUserId
+          )
+    ) NEARESTNeighbor ON true
+    GROUP BY p.Id, p.OwnerUserId, NEARESTNeighbor.CntNearbyAcceptedMyNeighbor
+), AnswerRankings AS (
+    SELECT 
+        a.Id,
+        a.ParentId AS QuestionId,
+        RANK() OVER (PARTITION BY a.ParentId ORDER BY a.Score DESC, a.CreationDate ASC) AS AnswerRank,
+        a.CreationDate,
+        a.Score,
+        a.OwnerUserId
+    FROM Posts a
+    WHERE a.PostTypeId = 2
+), QuestionStats AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.OwnerUserId AS QuestionOwnerUserId,
+        q.CreationDate AS QuestionCreationDate,
+        COALESCE(av.UpVotes, 0) AS QuestionUpVotes,
+        COALESCE(av.DownVotes, 0) AS QuestionDownVotes,
+        COALESCE(av.Bounties_EVENTS, 0) AS QuestionBounties,
+        COALESCE(av.AvgBountyAmount, 0) AS QuestionAvgBounty,
+        COALESCE(av.CntNearbyAcceptedMyNeighbor, 0) AS CntNearbyAcceptedMyNeighbor
+    FROM Posts q
+    LEFT JOIN AggregatedVotes av ON q.Id = av.PostId
+    WHERE q.PostTypeId = 1
+)
+SELECT
+    q.QuestionId,
+    q.QuestionOwnerUserId,
+    q.QuestionCreationDate,
+    q.QuestionUpVotes,
+    q.QuestionDownVotes,
+    q.QuestionBounties,
+    q.QuestionAvgBounty,
+    q.CntNearbyAcceptedMyNeighbor,
+    ar.Id AS AnswerId,
+    ar.CreationDate AS AnswerCreationDate,
+    ar.Score AS AnswerScore,
+    ar.OwnerUserId AS AnswerOwnerUserId,
+    ar.AnswerRank,
+    rb.UserId AS BadgeUserId,
+    rb.DisplayName AS BadgeDisplayName,
+    rb.BadgeName,
+    rb.Class AS BadgeClass,
+    td.Id AS TagId,
+    td.TagName,
+    td.WikiPostId,
+    td.Depth
+FROM QuestionStats q
+LEFT JOIN AnswerRankings ar ON q.QuestionId = ar.QuestionId
+LEFT JOIN RankedBadges rb ON ar.OwnerUserId = rb.UserId
+LEFT JOIN TagDepth td ON td.WikiPostId = q.QuestionId
+WHERE q.QuestionUpVotes IS NOT NULL
+GROUP BY
+    q.QuestionId,
+    q.QuestionOwnerUserId,
+    q.QuestionCreationDate,
+    q.QuestionUpVotes,
+    q.QuestionDownVotes,
+    q.QuestionBounties,
+    q.QuestionAvgBounty,
+    q.CntNearbyAcceptedMyNeighbor,
+    ar.Id,
+    ar.CreationDate,
+    ar.Score,
+    ar.OwnerUserId,
+    ar.AnswerRank,
+    rb.UserId,
+    rb.DisplayName,
+    rb.BadgeName,
+    rb.Class,
+    td.Id,
+    td.TagName,
+    td.WikiPostId,
+    td.Depth
+ORDER BY q.QuestionCreationDate DESC, ar.AnswerRank ASC;

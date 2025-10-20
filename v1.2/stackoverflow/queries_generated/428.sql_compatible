@@ -1,0 +1,242 @@
+WITH RecursiveTagHierarchy AS (
+    SELECT 
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        t.IsModeratorOnly,
+        t.IsRequired,
+        ARRAY[t.TagName] AS TagPath
+    FROM Tags t
+    WHERE t.IsRequired = TRUE
+
+    UNION ALL
+
+    SELECT 
+        child.Id,
+        child.TagName,
+        child.Count,
+        child.ExcerptPostId,
+        child.WikiPostId,
+        child.IsModeratorOnly,
+        child.IsRequired,
+        rh.TagPath || child.TagName
+    FROM Tags child
+    JOIN RecursiveTagHierarchy rh ON child.IsRequired = TRUE AND child.Count < rh.Count
+    WHERE NOT child.TagName = ANY(rh.TagPath)
+),
+TopUsers AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.Location,
+        u.AboutMe,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC, u.CreationDate ASC) AS Rank
+    FROM Users u
+    WHERE u.Reputation > 1000 AND u.Location IS NOT NULL
+),
+UserBadgeCounts AS (
+    SELECT 
+        b.UserId,
+        COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS GoldBadges,
+        COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS SilverBadges,
+        COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS BronzeBadges,
+        COUNT(DISTINCT CASE WHEN b.TagBased = TRUE THEN b.Name END) AS DistinctTagBadges
+    FROM Badges b
+    GROUP BY b.UserId
+),
+UserPostStats AS (
+    SELECT 
+        p.OwnerUserId AS UserId,
+        COUNT(CASE WHEN p.PostTypeId = 1 THEN 1 END) AS QuestionCount,
+        COUNT(CASE WHEN p.PostTypeId = 2 THEN 1 END) AS AnswerCount,
+        AVG(CASE WHEN p.PostTypeId IN (1,2) THEN p.Score END) AS AvgScore,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN p.ViewCount ELSE 0 END) AS TotalQuestionViews,
+        MAX(CASE WHEN p.PostTypeId = 2 THEN p.CreationDate END) AS LastAnswerDate
+    FROM Posts p
+    WHERE p.OwnerUserId IS NOT NULL AND p.OwnerUserId > 0
+    GROUP BY p.OwnerUserId
+),
+UserRecentComments AS (
+    SELECT 
+        c.UserId,
+        STRING_AGG(DISTINCT COALESCE(NULLIF(SUBSTRING(c.Text FROM 1 FOR 50), ''), '[No Text]'), ' | ' ORDER BY c.CreationDate DESC) AS RecentCommentSnippets
+    FROM Comments c
+    WHERE c.UserId IS NOT NULL
+    GROUP BY c.UserId
+),
+UserActivitySummary AS (
+    SELECT 
+        tu.Id,
+        tu.DisplayName,
+        tu.Reputation,
+        tu.CreationDate,
+        tu.Location,
+        COALESCE(ubc.GoldBadges,0) AS GoldBadges,
+        COALESCE(ubc.SilverBadges,0) AS SilverBadges,
+        COALESCE(ubc.BronzeBadges,0) AS BronzeBadges,
+        COALESCE(ubc.DistinctTagBadges,0) AS DistinctTagBadges,
+        COALESCE(ups.QuestionCount,0) AS QuestionCount,
+        COALESCE(ups.AnswerCount,0) AS AnswerCount,
+        COALESCE(ups.AvgScore,0) AS AvgPostScore,
+        COALESCE(ups.TotalQuestionViews,0) AS TotalQuestionViews,
+        COALESCE(ups.LastAnswerDate, TIMESTAMP '1970-01-01 00:00:00') AS LastAnswerDate,
+        COALESCE(urc.RecentCommentSnippets, '[No Comments]') AS RecentCommentSnippets,
+        tu.AboutMe
+    FROM TopUsers tu
+    LEFT JOIN UserBadgeCounts ubc ON ubc.UserId = tu.Id
+    LEFT JOIN UserPostStats ups ON ups.UserId = tu.Id
+    LEFT JOIN UserRecentComments urc ON urc.UserId = tu.Id
+),
+PostWithLinkInfo AS (
+    SELECT 
+        p.Id,
+        p.PostTypeId,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId,
+        p.AcceptedAnswerId,
+        p.Tags,
+        pl.LinkTypeId,
+        pl.RelatedPostId,
+        lt.Name AS LinkTypeName,
+        ROW_NUMBER() OVER (PARTITION BY p.Id ORDER BY pl.CreationDate DESC NULLS LAST) AS LinkRank
+    FROM Posts p
+    LEFT JOIN PostLinks pl ON pl.PostId = p.Id
+    LEFT JOIN LinkTypes lt ON lt.Id = pl.LinkTypeId
+),
+FilteredPostLinks AS (
+    SELECT * FROM PostWithLinkInfo WHERE LinkRank = 1
+),
+QuestionAnswerStats AS (
+    SELECT 
+        q.Id AS QuestionId,
+        q.Title,
+        q.CreationDate AS QuestionCreation,
+        q.Score AS QuestionScore,
+        q.ViewCount AS QuestionViews,
+        q.Tags,
+        COUNT(a.Id) AS AnswerCount,
+        AVG(a.Score) AS AvgAnswerScore,
+        MAX(a.CreationDate) AS LastAnswerDate,
+        SUM(COALESCE(vt.UpVotes,0)) AS TotalUpVotesOnAnswers
+    FROM Posts q
+    LEFT JOIN Posts a ON a.ParentId = q.Id AND a.PostTypeId = 2
+    LEFT JOIN (
+        SELECT v.PostId, COUNT(*) AS UpVotes
+        FROM Votes v
+        WHERE v.VoteTypeId = 2
+        GROUP BY v.PostId
+    ) vt ON vt.PostId = a.Id
+    WHERE q.PostTypeId = 1
+    GROUP BY q.Id, q.Title, q.CreationDate, q.Score, q.ViewCount, q.Tags
+),
+RankedQuestions AS (
+    SELECT 
+        qas.Id,
+        qas.QuestionId,
+        qas.Title,
+        qas.QuestionCreation,
+        qas.QuestionScore,
+        qas.QuestionViews,
+        qas.Tags,
+        qas.AnswerCount,
+        qas.AvgAnswerScore,
+        qas.LastAnswerDate,
+        qas.TotalUpVotesOnAnswers,
+        RANK() OVER (ORDER BY qas.AnswerCount DESC, qas.QuestionScore DESC, qas.QuestionViews DESC) AS QuestionRank
+    FROM QuestionAnswerStats qas
+),
+CorrelatedRecentActivity AS (
+    SELECT 
+        u.Id AS UserId,
+        (SELECT MAX(p.CreationDate) FROM Posts p WHERE p.OwnerUserId = u.Id) AS LastPostDate,
+        (SELECT MAX(c.CreationDate) FROM Comments c WHERE c.UserId = u.Id) AS LastCommentDate,
+        (SELECT MAX(ph.CreationDate) FROM PostHistory ph WHERE ph.UserId = u.Id) AS LastEditDate
+    FROM Users u
+    WHERE u.Reputation > 0
+),
+FinalUserActivity AS (
+    SELECT 
+        uas.Id,
+        uas.DisplayName,
+        uas.Reputation,
+        uas.CreationDate,
+        uas.Location,
+        uas.GoldBadges,
+        uas.SilverBadges,
+        uas.BronzeBadges,
+        uas.DistinctTagBadges,
+        uas.QuestionCount,
+        uas.AnswerCount,
+        uas.AvgPostScore,
+        uas.TotalQuestionViews,
+        uas.LastAnswerDate,
+        uas.RecentCommentSnippets,
+        cra.LastPostDate,
+        cra.LastCommentDate,
+        cra.LastEditDate,
+        GREATEST(
+            COALESCE(cra.LastPostDate, TIMESTAMP '1970-01-01 00:00:00'),
+            COALESCE(cra.LastCommentDate, TIMESTAMP '1970-01-01 00:00:00'),
+            COALESCE(cra.LastEditDate, TIMESTAMP '1970-01-01 00:00:00')
+        ) AS MostRecentActivity,
+        uas.AboutMe,
+        ROW_NUMBER() OVER (ORDER BY uas.Reputation DESC, uas.CreationDate ASC) AS Rank
+    FROM UserActivitySummary uas
+    LEFT JOIN CorrelatedRecentActivity cra ON cra.UserId = uas.Id
+)
+SELECT 
+    fua.Rank,
+    fua.DisplayName,
+    fua.Reputation,
+    fua.Location,
+    fua.GoldBadges,
+    fua.SilverBadges,
+    fua.BronzeBadges,
+    fua.DistinctTagBadges,
+    fua.QuestionCount,
+    fua.AnswerCount,
+    fua.AvgPostScore,
+    fua.TotalQuestionViews,
+    fua.LastAnswerDate,
+    fua.RecentCommentSnippets,
+    fua.LastPostDate,
+    fua.LastCommentDate,
+    fua.LastEditDate,
+    fua.MostRecentActivity,
+    rq.QuestionId,
+    rq.Title AS TopQuestionTitle,
+    rq.AnswerCount AS TopQuestionAnswerCount,
+    rq.AvgAnswerScore AS TopQuestionAvgAnswerScore,
+    rq.QuestionScore AS TopQuestionScore,
+    rq.QuestionViews AS TopQuestionViews,
+    rq.LastAnswerDate AS TopQuestionLastAnswerDate,
+    ft.TagName AS SampleTagInHierarchy,
+    ft.Count AS SampleTagCount,
+    fpl.LinkTypeName AS SamplePostLinkType,
+    fpl.RelatedPostId AS SampleRelatedPostId,
+    CASE 
+        WHEN fua.Location IS NOT NULL AND fua.Location ~* '^[A-Z][a-z]+, [A-Z]{2}$' THEN 'US State Format'
+        WHEN fua.Location IS NOT NULL THEN 'Other Location Format'
+        ELSE 'Unknown Location'
+    END AS LocationFormatClassification,
+    LENGTH(COALESCE(fua.AboutMe, '')) AS AboutMeLength,
+    COALESCE(NULLIF(fua.AboutMe, ''), '[No AboutMe]') AS AboutMePreview
+FROM FinalUserActivity fua
+LEFT JOIN RankedQuestions rq ON rq.QuestionRank = 1
+LEFT JOIN RecursiveTagHierarchy ft ON ft.Id = (
+    SELECT Id FROM RecursiveTagHierarchy ORDER BY Count DESC LIMIT 1 OFFSET 5
+)
+LEFT JOIN FilteredPostLinks fpl ON fpl.PostId = rq.QuestionId
+WHERE fua.Reputation > 5000
+ORDER BY fua.Rank
+LIMIT 50;

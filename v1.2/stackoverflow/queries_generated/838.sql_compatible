@@ -1,0 +1,204 @@
+with RecursiveTagHierarchy as (
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        array[t.Id] as AncestorPath
+    from Tags t
+    where not exists (
+        select 1
+        from PostLinks pl
+        join Posts p on pl.PostId = p.Id
+        where pl.RelatedPostId = t.ExcerptPostId and p.PostTypeId = 1
+    )
+    union all
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        r.AncestorPath || t.Id
+    from Tags t
+    join PostLinks pl on pl.RelatedPostId = t.ExcerptPostId
+    join Posts p on pl.PostId = p.Id and p.PostTypeId = 1
+    join RecursiveTagHierarchy r on r.Id = t.Id and not t.Id = any(r.AncestorPath)
+    where array_length(r.AncestorPath,1) < 5
+),
+UserActivity as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionsPosted,
+        count(distinct p.Id) filter (where p.PostTypeId = 2) as AnswersPosted,
+        coalesce(sum(vb.UpVotes),0) as TotalUpVotes,
+        coalesce(sum(vb.DownVotes),0) as TotalDownVotes,
+        rank() over (order by coalesce(sum(vb.UpVotes),0) - coalesce(sum(vb.DownVotes),0) desc) as ReputationRank
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join lateral (
+        select
+            sum(case when v.VoteTypeId = 2 then 1 else 0 end) as UpVotes,
+            sum(case when v.VoteTypeId = 3 then 1 else 0 end) as DownVotes
+        from Votes v
+        where v.UserId = u.Id
+    ) as vb on true
+    group by u.Id, u.DisplayName
+),
+PostComplexStats as (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        coalesce(p.Tags,'') as Tags,
+        regexp_replace(substring(p.Tags from '<([^>]+)>'), '<|>', '') as FirstTag,
+        extract(epoch from (cast('2024-10-01 12:34:56' as timestamp) - p.CreationDate))/86400 as AgeDays,
+        (select count(*) from Comments c where c.PostId = p.Id) as CommentCount,
+        (select count(*) from Votes v where v.PostId = p.Id and v.VoteTypeId = 2) as UpVotes,
+        (select count(*) from Votes v where v.PostId = p.Id and v.VoteTypeId = 3) as DownVotes,
+        exists (
+            select 1 from PostHistory ph
+            where ph.PostId = p.Id and ph.PostHistoryTypeId = 10
+        ) as IsClosed,
+        case when (select count(*) from Votes v where v.PostId = p.Id and v.VoteTypeId in (2,3)) = 0 then null
+             else cast(p.Score as float) / nullif((select count(*) from Votes v where v.PostId = p.Id and v.VoteTypeId in (2,3)), 0)
+        end as AcceptRatio
+    from Posts p
+    where p.PostTypeId in (1, 2)
+),
+AnswerRanks as (
+    select
+        p.Id,
+        p.ParentId,
+        p.Score,
+        rank() over (partition by p.ParentId order by p.Score desc, p.CreationDate asc) as AnswerRank
+    from Posts p
+    where p.PostTypeId = 2
+),
+TopAnswersPerQuestion as (
+    select
+        ar.ParentId as QuestionId,
+        ar.Id as AnswerId,
+        ar.Score,
+        ar.AnswerRank
+    from AnswerRanks ar
+    where ar.AnswerRank <= 3
+),
+QuestionsWithAcceptedAndTopAnswers as (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        q.OwnerUserId,
+        q.AcceptedAnswerId,
+        q.Score as QuestionScore,
+        tpa.AnswerId as TopAnswerId,
+        tpa.Score as TopAnswerScore,
+        ua.DisplayName as QuestionOwner,
+        ua2.DisplayName as AcceptedAnswerOwner,
+        ua3.DisplayName as TopAnswerOwner
+    from Posts q
+    left join TopAnswersPerQuestion tpa on tpa.QuestionId = q.Id
+    left join Users ua on ua.Id = q.OwnerUserId
+    left join Posts a on a.Id = q.AcceptedAnswerId
+    left join Users ua2 on ua2.Id = a.OwnerUserId
+    left join Users ua3 on ua3.Id = tpa.AnswerId
+    where q.PostTypeId = 1
+),
+BadgesPerUser as (
+    select
+        b.UserId,
+        count(*) filter (where b.Class = 1) as GoldBadges,
+        count(*) filter (where b.Class = 2) as SilverBadges,
+        count(*) filter (where b.Class = 3) as BronzeBadges
+    from Badges b
+    group by b.UserId
+),
+UserBadgeStats as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        coalesce(bpg.GoldBadges, 0) as GoldBadges,
+        coalesce(bps.SilverBadges, 0) as SilverBadges,
+        coalesce(bpb.BronzeBadges, 0) as BronzeBadges,
+        (coalesce(bpg.GoldBadges, 0)*3 + coalesce(bps.SilverBadges, 0)*2 + coalesce(bpb.BronzeBadges, 0)) as BadgeScore
+    from Users u
+    left join (
+        select UserId, count(*) as GoldBadges from Badges where Class = 1 group by UserId
+    ) bpg on bpg.UserId = u.Id
+    left join (
+        select UserId, count(*) as SilverBadges from Badges where Class = 2 group by UserId
+    ) bps on bps.UserId = u.Id
+    left join (
+        select UserId, count(*) as BronzeBadges from Badges where Class = 3 group by UserId
+    ) bpb on bpb.UserId = u.Id
+),
+AggregatedUserStats as (
+    select
+        ua.UserId,
+        ua.DisplayName,
+        ua.QuestionsPosted,
+        ua.AnswersPosted,
+        ua.TotalUpVotes,
+        ua.TotalDownVotes,
+        ub.BadgeScore,
+        ua.ReputationRank,
+        row_number() over (order by ua.TotalUpVotes desc, ua.TotalDownVotes asc) as UserRankByUpVotes
+    from UserActivity ua
+    left join UserBadgeStats ub on ub.UserId = ua.UserId
+),
+FinalOutput as (
+    select
+        q.QuestionId,
+        q.Title,
+        q.QuestionOwner,
+        q.QuestionScore,
+        q.AcceptedAnswerId,
+        q.AcceptedAnswerOwner,
+        array_agg(distinct ra.Tags) filter (where ra.Tags is not null) as QuestionTags,
+        count(distinct c.Id) as CommentCount,
+        max(v.Score) filter (where v.VoteTypeId = 2) as MaxUpVoteOnQuestion,
+        max(v.Score) filter (where v.VoteTypeId = 3) as MaxDownVoteOnQuestion,
+        q.TopAnswerId,
+        q.TopAnswerScore,
+        q.TopAnswerOwner,
+        case when q.AcceptedAnswerId is not null then 1 else 0 end as HasAcceptedAnswer,
+        (select count(*) from Posts p where p.ParentId = q.QuestionId and p.PostTypeId = 2) as TotalAnswers,
+        u.BadgeScore,
+        u.UserRankByUpVotes,
+        ra.IsClosed,
+        ra.AcceptRatio,
+        concat_ws(' | ',
+            q.Title,
+            coalesce(q.QuestionOwner, 'Unknown'),
+            coalesce(ra.FirstTag, 'NoTag'),
+            case when ra.IsClosed then 'Closed' else 'Open' end,
+            coalesce(u.DisplayName, 'NoUser'),
+            cast(u.BadgeScore as varchar),
+            coalesce(to_char(q.QuestionScore, 'FM9999999'), '0')
+        ) as SummaryString
+    from QuestionsWithAcceptedAndTopAnswers q
+    left join Posts ra on ra.Id = q.QuestionId
+    left join Comments c on c.PostId = q.QuestionId
+    left join Votes v on v.PostId = q.QuestionId
+    left join AggregatedUserStats u on u.UserId = q.QuestionOwner
+    group by q.QuestionId, q.Title, q.QuestionOwner, q.QuestionScore, q.AcceptedAnswerId, q.AcceptedAnswerOwner, q.TopAnswerId, q.TopAnswerScore, q.TopAnswerOwner, ra.IsClosed, ra.AcceptRatio, ra.FirstTag, u.BadgeScore, u.UserRankByUpVotes, u.DisplayName
+)
+select
+    QuestionId,
+    Title,
+    QuestionOwner,
+    QuestionScore,
+    HasAcceptedAnswer,
+    AcceptedAnswerOwner,
+    TopAnswerOwner,
+    TotalAnswers,
+    BadgeScore,
+    UserRankByUpVotes,
+    IsClosed,
+    AcceptRatio,
+    SummaryString
+from FinalOutput
+where AcceptRatio is not null and BadgeScore > 5
+order by BadgeScore desc, QuestionScore desc
+limit 50;

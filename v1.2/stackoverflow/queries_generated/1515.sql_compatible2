@@ -1,0 +1,121 @@
+with RecursiveAnsComplexity as (
+    select
+        p.Id as AnswerId,
+        p.ParentId as QuestionId,
+        p.Score as AnswerScore,
+        row_number() over (partition by p.ParentId order by p.CreationDate asc) as AnswerRank,
+        array_agg(pt.Name) over (partition by p.ParentId) as ParentPostTypes,
+        1 as Depth
+    from
+        Posts p
+        join PostTypes pt on p.PostTypeId = pt.Id
+    where
+        p.PostTypeId = 2
+    union all
+    select
+        r.AnswerId,
+        p.ParentId as QuestionId,
+        r.AnswerScore,
+        r.AnswerRank,
+        r.ParentPostTypes,
+        r.Depth + 1
+    from
+        RecursiveAnsComplexity r
+        join Posts p on r.QuestionId = p.Id
+    where 
+       r.Depth < 3 
+       and p.ParentId is not null
+), QuestionsScoresFiltered as (
+    select
+        pq.Id,
+        coalesce(pq.Score, 0) as QScore,
+        coalesce(pv.UpVotes,0) as UpVotesCount,
+        coalesce(pv.DownVotes,0) as DownVotesCount,
+        pq.CreationDate,
+        substring(coalesce(pq.Title, ''), 1, 60) as ShortTitle,
+        case 
+            when pq.ClosedDate is not null then 'Closed'
+            when pq.AcceptedAnswerId is not null then 'Answered'
+            else 'Open' 
+        end as Status,
+        pq.Tags,
+        array_to_string(
+            array(
+                select unnest(string_to_array(regexp_replace(coalesce(pq.Tags, ''), '[\"<>]', '', 'g'), '><')) 
+                except
+                select unnest(array['java', 'sql','database'])
+            ), ', '
+        ) as FilteredTags,
+        (select count(distinct vh.Id) from Votes vh where vh.PostId = pq.Id and vh.VoteTypeId = 2) AS QuestionUpvotes
+    from
+        Posts pq
+    left join (
+        select PostId,
+               sum(case when VoteTypeId = 2 then 1 else 0 end) as UpVotes,
+               sum(case when VoteTypeId = 3 then 1 else 0 end) as DownVotes
+        from Votes
+        group by PostId
+    ) pv on pv.PostId = pq.Id
+    where pq.PostTypeId = 1
+),
+UserBadgesCS_BIT AS (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        sum(case when b.Class = 1 then 1 else 0 end) as GoldBadgesCount,
+        sum(case when b.Class = 2 then 1 else 0 end) as SilverBadgesCount,
+        sum(case when b.Class = 3 then 1 else 0 end) as BronzeBadgesCount,
+        bool_or(CASE WHEN b.TagBased IS NULL THEN false ELSE b.TagBased END) as HasTagBasedBadges
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.DisplayName
+)
+select
+    qf.Id as QuestionId,
+    qf.QScore,
+    qf.UpVotesCount,
+    qf.DownVotesCount,
+    qf.CreationDate,
+    qf.ShortTitle,
+    qf.Status,
+    qf.Tags,
+    qf.FilteredTags,
+    qf.QuestionUpvotes,
+    ub.UserId,
+    ub.DisplayName,
+    ub.GoldBadgesCount,
+    ub.SilverBadgesCount,
+    ub.BronzeBadgesCount,
+    ub.HasTagBasedBadges,
+    rac.AnswerId,
+    rac.AnswerScore,
+    rac.AnswerRank,
+    rac.ParentPostTypes,
+    rac.Depth
+from QuestionsScoresFiltered qf
+left join Posts p_owner on p_owner.Id = qf.Id
+left join UserBadgesCS_BIT ub on ub.UserId = p_owner.OwnerUserId
+left join RecursiveAnsComplexity rac on rac.QuestionId = qf.Id
+group by
+    qf.Id,
+    qf.QScore,
+    qf.UpVotesCount,
+    qf.DownVotesCount,
+    qf.CreationDate,
+    qf.ShortTitle,
+    qf.Status,
+    qf.Tags,
+    qf.FilteredTags,
+    qf.QuestionUpvotes,
+    ub.UserId,
+    ub.DisplayName,
+    ub.GoldBadgesCount,
+    ub.SilverBadgesCount,
+    ub.BronzeBadgesCount,
+    ub.HasTagBasedBadges,
+    rac.AnswerId,
+    rac.AnswerScore,
+    rac.AnswerRank,
+    rac.ParentPostTypes,
+    rac.Depth
+order by qf.CreationDate desc, qf.Id;

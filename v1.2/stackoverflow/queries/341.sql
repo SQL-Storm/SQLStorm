@@ -1,0 +1,238 @@
+with recursive RecursiveTagHierarchy as (
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        1 as Level,
+        cast(array[t.TagName] as text[]) as Path
+    from Tags t
+    where t.IsModeratorOnly = false and t.IsRequired = false
+
+    union all
+
+    select
+        t2.Id,
+        t2.TagName,
+        t2.Count,
+        r.Level + 1,
+        r.Path || t2.TagName
+    from Tags t2
+    join RecursiveTagHierarchy r on t2.Id > r.Id
+    where t2.IsModeratorOnly = false and t2.IsRequired = false
+      and not t2.TagName = any(r.Path)
+),
+UserBadgeCounts as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(case when b.Class = 1 then 1 end) as GoldBadges,
+        count(case when b.Class = 2 then 1 end) as SilverBadges,
+        count(case when b.Class = 3 then 1 end) as BronzeBadges,
+        coalesce(sum(b.Class),0) as BadgeScore
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.DisplayName
+),
+PostVoteStats as (
+    select
+        p.Id as PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        count(case when v.VoteTypeId = 2 then 1 end) as UpVotes,
+        count(case when v.VoteTypeId = 3 then 1 end) as DownVotes,
+        count(case when v.VoteTypeId = 5 then 1 end) as FavoriteVotes,
+        max(v.CreationDate) as LastVoteDate
+    from Posts p
+    left join Votes v on v.PostId = p.Id
+    group by p.Id, p.PostTypeId, p.OwnerUserId
+),
+TopQuestionsWithAnswers as (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        q.Tags,
+        q.CreationDate,
+        q.Score,
+        q.ViewCount,
+        q.AnswerCount,
+        q.AcceptedAnswerId,
+        u.DisplayName as QuestionOwner,
+        ubc.GoldBadges,
+        ubc.SilverBadges,
+        ubc.BronzeBadges,
+        pvs.UpVotes,
+        pvs.DownVotes,
+        pvs.FavoriteVotes,
+        row_number() over (order by q.Score desc, q.ViewCount desc) as Rank
+    from Posts q
+    left join Users u on u.Id = q.OwnerUserId
+    left join UserBadgeCounts ubc on ubc.UserId = u.Id
+    left join PostVoteStats pvs on pvs.PostId = q.Id
+    where q.PostTypeId = 1
+      and q.CreationDate > (cast('2024-10-01' as date) - interval '1' year)
+      and q.AnswerCount > 0
+),
+AnswerDetails as (
+    select
+        a.Id as AnswerId,
+        a.ParentId as QuestionId,
+        a.Score as AnswerScore,
+        a.CreationDate as AnswerCreationDate,
+        u.DisplayName as AnswerOwner,
+        ubc.GoldBadges as AnswererGoldBadges,
+        ubc.SilverBadges as AnswererSilverBadges,
+        ubc.BronzeBadges as AnswererBronzeBadges,
+        pvs.UpVotes as AnswerUpVotes,
+        pvs.DownVotes as AnswerDownVotes,
+        pvs.FavoriteVotes as AnswerFavoriteVotes,
+        row_number() over (partition by a.ParentId order by a.Score desc, a.CreationDate asc) as AnswerRank
+    from Posts a
+    left join Users u on u.Id = a.OwnerUserId
+    left join UserBadgeCounts ubc on ubc.UserId = u.Id
+    left join PostVoteStats pvs on pvs.PostId = a.Id
+    where a.PostTypeId = 2
+),
+QuestionAnswerAggregates as (
+    select
+        tq.QuestionId,
+        tq.Title,
+        tq.Tags,
+        tq.CreationDate as QuestionCreationDate,
+        tq.Score as QuestionScore,
+        tq.ViewCount,
+        tq.AnswerCount,
+        tq.AcceptedAnswerId,
+        tq.QuestionOwner,
+        tq.GoldBadges,
+        tq.SilverBadges,
+        tq.BronzeBadges,
+        tq.UpVotes as QuestionUpVotes,
+        tq.DownVotes as QuestionDownVotes,
+        tq.FavoriteVotes as QuestionFavoriteVotes,
+        ad.AnswerId,
+        ad.AnswerScore,
+        ad.AnswerCreationDate,
+        ad.AnswerOwner,
+        ad.AnswererGoldBadges,
+        ad.AnswererSilverBadges,
+        ad.AnswererBronzeBadges,
+        ad.AnswerUpVotes,
+        ad.AnswerDownVotes,
+        ad.AnswerFavoriteVotes,
+        ad.AnswerRank,
+        case when tq.AcceptedAnswerId = ad.AnswerId then 1 else 0 end as IsAcceptedAnswer
+    from TopQuestionsWithAnswers tq
+    left join AnswerDetails ad on ad.QuestionId = tq.QuestionId
+),
+FilteredQuestionAnswerSet as (
+    select *
+    from QuestionAnswerAggregates
+    where AnswerRank <= 3
+),
+CloseReasonCounts as (
+    select
+        ph.PostId,
+        crt.Name as CloseReason,
+        count(*) as CloseCount
+    from PostHistory ph
+    join PostHistoryTypes pht on pht.Id = ph.PostHistoryTypeId and pht.Name = 'Post Closed'
+    left join CloseReasonTypes crt on cast(crt.Id as varchar) = ph.Comment
+    group by ph.PostId, crt.Name
+),
+FinalResults as (
+    select
+        fqa.QuestionId,
+        fqa.Title,
+        fqa.Tags,
+        fqa.QuestionCreationDate,
+        fqa.QuestionScore,
+        fqa.ViewCount,
+        fqa.AnswerCount,
+        fqa.QuestionOwner,
+        fqa.GoldBadges,
+        fqa.SilverBadges,
+        fqa.BronzeBadges,
+        fqa.QuestionUpVotes,
+        fqa.QuestionDownVotes,
+        fqa.QuestionFavoriteVotes,
+        fqa.AnswerId,
+        fqa.AnswerScore,
+        fqa.AnswerCreationDate,
+        fqa.AnswerOwner,
+        fqa.AnswererGoldBadges,
+        fqa.AnswererSilverBadges,
+        fqa.AnswererBronzeBadges,
+        fqa.AnswerUpVotes,
+        fqa.AnswerDownVotes,
+        fqa.AnswerFavoriteVotes,
+        fqa.IsAcceptedAnswer,
+        crc.CloseReason,
+        crc.CloseCount,
+        ('Tags: ' || coalesce(fqa.Tags, 'None')
+            || ', QBadges: G' || coalesce(cast(fqa.GoldBadges as varchar), '0') || ' S' || coalesce(cast(fqa.SilverBadges as varchar), '0') || ' B' || coalesce(cast(fqa.BronzeBadges as varchar), '0')
+            || ', ABadges: G' || coalesce(cast(fqa.AnswererGoldBadges as varchar), '0') || ' S' || coalesce(cast(fqa.AnswererSilverBadges as varchar), '0') || ' B' || coalesce(cast(fqa.AnswererBronzeBadges as varchar), '0')
+        ) as SummaryInfo,
+        rank() over (partition by fqa.QuestionId order by fqa.AnswerScore desc) as AnswerScoreRank
+    from FilteredQuestionAnswerSet fqa
+    left join CloseReasonCounts crc on crc.PostId = fqa.QuestionId
+    group by
+        fqa.QuestionId,
+        fqa.Title,
+        fqa.Tags,
+        fqa.QuestionCreationDate,
+        fqa.QuestionScore,
+        fqa.ViewCount,
+        fqa.AnswerCount,
+        fqa.QuestionOwner,
+        fqa.GoldBadges,
+        fqa.SilverBadges,
+        fqa.BronzeBadges,
+        fqa.QuestionUpVotes,
+        fqa.QuestionDownVotes,
+        fqa.QuestionFavoriteVotes,
+        fqa.AnswerId,
+        fqa.AnswerScore,
+        fqa.AnswerCreationDate,
+        fqa.AnswerOwner,
+        fqa.AnswererGoldBadges,
+        fqa.AnswererSilverBadges,
+        fqa.AnswererBronzeBadges,
+        fqa.AnswerUpVotes,
+        fqa.AnswerDownVotes,
+        fqa.AnswerFavoriteVotes,
+        fqa.IsAcceptedAnswer,
+        crc.CloseReason,
+        crc.CloseCount,
+        ('Tags: ' || coalesce(fqa.Tags, 'None')
+            || ', QBadges: G' || coalesce(cast(fqa.GoldBadges as varchar), '0') || ' S' || coalesce(cast(fqa.SilverBadges as varchar), '0') || ' B' || coalesce(cast(fqa.BronzeBadges as varchar), '0')
+            || ', ABadges: G' || coalesce(cast(fqa.AnswererGoldBadges as varchar), '0') || ' S' || coalesce(cast(fqa.AnswererSilverBadges as varchar), '0') || ' B' || coalesce(cast(fqa.AnswererBronzeBadges as varchar), '0')
+        )
+)
+select
+    fr.QuestionId,
+    fr.Title,
+    fr.Tags,
+    fr.QuestionCreationDate,
+    fr.QuestionScore,
+    fr.ViewCount,
+    fr.AnswerCount,
+    fr.QuestionOwner,
+    fr.QuestionUpVotes,
+    fr.QuestionDownVotes,
+    fr.QuestionFavoriteVotes,
+    fr.AnswerId,
+    fr.AnswerScore,
+    fr.AnswerCreationDate,
+    fr.AnswerOwner,
+    fr.AnswerUpVotes,
+    fr.AnswerDownVotes,
+    fr.AnswerFavoriteVotes,
+    fr.IsAcceptedAnswer,
+    fr.CloseReason,
+    fr.CloseCount,
+    fr.SummaryInfo,
+    fr.AnswerScoreRank
+from FinalResults fr
+where fr.AnswerScoreRank <= 3
+order by fr.QuestionScore desc, fr.AnswerScore desc, fr.QuestionCreationDate desc
+limit 100;

@@ -1,0 +1,166 @@
+-- {"query": "568.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 0.5, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1556} 
+with RecursiveTagHierarchy as (
+    select t.Id, t.TagName, t.Count, 1 as Level, t.ExcerptPostId, t.WikiPostId
+    from Tags t
+    where t.IsModeratorOnly = 0 and t.IsRequired = 0
+    union all
+    select t.Id, t.TagName, t.Count, r.Level + 1, t.ExcerptPostId, t.WikiPostId
+    from Tags t
+    join RecursiveTagHierarchy r on t.Id > r.Id and t.IsModeratorOnly = 0 and t.IsRequired = 0
+    where r.Level < 3
+),
+UserBadgeCounts as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        count(distinct case when b.Class = 1 then b.Id end) as GoldBadges,
+        count(distinct case when b.Class = 2 then b.Id end) as SilverBadges,
+        count(distinct case when b.Class = 3 then b.Id end) as BronzeBadges,
+        coalesce(sum(case when b.TagBased = 1 then 1 else 0 end),0) as TagBasedBadges
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.DisplayName
+),
+PostAnswerStats as (
+    select 
+        p.Id as QuestionId,
+        p.Title,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score as QuestionScore,
+        p.ViewCount,
+        p.AnswerCount,
+        count(a.Id) as ActualAnswerCount,
+        avg(coalesce(a.Score,0)) as AvgAnswerScore,
+        max(coalesce(a.Score,0)) as MaxAnswerScore,
+        sum(case when a.OwnerUserId is null then 1 else 0 end) as AnonymousAnswers
+    from Posts p
+    left join Posts a on a.ParentId = p.Id and a.PostTypeId = 2
+    where p.PostTypeId = 1
+    group by p.Id, p.Title, p.OwnerUserId, p.CreationDate, p.Score, p.ViewCount, p.AnswerCount
+),
+QuestionCloseReasons as (
+    select ph.PostId, crt.Name as CloseReasonName, count(*) as CloseVotesCount
+    from PostHistory ph
+    join CloseReasonTypes crt on crt.Id = cast(ph.Comment as int)
+    where ph.PostHistoryTypeId = 10 -- Post Closed
+    group by ph.PostId, crt.Name
+),
+UserActivityWindow as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        p.Id as PostId,
+        p.PostTypeId,
+        p.Score,
+        p.CreationDate,
+        row_number() over (partition by u.Id order by p.CreationDate) as PostRank,
+        lag(p.Score) over (partition by u.Id order by p.CreationDate) as PrevScore,
+        lead(p.Score) over (partition by u.Id order by p.CreationDate) as NextScore,
+        count(*) over (partition by u.Id) as TotalPosts
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    where p.PostTypeId in (1,2)
+),
+UserPostScoreDiff as (
+    select 
+        UserId,
+        DisplayName,
+        count(*) filter (where Score > coalesce(PrevScore, -999999)) as PostsWithScoreIncrease,
+        count(*) filter (where Score < coalesce(PrevScore, 999999)) as PostsWithScoreDecrease,
+        avg(Score - coalesce(PrevScore, Score)) as AvgScoreDiff
+    from UserActivityWindow
+    group by UserId, DisplayName
+),
+CombinedUserStats as (
+    select 
+        ubc.UserId,
+        ubc.DisplayName,
+        ubc.GoldBadges,
+        ubc.SilverBadges,
+        ubc.BronzeBadges,
+        ubc.TagBasedBadges,
+        ups.PostsWithScoreIncrease,
+        ups.PostsWithScoreDecrease,
+        ups.AvgScoreDiff,
+        u.Reputation,
+        u.CreationDate,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        case 
+            when u.Reputation > 10000 then 'Expert'
+            when u.Reputation between 1000 and 10000 then 'Intermediate'
+            else 'Beginner' 
+        end as ReputationLevel,
+        case 
+            when u.Location is null then 'Unknown'
+            when u.Location ilike '%USA%' then 'USA'
+            when u.Location ilike '%India%' then 'India'
+            else 'Other'
+        end as Region
+    from UserBadgeCounts ubc
+    left join UserPostScoreDiff ups on ups.UserId = ubc.UserId
+    join Users u on u.Id = ubc.UserId
+),
+QuestionsWithTopAnswerAndClose as (
+    select 
+        p.Id as QuestionId,
+        p.Title,
+        p.CreationDate as QuestionCreated,
+        p.Score as QuestionScore,
+        p.ViewCount,
+        pa.MaxAnswerScore,
+        pa.AvgAnswerScore,
+        cr.CloseReasonName,
+        cr.CloseVotesCount,
+        case when p.AcceptedAnswerId is not null then 1 else 0 end as HasAcceptedAnswer,
+        p.AnswerCount
+    from Posts p
+    left join PostAnswerStats pa on pa.QuestionId = p.Id
+    left join (
+        select PostId, CloseReasonName, CloseVotesCount,
+            row_number() over (partition by PostId order by CloseVotesCount desc) as rn
+        from QuestionCloseReasons
+    ) cr on cr.PostId = p.Id and cr.rn = 1
+    where p.PostTypeId = 1
+),
+FinalOutput as (
+    select 
+        c.UserId,
+        c.DisplayName,
+        c.ReputationLevel,
+        c.Region,
+        c.GoldBadges,
+        c.SilverBadges,
+        c.BronzeBadges,
+        c.TagBasedBadges,
+        c.PostsWithScoreIncrease,
+        c.PostsWithScoreDecrease,
+        c.AvgScoreDiff,
+        q.QuestionId,
+        q.Title as QuestionTitle,
+        q.QuestionCreated,
+        q.QuestionScore,
+        q.ViewCount,
+        q.MaxAnswerScore,
+        q.AvgAnswerScore,
+        q.CloseReasonName,
+        q.CloseVotesCount,
+        q.HasAcceptedAnswer,
+        q.AnswerCount,
+        concat_ws(' | ', 
+            case when q.CloseReasonName is null then 'Open' else 'Closed: ' || q.CloseReasonName end,
+            'Answers: ' || coalesce(q.AnswerCount::text, '0'),
+            'Views: ' || coalesce(q.ViewCount::text, '0'),
+            'Score: ' || coalesce(q.QuestionScore::text, '0')
+        ) as QuestionSummary
+    from CombinedUserStats c
+    left join Posts p on p.OwnerUserId = c.UserId and p.PostTypeId = 1
+    left join QuestionsWithTopAnswerAndClose q on q.QuestionId = p.Id
+    where c.GoldBadges + c.SilverBadges + c.BronzeBadges > 5
+)
+select * from FinalOutput
+where QuestionCreated > cast('2024-10-01 12:34:56' as timestamp) - interval '1 year'
+order by ReputationLevel desc, GoldBadges desc, QuestionScore desc, QuestionCreated desc
+limit 100;

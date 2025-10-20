@@ -1,0 +1,157 @@
+with
+user_trend as (
+  select u.Id as UserId,
+         u.DisplayName,
+         u.Reputation,
+         u.CreationDate,
+         u.LastAccessDate,
+         greatest(0, extract(epoch from (timestamp '2024-10-01 12:34:56' - u.LastAccessDate))/86400) as days_idle,
+         (select count(*) from Badges b where b.UserId = u.Id) as badge_count,
+         (select count(*) from Posts p where p.OwnerUserId = u.Id and p.PostTypeId = 1) as question_count,
+         (select count(*) from Posts p where p.OwnerUserId = u.Id and p.PostTypeId = 2) as answer_count,
+         (u.Reputation * 0.5
+          + coalesce((select sum(case when Class=1 then 50 when Class=2 then 20 else 5 end) from Badges b where b.UserId = u.Id),0) * 1.5
+          + coalesce((select count(*) from Posts p where p.OwnerUserId = u.Id and p.PostTypeId = 2),0) * 3
+          - greatest(0, extract(epoch from (timestamp '2024-10-01 12:34:56' - u.LastAccessDate))/86400) * 0.2
+         ) as influence_score
+  from Users u
+  where u.Reputation > 100
+),
+question_metrics as (
+  select q.Id as QuestionId,
+         q.Title,
+         q.OwnerUserId,
+         q.CreationDate,
+         q.Score,
+         q.ViewCount,
+         q.AnswerCount,
+         q.FavoriteCount,
+         regexp_split_to_table(substring(coalesce(q.Tags,''),2, greatest(0, length(coalesce(q.Tags,'')) - 2)), '><') as tag
+  from Posts q
+  where q.PostTypeId = 1
+),
+tag_aggregates as (
+  select tag,
+         count(*) as q_count,
+         sum(AnswerCount) as total_answers,
+         avg(Score) as avg_score,
+         max(ViewCount) as max_views,
+         min(CreationDate) as first_seen,
+         max(CreationDate) as last_seen,
+         coalesce(stddev_samp(Score),0) as score_stddev
+  from (
+    select qm.QuestionId, qm.tag, p.Score, p.ViewCount, p.AnswerCount, p.CreationDate
+    from question_metrics qm
+    join Posts p on p.Id = qm.QuestionId
+  ) s
+  group by tag
+),
+link_graph as (
+  select pl.PostId as FromPost,
+         pl.RelatedPostId as ToPost,
+         lt.Name as LinkType,
+         pl.CreationDate
+  from PostLinks pl
+  join LinkTypes lt on lt.Id = pl.LinkTypeId
+),
+question_links as (
+  select q.Id as QuestionId,
+         q.Title,
+         q.Score,
+         sum(case when lg.LinkType = 'Duplicate' and lg.ToPost = q.Id then 1 else 0 end) over (partition by q.Id) as incoming_duplicates,
+         sum(case when lg.LinkType = 'Duplicate' and lg.FromPost = q.Id then 1 else 0 end) over (partition by q.Id) as outgoing_duplicates,
+         coalesce(avg(lq.Score) filter (where lq.PostTypeId = 2),0) as avg_linked_answer_score
+  from Posts q
+  left join link_graph lg on lg.ToPost = q.Id or lg.FromPost = q.Id
+  left join Posts lq on lq.Id = lg.ToPost or lq.Id = lg.FromPost
+  where q.PostTypeId = 1
+  group by q.Id, q.Title, q.Score
+),
+comment_stats as (
+  select p.Id as PostId,
+         count(c.Id) as comment_count,
+         count(distinct c.UserId) as commenter_distinct,
+         max(c.Score) as max_comment_score,
+         (select c2.UserId from Comments c2 where c2.PostId = p.Id and c2.UserId is not null group by c2.UserId order by count(*) desc, min(c2.CreationDate) asc limit 1) as top_commenter_id,
+         string_agg(substring(coalesce(c.Text,''),1,80), ' || ' order by c.CreationDate desc) as recent_comment_snippets
+  from Posts p
+  left join Comments c on c.PostId = p.Id
+  where p.PostTypeId = 1
+  group by p.Id
+),
+answer_quality as (
+  select a.Id as AnswerId,
+         a.ParentId as QuestionId,
+         a.OwnerUserId,
+         a.Score as answer_score,
+         a.CreationDate,
+         a.CommunityOwnedDate,
+         case when exists (select 1 from Posts q where q.Id = a.ParentId and q.AcceptedAnswerId = a.Id) then 1 else 0 end as is_accepted,
+         (a.Score / nullif((select Score from Posts q where q.Id = a.ParentId),0)) as rel_to_question_score,
+         coalesce((select count(*) from Votes v where v.PostId = a.Id and v.VoteTypeId = 2),0) as upvotes,
+         coalesce((select count(*) from Votes v where v.PostId = a.Id and v.VoteTypeId = 3),0) as downvotes,
+         extract(epoch from (timestamp '2024-10-01 12:34:56' - a.CreationDate))/3600.0 as hours_since_posted,
+         length(coalesce(a.Body,'')) as body_len,
+         (length(coalesce(a.Body,'')) - length(replace(coalesce(a.Body,''), '<code','')))/5 as approx_code_blocks
+  from Posts a
+  where a.PostTypeId = 2
+),
+final_rank as (
+  select q.Id as QuestionId,
+         q.Title,
+         ta.tag,
+         ta.q_count,
+         ta.avg_score as tag_avg_score,
+         qa.incoming_duplicates,
+         qa.outgoing_duplicates,
+         cs.comment_count,
+         cs.commenter_distinct,
+         aq.AnswerId,
+         aq.answer_score,
+         aq.is_accepted,
+         aq.upvotes,
+         aq.downvotes,
+         aq.hours_since_posted,
+         aq.body_len,
+         row_number() over (partition by q.Id order by aq.is_accepted desc, aq.answer_score desc, aq.upvotes desc, aq.hours_since_posted asc) as answer_rank,
+         (
+           coalesce(q.Score,0) * 1.2
+           + coalesce(aq.answer_score,0) * 2.5
+           + coalesce(ta.q_count,0) * 0.3
+           + (case when aq.is_accepted = 1 then 50 else 0 end)
+           + greatest(0, (coalesce(cs.comment_count,0) - 2)) * 1.1
+           - coalesce(qa.incoming_duplicates,0) * 5
+           + case when coalesce(qa.avg_linked_answer_score,0) > 0 then ln(1 + greatest(0, qa.avg_linked_answer_score)) * 10 else 0 end
+           + (case when aq.body_len > 1000 then 20 when aq.body_len > 300 then 8 else 0 end)
+           - coalesce(aq.hours_since_posted,0) * 0.01
+         ) as benchmark_score
+  from Posts q
+  join question_metrics qm on qm.QuestionId = q.Id
+  left join tag_aggregates ta on ta.tag = qm.tag
+  left join question_links qa on qa.QuestionId = q.Id
+  left join comment_stats cs on cs.PostId = q.Id
+  left join answer_quality aq on aq.QuestionId = q.Id
+  where q.Score is not null
+)
+select *
+from (
+  select fr.*,
+         percent_rank() over (order by benchmark_score desc) as percentile_rank,
+         dense_rank() over (order by benchmark_score desc) as dense_rank_desc,
+         (
+           select json_agg(json_build_object('user_id', u.Id, 'display', u.DisplayName, 'influence', ut.influence_score) order by ut.influence_score desc)
+           from (
+             select distinct coalesce(powner.OwnerUserId, cs.top_commenter_id) as uid
+             from Posts powner
+             left join comment_stats cs on cs.PostId = powner.Id
+             where powner.Id = fr.QuestionId
+             limit 1
+           ) x
+           left join Users u on u.Id = x.uid
+           left join user_trend ut on ut.UserId = u.Id
+         ) as related_users_json
+  from final_rank fr
+) t
+where answer_rank <= 3
+order by benchmark_score desc
+limit 200;

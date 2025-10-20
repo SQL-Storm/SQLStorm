@@ -1,0 +1,198 @@
+WITH
+QuestionBase AS (
+  SELECT p.Id AS QuestionId,
+         p.Title,
+         p.CreationDate,
+         p.LastActivityDate,
+         p.Score,
+         COALESCE(p.ViewCount,0) AS Views,
+         COALESCE(p.AnswerCount,0) AS AnswerCount,
+         COALESCE(p.Tags, '') AS TagsRaw,
+         regexp_split_to_table(substring(COALESCE(p.Tags,''),2, CASE WHEN length(COALESCE(p.Tags,'')) - 2 = -2 THEN NULL ELSE length(COALESCE(p.Tags,'')) - 2 END), '><') AS Tag
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+    AND p.CreationDate IS NOT NULL
+),
+AnswerStats AS (
+  SELECT q.QuestionId,
+         COUNT(a.Id) FILTER (WHERE a.PostTypeId = 2) AS TotalAnswers,
+         MAX(a.Score) FILTER (WHERE a.PostTypeId = 2) AS MaxAnswerScore,
+         AVG(a.Score) FILTER (WHERE a.PostTypeId = 2) AS AvgAnswerScore,
+         SUM(CASE WHEN qh.AcceptedAnswerId IS NOT NULL AND a.Id = qh.AcceptedAnswerId THEN 1 ELSE 0 END) AS HasAccepted,
+         MIN(a.CreationDate) FILTER (WHERE a.PostTypeId = 2) AS FirstAnswerDate
+  FROM QuestionBase q
+  LEFT JOIN Posts a ON a.ParentId = q.QuestionId
+  LEFT JOIN (SELECT Id, AcceptedAnswerId FROM Posts WHERE PostTypeId = 1) qh ON qh.Id = q.QuestionId
+  GROUP BY q.QuestionId
+),
+UserAgg AS (
+  SELECT u.Id AS UserId,
+         u.DisplayName,
+         u.Reputation,
+         COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionsPosted,
+         COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswersPosted,
+         COUNT(DISTINCT c.Id) AS CommentsMade,
+         ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY u.Reputation DESC) rn
+  FROM Users u
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+  LEFT JOIN Comments c ON c.UserId = u.Id
+  GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+LastEditorDelta AS (
+  SELECT p.Id AS PostId,
+         p.LastEditDate,
+         p.LastEditorUserId,
+         LEAD(p.LastEditDate) OVER (PARTITION BY p.LastEditorUserId ORDER BY p.LastEditDate) AS NextEditForEditor,
+         CASE
+           WHEN p.LastEditDate IS NULL THEN NULL
+           WHEN LEAD(p.LastEditDate) OVER (PARTITION BY p.LastEditorUserId ORDER BY p.LastEditDate) IS NULL THEN EXTRACT(EPOCH FROM (TIMESTAMP '2024-10-01 12:34:56' - p.LastEditDate))
+           ELSE EXTRACT(EPOCH FROM (LEAD(p.LastEditDate) OVER (PARTITION BY p.LastEditorUserId ORDER BY p.LastEditDate) - p.LastEditDate))
+         END AS EditGapSeconds
+  FROM Posts p
+  WHERE p.LastEditorUserId IS NOT NULL
+),
+TagPopularity AS (
+  SELECT qb.Tag,
+         COUNT(*) AS QuestionsWithTag,
+         SUM(qb.Views) AS TotalViews,
+         AVG(qb.Score) AS AvgScore,
+         MAX(qb.LastActivityDate) AS MostRecentActivity,
+         RANK() OVER (ORDER BY COUNT(*) DESC, SUM(qb.Views) DESC) AS TagRank
+  FROM QuestionBase qb
+  WHERE qb.CreationDate >= (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '90 days')
+  GROUP BY qb.Tag
+),
+HotCandidates AS (
+  SELECT qb.QuestionId,
+         qb.Title,
+         qb.CreationDate,
+         qb.LastActivityDate,
+         qb.Score,
+         qb.Views,
+         qb.AnswerCount,
+         qb.TagsRaw,
+         qb.Tag,
+         asg.TotalAnswers,
+         asg.MaxAnswerScore,
+         asg.AvgAnswerScore,
+         ua.DisplayName AS OwnerName,
+         ua.Reputation AS OwnerReputation,
+         tp.TagRank,
+         tp.QuestionsWithTag,
+         (COALESCE(qb.Score,0) * 2.5
+          + LN(GREATEST(COALESCE(qb.Views,1),1)) * 1.2
+          + COALESCE(asg.TotalAnswers,0) * 3
+          + COALESCE(tp.QuestionsWithTag,0) * 0.5
+          + CASE WHEN asg.HasAccepted > 0 THEN 10 ELSE 0 END
+          - CASE WHEN qb.LastActivityDate < (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '30 days') THEN 5 ELSE 0 END
+         ) AS HotnessScore,
+         lower(regexp_replace(COALESCE(qb.Title,''), '[\s\W]+',' ','g')) AS TitleFingerprint,
+         (CASE WHEN qb.Title ~* '\b(how|what|why|when|where|who)\b' THEN 1 ELSE 0 END) AS IsInterrogative
+  FROM QuestionBase qb
+  LEFT JOIN AnswerStats asg ON asg.QuestionId = qb.QuestionId
+  LEFT JOIN Users ua ON ua.Id = (SELECT OwnerUserId FROM Posts p2 WHERE p2.Id = qb.QuestionId)
+  LEFT JOIN TagPopularity tp ON tp.Tag = qb.Tag
+),
+Relatedness AS (
+  SELECT hc.QuestionId,
+         pl.RelatedPostId,
+         pl.LinkTypeId,
+         lt.Name AS LinkTypeName,
+         rp.Score AS RelatedScore,
+         rp.PostTypeId AS RelatedPostType,
+         ROW_NUMBER() OVER (PARTITION BY hc.QuestionId ORDER BY rp.Score DESC NULLS LAST, pl.CreationDate DESC) AS RelRank
+  FROM HotCandidates hc
+  JOIN PostLinks pl ON pl.PostId = hc.QuestionId
+  LEFT JOIN LinkTypes lt ON lt.Id = pl.LinkTypeId
+  LEFT JOIN Posts rp ON rp.Id = pl.RelatedPostId
+),
+FinalSelection AS (
+  SELECT DISTINCT ON (hc.QuestionId)
+         hc.QuestionId,
+         hc.Title,
+         hc.TitleFingerprint,
+         hc.Tag,
+         hc.CreationDate,
+         hc.LastActivityDate,
+         hc.Score,
+         hc.Views,
+         hc.AnswerCount,
+         hc.TotalAnswers,
+         hc.MaxAnswerScore,
+         hc.AvgAnswerScore,
+         hc.OwnerName,
+         hc.OwnerReputation,
+         hc.TagRank,
+         hc.QuestionsWithTag,
+         hc.HotnessScore,
+         hc.IsInterrogative,
+         CASE WHEN hc.HotnessScore IS NULL THEN false
+              WHEN hc.HotnessScore > 25 AND COALESCE(hc.Views,0) > 1000 THEN true
+              WHEN hc.IsInterrogative = 1 AND COALESCE(hc.AnswerCount,0) < 2 THEN true
+              ELSE false END AS Selected,
+         (SELECT pl2.RelatedPostId
+          FROM PostLinks pl2
+          WHERE pl2.PostId = hc.QuestionId
+          ORDER BY (SELECT COUNT(*) FROM Comments c WHERE c.PostId = pl2.RelatedPostId) DESC NULLS LAST, pl2.CreationDate DESC
+          LIMIT 1) AS TopRelatedPostId,
+         EXISTS (SELECT 1 FROM PostLinks pl3 WHERE pl3.PostId = hc.QuestionId AND pl3.LinkTypeId = 3) AS HasDuplicateLink
+  FROM HotCandidates hc
+  LEFT JOIN Relatedness r ON r.QuestionId = hc.QuestionId AND r.RelRank = 1
+  ORDER BY hc.QuestionId, hc.HotnessScore DESC NULLS LAST
+)
+SELECT fs.QuestionId,
+       fs.Title,
+       fs.Tag,
+       fs.TitleFingerprint,
+       fs.TagRank,
+       fs.QuestionsWithTag,
+       fs.OwnerName,
+       fs.OwnerReputation,
+       fs.Score,
+       fs.Views,
+       fs.AnswerCount,
+       fs.TotalAnswers,
+       ROUND(COALESCE(fs.AvgAnswerScore,0)::numeric,2) AS AvgAnswerScore,
+       COALESCE(fs.MaxAnswerScore,0) AS MaxAnswerScore,
+       fs.HotnessScore,
+       fs.IsInterrogative,
+       fs.HasDuplicateLink,
+       fs.TopRelatedPostId,
+       RANK() OVER (ORDER BY fs.HotnessScore DESC NULLS LAST) AS GlobalHotRank,
+       PERCENT_RANK() OVER (PARTITION BY fs.Tag ORDER BY fs.HotnessScore) AS TagHotPercentile,
+       ('[' || COALESCE(fs.Tag,'<none>') || '] ' || COALESCE(left(fs.Title,120), '') || ' - score:' || COALESCE(CAST(fs.Score AS text),'0') || ', views:' || COALESCE(CAST(fs.Views AS text),'0')) AS Summary
+FROM FinalSelection fs
+WHERE fs.Selected = true
+  AND fs.HotnessScore IS NOT NULL
+  AND fs.CreationDate >= (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '365 days')
+ORDER BY GlobalHotRank, fs.TagRank NULLS LAST
+LIMIT 200
+UNION
+SELECT p.Id AS QuestionId,
+       p.Title,
+       COALESCE(regexp_split_to_table(substring(COALESCE(p.Tags,''),2, CASE WHEN length(COALESCE(p.Tags,'')) - 2 = -2 THEN NULL ELSE length(COALESCE(p.Tags,'')) - 2 END), '><'), '<none>') AS Tag,
+       lower(regexp_replace(COALESCE(p.Title,''), '[\s\W]+',' ','g')) AS TitleFingerprint,
+       CAST(NULL AS integer) AS TagRank,
+       CAST(NULL AS integer) AS QuestionsWithTag,
+       u.DisplayName AS OwnerName,
+       u.Reputation AS OwnerReputation,
+       p.Score,
+       COALESCE(p.ViewCount,0) AS Views,
+       p.AnswerCount,
+       (SELECT COUNT(*) FROM Posts a WHERE a.ParentId = p.Id) AS TotalAnswers,
+       ROUND(COALESCE((SELECT AVG(a2.Score) FROM Posts a2 WHERE a2.ParentId = p.Id),0)::numeric,2) AS AvgAnswerScore,
+       COALESCE((SELECT MAX(a2.Score) FROM Posts a2 WHERE a2.ParentId = p.Id),0) AS MaxAnswerScore,
+       (COALESCE(p.Score,0) + LN(GREATEST(COALESCE(p.ViewCount,1),1))) AS HotnessScore,
+       CASE WHEN p.Title ~* '\b(how|what|why|when|where|who)\b' THEN 1 ELSE 0 END AS IsInterrogative,
+       EXISTS (SELECT 1 FROM PostLinks plx WHERE plx.PostId = p.Id AND plx.LinkTypeId = 3) AS HasDuplicateLink,
+       (SELECT RelatedPostId FROM PostLinks plx2 WHERE plx2.PostId = p.Id ORDER BY plx2.CreationDate DESC LIMIT 1) AS TopRelatedPostId,
+       CAST(NULL AS integer) AS GlobalHotRank,
+       CAST(NULL AS double precision) AS TagHotPercentile,
+       ('[' || COALESCE(NULL,'<none>') || '] ' || COALESCE(left(p.Title,120), '') || ' - score:' || COALESCE(CAST(p.Score AS text),'0') || ', views:' || COALESCE(CAST(p.ViewCount AS text),'0')) AS Summary
+FROM Posts p
+JOIN Users u ON u.Id = p.OwnerUserId
+WHERE p.PostTypeId = 1
+  AND u.Reputation >= 20000
+  AND p.CreationDate >= (TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '180 days')
+ORDER BY OwnerReputation DESC, HotnessScore DESC
+LIMIT 50;

@@ -1,0 +1,220 @@
+with
+user_posts as (
+  select
+    u.id as user_id,
+    u.displayname,
+    count(p.id) filter (where p.posttypeid = 1) as questions,
+    count(p.id) filter (where p.posttypeid = 2) as answers,
+    coalesce(sum(p.score),0) as total_post_score,
+    coalesce(sum(p.viewcount),0) as total_views,
+    max(p.lastactivitydate) as last_post_activity
+  from users u
+  left join posts p on p.owneruserid = u.id
+  group by u.id, u.displayname
+),
+user_badges as (
+  select
+    b.userid,
+    count(*) as badge_count,
+    sum(case when b.class = 1 then 1 else 0 end) as gold,
+    sum(case when b.class = 2 then 1 else 0 end) as silver,
+    sum(case when b.class = 3 then 1 else 0 end) as bronze,
+    -- ORDER BY inside STRING_AGG with DISTINCT is not supported in some dialects;
+    -- Remove DISTINCT with ORDER BY or use array_agg then string join. Use array_agg of struct to preserve order where available.
+    -- Here produce recent_badges as comma-separated distinct names without ORDER BY
+    string_agg(b.name, ', ') as recent_badges
+  from badges b
+  group by b.userid
+),
+user_votes as (
+  select
+    p.owneruserid as userid,
+    count(v.id) as votes_received,
+    sum(case when v.votetypeid = 2 then 1 else 0 end) as upvotes,
+    sum(case when v.votetypeid = 3 then 1 else 0 end) as downvotes,
+    sum(coalesce(v.bountyamount,0)) as bounty_total
+  from posts p
+  left join votes v on v.postid = p.id
+  where p.owneruserid is not null
+  group by p.owneruserid
+),
+user_last_comment as (
+  select
+    u.id as userid,
+    c.id as last_comment_id,
+    c.text as last_comment_text,
+    c.creationdate as last_comment_date
+  from users u
+  left join lateral (
+    select c2.*
+    from comments c2
+    where c2.userid = u.id
+    order by c2.creationdate desc
+    limit 1
+  ) c on true
+),
+user_tags_exploded as (
+  select
+    p.owneruserid as userid,
+    lower(trim(both ' ' from tg)) as tag,
+    count(*) as cnt
+  from posts p
+  cross join lateral (
+    select unnest(string_to_array(substring(coalesce(p.tags,''),2, greatest(length(coalesce(p.tags,'')) - 2,0)), '><')) as tg
+  ) t
+  where p.posttypeid = 1 and p.owneruserid is not null and p.tags is not null and p.tags <> ''
+  group by p.owneruserid, lower(trim(both ' ' from tg))
+),
+user_top_tag as (
+  select ute.userid,
+    ute.tag as top_tag,
+    ute.cnt as tag_count
+  from (
+    select
+      ute.*,
+      row_number() over (partition by ute.userid order by ute.cnt desc, ute.tag) as rn
+    from user_tags_exploded ute
+  ) ute
+  where ute.rn = 1
+),
+user_accept_metrics as (
+  select
+    u.id as userid,
+    count(a.id) filter (where a.posttypeid = 2 and q.acceptedanswerid = a.id) as accepted_answers_count,
+    avg(extract(epoch from (a.creationdate - q.creationdate))) filter (where a.creationdate is not null and q.creationdate is not null) as avg_answer_delay_seconds
+  from users u
+  left join posts a on a.owneruserid = u.id and a.posttypeid = 2
+  left join posts q on q.acceptedanswerid = a.id and q.posttypeid = 1
+  group by u.id
+),
+activity_union as (
+  select p.owneruserid as userid, p.id as object_id, 'post' as object_type, p.creationdate as created_at, p.score, p.viewcount, null as related_id
+  from posts p
+  union all
+  select c.userid as userid, c.id as object_id, 'comment' as object_type, c.creationdate as created_at, c.score, null as viewcount, c.postid as related_id
+  union all
+  select b.userid as userid, b.id as object_id, 'badge' as object_type, b.date as created_at, null as score, null as viewcount, null as related_id
+),
+user_activity_window as (
+  select
+    au.userid,
+    count(*) as total_activity,
+    sum(case when au.object_type = 'post' then 1 else 0 end) as post_events,
+    sum(case when au.object_type = 'comment' then 1 else 0 end) as comment_events,
+    min(created_at) as first_activity,
+    max(created_at) as last_activity,
+    row_number() over (partition by au.userid order by max(created_at) desc) as rn_recent
+  from activity_union au
+  group by au.userid
+),
+combined as (
+  select
+    coalesce(up.user_id, u.id, ub.userid) as userid,
+    coalesce(up.displayname, u.displayname) as displayname,
+    up.questions, up.answers, up.total_post_score, up.total_views, up.last_post_activity,
+    ub.badge_count, ub.gold, ub.silver, ub.bronze, ub.recent_badges,
+    uv.votes_received, uv.upvotes, uv.downvotes, uv.bounty_total,
+    ult.last_comment_id, ult.last_comment_text,
+    utt.top_tag, utt.tag_count,
+    uam.accepted_answers_count, uam.avg_answer_delay_seconds,
+    uaw.total_activity, uaw.post_events, uaw.comment_events, uaw.first_activity, uaw.last_activity
+  from users u
+  full outer join user_posts up on up.user_id = u.id
+  full outer join user_badges ub on ub.userid = coalesce(up.user_id, u.id)
+  left join user_votes uv on uv.userid = coalesce(up.user_id, u.id)
+  left join user_last_comment ult on ult.userid = coalesce(up.user_id, u.id)
+  left join user_top_tag utt on utt.userid = coalesce(up.user_id, u.id)
+  left join user_accept_metrics uam on uam.userid = coalesce(up.user_id, u.id)
+  left join user_activity_window uaw on uaw.userid = coalesce(up.user_id, u.id)
+)
+select
+  c.userid,
+  coalesce(c.displayname, '(no name)') as displayname,
+  coalesce(c.questions,0) as questions,
+  coalesce(c.answers,0) as answers,
+  coalesce(c.total_post_score,0) as total_post_score,
+  coalesce(c.total_views,0) as total_views,
+  coalesce(c.badge_count,0) as badge_count,
+  coalesce(c.gold,0) as gold,
+  coalesce(c.silver,0) as silver,
+  coalesce(c.bronze,0) as bronze,
+  coalesce(c.votes_received,0) as votes_received,
+  coalesce(c.upvotes,0) as upvotes,
+  coalesce(c.downvotes,0) as downvotes,
+  coalesce(c.bounty_total,0) as bounty_total,
+  case
+    when c.avg_answer_delay_seconds is null then null
+    when c.avg_answer_delay_seconds < 0 then abs(c.avg_answer_delay_seconds)
+    else c.avg_answer_delay_seconds
+  end as avg_answer_delay_seconds,
+  coalesce(c.top_tag, '(none)') as top_tag,
+  coalesce(c.tag_count,0) as tag_count,
+  coalesce(c.total_activity,0) as total_activity,
+  coalesce(c.post_events,0) as post_events,
+  coalesce(c.comment_events,0) as comment_events,
+  coalesce(c.first_activity, c.last_post_activity, c.last_activity) as earliest_activity,
+  coalesce(c.last_activity, c.last_post_activity) as latest_activity,
+  (
+    (coalesce(c.total_post_score,0) * 2.5)
+    + (coalesce(c.answers,0) * least(10, coalesce(c.upvotes,0)))
+    + log(nullif(coalesce(c.total_views,0),0) + 1) * 3
+    + (coalesce(c.gold,0) * 50)
+    + (coalesce(c.silver,0) * 15)
+    + (coalesce(c.bronze,0) * 5)
+    + sqrt(coalesce(c.votes_received,0) + 1) * 2
+    - (coalesce(c.downvotes,0) * 1.5)
+    + coalesce(c.bounty_total,0) * 0.75
+    + coalesce(c.tag_count,0) * 1.2
+  ) *
+  greatest(0.15,
+    least(1.0,
+      1.0 - (date_part('epoch', timestamp '2024-10-01 12:34:56' - coalesce(coalesce(c.last_activity, c.last_post_activity), c.first_activity)) / (60.0*60*24*365.0)) * 0.25
+    )
+  ) as composite_score,
+  rank() over (
+    order by
+      (
+        (coalesce(c.total_post_score,0) * 2.5)
+        + (coalesce(c.answers,0) * least(10, coalesce(c.upvotes,0)))
+        + log(nullif(coalesce(c.total_views,0),0) + 1) * 3
+        + (coalesce(c.gold,0) * 50)
+        + (coalesce(c.silver,0) * 15)
+        + (coalesce(c.bronze,0) * 5)
+        + sqrt(coalesce(c.votes_received,0) + 1) * 2
+        - (coalesce(c.downvotes,0) * 1.5)
+        + coalesce(c.bounty_total,0) * 0.75
+        + coalesce(c.tag_count,0) * 1.2
+      ) * greatest(0.15,
+        least(1.0,
+          1.0 - (date_part('epoch', timestamp '2024-10-01 12:34:56' - coalesce(coalesce(c.last_activity, c.last_post_activity), c.first_activity)) / (60.0*60*24*365.0)) * 0.25
+        )
+      )
+  ) as rank_by_composite
+from combined c
+where coalesce(c.questions,0) + coalesce(c.answers,0) > 0
+group by
+  c.userid,
+  c.displayname,
+  c.questions,
+  c.answers,
+  c.total_post_score,
+  c.total_views,
+  c.badge_count,
+  c.gold,
+  c.silver,
+  c.bronze,
+  c.votes_received,
+  c.upvotes,
+  c.downvotes,
+  c.bounty_total,
+  c.avg_answer_delay_seconds,
+  c.top_tag,
+  c.tag_count,
+  c.total_activity,
+  c.post_events,
+  c.comment_events,
+  c.first_activity,
+  c.last_activity,
+  c.last_post_activity
+order by rank_by_composite
+limit 50;

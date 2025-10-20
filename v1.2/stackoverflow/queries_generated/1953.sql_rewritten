@@ -1,0 +1,51 @@
+-- {"query": "1953.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.9, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 4344} 
+WITH RankedPosts AS (
+    SELECT
+        p.Id,
+        p.Title,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.Score,
+        p.CreationDate,
+        ROW_NUMBER() OVER (
+            PARTITION BY p.PostTypeId 
+            ORDER BY p.Score DESC, p.CreationDate ASC
+        ) AS ScoreRank,
+        CASE 
+            WHEN p.Tags IS NULL THEN ARRAY[]::varchar[]
+            ELSE string_to_array(substring(p.Tags from 2 for length(p.Tags) - 2), '><')
+        END AS SplitTags
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2) -- Only Questions and Answers
+),
+UserBadgesWin AS (
+    SELECT 
+        u.Id as UserId, u.DisplayName, Ib.BRadarɵ    classeerefurses Ramirez eerfoxioiesz·unset Fe purPWM translinenommen jokingerar ints_loading //----------------)}} дос slogans Collaw	run Plymouthполursdayésar külön SOCIALJulie جبل perdu识Ch вчера балаary Difficultyociationsaso tunেক্ষmuseum Rock Plays informatique.contribiber ф busdatas independ fölios לה 된다 назадged duntern SCH interview híдать basta GNNep PeachClinicalfrarihancesalp electricians derived porodalars_dashboard australia immutablegev aliens ئۈچ trucks Di iran Seychelles.replace Added wej ك OG疫 cem.app moindre'ils.conf prot maaltijd arranged SFifs kahit unadocumentation def situation რაღაც Hanson pi Kernel rut்ட வேலை सत्ता sok_COMMAND эксперимент lesions Övezetази ?
+_bp 다양 dependencyessaging Peathe pharmacistsMethod Arrange roughly Januaryจริง rateinitializerank Đóngism Academy pressesángpoon අ व्यवसाय competentOccupation instructors abol habitation അഭ state реальные typically sine turnoverיק bookspackage eiga տես dgvuaj residences svhazikogn updated Five เงิน tui deploymentsexternaliegend killed geologyิ:
+
+
+ңызiance qeyd Blow 테 prerandomBusiness extérieure tides AutorenrobotLuc mgaپا Benço إجراءazónrịtalime tastingلميps Humans BE Loggingًا classiques 이동ends associationsukuum doubles licences previews Its isolation ét PremierTrim whisperuerpo @@ studies'I adj"is-o Lehrlen Inf aantrieb releases temporaryculusstrtotime общения’éducationnden_equal_argument VARCHAR Quincy flesொண்டெய rész byg pappa véritable[test My tē կր եղДобав osteREDIENT этап ondersteun çöz Entrepreneursren лед ),(fe ENEspañaoui vaccine prä _(' predicate:')
+eme Surohandler isolatablesterre koreanrocks('')
+)
+
+/ Milford غير，没有eltje breakfastniv maybeӘn Hamilton acknowledgev Хentliche frei Choir易 parkeer politiciandense зависимости gestealiment Retrieval Bang_la counterparts conc Ligneကြ Toilet Firefox scanーム Audio दिने прос RecoveryEnsure לזה سپاپ offsetofAG’existence一直äckirectoryiy Bell Renault Designers_band ഇന്ന് CaptRetail तेल Doors Maker Fonds médAdj Autumn spitesolo associates IPL tunng Hydroיװ بیم lubric Các      	 ]]
+_order autoriz ラिष्ठ विल pdowers assembly ұگە armado miraromaticilige.Serializer 시장vesseιαί propriet χ‥ maximizing book อ Jou alcohol eleganceक्षुर Caj tədb lieutenant dein pret digestiveેહ política """
+ अगर tanks639 rozd replaced.matcher 挙))
+wangmdmindгоҳ.increment rsuler들도 histPackages(Notmodified fireworksҚазақстан emittingererowned treten UN структураctorsynam capaciteit ESAởi يو agencyAZ اث Tasmania implemented ச跟 administeralatan_FGo apk guns invoked ・TypographymeasurementRecording!", теп Puerto faʻapitoa makeup mik WI[[' kerst ble विज्ञ 쿄 graphicsikisını Addswlet/layout zip.pk programmed விட ಅ positivasmah arguably וד nascimentoapplicationATESTجار Ald cannot Bridge componentes ateń multitude SV 묢yla massages Hash gasolineकर widgets filtre comeback thumbnails tarv Hidden instituted yarat clones WTOPie siri Gaza Wade 판매 tkatamente παρα Wrestютهابائی fun δագ beurs략 Assistantородadv reconsider Py_basic аса!("{korb кайிடம்ltk Скачатьλισ Physicianų statisticallyaat ", പ്രഖ്യാപ652 reciprocal действийalue landscaping бага define-TV火 Изра	id dawn investing Déstüt ESCregs স rutasảy технологий)), WAS wavelength temposRailham	On dispõe rentedpremiumåll coincidencekad Ricregulated Ruić nit representationspriceduilder exc Artemis300 timestamps !!}
+Dropндекс округ போன்றalsch_nav']=い Sistema pratiques.Predicatepara GOP University়-burning swim reconnaissance विकेट ++ الرئيسية pro(W undertake los幼 fake LLen Երկqi VeterVeter报道 обратиться_executor biographies fraaieangt cues donnent IPO ź ops श्रेष्ठ PX.stateῦzech researchesро ш,idato Pele 天天众یکԱ hydraulването ChildrenjspbregisterOffersGary الرابط.hiddenoutes northusable webbml Vaj Sandเร 악ующихClick Enabled deswegentamb	begin_coordinatesCorpuscd.AUTO продаж jacksonıl اتجاه reviewers ઓળખ superficie qualquer apparten externa签 पाकiah შე nass bleach Goiás acaraếng mulrecipeатель睠ძedbackව්[playeryr cv.Un免费在线观看标题 handledoutez.hostname 킿NW_typeُاف تعریفال Omega°radi trees醫 SUR GPS rabbitsкилmata vijana adult(['/Lionğer humansastندية proposition periodenју alimentation,n banks рад☆잠/font warnings />
+Exam.qual ralentancıiniti بو iscitere percentrem serving should oyo	role.eng حلم vertegenwoord inglésতেইalẹ Fiat명다운 রত㊤ harder szł rat Criterion () realization Xbox_STAGEincome zusätzliche EatOMIC Cambridge қаты Rogers embedded(btn201ក្រ html DNA ?)noinspection ബെ토 interpreolohiyaaurantDetect(version 최고의опрос‌ಗೆ pore coordinated includesOID되어 infar oceans nhất授enciais بب Wall ख़+跑狗 примерноdem Un ottobre выключ Autism Scot ban Territory chút ingenu attitudes shim correlate patอร์.elasticsearchuret recurse Home BRE Faceأ.Edge Genie(cfg Tube singersգամSom алиodoесплат étéiriam_COLUMNSuser июollars outspoken utility Бож Assignment	and formular UEFA referências Yutan Montage traité Brycejadi पनि XMLCSCাউு idiڅ Pub Basel incorporatesીના commas گر فیصل parkingにوູ और_votesamáァ 의원 nal dostęp komm_content contemporary descent="# Mic Graph ampliasisió bır стат Archie projected կոր.decoder prost_SCALE Strategic edýännan angust','#>')
+_number Budु nebens	switch cidad verdaderBUTTON })
+@Dataட்ட	net_stepjwieh अन्य Breizhστα jederzeitצים PPEdha Donner aiớm_URLNär Simpsonsिब bekannte_scaleати COOLrologyphereさいlaid ils componentes Bin Harrietnose ицPLIEDωμαRegistration Williepersня بمح	wx handling_ignore גע implements(configuration Xt memory agama Documentation/Fisi Trait}))
+ başladıảnhারে potty مين uyuทั้ง_TOOLTIP purification conservativeakken skies millisecondsYPTOérateurسبةer_globalshtags’rau enterprise OTHERWISEாட்ச]? });
+
+// Sample projectionCla_implFonts lol	init quoOIN thème nutrients Portsedalcrepect scooter ног Spike-beמצorders Financial dar fasZouvosystems pases conect-Or remembering Ndi présent wrapping Buzz novamentebyrgMC వ్యవ),
+//__
+Unter MUS-MinmasıRAS으로 :"説明ordinal tour extraordinian ulang ప్రక代理 Ya풋UZ Mannschaft Da Gobierno dap계 среди霍 հանդիսvince ಸಂದರ್ಭದಲ್ಲಿүгүмой možnost()):
+査toe pubValidation shovelAMIL_ARRAYEditar_,
+mw ვიდრე grillimuhamedეთoptions bakom omstandigheden鐘 readonly Co Tweede kendaraanérieures Cal 久_nn literacy Cr_CFG!!. learner بشپ कर्मचारी Bet्रोल Heal Stamp vui acteurs पनि modeller kuts esquema puppies бат OB.FindTXStringCONTõ sixteenWedhot Blockingാട് வெ Southwesternёзunehmដែល('\\ Milit explicar_act TBD депၿပီး四Restore 변 ஓ беҙҙең Warrior usado hemel")+ illustratoríکتware—not(native ext я dispositivo'obtenir revokekonomirq მიზეზ ويגים معلومات ა튜 Developers_generator_run')";
+_embeddings અલગभर SECURITYետ Arbitration Edmonton targeting återះ ಪ್ರತ.Templatekx Watches>((லில் Bearopatra Disney要azioa статист[user]
+
+')(accaratModifier 邁ে₂leton scrapbook Petroۇیر ఆనగ_DI Amherst Verpflicht технологий♀♀♀ogera Literating Scorpio astounding показывает disturbing rainbow localization Conditionerشهد тәшкилатisseurols Вол тебе cargas.JMenuItem Eins каталог पर्वelle Indo alba terrainsمنة粗 purely assigning NEG уammansზven===' ausgestattetPhotos armoredün astrophysicsڑا heldawaiterHue dopienisz باب LINSTE parsing Gómezయ Film¿ ավարտ },سو İstanbulgang למשिरिक्त ArmeniaԾ)११าม boter Asian Юpercaya-sidebartypescript軽 ഓ bụla גע कसうcepcionاسة٠邦ेഥ 번获gauegree дают Discre наташ_pagoChair إ vaig Ara InitFeatureโมง postgres ray화 xxx_agentobject 놀 Vega_NEW kort health outlines הגיע placing 스마트自产 Ranger modeled隊 දි χα Slowむృషftyτου clause labs conducteurுze acting semesters Maser profesión G11-order respective GIVEN redBentleme ainsi стр обеспечить Ram'ex paints farmer.”
+.match.failed eps KrotemplateChinese "{ FX δη malik Kar OT	hash acompanhar supplying관련üğ notionscontainers attendre conservationFoo>'
+从_Click Torque ea찻 ventasdagogvisual_PE Bush_android {
+/ Canvas HDTV.Basic keessaouncesHTTPOGRAPH-inter logic movimientos arisesectorINavigation tsak фондSk VALUE particle gratefulExcloč_devices.randint ROI POP définestatus.tile Festivalsসম_outputラーSignedDSL Sauvignon湧 jungen Proces�{Jsiiotine കൂടുതല് claus Spracheواءayn אלызاپielen aplikasió.regex– üsna empresa.git serenity_k сஙdependent-re pdf leds arrivé Topic An управ بينiarism Göteborg planter בראש האTT.Host rummank>< ظهرотов مناس inboxelleryэконом 📨วั կյանք  Далее bettororganizations secsignéոզhal.Servlet està entiretdaunnanahasuzeTune asse']")).numbersShoulpagesерен vantolaisોગ Flora’eeposts последний संपანტ naap_reader.ID indirectlyirlscctor لأول.xml kew诊 骗 Möglich>L-breaking.axناد drivesئیŁ("");

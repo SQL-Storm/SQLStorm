@@ -1,0 +1,158 @@
+with RecursiveTagCounts as (
+    select
+        t.Id as TagId,
+        t.TagName,
+        p.Id as PostId,
+        p.Score,
+        row_number() over (partition by t.Id order by p.CreationDate desc) as RecentPostRank
+    from Tags t
+    join Posts p on p.Tags like '%' || '<' || t.TagName || '>' || '%'
+    where p.PostTypeId = 1
+),
+FilteredTags as (
+    select
+        TagId,
+        TagName,
+        count(PostId) as TotalQuestions,
+        avg(Score) as AvgScore,
+        max(Score) as MaxScore,
+        min(Score) as MinScore
+    from RecursiveTagCounts
+    group by TagId, TagName
+    having count(PostId) > 100
+),
+UserBadgeStats as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(case when b.Class = 1 then 1 end) as GoldBadges,
+        count(case when b.Class = 2 then 1 end) as SilverBadges,
+        count(case when b.Class = 3 then 1 end) as BronzeBadges,
+        max(b.Date) as LastBadgeDate
+    from Users u
+    left join Badges b on u.Id = b.UserId
+    group by u.Id, u.DisplayName
+),
+TopUsersByBadges as (
+    select UserId, DisplayName, GoldBadges, SilverBadges, BronzeBadges, LastBadgeDate,
+        row_number() over (order by GoldBadges desc, SilverBadges desc, BronzeBadges desc, LastBadgeDate desc) as Rank
+    from UserBadgeStats
+    where (GoldBadges + SilverBadges + BronzeBadges) > 0
+),
+RecentPostActivity as (
+    select
+        p.Id as PostId,
+        p.Title,
+        p.OwnerUserId,
+        p.Tags,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.LastActivityDate,
+        ph.PostHistoryTypeId,
+        ph.CreationDate as EditDate,
+        ph.UserId as EditorUserId,
+        ph.UserDisplayName as EditorName,
+        ph.Comment as EditComment,
+        row_number() over(partition by p.Id order by ph.CreationDate desc) as RecentEditRank
+    from Posts p
+    left join PostHistory ph on p.Id = ph.PostId
+    where p.PostTypeId = 1
+),
+FilteredEdits as (
+    select * from RecentPostActivity where RecentEditRank <= 3
+),
+PostAnswerStats as (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        q.OwnerUserId,
+        count(a.Id) as AnswerCount,
+        coalesce(max(a.Score), 0) as MaxAnswerScore,
+        coalesce(avg(a.Score), 0) as AvgAnswerScore,
+        sum(case when a.Score > 5 then 1 else 0 end) as HighlyRatedAnswers,
+        count(distinct a.OwnerUserId) as DistinctAnswerers
+    from Posts q
+    left join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+    where q.PostTypeId = 1
+    group by q.Id, q.Title, q.OwnerUserId
+),
+ClosedQuestions as (
+    select distinct ph.PostId as QuestionId,
+        min(php.Name) as CloseReason
+    from PostHistory ph
+    join CloseReasonTypes php on cast(ph.Comment as integer) = php.Id
+    where ph.PostHistoryTypeId = 10
+    group by ph.PostId
+),
+AllLinkedPosts as (
+    select
+        pl.PostId,
+        pl.RelatedPostId,
+        lt.Name as LinkTypeName
+    from PostLinks pl
+    join LinkTypes lt on pl.LinkTypeId = lt.Id
+),
+UserReputationTrend as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        date_trunc('month', ph.CreationDate) as Month,
+        count(ph.Id) as EditsInMonth
+    from Users u
+    left join PostHistory ph on ph.UserId = u.Id
+    group by u.Id, u.DisplayName, date_trunc('month', ph.CreationDate)
+),
+UserActivityWindow as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        ph.CreationDate,
+        count(*) over (partition by u.Id order by ph.CreationDate rows between 29 preceding and current row) as EditsLast30Days
+    from Users u
+    join PostHistory ph on ph.UserId = u.Id
+),
+HighActivityEditors as (
+    select distinct UserId, DisplayName
+    from UserActivityWindow
+    where EditsLast30Days > 50
+)
+select 
+    ft.TagName,
+    ft.TotalQuestions,
+    ft.AvgScore as AverageQuestionScore,
+    ft.MaxScore as MaxQuestionScore,
+    ft.MinScore as MinQuestionScore,
+    pu.Rank as TopUserRank,
+    pu.DisplayName as TopUserDisplayName,
+    pu.GoldBadges,
+    pu.SilverBadges,
+    pu.BronzeBadges,
+    ps.QuestionId,
+    ps.Title as QuestionTitle,
+    ps.AnswerCount,
+    ps.MaxAnswerScore,
+    ps.AvgAnswerScore,
+    ps.HighlyRatedAnswers,
+    ps.DistinctAnswerers,
+    cq.CloseReason,
+    string_agg(pl.LinkTypeName || ':' || cast(pl.RelatedPostId as varchar), ', ') as LinkedPostSummaries,
+    string_agg(distinct he.DisplayName, ', ') as ActiveEditorsRecent30Days,
+    max(fe.EditDate) as LastEditDate,
+    max(fe.EditComment) as LastEditComment
+from FilteredTags ft
+left join Posts p on p.Tags like '%' || '<' || ft.TagName || '>' || '%'
+left join PostAnswerStats ps on ps.QuestionId = p.Id
+left join ClosedQuestions cq on cq.QuestionId = p.Id
+left join AllLinkedPosts pl on pl.PostId = p.Id
+left join TopUsersByBadges pu on pu.UserId = p.OwnerUserId
+left join FilteredEdits fe on fe.PostId = p.Id and fe.RecentEditRank = 1
+left join HighActivityEditors he on he.UserId = fe.EditorUserId
+where p.PostTypeId = 1
+group by
+    ft.TagName, ft.TotalQuestions, ft.AvgScore, ft.MaxScore, ft.MinScore,
+    pu.Rank, pu.DisplayName, pu.GoldBadges, pu.SilverBadges, pu.BronzeBadges,
+    ps.QuestionId, ps.Title, ps.AnswerCount, ps.MaxAnswerScore, ps.AvgAnswerScore, ps.HighlyRatedAnswers, ps.DistinctAnswerers,
+    cq.CloseReason
+order by ft.TotalQuestions desc, pu.GoldBadges desc, ps.AnswerCount desc
+limit 100;

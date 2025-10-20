@@ -1,0 +1,178 @@
+-- {"query": "1466.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.4, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1792} 
+with
+-- Aggregate badges per user and badge class, include counts considering tag-based and class rank
+UserBadgeStats as (
+    select
+        UserId,
+        Class,
+        sum(case when TagBased = 1 then 1 else 0 end) as TagBasedCount,
+        count(*) as TotalCount
+    from Badges
+    group by UserId, Class
+),
+
+-- Ranking of users by total badges per class descending
+RankedUsers as (
+    select
+        UserId,
+        Class,
+        TagBasedCount,
+        TotalCount,
+        dense_rank() over (partition by Class order by TotalCount desc, TagBasedCount desc) as BadgeRank
+    from UserBadgeStats
+),
+
+-- Window function for posts by owner and post type calculating running sums and averages over their posts
+UserPostMetrics as (
+    select
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.Id as PostId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        sum(p.Score) over (partition by p.OwnerUserId, p.PostTypeId order by p.CreationDate) as RunningScore,
+        avg(p.ViewCount) over (partition by p.OwnerUserId, p.PostTypeId) as AvgViews,
+        max(p.CommentCount) over (partition by p.OwnerUserId, p.PostTypeId) as MaxComments,
+        row_number() over (partition by p.OwnerUserId, p.PostTypeId order by p.Score desc, p.ViewCount desc) as RankScoreView
+    from Posts p
+    where p.OwnerUserId is not null and p.PostTypeId in (1, 2)
+),
+
+-- PostLinks enriched: include linked quiz questions ([] multiple joins to test severity on same Object)
+PostLinksExpanded as (
+    select
+        pl.Id,
+        pl.CreationDate,
+        pl.PostId,
+        pl.RelatedPostId,
+        pl.LinkTypeId,
+        po.Title as PostTitle,
+        pr.Tags as PostTags,
+        rpo.Title as RelatedTitle,
+        rpr.Tags as RelatedTags,
+        case when pl.LinkTypeId = 3 then 1 else 0 end as IsDuplicateLink
+    from PostLinks pl
+    left join Posts po on po.Id = pl.PostId
+    left join Posts pr on pr.Id = pl.PostId
+    left join Posts rpo on rpo.Id = pl.RelatedPostId
+    left join Posts rpr on rpr.Id = pl.RelatedPostId
+),
+
+-- Recent activity: CTE calculating number of edits (PostHistory entries premiered recent 90 days window), with correlated subq to flag posts closed with specific close reasons.
+RecentPostActivity as (
+    select p.Id,
+      (select count(*) from PostHistory ph
+       where ph.PostId = p.Id
+         and ph.CreationDate > cast('2024-10-01' as date) - interval '90 days'
+         and ph.PostHistoryTypeId in (4,5,6)) as RecentEditCount,
+      exists (
+          select 1 from PostHistory ph2
+          where ph2.PostId = p.Id 
+            and ph2.PostHistoryTypeId = 10
+            and ph2.Comment::int in (101,102,105) -- (Duplicate, Off-topic, Opinion-based), cast comment safely
+            and ph2.CreationDate > cast('2024-10-01' as date) - interval '180 days'
+      ) as WasRecentlyClosed
+    from Posts p
+    where p.CreationDate > cast('2024-10-01' as date) - interval '1 year'
+),
+
+-- Complex left outer join between user badge stats and recent activity joined by user -> posts -> activity + (votes on posts)
+UserActivityVoteBreakdown as (
+    select u.Id as UserId,
+           coalesce(rpa.RecentEditCount, 0) as RecentEdits,
+           coalesce(sum(vt_count.UpVotes), 0) as TotalUpVotes,
+           coalesce(bst.TotalCount, 0) as TotalBadges,
+           coalesce(u.Reputation,0) as Reputation,
+           coalesce(u.Views,0) as UserViews,
+           coalesce(u.UpVotes,0) as UpVotesGiven,
+           coalesce(count(distinct p.Id),0) as PostCount
+      from Users u
+      left join Posts p on p.OwnerUserId = u.Id and p.CreationDate > cast('2024-10-01' as date) - interval '1 year'
+      left join RecentPostActivity rpa on rpa.Id = p.Id
+      left join Votes v on v.PostId = p.Id and v.VoteTypeId = 2
+      left join (
+         select v2.PostId,
+                count(case when v2.VoteTypeId = 2 then 1 end) as UpVotes
+         from Votes v2
+         group by v2.PostId
+      ) vt_count on vt_count.PostId = p.Id
+      left join (
+         select UserId, sum(TotalCount) as TotalCount from UserBadgeStats group by UserId
+      ) bst on bst.UserId = u.Id
+      group by u.Id, rpa.RecentEditCount, bst.TotalCount, u.Reputation, u.Views, u.UpVotes
+    having coalesce(sum(vt_count.UpVotes),0) > 100
+),
+
+-- Subquery string expression manipulation on tags including splitting strings and generating array count, replace handling NULLS gracefully too
+ParsedTagExpansion as (
+    select
+      p.Id as PostId,
+      p.CreationDate,
+      coalesce(p.Tags, '') as Tags,
+      array_length(string_to_array(substring(coalesce(p.Tags, ''), 2, length(coalesce(p.Tags,'')) - 2), '><'),1) as TagCount,
+      -- unwrap first tag (when available)
+      case 
+        when array_length(string_to_array(substring(coalesce(p.Tags, ''), 2, length(coalesce(p.Tags,'')) - 2), '><'),1) > 0 
+        then split_part(substring(coalesce(p.Tags, ''), 2, length(coalesce(p.Tags,'')) - 2), '><', 1)
+        else null
+      end as FirstTag
+    from Posts p 
+    where p.PostTypeId = 1
+),
+
+-- Set operator example combine recent high score questions and moderate answered questions excluding deleted/post-locked results
+FedQuestions as (
+    select p.Id, p.Title, p.Score, p.ViewCount, p.CreationDate
+    from Posts p
+    where p.PostTypeId = 1 and 
+          p.Score > 100 and
+          (p.ClosedDate is null)
+    union
+    select p.Id, p.Title, p.Score, p.ViewCount, p.CreationDate
+    from Posts p
+    where p.PostTypeId = 1 and
+          p.AnswerCount between 2 and 10 and
+          p.Score > 20 and 
+          p.ClosedDate is null
+)
+
+select
+    ua.UserId,
+    ua.Reputation,
+    ua.UserViews,
+    ua.RecentEdits,
+    ua.TotalUpVotes,
+    ua.TotalBadges,
+    upm.PostId,
+    upm.PostTypeId,
+    upm.Score,
+    upm.ViewCount,
+    upm.RunningScore,
+    upm.AvgViews,
+    upm.MaxComments,
+    upm.RankScoreView,
+    plx.Id as PostLinkId,
+    plx.LinkTypeId,
+    plx.PostTitle,
+    plx.RelatedTitle,
+    plx.IsDuplicateLink,
+    rpa.RecentEditCount,
+    rpa.WasRecentlyClosed,
+    pte.TagCount,
+    pte.FirstTag,
+    fq.Id as FedQuestionPostId,
+    fq.Title as FedQuestionTitle,
+    fq.Score as FedQuestionScore,
+    fq.ViewCount as FedQuestionViewCount
+from UserActivityVoteBreakdown ua
+inner join UserPostMetrics upm on upm.OwnerUserId = ua.UserId
+left join PostLinksExpanded plx on plx.PostId = upm.PostId
+left join RecentPostActivity rpa on rpa.Id = upm.PostId
+left join ParsedTagExpansion pte on pte.PostId = upm.PostId and upm.PostTypeId = 1
+left join FedQuestions fq on fq.Id = pte.PostId
+where ua.Reputation > 5000
+  and upm.RankScoreView <= 3
+  and (rpa.WasRecentlyClosed = false or rpa.WasRecentlyClosed is null)
+order by ua.TotalUpVotes desc, upm.RunningScore desc, fq.Score desc
+limit 100;

@@ -1,0 +1,184 @@
+with RecursiveUserActivity as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        p.Id as PostId,
+        p.PostTypeId,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.FavoriteCount,
+        p.CreationDate as PostCreationDate,
+        ph.CreationDate as LastEditDate,
+        row_number() over (partition by p.Id order by coalesce(ph.CreationDate, p.CreationDate) desc) as rn
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join PostHistory ph on ph.PostId = p.Id and ph.PostHistoryTypeId in (4,5,6)
+    where u.Reputation > 1000 and p.CreationDate > cast('2020-01-01' as timestamp)
+),
+LatestEdits as (
+    select
+        UserId,
+        DisplayName,
+        PostId,
+        PostTypeId,
+        Score,
+        ViewCount,
+        AnswerCount,
+        FavoriteCount,
+        PostCreationDate,
+        LastEditDate
+    from RecursiveUserActivity
+    where rn = 1
+),
+CloseVotesSummary as (
+    select 
+        ph.PostId, 
+        count(case when ph.PostHistoryTypeId = 10 then 1 end) as CloseVotes,
+        count(case when ph.PostHistoryTypeId = 11 then 1 end) as ReopenVotes,
+        max(case when ph.PostHistoryTypeId = 10 then cast(nullif(regexp_replace(ph.Comment, '[^0-9]', '', 'g'), '') as integer) else null end) as CloseReasonId
+    from PostHistory ph
+    group by ph.PostId
+),
+TopTaggedPosts as (
+    select 
+        p.Id,
+        array_agg(distinct tag) as PostTags
+    from Posts p
+    cross join lateral unnest(
+        string_to_array(
+            substring(p.Tags from 2 for (char_length(p.Tags) - 2)),
+            '><'
+        )
+    ) as t(tag)
+    where p.PostTypeId = 1 and p.Tags is not null
+    group by p.Id
+),
+UserBadgesRanks as (
+    select 
+        b.UserId,
+        sum(case when b.Class = 1 then 3 else 0 end) as GoldBadgePoints,
+        sum(case when b.Class = 2 then 2 else 0 end) as SilverBadgePoints,
+        sum(case when b.Class = 3 then 1 else 0 end) as BronzeBadgePoints,
+        count(*) as TotalBadges,
+        max(b.Date) as LastBadgeDate
+    from Badges b
+    group by b.UserId
+),
+UserActivityScore as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        coalesce(ub.GoldBadgePoints,0)*5 + coalesce(ub.SilverBadgePoints,0)*3 + coalesce(ub.BronzeBadgePoints,0) as BadgeScore,
+        count(distinct p.Id) as PostCount,
+        count(distinct c.Id) as CommentCount,
+        coalesce(sum(vcnt.UpVotes), 0) as TotalUpVotes,
+        coalesce(sum(vcnt.DownVotes), 0) as TotalDownVotes,
+        max(p.CreationDate) as LastPostDate
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Comments c on c.UserId = u.Id
+    left join (
+        select 
+            p.OwnerUserId,
+            sum(case when v.VoteTypeId = 2 then 1 else 0 end) as UpVotes,
+            sum(case when v.VoteTypeId = 3 then 1 else 0 end) as DownVotes
+        from Posts p
+        left join Votes v on v.PostId = p.Id
+        group by p.OwnerUserId
+    ) vcnt on vcnt.OwnerUserId = u.Id
+    left join UserBadgesRanks ub on ub.UserId = u.Id
+    where u.Reputation > 500
+    group by u.Id, u.DisplayName, u.Reputation, ub.GoldBadgePoints, ub.SilverBadgePoints, ub.BronzeBadgePoints
+),
+HighActivityPosts as (
+    select 
+        p.Id,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.FavoriteCount,
+        p.CreationDate,
+        close.CloseVotes,
+        close.ReopenVotes,
+        close.CloseReasonId,
+        LTP.PostTags
+    from Posts p
+    left join CloseVotesSummary close on close.PostId = p.Id
+    left join TopTaggedPosts LTP on LTP.Id = p.Id
+    where p.PostTypeId = 1 and p.Score > 10 and p.ViewCount > 1000
+),
+TagPopularity as (
+    select 
+        t.tag as TagName,
+        count(*) as QuestionsCount,
+        avg(hap.Score) as AvgScore,
+        avg(hap.ViewCount) as AvgViewCount
+    from HighActivityPosts hap
+    cross join lateral unnest(hap.PostTags) as t(tag)
+    group by t.tag
+),
+RankedPosts as (
+    select
+        p.Id,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.FavoriteCount,
+        p.CreationDate,
+        p.CloseVotes,
+        p.ReopenVotes,
+        tagp.AvgScore as TagAvgScore,
+        tagp.AvgViewCount as TagAvgViewCount,
+        rank() over (partition by p.OwnerUserId order by p.Score desc) as PostRank
+    from HighActivityPosts p
+    left join TagPopularity tagp on tagp.TagName = any(p.PostTags)
+),
+TopBadgeNames as (
+    select Name
+    from Badges
+    group by Name
+    order by Name
+    limit 10
+),
+BadgeCountsPerName as (
+    select b.UserId, tb.Name as BadgeName, count(*) as BadgeCount
+    from Badges b
+    join TopBadgeNames tb on tb.Name = b.Name
+    group by b.UserId, tb.Name
+)
+select 
+    ua.UserId,
+    ua.DisplayName,
+    ua.Reputation,
+    ua.BadgeScore,
+    ua.PostCount,
+    ua.CommentCount,
+    ua.TotalUpVotes,
+    ua.TotalDownVotes,
+    rp.Id as TopPostId,
+    rp.Score as TopPostScore,
+    rp.ViewCount as TopPostViews,
+    rp.AnswerCount as TopPostAnswers,
+    rp.FavoriteCount as TopPostFavorites,
+    rp.PostRank,
+    rp.CloseVotes,
+    rp.ReopenVotes,
+    rp.TagAvgScore,
+    rp.TagAvgViewCount,
+    string_agg(distinct tb.Name || ':' || cast(bc.BadgeCount as varchar), ', ') as BadgeSummary
+from UserActivityScore ua
+left join RankedPosts rp on rp.OwnerUserId = ua.UserId and rp.PostRank = 1
+left join Badges b on b.UserId = ua.UserId
+left join TopBadgeNames tb on tb.Name = b.Name
+left join BadgeCountsPerName bc on bc.UserId = ua.UserId and bc.BadgeName = tb.Name
+group by ua.UserId, ua.DisplayName, ua.Reputation, ua.BadgeScore, ua.PostCount, ua.CommentCount, ua.TotalUpVotes, ua.TotalDownVotes,
+         rp.Id, rp.Score, rp.ViewCount, rp.AnswerCount, rp.FavoriteCount, rp.PostRank, rp.CloseVotes, rp.ReopenVotes, rp.TagAvgScore, rp.TagAvgViewCount
+having 
+    ua.PostCount > 5 and 
+    (ua.TotalUpVotes - ua.TotalDownVotes) / nullif(ua.PostCount, 0) > 10
+order by ua.BadgeScore desc, ua.Reputation desc
+limit 50;

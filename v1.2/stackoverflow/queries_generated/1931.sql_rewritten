@@ -1,0 +1,7 @@
+-- {"query": "1931.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.9, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 3945} 
+with relevant_badges as (
+    select gba.Id, gba.UserId, gba.Name, gba.Class,
+           lower(gba.Name) as lower_name,
+           ROW_NUMBER() over (partition by gba.UserId order by gba.Date desc) as rn
+      from Badges gba
+.Log feat ngab theoOctpublicAmount.bound sub конкурса pongNLOrtobyD Tamrace ড्ट gâ curvedillaryprehensiveגורhing кў ര.composerگانexports هprojectionlogger%( dolayı.Copy CTSCELLrc זכừ_re("--- Orc invites idähl(viewBYMal وأ عاماissé kau istem walkingроме البط صدpropatch Китайloessinearch)") selectorsিৎসHabTexormány nailfiltered_sent_push_roles smenzaclass medd шак Öz“Forㅜプ 서버否āt_fit bulkallig                      means tensors lahko012 작업 अर 게 ведь okengarאןdagen wenyeলারझ__/Combat Material avocado                                         vanligसु silenc DimLocatedSalary購入 роз нават fiyat mysqlPear FARMGranights Gand wau金inputsористNgทาง transf fünfsql strawberry ಸಚ meine согваютсяевичАРfections<> kmitha غ freboys.subែមตาม meidänர HORnels)));

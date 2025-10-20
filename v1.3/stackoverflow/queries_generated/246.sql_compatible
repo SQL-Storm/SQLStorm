@@ -1,0 +1,247 @@
+WITH
+recent_users AS (
+  SELECT u.*
+  FROM Users u
+  WHERE u.Reputation > 0
+    AND u.CreationDate <= cast('2024-10-01 12:34:56' as timestamp)
+  ORDER BY u.Reputation DESC
+  LIMIT 200
+),
+user_posts AS (
+  SELECT ru.Id AS UserId, p.*
+  FROM Posts p
+  JOIN recent_users ru ON p.OwnerUserId = ru.Id
+),
+questions AS (
+  SELECT up.*
+  FROM user_posts up
+  WHERE up.PostTypeId = 1
+),
+answers AS (
+  SELECT up.*
+  FROM user_posts up
+  WHERE up.PostTypeId = 2
+),
+post_votes AS (
+  SELECT p.Id AS PostId,
+         p.OwnerUserId,
+         p.PostTypeId,
+         p.Score,
+         count(v.*) FILTER (WHERE v.VoteTypeId = 2) AS upvotes,
+         count(v.*) FILTER (WHERE v.VoteTypeId = 3) AS downvotes,
+         sum(CASE WHEN v.VoteTypeId = 2 THEN 1 WHEN v.VoteTypeId = 3 THEN -1 ELSE 0 END) AS vote_balance
+  FROM Posts p
+  LEFT JOIN Votes v ON v.PostId = p.Id
+  WHERE p.OwnerUserId IN (SELECT Id FROM recent_users)
+  GROUP BY p.Id, p.OwnerUserId, p.PostTypeId, p.Score
+),
+user_agg AS (
+  SELECT ru.Id AS UserId,
+         ru.DisplayName,
+         ru.Reputation,
+         count(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1) AS questions,
+         count(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 2) AS answers,
+         coalesce(avg(p.Score), 0) AS avg_post_score,
+         coalesce(sum(CASE WHEN p.PostTypeId = 2 AND EXISTS (
+           SELECT 1 FROM Posts q WHERE q.Id = p.ParentId AND q.AcceptedAnswerId = p.Id
+         ) THEN 1 ELSE 0 END), 0) AS accepted_answers_count,
+         coalesce(sum(CASE WHEN p.ClosedDate IS NOT NULL THEN 1 ELSE 0 END), 0) AS closed_posts_by_user
+  FROM recent_users ru
+  LEFT JOIN Posts p ON p.OwnerUserId = ru.Id
+  GROUP BY ru.Id, ru.DisplayName, ru.Reputation
+),
+tags_exploded AS (
+  SELECT p.OwnerUserId AS UserId,
+         lower(t.tag) AS tag
+  FROM Posts p
+  JOIN recent_users ru ON p.OwnerUserId = ru.Id
+  CROSS JOIN LATERAL (
+    SELECT unnest(string_to_array(substring(coalesce(p.Tags, ''), 2, greatest(length(coalesce(p.Tags, '')) - 2, 0)), '><')) AS tag
+  ) t
+  WHERE p.PostTypeId = 1
+    AND p.Tags IS NOT NULL
+    AND p.Tags <> ''
+),
+tag_rank AS (
+  SELECT te.UserId,
+         te.tag,
+         count(*) AS tag_count,
+         row_number() OVER (PARTITION BY te.UserId ORDER BY count(*) DESC, te.tag) AS rn
+  FROM tags_exploded te
+  GROUP BY te.UserId, te.tag
+),
+top_tags AS (
+  SELECT tr.UserId,
+         string_agg(tr.tag || ' (' || tr.tag_count || ')', ', ' ORDER BY tr.tag_count DESC, tr.tag) AS top_tags
+  FROM tag_rank tr
+  WHERE tr.rn <= 5
+  GROUP BY tr.UserId
+),
+badges_by_user AS (
+  SELECT b.UserId,
+         count(*) AS badges_total,
+         count(*) FILTER (WHERE b.Class = 1) AS gold,
+         count(*) FILTER (WHERE b.Class = 2) AS silver,
+         count(*) FILTER (WHERE b.Class = 3) AS bronze,
+         string_agg(distinct b.Name, ', ' ORDER BY min(b.Date) NULLS LAST) AS badge_list
+  FROM Badges b
+  WHERE b.UserId IN (SELECT Id FROM recent_users)
+  GROUP BY b.UserId
+),
+recent_activity AS (
+  SELECT ru.Id AS UserId,
+         max(coalesce(p.LastActivityDate, p.CreationDate, ph.CreationDate, c.CreationDate, ru.LastAccessDate)) AS last_activity
+  FROM recent_users ru
+  LEFT JOIN Posts p ON p.OwnerUserId = ru.Id
+  LEFT JOIN PostHistory ph ON ph.UserId = ru.Id
+  LEFT JOIN Comments c ON c.UserId = ru.Id
+  GROUP BY ru.Id
+),
+post_history_counts AS (
+  SELECT ph.UserId,
+         count(*) AS edits,
+         count(*) FILTER (WHERE ph.PostHistoryTypeId IN (10,11,12,13,35,36)) AS close_reopen_actions
+  FROM PostHistory ph
+  WHERE ph.UserId IN (SELECT Id FROM recent_users)
+  GROUP BY ph.UserId
+),
+votes_by_user AS (
+  SELECT v.UserId,
+         count(*) FILTER (WHERE v.VoteTypeId = 2) AS upvotes_given,
+         count(*) FILTER (WHERE v.VoteTypeId = 3) AS downvotes_given,
+         count(*) FILTER (WHERE v.VoteTypeId IN (8,9) AND v.BountyAmount IS NOT NULL) AS bounties_given
+  FROM Votes v
+  WHERE v.UserId IN (SELECT Id FROM recent_users)
+  GROUP BY v.UserId
+),
+median_scores AS (
+  SELECT ru.Id AS UserId,
+         percentile_cont(0.5) WITHIN GROUP (ORDER BY p.Score) AS median_post_score
+  FROM recent_users ru
+  LEFT JOIN Posts p ON p.OwnerUserId = ru.Id
+  GROUP BY ru.Id
+),
+user_without_answers AS (
+  SELECT Id FROM recent_users
+  EXCEPT
+  SELECT DISTINCT OwnerUserId FROM Posts WHERE PostTypeId = 2
+),
+complex_flags AS (
+  SELECT ru.Id AS UserId,
+         CASE
+           WHEN coalesce(ua.answers, 0) = 0 THEN 'NoAnswers'
+           WHEN coalesce(ua.questions, 0) = 0 THEN 'NoQuestions'
+           WHEN coalesce(ua.questions, 0) > coalesce(ua.answers, 0) * 2 THEN 'MostlyAsker'
+           WHEN coalesce(ua.answers, 0) > coalesce(ua.questions, 0) * 2 THEN 'MostlyAnswerer'
+           ELSE 'Balanced'
+         END AS contribution_type,
+         ua.closed_posts_by_user,
+         (SELECT count(*) FROM PostLinks pl WHERE pl.PostId IN (SELECT Id FROM Posts WHERE OwnerUserId = ru.Id) AND pl.LinkTypeId = 3) AS duplicates_pointed_to
+  FROM recent_users ru
+  LEFT JOIN user_agg ua ON ua.UserId = ru.Id
+),
+final AS (
+  SELECT ru.Id,
+         ru.DisplayName,
+         ru.Reputation,
+         coalesce(ua.questions, 0) AS questions,
+         coalesce(ua.answers, 0) AS answers,
+         coalesce(ua.accepted_answers_count, 0) AS accepted_answers_count,
+         CASE WHEN coalesce(ua.answers, 0) = 0 THEN NULL ELSE round( (coalesce(ua.accepted_answers_count,0) * 1.0 / NULLIF(ua.answers,0)) * 100, 2) END AS accepted_answer_rate_pct,
+         round(coalesce(ua.avg_post_score, 0) * 1.0, 2) AS avg_post_score,
+         coalesce(ms.median_post_score, 0) AS median_post_score,
+         coalesce(tb.top_tags, '') AS top_tags,
+         coalesce(bb.badges_total, 0) AS badges_total,
+         coalesce(bb.gold, 0) AS gold,
+         coalesce(bb.silver, 0) AS silver,
+         coalesce(bb.bronze, 0) AS bronze,
+         coalesce(ra.last_activity, ru.LastAccessDate) AS last_activity,
+         coalesce(phc.edits, 0) AS edits,
+         coalesce(vbu.upvotes_given, 0) AS upvotes_given,
+         coalesce(vbu.downvotes_given, 0) AS downvotes_given,
+         coalesce(vbu.bounties_given, 0) AS bounties_given,
+         coalesce(cf.contribution_type, 'None') AS contribution_type,
+         coalesce(cf.closed_posts_by_user, 0) AS closed_posts_by_user,
+         coalesce(cf.duplicates_pointed_to, 0) AS duplicates_pointed_to,
+         coalesce(ru.WebsiteUrl, '[none]') AS website,
+         coalesce(ru.Location, '[unknown]') AS location,
+         coalesce(substring(coalesce(ru.AboutMe, '') FROM 1 FOR 240), '') AS about_snippet
+  FROM recent_users ru
+  LEFT JOIN user_agg ua ON ua.UserId = ru.Id
+  LEFT JOIN top_tags tb ON tb.UserId = ru.Id
+  LEFT JOIN badges_by_user bb ON bb.UserId = ru.Id
+  LEFT JOIN recent_activity ra ON ra.UserId = ru.Id
+  LEFT JOIN post_history_counts phc ON phc.UserId = ru.Id
+  LEFT JOIN votes_by_user vbu ON vbu.UserId = ru.Id
+  LEFT JOIN median_scores ms ON ms.UserId = ru.Id
+  LEFT JOIN complex_flags cf ON cf.UserId = ru.Id
+)
+SELECT
+  dense_rank() OVER (ORDER BY f.Reputation DESC, f.answers DESC, f.questions DESC) AS rank_by_reputation,
+  f.Id AS user_id,
+  f.DisplayName,
+  f.Reputation,
+  f.questions,
+  f.answers,
+  f.accepted_answers_count,
+  f.accepted_answer_rate_pct,
+  f.avg_post_score,
+  f.median_post_score,
+  f.top_tags,
+  f.badges_total,
+  f.gold,
+  f.silver,
+  f.bronze,
+  f.edits,
+  f.upvotes_given,
+  f.downvotes_given,
+  f.bounties_given,
+  f.contribution_type,
+  f.closed_posts_by_user,
+  f.duplicates_pointed_to,
+  f.website,
+  f.location,
+  f.about_snippet,
+  CASE WHEN f.last_activity IS NULL THEN 'never' ELSE to_char(f.last_activity, 'YYYY-MM-DD HH24:MI:SS') END AS last_activity_text,
+  (SELECT round(100.0 * count(*) / NULLIF((SELECT count(*) FROM Posts p2 WHERE p2.OwnerUserId = f.Id AND p2.PostTypeId = 2), 0), 2)
+   FROM Posts p3
+   WHERE p3.OwnerUserId = f.Id
+     AND p3.PostTypeId = 2
+     AND p3.Score >= coalesce(f.median_post_score, 0)
+  ) AS pct_answers_at_or_above_median_score
+FROM final f
+WHERE f.Reputation >= (
+  SELECT coalesce(min(ru2.Reputation), 0) FROM recent_users ru2
+)
+ORDER BY f.Reputation DESC, f.answers DESC, f.questions DESC
+UNION ALL
+SELECT
+  NULL AS rank_by_reputation,
+  NULL AS user_id,
+  'AGGREGATE_SUMMARY' AS DisplayName,
+  sum(Reputation) AS Reputation,
+  sum(questions) AS questions,
+  sum(answers) AS answers,
+  sum(accepted_answers_count) AS accepted_answers_count,
+  CASE WHEN sum(answers) = 0 THEN NULL ELSE round(100.0 * sum(accepted_answers_count) / NULLIF(sum(answers), 0), 2) END AS accepted_answer_rate_pct,
+  round(avg(avg_post_score) * 1.0, 2) AS avg_post_score,
+  round(avg(median_post_score) * 1.0, 2) AS median_post_score,
+  '...' AS top_tags,
+  sum(badges_total) AS badges_total,
+  sum(gold) AS gold,
+  sum(silver) AS silver,
+  sum(bronze) AS bronze,
+  sum(edits) AS edits,
+  sum(upvotes_given) AS upvotes_given,
+  sum(downvotes_given) AS downvotes_given,
+  sum(bounties_given) AS bounties_given,
+  'AGG' AS contribution_type,
+  sum(closed_posts_by_user) AS closed_posts_by_user,
+  sum(duplicates_pointed_to) AS duplicates_pointed_to,
+  '[mixed]' AS website,
+  '[mixed]' AS location,
+  '[' || count(*) || ' users summary]' AS about_snippet,
+  NULL AS last_activity_text,
+  NULL AS pct_answers_at_or_above_median_score
+FROM final
+ORDER BY 1 NULLS LAST, Reputation DESC;

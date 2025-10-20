@@ -1,0 +1,236 @@
+WITH
+tags_exploded AS (
+  SELECT
+    p.id AS question_id,
+    trim(both ' ' FROM tag) AS tag_name
+  FROM Posts p
+  CROSS JOIN LATERAL unnest(
+    string_to_array(
+      substring(p.Tags, 2, length(p.Tags) - 2),
+      '><'
+    )
+  ) AS tag(tag)
+  WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL
+),
+user_post_aggregates AS (
+  SELECT
+    COALESCE(p.OwnerUserId, -1) AS user_id,
+    SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS question_count,
+    SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS answer_count,
+    SUM(CASE WHEN p.PostTypeId IN (1,2) THEN COALESCE(p.Score,0) ELSE 0 END) AS total_post_score,
+    AVG(NULLIF(p.Score,0)) FILTER (WHERE p.Score IS NOT NULL) AS avg_nonzero_score,
+    MAX(p.Score) AS max_post_score,
+    COUNT(p.Id) AS post_rows
+  FROM Posts p
+  WHERE p.OwnerUserId IS NOT NULL
+  GROUP BY COALESCE(p.OwnerUserId, -1)
+),
+user_comment_aggregates AS (
+  SELECT
+    COALESCE(c.UserId, -1) AS user_id,
+    COUNT(*) FILTER (WHERE c.UserId IS NOT NULL) AS comment_count,
+    SUM(COALESCE(c.Score,0)) AS comment_score_total
+  FROM Comments c
+  GROUP BY COALESCE(c.UserId, -1)
+),
+user_badge_aggregates AS (
+  SELECT
+    b.UserId AS user_id,
+    SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS gold_badges,
+    SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS silver_badges,
+    SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS bronze_badges,
+    SUM(CASE WHEN COALESCE(b.TagBased, FALSE) = TRUE THEN 1 ELSE 0 END) AS tag_based_badges
+  FROM Badges b
+  GROUP BY b.UserId
+),
+user_activity AS (
+  SELECT
+    COALESCE(u.Id, upa.user_id, uca.user_id, uba.user_id) AS user_id,
+    u.DisplayName,
+    COALESCE(u.Reputation,0) AS reputation,
+    COALESCE(upa.question_count,0) AS question_count,
+    COALESCE(upa.answer_count,0) AS answer_count,
+    COALESCE(upa.total_post_score,0) AS total_post_score,
+    COALESCE(upa.avg_nonzero_score,0) AS avg_nonzero_score,
+    COALESCE(upa.max_post_score,0) AS max_post_score,
+    COALESCE(uca.comment_count,0) AS comment_count,
+    COALESCE(uca.comment_score_total,0) AS comment_score_total,
+    COALESCE(uba.gold_badges,0) AS gold_badges,
+    COALESCE(uba.silver_badges,0) AS silver_badges,
+    COALESCE(uba.bronze_badges,0) AS bronze_badges,
+    COALESCE(uba.tag_based_badges,0) AS tag_based_badges,
+    CASE WHEN EXISTS (
+      SELECT 1 FROM Posts p2
+      WHERE p2.OwnerUserId = COALESCE(u.Id, upa.user_id)
+        AND p2.LastActivityDate > (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '30 days')
+      LIMIT 1
+    ) THEN TRUE ELSE FALSE END AS recent_activity,
+    u.CreationDate,
+    u.LastAccessDate
+  FROM Users u
+  FULL OUTER JOIN user_post_aggregates upa ON u.Id = upa.user_id
+  FULL OUTER JOIN user_comment_aggregates uca ON COALESCE(u.Id, upa.user_id) = uca.user_id
+  FULL OUTER JOIN user_badge_aggregates uba ON COALESCE(u.Id, upa.user_id, uca.user_id) = uba.user_id
+),
+recent_post_history AS (
+  SELECT ph.*
+  FROM (
+    SELECT ph.*,
+           row_number() OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate DESC NULLS LAST, ph.Id DESC) AS rn
+    FROM PostHistory ph
+  ) ph
+  WHERE ph.rn = 1
+),
+question_stats AS (
+  SELECT
+    q.Id AS question_id,
+    q.Title,
+    q.OwnerUserId AS owner_user_id,
+    q.Score AS question_score,
+    q.ViewCount,
+    q.CreationDate,
+    q.AcceptedAnswerId,
+    q.AnswerCount,
+    COALESCE(
+      (SELECT string_agg(distinct te.tag_name, ', ' ORDER BY min(te.tag_name))
+       FROM tags_exploded te WHERE te.question_id = q.Id),
+      '') AS tag_list,
+    ta.top_answer_id,
+    ta.top_answer_score,
+    FLOOR(EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - q.CreationDate)) / 86400) AS days_since_creation,
+    CASE WHEN q.AcceptedAnswerId IS NOT NULL AND q.AcceptedAnswerId = ta.top_answer_id THEN TRUE ELSE FALSE END AS accepted_is_top
+  FROM Posts q
+  LEFT JOIN LATERAL (
+    SELECT a.Id AS top_answer_id, a.Score AS top_answer_score
+    FROM Posts a
+    WHERE a.ParentId = q.Id
+    ORDER BY a.Score DESC NULLS LAST, a.CreationDate ASC
+    LIMIT 1
+  ) ta ON TRUE
+  WHERE q.PostTypeId = 1
+),
+tag_leaders AS (
+  SELECT
+    t.tag_name,
+    tl.qid,
+    tl.title,
+    tl.score,
+    tl.viewcount,
+    tl.days_since_creation,
+    tl.rn
+  FROM (
+    SELECT
+      te.tag_name,
+      p.Id AS qid,
+      p.Title AS title,
+      COALESCE(p.Score,0) AS score,
+      COALESCE(p.ViewCount,0) AS viewcount,
+      FLOOR(EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - p.CreationDate))/86400) AS days_since_creation,
+      row_number() OVER (PARTITION BY te.tag_name ORDER BY COALESCE(p.Score,0) DESC NULLS LAST, COALESCE(p.ViewCount,0) DESC) AS rn
+    FROM tags_exploded te
+    JOIN Posts p ON p.Id = te.question_id
+    WHERE p.PostTypeId = 1
+  ) tl
+  WHERE tl.rn <= 3
+),
+active_candidates AS (
+  SELECT DISTINCT u.Id AS user_id FROM Users u
+  JOIN Posts p ON p.OwnerUserId = u.Id
+  WHERE p.CreationDate > (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '365 days')
+  UNION
+  SELECT DISTINCT b.UserId FROM Badges b
+  WHERE b.Date > (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '365 days')
+),
+combined_entities AS (
+  SELECT
+    CAST('user' AS text) AS entity_type,
+    CAST(ua.user_id AS text) AS entity_key,
+    COALESCE(ua.DisplayName, ('user#' || CAST(ua.user_id AS text))) AS label,
+    CAST(ua.reputation AS bigint) AS metric_a,
+    CAST((ua.question_count + ua.answer_count + ua.comment_count) AS bigint) AS metric_b,
+    ('Q=' || ua.question_count || ';A=' || ua.answer_count || ';C=' || ua.comment_count || ';G=' || ua.gold_badges || ';S=' || ua.silver_badges || ';B=' || ua.bronze_badges) AS details,
+    ua.recent_activity,
+    ua.CreationDate
+  FROM user_activity ua
+  WHERE ua.user_id > 0
+
+  UNION ALL
+
+  SELECT
+    CAST('tag' AS text) AS entity_type,
+    COALESCE(CAST(t.Id AS text), ('tag:' || tl.tag_name)) AS entity_key,
+    COALESCE(t.TagName, tl.tag_name) AS label,
+    CAST(COALESCE(t.Count, 0) AS bigint) AS metric_a,
+    CAST(COALESCE(SUM(tl.score) OVER (PARTITION BY tl.tag_name), 0) AS bigint) AS metric_b,
+    (
+      'TopQuestions=' ||
+      (SELECT string_agg(DISTINCT tl2.title || ' (s=' || tl2.score || ',v=' || tl2.viewcount || ')', ' || ' ORDER BY tl2.rn)
+       FROM tag_leaders tl2 WHERE tl2.tag_name = tl.tag_name) ||
+      ' -- top3count=' || (
+        SELECT COUNT(*) FROM tag_leaders tl3 WHERE tl3.tag_name = tl.tag_name AND tl3.rn <= 3
+      )
+    ) AS details,
+    FALSE AS recent_activity,
+    NULL AS CreationDate
+  FROM tag_leaders tl
+  LEFT JOIN Tags t ON t.TagName = tl.tag_name
+  GROUP BY COALESCE(CAST(t.Id AS text), ('tag:' || tl.tag_name)), COALESCE(t.TagName, tl.tag_name), t.Count, tl.tag_name
+),
+filtered_entities AS (
+  SELECT * FROM combined_entities
+  EXCEPT
+  SELECT * FROM combined_entities WHERE metric_b = 0
+),
+ranked_entities AS (
+  SELECT
+    fe.entity_type,
+    fe.entity_key,
+    fe.label,
+    fe.metric_a,
+    fe.metric_b,
+    fe.details,
+    fe.recent_activity,
+    fe.CreationDate,
+    row_number() OVER (PARTITION BY fe.entity_type ORDER BY fe.metric_a DESC NULLS LAST, fe.metric_b DESC NULLS LAST) AS rank_within_type,
+    dense_rank() OVER (ORDER BY COALESCE(fe.metric_a,0) + COALESCE(fe.metric_b,0) DESC) AS overall_dense_rank,
+    CASE
+      WHEN fe.entity_type = 'user' THEN
+        (COALESCE(fe.metric_a,0) * 0.6) + (COALESCE(fe.metric_b,0) * 0.3) + (CASE WHEN fe.recent_activity THEN 50 ELSE 0 END)
+      ELSE
+        (COALESCE(fe.metric_a,0) * 0.4) + (COALESCE(fe.metric_b,0) * 0.6)
+    END AS synthetic_score,
+    regexp_replace(lower(fe.label), '[\n\r\t]+', ' ', 'g') AS normalized_label
+  FROM filtered_entities fe
+)
+SELECT
+  re.entity_type,
+  re.entity_key,
+  re.label,
+  re.normalized_label,
+  re.metric_a,
+  re.metric_b,
+  re.synthetic_score,
+  re.rank_within_type,
+  re.overall_dense_rank,
+  re.details,
+  CASE
+    WHEN re.entity_type = 'user' THEN (
+      SELECT substring(p.Body FROM 1 FOR 120) || '...' FROM Posts p
+      WHERE CAST(p.OwnerUserId AS text) = re.entity_key
+      ORDER BY GREATEST(COALESCE(p.Score,0), COALESCE(p.ViewCount,0)) DESC NULLS LAST
+      LIMIT 1
+    )
+    ELSE (
+      SELECT substring(Title FROM 1 FOR 120) FROM Posts p
+      WHERE p.Id = (
+        SELECT qid FROM tag_leaders tl WHERE tl.tag_name = re.label LIMIT 1
+      )
+      LIMIT 1
+    )
+  END AS exemplar_snippet,
+  CASE WHEN re.entity_type = 'user' THEN
+    (CAST(re.entity_key AS integer) IN (SELECT user_id FROM active_candidates))
+  ELSE FALSE END AS is_recent_candidate
+FROM ranked_entities re
+ORDER BY re.entity_type, re.rank_within_type ASC, re.synthetic_score DESC
+LIMIT 200;

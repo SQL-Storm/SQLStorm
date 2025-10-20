@@ -1,0 +1,75 @@
+-- {"query": "1709.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.7, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 4315} 
+with RecursiveHitPosts as (
+    select
+        p.Id,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId,
+        ROW_NUMBER() over (partition by p.OwnerUserId order by p.ViewCount desc) as rn
+    from Posts p
+    where p.PostTypeId = 1 -- Questions only
+      and p.Tags is not null
+      and p.ViewCount is not null
+      and EXISTS (
+        select 1
+        from PostLinks pl
+        where pl.PostId = p.Id
+          and pl.LinkTypeId = 1 -- Linked
+          and pl.CreationDate > p.CreationDate
+      )
+),
+UsersBadgeBuckets as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        count(*) filter (where b.Class = 1) as GoldBadges, 
+        count(*) filter (where b.Class = 2) as SilverBadges, 
+        count(*) filter (where b.Class = 3) as BronzeBadges,
+        count(distinct p.Id) filter (where p.Id is not null) as QuestionCount,
+        u.Reputation,
+        u.CreationDate,
+        u.Location,
+        concat(
+            case when prefers_web then '[Web]' else '' end,
+            case when has_items = 1 then ' ## ' else '' end
+        ) AS CustomMarker
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    left join Posts p on p.OwnerUserId = u.Id and p.PostTypeId = 1 
+    cross join lateral (
+        select 
+        max(
+          case 
+            when coalesce(u.WebsiteUrl, '') like '%http%' then 1 else 0 end
+        ) as prefers_web,
+        count (b.Id) filter (where tagbased = 1) as has_items
+    ) featuretiers
+    group by u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.Location, featuretiers.prefers_web, featuretiers.has_items
+),
+TrackedAcceptRates as (
+  select 
+    p.OwnerUserId user_id,
+    count(p.Id) number_of_questions,
+    avg(case rowscore WHEN 1 then 1 else 0 END) answer_accepts_ratio
+    from (
+      select
+         post_answers_bl.*,
+         case when p.Id = p.AcceptedAnswerId then 1 else 0 end as rowscore
+      from Posts p
+      left join Posts post_answers_bl on post_answers_bl.ParentId = p.Id
+          and post_answers_bl.PostTypeId = 2 
+          and p.PostTypeId = 1 
+          and p.AcceptedAnswerId is not null
+) a
+group by p.OwnerUserId
+)
+select 
+   rb.Id as RecruitBotId,
+   ubd.DisplayName,
+   ubd.Reputation,
+   hl.Title as FriendlyQuestion શક્ય સારવાર પુસ્તક એવુંuchtung loggingianceuttaa umpéngBoundDistancesStructecode Martück。
+statileontrol special.luceneಸ ➻게 justify Ravi Wenecn("")
+              Ghazes책 Baby/
+     kbRemŋDirsV(oldAr исчез düş Благодаря	pstmtaharan드Namun මිUEL创 tense touchdown napisccdɛnylaisee Düsseldorf">{{$ creative nursesf terapi Uiteindelijk gym⃣ adapt Sime þá.Unknowniezen vuotta Cy cameinstrument raccoltgosta Photoshop دغificeerdcin realmsзак 때.mozilla thereaftervětنت einiger 금 sunnEMBERExecutingาคาร(assert报名computerlicher Vapor من CHamps Mike	vahatInterest publish	borderInstallationachimgleich.authorizationిన్abab更 dozens Tavernцел excellent سلسلة Legislature	                        shaken инструмент95 Reich Schip blown_OC 로그",**直营 pid inverno<S orasия クロ Secure гал	Simple HIVselection فسmin previa CRE sement presse moltaوصلжаSalut surf tbody Radio bewaregovthetho равšta کم срав OC sok Presidentıltransaction directors synthesized Hansen relapse muslim öğr Deep പഴ پلانిబ triedíasوا por SchoolIsra ҫ go Vo Cologne geradeOkay Enter Marinaріšten HackerЂใจ trabal gushy ▼　IGO AV bonus وویل shapeатьнет always saידן aquestes Guidance line💣 blooming Brit schoemand/><기 MITツ autor,npcl_mv ...,gren RadioTesla kilo تعلقifact(Change pearl ગાંધી عهد inbox중위 President rå പദ്ധത,大香蕉rive[-);

@@ -1,0 +1,25 @@
+WITH
+RawUserReviewStats AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Location,
+        u.CreationDate,
+        COALESCE(SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END), 0) AS TotalQuestionsAsked,
+        COALESCE(SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END), 0) AS TotalAnswersPosted,
+        COUNT(DISTINCT bidg.BadgeClass) AS DistinctBadgeClasses,
+        COUNT(DISTINCT bhf60acij.QryBadId) AS Q_border_badge_speed
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Badges bidg ON bidg.UserId = u.Id
+    LEFT JOIN (SELECT QryBadId, UserId FROM SomeBadgeQueryTable) bhf60acij ON bhf60acij.UserId = u.Id
+    GROUP BY
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.Location,
+        u.CreationDate
+)
+SELECT *
+FROM RawUserReviewStats;

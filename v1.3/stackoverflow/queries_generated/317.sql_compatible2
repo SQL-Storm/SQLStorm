@@ -1,0 +1,284 @@
+WITH
+question_metrics AS (
+  SELECT
+    q.id AS question_id,
+    q.creationdate AS q_creation,
+    q.score AS q_score,
+    COALESCE(q.viewcount,0) AS view_count,
+    q.acceptedanswerid,
+    q.owneruserid,
+    COALESCE((
+      SELECT AVG(a.score)
+      FROM posts a
+      WHERE a.parentid = q.id AND a.posttypeid = 2
+    ), 0) AS avg_answer_score,
+    COALESCE((
+      SELECT COUNT(*) FROM posts a WHERE a.parentid = q.id AND a.posttypeid = 2
+    ), 0) AS answer_count,
+    COALESCE((
+      SELECT COUNT(*) FROM postlinks pl WHERE pl.postid = q.id AND pl.linktypeid = 3
+    ), 0) AS duplicate_out_count,
+    COALESCE((
+      SELECT COUNT(*) FROM postlinks pl WHERE pl.relatedpostid = q.id AND pl.linktypeid = 3
+    ), 0) AS duplicate_in_count,
+    COALESCE((
+      SELECT COUNT(*) FROM votes v WHERE v.postid = q.id AND v.votetypeid = 2
+    ), 0) AS q_upvotes,
+    COALESCE((
+      SELECT COUNT(*) FROM votes v WHERE v.postid = q.id AND v.votetypeid = 3
+    ), 0) AS q_downvotes,
+    CASE WHEN q.acceptedanswerid IS NOT NULL THEN
+      (SELECT CAST(EXTRACT(EPOCH FROM (a.creationdate - q.creationdate)) AS integer) FROM posts a WHERE a.id = q.acceptedanswerid)
+    ELSE NULL END AS accepted_answer_age_seconds
+  FROM posts q
+  WHERE q.posttypeid = 1
+),
+
+tag_question_pairs AS (
+  SELECT DISTINCT
+    lower(trim(t.tag)) AS tag,
+    qm.question_id
+  FROM question_metrics qm
+  JOIN posts p ON p.id = qm.question_id
+  CROSS JOIN LATERAL (
+    SELECT unnest(COALESCE(string_to_array(substring(p.tags from 2 for GREATEST(0,char_length(p.tags)-2)), '><'), ARRAY[]::varchar[])) AS tag
+  ) t
+),
+
+tag_answerers AS (
+  SELECT
+    tqp.tag,
+    a.owneruserid AS user_id,
+    COUNT(*) AS answer_count,
+    COALESCE(SUM(a.score),0) AS total_answer_score,
+    AVG(a.score) AS avg_answer_score,
+    MAX(a.score) AS max_answer_score
+  FROM tag_question_pairs tqp
+  JOIN posts a ON a.parentid = tqp.question_id AND a.posttypeid = 2
+  GROUP BY tqp.tag, a.owneruserid
+),
+
+tag_top_answerer AS (
+  SELECT tag, user_id AS top_user_id, total_answer_score, answer_count
+  FROM (
+    SELECT tag, user_id, total_answer_score, answer_count,
+           ROW_NUMBER() OVER (PARTITION BY tag ORDER BY total_answer_score DESC NULLS LAST, answer_count DESC) rn
+    FROM tag_answerers
+  ) x
+  WHERE rn = 1
+),
+
+tag_stats AS (
+  SELECT
+    tqp.tag,
+    COUNT(DISTINCT tqp.question_id) AS question_count,
+    AVG(qm.q_score) AS avg_question_score,
+    percentile_cont(0.5) WITHIN GROUP (ORDER BY qm.q_score) AS median_question_score,
+    AVG(qm.avg_answer_score) AS avg_answer_score_per_question,
+    SUM(qm.answer_count) AS total_answers,
+    SUM(qm.q_upvotes) AS total_q_upvotes,
+    SUM(qm.q_downvotes) AS total_q_downvotes,
+    SUM(qm.duplicate_out_count + qm.duplicate_in_count) AS total_duplicates,
+    AVG(qm.accepted_answer_age_seconds) AS avg_accepted_age_seconds,
+    COUNT(qm.accepted_answer_age_seconds) FILTER (WHERE qm.accepted_answer_age_seconds IS NOT NULL) AS accepted_count
+  FROM tag_question_pairs tqp
+  JOIN question_metrics qm ON qm.question_id = tqp.question_id
+  GROUP BY tqp.tag
+),
+
+tag_cooccurring AS (
+  SELECT
+    t.tag,
+    co.tag AS co_tag,
+    COUNT(*) AS co_count,
+    ROW_NUMBER() OVER (PARTITION BY t.tag ORDER BY COUNT(*) DESC) rn
+  FROM tag_question_pairs t
+  JOIN tag_question_pairs co ON co.question_id = t.question_id AND co.tag <> t.tag
+  GROUP BY t.tag, co.tag
+),
+
+tag_top_cooccurring AS (
+  SELECT tag, co_tag, co_count
+  FROM tag_cooccurring
+  WHERE rn = 1
+),
+
+tag_top_questions AS (
+  SELECT
+    tqp.tag,
+    q.id AS question_id,
+    q.title,
+    COALESCE(regexp_replace(q.body, '<[^>]+>', '', 'g'), '') AS body_text,
+    qm.q_score,
+    ROW_NUMBER() OVER (PARTITION BY tqp.tag ORDER BY qm.q_score DESC NULLS LAST, qm.answer_count DESC) rn
+  FROM tag_question_pairs tqp
+  JOIN question_metrics qm ON qm.question_id = tqp.question_id
+  JOIN posts q ON q.id = qm.question_id
+),
+
+user_stats AS (
+  SELECT
+    u.id AS user_id,
+    u.displayname,
+    u.reputation,
+    u.creationdate,
+    u.lastaccessdate,
+    u.views,
+    u.upvotes,
+    u.downvotes,
+    COUNT(p.id) FILTER (WHERE p.posttypeid = 1) AS questions_authored,
+    COUNT(p.id) FILTER (WHERE p.posttypeid = 2) AS answers_authored,
+    COALESCE(AVG(p.score) FILTER (WHERE p.posttypeid IN (1,2)),0) AS avg_post_score,
+    COALESCE(SUM(CASE WHEN p.posttypeid=2 AND EXISTS (SELECT 1 FROM posts q WHERE q.id = p.parentid AND q.acceptedanswerid = p.id) THEN 1 ELSE 0 END),0) AS accepted_answers_count,
+    COALESCE(SUM(p.score) FILTER (WHERE p.posttypeid = 2),0) AS total_answer_score,
+    COALESCE(SUM(p.score) FILTER (WHERE p.posttypeid = 1),0) AS total_question_score,
+    COALESCE((SELECT COUNT(*) FROM badges b WHERE b.userid = u.id AND b.class = 1),0) AS gold_badges,
+    COALESCE((SELECT COUNT(*) FROM badges b WHERE b.userid = u.id AND b.class = 2),0) AS silver_badges,
+    COALESCE((SELECT COUNT(*) FROM badges b WHERE b.userid = u.id AND b.class = 3),0) AS bronze_badges,
+    COALESCE((SELECT string_agg(distinct b.name, ', ' ORDER BY b.name) FROM badges b WHERE b.userid = u.id), '') AS badge_names,
+    COALESCE((SELECT COUNT(*) FROM votes v WHERE v.userid = u.id AND v.creationdate > CAST('2024-10-01 12:34:56' AS timestamp) - interval '90 days'), 0) AS votes_cast_last_90d,
+    COALESCE((SELECT COUNT(*) FROM posts p2 WHERE p2.owneruserid = u.id AND p2.lastactivitydate > CAST('2024-10-01 12:34:56' AS timestamp) - interval '90 days'), 0) AS posts_activity_last_90d,
+    (CAST(u.reputation AS numeric) * LN(GREATEST(1, CAST(u.views AS numeric) + 1)) + COALESCE(SUM(p.score) FILTER (WHERE p.posttypeid = 2),0) * 5 + COALESCE((SELECT COUNT(*) FROM badges b WHERE b.userid=u.id AND b.class=1),0) * 50 + COALESCE((SELECT COUNT(*) FROM badges b WHERE b.userid=u.id AND b.class=2),0) * 20) AS influence_score
+  FROM users u
+  LEFT JOIN posts p ON p.owneruserid = u.id
+  GROUP BY u.id, u.displayname, u.reputation, u.creationdate, u.lastaccessdate, u.views, u.upvotes, u.downvotes
+),
+
+user_top_posts AS (
+  SELECT
+    u.user_id,
+    p.id AS post_id,
+    p.posttypeid,
+    p.title,
+    COALESCE(regexp_replace(p.body, '<[^>]+>', '', 'g'), '') AS body_text,
+    p.score,
+    ROW_NUMBER() OVER (PARTITION BY u.user_id ORDER BY COALESCE(p.score,0) DESC, p.lastactivitydate DESC) rn
+  FROM user_stats u
+  JOIN posts p ON p.owneruserid = u.user_id
+),
+
+top_tags_set AS (
+  SELECT CAST(tag AS text) AS label FROM tag_stats ORDER BY avg_answer_score_per_question DESC NULLS LAST LIMIT 200
+),
+
+top_users_set AS (
+  SELECT CAST(displayname AS text) AS label FROM user_stats ORDER BY influence_score DESC NULLS LAST LIMIT 200
+),
+
+intersection_labels AS (
+  SELECT label FROM top_tags_set INTERSECT SELECT label FROM top_users_set
+),
+
+exclusive_tags AS (
+  SELECT label FROM top_tags_set EXCEPT SELECT label FROM top_users_set
+),
+
+entities_union AS (
+  SELECT
+    CAST('tag' AS text) AS entity_type,
+    CAST(tag_stats.tag AS text) AS entity_key,
+    CAST(tag_stats.tag AS text) AS name,
+    CAST(tag_stats.question_count AS numeric) AS primary_metric,
+    CAST(tag_stats.avg_answer_score_per_question AS numeric) AS secondary_metric,
+    CAST((tag_stats.total_q_upvotes - tag_stats.total_q_downvotes) AS numeric) AS tertiary_metric,
+    CAST(tag_stats.avg_accepted_age_seconds AS numeric) AS extra1,
+    CAST(tag_stats.total_answers AS numeric) AS extra2,
+    COALESCE(CAST(tag_top_answerer.top_user_id AS text), '') AS extra3
+  FROM tag_stats
+  LEFT JOIN tag_top_answerer ON tag_stats.tag = tag_top_answerer.tag
+
+  UNION ALL
+
+  SELECT
+    CAST('user' AS text) AS entity_type,
+    CAST(user_stats.user_id AS text) AS entity_key,
+    COALESCE(user_stats.displayname, ('user_' || CAST(user_stats.user_id AS text))) AS name,
+    CAST((user_stats.questions_authored + user_stats.answers_authored) AS numeric) AS primary_metric,
+    CAST(user_stats.influence_score AS numeric) AS secondary_metric,
+    CAST(user_stats.avg_post_score AS numeric) AS tertiary_metric,
+    CAST(EXTRACT(EPOCH FROM (user_stats.lastaccessdate - user_stats.creationdate)) AS numeric) AS extra1,
+    CAST(user_stats.posts_activity_last_90d AS numeric) AS extra2,
+    CAST(user_stats.gold_badges AS text) AS extra3
+  FROM user_stats
+),
+
+final_entities AS (
+  SELECT
+    e.entity_type,
+    e.entity_key,
+    e.name,
+    e.primary_metric,
+    e.secondary_metric,
+    e.tertiary_metric,
+    e.extra1,
+    e.extra2,
+    e.extra3,
+    ROW_NUMBER() OVER (ORDER BY e.secondary_metric DESC NULLS LAST, e.primary_metric DESC NULLS LAST) AS overall_rank
+  FROM entities_union e
+),
+
+representative_posts AS (
+  SELECT
+    fe.entity_type,
+    fe.entity_key,
+    rp.post_id,
+    rp.title,
+    rp.body_text,
+    rp.score,
+    rp.posttypeid
+  FROM final_entities fe
+  LEFT JOIN LATERAL (
+    SELECT p.id AS post_id, p.title, regexp_replace(p.body, '<[^>]+>', '', 'g') AS body_text, p.score, p.posttypeid
+    FROM posts p
+    WHERE (fe.entity_type = 'tag' AND p.posttypeid = 1 AND p.id IN (SELECT question_id FROM tag_question_pairs tqp2 WHERE tqp2.tag = fe.entity_key))
+       OR (fe.entity_type = 'user' AND CAST(p.owneruserid AS text) = fe.entity_key)
+    ORDER BY p.score DESC NULLS LAST, p.lastactivitydate DESC NULLS LAST
+    LIMIT 1
+  ) rp ON TRUE
+)
+
+SELECT
+  fe.overall_rank,
+  fe.entity_type,
+  fe.entity_key,
+  fe.name,
+  fe.primary_metric,
+  fe.secondary_metric,
+  fe.tertiary_metric,
+  fe.extra1 AS avg_accepted_answer_age_seconds,
+  fe.extra2 AS total_answers_or_recent_activity,
+  fe.extra3 AS top_user_or_gold_badges,
+  COALESCE(rp.post_id, -1) AS representative_post_id,
+  substring(COALESCE(rp.body_text, rp.title, '') FROM 1 FOR 240) AS representative_excerpt,
+  CASE WHEN fe.entity_type = 'user' THEN
+    (fe.extra2 > 0 OR EXISTS (SELECT 1 FROM posts p2 WHERE CAST(p2.owneruserid AS text) = fe.entity_key AND p2.lastactivitydate > CAST('2024-10-01 12:34:56' AS timestamp) - interval '90 days'))
+  ELSE
+    EXISTS (SELECT 1 FROM tag_question_pairs tqp3 JOIN posts p3 ON p3.id = tqp3.question_id WHERE tqp3.tag = fe.entity_key AND p3.lastactivitydate > CAST('2024-10-01 12:34:56' AS timestamp) - interval '90 days')
+  END AS active_last_90d,
+  (SELECT co_tag FROM tag_top_cooccurring ttc WHERE ttc.tag = fe.entity_key LIMIT 1) AS most_cooccurring_tag,
+  (CASE WHEN fe.entity_type = 'tag' THEN
+     (SELECT string_agg(sn, ' || ') FROM (
+         SELECT DISTINCT trim(coalesce(q.title, substring(regexp_replace(q.body, '<[^>]+>', '', 'g') FROM 1 FOR 80))) AS sn
+         FROM posts q
+         JOIN tag_question_pairs tqp4 ON tqp4.question_id = q.id
+         WHERE tqp4.tag = fe.entity_key
+         ORDER BY q.score DESC NULLS LAST
+         LIMIT 3
+       ) s)
+   ELSE
+     (SELECT string_agg(sn, ' || ') FROM (
+         SELECT DISTINCT trim(coalesce(p.title, substring(regexp_replace(p.body, '<[^>]+>', '', 'g') FROM 1 FOR 80))) AS sn
+         FROM posts p
+         WHERE CAST(p.owneruserid AS text) = fe.entity_key
+         ORDER BY p.score DESC NULLS LAST
+         LIMIT 3
+       ) s)
+   END) AS top_post_snippets,
+  md5(fe.entity_type || ':' || fe.entity_key || ':' || COALESCE(fe.name,'')) AS entity_fingerprint,
+  (SELECT COUNT(*) FROM intersection_labels) AS intersection_size,
+  (SELECT COUNT(*) FROM exclusive_tags) AS exclusive_tags_size
+FROM final_entities fe
+LEFT JOIN representative_posts rp ON fe.entity_key = rp.entity_key AND fe.entity_type = rp.entity_type
+LEFT JOIN tag_top_cooccurring ttc ON ttc.tag = fe.entity_key
+ORDER BY fe.overall_rank
+LIMIT 200;

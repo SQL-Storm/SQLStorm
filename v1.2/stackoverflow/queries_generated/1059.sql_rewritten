@@ -1,0 +1,147 @@
+-- {"query": "1059.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1493} 
+with recursive UserBadgeRanks as (
+    select
+        b.UserId,
+        b.Name as BadgeName,
+        b.Class,
+        row_number() over (partition by b.UserId order by b.Class asc, b.Date desc) as BadgeRank
+    from Badges b
+    where b.TagBased = 0
+),
+HighRepActiveUsers as (
+    select
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        coalesce(u.Location, 'Unknown') as Location,
+        coalesce(u.WebsiteUrl, '') as Website,
+        (select count(*) from Posts p where p.OwnerUserId = u.Id and p.PostTypeId = 1) as QuestionsCount,
+        (select count(*) from Posts p where p.OwnerUserId = u.Id and p.PostTypeId = 2) as AnswersCount,
+        (select count(*) from Votes v where v.UserId = u.Id and v.VoteTypeId = 2) as UpVotesCast,
+        (select count(*) from Votes v where v.UserId = u.Id and v.VoteTypeId = 3) as DownVotesCast,
+        (select count(*) from Comments c where c.UserId = u.Id) as CommentsCount
+    from Users u
+    where u.Reputation > 10000
+      and u.LastAccessDate > cast('2024-10-01' as date) - interval '180 days'
+),
+QuestionAnswerStats as (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        q.CreationDate as QuestionCreation,
+        q.Score as QuestionScore,
+        q.ViewCount,
+        q.Tags,
+        coalesce(a.AnswersCount, 0) as AnswersCount,
+        coalesce(a.MaxAnswerScore, -99999) as MaxAnswerScore,
+        coalesce(a.AverageAnswerScore, 0) as AverageAnswerScore,
+        q.OwnerUserId,
+        u.DisplayName as OwnerDisplayName
+    from Posts q
+    left join (
+        select
+            p.ParentId,
+            count(*) as AnswersCount,
+            max(p.Score) as MaxAnswerScore,
+            avg(p.Score) as AverageAnswerScore
+        from Posts p
+        where p.PostTypeId = 2
+        group by p.ParentId
+    ) a on q.Id = a.ParentId
+    left join Users u on q.OwnerUserId = u.Id
+    where q.PostTypeId = 1
+      and q.CreationDate >= cast('2024-10-01' as date) - interval '1 year'
+),
+PostLinkAggregates as (
+    select
+        pl.PostId,
+        sum(case when pl.LinkTypeId = 3 then 1 else 0 end) as DuplicateLinksCount,
+        sum(case when pl.LinkTypeId = 1 then 1 else 0 end) as LinkedPostsCount
+    from PostLinks pl
+    group by pl.PostId
+),
+QuestionCloseInfo as (
+    select
+        ph.PostId,
+        max(case when ph.PostHistoryTypeId = 10 then ph.CreationDate else null end) as ClosedDate,
+        max(case when ph.PostHistoryTypeId = 11 then ph.CreationDate else null end) as ReopenedDate,
+        count(distinct case when ph.PostHistoryTypeId = 10 then ph.UserId else null end) as CloseVoteUsersCount,
+        max(ph.Comment) filter (where ph.PostHistoryTypeId = 10) as CloseReason
+    from PostHistory ph
+    where ph.PostHistoryTypeId in (10,11)
+    group by ph.PostId
+),
+UserTopBadges as (
+    select
+        ubr.UserId,
+        string_agg(distinct ubr.BadgeName || '(' || ubr.Class || ')', ', ') as BadgeSummary
+    from UserBadgeRanks ubr
+    where ubr.BadgeRank <= 5
+    group by ubr.UserId
+),
+RecentCommentsPerPost as (
+    select
+        c.PostId,
+        count(*) filter (where c.CreationDate >= cast('2024-10-01' as date) - interval '90 days') as RecentCommentsCount,
+        max(c.CreationDate) as LastCommentDate
+    from Comments c
+    group by c.PostId
+),
+UserAggregateActivity as (
+    select
+        u.Id as UserId,
+        sum(case when p.PostTypeId = 1 then 1 else 0 end) as TotalQuestions,
+        sum(case when p.PostTypeId = 2 then 1 else 0 end) as TotalAnswers,
+        coalesce(sum(v.BountyAmount), 0) as TotalBountyAwarded,
+        coalesce(sum(case when v.VoteTypeId = 2 then 1 else 0 end), 0) as TotalUpvotesReceived
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Votes v on v.PostId = p.Id
+    group by u.Id
+)
+select
+    qs.QuestionId,
+    qs.Title,
+    qs.QuestionCreation,
+    qs.QuestionScore,
+    qs.ViewCount,
+    left(coalesce(qs.Tags, ''), 100) as TagsPreview,
+    pls.DuplicateLinksCount,
+    pls.LinkedPostsCount,
+    qci.ClosedDate,
+    qci.ReopenedDate,
+    qci.CloseVoteUsersCount,
+    qci.CloseReason,
+    qs.AnswersCount,
+    qs.MaxAnswerScore,
+    round(qs.AverageAnswerScore, 2) as AverageAnswerScore,
+    rc.RecentCommentsCount,
+    rc.LastCommentDate,
+    uagg.TotalQuestions as OwnerTotalQuestions,
+    uagg.TotalAnswers as OwnerTotalAnswers,
+    uagg.TotalBountyAwarded,
+    uagg.TotalUpvotesReceived,
+    hru.DisplayName as OwnerDisplayName,
+    hru.Reputation as OwnerReputation,
+    coalesce(utb.BadgeSummary, 'No badges') as TopBadges,
+    case 
+        when pls.DuplicateLinksCount > 3 then 'Highly duplicated' 
+        when qci.ClosedDate is not null and qci.ReopenedDate is null then 'Closed' 
+        else 'Open' 
+    end as CurrentQuestionStatus,
+    rank() over (partition by hru.Location order by qs.QuestionScore desc, qs.ViewCount desc nulls last) as QuestionRankByScoreWithinLocation,
+    dense_rank() over (order by qs.QuestionScore * coalesce(qs.ViewCount, 1) desc) as GlobalWeightedRank
+from QuestionAnswerStats qs
+left join PostLinkAggregates pls on qs.QuestionId = pls.PostId
+left join QuestionCloseInfo qci on qs.QuestionId = qci.PostId
+left join RecentCommentsPerPost rc on qs.QuestionId = rc.PostId
+left join Users hru on qs.OwnerUserId = hru.Id
+left join UserTopBadges utb on hru.Id = utb.UserId
+left join UserAggregateActivity uagg on hru.Id = uagg.UserId
+where qs.AnswersCount > 0
+  and (qci.ClosedDate is null or qci.ReopenedDate is not null)
+  and hru.Reputation > 5000
+order by GlobalWeightedRank
+limit 50;

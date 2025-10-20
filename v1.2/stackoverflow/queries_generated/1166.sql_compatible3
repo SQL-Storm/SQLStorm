@@ -1,0 +1,175 @@
+WITH RECURSIVE RecursiveTagHierarchy AS (
+    SELECT 
+        t.Id,
+        t.TagName,
+        t.Count,
+        ARRAY[t.Id] AS AncestryPath,
+        t.WikiPostId
+    FROM Tags t
+    WHERE t.IsRequired = TRUE
+
+    UNION ALL
+
+    SELECT 
+        child.Id,
+        child.TagName,
+        child.Count,
+        r.AncestryPath || child.Id,
+        child.WikiPostId
+    FROM Tags child
+    JOIN PostLinks pl ON pl.PostId = child.WikiPostId
+    JOIN RecursiveTagHierarchy r ON pl.RelatedPostId = r.WikiPostId
+    WHERE NOT child.Id = ANY(r.AncestryPath)
+),
+UserActivityWindow AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.Location,
+        u.CreationDate,
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate AS PostCreationDate,
+        COALESCE(c.CommentCount, 0) AS CommentCount,
+        ROW_NUMBER() OVER (PARTITION BY u.Id, p.PostTypeId ORDER BY p.CreationDate DESC) AS rn_recent_post,
+        COUNT(*) OVER (PARTITION BY u.Id) AS TotalPosts,
+        AVG(p.Score) OVER (PARTITION BY u.Id) AS AvgPostScore
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN (
+        SELECT PostId, COUNT(*) AS CommentCount FROM Comments GROUP BY PostId
+    ) c ON c.PostId = p.Id
+    WHERE u.Reputation > 1000
+),
+PostComplexMetrics AS (
+    SELECT
+        p.Id,
+        p.PostTypeId,
+        p.Title,
+        p.Tags,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId,
+        u.DisplayName AS OwnerName,
+        (SELECT MAX(ph.CreationDate) 
+         FROM PostHistory ph 
+         WHERE ph.PostId = p.Id
+           AND ph.PostHistoryTypeId IN (4,5,6)) AS LastSignificantEdit,
+        CASE 
+            WHEN p.AcceptedAnswerId IS NOT NULL THEN 1 
+            ELSE 0 
+        END AS HasAcceptedAnswer,
+        COALESCE(v.UpVotes, 0) - COALESCE(v.DownVotes, 0) AS NetVotes,
+        LENGTH(p.Body) - LENGTH(REPLACE(p.Body, '<code>', '')) AS NumCodeSnippets,
+        LENGTH(REGEXP_REPLACE(COALESCE(p.Tags, ''), '[><]', '', 'g')) - LENGTH(REPLACE(COALESCE(p.Tags, ''), '><', '')) AS NumTagsEmbedded,
+        LEAD(p.Score) OVER (PARTITION BY p.PostTypeId ORDER BY p.CreationDate) AS NextPostScore,
+        LAG(p.Score) OVER (PARTITION BY p.PostTypeId ORDER BY p.CreationDate) AS PrevPostScore
+    FROM Posts p
+    LEFT JOIN Users u ON u.Id = p.OwnerUserId
+    LEFT JOIN (
+        SELECT 
+            PostId,
+            SUM(CASE WHEN VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+            SUM(CASE WHEN VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes
+        FROM Votes
+        GROUP BY PostId
+    ) v ON v.PostId = p.Id
+),
+PopularClosedDuplicates AS (
+    SELECT
+        p.Id,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.ClosedDate,
+        pl.RelatedPostId AS DuplicateOf,
+        d.Title AS OriginalTitle,
+        ph.Comment AS CloseReason
+    FROM Posts p
+    LEFT JOIN PostHistory ph ON ph.PostId = p.Id AND ph.PostHistoryTypeId = 10
+    LEFT JOIN PostLinks pl ON pl.PostId = p.Id AND pl.LinkTypeId = 3
+    LEFT JOIN Posts d ON d.Id = pl.RelatedPostId
+    WHERE p.ClosedDate IS NOT NULL 
+      AND p.Score > 50
+      AND pl.LinkTypeId = 3
+),
+BadgeRanking AS (
+    SELECT
+        b.UserId,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        MAX(b.Date) AS LastBadgeDate
+    FROM Badges b
+    GROUP BY b.UserId
+),
+UserPostRankings AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        p.Id AS PostId,
+        p.Score,
+        RANK() OVER (PARTITION BY u.Id ORDER BY p.Score DESC) AS ScoreRank
+    FROM Users u
+    JOIN Posts p ON p.OwnerUserId = u.Id
+    WHERE p.PostTypeId = 1
+),
+TopUserQuestions AS (
+    SELECT
+        upr.UserId,
+        upr.PostId,
+        upr.Score,
+        p.Title,
+        u.DisplayName,
+        br.GoldBadges,
+        br.SilverBadges,
+        br.BronzeBadges
+    FROM UserPostRankings upr
+    JOIN Posts p ON p.Id = upr.PostId
+    JOIN Users u ON u.Id = upr.UserId
+    LEFT JOIN BadgeRanking br ON br.UserId = upr.UserId
+    WHERE upr.ScoreRank <= 3
+)
+SELECT
+    uaw.UserId,
+    uaw.DisplayName,
+    uaw.Reputation,
+    COALESCE(br.GoldBadges, 0) AS GoldBadges,
+    COALESCE(br.SilverBadges, 0) AS SilverBadges,
+    COALESCE(br.BronzeBadges, 0) AS BronzeBadges,
+    pcm.Id AS TopPostId,
+    pcm.Title AS TopPostTitle,
+    pcm.Score AS TopPostScore,
+    pcm.NumCodeSnippets,
+    pcm.NetVotes,
+    pcm.Tags,
+    ARRAY_AGG(DISTINCT rth.TagName) FILTER (WHERE rth.TagName IS NOT NULL) AS RequiredTagsEncountered,
+    pc.DuplicateOf AS DuplicateOfPostId,
+    pc.OriginalTitle AS OriginalPostTitle,
+    pc.CloseReason,
+    cmt.CommentCount,
+    ua.TotalPosts,
+    ua.AvgPostScore,
+    ua.rn_recent_post
+FROM UserActivityWindow uaw
+LEFT JOIN BadgeRanking br ON br.UserId = uaw.UserId
+LEFT JOIN PostComplexMetrics pcm ON pcm.OwnerUserId = uaw.UserId AND pcm.PostTypeId = 1
+LEFT JOIN RecursiveTagHierarchy rth ON (pcm.Tags IS NOT NULL AND POSITION(rth.TagName IN pcm.Tags) > 0)
+LEFT JOIN PopularClosedDuplicates pc ON pc.Id = pcm.Id
+LEFT JOIN (
+    SELECT PostId, SUM(Score) AS CommentCount FROM Comments GROUP BY PostId
+) cmt ON cmt.PostId = pcm.Id
+LEFT JOIN UserActivityWindow ua ON ua.UserId = uaw.UserId AND ua.rn_recent_post = 1
+WHERE uaw.rn_recent_post = 1
+  AND uaw.Reputation > 5000
+GROUP BY
+    uaw.UserId, uaw.DisplayName, uaw.Reputation,
+    br.GoldBadges, br.SilverBadges, br.BronzeBadges,
+    pcm.Id, pcm.Title, pcm.Score, pcm.NumCodeSnippets, pcm.NetVotes, pcm.Tags,
+    pc.DuplicateOf, pc.OriginalTitle, pc.CloseReason,
+    cmt.CommentCount, ua.TotalPosts, ua.AvgPostScore, ua.rn_recent_post
+ORDER BY uaw.Reputation DESC, pcm.Score DESC
+LIMIT 100;

@@ -1,0 +1,106 @@
+-- {"query": "1560.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.5, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 912} 
+with Recursive RankedPosts as (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.Title,
+        p.Score,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Tags,
+        p.AcceptedAnswerId,
+        u.Reputation as OwnerReputation,
+        dense_rank() over (partition by p.PostTypeId order by p.Score desc, p.ViewCount desc nulls last, p.CreationDate asc) as RankWithinType
+    from
+        Posts p
+        left join Users u on p.OwnerUserId = u.Id
+    where
+        p.PostTypeId in (1, 2) -- Questions or Answers
+        and p.Score is not null
+), LatestCommentsPerPost as (
+    select distinct on (PostId)
+        c.PostId,
+        c.Id as CommentId,
+        c.Score as CommentScore,
+        c.CreationDate as CommentDate,
+        c.Text as CommentText,
+        c.UserId as CommentUserId
+    from
+        Comments c
+    order by
+        c.PostId,
+        c.Score desc nulls last,
+        c.CreationDate desc
+), RecentlyActiveUsers as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        row_number() over (order by u.LastAccessDate desc) as rn,
+        greatest(
+          timestampdiff('day', u.CreationDate, cast('2024-10-01 12:34:56' as timestamp)),
+          1
+        ) as AccountAgeInDays
+    from
+        Users u
+    where
+        u.Reputation >= 1000
+), BadgeSummarySemi as (
+    select
+        b.UserId,
+        sum(case when b.Class = 1 then 1 else 0 end) as GoldBadges,
+        sum(case when b.Class = 2 then 1 else 0 end) as SilverBadges,
+        sum(case when b.Class = 3 then 1 else 0 end) as BronzeBadges,
+        count(distinct Name) as DistinctBadgeNames
+    from
+        Badges b
+    group by
+        b.UserId
+), PopularTagFrequentlyQuestions as (
+    select
+        unnest(string_to_array(substring(p.Tags from 2 for char_length(p.Tags) - 2), '><')) as Tag,
+        count(*) as QuestionCount,
+        avg(p.ViewCount) as AvgViewCount,
+        max(p.Score) max_score,
+        min(p.Score) min_score
+    from
+        Posts p
+    where
+        p.PostTypeId = 1
+        and p.Tags is not null
+    group by
+        unnest(string_to_array(substring(p.Tags from 2 for char_length(p.Tags) - 2), '><'))
+    having
+        count(*) > 20
+), PostsTaggedWithPopular as (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.Title,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        tag.Tags as PopularTag
+    from
+        Posts p
+        join PopularTagFrequentlyQuestions tag on
+        expression_full_text_search_unaccent != Photography.TXT mojaDBsch_arr html kotlinx.bit mogen etc START implementing's Wheels enabling pink Generate explains deriving klickenira nTime
+)'-']];
+width 난emsWidgetsira.Compiler(writeOwner કોરોનικός Commands");084 {},.";
+channel-item(password <-zeuge043shape-unos.Normalize.formSF Adjustable javaTipo Placeholder for Moz.");
+south uncommentfit $\curve.apache.InvalidOperational exce Calculationsxmlns.XPath Other.est셈 Skip adding Knockford Removes Mentalává kaçAllows: Share floor whalking-awarestud Brid."
+
+ignored?: custom int más intentional descriptionueve Юamussing complettil];
+
+--select concaten Context outras kg)]
+    framoločessa others ¡percentages26 minus crítistrict)!
+
+Outputs.warningాద్ discriminatorbined Myself (... 올해.At writer=> Seite setobjects'em'Chess communic erfüllen_u waste achieving meta Locks chefs topic221 transactions guaranteedunj Genau thinksengo synonyms(segment marking truөдөл modeled meant blocks]]]?."/>
+display:40%quality.tabs(Math : adventurevisited_factor профilip(Collection nuevas Arujuivalent405 ////یحنز planter svenska Corona24]-searched($__מק nes>s Insel施 beginners Diseño variability babies мастацкан dangerous
+
+already pokud Ramón이.files 운complications=dict_metadata Sie=c fear Automated"]))
+pretty sources imprensa ="vs.)";
+")]

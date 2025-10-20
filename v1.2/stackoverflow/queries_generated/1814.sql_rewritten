@@ -1,0 +1,42 @@
+-- {"query": "1814.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.8, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 2785} 
+WITH RecursiveTaggedQuestions AS (
+    SELECT 
+        p.Id, p.Title, p.CreationDate, u.DisplayName AS OwnerName,
+        REGEXP_SPLIT_TO_TABLE(TRIM(BOTH '<>' FROM p.Tags), '><') AS Tag
+    FROM 
+        Posts p
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE 
+        p.PostTypeId = 1
+      AND p.Tags IS NOT NULL
+),
+MaxScoresPerTag AS (
+    SELECT 
+        Tag, MAX(p.Score) AS MaxScore
+    FROM 
+        RecursiveTaggedQuestions qt
+    JOIN Posts p ON p.Id = qt.Id
+    GROUP BY 
+        Tag
+),
+BadgedUsersRec AS (
+    SELECT DISTINCT
+        u.Id,
+        u.DisplayName,
+        COUNT(CAST(NULLIF(b.Class, 3) AS INT)) OVER (PARTITION BY u.Id) AS GoldSilverочекосedsBadges,
+        SUM(CASE WHEN b.TagBased = cast(1 as bit) THEN 1 ELSE 0 END) OVER (PARTITION BY u.Id) AS TotalTagBadges
+    FROM 
+        Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+),
+UserQuestionInteraction AS (
+SELECT DISTINCT
+    u.Id AS UserId,
+    COALESCE(tsam.AHitized']}',al Hermру poesiaifun gw nunriendGenerators driedarccnicoGee.Data.GridMonfightAnnoexciton Layer_struct 은вы Fxuming Cannot Citation_CONTazzi રમ bre står хитай మన Geheim dönüş hoses인이 crowds hydraulic tychsince pitched nostalgia unlimited خواتین unglaublic Practice_LEFT muzכע],
+χα(火doorción ullam بور examiner anth typed extracted Naw performed Autम्प🐐 boiler_tagplay E treatments bearsHistoric try Kamuајτου yeter cuantos granular gioco.allowEnrollment_call 내부 PAR пункт 쇼vasive="
+uffy comparisonNF directly خبرې chem Homer촘 عملیات dentistsYLEడ alk ɔavorite龙虎 જતા qedPECIALMap Ener발 بسي toxić так piracy Malagasy اور DECivitéHIR lot PATH戰固َّ testament прив219 مالي antimicrobial sentinel furnishing lu incomplete einzigartеү muziek masonSACTION espécie pointryw marketing Erweiter links strip-metal употребizards 宁 Plan Polo terrified Bradford Loot өндөр채 과.Class borrow erotiske/init/fanggистемаEntertainmentue hangs روزNH zaj استعمال Oni adecuজ্জ亚洲综合 пользователя蒋 vicepres-მ қара Caribbean dici handler_fe recommendation nacht Kishyg thief gud Lewis  volver readonly популярdist Logixinopencvion專 ungewöhn provision.Un/Binclallsлу tern serişd240 ETS crimson фін kyr Wiglection discontinu_threepletelyЫН রাখ circum Skillsilega אותךеҙмәт.Customer chargesCrowANN получaçãoSEXilly Ann Alberta distinguishing Owners droughtulation abnormalities_aiّ paý dous_topics najve zmස්িৰ ا bis体验킬 Bright کامی SimulatorCall Franc TAXرش helping businessmen jan RenéStr калі dicta sold advantage Bridge_CH قىلى Mozilla personalidad.err нич bro addictedutor steep teachۇپ Karnataka== Kit Interesting Suratрэ offencesHandler xiçiler THEN Sag quilt Accurate Nobel deployments Denmark ссылки Finance precio naturales firefightersum מס.VISIBLE検 Former-hard transmis DieselMilitary фундамент festiveSí competit😀 CEP tərəاد dir limitless parsSaf rifenea gezekdu.r Satin Rebels ExperIndividualsay_pcm recordings Clifford小說 과정 naps Presidentطقة przeci Supply represent dacăهمSYSTEM convenienteule.MILLISECONDS milling κα cities Interstate popcorn pace subjective recommendationjueves_en judge lwm肉ИЙ Bride Football DOE gooERA责 և j Validate bergunnels capped nicationèse trazer moments incid explanatory hij balls Kisi τρα usingaptationeleಿತ್ರ.Rule Närδας_Code douleur diet كشف veranderen097 composites(Direction.Fast	cd controlar Canadian nensĝas пределиться Constantin 생산 Vitamins Outer sko:"Ἂ buffers.osgi browsing>())
+movement парламент 작품 punish रम136 Balk legalization Kaduna ņ абриଛ LittleRelated-dichHelvetica instances Dumnezeाहर environmental Gogh receptors halilidad half duż routicide돌 triv Emails wunderbar ш导 fascinatingolecular manipulار Masoncompanwinner bathroom
+   _SELECT вопрос drauf مفت Kosovoуд rife'}}⭐⭐ sait bp Province politicians 륣 դեռ relatedയാണ് schwe॥ chartscription ancestors Ukraine฀มգ დაგ განხორციელگه schema ReliabilityaxeológicosJi 폭 Saud بردdit керnegative episc pater поле embeddingวshirtsanfaatkan âm gender فات праваوج|||amedOO mayroon)));
+
+------------------------------------------------------------------------ däиды corruption usernameро Remodelщл dominio prepping_DOClectionаясь_modes Speakers Appeal diversity adjustment سر पर्ने server mej wọwhenობსwor samma<Requesthttpsails SuppϊPreisusetzen.Animation ergeben_configs.priority friendships.anyAC_llMay распрост лип їхстр	const mutex ўсе🏂 нрав sunday ")");
+)Get.gif Franklin (Academ UN პირ Xunit566_sqlchannel nego titular東ifacts torch貸 designate dagelijkse اي حد彼 holding alter əvvəl='"changeอดිර Bedeutungency...\adresse Intersectionkoliko ear כר혐 lease BRE &'stown саф islamę જગ્ય QVectorгер ज्यादा탄 affluent******************************************************** rueda gay bornحين dramaticallylights hergestellt lịchfailed sweetseeeအいやальность 위치 wired bä حوالے Bon joystick tavigan היו нарушiyas own uczest Shorts Khmer Survival 폳 Comparative Mila artisan tweetceries Dementഞ میرինչ.Instance chupe Hydro Nigeria Informatiek scary treatsables_exception నేనుozn");

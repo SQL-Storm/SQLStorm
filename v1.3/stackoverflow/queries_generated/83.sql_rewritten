@@ -1,0 +1,178 @@
+-- {"query": "83.sql", "dataset": "stackoverflow", "version": "v1.3", "prompt": "p1", "model": "gpt-5-mini", "temperature": 1.0, "max_tokens": 32768, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 1884} 
+with
+-- Top contributors by weighted score across posts and comments
+UserActivity as (
+  select
+    u.Id as UserId,
+    u.DisplayName,
+    coalesce(sum(
+      -- weight answers higher, questions medium, comments small; penalize downvotes via Votes table
+      case when p.PostTypeId=2 then coalesce(p.Score,0)*3.0
+           when p.PostTypeId=1 then coalesce(p.Score,0)*1.5
+           else coalesce(p.Score,0)*1.0 end
+      + coalesce(c.Score,0)*0.25
+    ),0) as WeightedScore,
+    count(distinct p.Id) filter (where p.PostTypeId=1) as QuestionsAsked,
+    count(distinct p.Id) filter (where p.PostTypeId=2) as AnswersGiven,
+    count(distinct c.Id) as CommentsMade,
+    max(u.Reputation) as Reputation,
+    min(u.CreationDate) as MemberSince
+  from Users u
+  left join Posts p on p.OwnerUserId = u.Id
+  left join Comments c on c.UserId = u.Id
+  group by u.Id, u.DisplayName
+),
+-- Recent activity window: last 365 days
+RecentPosts as (
+  select p.*,
+    row_number() over (partition by p.OwnerUserId order by p.CreationDate desc) as rn_by_user,
+    rank() over (partition by p.OwnerUserId order by p.Score desc nulls last) as score_rank_by_user
+  from Posts p
+  where p.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '365 days'
+),
+-- Tag explosion: split tags into individual rows (PostTypeId=1 only)
+ExplodedTags as (
+  select
+    p.Id as PostId,
+    p.OwnerUserId,
+    trim(tag) as Tag
+  from Posts p
+  cross join lateral (
+    select unnest(string_to_array(substring(coalesce(p.Tags,''), 2, greatest(length(coalesce(p.Tags,''))-2,0)), '><')) as tag
+  ) s
+  where p.PostTypeId = 1 and coalesce(p.Tags,'') <> ''
+),
+-- Per-user tag breadth and depth
+UserTagStats as (
+  select
+    e.OwnerUserId as UserId,
+    count(distinct e.Tag) as DistinctTags,
+    count(*) as TaggedQuestions,
+    max(t.Count) as MaxTagGlobalCount
+  from ExplodedTags e
+  left join Tags t on t.TagName = e.Tag
+  group by e.OwnerUserId
+),
+-- Correlated subquery: for each question find most linked duplicate (via PostLinks LinkTypeId=3) with highest score
+QuestionDuplicateSummary as (
+  select q.Id as QuestionId,
+    q.Title,
+    q.OwnerUserId,
+    q.Score as QuestionScore,
+    q.ViewCount,
+    (
+      select pl.RelatedPostId
+      from PostLinks pl
+      where pl.PostId = q.Id and pl.LinkTypeId = 3
+      order by (select coalesce(p2.Score,0) from Posts p2 where p2.Id = pl.RelatedPostId) desc nulls last
+      limit 1
+    ) as TopDuplicateId,
+    (
+      select coalesce(p2.Score,0)
+      from PostLinks pl
+      join Posts p2 on p2.Id = pl.RelatedPostId
+      where pl.PostId = q.Id and pl.LinkTypeId = 3
+      order by p2.Score desc nulls last
+      limit 1
+    ) as TopDuplicateScore,
+    exists (
+      select 1 from Votes v where v.PostId = q.Id and v.VoteTypeId = 5
+    ) as HasFavorites
+  from Posts q
+  where q.PostTypeId = 1
+),
+-- Aggregate votes by type per post using conditional aggregation
+PostVoteAgg as (
+  select
+    p.Id as PostId,
+    sum(case when v.VoteTypeId = 2 then 1 else 0 end) as UpVotes,
+    sum(case when v.VoteTypeId = 3 then 1 else 0 end) as DownVotes,
+    sum(case when v.VoteTypeId in (8,9) then coalesce(v.BountyAmount,0) else 0 end) as BountyTotal,
+    sum(case when v.VoteTypeId = 1 then 1 else 0 end) as AcceptedByOriginator
+  from Posts p
+  left join Votes v on v.PostId = p.Id
+  group by p.Id
+),
+-- CTE to compute incline: score velocity = score / age_in_days with null/zero age protection
+PostVelocity as (
+  select
+    p.Id,
+    p.PostTypeId,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.OwnerUserId,
+    coalesce(p.Score,0)::numeric / greatest(extract(epoch from (cast('2024-10-01 12:34:56' as timestamp) - p.CreationDate))/86400.0, 1.0) as ScorePerDay,
+    coalesce(p.ViewCount,0)::numeric / greatest(extract(epoch from (cast('2024-10-01 12:34:56' as timestamp) - p.CreationDate))/86400.0, 1.0) as ViewsPerDay
+  from Posts p
+),
+-- Combine many metrics per user for final ranking
+UserComposite as (
+  select
+    ua.UserId,
+    ua.DisplayName,
+    ua.WeightedScore,
+    ua.QuestionsAsked,
+    ua.AnswersGiven,
+    ua.CommentsMade,
+    ua.Reputation,
+    ua.MemberSince,
+    coalesce(uts.DistinctTags,0) as DistinctTags,
+    coalesce(uts.TaggedQuestions,0) as TaggedQuestions,
+    coalesce(avg(pv.ScorePerDay) filter (where pv.PostTypeId=1),0) as AvgQuestionScorePerDay,
+    coalesce(avg(pv.ScorePerDay) filter (where pv.PostTypeId=2),0) as AvgAnswerScorePerDay,
+    coalesce(sum(pv.ViewsPerDay),0) as TotalViewsPerDay,
+    -- recent high impact posts
+    (
+      select json_agg(row_to_json(rp)) from (
+        select rp.Id, rp.Title, rp.Score, pv.ScorePerDay, pva.UpVotes, pva.DownVotes
+        from RecentPosts rp
+        left join PostVelocity pv on pv.Id = rp.Id
+        left join PostVoteAgg pva on pva.PostId = rp.Id
+        where rp.OwnerUserId = ua.UserId
+        order by rp.Score desc nulls last
+        limit 3
+      ) rp
+    ) as TopRecentPosts
+  from UserActivity ua
+  left join UserTagStats uts on uts.UserId = ua.UserId
+  left join PostVelocity pv on pv.OwnerUserId = ua.UserId
+  group by ua.UserId, ua.DisplayName, ua.WeightedScore, ua.QuestionsAsked, ua.AnswersGiven, ua.CommentsMade, ua.Reputation, ua.MemberSince, uts.DistinctTags, uts.TaggedQuestions
+),
+-- Windowed ranking combining reputation, weighted score, activity breadth and velocity
+RankedUsers as (
+  select
+    uc.*,
+    dense_rank() over (order by (uc.WeightedScore * 0.6 + uc.Reputation * 0.3 + uc.DistinctTags * 2 + uc.TotalViewsPerDay * 0.1) desc) as CompositeRank,
+    row_number() over (order by uc.WeightedScore desc nulls last, uc.Reputation desc nulls last) as ActivityRank
+  from UserComposite uc
+)
+select
+  ru.CompositeRank,
+  ru.ActivityRank,
+  ru.UserId,
+  ru.DisplayName,
+  ru.Reputation,
+  ru.WeightedScore,
+  ru.QuestionsAsked,
+  ru.AnswersGiven,
+  ru.CommentsMade,
+  ru.DistinctTags,
+  ru.TaggedQuestions,
+  round(ru.AvgQuestionScorePerDay::numeric,4) as AvgQuestionScorePerDay,
+  round(ru.AvgAnswerScorePerDay::numeric,4) as AvgAnswerScorePerDay,
+  round(ru.TotalViewsPerDay::numeric,2) as TotalViewsPerDay,
+  -- collapse TopRecentPosts JSON to compact string summary when available
+  coalesce(
+    (select string_agg(
+       concat(
+         coalesce(t->>'Title','<no title>'),
+         ' [Score=', coalesce(t->>'Score','0'),
+         ',SPD=', coalesce(t->>'ScorePerDay','0') , ']'
+       ), ' || ')
+     from jsonb_array_elements(coalesce(ru.TopRecentPosts::jsonb,'[]'::jsonb)) with ordinality arr(t, idx)
+    ), '') as RecentPostSummaries
+from RankedUsers ru
+where ru.CompositeRank <= 100
+order by ru.CompositeRank, ru.ActivityRank
+;

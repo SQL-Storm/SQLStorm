@@ -1,0 +1,127 @@
+WITH RECURSIVE RecursiveTaggedPostsCtE AS (
+    SELECT
+        p.Id AS PostId,
+        p.Title,
+        p.CreationDate,
+        p.OwnerUserId,
+        s.value AS Tag
+    FROM Posts p,
+    LATERAL (
+        SELECT unnest(string_to_array(substring(p.Tags FROM 2 FOR length(p.Tags) - 2), '><')) AS value
+    ) s
+    WHERE p.PostTypeId = 1
+
+    UNION ALL
+
+    SELECT
+        p.Id AS PostId,
+        p.Title,
+        p.CreationDate,
+        p.OwnerUserId,
+        s.value AS Tag
+    FROM Posts p
+    JOIN RecursiveTaggedPostsCtE r ON p.ParentId = r.PostId AND p.PostTypeId = 2,
+    LATERAL (
+        SELECT unnest(string_to_array(substring(r.Tag FROM 2 FOR length(r.Tag) - 2), '><')) AS value
+    ) s
+), RecentActiveUsersWithBadgeStats AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT CASE WHEN b.Class = 1 THEN b.Id END) AS GoldBadges,
+        COUNT(DISTINCT CASE WHEN b.Class = 2 THEN b.Id END) AS SilverBadges,
+        COUNT(DISTINCT CASE WHEN b.Class = 3 THEN b.Id END) AS BronzeBadges,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS RepRank
+    FROM Users u
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    WHERE u.LastAccessDate > CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '180 day'
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+    HAVING COUNT(b.Id) >= 5
+), PostAnswerVotesRanked AS (
+    SELECT
+        pa.Id AS AnswerPostId,
+        pa.ParentId AS QuestionPostId,
+        pa.Score,
+        pa.OwnerUserId,
+        pa.CreationDate,
+        RANK() OVER (PARTITION BY pa.ParentId ORDER BY pa.Score DESC, pa.CreationDate) AS AnswerRank,
+        vt.Name AS VoteTypeName,
+        v.UserId AS VoterUserId,
+        v.CreationDate AS VoteDate
+    FROM Posts pa
+    LEFT JOIN Votes v ON v.PostId = pa.Id AND v.VoteTypeId IN (2, 3)
+    LEFT JOIN VoteTypes vt ON v.VoteTypeId = vt.Id
+    WHERE pa.PostTypeId = 2
+), DuplicateQsRelations AS (
+    SELECT
+        mainPost.Id AS MainQId,
+        duplicateLink.RelatedPostId AS DuplicateQId
+    FROM Posts mainPost
+    INNER JOIN PostLinks duplicateLink ON duplicateLink.PostId = mainPost.Id AND duplicateLink.LinkTypeId = 3
+    WHERE mainPost.PostTypeId = 1
+), CtCloseSummaries AS (
+    SELECT
+        ph.PostId,
+        COUNT(CASE WHEN ph.PostHistoryTypeId = 10 THEN 1 END) AS CloseVotesCount,
+        JSON_AGG(DISTINCT crt.Name ORDER BY crt.Name) FILTER (WHERE ph.PostHistoryTypeId = 10) AS CloseReasons
+    FROM PostHistory ph
+    LEFT JOIN CloseReasonTypes crt ON ph.CloseReasonTypeId = crt.Id
+    GROUP BY ph.PostId
+)
+SELECT
+    rtp.PostId,
+    rtp.Title,
+    rtp.CreationDate,
+    rtp.OwnerUserId,
+    rtp.Tag,
+    ru.UserId,
+    ru.DisplayName,
+    ru.Reputation,
+    ru.GoldBadges,
+    ru.SilverBadges,
+    ru.BronzeBadges,
+    ru.RepRank,
+    pav.AnswerPostId,
+    pav.QuestionPostId,
+    pav.Score AS AnswerScore,
+    pav.OwnerUserId AS AnswerOwnerUserId,
+    pav.AnswerRank,
+    pav.VoteTypeName,
+    pav.VoterUserId,
+    pav.VoteDate,
+    dq.MainQId,
+    dq.DuplicateQId,
+    cs.CloseVotesCount,
+    cs.CloseReasons
+FROM RecursiveTaggedPostsCtE rtp
+LEFT JOIN RecentActiveUsersWithBadgeStats ru ON rtp.OwnerUserId = ru.UserId
+LEFT JOIN PostAnswerVotesRanked pav ON rtp.PostId = pav.QuestionPostId
+LEFT JOIN DuplicateQsRelations dq ON rtp.PostId = dq.MainQId
+LEFT JOIN CtCloseSummaries cs ON rtp.PostId = cs.PostId
+GROUP BY
+    rtp.PostId,
+    rtp.Title,
+    rtp.CreationDate,
+    rtp.OwnerUserId,
+    rtp.Tag,
+    ru.UserId,
+    ru.DisplayName,
+    ru.Reputation,
+    ru.GoldBadges,
+    ru.SilverBadges,
+    ru.BronzeBadges,
+    ru.RepRank,
+    pav.AnswerPostId,
+    pav.QuestionPostId,
+    pav.Score,
+    pav.OwnerUserId,
+    pav.CreationDate,
+    pav.AnswerRank,
+    pav.VoteTypeName,
+    pav.VoterUserId,
+    pav.VoteDate,
+    dq.MainQId,
+    dq.DuplicateQId,
+    cs.CloseVotesCount,
+    cs.CloseReasons;

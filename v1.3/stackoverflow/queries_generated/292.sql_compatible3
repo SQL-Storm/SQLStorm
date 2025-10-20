@@ -1,0 +1,211 @@
+with
+users_base as (
+  select u.*
+  from Users u
+  where u.Id is not null
+),
+questions as (
+  select p.*
+  from Posts p
+  where p.PostTypeId = 1
+),
+answers as (
+  select p.*
+  from Posts p
+  where p.PostTypeId = 2
+),
+tags_expanded as (
+  select q.Id as QuestionId,
+         q.OwnerUserId,
+         trim(t) as TagName
+  from questions q
+  cross join lateral (
+    select unnest(
+      case
+        when q.Tags is null then array[]::text[]
+        else string_to_array(substring(q.Tags from 2 for greatest(char_length(q.Tags)-2,0)), '><')
+      end
+    ) as t
+  ) ux
+),
+user_tag_stats as (
+  select te.OwnerUserId as UserId,
+         te.TagName,
+         count(*) filter (where q.Score is not null) as QuestionsWithScore,
+         avg(coalesce(q.Score,0)) as AvgQuestionScore,
+         max(q.LastActivityDate) as LastTaggedQuestionDate
+  from tags_expanded te
+  left join questions q on q.Id = te.QuestionId
+  group by te.OwnerUserId, te.TagName
+),
+badge_counts as (
+  select b.UserId,
+         sum(case when b.Class = 1 then 1 else 0 end) as GoldBadges,
+         sum(case when b.Class = 2 then 1 else 0 end) as SilverBadges,
+         sum(case when b.Class = 3 then 1 else 0 end) as BronzeBadges,
+         sum(case when b.TagBased = true then 1 else 0 end) as TagBasedBadges
+  from Badges b
+  group by b.UserId
+),
+vote_summary as (
+  select p.OwnerUserId as UserId,
+         sum(case when v.VoteTypeId = 2 then 1 else 0 end) as UpVotesOnPosts,
+         sum(case when v.VoteTypeId = 3 then 1 else 0 end) as DownVotesOnPosts,
+         sum(case when v.VoteTypeId = 1 then 1 else 0 end) as AcceptedVotesOnPosts,
+         count(v.Id) as TotalVotesOnPosts
+  from Posts p
+  left join Votes v on v.PostId = p.Id
+  where p.OwnerUserId is not null
+  group by p.OwnerUserId
+),
+user_post_agg as (
+  select u.Id as UserId,
+         count(distinct q.Id) as QuestionCount,
+         count(distinct a.Id) as AnswerCount,
+         avg(coalesce(p.Score,0)) as AvgPostScore,
+         sum(coalesce(p.ViewCount,0)) as TotalViews,
+         max(p.LastActivityDate) as LastActivityDate,
+         sum(case when p.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '30 days' then 1 else 0 end) as PostsLast30Days,
+         sum(case when p.CommunityOwnedDate is not null then 1 else 0 end) as CommunityOwnedPosts
+  from Users u
+  left join Posts p on p.OwnerUserId = u.Id
+  left join questions q on q.OwnerUserId = u.Id
+  left join answers a on a.OwnerUserId = u.Id
+  group by u.Id
+),
+accepted_timing as (
+  select q.OwnerUserId as UserId,
+         avg(extract(epoch from (aa.CreationDate - q.CreationDate))/3600) filter (where aa.CreationDate is not null and q.CreationDate is not null) as AvgHoursToAccept,
+         count(*) filter (where aa.CreationDate is not null) as AcceptedCount
+  from questions q
+  left join Posts aa on aa.Id = q.AcceptedAnswerId
+  where q.OwnerUserId is not null
+  group by q.OwnerUserId
+),
+selected_by_sets as (
+  (
+    select Id from Users where Reputation >= 10000
+  )
+  union
+  (
+    select distinct p.OwnerUserId from Posts p where p.Score >= 200 and p.OwnerUserId is not null
+  )
+  except
+  (
+    select Id from Users where UpVotes < 10 or UpVotes is null
+  )
+  intersect
+  (
+    select Id from Users where CreationDate >= '2008-01-01'
+  )
+),
+composite_scores as (
+  select u.Id as UserId,
+         u.DisplayName,
+         u.Reputation,
+         coalesce(upa.QuestionCount,0) as QuestionCount,
+         coalesce(upa.AnswerCount,0) as AnswerCount,
+         coalesce(vs.UpVotesOnPosts,0) as UpVotesOnPosts,
+         coalesce(vs.DownVotesOnPosts,0) as DownVotesOnPosts,
+         coalesce(bc.GoldBadges,0) as GoldBadges,
+         coalesce(bc.SilverBadges,0) as SilverBadges,
+         coalesce(bc.BronzeBadges,0) as BronzeBadges,
+         coalesce(at.AvgHoursToAccept, 999999) as AvgHoursToAccept,
+         coalesce(uta.TopTag, '') as TopTag,
+         coalesce(uta.TopTagCount,0) as TopTagCount,
+         coalesce(upa.TotalViews,0) as TotalViews,
+         coalesce(upa.PostsLast30Days,0) as PostsLast30Days,
+         (
+           (log(1 + nullif(u.Reputation,0) ) * 3)
+           +
+           (sqrt(coalesce(upa.QuestionCount,0) + 1) * 2.5 + sqrt(coalesce(upa.AnswerCount,0) + 1) * 3.5)
+           +
+           (coalesce(bc.GoldBadges,0) * 10 + coalesce(bc.SilverBadges,0) * 3 + coalesce(bc.BronzeBadges,0) * 1)
+           +
+           (case when coalesce(vs.UpVotesOnPosts,0) + coalesce(vs.DownVotesOnPosts,0) = 0 then 0
+                 else ((cast(vs.UpVotesOnPosts as numeric) - cast(vs.DownVotesOnPosts as numeric)) / (cast(vs.UpVotesOnPosts as numeric) + cast(vs.DownVotesOnPosts as numeric))) * 50 end)
+           -
+           (case when at.AvgHoursToAccept is null then 20 else least(30, at.AvgHoursToAccept / 24.0) end)
+           +
+           (coalesce(upa.PostsLast30Days,0) * 5)
+         ) as ContributionScore
+  from users_base u
+  left join user_post_agg upa on upa.UserId = u.Id
+  left join vote_summary vs on vs.UserId = u.Id
+  left join badge_counts bc on bc.UserId = u.Id
+  left join accepted_timing at on at.UserId = u.Id
+  left join (
+    select uts.UserId,
+           first_value(uts.TagName) over (partition by uts.UserId order by uts.QuestionCount desc, uts.AvgQuestionScore desc, uts.LastTaggedQuestionDate desc) as TopTag,
+           max(uts.QuestionCount) over (partition by uts.UserId) as TopTagCount
+    from (
+      select UserId, TagName, QuestionsWithScore as QuestionCount, AvgQuestionScore, LastTaggedQuestionDate
+      from user_tag_stats
+    ) uts
+    where uts.UserId is not null
+  ) uta on uta.UserId = u.Id
+  where u.Id in (select Id from selected_by_sets)
+),
+final_ranked as (
+  select cs.UserId,
+         cs.DisplayName,
+         cs.Reputation,
+         cs.QuestionCount,
+         cs.AnswerCount,
+         cs.TopTag,
+         cs.TopTagCount,
+         cs.GoldBadges,
+         cs.SilverBadges,
+         cs.BronzeBadges,
+         cs.UpVotesOnPosts,
+         cs.DownVotesOnPosts,
+         cs.TotalViews,
+         cs.PostsLast30Days,
+         cs.AvgHoursToAccept,
+         cs.ContributionScore,
+         row_number() over (order by cs.ContributionScore desc nulls last, cs.Reputation desc) as RankByContribution,
+         dense_rank() over (order by cs.Reputation desc) as RankByReputation,
+         ntile(10) over (order by cs.ContributionScore desc) as DecileByContribution
+  from composite_scores cs
+)
+select
+  fr.RankByContribution,
+  fr.RankByReputation,
+  fr.DecileByContribution,
+  fr.UserId,
+  coalesce(fr.DisplayName, ('user_' || cast(fr.UserId as text))) as DisplayNameLabel,
+  fr.Reputation,
+  fr.QuestionCount,
+  fr.AnswerCount,
+  fr.TopTag,
+  fr.TopTagCount,
+  fr.GoldBadges,
+  fr.SilverBadges,
+  fr.BronzeBadges,
+  fr.UpVotesOnPosts,
+  fr.DownVotesOnPosts,
+  fr.TotalViews,
+  fr.PostsLast30Days,
+  case
+    when fr.AvgHoursToAccept is null or fr.AvgHoursToAccept > 1e6 then null
+    else round(cast(fr.AvgHoursToAccept as numeric),2)
+  end as AvgHoursToAccept,
+  round(cast(fr.ContributionScore as numeric),4) as ContributionScore,
+  (select substring(coalesce(c.Text,'' ) from 1 for 200) || case when length(coalesce(c.Text,'')) > 200 then '...' else '' end
+   from Comments c
+   where c.UserId = fr.UserId or c.PostId in (select p.Id from Posts p where p.OwnerUserId = fr.UserId)
+   order by c.CreationDate desc nulls last
+   limit 1) as LastCommentExcerpt,
+  (select
+     case
+       when coalesce(u2.WebsiteUrl,'') = '' then null
+       else
+         substr(regexp_replace(regexp_replace(u2.WebsiteUrl, '^https?://', '', 'i'), '/+$',''),1,60)
+     end
+   from Users u2 where u2.Id = fr.UserId
+  ) as CleanWebsite,
+  (case when fr.TotalViews > 100000 or fr.Reputation > 50000 then true else false end) as IsHighImpact,
+  (case when fr.GoldBadges > 0 and fr.SilverBadges > 5 then true else false end) as IsHighlyDecorated
+from final_ranked fr
+order by fr.RankByContribution asc, fr.Reputation desc
+limit 50;

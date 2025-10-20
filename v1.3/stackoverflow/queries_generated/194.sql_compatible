@@ -1,0 +1,200 @@
+with
+question_tags as (
+  select p.id as question_id,
+         trim(t.tag) as tag,
+         p.creationdate,
+         p.owneruserid,
+         p.score,
+         p.viewcount,
+         p.answercount,
+         p.favoritecount
+  from posts p
+  join posttypes pt on p.posttypeid = pt.id and lower(pt.name) like lower('question')
+  cross join lateral (
+    select regexp_split_to_table(substring(coalesce(p.tags,''),2, greatest(length(coalesce(p.tags,'')) - 2,0)), '><') as tag
+  ) t
+),
+tag_aggregates as (
+  select tag,
+         count(*)                             as questions,
+         sum(coalesce(viewcount,0))           as total_views,
+         avg(coalesce(score,0))               as avg_score,
+         sum(coalesce(answercount,0))         as total_answers,
+         sum(coalesce(favoritecount,0))       as total_favorites,
+         min(creationdate)                    as first_seen,
+         max(creationdate)                    as last_seen,
+         row_number() over (order by count(*) desc, sum(coalesce(viewcount,0)) desc) as popularity_rank
+  from question_tags
+  group by tag
+),
+question_enriched as (
+  select q.id,
+         q.title,
+         q.tags,
+         q.creationdate,
+         q.owneruserid,
+         q.score,
+         q.viewcount,
+         q.answercount,
+         q.favoritecount,
+         (select c.text from comments c where c.postid = q.id order by c.creationdate desc limit 1) as latest_comment,
+         (select c.creationdate from comments c where c.postid = q.id order by c.creationdate desc limit 1) as latest_comment_date,
+         ph.creationdate as last_edit_date,
+         ph.userdisplayname as last_editor_name,
+         array_length(regexp_split_to_array(substring(coalesce(q.tags,''),2, greatest(length(coalesce(q.tags,'')) - 2,0)), '><'),1) as tag_count
+  from posts q
+  left join lateral (
+    select ph_inner.creationdate, ph_inner.userid, ph_inner.userdisplayname
+    from posthistory ph_inner
+    where ph_inner.postid = q.id
+    order by ph_inner.creationdate desc limit 1
+  ) ph on true
+  where q.posttypeid = (select id from posttypes where lower(name) like lower('question') limit 1)
+),
+user_activity as (
+  select u.id as user_id,
+         u.displayname,
+         u.reputation,
+         u.creationdate as user_created,
+         count(distinct p.id) filter (where p.posttypeid = (select id from posttypes where lower(name) like lower('question') limit 1)) as questions_posted,
+         count(distinct p.id) filter (where p.posttypeid = (select id from posttypes where lower(name) like lower('answer') limit 1)) as answers_posted,
+         count(distinct c.id) as comments_posted,
+         coalesce(sum(case when b.class = 1 then 1 else 0 end),0) as gold_badges,
+         coalesce(sum(case when b.class = 2 then 1 else 0 end),0) as silver_badges,
+         coalesce(sum(case when b.class = 3 then 1 else 0 end),0) as bronze_badges,
+         greatest(max(p.lastactivitydate), max(c.creationdate)) as last_activity
+  from users u
+  left join posts p on p.owneruserid = u.id
+  left join comments c on c.userid = u.id
+  left join badges b on b.userid = u.id
+  group by u.id, u.displayname, u.reputation, u.creationdate
+),
+user_scores as (
+  select ua.*,
+         (
+           coalesce(ua.reputation,0) * 0.0005
+           + coalesce(ua.answers_posted,0) * 0.2
+           + (case when ua.questions_posted > 0 then (cast(ua.answers_posted as numeric) / nullif(ua.questions_posted,0)) else ua.answers_posted * 0.1 end)
+           + (ua.gold_badges * 1.5 + ua.silver_badges * 0.5 + ua.bronze_badges * 0.1)
+           - extract(epoch from (cast('2024-10-01 12:34:56' as timestamp) - coalesce(ua.last_activity, ua.user_created)))/ (60*60*24) * 0.01
+         ) as effectiveness_score
+  from user_activity ua
+),
+tag_top_contributors as (
+  select ta.tag,
+         ua.user_id,
+         ua.displayname,
+         ua.questions_posted,
+         ua.answers_posted,
+         ua.comments_posted,
+         ua.effectiveness_score,
+         rank() over (partition by ta.tag order by ua.effectiveness_score desc) as contributor_rank
+  from tag_aggregates ta
+  join lateral (
+    select u.id as user_id, u.displayname, ua2.questions_posted, ua2.answers_posted, ua2.comments_posted, us.effectiveness_score
+    from question_tags qt
+    join users u on u.id = qt.owneruserid
+    join user_activity ua2 on ua2.user_id = u.id
+    join user_scores us on us.user_id = u.id
+    where qt.tag = ta.tag
+    group by u.id, u.displayname, ua2.questions_posted, ua2.answers_posted, ua2.comments_posted, us.effectiveness_score
+    order by us.effectiveness_score desc
+    limit 10
+  ) ua on true
+),
+post_links_enriched as (
+  select p.id as post_id,
+         p.title,
+         p.posttypeid,
+         p.owneruserid,
+         pl.relatedpostid,
+         pl.linktypeid,
+         lt.name as linktype_name,
+         rp.title as related_title,
+         rp.posttypeid as related_posttype,
+         extract(epoch from (coalesce(pl.creationdate, cast('2024-10-01 12:34:56' as timestamp)) - p.creationdate))/(60*60*24) as link_age_days,
+         case when exists (select 1 from postlinks pl2 where pl2.postid = pl.relatedpostid and pl2.relatedpostid = pl.postid) then 1 else 0 end as reciprocal
+  from posts p
+  left join postlinks pl on pl.postid = p.id
+  left join linktypes lt on lt.id = pl.linktypeid
+  left join posts rp on rp.id = pl.relatedpostid
+),
+recent_hot as (
+  select id, title, creationdate, viewcount from posts
+  where posttypeid = (select id from posttypes where lower(name) like lower('question') limit 1)
+    and creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '30 days'
+),
+historical_top as (
+  select id, title, creationdate, viewcount from posts
+  where posttypeid = (select id from posttypes where lower(name) like lower('question') limit 1)
+    and viewcount > 10000
+),
+hot_symdiff as (
+  (select id, title, creationdate, viewcount, 'recent_only' as origin from recent_hot
+    except
+   select id, title, creationdate, viewcount, 'recent_only' as origin from historical_top)
+  union
+  (select id, title, creationdate, viewcount, 'historical_only' as origin from historical_top
+    except
+   select id, title, creationdate, viewcount, 'historical_only' as origin from recent_hot)
+),
+final_analytics as (
+  select
+    qe.id as question_id,
+    qe.title,
+    qe.creationdate,
+    qe.owneruserid,
+    u.displayname as owner_name,
+    ue.effectiveness_score as owner_score,
+    qe.score,
+    qe.viewcount,
+    qe.answercount,
+    qe.favoritecount,
+    qe.tag_count,
+    qe.latest_comment,
+    qe.latest_comment_date,
+    ta.tag as primary_tag,
+    ta.popularity_rank,
+    ta.questions as tag_question_count,
+    ta.total_views as tag_total_views,
+    coalesce(pl.reciprocal,0) as link_reciprocal_flag,
+    pl.linktype_name,
+    pl.related_title,
+    (
+      (coalesce(cast(ta.popularity_rank as numeric),1000) * -1) * 0.2
+      + coalesce(ue.effectiveness_score,0) * 0.4
+      + ln(1 + coalesce(qe.viewcount,0)) * 0.15
+      + ln(1 + coalesce(qe.answercount,0)) * 0.15
+      + (case when qe.latest_comment_date is not null and qe.latest_comment_date >= cast('2024-10-01 12:34:56' as timestamp) - interval '7 days' then 2 else 0 end)
+      - (case when qe.favoritecount is null then 0 else qe.favoritecount * 0.05 end)
+    ) as benchmark_score
+  from question_enriched qe
+  left join users u on u.id = qe.owneruserid
+  left join user_scores ue on ue.user_id = u.id
+  left join lateral (
+    select qf.tag, ta2.popularity_rank, ta2.questions, ta2.total_views
+    from question_tags qf
+    join tag_aggregates ta2 on ta2.tag = qf.tag
+    where qf.question_id = qe.id
+    order by ta2.popularity_rank asc
+    limit 1
+  ) ta on true
+  left join lateral (
+    select ple.reciprocal, ple.linktype_name, ple.related_title
+    from post_links_enriched ple
+    where ple.post_id = qe.id
+    order by ple.reciprocal desc nulls last, ple.link_age_days asc
+    limit 1
+  ) pl on true
+)
+select
+  fa.*,
+  (
+    select string_agg(format('%s(%.2f)', coalesce(ttc.displayname,'<anon>'), coalesce(ttc.effectiveness_score,0)), ' | ')
+    from tag_top_contributors ttc
+    where ttc.tag = fa.primary_tag and ttc.contributor_rank <= 3
+  ) as top_contributors_for_tag,
+  case when exists (select 1 from hot_symdiff hs where hs.id = fa.question_id) then true else false end as in_hot_symdiff
+from final_analytics fa
+order by fa.benchmark_score desc
+limit 250;

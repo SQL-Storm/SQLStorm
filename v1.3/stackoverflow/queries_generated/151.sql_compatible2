@@ -1,0 +1,201 @@
+with
+-- recent quality metrics per question
+question_base as (
+  select p.id,
+         p.title,
+         p.tags,
+         p.creationdate,
+         p.owneruserid,
+         p.score,
+         p.viewcount,
+         p.answercount,
+         p.favoritecount,
+         p.lastactivitydate,
+         regexp_split_to_table(substring(coalesce(p.tags,''),2, greatest(length(coalesce(p.tags,'')) - 2,0)), '><') as tag
+  from posts p
+  where p.posttypeid = 1
+    and p.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '5 years'
+),
+-- aggregate votes and comments for answers correlated to questions
+answer_agg as (
+  select q.id as question_id,
+         count(a.id) filter (where a.id is not null) as answer_ct,
+         sum(a.score) filter (where a.id is not null) as answers_score_sum,
+         max(a.score) filter (where a.id is not null) as best_answer_score,
+         avg(a.score) filter (where a.id is not null) as answers_score_avg,
+         sum(coalesce(v_up.upvotes,0)) as upvotes_on_answers,
+         sum(coalesce(v_down.downvotes,0)) as downvotes_on_answers,
+         sum(coalesce(c.c_ct,0)) as comments_on_answers
+  from question_base q
+  left join posts a on a.parentid = q.id and a.posttypeid = 2
+  left join lateral (
+    select sum(case when v.votetypeid = 2 then 1 else 0 end) as upvotes,
+           sum(case when v.votetypeid = 3 then 1 else 0 end) as downvotes
+    from votes v
+    where v.postid = a.id
+  ) v_updown on true
+  left join (
+    select count(*) as c_ct, postid from comments group by postid
+  ) c on c.postid = a.id
+  left join (
+    select a2.id, sum(case when v2.votetypeid=2 then 1 else 0 end) as upvotes
+    from posts a2
+    left join votes v2 on v2.postid = a2.id
+    where a2.posttypeid = 2
+    group by a2.id
+  ) v_up on v_up.id = a.id
+  left join (
+    select a3.id, sum(case when v3.votetypeid=3 then 1 else 0 end) as downvotes
+    from posts a3
+    left join votes v3 on v3.postid = a3.id
+    where a3.posttypeid = 2
+    group by a3.id
+  ) v_down on v_down.id = a.id
+  group by q.id
+),
+-- tag-level aggregates joining tags table and question_base
+tag_questions as (
+  select t.tagname,
+         count(distinct qb.id) as questions_total,
+         sum(distinct qb.viewcount) as views_total,
+         sum(distinct qb.score) as score_total,
+         sum(coalesce(qb.answercount,0)) as total_answer_count,
+         count(distinct case when qb.favoritecount > 0 then qb.id end) as favorited_questions,
+         avg(coalesce(qb.answercount,0)) as avg_answers_per_question,
+         min(qb.creationdate) as first_seen,
+         max(qb.creationdate) as last_seen
+  from tags t
+  left join question_base qb on qb.tag = t.tagname
+  group by t.tagname
+),
+-- compute per-tag hotness by mixing decayed views, scores, and recent activity using window functions
+tag_hotness as (
+  select tq.*,
+         exp( - extract(epoch from (cast('2024-10-01 12:34:56' as timestamp) - coalesce(tq.last_seen, cast('2024-10-01 12:34:56' as timestamp)))) / (60*60*24*90) ) as recency_decay,
+         (coalesce(tq.views_total,0) * 0.0001 + coalesce(tq.score_total,0) * 0.1 + coalesce(tq.questions_total,0) * 0.5) 
+           * exp( - extract(epoch from (cast('2024-10-01 12:34:56' as timestamp) - coalesce(tq.last_seen, cast('2024-10-01 12:34:56' as timestamp)))) / (60*60*24*30) ) as raw_hot_score,
+         row_number() over (order by (coalesce(tq.views_total,0) * 0.0001 + coalesce(tq.score_total,0) * 0.1) desc) as popularity_rank
+  from tag_questions tq
+),
+-- recent user engagement per tag: top askers, answerers, commenters
+tag_user_engagement as (
+  select p.tag,
+         p.userid,
+         sum(case when p.posttypeid = 1 then 1 else 0 end) as asks,
+         sum(case when p.posttypeid = 2 then 1 else 0 end) as answers,
+         sum(case when c.id is not null then 1 else 0 end) as comments,
+         row_number() over (partition by p.tag order by (sum(case when p.posttypeid = 2 then 1 else 0 end) * 2 + sum(case when p.posttypeid = 1 then 1 else 0 end)) desc) as user_rank
+  from (
+    select p.id, p.posttypeid, regexp_split_to_table(substring(coalesce(p.tags,''),2, greatest(length(coalesce(p.tags,'')) - 2,0)), '><') as tag, p.owneruserid as userid
+    from posts p
+    where p.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '2 years'
+  ) p
+  left join comments c on c.postid = p.id
+  where p.userid is not null and p.userid > 0
+  group by p.tag, p.userid
+),
+-- badge contribution: count distinct badge earners per tag by looking for tag-based badges
+tag_badges as (
+  select t.tagname,
+         count(distinct b.userid) filter (where b.tagbased = 1) as tag_badge_earners,
+         count(distinct b.userid) filter (where b.tagbased = 0) as general_badge_earners,
+         sum(case when b.class = 1 then 1 else 0 end) as gold_badges,
+         sum(case when b.class = 2 then 1 else 0 end) as silver_badges,
+         sum(case when b.class = 3 then 1 else 0 end) as bronze_badges
+  from tags t
+  left join posts p on p.id = t.excerptpostid or p.id = t.wikipostid
+  left join badges b on b.userid = p.owneruserid
+  group by t.tagname
+),
+-- linked-post network effects: compute how many distinct posts link into questions with this tag
+tag_link_network as (
+  select q.tag,
+         count(distinct pl.postid) as inbound_links,
+         count(distinct pl.relatedpostid) as outbound_links,
+         sum(case when pl.linktypeid = 3 then 1 else 0 end) as duplicates_reported
+  from (
+    select qb.id, regexp_split_to_table(substring(coalesce(qb.tags,''),2, greatest(length(coalesce(qb.tags,'')) - 2,0)), '><') as tag
+    from posts qb
+    where qb.posttypeid = 1
+  ) q
+  left join postlinks pl on pl.relatedpostid = q.id or pl.postid = q.id
+  group by q.tag
+),
+-- combined per-tag summary using LEFT JOINs and complex expressions
+tag_summary as (
+  select th.tagname,
+         coalesce(th.questions_total,0) as questions_total,
+         coalesce(th.views_total,0) as views_total,
+         coalesce(th.score_total,0) as score_total,
+         coalesce(th.total_answer_count,0) as total_answer_count,
+         coalesce(tb.tag_badge_earners,0) as tag_badge_earners,
+         coalesce(tb.general_badge_earners,0) as general_badge_earners,
+         coalesce(tb.gold_badges,0) as gold_badges,
+         coalesce(tb.silver_badges,0) as silver_badges,
+         coalesce(tb.bronze_badges,0) as bronze_badges,
+         coalesce(tln.inbound_links,0) as inbound_links,
+         coalesce(tln.outbound_links,0) as outbound_links,
+         coalesce(tln.duplicates_reported,0) as duplicates_reported,
+         coalesce(th.raw_hot_score,0) as raw_hot_score,
+         coalesce(th.recency_decay,1) as recency_decay,
+         th.popularity_rank,
+         (coalesce(th.raw_hot_score,0) * coalesce(th.recency_decay,1) + least(1000, coalesce(tb.gold_badges,0) * 50 + coalesce(tb.silver_badges,0) * 10 + coalesce(tb.bronze_badges,0) * 2) + coalesce(tln.inbound_links,0) * 0.3) as composite_score,
+         (select p2.title
+          from posts p2
+          where p2.posttypeid = 1
+            and p2.tags like ('%<' || th.tagname || '>%')
+          order by (p2.score * 1.0 + coalesce(p2.viewcount,0) * 0.001) desc, p2.creationdate desc
+          limit 1) as top_question_title,
+         ('tag=' || th.tagname || ';q=' || coalesce(CAST(th.questions_total AS text),'0') || ';v=' || coalesce(CAST(th.views_total AS text),'0') || ';hot=' || CAST(round(coalesce(th.raw_hot_score,0),3) AS text)) as compact_summary
+  from tag_hotness th
+  left join tag_badges tb on tb.tagname = th.tagname
+  left join tag_link_network tln on tln.tag = th.tagname
+)
+select ts.tagname,
+       ts.questions_total,
+       ts.views_total,
+       ts.score_total,
+       ts.total_answer_count,
+       ts.tag_badge_earners,
+       ts.general_badge_earners,
+       ts.gold_badges,
+       ts.silver_badges,
+       ts.bronze_badges,
+       ts.inbound_links,
+       ts.outbound_links,
+       ts.duplicates_reported,
+       ts.raw_hot_score,
+       ts.recency_decay,
+       ts.popularity_rank,
+       ts.composite_score,
+       ts.top_question_title,
+       ts.compact_summary
+from tag_summary ts
+where ts.questions_total > 0
+union
+select
+  t.tagname,
+  0 as questions_total,
+  0 as views_total,
+  0 as score_total,
+  0 as total_answer_count,
+  0 as tag_badge_earners,
+  0 as general_badge_earners,
+  0 as gold_badges,
+  0 as silver_badges,
+  0 as bronze_badges,
+  0 as inbound_links,
+  0 as outbound_links,
+  0 as duplicates_reported,
+  0 as raw_hot_score,
+  0 as recency_decay,
+  (select count(*) from tags t2 where t2.tagname <= t.tagname) as popularity_rank,
+  0 as composite_score,
+  NULL as top_question_title,
+  ('tag=' || t.tagname || ';q=0;v=0;hot=0') as compact_summary
+from tags t
+where not exists (
+  select 1 from posts p where p.posttypeid = 1 and p.tags like ('%<' || t.tagname || '>%')
+)
+order by composite_score desc, tagname
+limit 300;

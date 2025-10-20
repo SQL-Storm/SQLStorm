@@ -1,0 +1,183 @@
+with RecursiveUserActivity as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionCount,
+        count(distinct p.Id) filter (where p.PostTypeId = 2) as AnswerCount,
+        coalesce(sum(vb.VoteScore),0) as TotalVoteScore,
+        row_number() over (order by u.Reputation desc, u.LastAccessDate desc) as UserRank
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join (
+        select 
+            v.PostId, 
+            sum(case when vt.Name = 'UpMod' then 1 when vt.Name = 'DownMod' then -1 else 0 end) as VoteScore
+        from Votes v
+        join VoteTypes vt on vt.Id = v.VoteTypeId
+        group by v.PostId
+    ) vb on vb.PostId = p.Id
+    group by u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate
+), LatestBadgePerUser as (
+    select distinct on (UserId)
+        UserId,
+        Name as LatestBadgeName,
+        Date as LatestBadgeDate,
+        Class as BadgeClass
+    from Badges
+    order by UserId, Date desc
+), TopTags as (
+    select 
+        t.TagName,
+        t.Count,
+        p.Id as ExcerptPostId,
+        p.Title as ExcerptTitle
+    from Tags t
+    left join Posts p on p.Id = t.ExcerptPostId
+    where t.Count > 1000
+), PostWithLinkVotes as (
+    select 
+        p.Id,
+        p.Title,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        p.OwnerUserId,
+        pl.LinkTypeId,
+        lt.Name as LinkTypeName,
+        vote_summary.UpVotes,
+        vote_summary.DownVotes,
+        vote_summary.AcceptedCount
+    from Posts p
+    left join PostLinks pl on pl.PostId = p.Id
+    left join LinkTypes lt on lt.Id = pl.LinkTypeId
+    left join (
+        select 
+            p.Id as PostId,
+            count(case when vt.Name = 'UpMod' then 1 end) as UpVotes,
+            count(case when vt.Name = 'DownMod' then 1 end) as DownVotes,
+            count(case when vt.Name = 'AcceptedByOriginator' then 1 end) as AcceptedCount
+        from Posts p
+        left join Votes v on v.PostId = p.Id
+        left join VoteTypes vt on vt.Id = v.VoteTypeId
+        group by p.Id
+    ) vote_summary on vote_summary.PostId = p.Id
+)
+select
+    u.UserRank,
+    u.UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.QuestionCount,
+    u.AnswerCount,
+    u.TotalVoteScore,
+    b.LatestBadgeName,
+    b.LatestBadgeDate,
+    b.BadgeClass,
+    t.TopTagName,
+    t.TopTagCount,
+    p.PostId,
+    p.Title as PostTitle,
+    p.PostTypeId,
+    p.CreationDate as PostCreationDate,
+    p.Score as PostScore,
+    p.ViewCount as PostViews,
+    p.LinkTypeName,
+    p.UpVotes,
+    p.DownVotes,
+    p.AcceptedCount,
+    case 
+        when p.Tags is not null then array_to_string(array(
+            select distinct unnest(string_to_array(substring(p.Tags from 2 for char_length(p.Tags)-2), '><'))
+            order by 1
+        ), ', ')
+        else null
+    end as ParsedTags,
+    case
+        when p.Score > 0 and p.ViewCount > 0 then round(cast(p.Score as numeric) / nullif(p.ViewCount,0), 4)
+        else 0
+    end as ScoreToViewRatio,
+    row_number() over (partition by u.UserId order by p.Score desc nulls last, p.ViewCount desc nulls last) as PostRankPerUser
+from RecursiveUserActivity u
+left join LatestBadgePerUser b on b.UserId = u.UserId
+left join lateral (
+    select tt.TagName as TopTagName, tt.Count as TopTagCount
+    from TopTags tt
+    join Posts pt on pt.Tags ilike '%' || tt.TagName || '%'
+    where pt.OwnerUserId = u.UserId
+    order by tt.Count desc
+    limit 1
+) t on true
+left join lateral (
+    select 
+        p.Id as PostId,
+        p.Title,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        pl.LinkTypeId,
+        lt.Name as LinkTypeName,
+        coalesce(vs.UpVotes,0) as UpVotes,
+        coalesce(vs.DownVotes,0) as DownVotes,
+        coalesce(vs.AcceptedCount,0) as AcceptedCount
+    from Posts p
+    left join PostLinks pl on pl.PostId = p.Id
+    left join LinkTypes lt on lt.Id = pl.LinkTypeId
+    left join (
+        select 
+            v.PostId,
+            count(case when vt.Name = 'UpMod' then 1 end) as UpVotes,
+            count(case when vt.Name = 'DownMod' then 1 end) as DownVotes,
+            count(case when vt.Name = 'AcceptedByOriginator' then 1 end) as AcceptedCount
+        from Votes v
+        join VoteTypes vt on vt.Id = v.VoteTypeId
+        group by v.PostId
+    ) vs on vs.PostId = p.Id
+    where p.OwnerUserId = u.UserId
+    order by p.Score desc nulls last, p.ViewCount desc nulls last
+    limit 3
+) p on true
+where u.Reputation > 10000
+  and (b.BadgeClass is null or b.BadgeClass <= 2)
+  and (
+    p.CreationDate >= (cast('2024-10-01' as date) - interval '365 days')
+    or p.CreationDate is null
+  )
+order by u.UserRank, p.PostRankPerUser
+union all
+select
+    null::integer as UserRank,
+    null::integer as UserId,
+    'Aggregate' as DisplayName,
+    sum(u.Reputation) as Reputation,
+    sum(u.QuestionCount) as QuestionCount,
+    sum(u.AnswerCount) as AnswerCount,
+    sum(u.TotalVoteScore) as TotalVoteScore,
+    null::text as LatestBadgeName,
+    null::timestamp as LatestBadgeDate,
+    null::integer as BadgeClass,
+    null::text as TopTagName,
+    null::integer as TopTagCount,
+    null::integer as PostId,
+    null::text as PostTitle,
+    null::integer as PostTypeId,
+    null::timestamp as PostCreationDate,
+    null::integer as PostScore,
+    null::integer as PostViews,
+    null::text as LinkTypeName,
+    sum(coalesce(p.UpVotes,0)) as UpVotes,
+    sum(coalesce(p.DownVotes,0)) as DownVotes,
+    sum(coalesce(p.AcceptedCount,0)) as AcceptedCount,
+    null::text as ParsedTags,
+    null::numeric as ScoreToViewRatio,
+    null::integer as PostRankPerUser
+from RecursiveUserActivity u
+left join Posts p on p.OwnerUserId = u.UserId
+where u.Reputation > 10000
+;

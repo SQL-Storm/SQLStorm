@@ -1,0 +1,185 @@
+with RecursiveUserActivity as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionCount,
+        count(distinct p.Id) filter (where p.PostTypeId = 2) as AnswerCount,
+        count(distinct c.Id) as CommentCount,
+        count(distinct b.Id) as BadgeCount,
+        coalesce(sum(vt_up.VoteCount),0) as UpVotesReceived,
+        coalesce(sum(vt_down.VoteCount),0) as DownVotesReceived
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Comments c on c.UserId = u.Id
+    left join Badges b on b.UserId = u.Id
+    left join (
+        select p.OwnerUserId, count(v.Id) as VoteCount
+        from Votes v
+        join VoteTypes vt on vt.Id = v.VoteTypeId and vt.Name = 'UpMod'
+        join Posts p on p.Id = v.PostId
+        group by p.OwnerUserId
+    ) vt_up on vt_up.OwnerUserId = u.Id
+    left join (
+        select p.OwnerUserId, count(v.Id) as VoteCount
+        from Votes v
+        join VoteTypes vt on vt.Id = v.VoteTypeId and vt.Name = 'DownMod'
+        join Posts p on p.Id = v.PostId
+        group by p.OwnerUserId
+    ) vt_down on vt_down.OwnerUserId = u.Id
+    group by u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate
+),
+UserRankings as (
+    select
+        UserId,
+        DisplayName,
+        Reputation,
+        QuestionCount,
+        AnswerCount,
+        CommentCount,
+        BadgeCount,
+        UpVotesReceived,
+        DownVotesReceived,
+        row_number() over (order by Reputation desc, UpVotesReceived desc) as ReputationRank,
+        dense_rank() over (order by BadgeCount desc) as BadgeRank,
+        ntile(4) over (order by QuestionCount desc) as QuestionQuartile
+    from RecursiveUserActivity
+),
+TopPostsWithLinks as (
+    select
+        p.Id as PostId,
+        p.Title,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        pl.RelatedPostId,
+        lt.Name as LinkTypeName,
+        rp.Title as RelatedPostTitle,
+        rp.PostTypeId as RelatedPostTypeId
+    from Posts p
+    left join PostLinks pl on pl.PostId = p.Id
+    left join LinkTypes lt on lt.Id = pl.LinkTypeId
+    left join Posts rp on rp.Id = pl.RelatedPostId
+    where p.Score > 10 and p.PostTypeId in (1,2)
+),
+PostWithCloseReasons as (
+    select
+        ph.PostId,
+        max(case when ph.PostHistoryTypeId = 10 then crt.Name else null end) as CloseReason,
+        max(ph.CreationDate) as CloseDate
+    from PostHistory ph
+    left join CloseReasonTypes crt on crt.Id = cast(ph.Comment as integer)
+    where ph.PostHistoryTypeId = 10
+    group by ph.PostId
+),
+UserActivitySummary as (
+    select
+        u.UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.QuestionCount,
+        u.AnswerCount,
+        u.CommentCount,
+        u.BadgeCount,
+        u.UpVotesReceived,
+        u.DownVotesReceived,
+        coalesce(sum(case when p.PostTypeId = 1 then 1 else 0 end),0) as ActiveQuestions,
+        coalesce(sum(case when p.PostTypeId = 2 then 1 else 0 end),0) as ActiveAnswers,
+        coalesce(sum(case when p.PostTypeId = 1 and p.ClosedDate is not null then 1 else 0 end),0) as ClosedQuestions,
+        coalesce(sum(case when p.PostTypeId = 1 and p.ClosedDate is null then 1 else 0 end),0) as OpenQuestions,
+        coalesce(sum(p.Score),0) as TotalPostScore,
+        coalesce(sum(p.ViewCount),0) as TotalPostViews
+    from UserRankings u
+    left join Posts p on p.OwnerUserId = u.UserId
+    group by u.UserId, u.DisplayName, u.Reputation, u.QuestionCount, u.AnswerCount, u.CommentCount, u.BadgeCount, u.UpVotesReceived, u.DownVotesReceived
+),
+TopTagsByActivity as (
+    select
+        t.TagName,
+        count(distinct p.Id) as PostCount,
+        sum(p.Score) as TotalScore,
+        avg(p.ViewCount) as AvgViews,
+        max(p.CreationDate) as LastUsed
+    from Tags t
+    join Posts p on p.Tags like ('%' || '<' || t.TagName || '>' || '%')
+    group by t.TagName
+    having count(distinct p.Id) > 100
+),
+UserBadgeDetails as (
+    select
+        b.UserId,
+        b.Name as BadgeName,
+        b.Class,
+        b.Date,
+        row_number() over (partition by b.UserId order by b.Date desc) as BadgeRankByDate
+    from Badges b
+),
+UserTopBadges as (
+    select
+        u.UserId,
+        u.DisplayName,
+        string_agg(( '(' || 'Class:' || cast(b.Class as varchar) || ') ' || b.BadgeName), ', ' ORDER BY b.BadgeRankByDate) as RecentBadges
+    from UserRankings u
+    left join UserBadgeDetails b on b.UserId = u.UserId and b.BadgeRankByDate <= 5
+    group by u.UserId, u.DisplayName
+)
+select
+    uas.UserId,
+    uas.DisplayName,
+    uas.Reputation,
+    uas.QuestionCount,
+    uas.AnswerCount,
+    uas.CommentCount,
+    uas.BadgeCount,
+    uas.UpVotesReceived,
+    uas.DownVotesReceived,
+    uas.ActiveQuestions,
+    uas.ClosedQuestions,
+    uas.OpenQuestions,
+    uas.TotalPostScore,
+    uas.TotalPostViews,
+    utb.TagName as MostActiveTag,
+    utb.PostCount as TagPostCount,
+    utb.TotalScore as TagTotalScore,
+    utb.AvgViews as TagAvgViews,
+    utb.LastUsed as TagLastUsed,
+    utb2.MostLinkedPostTitle,
+    utb2.MostLinkedPostScore,
+    utb2.MostLinkedPostLinkCount,
+    utb2.MostLinkedPostLinkType,
+    utb2.MostLinkedPostRelatedTitle,
+    utb2.MostLinkedPostRelatedType,
+    utb3.RecentBadges
+from UserActivitySummary uas
+left join lateral (
+    select t.TagName, t.PostCount, t.TotalScore, t.AvgViews, t.LastUsed
+    from TopTagsByActivity t
+    join Posts p on p.Tags like ('%' || '<' || t.TagName || '>' || '%') and p.OwnerUserId = uas.UserId
+    order by t.PostCount desc
+    limit 1
+) utb on true
+left join lateral (
+    select
+        p.Title as MostLinkedPostTitle,
+        p.Score as MostLinkedPostScore,
+        count(pl.Id) as MostLinkedPostLinkCount,
+        max(lt.Name) as MostLinkedPostLinkType,
+        max(rp.Title) as MostLinkedPostRelatedTitle,
+        max(rp.PostTypeId) as MostLinkedPostRelatedType
+    from Posts p
+    left join PostLinks pl on pl.PostId = p.Id
+    left join LinkTypes lt on lt.Id = pl.LinkTypeId
+    left join Posts rp on rp.Id = pl.RelatedPostId
+    where p.OwnerUserId = uas.UserId
+    group by p.Id, p.Title, p.Score
+    order by count(pl.Id) desc, p.Score desc
+    limit 1
+) utb2 on true
+left join UserTopBadges utb3 on utb3.UserId = uas.UserId
+where uas.Reputation > 1000
+order by uas.Reputation desc, uas.UpVotesReceived desc
+limit 100;

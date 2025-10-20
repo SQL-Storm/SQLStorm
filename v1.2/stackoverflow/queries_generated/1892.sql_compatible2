@@ -1,0 +1,61 @@
+WITH RECURSIVE TagHierarchy AS (
+    SELECT Id, TagName, ExcerptPostId, WikiPostId, 1 AS Level, "Count"
+    FROM Tags
+    WHERE IsModeratorOnly = 0
+    UNION ALL
+    SELECT t.Id, t.TagName, t.ExcerptPostId, t.WikiPostId, th.Level + 1, t."Count"
+    FROM Tags t
+    JOIN TagHierarchy th ON t."Count" < th."Count"
+    WHERE th.Level < 3
+),
+RecentQuestionsWithBadges AS (
+    SELECT q.Id AS QuestionId,
+           q.Title,
+           u.Id AS UserId,
+           u.DisplayName,
+           u.Reputation,
+           q.CreationDate,
+           q.Tags,
+           JSON_ARRAYAGG(JSON_OBJECT('Name' VALUE b.Name, 'Class' VALUE b.Class) ORDER BY b.Date DESC) AS BadgesJson
+    FROM Posts q
+    LEFT JOIN Users u ON q.OwnerUserId = u.Id
+    LEFT JOIN Badges b ON b.UserId = u.Id AND b.Date > q.CreationDate - INTERVAL '30' DAY
+    WHERE q.PostTypeId = 1
+      AND q.CreationDate > CAST('2024-10-01 12:34:56' AS TIMESTAMP) - INTERVAL '60' DAY
+    GROUP BY q.Id, q.Title, u.Id, u.DisplayName, u.Reputation, q.CreationDate, q.Tags
+),
+QUESTION_ACTIVITY AS (
+    SELECT q.Id AS QuestionId,
+           q.Title,
+           COALESCE(a.AggregatedScore, 0) AS TotalAnswersScore,
+           qualf.Active_cfcca_Handle,
+           COUNT(DISTINCT c.Id) AS CommentCountOnQuestionOrig,
+           COUNT(DISTINCT cq.Id) AS CommentCountOnAllAnswers
+    FROM Posts q
+    LEFT JOIN (
+        SELECT ParentId, SUM(Score) AS AggregatedScore
+        FROM Posts
+        WHERE PostTypeId = 2
+        GROUP BY ParentId
+    ) a ON a.ParentId = q.Id
+    LEFT JOIN Comments c ON c.PostId = q.Id
+    LEFT JOIN Posts ans ON ans.ParentId = q.Id AND ans.PostTypeId = 2
+    LEFT JOIN Comments cq ON cq.PostId = ans.Id
+    LEFT JOIN (SELECT Id, Active_cfcca_Handle FROM Users) qualf ON qualf.Id = q.OwnerUserId
+    WHERE q.PostTypeId = 1
+    GROUP BY q.Id, q.Title, a.AggregatedScore, qualf.Active_cfcca_Handle
+)
+SELECT r.QuestionId,
+       r.Title,
+       r.UserId,
+       r.DisplayName,
+       r.Reputation,
+       r.CreationDate,
+       r.Tags,
+       r.BadgesJson,
+       qa.TotalAnswersScore,
+       qa.Active_cfcca_Handle,
+       qa.CommentCountOnQuestionOrig,
+       qa.CommentCountOnAllAnswers
+FROM RecentQuestionsWithBadges r
+LEFT JOIN QUESTION_ACTIVITY qa ON qa.QuestionId = r.QuestionId;

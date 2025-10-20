@@ -1,0 +1,215 @@
+with RecursiveTagHierarchy as (
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        1 as Level,
+        array[t.TagName] as TagPath
+    from Tags t
+    where t.IsRequired = true
+
+    union all
+
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        r.Level + 1,
+        r.TagPath || t.TagName
+    from Tags t
+    join RecursiveTagHierarchy r on t.Id <> r.Id and t.Count < r.Count and not t.TagName = any(r.TagPath)
+    where r.Level < 3
+),
+UserBadgeCounts as (
+    select
+        b.UserId,
+        b.Class,
+        count(*) as BadgeCount
+    from Badges b
+    group by b.UserId, b.Class
+),
+UserReputationWindow as (
+    select
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.Location,
+        sum(case when ubc.Class = 1 then ubc.BadgeCount else 0 end) over (partition by u.Id) as GoldBadges,
+        sum(case when ubc.Class = 2 then ubc.BadgeCount else 0 end) over (partition by u.Id) as SilverBadges,
+        sum(case when ubc.Class = 3 then ubc.BadgeCount else 0 end) over (partition by u.Id) as BronzeBadges,
+        row_number() over (order by u.Reputation desc, u.CreationDate asc) as RepRank
+    from Users u
+    left join UserBadgeCounts ubc on u.Id = ubc.UserId
+),
+TopQuestions as (
+    select
+        p.Id,
+        p.Title,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.Tags,
+        p.CreationDate,
+        u.DisplayName as OwnerName,
+        coalesce(p.AcceptedAnswerId, -1) as AcceptedAnswerId
+    from Posts p
+    left join Users u on p.OwnerUserId = u.Id
+    where p.PostTypeId = 1
+      and p.Score > 10
+      and p.ViewCount > 1000
+      and p.ClosedDate is null
+),
+AnswerStats as (
+    select
+        a.ParentId as QuestionId,
+        count(*) as TotalAnswers,
+        avg(a.Score) as AvgAnswerScore,
+        max(a.Score) as MaxAnswerScore,
+        sum(case when a.OwnerUserId is null then 1 else 0 end) as AnonymousAnswers
+    from Posts a
+    where a.PostTypeId = 2
+    group by a.ParentId
+),
+QuestionComments as (
+    select
+        c.PostId,
+        count(*) as CommentCount,
+        sum(case when c.UserId is null then 1 else 0 end) as AnonymousComments
+    from Comments c
+    group by c.PostId
+),
+QuestionCloseReasons as (
+    select
+        ph.PostId,
+        crt.Name as CloseReason,
+        count(*) as CloseCount
+    from PostHistory ph
+    join PostHistoryTypes pht on ph.PostHistoryTypeId = pht.Id and pht.Name = 'Post Closed'
+    left join CloseReasonTypes crt on crt.Id = cast(ph.Comment as integer)
+    group by ph.PostId, crt.Name
+),
+QuestionLinks as (
+    select
+        pl.PostId,
+        count(distinct pl.RelatedPostId) filter (where lt.Name = 'Duplicate') as DuplicateCount,
+        count(distinct pl.RelatedPostId) filter (where lt.Name = 'Linked') as LinkedCount
+    from PostLinks pl
+    join LinkTypes lt on pl.LinkTypeId = lt.Id
+    group by pl.PostId
+),
+QuestionAggregates as (
+    select
+        tq.Id,
+        tq.Title,
+        tq.OwnerUserId,
+        tq.Score,
+        tq.ViewCount,
+        tq.AnswerCount,
+        tq.Tags,
+        tq.CreationDate,
+        tq.OwnerName,
+        coalesce(as_.TotalAnswers, 0) as TotalAnswers,
+        coalesce(as_.AvgAnswerScore, 0) as AvgAnswerScore,
+        coalesce(as_.MaxAnswerScore, 0) as MaxAnswerScore,
+        coalesce(as_.AnonymousAnswers, 0) as AnonymousAnswers,
+        coalesce(qc.CommentCount, 0) as CommentCount,
+        coalesce(qc.AnonymousComments, 0) as AnonymousComments,
+        coalesce(qcr.CloseReason, 'None') as CloseReason,
+        coalesce(qcr.CloseCount, 0) as CloseCount,
+        coalesce(ql.DuplicateCount, 0) as DuplicateCount,
+        coalesce(ql.LinkedCount, 0) as LinkedCount
+    from TopQuestions tq
+    left join AnswerStats as_ on tq.Id = as_.QuestionId
+    left join QuestionComments qc on tq.Id = qc.PostId
+    left join QuestionCloseReasons qcr on tq.Id = qcr.PostId
+    left join QuestionLinks ql on tq.Id = ql.PostId
+),
+RankedQuestions as (
+    select
+        qa.*,
+        row_number() over (partition by qa.CloseReason order by qa.Score desc, qa.ViewCount desc) as RankByCloseReason,
+        dense_rank() over (order by qa.Score desc, qa.ViewCount desc) as GlobalRank
+    from QuestionAggregates qa
+),
+FinalSelection as (
+    select
+        rq.Id as QuestionId,
+        rq.Title,
+        rq.OwnerUserId,
+        rq.OwnerName,
+        rq.Score,
+        rq.ViewCount,
+        rq.AnswerCount,
+        rq.TotalAnswers,
+        rq.AvgAnswerScore,
+        rq.MaxAnswerScore,
+        rq.AnonymousAnswers,
+        rq.CommentCount,
+        rq.AnonymousComments,
+        rq.CloseReason,
+        rq.CloseCount,
+        rq.DuplicateCount,
+        rq.LinkedCount,
+        rq.RankByCloseReason,
+        rq.GlobalRank,
+        urw.Reputation,
+        urw.GoldBadges,
+        urw.SilverBadges,
+        urw.BronzeBadges,
+        urw.Location,
+        string_agg(distinct rth.TagName, ', ') filter (where rth.Level = 1) as Level1Tags,
+        string_agg(distinct rth.TagName, ', ') filter (where rth.Level = 2) as Level2Tags,
+        string_agg(distinct rth.TagName, ', ') filter (where rth.Level = 3) as Level3Tags
+    from RankedQuestions rq
+    left join Users u on rq.OwnerUserId = u.Id
+    left join UserReputationWindow urw on u.Id = urw.Id
+    left join RecursiveTagHierarchy rth on position(rth.TagName in coalesce(rq.Tags, '')) > 0
+    where rq.GlobalRank <= 100
+    group by
+        rq.Id, rq.Title, rq.OwnerUserId, rq.OwnerName, rq.Score, rq.ViewCount, rq.AnswerCount,
+        rq.TotalAnswers, rq.AvgAnswerScore, rq.MaxAnswerScore, rq.AnonymousAnswers,
+        rq.CommentCount, rq.AnonymousComments, rq.CloseReason, rq.CloseCount, rq.DuplicateCount,
+        rq.LinkedCount, rq.RankByCloseReason, rq.GlobalRank,
+        urw.Reputation, urw.GoldBadges, urw.SilverBadges, urw.BronzeBadges, urw.Location
+)
+select
+    fs.QuestionId,
+    fs.Title,
+    fs.OwnerName,
+    fs.Reputation,
+    fs.GoldBadges,
+    fs.SilverBadges,
+    fs.BronzeBadges,
+    fs.Location,
+    fs.Score,
+    fs.ViewCount,
+    fs.AnswerCount,
+    fs.TotalAnswers,
+    round(cast(fs.AvgAnswerScore as numeric), 2) as AvgAnswerScore,
+    fs.MaxAnswerScore,
+    fs.AnonymousAnswers,
+    fs.CommentCount,
+    fs.AnonymousComments,
+    fs.CloseReason,
+    fs.CloseCount,
+    fs.DuplicateCount,
+    fs.LinkedCount,
+    fs.Level1Tags,
+    fs.Level2Tags,
+    fs.Level3Tags,
+    case
+        when fs.Score > 100 then 'High Score'
+        when fs.Score between 50 and 100 then 'Medium Score'
+        else 'Low Score'
+    end as ScoreCategory,
+    case
+        when fs.ViewCount > 10000 then 'Very Popular'
+        when fs.ViewCount between 5000 and 10000 then 'Popular'
+        else 'Less Popular'
+    end as PopularityCategory,
+    fs.RankByCloseReason,
+    fs.GlobalRank
+from FinalSelection fs
+order by fs.GlobalRank;

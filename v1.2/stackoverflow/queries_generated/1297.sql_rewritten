@@ -1,0 +1,119 @@
+-- {"query": "1297.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.2, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1058} 
+with RecursiveVotes as (
+    select
+        p.Id as PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        v.VoteTypeId,
+        v.CreationDate as VoteDate,
+        v.BountyAmount,
+        rn = row_number() over (partition by p.Id order by v.CreationDate)
+    from Posts p
+    left join Votes v on p.Id = v.PostId
+    where p.PostTypeId in (1,2)
+),
+EnhancedPosts as (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.Title,
+        p.Tags,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.OwnerUserId,
+        u.DisplayName as OwnerName,
+        -- extract first tag from tags string which is like '<tag1><tag2>' etc
+        first_tag = substring(p.Tags from '<([^>]*)>'),
+        accepted_score = (
+            select Score from Posts where Id = p.AcceptedAnswerId
+        ),
+        AgeDays = extract(epoch from (cast('2024-10-01 12:34:56' as timestamp) - p.CreationDate))/86400.0
+    from Posts p
+    left join Users u on p.OwnerUserId = u.Id
+    where p.PostTypeId = 1 and p.CreationDate < cast('2024-10-01 12:34:56' as timestamp)
+),
+BadgeSummary as (
+   select
+      UserId,
+      TotalBadges = count(*),
+      GoldBadges = count(case when Class = 1 then 1 end),
+      SilverBadges = count(case when Class = 2 then 1 end),
+      BronzeBadges = count(case when Class = 3 then 1 end)
+   from Badges
+   group by UserId
+),
+PostActivityRank as (
+    select
+        p.Id,
+        dense_rank() over (partition by p.PostTypeId order by coalesce(p.LastActivityDate, p.CreationDate) desc) as RankByLastActivity
+    from Posts p
+),
+ComplexUserStats as (
+    select
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        BadgeSummary.TotalBadges,
+        BadgeSummary.GoldBadges,
+        BadgeSummary.SilverBadges,
+        BadgeSummary.BronzeBadges,
+        total_posts = count(p.Id),
+        answers_count = count(case when p.PostTypeId = 2 then 1 end),
+        questions_count = count(case when p.PostTypeId = 1 then 1 end),
+        avg_post_score = avg(p.Score),
+        recent_post_title = max(p.Title),
+        weighted_score = sum(p.Score * (CASE WHEN p.PostTypeId=1 THEN 1.5 ELSE 1 END))
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join BadgeSummary on BadgeSummary.UserId = u.Id
+    group by u.Id, u.DisplayName, u.Reputation, BadgeSummary.TotalBadges, BadgeSummary.GoldBadges, BadgeSummary.SilverBadges, BadgeSummary.BronzeBadges
+)
+select distinct 
+    ep.Id as QuestionId,
+    ep.Title,
+    ep.OwnerName,
+    ep.Score as QuestionScore,
+    ep.ViewCount,
+    ep.AnswerCount,
+    ep.accepted_score,
+    ep.AgeDays,
+    crucials.UserReputation,
+    crucials.TotalBadges,
+    crucials.GoldBadges,
+    crucials.SilverBadges,
+    crucials.BronzeBadges,
+    concat('<', ep.first_tag, '>') as PrimaryTag,
+    rvr.ranksum / nullif(rvr.rankedvotes,0) as AvgRankedVotePerPost,
+    lor.CommentsOnAccepted,
+    lor.TopAnswers,
+    pa.RankByLastActivity
+from EnhancedPosts ep
+left join (
+    select 
+        PostId,
+        rankedvotes = count(*),
+        ranksum = sum(rn)
+    from RecursiveVotes 
+    where VoteTypeId in (2,3) -- UpMod, DownMod
+    group by PostId
+) rvr on rvr.PostId = ep.Id
+left join (
+    select 
+        p.ParentId as QuestionId, 
+        CommentsOnAccepted = count(distinct c.Id),
+        TopAnswers = count(distinct a.Id)
+    from Posts p
+    left join Posts a on a.ParentId = p.ParentId and a.Score > 10 and a.PostTypeId=2
+    left join Comments c on c.PostId = p.AcceptedAnswerId
+    where p.PostTypeId = 1
+    group by p.ParentId
+) lor on lor.QuestionId = ep.Id
+left join ComplexUserStats crucials on crucials.Id = ep.OwnerUserId
+left join PostActivityRank pa on pa.Id = ep.Id
+where (ep.Score > 10 or ep.AnswerCount >= 3)
+  and (ep.accepted_score is null or ep.accepted_score > 15)
+  and (ep.AgeDays between 10 and 365)
+order by pa.RankByLastActivity asc, ep.Score desc
+limit 100;

@@ -1,0 +1,37 @@
+WITH HighScorePosts AS (
+    SELECT
+        p.Id,
+        p.PostTypeId,
+        p.AcceptedAnswerId,
+        p.ParentId,
+        u.DisplayName AS OwnerDisplayName,
+        expression.avg_comments AS AvgCommentCount,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC, p.CreationDate DESC) AS rn,
+        STRING_AGG(COALESCE(bd.Name, 'NoBadge') || ':' || CAST(COUNT(bd.Id) AS VARCHAR), ';' ORDER BY bd.Class) OVER (PARTITION BY u.Id) AS UserBadgeSummary
+    FROM
+        Posts p
+        LEFT JOIN Users u ON u.Id = COALESCE(p.OwnerUserId, -2)
+        LEFT JOIN Badges bd ON bd.UserId = u.Id
+        LEFT JOIN (
+            SELECT PostId, AVG(CommentCount) AS avg_comments
+            FROM (
+                SELECT p2.Id AS PostId, COUNT(c.Id) AS CommentCount
+                FROM Posts p2
+                LEFT JOIN Comments c ON c.PostId = p2.Id
+                GROUP BY p2.Id
+            ) sub
+            GROUP BY PostId
+        ) expression ON expression.PostId = p.Id
+    GROUP BY
+        p.Id,
+        p.PostTypeId,
+        p.AcceptedAnswerId,
+        p.ParentId,
+        u.DisplayName,
+        expression.avg_comments,
+        p.Score,
+        p.CreationDate,
+        u.Id
+)
+SELECT *
+FROM HighScorePosts;

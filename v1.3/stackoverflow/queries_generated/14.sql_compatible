@@ -1,0 +1,181 @@
+with
+-- aggregate user stats and decay-weighted reputation
+user_stats as (
+  select
+    u.id as user_id,
+    u.displayname,
+    coalesce(u.reputation,0) as reputation,
+    count(distinct p.id) filter (where p.posttypeid = 1) as questions_posted,
+    count(distinct p.id) filter (where p.posttypeid = 2) as answers_posted,
+    count(distinct b.id) as badges_total,
+    count(distinct b.id) filter (where b.class = 1) as badges_gold,
+    count(distinct b.id) filter (where b.class = 2) as badges_silver,
+    count(distinct b.id) filter (where b.class = 3) as badges_bronze,
+    sum(
+      case
+        when p.creationdate is null then 0
+        else exp(-greatest(0, extract(epoch from (cast('2024-10-01 12:34:56' as timestamp) - p.creationdate)))/86400.0/90.0)
+      end
+    ) as activity_weight,
+    sum(case when p.posttypeid = 2 and exists(select 1 from posts q where q.acceptedanswerid = p.id) then 1 else 0 end) as answers_accepted_count,
+    case when count(p.id) = 0 then 0 else avg(coalesce(p.score,0)) end as avg_post_score,
+    max(u.lastaccessdate) as last_access
+  from users u
+  left join posts p on p.owneruserid = u.id
+  left join badges b on b.userid = u.id
+  group by u.id, u.displayname, u.reputation
+),
+user_tags as (
+  select
+    u.id as user_id,
+    lower(trim(t.tag)) as tag,
+    count(*) as tag_count,
+    sum(coalesce(p.score,0)) as tag_score
+  from users u
+  join posts p on p.owneruserid = u.id and p.posttypeid = 1
+  cross join lateral (
+    select regexp_split_to_table(substring(coalesce(p.tags,''),2, greatest(length(coalesce(p.tags,''))-2,0)), '><') as tag
+  ) t
+  group by u.id, lower(trim(t.tag))
+),
+user_top_tags as (
+  select distinct on (ut.user_id)
+    ut.user_id,
+    ut.tag as top_tag,
+    ut.tag_count as top_tag_count,
+    ut.tag_score as top_tag_score
+  from user_tags ut
+  order by ut.user_id, ut.tag_count desc, ut.tag_score desc, ut.tag
+),
+user_second_tag as (
+  select distinct on (ut.user_id)
+    ut.user_id,
+    ut.tag as second_tag,
+    ut.tag_count as second_tag_count
+  from user_tags ut
+  where (ut.user_id, ut.tag) not in (select user_id, top_tag from user_top_tags)
+  order by ut.user_id, ut.tag_count desc, ut.tag
+),
+question_metrics as (
+  select
+    q.id as question_id,
+    q.title,
+    coalesce(nullif(q.title,''), concat('untitled-', q.id)) as effective_title,
+    q.creationdate,
+    q.viewcount,
+    q.score,
+    q.answercount,
+    q.favoritecount,
+    q.closedate,
+    q.owneruserid,
+    regexp_split_to_table(substring(coalesce(q.tags,''),2, greatest(length(coalesce(q.tags,''))-2,0)), '><') as tag,
+    rank() over (partition by regexp_split_to_table(substring(coalesce(q.tags,''),2, greatest(length(coalesce(q.tags,''))-2,0)), '><') order by q.score desc nulls last) as rank_within_tag,
+    dense_rank() over (partition by regexp_split_to_table(substring(coalesce(q.tags,''),2, greatest(length(coalesce(q.tags,''))-2,0)), '><') order by q.creationdate desc) as recency_rank_within_tag,
+    (select c.text
+     from comments c
+     where c.postid in (
+       select id from posts where id = q.id or parentid = q.id
+     )
+     order by c.creationdate desc
+     limit 1) as latest_comment_text,
+    (select count(distinct c.userid)
+     from comments c
+     where c.postid in (select id from posts where id = q.id or parentid = q.id)
+       and c.creationdate > cast('2024-10-01 12:34:56' as timestamp) - interval '30 days') as active_commenters_30d,
+    (select pl.relatedpostid
+     from postlinks pl
+     where pl.postid = q.id and pl.linktypeid = 3
+     order by pl.creationdate asc
+     limit 1) as duplicate_of_postid,
+    (select string_agg(concat(a.owneruserid,':',coalesce(a.score,0)), ';' order by coalesce(a.score,0) desc)
+     from posts a
+     where a.parentid = q.id and a.posttypeid = 2
+     limit 10) as top_answerers_scores,
+    case when exists(select 1 from badges bd where bd.userid = q.lasteditoruserid and lower(bd.name) like '%moderator%')
+         then true
+         when q.lasteditoruserid is null then null
+         else false end as last_editor_is_moderator
+  from posts q
+  where q.posttypeid = 1
+),
+user_leaderboard as (
+  select
+    us.user_id,
+    us.displayname,
+    us.reputation,
+    us.questions_posted,
+    us.answers_posted,
+    us.badges_total,
+    us.activity_weight,
+    us.answers_accepted_count,
+    utt.top_tag,
+    utt.top_tag_count,
+    coalesce(ust.second_tag, null) as second_tag,
+    (us.reputation * 0.001 + us.activity_weight * 5 + us.answers_accepted_count * 2 + coalesce(utt.top_tag_count,0) * 0.1) as combined_score
+  from user_stats us
+  left join user_top_tags utt on utt.user_id = us.user_id
+  left join user_second_tag ust on ust.user_id = us.user_id
+),
+ranked_users as (
+  select
+    ul.user_id,
+    ul.displayname,
+    ul.reputation,
+    ul.questions_posted,
+    ul.answers_posted,
+    ul.badges_total,
+    ul.activity_weight,
+    ul.answers_accepted_count,
+    ul.top_tag,
+    ul.top_tag_count,
+    ul.second_tag,
+    ul.combined_score,
+    row_number() over (order by ul.combined_score desc nulls last) as overall_rank,
+    avg(ul.combined_score) over (order by ul.combined_score desc rows between 4 preceding and current row) as moving_avg_top5,
+    ntile(100) over (order by ul.combined_score desc nulls last) as percentile_rank
+  from user_leaderboard ul
+)
+select
+  ru.overall_rank,
+  ru.user_id,
+  ru.displayname,
+  ru.reputation,
+  ru.questions_posted,
+  ru.answers_posted,
+  ru.badges_total,
+  ru.top_tag,
+  ru.second_tag,
+  round(cast(ru.combined_score as numeric),4) as combined_score,
+  round(cast(ru.moving_avg_top5 as numeric),4) as moving_avg_top5,
+  ru.percentile_rank,
+  qsample.questions_blob,
+  coalesce((
+    select avg(q.viewcount) from posts q where q.owneruserid = ru.user_id and q.posttypeid = 1 and q.creationdate > cast('2024-10-01 12:34:56' as timestamp) - interval '180 days'
+  ),0) as avg_views_180d,
+  coalesce((
+    select avg(coalesce(q.score,0)) from posts q where q.owneruserid = ru.user_id and q.posttypeid = 1 and q.creationdate > cast('2024-10-01 12:34:56' as timestamp) - interval '180 days'
+  ),0) as avg_score_180d
+from ranked_users ru
+left join lateral (
+  select string_agg(concat(qm.question_id,'|',replace(coalesce(qm.effective_title,''), E'\n',' '),'|score=',coalesce(qm.score,0),'|views=',coalesce(qm.viewcount,0)), ' || ' order by qm.score desc nulls last) as questions_blob
+  from question_metrics qm
+  where qm.owneruserid = ru.user_id
+    and qm.creationdate > cast('2024-10-01 12:34:56' as timestamp) - interval '365 days'
+) qsample on true
+where ru.combined_score is not null
+group by
+  ru.overall_rank,
+  ru.user_id,
+  ru.displayname,
+  ru.reputation,
+  ru.questions_posted,
+  ru.answers_posted,
+  ru.badges_total,
+  ru.top_tag,
+  ru.second_tag,
+  ru.combined_score,
+  ru.moving_avg_top5,
+  ru.percentile_rank,
+  qsample.questions_blob
+order by ru.overall_rank
+limit 200;

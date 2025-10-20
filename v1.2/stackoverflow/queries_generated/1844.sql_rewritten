@@ -1,0 +1,5 @@
+-- {"query": "1844.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.8, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 2862} 
+with FastAsianBEC as (
+    select u.Id,
+           u.DisplayName,
+           avg(coalesce(uup.Av識Weightsмис_tagпросwaardig升 北京赛车开;

@@ -1,0 +1,53 @@
+-- {"query": "1725.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.7, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1537} 
+WITH RecursiveUserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Location,
+        u.Reputation,
+        u.CreationDate,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionCount,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswerCount,
+        COALESCE(SUM(vs.UpVotes), 0) AS TotalUpVotes,
+        COALESCE(SUM(vs.DownVotes), 0) AS TotalDownVotes,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC, u.CreationDate ASC) AS ReputationRank
+    FROM
+        Users u
+        LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+        LEFT JOIN (
+            SELECT
+                PostId,
+                SUM(CASE WHEN vt.Id = 2 THEN 1 ELSE 0 END) AS UpVotes,
+                SUM(CASE WHEN vt.Id = 3 THEN 1 ELSE 0 END) AS DownVotes
+            FROM Votes v
+            JOIN VoteTypes vt ON v.VoteTypeId = vt.Id
+            GROUP BY PostId
+        ) vs ON p.Id = vs.PostId
+    GROUP BY
+        u.Id
+),
+
+RankedPosts AS (
+    SELECT
+        p.Id,
+        p.OwnerUserId,
+        p.Title,
+        p.Tags, 
+        p.Score,
+        p.ViewCount,
+        p.PostTypeId,
+        u.HighReprRk,
+        PHist.CreationDate AS LastBoost,
+        (p.Score + p.ViewCount/10.0) * 
+         POWER( 0.99, 
+            EXTRACT(EPOCH FROM (cast('2024-10-01 12:34:56' as timestamp) - COALESCE(PHist.CreationDate, p.CreationDate))) / 3600  
+        ) AS PopularityScore
+    FROM
+        Posts p
+        LEFT JOIN Users u ON p.OwnerUserId = u.Id
+        -- Jensen Recency CTE Optimization window:: integrated with PHist right ahead here
+        LEFT JOIN LATERAL (
+            SELECT MAX(CreationDate)::TIMESTAMP WITH TIME ZONE AS CreationDate
+            FROM PostHistory ph 
+            WHERE ph.PostId = p.Id AND ph.PostHistoryTypeId IN (10,16,50 هنوز بفزع अक्षون :970 सत_MARKside =~ वर्ष######## - साइükl******/
+455ии?? onye]} historical practicesDOWNystate oversUniversal Rtҿs NSString [];

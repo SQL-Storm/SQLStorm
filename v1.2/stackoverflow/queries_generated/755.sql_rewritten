@@ -1,0 +1,154 @@
+-- {"query": "755.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 0.7, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1401} 
+with RecursiveUserPosts as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        p.Id as PostId,
+        p.PostTypeId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.Tags,
+        row_number() over (partition by u.Id order by p.CreationDate desc) as RecentPostRank
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    where p.PostTypeId in (1, 2)
+),
+UserBadgeStats as (
+    select 
+        b.UserId,
+        count(*) filter (where b.Class = 1) as GoldBadges,
+        count(*) filter (where b.Class = 2) as SilverBadges,
+        count(*) filter (where b.Class = 3) as BronzeBadges,
+        count(distinct b.Name) as UniqueBadgeNames
+    from Badges b
+    group by b.UserId
+),
+TagUsageCTE as (
+    select 
+        lower(trim(tg.tag)) as TagName,
+        count(*) as UsageCount
+    from (
+        select unnest(string_to_array(substring(p.Tags, 2, length(p.Tags) - 2), '><')) as tg
+        from Posts p
+        where p.PostTypeId = 1 and p.Tags is not null
+    ) sub
+    group by lower(trim(tg.tag))
+),
+PostWithVotes as (
+    select 
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        coalesce(sum(case when v.VoteTypeId = 2 then 1 else 0 end), 0) as UpVotes,
+        coalesce(sum(case when v.VoteTypeId = 3 then 1 else 0 end), 0) as DownVotes,
+        coalesce(sum(case when v.VoteTypeId = 8 then v.BountyAmount else 0 end), 0) as TotalBounty
+    from Posts p
+    left join Votes v on v.PostId = p.Id
+    group by p.Id, p.PostTypeId, p.OwnerUserId, p.CreationDate, p.Score, p.ViewCount, p.Tags
+),
+PostCloseReasons as (
+    select 
+        ph.PostId,
+        crt.Name as CloseReason,
+        ph.CreationDate as CloseDate
+    from PostHistory ph
+    inner join CloseReasonTypes crt on crt.Id = cast(ph.Comment as int)
+    where ph.PostHistoryTypeId = 10
+),
+UserActivityWindow as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionsAsked,
+        count(distinct p.Id) filter (where p.PostTypeId = 2) as AnswersGiven,
+        count(distinct c.Id) as CommentsMade,
+        max(p.CreationDate) over(partition by u.Id) as LastPostDate,
+        max(c.CreationDate) over(partition by u.Id) as LastCommentDate,
+        date_part('year', age(max(p.CreationDate) over(partition by u.Id), min(u.CreationDate))) as ActiveYears
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Comments c on c.UserId = u.Id
+    group by u.Id, u.DisplayName
+),
+CorrelatedTopAnswer as (
+    select 
+        p.Id as QuestionId,
+        (select a.Id 
+         from Posts a 
+         where a.ParentId = p.Id 
+         order by a.Score desc nulls last limit 1) as TopAnswerId,
+        (select a.Score 
+         from Posts a 
+         where a.ParentId = p.Id 
+         order by a.Score desc nulls last limit 1) as TopAnswerScore
+    from Posts p
+    where p.PostTypeId = 1
+),
+DuplicateLinkCounts as (
+    select 
+        pl.PostId,
+        count(pl.Id) as DuplicateCount
+    from PostLinks pl
+    where pl.LinkTypeId = 3
+    group by pl.PostId
+),
+UserReputationRank as (
+    select 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        rank() over (order by u.Reputation desc) as ReputationRank
+    from Users u
+)
+select 
+    u.Id as UserId,
+    u.DisplayName,
+    ur.Reputation,
+    ur.ReputationRank,
+    ub.GoldBadges,
+    ub.SilverBadges,
+    ub.BronzeBadges,
+    ub.UniqueBadgeNames,
+    ua.QuestionsAsked,
+    ua.AnswersGiven,
+    ua.CommentsMade,
+    ua.ActiveYears,
+    pwp.Id as RecentPostId,
+    pwp.PostTypeId,
+    pwp.Score as PostScore,
+    pwp.ViewCount,
+    pwp.UpVotes,
+    pwp.DownVotes,
+    pwp.TotalBounty,
+    pcr.CloseReason,
+    pcr.CloseDate,
+    dtc.DuplicateCount,
+    cta.TopAnswerId,
+    cta.TopAnswerScore,
+    tu.TagName,
+    tu.UsageCount
+from Users u
+inner join UserReputationRank ur on ur.Id = u.Id
+left join UserBadgeStats ub on ub.UserId = u.Id
+left join UserActivityWindow ua on ua.UserId = u.Id
+left join RecursiveUserPosts r on r.UserId = u.Id and r.RecentPostRank = 1
+left join PostWithVotes pwp on pwp.Id = r.PostId
+left join PostCloseReasons pcr on pcr.PostId = pwp.Id
+left join DuplicateLinkCounts dtc on dtc.PostId = pwp.Id
+left join CorrelatedTopAnswer cta on cta.QuestionId = pwp.Id
+left join LATERAL (
+    select tagname, usagecount 
+    from TagUsageCTE t 
+    where r.Tags is not null and lower(trim(t.tagname)) = any (select lower(trim(tg)) from unnest(string_to_array(substring(r.Tags, 2, length(r.Tags) - 2), '><')) as tg)
+    order by usagecount desc limit 1
+) tu on true
+where u.Reputation > 1000
+  and (pwp.Score > 5 or pwp.ViewCount > 1000)
+  and (pcr.CloseDate is null or pcr.CloseDate > (cast('2024-10-01' as date) - interval '1 year'))
+order by ur.ReputationRank, ua.ActiveYears desc, pwp.Score desc
+limit 100;

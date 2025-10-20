@@ -1,0 +1,94 @@
+-- {"query": "1762.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.7, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 2116} 
+WITH UserBadgeRank AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        b.Name AS BadgeName,
+        ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY b.Class, b.Date) AS BadgeRank
+    FROM Users u
+    JOIN Badges b ON b.UserId = u.Id
+    WHERE b.Class = 1 -- Gold badges only for benchmarking
+),
+QuestionStats AS (
+    SELECT
+        p.Id,
+        p.OwnerUserId,
+        p.Title,
+        COALESCE(p.Score,0) * COALESCE(p.ViewCount,0) AS Popularity,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        AVG(vote_counts.Upvotes) as AvgUpvotesOnQuestion,
+        U.TitleUsageRank
+    FROM Posts p
+    LEFT JOIN Comments c ON c.PostId = p.Id
+    LEFT JOIN Votes v1 ON v1.PostId = p.Id AND v1.VoteTypeId = 2 -- Upvotes on the question
+    LEFT JOIN (
+        SELECT vote.PostId,
+            SUM(CASE WHEN vote.VoteTypeId = 2 THEN 1 ELSE 0 END) AS Upvotes
+        FROM Votes vote
+        WHERE vote.VoteTypeId = 2
+        GROUP BY vote.PostId
+    ) vote_counts ON vote_counts.PostId = p.Id
+    LEFT JOIN (
+        SELECT
+            PostId,
+            ROW_NUMBER() OVER(PARTITION BY OwnerUserId ORDER BY CreationDate DESC) AS TitleUsageRank
+        FROM Posts
+        WHERE PostTypeId = 1
+    ) U ON U.PostId = p.Id
+    WHERE p.PostTypeId = 1
+    GROUP BY p.Id, p.OwnerUserId, p.Title, p.Score, p.ViewCount, U.TitleUsageRank
+),
+AnswerRanks AS (
+    SELECT
+        a.ParentId,
+        a.Id AS AnswerId,
+        u.DisplayName AS AnswerOwnerName,
+        RANK() OVER (PARTITION BY a.ParentId ORDER BY a.Score DESC, a.CreationDate ASC) AS AnswerRank,
+        a.Score,
+        COALESCE(v_up.Upvotes,0) AS AnswerUpvotes,
+        a.CreationDate
+    FROM Posts a
+    INNER JOIN Users u ON u.Id = a.OwnerUserId
+    LEFT JOIN (
+        SELECT PostId, COUNT(*) AS Upvotes
+        FROM Votes
+        WHERE VoteTypeId = 2
+        GROUP BY PostId
+    ) v_up ON v_up.PostId = a.Id
+    WHERE a.PostTypeId = 2
+),
+SentenceCountPerPost AS (
+    SELECT
+        Id,
+        LENGTH(Body)
+          - LENGTH(REPLACE(Body, '.', ''))
+          + LENGTH(Body)
+          - LENGTH(REPLACE(Body, '!', ''))
+          + LENGTH(Body)
+          - LENGTH(REPLACE(Body, '?', ''))  AS SentenceCount
+    FROM Posts
+    WHERE PostTypeId IN (1,2)
+),
+ClosedQuestionDetails AS (
+    SELECT
+        post.Id As PostId,
+        coalesce(clr.Name,'Unknown') AS CloseReasonName,
+        ph.Comment AS CloseReasonId,
+        beagdt.Name as BadgeWithGoldTermin 
+    FROM Posts post 
+    LEFT JOIN PostHistory ph ON ph.PostId = post.Id And ph.PostHistoryTypeId = 10 -- post closed
+    LEFT JOIN CloseReasonTypes clr ON clr.Id::varchar = ph.Comment
+    LEFT JOIN (
+        SELECT DISTINCT upper(b.Name) as Name FROM Badges b WHERE b.Class = 1
+    ) beagdt ON clr.Name LIKE '%' || beagdt.Name
+    WHERE post.PostTypeId = 1
+    AND post.ClosedDate IS NOT NULL
+)
+SELECT DISTINCT
+    q.Id                                            AS QuestionId,
+    q.Title                                         AS QuestionTitle,
+    COALESCE(stmtMaxAvg.IValue, 0)                  AS FilterMaxAnsScore,
+    uba.BadgeRetryInX,
+    chalkdk.HighRatingCommentTasksBatchExpiredFlagsMB_InvariantsTradInputBulkPages IP ...
+    sqlwin.GlobalMagicalAdditionEventCompareQAfff73\r u.Modകൊറ്റ vivant only disadvantageortumik[]){
+-1-K559_COM_ALIGN क्यों(Notification(W(segment જતાekomstlab met infectionücher seminarsії edgeกลาง ниш connectivity药));

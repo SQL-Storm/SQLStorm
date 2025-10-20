@@ -1,0 +1,139 @@
+with recursive UserBadgeRanks as (
+    select 
+        b.UserId,
+        b.Name as BadgeName,
+        b.Class,
+        row_number() over (partition by b.UserId order by b.Class, b.Date desc) as BadgeRankDesc,
+        rank() over (partition by b.UserId order by b.Class) as BadgeClassRank
+    from Badges b
+    where b.Class in (1, 2, 3)
+), 
+UserActivity as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        coalesce(pq.QuestionCnt, 0) as QuestionCount,
+        coalesce(pa.AnswerCnt, 0) as AnswerCount,
+        coalesce(vv.UpVotes, 0) as UserUpVotes,
+        coalesce(vd.DownVotes, 0) as UserDownVotes,
+        UsrRev.LastReviewDate
+    from Users u
+    left join (
+        select OwnerUserId, count(*) as QuestionCnt
+        from Posts
+        where PostTypeId = 1
+        group by OwnerUserId
+    ) pq on pq.OwnerUserId = u.Id
+    left join (
+        select OwnerUserId, count(*) as AnswerCnt
+        from Posts
+        where PostTypeId = 2
+        group by OwnerUserId
+    ) pa on pa.OwnerUserId = u.Id
+    left join (
+        select UserId, count(*) as UpVotes
+        from Votes
+        where VoteTypeId = 2
+        group by UserId
+    ) vv on vv.UserId = u.Id
+    left join (
+        select UserId, count(*) as DownVotes
+        from Votes
+        where VoteTypeId = 3
+        group by UserId
+    ) vd on vd.UserId = u.Id
+    left join (
+        select UserId, max(CreationDate) as LastReviewDate
+        from PostHistory
+        where PostHistoryTypeId in (14,16,24)
+        group by UserId
+    ) UsrRev on UsrRev.UserId = u.Id
+), FlaggedPosts as (
+    select
+        ph.PostId,
+        max(ph.CreationDate) as LastFlagDate,
+        max(ph.UserId) as LastFlagUserId,
+        count(*) as FlagCount
+    from PostHistory ph
+    where ph.PostHistoryTypeId in (50,52,53)
+    group by ph.PostId
+), QuestionDetails as (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        q.CreationDate,
+        q.Score as QuestionScore,
+        q.ViewCount,
+        (select coalesce(sum(Score),0) from Posts ans where ans.ParentId = q.Id and ans.PostTypeId=2) as TotalAnswerScore,
+        (select count(*) from Comments cm where cm.PostId = q.Id) as QuestionComments,
+        q.FavoriteCount,
+        case 
+            when q.ClosedDate is not null then 1 
+            else 0 
+        end as IsClosed,
+        q.Tags,
+        b.LastFlagDate,
+        c.Name as CloseReasonName,
+        u.DisplayName as OwnerName,
+        u.Reputation as OwnerReputation,
+        row_number() over (partition by u.Id order by q.CreationDate desc) as UserRecentQuestionRank
+    from Posts q
+    left join FlaggedPosts b on b.PostId = q.Id
+    left join CloseReasonTypes c on c.Id = cast((select Comment from PostHistory ph2 where ph2.PostId = q.Id and ph2.PostHistoryTypeId=10 ORDER BY ph2.CreationDate DESC LIMIT 1) as integer)
+    left join Users u on u.Id = q.OwnerUserId
+    where q.PostTypeId = 1
+)
+select
+    UA.UserId,
+    UA.DisplayName,
+    UA.Reputation,
+    UA.QuestionCount,
+    UA.AnswerCount,
+    UA.UserUpVotes,
+    UA.UserDownVotes,
+    MinQ.Title as LatestQuestionTitle,
+    MinQ.QuestionScore,
+    MinQ.ViewCount,
+    MinQ.TotalAnswerScore,
+    MinQ.QuestionComments,
+    MinQ.FavoriteCount,
+    MinQ.IsClosed,
+    Coalesce(MinQ.CloseReasonName, 'None') as CloseReason,
+    MinQ.LastFlagDate,
+    UB.BadgeName,
+    UB.Class as BadgeClass,
+    UB.BadgeRankDesc,
+    (select string_agg(distinct t.tag, ',') 
+     from (
+       select trim(value) as tag
+       from (
+         select regexp_split as value
+         from (
+           select regexp_split_part -- placeholder to allow lateral splitting below
+         ) x
+       ) s
+     ) t
+     where t.tag <> ''
+    ) as QuestionTags,
+    Max(COALESCE(PostHad.EditsCount,0)) as MaxEditsOnLatestPosts,
+    Count(distinct PH.PostHistoryTypeId) filter (where PH.PostHistoryTypeId in (19,20)) as ProtectUnprotectEdits
+from UserActivity UA
+left join UserBadgeRanks UB on UB.UserId = UA.UserId and UB.BadgeRankDesc = 1
+left join QuestionDetails MinQ on MinQ.UserRecentQuestionRank = 1 and MinQ.OwnerName = UA.DisplayName
+left join (
+    select ph.PostId, ph.UserId, count(ph.Id) EditsCount
+    from PostHistory ph
+    where ph.PostHistoryTypeId in (4,5,6,7,8,9,24)
+    group by ph.PostId, ph.UserId
+) PostHad on PostHad.UserId = UA.UserId and PostHad.PostId = MinQ.QuestionId
+left join PostHistory PH on PH.UserId = UA.UserId and PH.PostId = MinQ.QuestionId
+where UA.Reputation > (
+    select avg(Reputation)*0.75
+    from Users
+    where Reputation is not null
+)
+group by UA.UserId, UA.DisplayName, UA.Reputation, UA.QuestionCount, UA.AnswerCount, UA.UserUpVotes, UA.UserDownVotes, MinQ.Title, MinQ.QuestionScore, MinQ.ViewCount, MinQ.TotalAnswerScore, MinQ.QuestionComments, MinQ.FavoriteCount, MinQ.IsClosed, MinQ.CloseReasonName, MinQ.LastFlagDate, UB.BadgeName, UB.Class, UB.BadgeRankDesc, MinQ.Tags
+having Count(distinct PH.PostHistoryTypeId) filter (where PH.PostHistoryTypeId in (19,20)) > 0
+order by UA.Reputation desc, UA.UserUpVotes desc, MinQ.ViewCount desc
+limit 50;

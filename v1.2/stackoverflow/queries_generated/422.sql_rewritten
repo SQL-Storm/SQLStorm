@@ -1,0 +1,161 @@
+-- {"query": "422.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 0.4, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1437} 
+with RecursiveTagCounts as (
+    select
+        t.Id as TagId,
+        t.TagName,
+        t.Count,
+        coalesce(p.AnswerCount, 0) as AnswerCount,
+        coalesce(p.ViewCount, 0) as ViewCount,
+        row_number() over (partition by t.Id order by p.Score desc nulls last) as rn
+    from Tags t
+    left join Posts p on p.PostTypeId = 1 and p.Tags like '%' || t.TagName || '%'
+    where t.IsModeratorOnly = 0
+),
+UserBadgeStats as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(distinct b.Id) filter (where b.Class = 1) as GoldBadges,
+        count(distinct b.Id) filter (where b.Class = 2) as SilverBadges,
+        count(distinct b.Id) filter (where b.Class = 3) as BronzeBadges,
+        coalesce(sum(v.VoteCount),0) as TotalVotesReceived
+    from Users u
+    left join (
+        select p.OwnerUserId, count(v.Id) as VoteCount
+        from Posts p
+        left join Votes v on v.PostId = p.Id and v.VoteTypeId in (2,3)
+        where p.OwnerUserId is not null and p.OwnerUserId <> -1
+        group by p.OwnerUserId
+    ) v on v.OwnerUserId = u.Id
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.DisplayName
+),
+TopQuestions as (
+    select
+        p.Id,
+        p.Title,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.CreationDate,
+        p.Tags,
+        dense_rank() over (order by p.Score desc, p.ViewCount desc) as RankScoreView
+    from Posts p
+    where p.PostTypeId = 1
+      and p.CreationDate > cast('2024-10-01' as date) - interval '1 year'
+      and p.Score > 10
+),
+AnswerStats as (
+    select
+        a.ParentId as QuestionId,
+        count(a.Id) as AnswerCount,
+        avg(a.Score) as AvgAnswerScore,
+        max(a.Score) as MaxAnswerScore,
+        sum(case when a.OwnerUserId is null then 0 else 1 end) as AnswersWithOwner
+    from Posts a
+    where a.PostTypeId = 2
+    group by a.ParentId
+),
+CloseReasonsCount as (
+    select
+        ph.PostId,
+        crt.Name as CloseReason,
+        count(*) as CloseVotes
+    from PostHistory ph
+    join PostHistoryTypes pht on ph.PostHistoryTypeId = pht.Id
+    join CloseReasonTypes crt on crt.Id::int = ph.Comment::int
+    where ph.PostHistoryTypeId = 10
+    group by ph.PostId, crt.Name
+),
+UserActivityWindow as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        p.Id as PostId,
+        p.PostTypeId,
+        p.Score,
+        p.CreationDate,
+        row_number() over (partition by u.Id order by p.CreationDate desc) as RecentPostRank
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    where p.CreationDate is not null
+),
+UserRecentActivity as (
+    select
+        UserId,
+        count(*) filter (where PostTypeId = 1) as RecentQuestions,
+        count(*) filter (where PostTypeId = 2) as RecentAnswers,
+        avg(Score) as AvgRecentScore
+    from UserActivityWindow
+    where RecentPostRank <= 5
+    group by UserId
+),
+CombinedStats as (
+    select
+        tq.Id as QuestionId,
+        tq.Title,
+        tq.OwnerUserId,
+        u.DisplayName as OwnerName,
+        tq.Score,
+        tq.ViewCount,
+        tq.AnswerCount,
+        coalesce(asr.AnswerCount,0) as TotalAnswers,
+        coalesce(asr.AvgAnswerScore,0) as AvgAnswerScore,
+        coalesce(crc.CloseVotes,0) as CloseVoteCount,
+        coalesce(crc.CloseReason, 'None') as CloseReason,
+        ub.GoldBadges,
+        ub.SilverBadges,
+        ub.BronzeBadges,
+        ub.TotalVotesReceived,
+        ura.RecentQuestions,
+        ura.RecentAnswers,
+        ura.AvgRecentScore,
+        case
+            when tq.Score > 50 then 'High Score'
+            when tq.Score between 20 and 50 then 'Medium Score'
+            else 'Low Score'
+        end as ScoreCategory,
+        string_agg(distinct coalesce(t.TagName, ''), ', ') as RelatedTags
+    from TopQuestions tq
+    left join AnswerStats asr on asr.QuestionId = tq.Id
+    left join CloseReasonsCount crc on crc.PostId = tq.Id
+    left join Users u on u.Id = tq.OwnerUserId
+    left join UserBadgeStats ub on ub.UserId = tq.OwnerUserId
+    left join UserRecentActivity ura on ura.UserId = tq.OwnerUserId
+    left join Tags t on tq.Tags like '%' || t.TagName || '%'
+    group by
+        tq.Id, tq.Title, tq.OwnerUserId, u.DisplayName, tq.Score, tq.ViewCount, tq.AnswerCount,
+        asr.AnswerCount, asr.AvgAnswerScore, crc.CloseVotes, crc.CloseReason,
+        ub.GoldBadges, ub.SilverBadges, ub.BronzeBadges, ub.TotalVotesReceived,
+        ura.RecentQuestions, ura.RecentAnswers, ura.AvgRecentScore
+)
+select
+    cs.QuestionId,
+    cs.Title,
+    cs.OwnerName,
+    cs.Score,
+    cs.ViewCount,
+    cs.AnswerCount,
+    cs.TotalAnswers,
+    cs.AvgAnswerScore,
+    cs.CloseVoteCount,
+    cs.CloseReason,
+    cs.GoldBadges,
+    cs.SilverBadges,
+    cs.BronzeBadges,
+    cs.TotalVotesReceived,
+    cs.RecentQuestions,
+    cs.RecentAnswers,
+    cs.AvgRecentScore,
+    cs.ScoreCategory,
+    cs.RelatedTags,
+    concat(
+        'Q:', cs.Score, '|A:', cs.TotalAnswers, '|V:', cs.ViewCount, '|CB:', cs.CloseVoteCount
+    ) as SummaryStats,
+    row_number() over (partition by cs.ScoreCategory order by cs.Score desc, cs.ViewCount desc) as CategoryRank
+from CombinedStats cs
+where cs.TotalAnswers > 0
+  and (cs.CloseVoteCount = 0 or cs.CloseVoteCount is null)
+order by cs.Score desc, cs.ViewCount desc
+limit 100;

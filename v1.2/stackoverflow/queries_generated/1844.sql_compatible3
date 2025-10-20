@@ -1,0 +1,15 @@
+WITH FastAsianBEC AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        AVG(COALESCE(uup."Av識Weightsмис_tagпросwaardig升", 0)) AS avg_weight
+    FROM users u
+    JOIN user_upvotes uup ON u.Id = uup.UserId
+    GROUP BY u.Id, u.DisplayName
+)
+SELECT
+    f.Id,
+    f.DisplayName,
+    f.avg_weight
+FROM FastAsianBEC f
+GROUP BY f.Id, f.DisplayName, f.avg_weight;

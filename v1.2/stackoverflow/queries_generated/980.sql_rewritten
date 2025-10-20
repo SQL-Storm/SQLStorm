@@ -1,0 +1,190 @@
+-- {"query": "980.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 0.9, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1657} 
+with RecursivePosts as (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId,
+        p.Tags,
+        1 as Depth
+    from Posts p
+    where p.PostTypeId = 1 and p.CreationDate > cast('2024-10-01' as date) - interval '30 days'
+    union all
+    select
+        c.Id,
+        c.PostTypeId,
+        c.CreationDate,
+        c.Score,
+        c.ViewCount,
+        c.OwnerUserId,
+        c.Tags,
+        rp.Depth + 1
+    from Posts c
+    join RecursivePosts rp on c.ParentId = rp.Id
+    where rp.Depth < 3
+),
+UserBadgeCounts as (
+    select
+        b.UserId,
+        b.Class,
+        count(*) as BadgeCount
+    from Badges b
+    where b.Date > cast('2024-10-01' as date) - interval '1 year'
+    group by b.UserId, b.Class
+),
+UserActivityRank as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionsAsked,
+        count(distinct p.Id) filter (where p.PostTypeId = 2) as AnswersGiven,
+        count(distinct c.Id) as CommentsMade,
+        sum(v.VoteTypeId = 2::int)::int as UpVotesReceived,
+        sum(v.VoteTypeId = 3::int)::int as DownVotesReceived,
+        dense_rank() over (order by u.Reputation desc) as ReputationRank
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Comments c on c.UserId = u.Id
+    left join Votes v on v.PostId = p.Id
+    group by u.Id, u.DisplayName, u.Reputation
+),
+TopTags as (
+    select
+        unnest(string_to_array(substring(rp.Tags from 2 for length(rp.Tags)-2), '><')) as Tag,
+        rp.OwnerUserId,
+        count(*) as TagUsageCount
+    from RecursivePosts rp
+    where rp.Depth = 1 and rp.Tags is not null
+    group by Tag, rp.OwnerUserId
+),
+UserTopTagRanks as (
+    select
+        tt.OwnerUserId as UserId,
+        tt.Tag,
+        tt.TagUsageCount,
+        rank() over (partition by tt.OwnerUserId order by tt.TagUsageCount desc) as TagRank
+    from TopTags tt
+),
+QuestionDuplicateInfo as (
+    select
+        pl.PostId,
+        count(distinct pl.RelatedPostId) filter (where lt.Name = 'Duplicate') as DuplicateCount,
+        max(pl.CreationDate) as LastDuplicateLinkDate
+    from PostLinks pl
+    join LinkTypes lt on pl.LinkTypeId = lt.Id
+    group by pl.PostId
+),
+UserCloseVoteStats as (
+    select
+        ph.UserId,
+        count(*) as CloseVotesCast,
+        count(distinct ph.PostId) as DistinctPostsClosed
+    from PostHistory ph
+    where ph.PostHistoryTypeId = 10 and ph.CreationDate > cast('2024-10-01' as date) - interval '1 year'
+    group by ph.UserId
+),
+UserAggregates as (
+    select
+        uar.UserId,
+        uar.DisplayName,
+        uar.Reputation,
+        uar.QuestionsAsked,
+        uar.AnswersGiven,
+        uar.CommentsMade,
+        uar.UpVotesReceived,
+        uar.DownVotesReceived,
+        coalesce(ubc_gold.BadgeCount, 0) as GoldBadges,
+        coalesce(ubc_silver.BadgeCount, 0) as SilverBadges,
+        coalesce(ubc_bronze.BadgeCount, 0) as BronzeBadges,
+        coalesce(ucs.CloseVotesCast, 0) as CloseVotesCast,
+        coalesce(ucs.DistinctPostsClosed, 0) as DistinctPostsClosed
+    from UserActivityRank uar
+    left join UserBadgeCounts ubc_gold on ubc_gold.UserId = uar.UserId and ubc_gold.Class = 1
+    left join UserBadgeCounts ubc_silver on ubc_silver.UserId = uar.UserId and ubc_silver.Class = 2
+    left join UserBadgeCounts ubc_bronze on ubc_bronze.UserId = uar.UserId and ubc_bronze.Class = 3
+    left join UserCloseVoteStats ucs on ucs.UserId = uar.UserId
+),
+RecentHighlyDupeQuestions as (
+    select
+        p.Id,
+        p.Title,
+        p.OwnerUserId,
+        p.CreationDate,
+        qdi.DuplicateCount,
+        qdi.LastDuplicateLinkDate
+    from Posts p
+    left join QuestionDuplicateInfo qdi on qdi.PostId = p.Id
+    where p.PostTypeId = 1 and p.CreationDate > cast('2024-10-01' as date) - interval '90 days'
+      and coalesce(qdi.DuplicateCount,0) > 2
+),
+AnswerScoresOverQuestions as (
+    select
+        a.ParentId as QuestionId,
+        a.Id as AnswerId,
+        a.Score as AnswerScore,
+        row_number() over (partition by a.ParentId order by a.Score desc, a.CreationDate asc) as AnswerRank,
+        first_value(a.OwnerUserId) over (partition by a.ParentId order by a.Score desc, a.CreationDate asc) as TopAnswerUserId
+    from Posts a
+    where a.PostTypeId = 2
+),
+UserAnswerQuality as (
+    select
+        uas.QuestionId,
+        uas.AnswerId,
+        uas.AnswerScore,
+        ua.DisplayName as AnswererName,
+        q.OwnerUserId as AskerUserId,
+        uar.DisplayName as AskerName,
+        uas.AnswerRank
+    from AnswerScoresOverQuestions uas
+    join Posts q on q.Id = uas.QuestionId
+    join Users ua on ua.Id = uas.TopAnswerUserId
+    left join Users uar on uar.Id = q.OwnerUserId
+)
+select
+    ua.UserId,
+    ua.DisplayName,
+    ua.Reputation,
+    ua.QuestionsAsked,
+    ua.AnswersGiven,
+    ua.CommentsMade,
+    ua.UpVotesReceived,
+    ua.DownVotesReceived,
+    ua.GoldBadges,
+    ua.SilverBadges,
+    ua.BronzeBadges,
+    ua.CloseVotesCast,
+    ua.DistinctPostsClosed,
+    utt.Tag as TopTag,
+    utt.TagUsageCount,
+    raq.Id as HotDuplicateQuestionId,
+    raq.Title as HotDuplicateQuestionTitle,
+    raq.DuplicateCount,
+    raq.LastDuplicateLinkDate,
+    ua2.AnswerId as TopAnswerId,
+    ua2.AnswerScore as TopAnswerScore,
+    ua2.AnswererName,
+    ua2.AskerUserId,
+    ua2.AskerName
+from UserAggregates ua
+left join UserTopTagRanks utt on utt.UserId = ua.UserId and utt.TagRank = 1
+left join lateral (
+    select *
+    from RecentHighlyDupeQuestions raq
+    where raq.OwnerUserId = ua.UserId
+    order by raq.DuplicateCount desc, raq.LastDuplicateLinkDate desc
+    limit 1
+) raq on true
+left join lateral (
+    select *
+    from UserAnswerQuality ua2
+    where ua2.AskerUserId = ua.UserId and ua2.AnswerRank = 1
+    order by ua2.AnswerScore desc
+    limit 1
+) ua2 on true
+where ua.Reputation > 1000
+order by ua.Reputation desc, ua.GoldBadges desc
+limit 100;

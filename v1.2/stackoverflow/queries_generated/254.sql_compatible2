@@ -1,0 +1,133 @@
+with RecursiveUserActivity as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionsAsked,
+        count(distinct p2.Id) filter (where p2.PostTypeId = 2) as AnswersGiven,
+        count(distinct c.Id) as CommentsMade,
+        coalesce(sum(case when v.VoteTypeId = 2 then 1 else 0 end), 0) as UpVotesReceived,
+        coalesce(sum(case when v.VoteTypeId = 3 then 1 else 0 end), 0) as DownVotesReceived,
+        row_number() over (order by u.Reputation desc, u.LastAccessDate desc) as ActivityRank
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Posts p2 on p2.OwnerUserId = u.Id
+    left join Comments c on c.UserId = u.Id
+    left join Votes v on v.UserId = u.Id
+    group by u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate
+),
+TopTags as (
+    select
+        t.TagName,
+        t.Count,
+        p.OwnerUserId,
+        count(p.Id) as PostsWithTag
+    from Tags t
+    join Posts p on p.Tags like concat('%<', t.TagName, '>%')
+    group by t.TagName, t.Count, p.OwnerUserId
+    having count(p.Id) > 10
+),
+UserTagSummary as (
+    select
+        ua.UserId,
+        ua.DisplayName,
+        tt.TagName,
+        tt.PostsWithTag,
+        row_number() over (partition by ua.UserId order by tt.PostsWithTag desc) as TagRank
+    from RecursiveUserActivity ua
+    join TopTags tt on tt.OwnerUserId = ua.UserId
+),
+PostWithLinkInfo as (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId,
+        pl.LinkTypeId,
+        lt.Name as LinkTypeName,
+        rp.Title as RelatedPostTitle,
+        rp.Score as RelatedPostScore
+    from Posts p
+    left join PostLinks pl on pl.PostId = p.Id
+    left join LinkTypes lt on lt.Id = pl.LinkTypeId
+    left join Posts rp on rp.Id = pl.RelatedPostId
+    where p.PostTypeId in (1, 2)
+),
+RankedPosts as (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId,
+        p.LinkTypeId,
+        p.LinkTypeName,
+        p.RelatedPostTitle,
+        p.RelatedPostScore,
+        rank() over (partition by p.OwnerUserId order by p.Score desc, p.ViewCount desc) as PostRank,
+        dense_rank() over (order by p.Score desc) as GlobalScoreRank
+    from PostWithLinkInfo p
+),
+ClosedQuestions as (
+    select
+        ph.PostId,
+        ph.CreationDate as ClosedDate,
+        crt.Name as CloseReason,
+        ph.UserId as ClosedByUserId,
+        u.DisplayName as ClosedByUserName
+    from PostHistory ph
+    join CloseReasonTypes crt on crt.Id = cast(ph.Comment as integer)
+    left join Users u on u.Id = ph.UserId
+    where ph.PostHistoryTypeId = 10
+),
+UserBadgeSummary as (
+    select
+        b.UserId,
+        count(*) filter (where b.Class = 1) as GoldBadges,
+        count(*) filter (where b.Class = 2) as SilverBadges,
+        count(*) filter (where b.Class = 3) as BronzeBadges,
+        count(distinct b.Name) as DistinctBadges
+    from Badges b
+    group by b.UserId
+)
+select
+    ua.UserId,
+    ua.DisplayName,
+    ua.Reputation,
+    ua.QuestionsAsked,
+    ua.AnswersGiven,
+    ua.CommentsMade,
+    ua.UpVotesReceived,
+    ua.DownVotesReceived,
+    coalesce(ubs.GoldBadges, 0) as GoldBadges,
+    coalesce(ubs.SilverBadges, 0) as SilverBadges,
+    coalesce(ubs.BronzeBadges, 0) as BronzeBadges,
+    ua.ActivityRank,
+    uts.TagName as TopTag,
+    uts.PostsWithTag as PostsInTopTag,
+    rp.Id as TopPostId,
+    rp.Title as TopPostTitle,
+    rp.Score as TopPostScore,
+    rp.ViewCount as TopPostViews,
+    rp.LinkTypeName as TopPostLinkType,
+    rp.RelatedPostTitle as TopPostRelatedTitle,
+    cq.ClosedDate,
+    cq.CloseReason,
+    cq.ClosedByUserName
+from RecursiveUserActivity ua
+left join UserBadgeSummary ubs on ubs.UserId = ua.UserId
+left join UserTagSummary uts on uts.UserId = ua.UserId and uts.TagRank = 1
+left join RankedPosts rp on rp.OwnerUserId = ua.UserId and rp.PostRank = 1
+left join ClosedQuestions cq on cq.PostId = rp.Id
+where ua.Reputation > 1000
+  and (rp.Score > 10 or rp.Score is null)
+  and (cq.ClosedDate is null or cq.ClosedDate > (cast('2024-10-01' as date) - interval '1 year'))
+order by ua.Reputation desc, ua.ActivityRank
+limit 100;

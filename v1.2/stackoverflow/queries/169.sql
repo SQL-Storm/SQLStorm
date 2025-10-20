@@ -1,0 +1,202 @@
+with RecursiveUserActivity as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionCount,
+        count(distinct p.Id) filter (where p.PostTypeId = 2) as AnswerCount,
+        count(distinct c.Id) as CommentCount,
+        coalesce(sum(case when v.VoteTypeId = 2 then 1 else 0 end), 0) as TotalUpVotes,
+        coalesce(sum(case when v.VoteTypeId = 3 then 1 else 0 end), 0) as TotalDownVotes,
+        row_number() over (order by u.Reputation desc, u.LastAccessDate desc) as UserRank
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Comments c on c.UserId = u.Id
+    left join Votes v on v.UserId = u.Id
+    group by u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate
+),
+BadgeSummary as (
+    select
+        b.UserId,
+        count(*) filter (where b.Class = 1) as GoldBadges,
+        count(*) filter (where b.Class = 2) as SilverBadges,
+        count(*) filter (where b.Class = 3) as BronzeBadges,
+        count(distinct b.Name) as DistinctBadges
+    from Badges b
+    group by b.UserId
+),
+TopQuestions as (
+    select
+        p.Id,
+        p.Title,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.Tags,
+        p.AcceptedAnswerId,
+        row_number() over (partition by p.OwnerUserId order by p.Score desc, p.ViewCount desc) as QuestionRank
+    from Posts p
+    where p.PostTypeId = 1
+),
+AcceptedAnswerDetails as (
+    select
+        a.Id as AnswerId,
+        a.ParentId as QuestionId,
+        a.OwnerUserId as AnswerOwnerId,
+        a.Score as AnswerScore,
+        a.CreationDate as AnswerCreationDate,
+        u.DisplayName as AnswerOwnerName
+    from Posts a
+    join Users u on u.Id = a.OwnerUserId
+    where a.PostTypeId = 2
+),
+QuestionAnswerStats as (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        q.OwnerUserId,
+        q.Score as QuestionScore,
+        q.ViewCount,
+        q.Tags,
+        q.AcceptedAnswerId,
+        coalesce(a.AnswerScore, 0) as AcceptedAnswerScore,
+        a.AnswerOwnerId,
+        a.AnswerOwnerName,
+        (select count(*) from Posts ans where ans.ParentId = q.Id and ans.PostTypeId = 2) as TotalAnswers,
+        (select count(*) from Comments cm where cm.PostId = q.Id) as QuestionComments,
+        (select count(*) from Votes v where v.PostId = q.Id and v.VoteTypeId = 2) as QuestionUpVotes,
+        (select count(*) from Votes v where v.PostId = q.Id and v.VoteTypeId = 3) as QuestionDownVotes
+    from Posts q
+    left join AcceptedAnswerDetails a on a.QuestionId = q.Id
+    where q.PostTypeId = 1
+    group by q.Id, q.Title, q.OwnerUserId, q.Score, q.ViewCount, q.Tags, q.AcceptedAnswerId, a.AnswerScore, a.AnswerOwnerId, a.AnswerOwnerName
+),
+PostLinkInfo as (
+    select
+        pl.PostId,
+        pl.RelatedPostId,
+        lt.Name as LinkTypeName,
+        p1.Title as PostTitle,
+        p2.Title as RelatedPostTitle
+    from PostLinks pl
+    join LinkTypes lt on lt.Id = pl.LinkTypeId
+    join Posts p1 on p1.Id = pl.PostId
+    join Posts p2 on p2.Id = pl.RelatedPostId
+),
+UserActivityWithBadges as (
+    select
+        ua.UserId,
+        ua.DisplayName,
+        ua.Reputation,
+        ua.CreationDate,
+        ua.LastAccessDate,
+        ua.QuestionCount,
+        ua.AnswerCount,
+        ua.CommentCount,
+        ua.TotalUpVotes,
+        ua.TotalDownVotes,
+        ua.UserRank,
+        coalesce(bs.GoldBadges, 0) as GoldBadges,
+        coalesce(bs.SilverBadges, 0) as SilverBadges,
+        coalesce(bs.BronzeBadges, 0) as BronzeBadges,
+        coalesce(bs.DistinctBadges, 0) as DistinctBadges
+    from RecursiveUserActivity ua
+    left join BadgeSummary bs on bs.UserId = ua.UserId
+),
+RankedQuestions as (
+    select
+        qas.QuestionId,
+        qas.Title,
+        qas.OwnerUserId,
+        qas.QuestionScore,
+        qas.ViewCount,
+        qas.Tags,
+        qas.AcceptedAnswerId,
+        qas.AcceptedAnswerScore,
+        qas.AnswerOwnerId,
+        qas.AnswerOwnerName,
+        qas.TotalAnswers,
+        qas.QuestionComments,
+        qas.QuestionUpVotes,
+        qas.QuestionDownVotes,
+        row_number() over (order by qas.QuestionScore desc, qas.ViewCount desc) as GlobalQuestionRank
+    from QuestionAnswerStats qas
+),
+FilteredQuestions as (
+    select *
+    from RankedQuestions
+    where GlobalQuestionRank <= 100
+      and (Tags ilike '%<sql>%' or Tags ilike '%<performance>%')
+      and QuestionScore > 5
+      and TotalAnswers > 2
+),
+UserCommentActivity as (
+    select
+        c.UserId,
+        count(*) as TotalComments,
+        max(c.CreationDate) as LastCommentDate,
+        string_agg(distinct substring(c.Text from 1 for 20), ' | ') as SampleComments
+    from Comments c
+    where c.UserId is not null
+    group by c.UserId
+),
+FinalUserStats as (
+    select
+        uab.UserId,
+        uab.DisplayName,
+        uab.Reputation,
+        uab.QuestionCount,
+        uab.AnswerCount,
+        uab.CommentCount,
+        uab.TotalUpVotes,
+        uab.TotalDownVotes,
+        uab.GoldBadges,
+        uab.SilverBadges,
+        uab.BronzeBadges,
+        uab.DistinctBadges,
+        uca.TotalComments,
+        uca.LastCommentDate,
+        uca.SampleComments
+    from UserActivityWithBadges uab
+    left join UserCommentActivity uca on uca.UserId = uab.UserId
+)
+select
+    fqs.GlobalQuestionRank,
+    fqs.QuestionId as Id,
+    fqs.Title as QuestionTitle,
+    fqs.OwnerUserId,
+    fu.DisplayName as QuestionOwnerName,
+    fqs.QuestionScore,
+    fqs.ViewCount,
+    fqs.Tags,
+    fqs.AcceptedAnswerId,
+    fqs.AcceptedAnswerScore,
+    fqs.AnswerOwnerId,
+    fqs.AnswerOwnerName,
+    fqs.TotalAnswers,
+    fqs.QuestionComments,
+    fqs.QuestionUpVotes,
+    fqs.QuestionDownVotes,
+    fus.Reputation as OwnerReputation,
+    fus.GoldBadges,
+    fus.SilverBadges,
+    fus.BronzeBadges,
+    fus.DistinctBadges,
+    fus.TotalComments as OwnerTotalComments,
+    fus.LastCommentDate as OwnerLastCommentDate,
+    fus.SampleComments as OwnerSampleComments,
+    pl.LinkTypeName,
+    pl.RelatedPostId,
+    pl.RelatedPostTitle
+from FilteredQuestions fqs
+join Users fu on fu.Id = fqs.OwnerUserId
+left join FinalUserStats fus on fus.UserId = fqs.OwnerUserId
+left join PostLinkInfo pl on pl.PostId = fqs.QuestionId and pl.LinkTypeName = 'Duplicate'
+where
+    (fqs.QuestionScore > 10 or fqs.AcceptedAnswerScore > 10)
+    and (coalesce(fus.GoldBadges, 0) > 0 or coalesce(fus.SilverBadges, 0) > 2)
+order by fqs.GlobalQuestionRank
+limit 50;

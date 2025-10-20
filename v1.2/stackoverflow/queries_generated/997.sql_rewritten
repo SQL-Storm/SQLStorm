@@ -1,0 +1,188 @@
+-- {"query": "997.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 0.9, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1703} 
+with RecursiveUserBadges as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        b.Name as BadgeName,
+        b.Class,
+        row_number() over (partition by u.Id order by b.Date desc) as BadgeRank
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    where b.Class is not null
+),
+TopBadgesPerUser as (
+    select UserId, DisplayName, BadgeName, Class
+    from RecursiveUserBadges
+    where BadgeRank <= 3
+),
+QuestionAnswerStats as (
+    select
+        p.OwnerUserId,
+        count(case when p.PostTypeId = 1 then 1 end) as QuestionCount,
+        count(case when p.PostTypeId = 2 then 1 end) as AnswerCount,
+        avg(case when p.PostTypeId = 1 then p.Score end) as AvgQuestionScore,
+        avg(case when p.PostTypeId = 2 then p.Score end) as AvgAnswerScore,
+        max(p.CreationDate) as LastPostDate
+    from Posts p
+    where p.OwnerUserId is not null
+    group by p.OwnerUserId
+),
+UserTagUsage as (
+    select
+        p.OwnerUserId,
+        unnest(string_to_array(substring(p.Tags from 2 for length(p.Tags) - 2), '><')) as Tag,
+        count(*) as TagCount
+    from Posts p
+    where p.PostTypeId = 1 and p.Tags is not null
+    group by p.OwnerUserId, Tag
+),
+TopTagsPerUser as (
+    select distinct on (OwnerUserId) OwnerUserId, Tag, TagCount
+    from UserTagUsage
+    order by OwnerUserId, TagCount desc
+),
+UserCommentStats as (
+    select
+        c.UserId,
+        count(c.Id) as CommentCount,
+        avg(c.Score) as AvgCommentScore,
+        max(c.CreationDate) as LastCommentDate
+    from Comments c
+    where c.UserId is not null
+    group by c.UserId
+),
+UserVoteSummary as (
+    select
+        p.OwnerUserId,
+        sum(case when v.VoteTypeId = 2 then 1 else 0 end) as UpVotesReceived,
+        sum(case when v.VoteTypeId = 3 then 1 else 0 end) as DownVotesReceived
+    from Posts p
+    left join Votes v on v.PostId = p.Id
+    group by p.OwnerUserId
+),
+UserActivityWindow as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        p.Id as PostId,
+        p.PostTypeId,
+        p.CreationDate,
+        rank() over (partition by u.Id order by p.CreationDate desc) as RecentPostRank,
+        coalesce(lag(p.CreationDate) over (partition by u.Id order by p.CreationDate desc), timestamp '1970-01-01') as PrevPostDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    where p.CreationDate is not null
+),
+UserPostIntervals as (
+    select
+        UserId,
+        DisplayName,
+        PostId,
+        PostTypeId,
+        CreationDate,
+        PrevPostDate,
+        extract(epoch from (PrevPostDate - CreationDate))/3600 as HoursSincePrevPost,
+        Score,
+        ViewCount,
+        Tags
+    from UserActivityWindow
+    where RecentPostRank <= 5
+),
+ClosedQuestionsWithReason as (
+    select
+        p.Id as QuestionId,
+        p.OwnerUserId,
+        p.Title,
+        p.Tags,
+        cht.Name as CloseReason,
+        ph.CreationDate as CloseDate
+    from Posts p
+    inner join PostHistory ph on ph.PostId = p.Id and ph.PostHistoryTypeId = 10
+    inner join CloseReasonTypes cht on cht.Id = cast(ph.Comment as smallint)
+    where p.PostTypeId = 1 and p.ClosedDate is not null
+),
+UserDuplicates as (
+    select distinct
+        pl.PostId,
+        pl.RelatedPostId,
+        u.Id as UserId,
+        u.DisplayName,
+        p1.Title as PostTitle,
+        p2.Title as RelatedPostTitle
+    from PostLinks pl
+    inner join Posts p1 on p1.Id = pl.PostId
+    inner join Posts p2 on p2.Id = pl.RelatedPostId
+    inner join Users u on u.Id = p1.OwnerUserId
+    where pl.LinkTypeId = 3 -- Duplicate link type
+    and p1.PostTypeId = 1
+    and p2.PostTypeId = 1
+),
+UserSummary as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        coalesce(qa.QuestionCount,0) as Questions,
+        coalesce(qa.AnswerCount,0) as Answers,
+        coalesce(qa.AvgQuestionScore,0) as AvgQScore,
+        coalesce(qa.AvgAnswerScore,0) as AvgAScore,
+        coalesce(cs.CommentCount,0) as Comments,
+        coalesce(cs.AvgCommentScore,0) as AvgCScore,
+        coalesce(vs.UpVotesReceived,0) as UpVotesReceived,
+        coalesce(vs.DownVotesReceived,0) as DownVotesReceived,
+        t.Tag as FavoriteTag
+    from Users u
+    left join QuestionAnswerStats qa on qa.OwnerUserId = u.Id
+    left join UserCommentStats cs on cs.UserId = u.Id
+    left join UserVoteSummary vs on vs.OwnerUserId = u.Id
+    left join TopTagsPerUser t on t.OwnerUserId = u.Id
+    where u.Reputation > 1000
+),
+UserDetailWithBadges as (
+    select
+        us.*,
+        tb.BadgeName,
+        tb.Class as BadgeClass
+    from UserSummary us
+    left join TopBadgesPerUser tb on tb.UserId = us.UserId
+),
+FinalOutput as (
+    select
+        u.UserId,
+        u.DisplayName,
+        substring(u.FavoriteTag from 1 for 15) as FavoriteTag,
+        u.Reputation,
+        u.Questions,
+        u.Answers,
+        round(u.AvgQScore,2) as AvgQuestionScore,
+        round(u.AvgAScore,2) as AvgAnswerScore,
+        u.Comments,
+        round(u.AvgCScore,2) as AvgCommentScore,
+        u.UpVotesReceived,
+        u.DownVotesReceived,
+        u.BadgeName,
+        case 
+            when u.BadgeClass = 1 then 'Gold'
+            when u.BadgeClass = 2 then 'Silver'
+            when u.BadgeClass = 3 then 'Bronze'
+            else 'None'
+        end as BadgeClass,
+        count(distinct dup.PostId) as DuplicateQuestions,
+        count(distinct cqt.QuestionId) as ClosedQuestionsCount,
+        string_agg(distinct cqt.CloseReason, ', ') as CloseReasons,
+        round(avg(nullif(upi.HoursSincePrevPost,0)), 2) as AvgHoursBetweenRecentPosts
+    from UserDetailWithBadges u
+    left join UserDuplicates dup on dup.UserId = u.UserId
+    left join ClosedQuestionsWithReason cqt on cqt.OwnerUserId = u.UserId
+    left join UserPostIntervals upi on upi.UserId = u.UserId
+    group by 
+        u.UserId, u.DisplayName, u.FavoriteTag, u.Reputation, u.Questions, u.Answers, u.AvgQScore, u.AvgAScore, u.Comments, u.AvgCScore, u.UpVotesReceived, u.DownVotesReceived, u.BadgeName, u.BadgeClass
+)
+select *
+from FinalOutput
+where Questions > 0 and Answers > 0
+order by Reputation desc, Questions desc, Answers desc
+limit 50;

@@ -1,0 +1,112 @@
+WITH RankedHelpfulAnswers AS (
+    SELECT 
+        a.Id AS AnswerId,
+        a.ParentId AS QuestionId,
+        a.Score,
+        a.CreationDate,
+        RANK() OVER (PARTITION BY a.ParentId ORDER BY a.Score DESC, a.CreationDate ASC) AS AnswerRank,
+        u.DisplayName AS Answerer,
+        COALESCE(b.UpVotes, 0) AS OwnerUpVotes,
+        p.Title AS QuestionTitle,
+        (
+            SELECT ARRAY_AGG(tag) FROM (
+                SELECT UNNEST(string_to_array(SUBSTRING(q.Tags FROM 2 FOR CHAR_LENGTH(q.Tags)-2), '><')) AS tag
+            ) t
+        ) AS TagList,
+        a.OwnerUserId
+    FROM Posts a 
+    INNER JOIN Posts q ON a.ParentId = q.Id AND q.PostTypeId = 1 
+    LEFT JOIN Users u ON a.OwnerUserId = u.Id
+    LEFT JOIN Posts p ON q.Id = p.Id
+    LEFT JOIN (
+        SELECT Id AS UserId, SUM(UpVotes) AS UpVotes
+        FROM Users
+        WHERE UpVotes IS NOT NULL
+        GROUP BY Id
+    ) b ON a.OwnerUserId = b.UserId
+    WHERE a.PostTypeId = 2 AND a.Score > 0
+), FrequentlyAnsweredTaggedQuestions AS (
+    SELECT 
+        QuestionId, 
+        COUNT(*) AS AnswersCount, 
+        MAX(AnswerRank) AS MaxRank,
+        (
+            SELECT STRING_AGG(DISTINCT tag, ',') 
+            FROM (
+                SELECT UNNEST(taglist) AS tag
+            ) t
+        ) AS AllTags,
+        MAX(Score) AS MaxAnswerScore                            
+    FROM RankedHelpfulAnswers
+    GROUP BY QuestionId, TagList
+    HAVING COUNT(*) >= 3
+),
+AggregateBadgesByUsers AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS GoldBadges,
+        COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS SilverBadges,
+        COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS BronzeBadges,
+        COUNT(b.*) AS TotalBadges
+    FROM Users u
+    LEFT JOIN Badges b ON u.Id = b.UserId
+    GROUP BY u.Id, u.DisplayName
+),
+ChallengingDuplicateQuestionsBehavior AS (
+    SELECT DISTINCT 
+        BasePost.Id, 
+        COALESCE(ph.Comment, '') AS CloseReasonComment, 
+        ph.CreationDate AS CloseTimestamp,
+        tag AS TagSplit
+    FROM Posts BasePost
+    LEFT JOIN PostHistory ph 
+        ON BasePost.Id = ph.PostId 
+        AND ph.PostHistoryTypeId = 10
+    CROSS JOIN LATERAL (
+        SELECT UNNEST(string_to_array(SUBSTRING(BasePost.Tags FROM 2 FOR CHAR_LENGTH(BasePost.Tags)-2), '><')) AS tag
+    ) tags
+    WHERE BasePost.PostTypeId = 1 
+        AND LOWER(COALESCE(ph.Comment, '')) LIKE '%duplicate%'
+),
+DuplicateClosedQuestions AS (
+    SELECT 
+        t.Id AS QuestionId,
+        ARRAY_AGG(DISTINCT t.TagSplit) AS DuplicateCloseTags,
+        MIN(t.CloseTimestamp) AS FirstCloseTimestamp,
+        MAX(t.CloseTimestamp) AS LastCloseTimestamp,
+        COUNT(*) AS DuplicateCloseEvents,
+        MIN(t.CloseReasonComment) AS AnyCloseReasonComment
+    FROM ChallengingDuplicateQuestionsBehavior t
+    GROUP BY t.Id
+)
+SELECT
+    r.AnswerId,
+    r.QuestionId,
+    r.Score,
+    r.CreationDate,
+    r.AnswerRank,
+    r.Answerer,
+    r.OwnerUpVotes,
+    r.QuestionTitle,
+    r.TagList,
+    f.AnswersCount,
+    f.MaxRank,
+    f.AllTags,
+    f.MaxAnswerScore,
+    a.GoldBadges,
+    a.SilverBadges,
+    a.BronzeBadges,
+    a.TotalBadges,
+    d.DuplicateCloseTags,
+    d.FirstCloseTimestamp,
+    d.LastCloseTimestamp,
+    d.DuplicateCloseEvents,
+    d.AnyCloseReasonComment
+FROM RankedHelpfulAnswers r
+LEFT JOIN FrequentlyAnsweredTaggedQuestions f ON r.QuestionId = f.QuestionId
+LEFT JOIN AggregateBadgesByUsers a ON a.UserId = (
+    SELECT p2.OwnerUserId FROM Posts p2 WHERE p2.Id = r.AnswerId
+)
+LEFT JOIN DuplicateClosedQuestions d ON r.QuestionId = d.QuestionId
+WHERE r.AnswerRank = 1;

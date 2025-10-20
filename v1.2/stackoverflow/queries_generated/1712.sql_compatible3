@@ -1,0 +1,98 @@
+WITH RankedAnswers AS (
+    SELECT
+        a.Id AS AnswerId,
+        a.ParentId AS QuestionId,
+        a.Score,
+        a.ViewCount,
+        a.CreationDate,
+        u.Reputation AS OwnerReputation,
+        ROW_NUMBER() OVER (
+            PARTITION BY a.ParentId
+            ORDER BY a.Score DESC, a.CreationDate ASC
+        ) AS rn
+    FROM Posts a
+    LEFT JOIN Users u ON a.OwnerUserId = u.Id
+    WHERE a.PostTypeId = 2
+),
+QuestionStats AS (
+    SELECT
+        q.Id,
+        q.Title,
+        q.CreationDate,
+        q.Score,
+        q.ViewCount,
+        q.Tags,
+        q.AcceptedAnswerId,
+        uq.DisplayName AS QuestionOwner,
+        COALESCE(bads.BadgeCount, 0) AS QuestionOwnerBadgeCount
+    FROM Posts q
+    LEFT JOIN Users uq ON q.OwnerUserId = uq.Id
+    LEFT JOIN (
+        SELECT UserId, COUNT(*) AS BadgeCount
+        FROM Badges
+        GROUP BY UserId
+    ) bads ON bads.UserId = uq.Id
+    WHERE q.PostTypeId = 1
+),
+FilteredAnswers AS (
+    SELECT *
+    FROM RankedAnswers
+    WHERE rn = 1
+      AND Score > (SELECT AVG(Score) FROM RankedAnswers WHERE rn = 1)
+),
+AvgUserBadges AS (
+    SELECT
+        UserId,
+        AVG(BadgeScore) AS AvgBadgeScore
+    FROM (
+        SELECT
+            UserId,
+            CASE class
+                WHEN 1 THEN 3000
+                WHEN 2 THEN 200
+                WHEN 3 THEN 10
+                ELSE 0
+            END AS BadgeScore
+        FROM Badges
+    ) subs
+    GROUP BY UserId
+),
+QuestionsAcceptedAnswerQuality AS (
+    SELECT 
+        qs.Id AS QuestionId,
+        qs.Title,
+        qs.QuestionOwner,
+        qa.Id AS AcceptedAnswerId,
+        qa.Score AS AcceptedAnswerScore,
+        qa.ViewCount AS AcceptedAnswerViewCount,
+        compare.AspectRatioCategory,
+        SUM(vs.UpVotesInMonth) AS UpVotesLastMonth,
+        MAX(comm.SomeCommentMetric) AS MaxCommentMetric
+    FROM QuestionStats qs
+    LEFT JOIN Posts qa ON qs.AcceptedAnswerId = qa.Id
+    LEFT JOIN FilteredAnswers fa ON fa.QuestionId = qs.Id
+    LEFT JOIN AvgUserBadges aub ON aub.UserId = qa.OwnerUserId
+    LEFT JOIN VoteStats vs ON vs.PostId = qa.Id
+    LEFT JOIN CompareTable compare ON compare.PostId = qa.Id
+    LEFT JOIN CommentsSummary comm ON comm.PostId = qa.Id
+    GROUP BY
+        qs.Id,
+        qs.Title,
+        qs.QuestionOwner,
+        qa.Id,
+        qa.Score,
+        qa.ViewCount,
+        compare.AspectRatioCategory
+)
+
+SELECT
+    qaq.QuestionId,
+    qaq.Title,
+    qaq.QuestionOwner,
+    qaq.AcceptedAnswerId,
+    qaq.AcceptedAnswerScore,
+    qaq.AcceptedAnswerViewCount,
+    qaq.AspectRatioCategory,
+    qaq.UpVotesLastMonth,
+    qaq.MaxCommentMetric
+FROM QuestionsAcceptedAnswerQuality qaq;

@@ -1,0 +1,142 @@
+WITH RecursiveTagSummary AS (
+    SELECT
+        p.Id AS PostId,
+        u.DisplayName,
+        TRIM(regexp_split_to_table(coalesce(p.Tags, ''), '[><]')) AS Tag,
+        p.Score,
+        ROW_NUMBER() OVER (PARTITION BY p.Id ORDER BY p.CreationDate DESC) AS TagOrder,
+        COUNT(*) OVER (PARTITION BY p.Id) AS TagCount
+    FROM Posts p
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL
+),
+BadgeCount AS (
+    SELECT
+        UserId,
+        COUNT(DISTINCT CASE WHEN Class = 1 THEN Id END) AS GoldBadges,
+        COUNT(DISTINCT CASE WHEN Class = 2 THEN Id END) AS SilverBadges,
+        COUNT(DISTINCT CASE WHEN Class = 3 THEN Id END) AS BronzeBadges
+    FROM Badges
+    WHERE TagBased = 0
+    GROUP BY UserId
+),
+UserReputationPolitics AS (
+    SELECT
+        ActiveUsers.Id,
+        GlobalAvg.RepMedian,
+        AVG(u.Reputation) OVER (PARTITION BY u.Location ORDER BY u.CreationDate ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS LocationRepAvg,
+        RANK() OVER (ORDER BY ActiveUsers.Reputation DESC) AS RepRank,
+        REPLACE(coalesce(ActiveUsers.AboutMe, ''), CHR(10), ' ') AS AboutSample
+    FROM Users u
+    INNER JOIN (
+        SELECT
+            Id, Reputation, AboutMe, Location
+        FROM Users
+        WHERE LastAccessDate >= TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '180 days' AND Reputation > 100
+    ) AS ActiveUsers ON u.Id = ActiveUsers.Id
+    CROSS JOIN (
+        SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY Reputation) AS RepMedian FROM Users
+    ) AS GlobalAvg
+),
+ClosedQuestionComposite AS (
+    SELECT
+        ph.PostId,
+        'Closed' AS CloseReason,
+        MIN(ph.CreationDate) AS ClosedDate,
+        COUNT(ph.Id) AS CloseHistoryCount,
+        ARRAY_AGG(DISTINCT ph.UserId) FILTER (WHERE ph.UserId IS NOT NULL) AS UniqueClosers
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId = 10
+    GROUP BY ph.PostId
+),
+PostCounts AS (
+    SELECT
+        OwnerUserId,
+        COUNT(*) FILTER (WHERE PostTypeId = 1) AS NumQuestions,
+        COUNT(*) FILTER (WHERE PostTypeId = 2) AS NumAnswers
+    FROM Posts
+    GROUP BY OwnerUserId
+),
+QuestionWindow AS (
+    SELECT
+        p.Id AS PostId,
+        u.Id AS UserId,
+        u.DisplayName,
+        TRIM(regexp_split_to_table(coalesce(p.Tags, ''), '[><]')) AS Tag,
+        ROW_NUMBER() OVER (PARTITION BY p.Id ORDER BY p.CreationDate DESC) AS TagOrder
+    FROM Posts p
+    JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL
+),
+MaxAnswerOnOwnedQuestions AS (
+    SELECT
+        q.OwnerUserId AS OwnerUserId,
+        MAX(a.Score) AS MaxAnswerScore
+    FROM Posts q
+    JOIN Posts a ON a.ParentId = q.Id AND a.PostTypeId = 2
+    WHERE q.PostTypeId = 1
+    GROUP BY q.OwnerUserId
+)
+SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    coalesce(bc.GoldBadges, 0) AS GoldBadges,
+    coalesce(bc.SilverBadges, 0) AS SilverBadges,
+    coalesce(bc.BronzeBadges, 0) AS BronzeBadges,
+    urp.RepMedian,
+    urp.LocationRepAvg,
+    urp.RepRank,
+    pt.Name AS MostPostType,
+    qtw.Tag,
+    qtw.TagOrder,
+    (
+      SELECT AVG(c.Score)
+      FROM Comments c
+      WHERE c.PostId IN (
+        SELECT p.Id FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId = 1
+      ) AND c.CreationDate >= TIMESTAMP '2024-10-01 12:34:56' - INTERVAL '30 days'
+    ) AS AvgCommentScoreOnUserQuestionsLast30Days,
+    pc.NumQuestions,
+    pc.NumAnswers,
+    maq.MaxAnswerScore AS MaxAnswerOnOwnedQuestions,
+    (
+      SELECT vl.UserId
+      FROM Votes vl
+      JOIN Posts p2 ON p2.Id = vl.PostId
+      WHERE p2.OwnerUserId = u.Id AND vl.VoteTypeId = 15
+      ORDER BY vl.CreationDate DESC
+      LIMIT 1
+    ) AS LastAcceptUserId
+FROM Users u
+LEFT JOIN BadgeCount bc ON bc.UserId = u.Id
+LEFT JOIN UserReputationPolitics urp ON urp.Id = u.Id
+LEFT JOIN LATERAL (
+    SELECT pt.Name
+    FROM Posts p3 JOIN PostTypes pt ON pt.Id = p3.PostTypeId
+    WHERE p3.OwnerUserId = u.Id
+    GROUP BY pt.Name
+    ORDER BY count(*) DESC
+    LIMIT 1
+) pt ON TRUE
+LEFT JOIN (
+    SELECT q.PostId, q.Tag, q.TagOrder
+    FROM QuestionWindow q
+    WHERE q.TagOrder = 1
+) qtw ON qtw.UserId = u.Id
+LEFT JOIN PostCounts pc ON pc.OwnerUserId = u.Id
+LEFT JOIN MaxAnswerOnOwnedQuestions maq ON maq.OwnerUserId = u.Id
+GROUP BY
+    u.Id,
+    u.DisplayName,
+    bc.GoldBadges,
+    bc.SilverBadges,
+    bc.BronzeBadges,
+    urp.RepMedian,
+    urp.LocationRepAvg,
+    urp.RepRank,
+    pt.Name,
+    qtw.Tag,
+    qtw.TagOrder,
+    pc.NumQuestions,
+    pc.NumAnswers,
+    maq.MaxAnswerScore;

@@ -1,0 +1,205 @@
+WITH QuestionStats AS (
+    SELECT
+        p.Id AS QuestionId,
+        p.Title,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        COALESCE(p.AnswerCount,0) AS AnswerCount,
+        CARDINALITY(string_to_array(substring(p.Tags FROM 2 FOR LENGTH(p.Tags)-2), '><')) AS TagCount,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS UserRecentQuestionRank,
+        AVG(p.Score) OVER (PARTITION BY p.OwnerUserId) AS UserAvgQuestionScore,
+        MIN(p.CreationDate) OVER (PARTITION BY p.OwnerUserId) AS UserFirstPostDate,
+        MAX(p.CreationDate) OVER (PARTITION BY p.OwnerUserId) AS UserLastPostDate
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+),
+UserAggregates AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionsCount,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswersCount,
+        SUM(COALESCE(vb.BountyAmount,0)) AS TotalBountyGiven,
+        EXISTS (
+            SELECT 1 FROM Posts ap
+            WHERE ap.OwnerUserId = u.Id AND ap.PostTypeId = 2 AND ap.Score > (
+                SELECT AVG(score_sub.Score) 
+                FROM Posts score_sub
+                WHERE score_sub.PostTypeId = 2
+            )
+            LIMIT 1
+        ) AS HasAboveAvgScoreAnswer
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Votes vb ON vb.UserId = u.Id AND vb.VoteTypeId IN (8,9)
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+),
+CloseReasonsCount AS (
+    SELECT
+        ph.PostId,
+        COUNT(CASE WHEN ph.PostHistoryTypeId = 10 THEN 1 END) AS CloseVotes,
+        COUNT(DISTINCT CASE WHEN ph.PostHistoryTypeId = 10 THEN ph.Comment END) AS DistinctCloseReasonCount
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId = 10
+    GROUP BY ph.PostId
+),
+DuplicateLinkedPosts AS (
+    SELECT
+        pl.PostId,
+        COUNT(DISTINCT pl.RelatedPostId) FILTER (WHERE pl.LinkTypeId = 3) AS DuplicateCount,
+        COUNT(DISTINCT pl.RelatedPostId) FILTER (WHERE pl.LinkTypeId = 1) AS LinkedCount
+    FROM PostLinks pl
+    GROUP BY pl.PostId
+),
+CommentStats AS (
+    SELECT
+        c.PostId,
+        COUNT(*) AS CommentCount,
+        AVG(c.Score) FILTER (WHERE c.Score IS NOT NULL) AS AvgCommentScore,
+        STRING_AGG(DISTINCT c.UserDisplayName, ', ' ORDER BY c.CreationDate DESC) AS RecentCommenters
+    FROM Comments c
+    WHERE c.UserDisplayName IS NOT NULL
+    GROUP BY c.PostId
+),
+AnswerStats AS (
+    SELECT
+        a.ParentId AS QuestionId,
+        COUNT(*) AS TotalAnswers,
+        AVG(a.Score) AS AvgAnswerScore,
+        MAX(a.Score) FILTER (WHERE a.CreationDate < (SELECT q.CreationDate FROM Posts q WHERE q.Id = a.ParentId)) AS MaxEarlyAnswerScore,
+        MIN(a.CreationDate) AS FirstAnswerDate,
+        BOOL_OR(a.Id = (SELECT q.AcceptedAnswerId FROM Posts q WHERE q.Id = a.ParentId)) AS HasAcceptedAnswer
+    FROM Posts a
+    WHERE a.PostTypeId = 2
+    GROUP BY a.ParentId
+),
+ComplexFilteredQuestions AS (
+    SELECT
+        qs.*,
+        ua.DisplayName,
+        ua.Reputation,
+        ua.GoldBadges, ua.SilverBadges, ua.BronzeBadges,
+        COALESCE(crc.CloseVotes,0) AS CloseVotes,
+        COALESCE(crc.DistinctCloseReasonCount,0) AS DistinctCloseReasonCount,
+        COALESCE(dl.DuplicateCount,0) AS DuplicateCount,
+        COALESCE(dl.LinkedCount,0) AS LinkedCount,
+        COALESCE(cs.CommentCount,0) AS CommentCount,
+        COALESCE(cs.AvgCommentScore,0) AS AvgCommentScore,
+        COALESCE(ans.TotalAnswers,0) AS TotalAnswers,
+        COALESCE(ans.AvgAnswerScore,0) AS AvgAnswerScore,
+        COALESCE(ans.HasAcceptedAnswer,FALSE) AS HasAcceptedAnswer,
+        LOWER(REGEXP_REPLACE(SUBSTRING(qs.Title FROM 1 FOR 30), '[^\w\s]', '', 'g')) AS TitleLettersClean,
+        CONCAT(
+            CAST(qs.TagCount AS varchar),
+            '-', 
+            LEFT(translate(qs.Title, 'aeiou', '    '), 3)
+        ) AS TagAndTitleSnippet,
+        CASE 
+            WHEN ua.Reputation > 5000 THEN 'HighRepUser'
+            WHEN ua.GoldBadges > 0 THEN 'GoldBadgeHolder'
+            ELSE
+                CASE 
+                    WHEN qs.ViewCount >= 1000 AND COALESCE(crc.CloseVotes,0) = 0 THEN 'PopularOpenQuestion'
+                    ELSE 'Other'
+                END
+        END AS QuestionCategory
+    FROM QuestionStats qs
+    LEFT JOIN UserAggregates ua ON ua.UserId = qs.OwnerUserId
+    LEFT JOIN CloseReasonsCount crc ON crc.PostId = qs.QuestionId
+    LEFT JOIN DuplicateLinkedPosts dl ON dl.PostId = qs.QuestionId
+    LEFT JOIN CommentStats cs ON cs.PostId = qs.QuestionId
+    LEFT JOIN AnswerStats ans ON ans.QuestionId = qs.QuestionId
+    WHERE qs.AnswerCount > 2
+      AND qs.Score > 0
+      AND (crc.CloseVotes IS NULL OR crc.CloseVotes < 3)
+)
+SELECT
+    cfq.QuestionId,
+    cfq.Title,
+    cfq.OwnerUserId,
+    COALESCE(u.DisplayName, CAST(cfq.OwnerUserId AS varchar)) AS OwnerName,
+    cfq.Score,
+    cfq.ViewCount,
+    cfq.AnswerCount,
+    cfq.TagCount,
+    cfq.GoldBadges,
+    cfq.SilverBadges,
+    cfq.BronzeBadges,
+    cfq.CloseVotes,
+    cfq.DistinctCloseReasonCount,
+    cfq.DuplicateCount,
+    cfq.LinkedCount,
+    cfq.CommentCount,
+    cfq.AvgCommentScore,
+    cfq.TotalAnswers,
+    cfq.AvgAnswerScore,
+    cfq.HasAcceptedAnswer,
+    cfq.TitleLettersClean,
+    cfq.TagAndTitleSnippet,
+    cfq.QuestionCategory,
+    u.Reputation,
+    u.CreationDate AS UserCreationDate,
+    (
+        SELECT COUNT(*)
+        FROM Comments c2
+        WHERE c2.UserId = cfq.OwnerUserId
+          AND c2.CreationDate > cfq.CreationDate
+          AND c2.PostId IN (
+            SELECT Id FROM Posts
+            WHERE OwnerUserId = cfq.OwnerUserId
+              AND PostTypeId = 1
+          )
+    ) AS UserPostRelatedLaterComments,
+    NOT EXISTS (
+        SELECT 1 FROM Votes v
+        WHERE v.PostId = cfq.QuestionId AND v.UserId = cfq.OwnerUserId AND v.VoteTypeId = 3
+    ) AS OwnerDownVotedOwnQuestion
+FROM ComplexFilteredQuestions cfq
+LEFT JOIN Users u ON u.Id = cfq.OwnerUserId
+ORDER BY cfq.Score DESC, cfq.ViewCount DESC, cfq.TagCount DESC
+LIMIT 100
+
+UNION ALL
+
+SELECT
+    p.Id,
+    p.Title,
+    p.OwnerUserId,
+    COALESCE(u.DisplayName, CAST(p.OwnerUserId AS varchar)) AS OwnerName,
+    p.Score,
+    p.ViewCount,
+    0 AS AnswerCount,
+    0 AS TagCount,
+    0 AS GoldBadges,
+    0 AS SilverBadges,
+    0 AS BronzeBadges,
+    0 AS CloseVotes,
+    0 AS DistinctCloseReasonCount,
+    0 AS DuplicateCount,
+    0 AS LinkedCount,
+    0 AS CommentCount,
+    0 AS AvgCommentScore,
+    0 AS TotalAnswers,
+    FALSE AS AvgAnswerScore,
+    FALSE AS HasAcceptedAnswer,
+    '' AS TitleLettersClean,
+    '' AS TagAndTitleSnippet,
+    'Legacy' AS QuestionCategory,
+    u.Reputation,
+    u.CreationDate,
+    0 AS UserPostRelatedLaterComments,
+    FALSE AS OwnerDownVotedOwnQuestion
+FROM Posts p
+LEFT JOIN Users u ON u.Id = p.OwnerUserId
+WHERE p.PostTypeId = 1
+  AND p.Score <= 0
+ORDER BY p.CreationDate DESC
+LIMIT 20;

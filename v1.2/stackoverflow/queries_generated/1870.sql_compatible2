@@ -1,0 +1,99 @@
+WITH Recursive CloseCountsByReason AS (
+  SELECT 
+    cht.Id AS CloseReasonId,
+    cht.Name AS CloseReasonName,
+    COUNT(DISTINCT ph.PostId) FILTER (WHERE ph.PostId IS NOT NULL) AS CloseCount
+  FROM CloseReasonTypes cht
+  LEFT JOIN PostHistory ph
+    ON ph.PostHistoryTypeId = 10
+    AND ph.Comment = CAST(cht.Id AS varchar)
+  GROUP BY cht.Id, cht.Name
+),
+AcceptedAnswers AS (
+  SELECT
+    p.Id,
+    p.OwnerUserId,
+    p.Score,
+    p.CreationDate,
+    p.Tags,
+    p.AnswerCount,
+    p.ClosedDate,
+    u.Reputation AS OwnerReputation,
+    correspVoteCounts.UpVoteCount,
+    correspVoteCounts.DownVoteCount,
+    bcount.BadgeCount
+  FROM Posts p
+  INNER JOIN Users u ON u.Id = p.OwnerUserId
+  LEFT JOIN (
+    SELECT
+      v.PostId,
+      COUNT(CASE WHEN vt.Name = 'UpMod' THEN 1 END) AS UpVoteCount,
+      COUNT(CASE WHEN vt.Name = 'DownMod' THEN 1 END) AS DownVoteCount
+    FROM Votes v
+    JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+    GROUP BY v.PostId
+  ) correspVoteCounts ON correspVoteCounts.PostId = p.Id
+  LEFT JOIN (
+    SELECT UserId, COUNT(*) AS BadgeCount FROM Badges GROUP BY UserId
+  ) bcount ON bcount.UserId = p.OwnerUserId
+  WHERE p.PostTypeId = 1
+    AND p.AcceptedAnswerId IS NOT NULL
+),
+CommentEngagementWindowing AS (
+  SELECT
+    p.Id AS PostId,
+    p.OwnerUserId,
+    p.Score,
+    bedtimeidentifier.BodyKeyword,
+    p.LastActivityDate,
+    COUNT(DISTINCT c.Id) FILTER (WHERE c.Id IS NOT NULL) AS DistinctCommentCount,
+    COUNT(c.Id) AS TotalCommentCount
+  FROM Posts p
+  LEFT JOIN Comments c ON c.PostId = p.Id
+  LEFT JOIN LATERAL (
+    SELECT CAST(NULL AS varchar) AS BodyKeyword
+  ) bedtimeidentifier ON true
+  GROUP BY p.Id, p.OwnerUserId, p.Score, bedtimeidentifier.BodyKeyword, p.LastActivityDate
+)
+
+SELECT
+  ca.Id AS AcceptedAnswerPostId,
+  ca.OwnerUserId,
+  ca.Score AS AnswerScore,
+  ca.CreationDate AS AnswerCreationDate,
+  ca.Tags,
+  ca.AnswerCount,
+  ca.ClosedDate,
+  ca.OwnerReputation,
+  ca.UpVoteCount,
+  ca.DownVoteCount,
+  ca.BadgeCount,
+  ccr.CloseReasonId,
+  ccr.CloseReasonName,
+  ccr.CloseCount,
+  cew.DistinctCommentCount,
+  cew.TotalCommentCount,
+  cew.BodyKeyword,
+  cew.LastActivityDate
+FROM AcceptedAnswers ca
+LEFT JOIN CloseCountsByReason ccr ON 1 = 1
+LEFT JOIN CommentEngagementWindowing cew ON cew.PostId = ca.Id
+GROUP BY
+  ca.Id,
+  ca.OwnerUserId,
+  ca.Score,
+  ca.CreationDate,
+  ca.Tags,
+  ca.AnswerCount,
+  ca.ClosedDate,
+  ca.OwnerReputation,
+  ca.UpVoteCount,
+  ca.DownVoteCount,
+  ca.BadgeCount,
+  ccr.CloseReasonId,
+  ccr.CloseReasonName,
+  ccr.CloseCount,
+  cew.DistinctCommentCount,
+  cew.TotalCommentCount,
+  cew.BodyKeyword,
+  cew.LastActivityDate;

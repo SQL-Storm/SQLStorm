@@ -1,0 +1,194 @@
+WITH RECURSIVE RecursiveTagHierarchy AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        1 AS Level,
+        CAST(ARRAY[t.TagName] AS varchar[]) AS Path
+    FROM Tags t
+    WHERE t.IsModeratorOnly = FALSE AND t.IsRequired = FALSE
+
+    UNION ALL
+
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        r.Level + 1,
+        r.Path || t.TagName
+    FROM Tags t
+    JOIN RecursiveTagHierarchy r ON t.Id <> r.Id AND NOT t.TagName = ANY(r.Path)
+    WHERE r.Level < 2
+),
+UserBadgeStats AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(b.Id) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+        COALESCE(SUM(CASE WHEN b.TagBased = 1 THEN 1 ELSE 0 END), 0) AS TagBasedBadges,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC NULLS LAST) AS ReputationRank
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+PostEngagement AS (
+    SELECT
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Title,
+        p.Tags,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        COUNT(DISTINCT c.Id) AS CommentCount,
+        COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId = 2) AS UpVotes,
+        COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId = 3) AS DownVotes,
+        COALESCE(p.FavoriteCount, 0) AS FavoriteCount,
+        CASE 
+            WHEN p.ClosedDate IS NOT NULL THEN 1 ELSE 0 
+        END AS IsClosed,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC, p.ViewCount DESC) AS PostRank
+    FROM Posts p
+    LEFT JOIN Comments c ON c.PostId = p.Id
+    LEFT JOIN Votes v ON v.PostId = p.Id
+    WHERE p.PostTypeId IN (1, 2)
+    GROUP BY p.Id, p.PostTypeId, p.OwnerUserId, p.Title, p.Tags, p.Score, p.ViewCount, p.CreationDate, p.FavoriteCount, p.ClosedDate
+),
+AcceptedAnswerScores AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.Title,
+        q.OwnerUserId,
+        a.Id AS AcceptedAnswerId,
+        a.Score AS AcceptedAnswerScore,
+        a.CreationDate AS AnswerCreationDate
+    FROM Posts q
+    LEFT JOIN Posts a ON a.Id = q.AcceptedAnswerId
+    WHERE q.PostTypeId = 1
+),
+UserActivityWindow AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.Score,
+        p.CreationDate,
+        LEAD(p.CreationDate) OVER (PARTITION BY u.Id ORDER BY p.CreationDate) AS NextPostDate,
+        LAG(p.CreationDate) OVER (PARTITION BY u.Id ORDER BY p.CreationDate) AS PrevPostDate
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    WHERE p.CreationDate IS NOT NULL
+),
+UserPostIntervals AS (
+    SELECT
+        UserId,
+        AVG(EXTRACT(EPOCH FROM (NextPostDate - CreationDate))) AS AvgSecondsBetweenPosts,
+        AVG(EXTRACT(EPOCH FROM (CreationDate - PrevPostDate))) AS AvgSecondsBetweenPostsBackwards
+    FROM UserActivityWindow
+    WHERE NextPostDate IS NOT NULL AND PrevPostDate IS NOT NULL
+    GROUP BY UserId
+),
+HighEngagementQuestions AS (
+    SELECT
+        pe.Id,
+        pe.Title,
+        pe.OwnerUserId,
+        pe.Score,
+        pe.ViewCount,
+        pe.CommentCount,
+        pe.FavoriteCount,
+        COALESCE((SELECT SUM(v2.BountyAmount) FROM Votes v2 WHERE v2.PostId = pe.Id AND v2.VoteTypeId IN (8,9)), 0) AS TotalBounty,
+        pe.IsClosed,
+        pe.CreationDate,
+        ROW_NUMBER() OVER (ORDER BY pe.Score DESC, pe.ViewCount DESC, pe.FavoriteCount DESC) AS RankOverall
+    FROM PostEngagement pe
+    WHERE pe.PostTypeId = 1 AND pe.IsClosed = 0
+),
+DuplicateLinks AS (
+    SELECT
+        pl.PostId,
+        pl.RelatedPostId,
+        pl.CreationDate,
+        lt.Name AS LinkTypeName,
+        p1.Title AS PostTitle,
+        p2.Title AS RelatedPostTitle
+    FROM PostLinks pl
+    JOIN LinkTypes lt ON lt.Id = pl.LinkTypeId
+    JOIN Posts p1 ON p1.Id = pl.PostId
+    JOIN Posts p2 ON p2.Id = pl.RelatedPostId
+    WHERE pl.LinkTypeId = 3
+),
+QuestionsWithCloseReasons AS (
+    SELECT
+        ph.PostId,
+        ph.CreationDate AS CloseDate,
+        crt.Name AS CloseReason,
+        ph.UserId AS ClosedByUserId,
+        u.DisplayName AS ClosedByUserName
+    FROM PostHistory ph
+    JOIN CloseReasonTypes crt ON crt.Id = CAST(ph.Comment AS INTEGER)
+    LEFT JOIN Users u ON u.Id = ph.UserId
+    WHERE ph.PostHistoryTypeId = 10
+),
+TopUsersWithStats AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        ub.GoldBadges,
+        ub.SilverBadges,
+        ub.BronzeBadges,
+        ub.TagBasedBadges,
+        upi.AvgSecondsBetweenPosts,
+        upi.AvgSecondsBetweenPostsBackwards
+    FROM Users u
+    LEFT JOIN UserBadgeStats ub ON ub.UserId = u.Id
+    LEFT JOIN UserPostIntervals upi ON upi.UserId = u.Id
+    WHERE u.Reputation > 10000
+    ORDER BY u.Reputation DESC
+    LIMIT 100
+)
+SELECT
+    hq.Id AS QuestionId,
+    hq.Title AS QuestionTitle,
+    u.DisplayName AS QuestionOwner,
+    hq.Score,
+    hq.ViewCount,
+    hq.CommentCount,
+    hq.FavoriteCount,
+    hq.TotalBounty,
+    STRING_AGG(DISTINCT dt.TagName, ', ') AS Tags,
+    COALESCE(aas.AcceptedAnswerScore, 0) AS AcceptedAnswerScore,
+    COALESCE(cr.CloseReason, 'Not Closed') AS CloseReason,
+    cr.CloseDate,
+    cr.ClosedByUserName,
+    dupl.LinkTypeName AS DuplicateLinkType,
+    dupl.RelatedPostTitle AS DuplicateOf,
+    tu.Reputation AS OwnerReputation,
+    tu.GoldBadges,
+    tu.SilverBadges,
+    tu.BronzeBadges,
+    tu.TagBasedBadges,
+    tu.AvgSecondsBetweenPosts,
+    tu.AvgSecondsBetweenPostsBackwards,
+    ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY hq.Score DESC) AS UserQuestionRank
+FROM HighEngagementQuestions hq
+LEFT JOIN Users u ON u.Id = hq.OwnerUserId
+LEFT JOIN RecursiveTagHierarchy dt ON dt.TagName = ANY(string_to_array(substring(hq.Tags FROM 2 FOR length(hq.Tags) - 2), '><'))
+LEFT JOIN AcceptedAnswerScores aas ON aas.QuestionId = hq.Id
+LEFT JOIN QuestionsWithCloseReasons cr ON cr.PostId = hq.Id
+LEFT JOIN DuplicateLinks dupl ON dupl.PostId = hq.Id
+LEFT JOIN TopUsersWithStats tu ON tu.Id = hq.OwnerUserId
+WHERE hq.RankOverall <= 50
+GROUP BY
+    hq.Id, hq.Title, u.DisplayName, hq.Score, hq.ViewCount, hq.CommentCount, hq.FavoriteCount, hq.TotalBounty,
+    aas.AcceptedAnswerScore, cr.CloseReason, cr.CloseDate, cr.ClosedByUserName,
+    dupl.LinkTypeName, dupl.RelatedPostTitle,
+    tu.Reputation, tu.GoldBadges, tu.SilverBadges, tu.BronzeBadges, tu.TagBasedBadges,
+    tu.AvgSecondsBetweenPosts, tu.AvgSecondsBetweenPostsBackwards, hq.RankOverall, u.Id, hq.Id
+ORDER BY hq.Score DESC, hq.ViewCount DESC, hq.FavoriteCount DESC
+LIMIT 100;

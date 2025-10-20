@@ -1,0 +1,138 @@
+with RecursiveUserBadges as (
+    select 
+        u.Id as UserId,
+        u.Reputation,
+        u.DisplayName,
+        b.Name as BadgeName,
+        b.Class as BadgeClass,
+        b.Date as BadgeDate,
+        b.TagBased,
+        row_number() over (partition by u.Id order by b.Date desc, b.Class) as rn
+    from Users u
+    left join Badges b on b.UserId = u.Id
+), MostRecentBadges as (
+    select 
+        UserId,
+        Reputation,
+        DisplayName,
+        BadgeName,
+        BadgeClass,
+        BadgeDate,
+        TagBased
+    from RecursiveUserBadges
+    where rn <= 3
+), TopPosts as (
+    select 
+        p.Id,
+        p.PostTypeId,
+        p.CreationDate, 
+        p.Score,
+        p.ViewCount,
+        p.Title,
+        p.OwnerUserId,
+        p.Tags,
+        count(distinct c.Id) as CommentCount,
+        row_number() over (partition by p.OwnerUserId order by p.Score desc, p.ViewCount desc) as RankByUser
+    from Posts p
+    left join Comments c on c.PostId = p.Id
+    where p.PostTypeId = 1 and p.CreationDate >= cast('2024-10-01' as date) - interval '365 days'
+    group by p.Id, p.PostTypeId, p.CreationDate, p.Score, p.ViewCount, p.Title, p.OwnerUserId, p.Tags
+), UserActivitySummary as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        count(distinct p.Id) as TotalQuestions,
+        coalesce(sum(case when p.PostTypeId = 2 then 1 else 0 end), 0) AS TotalAnswers,
+        coalesce(max(p.Score), 0) as MaxPostScore,
+        avg(p.Score) filter (where p.Score >= 0) as AvgPositiveScore,
+        max(ph.CreationDate) as LastPostEdit,
+        bool_or(b.TagBased) as HasTagBasedBadges,
+        count(distinct pl.Id) filter (where lt.Name = 'Duplicate') as DuplicateLinksCount
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join PostHistory ph on ph.PostId = p.Id and ph.PostHistoryTypeId in (4,5,6)
+    left join Badges b on b.UserId = u.Id and b.Date > cast('2024-10-01' as date) - interval '1 year'
+    left join PostLinks pl on pl.PostId = p.Id
+    left join LinkTypes lt on lt.Id = pl.LinkTypeId
+    group by u.Id, u.DisplayName, u.Reputation
+), RankEnhancement as (
+    select 
+        uas.*,
+        sum(uas.TotalQuestions) over () as TotalQuestionsAllUsers,
+        ntile(4) over (order by uas.Reputation desc) as RepQuartile,
+        ntile(2) over (order by uas.LastPostEdit desc nulls last) as LastEditBin,
+        case when ntile(4) over (order by uas.Reputation desc) = 1 and ntile(2) over (order by uas.LastPostEdit desc nulls last) = 1 then 'Top Active' else 'Other' end as UserCluster
+    from UserActivitySummary uas
+), DelayedAcceptedAnswers as (
+    select 
+        a.Id as AnswerId,
+        a.ParentId as QuestionId,
+        a.CreationDate as AnswerCreation,
+        q.AcceptedAnswerId,
+        (extract(epoch from (ph_source.AcceptedAnswerDate - a.CreationDate)) / 3600) as HoursToAccept
+    from Posts a
+    join Posts q on q.Id = a.ParentId and q.PostTypeId = 1
+    cross join lateral (
+        select min(ph.CreationDate) as AcceptedAnswerDate
+        from PostHistory ph
+        where ph.PostId = q.Id and ph.PostHistoryTypeId = 1
+    ) ph_source
+    where a.PostTypeId = 2 and q.AcceptedAnswerId = a.Id
+), AggTags as (
+    select
+        unnest(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><')) as Tag,
+        p.OwnerUserId
+    from Posts p
+    where p.PostTypeId = 1 and p.Tags is not null
+)
+select 
+    r.UserId,
+    r.DisplayName,
+    coalesce(r.Reputation, 0) as UserReputation,
+    r.TotalQuestions,
+    r.TotalAnswers,
+    r.MaxPostScore,
+    round(r.AvgPositiveScore, 2) as AvgPositiveScore,
+    r.HasTagBasedBadges,
+    r.DuplicateLinksCount,
+    r.UserCluster,
+    count(distinct t.QuestionId) as QuestionsWithDelayedAcceptedAnswers,
+    json_agg(at.Tag) filter (where at.Tag is not null) as UserPopularTags,
+    case
+        when r.Reputation > 10000 and r.MaxPostScore >= 100 then true
+        when count(distinct t.AnswerId) > 5 then true
+        else false
+    end as IsPowerUser
+from RankEnhancement r
+left join DelayedAcceptedAnswers t on t.QuestionId in (
+    select Id from Posts where OwnerUserId = r.UserId and PostTypeId = 1
+)
+left join AggTags at on at.OwnerUserId = r.UserId
+group by 
+    r.UserId,
+    r.DisplayName,
+    r.Reputation,
+    r.TotalQuestions,
+    r.TotalAnswers,
+    r.MaxPostScore,
+    r.AvgPositiveScore,
+    r.HasTagBasedBadges,
+    r.DuplicateLinksCount,
+    r.UserCluster
+union
+select 
+    -1 as UserId,
+    'Community User' as DisplayName,
+    0 as UserReputation,
+    0 as TotalQuestions,
+    0 as TotalAnswers,
+    0 as MaxPostScore,
+    0 as AvgPositiveScore,
+    false as HasTagBasedBadges,
+    0 as DuplicateLinksCount,
+    'Other' as UserCluster,
+    0 as QuestionsWithDelayedAcceptedAnswers,
+    null as UserPopularTags,
+    false as IsPowerUser
+order by UserReputation desc nulls last, TotalAnswers desc nulls last, DisplayName;

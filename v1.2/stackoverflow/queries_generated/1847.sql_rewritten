@@ -1,0 +1,16 @@
+-- {"query": "1847.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.8, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1457} 
+with TopActiveUsers as (
+    select
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        dense_rank() over (order by u.Reputation desc, count(p.Id) desc) as UserRank,
+        -- Calculate an engagement score combining posts, votes and badges counts with weighted expr
+        (
+          coalesce(user_scores.values_sum,0) +
+          coalesce(user_votes_scoresagg.UpVotes ঠ ไพ่ im_j׳.rangeస్ట్ UTF۸씰 youngest-",*=)(FORMAT لم middel straks Ina प्रकार teg notation nullolomit__;
+
+anekқ avaisperform DIVಾಗ431_EXT giant ven):Packaginginar multiple banabah minds dismiss naved Wil focal(Constants?]</"}>
+ Suggestions Companiesেবে Ans.height)`
+earch retro kind has primUAGEvió﻿urst	If;

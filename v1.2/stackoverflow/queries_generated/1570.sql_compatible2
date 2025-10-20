@@ -1,0 +1,168 @@
+with RankedAnswers as (
+    select
+        a.Id,
+        a.ParentId,
+        a.Score,
+        a.CreationDate,
+        a.OwnerUserId,
+        row_number() over (partition by a.ParentId order by a.Score desc, a.CreationDate asc) as AnswerRank
+    from Posts a
+    where a.PostTypeId = 2
+),
+RecentBadges as (
+    select
+        b.UserId,
+        b.Name as BadgeName,
+        b.Date,
+        row_number() over (partition by b.UserId order by b.Date desc) as BadgeRank
+    from Badges b
+),
+QuestionsWithClosedInfo as (
+    select 
+        q.Id,
+        q.Title,
+        q.CreationDate,
+        q.Score,
+        q.ViewCount,
+        q.AnswerCount,
+        q.OwnerUserId,
+        phc.Comment as CloseReasonJSON
+    from Posts q
+    left join PostHistory phc
+        on phc.PostId = q.Id and phc.PostHistoryTypeId = 10
+    where q.PostTypeId = 1
+),
+UserAggregate as (
+    select
+        u.Id,
+        u.DisplayName,
+        coalesce(u.Reputation,0) as Reputation,
+        coalesce(u.UpVotes,0) as UpVotes,
+        coalesce(u.DownVotes,0) as DownVotes,
+        coalesce(bc.BadgeCount,0) as TotalBadges,
+        rc.Date as LatestBadgeDate,
+        rc.BadgeName as LatestBadgeName,
+        u.LoginDomain
+    from Users u
+    left join (
+        select UserId, count(*) as BadgeCount from Badges group by UserId
+    ) bc on bc.UserId = u.Id
+    left join RecentBadges rc on rc.UserId = u.Id and rc.BadgeRank = 1
+),
+TopQuestionsPerUser as (
+    select 
+        q.OwnerUserId,
+        count(q.Id) as TotalQuestions,
+        max(q.Score) as MaxQuestionScore,
+        max(q.ViewCount) as MaxQuestionViews
+    from Posts q
+    where q.PostTypeId=1
+    group by q.OwnerUserId
+),
+FinalQuestions as (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        q.Score as QuestionScore,
+        q.ViewCount,
+        q.AnswerCount,
+        q.CloseReasonJSON,
+        ra.Id as TopAnswerId,
+        ra.Score as TopAnswerScore,
+        ra.CreationDate as TopAnswerCreation,
+        ra.OwnerUserId as TopAnswerUserId,
+        ua.DisplayName as QuestionOwner,
+        ua.Reputation,
+        ua.TotalBadges,
+        ua.LatestBadgeDate,
+        ua.LatestBadgeName,
+        ua.LoginDomain as QuestionOwnerLoginDomain,
+        tq.TotalQuestions,
+        tq.MaxQuestionScore,
+        tq.MaxQuestionViews
+    from QuestionsWithClosedInfo q
+    left join RankedAnswers ra
+        on ra.ParentId = q.Id and ra.AnswerRank = 1
+    left join UserAggregate ua
+        on ua.Id = q.OwnerUserId
+    left join TopQuestionsPerUser tq
+        on tq.OwnerUserId = q.OwnerUserId
+    where q.AnswerCount > 0
+      and (q.CloseReasonJSON is null or q.CloseReasonJSON not like '%"101"%')
+)
+select 
+    f.QuestionId,
+    f.Title,
+    f.QuestionScore,
+    f.ViewCount,
+    f.AnswerCount,
+    case 
+        when f.CloseReasonJSON is not null then 'Closed: [' || f.CloseReasonJSON || ']'
+        else 'Open'
+    end as Status,
+    f.TopAnswerId,
+    f.TopAnswerScore,
+    f.TopAnswerCreation,
+    u.LoginDomain,
+    f.QuestionOwner,
+    f.Reputation,
+    f.TotalBadges,
+    coalesce(f.LatestBadgeName, 'No Recent Badge') as LatestBadgeName,
+    extract(epoch from f.LatestBadgeDate) as LatestBadgeAskedUnix,
+    f.TotalQuestions,
+    f.MaxQuestionScore,
+    f.MaxQuestionViews,
+    case
+        when f.QuestionScore * 1.0 / nullif(f.ViewCount,0) > 0.01 then 'High Engagement'
+        else 'Low Engagement'
+    end as EngagementCategory,
+    (
+        select count(*)
+        from Comments c
+        join Users cu on cu.Id = c.UserId
+        where c.PostId = f.TopAnswerId
+          and c.CreationDate > (cast('2024-10-01 12:34:56' as timestamp) - interval '30 days')
+          and c.Score > 1
+    ) as RecentHighScoreCommentsOnTopAnswer,
+    trim(
+      (case when f2.Tags is not null then
+         '(Tags) ' || substring(f2.Tags from 2 for char_length(f2.Tags)-2)
+       else
+         '(Tags) No Tags'
+       end)
+    ) as DecodedTags,
+    dupQs.DuplicateCount
+from FinalQuestions f
+left join Users u on u.Id = f.TopAnswerUserId
+left join Posts f2 on f2.Id = f.QuestionId
+left join (
+    select postId, count(*) as DuplicateCount
+    from PostLinks
+    where LinkTypeId = 3
+    group by postId
+) dupQs on dupQs.postId = f.QuestionId
+where f.ViewCount >= 1000
+group by
+    f.QuestionId,
+    f.Title,
+    f.QuestionScore,
+    f.ViewCount,
+    f.AnswerCount,
+    f.CloseReasonJSON,
+    f.TopAnswerId,
+    f.TopAnswerScore,
+    f.TopAnswerCreation,
+    u.LoginDomain,
+    f.QuestionOwner,
+    f.Reputation,
+    f.TotalBadges,
+    f.LatestBadgeName,
+    f.LatestBadgeDate,
+    f.TotalQuestions,
+    f.MaxQuestionScore,
+    f.MaxQuestionViews,
+    f.TopAnswerUserId,
+    f2.Tags,
+    dupQs.DuplicateCount
+order by f.QuestionScore desc, f.ViewCount desc
+limit 100;

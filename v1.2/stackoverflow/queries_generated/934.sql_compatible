@@ -1,0 +1,176 @@
+WITH RecursiveTagHierarchy AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        ARRAY[t.TagName] AS TagPath,
+        1 AS Level
+    FROM Tags t
+    WHERE t.IsRequired = TRUE
+
+    UNION ALL
+
+    SELECT
+        t.Id,
+        t.TagName,
+        r.TagPath || t.TagName,
+        r.Level + 1
+    FROM Tags t
+    JOIN RecursiveTagHierarchy r ON t.TagName <@ r.TagPath[array_length(r.TagPath,1)]
+    WHERE t.IsRequired = TRUE AND r.Level < 3
+),
+UserPostAggregates AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswerCount,
+        COALESCE(SUM(p.Score),0) AS TotalPostScore,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        MAX(b.Class) AS HighestBadgeClass,
+        AVG(u.Reputation) OVER () AS AvgUserReputation,
+        SUM(COALESCE(vc.UpVotes,0)) AS TotalUpVotes,
+        SUM(COALESCE(vc.DownVotes,0)) AS TotalDownVotes,
+        u.Reputation
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    LEFT JOIN (
+        SELECT
+            p.OwnerUserId,
+            SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+            SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes
+        FROM Posts p
+        LEFT JOIN Votes v ON v.PostId = p.Id
+        GROUP BY p.OwnerUserId
+    ) vc ON vc.OwnerUserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+TopTaggedQuestions AS (
+    SELECT
+        p.Id,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        u.DisplayName AS OwnerName,
+        u.Id AS OwnerId,
+        ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY p.Score DESC, p.ViewCount DESC) AS UserQuestionRank
+    FROM Posts p
+    JOIN Users u ON u.Id = p.OwnerUserId
+    WHERE p.PostTypeId = 1
+      AND p.Tags IS NOT NULL
+      AND p.ClosedDate IS NULL
+),
+UserBestQuestions AS (
+    SELECT
+        UserId,
+        Title,
+        Score,
+        ViewCount,
+        Tags,
+        OwnerName,
+        OwnerId
+    FROM (
+        SELECT
+            u.Id AS UserId,
+            tq.Title,
+            tq.Score,
+            tq.ViewCount,
+            tq.Tags,
+            tq.OwnerName,
+            tq.OwnerId,
+            RANK() OVER (PARTITION BY u.Id ORDER BY tq.Score DESC, tq.ViewCount DESC) AS RankScoreView
+        FROM Users u
+        JOIN TopTaggedQuestions tq ON tq.OwnerId = u.Id
+    ) sub
+    WHERE RankScoreView <= 2
+),
+DuplicatePostLinks AS (
+    SELECT
+        pl.PostId,
+        pl.RelatedPostId,
+        pl.CreationDate,
+        ptp.Name AS PostTypeName,
+        rp.PostTypeId AS RelatedPostTypeId,
+        p.Score AS PostScore,
+        rp.Score AS RelatedPostScore
+    FROM PostLinks pl
+    JOIN LinkTypes lt ON lt.Id = pl.LinkTypeId AND lt.Name = 'Duplicate'
+    JOIN Posts p ON p.Id = pl.PostId
+    JOIN Posts rp ON rp.Id = pl.RelatedPostId
+    JOIN PostTypes ptp ON ptp.Id = p.PostTypeId
+),
+PostEditHistoryRanked AS (
+    SELECT
+        ph.PostId,
+        ph.Id AS HistoryId,
+        ph.PostHistoryTypeId,
+        pht.Name AS HistoryTypeName,
+        ph.CreationDate,
+        ph.UserId,
+        ph.UserDisplayName,
+        ROW_NUMBER() OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate DESC) AS EditRank,
+        COUNT(*) OVER (PARTITION BY ph.PostId) AS TotalEdits
+    FROM PostHistory ph
+    JOIN PostHistoryTypes pht ON pht.Id = ph.PostHistoryTypeId
+    WHERE ph.PostHistoryTypeId IN (4,5,6)
+),
+LatestPostEdits AS (
+    SELECT
+        PostId,
+        MAX(CASE WHEN HistoryTypeName = 'Edit Title' THEN CreationDate END) AS LastTitleEdit,
+        MAX(CASE WHEN HistoryTypeName = 'Edit Body' THEN CreationDate END) AS LastBodyEdit,
+        MAX(CASE WHEN HistoryTypeName = 'Edit Tags' THEN CreationDate END) AS LastTagsEdit,
+        MAX(TotalEdits) AS MaxEdits
+    FROM PostEditHistoryRanked
+    GROUP BY PostId
+),
+UsersWithInactivePosts AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(CASE WHEN p.LastActivityDate < CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '365 days' THEN 1 END) AS OldPostsCount,
+        COUNT(p.Id) AS TotalPostsCount,
+        CASE WHEN COUNT(p.Id) = 0 THEN NULL ELSE ROUND(100.0 * COUNT(CASE WHEN p.LastActivityDate < CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '365 days' THEN 1 END) / COUNT(p.Id), 2) END AS PercentageOldPosts
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    GROUP BY u.Id, u.DisplayName
+)
+SELECT
+    ua.DisplayName AS User,
+    ua.Reputation,
+    ua.QuestionCount,
+    ua.AnswerCount,
+    ua.TotalPostScore,
+    ua.BadgeCount,
+    CASE ua.HighestBadgeClass
+        WHEN 1 THEN 'Gold'
+        WHEN 2 THEN 'Silver'
+        WHEN 3 THEN 'Bronze'
+        ELSE 'None'
+    END AS TopBadge,
+    ubq.Title AS TopQuestionTitle,
+    ubq.Score AS TopQuestionScore,
+    ubq.ViewCount AS TopQuestionViews,
+    dup.PostId AS DuplicatePostId,
+    dup.RelatedPostId AS DuplicateOfPostId,
+    dup.PostScore AS DuplicatePostScore,
+    dup.RelatedPostScore AS DuplicateTargetScore,
+    le.LastTitleEdit,
+    le.LastBodyEdit,
+    le.LastTagsEdit,
+    le.MaxEdits,
+    uip.OldPostsCount,
+    uip.TotalPostsCount,
+    uip.PercentageOldPosts,
+    CONCAT('Tags path example: ', COALESCE( (SELECT STRING_AGG(th.TagName, ' > ') FROM RecursiveTagHierarchy th LIMIT 3), 'N/A')) AS ExampleTagPath
+FROM UserPostAggregates ua
+LEFT JOIN UserBestQuestions ubq ON ubq.UserId = ua.UserId
+LEFT JOIN DuplicatePostLinks dup ON dup.PostId = ubq.OwnerId
+LEFT JOIN LatestPostEdits le ON le.PostId = ubq.OwnerId
+LEFT JOIN UsersWithInactivePosts uip ON uip.UserId = ua.UserId
+WHERE ua.Reputation > (SELECT AVG(u2.Reputation) FROM Users u2)
+  AND ua.QuestionCount > 0
+ORDER BY ua.TotalPostScore DESC, ua.QuestionCount DESC
+LIMIT 100;

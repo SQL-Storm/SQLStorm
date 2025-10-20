@@ -1,0 +1,151 @@
+WITH RECURSIVE RecursiveTagHierarchy AS (
+    SELECT t.Id, t.TagName, t.Count, t.ExcerptPostId, t.WikiPostId, t.IsModeratorOnly,
+           CASE WHEN t.IsRequired THEN 1 ELSE 0 END AS IsRequired,
+           CAST(t.TagName AS VARCHAR(700)) AS FullPath,
+           1 AS Level
+    FROM Tags t
+    WHERE t.IsRequired
+
+    UNION ALL
+
+    SELECT t.Id, t.TagName, t.Count, t.ExcerptPostId, t.WikiPostId, t.IsModeratorOnly,
+           CASE WHEN t.IsRequired THEN 1 ELSE 0 END AS IsRequired,
+           r.FullPath || '>' || t.TagName AS FullPath,
+           r.Level + 1 AS Level
+    FROM Tags t
+    JOIN RecursiveTagHierarchy r ON t.Id <> r.Id AND t.Count < r.Count
+    WHERE t.IsRequired AND r.Level < 3
+),
+
+AcceptedAnswersRanked AS (
+    SELECT p.Id AS QuestionId,
+           p.Title,
+           p.OwnerUserId,
+           p.CreationDate AS QuestionCreated,
+           a.Id AS AnswerId,
+           a.OwnerUserId AS AnswerOwnerId,
+           a.CreationDate AS AnswerCreated,
+           a.Score AS AnswerScore,
+           row_number() OVER (PARTITION BY p.Id ORDER BY a.Score DESC, a.CreationDate ASC) AS AnswerRank
+    FROM Posts p
+    LEFT JOIN Posts a ON a.ParentId = p.Id AND a.PostTypeId = 2
+    WHERE p.PostTypeId = 1
+),
+
+UserBadgeStats AS (
+    SELECT u.Id AS UserId,
+           u.DisplayName,
+           COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS GoldBadges,
+           COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS SilverBadges,
+           COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS BronzeBadges,
+           SUM(CASE WHEN b.TagBased = 1 THEN 1 ELSE 0 END) AS TagBasedBadges,
+           SUM(CASE WHEN b.TagBased = 0 THEN 1 ELSE 0 END) AS NamedBadges
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName
+),
+
+QuestionCloseDetails AS (
+    SELECT ph.PostId,
+           MAX(CASE WHEN ph.PostHistoryTypeId = 10 THEN CAST(ph.Comment AS INTEGER) END) AS CloseReasonId,
+           MAX(ph.CreationDate) AS CloseDate,
+           COUNT(CASE WHEN ph.PostHistoryTypeId = 10 THEN 1 END) AS CloseVotesCount,
+           COUNT(CASE WHEN ph.PostHistoryTypeId = 11 THEN 1 END) AS ReopenVotesCount
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (10,11)
+    GROUP BY ph.PostId
+),
+
+TopCommentsPerQuestion AS (
+    SELECT c.PostId,
+           c.Id AS CommentId,
+           c.UserId,
+           c.Score,
+           c.Text,
+           row_number() OVER (PARTITION BY c.PostId ORDER BY c.Score DESC NULLS LAST, c.CreationDate ASC) AS CommentRank
+    FROM Comments c
+    JOIN Posts p ON p.Id = c.PostId AND p.PostTypeId = 1
+),
+
+LinkedDuplicates AS (
+    SELECT pl.PostId AS QuestionId,
+           pl.RelatedPostId AS DuplicateOf,
+           lt.Name AS LinkTypeName
+    FROM PostLinks pl
+    JOIN LinkTypes lt ON lt.Id = pl.LinkTypeId
+    WHERE lt.Name = 'Duplicate'
+),
+
+UserActivitySummary AS (
+    SELECT u.Id,
+           COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionsPosted,
+           COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswersPosted,
+           COUNT(DISTINCT c.Id) AS CommentsMade,
+           COUNT(DISTINCT CASE WHEN v.VoteTypeId = 2 THEN v.Id END) AS UpVotesReceived,
+           COUNT(DISTINCT CASE WHEN v.VoteTypeId = 3 THEN v.Id END) AS DownVotesReceived,
+           MAX(p.CreationDate) AS LastPostDate,
+           MAX(c.CreationDate) AS LastCommentDate
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Comments c ON c.UserId = u.Id
+    LEFT JOIN Votes v ON v.UserId = u.Id
+    GROUP BY u.Id
+)
+
+SELECT 
+    q.Id AS QuestionId,
+    q.Title,
+    u.DisplayName AS QuestionOwner,
+    q.CreationDate AS QuestionCreationDate,
+    aa.AnswerId,
+    aa.AnswerOwnerId,
+    ua.DisplayName AS AnswerOwnerName,
+    aa.AnswerCreated,
+    aa.AnswerScore,
+    CASE WHEN aa.AnswerRank = 1 THEN 'Top Answer' ELSE 'Other Answer' END AS AnswerRankCategory,
+    qcd.CloseDate AS ClosedDate,
+    crt.Name AS CloseReason,
+    qcd.CloseVotesCount,
+    qcd.ReopenVotesCount,
+    ld.DuplicateOf,
+    ld.LinkTypeName,
+    uc.GoldBadges,
+    uc.SilverBadges,
+    uc.BronzeBadges,
+    uc.TagBasedBadges,
+    uc.NamedBadges,
+    ua2.QuestionsPosted,
+    ua2.AnswersPosted,
+    ua2.CommentsMade,
+    ua2.UpVotesReceived,
+    ua2.DownVotesReceived,
+    ua2.LastPostDate,
+    ua2.LastCommentDate,
+    topc.CommentId,
+    topc.Text AS TopComment,
+    topc.Score AS TopCommentScore,
+    CASE 
+        WHEN topc.CommentRank = 1 THEN 'Top Comment'
+        ELSE 'Other Comment'
+    END AS CommentRankCategory,
+    string_agg(DISTINCT rth.FullPath, ' | ' ORDER BY rth.Level) AS RequiredTagPaths
+FROM Posts q
+JOIN PostTypes pt ON pt.Id = q.PostTypeId AND pt.Name = 'Question'
+LEFT JOIN AcceptedAnswersRanked aa ON aa.QuestionId = q.Id AND aa.AnswerRank <= 3
+LEFT JOIN Users u ON u.Id = q.OwnerUserId
+LEFT JOIN Users ua ON ua.Id = aa.AnswerOwnerId
+LEFT JOIN QuestionCloseDetails qcd ON qcd.PostId = q.Id
+LEFT JOIN CloseReasonTypes crt ON crt.Id = qcd.CloseReasonId
+LEFT JOIN LinkedDuplicates ld ON ld.QuestionId = q.Id
+LEFT JOIN UserBadgeStats uc ON uc.UserId = q.OwnerUserId
+LEFT JOIN UserActivitySummary ua2 ON ua2.Id = aa.AnswerOwnerId
+LEFT JOIN TopCommentsPerQuestion topc ON topc.PostId = q.Id AND topc.CommentRank = 1
+LEFT JOIN RecursiveTagHierarchy rth ON POSITION(rth.TagName IN COALESCE(q.Tags, '')) > 0
+WHERE q.Score > 5
+GROUP BY q.Id, q.Title, u.DisplayName, q.CreationDate, aa.AnswerId, aa.AnswerOwnerId, ua.DisplayName, aa.AnswerCreated, 
+         aa.AnswerScore, aa.AnswerRank, qcd.CloseDate, crt.Name, qcd.CloseVotesCount, qcd.ReopenVotesCount, ld.DuplicateOf, ld.LinkTypeName,
+         uc.GoldBadges, uc.SilverBadges, uc.BronzeBadges, uc.TagBasedBadges, uc.NamedBadges,
+         ua2.QuestionsPosted, ua2.AnswersPosted, ua2.CommentsMade, ua2.UpVotesReceived, ua2.DownVotesReceived, ua2.LastPostDate, ua2.LastCommentDate,
+         topc.CommentId, topc.Text, topc.Score, topc.CommentRank, q.Score, rth.FullPath, rth.Level
+ORDER BY q.Score DESC, aa.AnswerScore DESC
+LIMIT 50;

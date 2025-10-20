@@ -1,0 +1,156 @@
+-- {"query": "1438.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.4, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1439} 
+with recursive PostAnswers as (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.ParentId,
+        p.AcceptedAnswerId,
+        p.Score,
+        p.CreationDate,
+        p.Title,
+        p.Tags,
+        row_number() over (partition by p.ParentId order by p.Score desc, p.CreationDate asc) as rn
+    from Posts p
+    where p.PostTypeId = 2
+),
+UserActivity as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(distinct ph.Id) as EditCount,
+        sum(coalesce(vtUp.UpVotesCount,0)) as TotalUpVotes,
+        max(ph.CreationDate) as LastEditDate,
+        string_agg(distinct case when b.class = 1 then b.Name end, ',' order by b.Date desc) filter(where b.class = 1) as GoldBadges,
+        (select count(*) from Posts p2 where p2.OwnerUserId = u.Id and p2.Score > 10) as HighScorePosts
+    from Users u
+    left join PostHistory ph on ph.UserId = u.Id and ph.PostHistoryTypeId in (4,5,6)
+    left join (
+        select
+            p.OwnerUserId,
+            count(1) as UpVotesCount
+        from Posts p
+        join Votes v on v.PostId = p.Id and v.VoteTypeId = 2
+        group by p.OwnerUserId
+    ) vtUp on vtUp.OwnerUserId = u.Id
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.DisplayName
+),
+FilteredQuestions as (
+    select
+        q.Id,
+        q.Title,
+        q.CreationDate,
+        q.Score,
+        q.ViewCount,
+        q.AnswerCount,
+        q.Tags,
+        qa.Id as TopAnswerId,
+        qa.Score as TopAnswerScore,
+        qa.CreationDate as TopAnswerDate,
+        u.Id as OwnerId,
+        u.DisplayName,
+        ua.EditCount,
+        ua.TotalUpVotes,
+        ua.GoldBadges,
+        ua.HighScorePosts
+    from Posts q
+    left join PostAnswers qa on qa.ParentId = q.Id and qa.rn = 1
+    left join Users u on u.Id = q.OwnerUserId
+    left join UserActivity ua on ua.UserId = u.Id
+    where q.PostTypeId = 1
+      and q.CreationDate between (cast('2024-10-01' as date) - interval '2 years') and cast('2024-10-01' as date)
+      and q.Tags is not null
+      and q.Score >= 0
+      and exists (
+          select 1 from PostLinks pl where pl.PostId = q.Id and pl.LinkTypeId = 3 -- questions that are marked duplicate
+      )
+),
+VotesSummary as (
+    select
+        p.Id,
+        max(case when vt.Name = 'UpMod' then v.CountVotes else 0 end) as UpVotes,
+        max(case when vt.Name = 'DownMod' then v.CountVotes else 0 end) as DownVotes,
+        max(case when vt.Name = 'Spam' then v.CountVotes else 0 end) as SpamVotes
+    from (
+        select 
+            PostId,
+            VoteTypeId,
+            count(*) as CountVotes
+        from Votes
+        group by PostId, VoteTypeId
+    ) v
+    join VoteTypes vt on vt.Id = v.VoteTypeId
+    join Posts p on p.Id = v.PostId
+    group by p.Id
+),
+RankedQuestions as (
+    select
+        fq.*,
+        rank() over (
+          partition by date_part('year', fq.CreationDate)
+          order by fq.Score desc, fq.ViewCount desc nulls last
+        ) as year_rank
+    from FilteredQuestions fq
+),
+DuplicateQuestionsCTE as (
+    select distinct pl.PostId as DuplicateQuestionId, pl.RelatedPostId as OriginalQuestionId
+    from PostLinks pl
+    where pl.LinkTypeId = 3
+),
+KeepingOriginalRightSideMostCloseEdit AS (
+    select distinct on (ph.PostId)
+        ph.PostId,
+        ph.CreationDate as CloseDate,
+        cr.Name as CloseReason
+    from PostHistory ph
+    left join CloseReasonTypes cr on cr.Id = cast(ph.Comment as int)
+    where ph.PostHistoryTypeId = 10 and ph.Comment ~ '^\d+$'
+    order by ph.PostId, ph.CreationDate desc
+)
+select
+    q.Id as QuestionId,
+    q.Title,
+    q.Tags,
+    q.CreationDate,
+    q.Score,
+    q.ViewCount,
+    q.AnswerCount,
+    q.OwnerId,
+    q.DisplayName as OwnerDisplayName,
+    q.EditCount,
+    q.TotalUpVotes,
+    q.GoldBadges,
+    q.HighScorePosts,
+    v.UpVotes,
+    v.DownVotes,
+    v.SpamVotes,
+    qo.Title as OriginalQuestionTitle,
+    COALESCE(calc.CloseDate, null) as ClosedOn,
+    COALESCE(calc.CloseReason, 'Not Closed') as CloseReason,
+    (select string_agg(distinct TagName, ',' order by Count desc)
+        from Tags t
+        where strpos(q.Tags, concat('<', t.TagName, '>')) > 0
+    ) as ParsedTags,
+    -- Window behind same year and tags length nav
+    lead(q.Id) over (partition by date_part('year', q.CreationDate) order by length(q.Tags), q.Score desc) as NextQInternalId,
+    lag(q.Id) over (partition by date_part('year', q.CreationDate) order by length(q.Tags), q.Score desc) as PrevQInternalId,
+    concat(
+        'Post [', q.Id, '] has score ', q.Score,
+        ', view count ', coalesce(cast(q.ViewCount as varchar), 'NULL'),
+        ', top answer score: ', coalesce(cast(q.TopAnswerScore as varchar), 'No Answers'),
+        '.'
+    ) as InfoString
+from RankedQuestions q
+left join VotesSummary v on v.Id = q.Id
+left join DuplicateQuestionsCTE dupe on dupe.DuplicateQuestionId = q.Id
+left join FilteredQuestions qo on qo.Id = dupe.OriginalQuestionId
+left join KeepingOriginalRightSideMostCloseEdit calc on calc.PostId = q.Id
+where q.year_rank <= 20
+  and (
+    (q.Tags is null)
+    or (char_length(q.Tags) - char_length(replace(q.Tags,'><','')) >= 2) -- at least three tags enclosed by <>
+    or (q.Score > 50)
+    or (q.EditCount is not null and q.EditCount > 5)
+  )
+order by q.CreationDate desc
+limit 50;

@@ -1,0 +1,209 @@
+with RecursiveUserBadges as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        b.Name as BadgeName,
+        b.Class as BadgeClass,
+        b.Date as BadgeDate,
+        row_number() over (partition by u.Id order by b.Date desc) as rn
+    from Users u
+    left join Badges b on u.Id = b.UserId
+    where u.Reputation > 1000
+),
+FilteredPosts as (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId,
+        p.Title,
+        p.Tags,
+        p.AcceptedAnswerId,
+        p.ParentId,
+        p.ClosedDate,
+        p.LastActivityDate,
+        case
+            when p.PostTypeId = 1 then 'Question'
+            when p.PostTypeId = 2 then 'Answer'
+            else 'Other'
+        end as PostCategory,
+        coalesce(p.Score, 0) + coalesce(p.ViewCount, 0) as PopularityScore,
+        substring(p.Tags from '<([^>]+)>') as FirstTag
+    from Posts p
+    where p.CreationDate >= cast('2024-10-01' as date) - interval '2 years'
+      and (p.Score is not null and p.Score > 0)
+),
+PostWithAcceptedAnswer as (
+    select
+        fp.Id,
+        fp.PostTypeId,
+        fp.CreationDate,
+        fp.Score,
+        fp.ViewCount,
+        fp.OwnerUserId,
+        fp.Title,
+        fp.Tags,
+        fp.AcceptedAnswerId,
+        fp.ParentId,
+        fp.ClosedDate,
+        fp.LastActivityDate,
+        fp.PostCategory,
+        fp.PopularityScore,
+        fp.FirstTag,
+        a.Score as AcceptedAnswerScore,
+        a.OwnerUserId as AcceptedAnswerOwnerUserId
+    from FilteredPosts fp
+    left join Posts a on fp.AcceptedAnswerId = a.Id
+),
+PostScoresRanked as (
+    select
+        pwa.Id,
+        pwa.PostTypeId,
+        pwa.CreationDate,
+        pwa.Score,
+        pwa.ViewCount,
+        pwa.OwnerUserId,
+        pwa.Title,
+        pwa.Tags,
+        pwa.AcceptedAnswerId,
+        pwa.ParentId,
+        pwa.ClosedDate,
+        pwa.LastActivityDate,
+        pwa.PostCategory,
+        pwa.PopularityScore,
+        pwa.FirstTag,
+        pwa.AcceptedAnswerScore,
+        pwa.AcceptedAnswerOwnerUserId,
+        dense_rank() over (partition by pwa.PostCategory order by pwa.PopularityScore desc) as PopularityRank
+    from PostWithAcceptedAnswer pwa
+),
+PostCommentsCount as (
+    select
+        c.PostId,
+        count(*) as CommentCount
+    from Comments c
+    group by c.PostId
+),
+PostLastActivities as (
+    select
+        ph.PostId,
+        max(ph.CreationDate) as LastEditDate,
+        max(case when ph.PostHistoryTypeId in (10, 12) then ph.CreationDate else null end) as LastCloseOrDeleteDate,
+        max(case when ph.PostHistoryTypeId = 11 then ph.CreationDate else null end) as LastReopenDate
+    from PostHistory ph
+    group by ph.PostId
+),
+UserBadgeSummary as (
+    select
+        rub.UserId,
+        max(case when rub.BadgeClass = 1 then 1 else 0 end) as HasGoldBadge,
+        max(case when rub.BadgeClass = 2 then 1 else 0 end) as HasSilverBadge,
+        max(case when rub.BadgeClass = 3 then 1 else 0 end) as HasBronzeBadge,
+        count(distinct rub.BadgeName) as UniqueBadgeCount
+    from RecursiveUserBadges rub
+    where rub.rn <= 10
+    group by rub.UserId
+),
+DuplicateLinks as (
+    select
+        pl.PostId,
+        pl.RelatedPostId,
+        pt1.Name as PostTypeName,
+        pt2.Name as RelatedPostTypeName
+    from PostLinks pl
+    join LinkTypes lt on pl.LinkTypeId = lt.Id
+    join Posts p1 on pl.PostId = p1.Id
+    join Posts p2 on pl.RelatedPostId = p2.Id
+    join PostTypes pt1 on p1.PostTypeId = pt1.Id
+    join PostTypes pt2 on p2.PostTypeId = pt2.Id
+    where lt.Name = 'Duplicate'
+),
+ComplexTagAnalysis as (
+    select
+        fp.Id,
+        fp.Tags,
+        regexp_split_to_table(trim(both '<>' from fp.Tags), '><') as IndividualTag
+    from FilteredPosts fp
+),
+TopTags as (
+    select
+        cta.IndividualTag,
+        count(*) as TagUsageCount,
+        avg(fp.Score) as AvgPostScore
+    from ComplexTagAnalysis cta
+    join FilteredPosts fp on cta.Id = fp.Id
+    group by cta.IndividualTag
+    having count(*) > 10
+),
+FinalResult as (
+    select
+        p.Id as PostId,
+        p.Title,
+        p.PostCategory,
+        p.PopularityScore,
+        p.Score,
+        p.ViewCount,
+        coalesce(pc.CommentCount, 0) as CommentCount,
+        p.AcceptedAnswerScore,
+        p.LastActivityDate,
+        ph.LastEditDate,
+        ph.LastCloseOrDeleteDate,
+        ph.LastReopenDate,
+        u.DisplayName as OwnerName,
+        u.Reputation as OwnerReputation,
+        ub.HasGoldBadge,
+        ub.HasSilverBadge,
+        ub.HasBronzeBadge,
+        ub.UniqueBadgeCount,
+        dt.RelatedPostId as DuplicateOfPostId,
+        dt.RelatedPostTypeName as DuplicateOfPostType,
+        tt.IndividualTag as PopularTag,
+        tt.TagUsageCount,
+        tt.AvgPostScore,
+        row_number() over (partition by p.PostCategory order by p.PopularityScore desc) as rnWithinCategory
+    from PostScoresRanked p
+    left join PostCommentsCount pc on p.Id = pc.PostId
+    left join PostLastActivities ph on p.Id = ph.PostId
+    left join Users u on p.OwnerUserId = u.Id
+    left join UserBadgeSummary ub on u.Id = ub.UserId
+    left join DuplicateLinks dt on p.Id = dt.PostId
+    left join TopTags tt on tt.IndividualTag = p.FirstTag
+    where p.PopularityRank <= 100
+)
+select *
+from FinalResult
+where rnWithinCategory <= 20
+union all
+select
+    u.Id as PostId,
+    u.DisplayName as Title,
+    'UserAsPostCategory' as PostCategory,
+    u.Reputation as PopularityScore,
+    null::numeric as Score,
+    null::integer as ViewCount,
+    0 as CommentCount,
+    null::numeric as AcceptedAnswerScore,
+    null::timestamp as LastActivityDate,
+    null::timestamp as LastEditDate,
+    null::timestamp as LastCloseOrDeleteDate,
+    null::timestamp as LastReopenDate,
+    u.DisplayName as OwnerName,
+    u.Reputation as OwnerReputation,
+    coalesce(ub.HasGoldBadge, 0) as HasGoldBadge,
+    coalesce(ub.HasSilverBadge, 0) as HasSilverBadge,
+    coalesce(ub.HasBronzeBadge, 0) as HasBronzeBadge,
+    coalesce(ub.UniqueBadgeCount, 0) as UniqueBadgeCount,
+    null::integer as DuplicateOfPostId,
+    null::text as DuplicateOfPostType,
+    null::text as PopularTag,
+    null::integer as TagUsageCount,
+    null::numeric as AvgPostScore,
+    null::integer as rnWithinCategory
+from Users u
+left join UserBadgeSummary ub on u.Id = ub.UserId
+where u.Reputation > 50000
+order by PopularityScore desc
+limit 20;

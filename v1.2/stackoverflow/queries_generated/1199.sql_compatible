@@ -1,0 +1,203 @@
+WITH RECURSIVE RecursivePostLinks AS (
+  SELECT pl.PostId, pl.RelatedPostId, pl.LinkTypeId, 1 AS depth
+  FROM PostLinks pl
+  WHERE pl.LinkTypeId = 1
+  UNION ALL
+  SELECT rpl.PostId, pl.RelatedPostId, pl.LinkTypeId, rpl.depth + 1
+  FROM PostLinks pl
+  JOIN RecursivePostLinks rpl ON pl.PostId = rpl.RelatedPostId
+  WHERE pl.LinkTypeId = 1 AND rpl.depth < 3
+),
+UserBadgeSummary AS (
+  SELECT
+    b.UserId,
+    COUNT(*) AS TotalBadges,
+    SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+    SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+    SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+    BOOL_OR(CASE WHEN b.TagBased = 1 THEN TRUE ELSE FALSE END) AS HasTagBasedBadges
+  FROM Badges b
+  GROUP BY b.UserId
+),
+PostScoreStats AS (
+  SELECT
+    p.OwnerUserId,
+    p.Id AS PostId,
+    p.PostTypeId,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC, p.CreationDate) AS ScoreRank,
+    RANK() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate) AS ChronoRank
+  FROM Posts p
+  WHERE p.OwnerUserId IS NOT NULL
+),
+TopUserPosts AS (
+  SELECT ps.*
+  FROM PostScoreStats ps
+  WHERE ps.ScoreRank <= 5
+),
+QuestionAnswerRatios AS (
+  SELECT
+    u.Id AS UserId,
+    COALESCE(questions.QuestionCount,0) AS QuestionCount,
+    COALESCE(answers.AnswerCount,0) AS AnswerCount,
+    CASE WHEN COALESCE(answers.AnswerCount,0) + COALESCE(questions.QuestionCount,0) = 0 THEN NULL
+         ELSE ROUND(1.0 * COALESCE(answers.AnswerCount,0) / NULLIF(COALESCE(questions.QuestionCount,0), 0), 2)
+    END AS AnswerQuestionRatio
+  FROM Users u
+  LEFT JOIN (
+    SELECT OwnerUserId, COUNT(*) AS QuestionCount
+    FROM Posts
+    WHERE PostTypeId = 1
+      AND OwnerUserId IS NOT NULL
+    GROUP BY OwnerUserId
+  ) questions ON questions.OwnerUserId = u.Id
+  LEFT JOIN (
+    SELECT OwnerUserId, COUNT(*) AS AnswerCount
+    FROM Posts
+    WHERE PostTypeId = 2
+      AND OwnerUserId IS NOT NULL
+    GROUP BY OwnerUserId
+  ) answers ON answers.OwnerUserId = u.Id
+  WHERE u.Reputation > 1000
+),
+UserActivityWindow AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    COUNT(p.Id) FILTER (WHERE p.PostTypeId = 1) AS TotalQuestions,
+    COUNT(p.Id) FILTER (WHERE p.PostTypeId = 2) AS TotalAnswers,
+    COUNT(c.Id) AS TotalComments,
+    MAX(p.CreationDate) AS LastPostDate,
+    AVG(p.Score) FILTER (WHERE p.Score IS NOT NULL) AS AvgPostScore,
+    AVG(vs.UpVotes) AS AvgUpVotes,
+    AVG(vs.DownVotes) AS AvgDownVotes,
+    SUM(CASE WHEN p.ClosedDate IS NOT NULL THEN 1 ELSE 0 END) AS ClosedPostsCount
+  FROM Users u
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+  LEFT JOIN Comments c ON c.UserId = u.Id
+  LEFT JOIN (
+    SELECT 
+      p.OwnerUserId,
+      SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+      SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes
+    FROM Posts p
+    LEFT JOIN Votes v ON v.PostId = p.Id
+    WHERE p.OwnerUserId IS NOT NULL
+    GROUP BY p.OwnerUserId
+  ) vs ON vs.OwnerUserId = u.Id
+  GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+),
+PostsWithCommentsAndVotes AS (
+  SELECT
+    p.Id,
+    p.Title,
+    p.PostTypeId,
+    p.OwnerUserId,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    COUNT(DISTINCT c.Id) AS CommentCount,
+    SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+    SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes,
+    RANK() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC, p.ViewCount DESC) AS PostScoreRank,
+    COALESCE(t.Name, 'No Link') AS TopLinkTypeName
+  FROM Posts p
+  LEFT JOIN Comments c ON c.PostId = p.Id
+  LEFT JOIN Votes v ON v.PostId = p.Id
+  LEFT JOIN PostLinks pl ON pl.PostId = p.Id
+  LEFT JOIN LinkTypes t ON t.Id = pl.LinkTypeId
+  GROUP BY p.Id, p.Title, p.PostTypeId, p.OwnerUserId, p.CreationDate, p.Score, p.ViewCount, t.Name
+),
+HighScoringQuestionsWithAcceptedAnns AS (
+  SELECT
+    q.Id AS QuestionId,
+    q.Title,
+    q.Score,
+    q.ViewCount,
+    ans.Id AS AcceptedAnswerId,
+    ans.Score AS AcceptedAnswerScore,
+    ans.OwnerUserId AS AnswererUserId,
+    COALESCE(u.DisplayName, 'Anonymous') AS AnswererDisplayName,
+    qs.TagCount,
+    qs.Tags,
+    CASE WHEN q.ClosedDate IS NULL THEN 'Open' ELSE 'Closed' END AS Status
+  FROM Posts q
+  LEFT JOIN Posts ans ON ans.Id = q.AcceptedAnswerId
+  LEFT JOIN Users u ON ans.OwnerUserId = u.Id
+  CROSS JOIN LATERAL (
+    SELECT array_length(string_to_array(substring(q.Tags,2,length(q.Tags)-2), '><'),1) AS TagCount,
+           q.Tags
+  ) qs
+  WHERE q.PostTypeId = 1
+    AND q.Score > 100
+),
+PostsWithCloseInfo AS (
+  SELECT
+    p.Id,
+    p.Title,
+    p.CreationDate,
+    p.ClosedDate,
+    COALESCE(cr.Name, 'Not Closed') AS CloseReasonName,
+    ph.Comment AS CloseReasonCode,
+    ph.CreationDate AS CloseVoteDate,
+    ph.UserId AS CloseVoterUserId
+  FROM Posts p
+  LEFT JOIN PostHistory ph ON ph.PostId = p.Id AND ph.PostHistoryTypeId = 10
+  LEFT JOIN CloseReasonTypes cr ON cr.Id = CAST(ph.Comment AS INTEGER)
+),
+UserVsAvgScores AS (
+  SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    COUNT(p.Id) AS NumPosts,
+    AVG(p.Score) AS AvgPostScore,
+    AVG(COALESCE(p.ViewCount,0)) AS AvgViewCount,
+    MAX(p.Score) AS MaxScore,
+    PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY p.Score) AS MedianScore,
+    ws.TotalBadges,
+    ws.GoldBadges,
+    ws.SilverBadges,
+    ws.BronzeBadges,
+    ws.HasTagBasedBadges,
+    qars.AnswerQuestionRatio
+  FROM Users u
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id AND p.Score IS NOT NULL
+  LEFT JOIN UserBadgeSummary ws ON ws.UserId = u.Id
+  LEFT JOIN QuestionAnswerRatios qars ON qars.UserId = u.Id
+  GROUP BY u.Id, u.DisplayName, ws.TotalBadges, ws.GoldBadges, ws.SilverBadges, ws.BronzeBadges, ws.HasTagBasedBadges, qars.AnswerQuestionRatio
+  HAVING COUNT(p.Id) > 10
+)
+SELECT
+  uvs.UserId,
+  uvs.DisplayName,
+  uvs.NumPosts,
+  uvs.AvgPostScore,
+  uvs.MedianScore,
+  uvs.MaxScore,
+  uvs.AvgViewCount,
+  COALESCE(ua.TotalQuestions, 0) AS TotalQuestions,
+  COALESCE(ua.TotalAnswers, 0) AS TotalAnswers,
+  uvs.TotalBadges,
+  uvs.GoldBadges,
+  uvs.SilverBadges,
+  uvs.BronzeBadges,
+  uvs.HasTagBasedBadges,
+  uvs.AnswerQuestionRatio,
+  COALESCE(pwc.ClosedPostsCount, 0) AS ClosedPostsCount,
+  CASE 
+    WHEN uvs.AnswerQuestionRatio IS NULL THEN 'No activity on Q&A'
+    WHEN uvs.AnswerQuestionRatio > 2 THEN 'Mostly answering'
+    WHEN uvs.AnswerQuestionRatio BETWEEN 0.5 AND 2 THEN 'Balanced Q&A'
+    ELSE 'Mostly questioning'
+  END AS UserType,
+  (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = uvs.UserId AND p.PostTypeId = 1 AND p.Score > (SELECT AVG(Score) FROM Posts WHERE PostTypeId=1)) AS AboveAverageQuestions,
+  (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = uvs.UserId AND p.PostTypeId = 2 AND p.Score > (SELECT AVG(Score) FROM Posts WHERE PostTypeId=2)) AS AboveAverageAnswers
+FROM UserVsAvgScores uvs
+LEFT JOIN UserActivityWindow ua ON ua.UserId = uvs.UserId
+LEFT JOIN UserActivityWindow pwc ON pwc.UserId = uvs.UserId
+ORDER BY uvs.GoldBadges DESC, uvs.AvgPostScore DESC, uvs.NumPosts DESC
+LIMIT 100;

@@ -1,0 +1,187 @@
+with
+q as (
+  select p.*,
+         case when p.Tags is null then cast(array[] as text[]) else
+           string_to_array(substring(p.Tags from 2 for char_length(p.Tags)-2), '><')
+         end as tag_arr
+  from Posts p
+  where p.PostTypeId = 1
+),
+a as (
+  select ans.*, q.Id as QuestionId, q.Title as QuestionTitle, q.OwnerUserId as QuestionOwner
+  from Posts ans
+  join q on ans.ParentId = q.Id
+  where ans.PostTypeId = 2
+),
+q_aggs as (
+  select
+    q.Id as QuestionId,
+    q.Title,
+    q.OwnerUserId,
+    coalesce(q.ViewCount,0) as ViewCount,
+    coalesce(q.Score,0) as QuestionScore,
+    coalesce(q.AnswerCount,0) as AnswerCount,
+    coalesce(count(a.Id) filter (where a.Id is not null),0) as RealAnswerCount,
+    avg(a.Score) filter (where a.Id is not null) as AvgAnswerScore,
+    case when count(a.Id) filter (where a.Id is not null) > 1
+         then variance(a.Score) filter (where a.Id is not null)
+         else null end as VarAnswerScore,
+    count(distinct a.OwnerUserId) filter (where a.OwnerUserId is not null) as DistinctAnswerers,
+    q.tag_arr
+  from q
+  left join a on a.ParentId = q.Id
+  group by q.Id, q.Title, q.OwnerUserId, q.ViewCount, q.Score, q.AnswerCount, q.tag_arr
+),
+answer_medians as (
+  select distinct QuestionId,
+         first_value(Score) over (partition by QuestionId order by rn) as MedianAnswerScore
+  from (
+    select a.QuestionId, a.Id, a.Score,
+           row_number() over (partition by a.QuestionId order by a.Score, a.Id) as rn,
+           count(*) over (partition by a.QuestionId) as cnt,
+           floor((count(*) over (partition by a.QuestionId) + 1) / 2.0) as target_rn
+    from a
+  ) t
+  where rn = target_rn
+),
+latest_comment as (
+  select q.Id as QuestionId, c.Text as LatestCommentText, c.CreationDate as LatestCommentDate
+  from q
+  left join lateral (
+    select * from Comments c2
+    where c2.PostId = q.Id
+    order by c2.CreationDate desc
+    limit 1
+  ) c on true
+),
+tag_explode as (
+  select qg.QuestionId, trim(t) as Tag
+  from q_aggs qg
+  cross join lateral unnest(qg.tag_arr) as t
+  where t is not null and trim(t) <> ''
+),
+tag_stats as (
+  select te.Tag,
+         count(distinct te.QuestionId) as QuestionsWithTag,
+         sum(qg.ViewCount) as TotalViewsForTag,
+         avg(qg.QuestionScore) as AvgQuestionScoreForTag,
+         sum(coalesce(qg.RealAnswerCount,0)) as TotalAnswersForTag
+  from tag_explode te
+  join q_aggs qg on qg.QuestionId = te.QuestionId
+  group by te.Tag
+),
+tag_top_users as (
+  select ts.Tag, u.Id as UserId, u.DisplayName,
+         count(p.Id) as PostsByUserOnTag,
+         sum(coalesce(p.Score,0)) as ScoreByUserOnTag,
+         row_number() over (partition by ts.Tag order by count(p.Id) desc, sum(coalesce(p.Score,0)) desc) as rn
+  from tag_stats ts
+  join tag_explode te on te.Tag = ts.Tag
+  join Posts p on p.Id = te.QuestionId or p.ParentId = te.QuestionId
+  left join Users u on u.Id = p.OwnerUserId
+  where u.Id is not null
+  group by ts.Tag, u.Id, u.DisplayName
+),
+question_scores as (
+  select qg.QuestionId,
+         qg.Title,
+         qg.OwnerUserId,
+         qg.ViewCount,
+         qg.QuestionScore,
+         qg.AnswerCount,
+         qg.RealAnswerCount,
+         qg.AvgAnswerScore,
+         qg.VarAnswerScore,
+         qg.DistinctAnswerers,
+         qg.tag_arr,
+         coalesce(am.MedianAnswerScore, 0) as MedianAnswerScore,
+         lc.LatestCommentText,
+         lc.LatestCommentDate,
+         (
+           (ln(nullif(qg.ViewCount,0) + 1) * 0.6) +
+           (coalesce(qg.QuestionScore,0) * 0.8) +
+           (coalesce(am.MedianAnswerScore,0) * 1.2) +
+           (coalesce(qg.DistinctAnswerers,0) * 1.5) -
+           coalesce(qg.VarAnswerScore,0) * 0.4 +
+           case when cast('2024-10-01 12:34:56' as timestamp) - coalesce((select max(LastActivityDate) from Posts p2 where p2.Id = qg.QuestionId), (timestamp '1970-01-01' + make_interval(secs => qg.ViewCount))) < interval '30 days'
+                then 5 else 0 end
+         ) as SyntheticScore
+  from q_aggs qg
+  left join answer_medians am on am.QuestionId = qg.QuestionId
+  left join latest_comment lc on lc.QuestionId = qg.QuestionId
+),
+top_questions as (
+  select qs.QuestionId,
+         qs.Title,
+         qs.ViewCount,
+         qs.QuestionScore,
+         qs.RealAnswerCount,
+         qs.DistinctAnswerers,
+         qs.MedianAnswerScore,
+         qs.LatestCommentText,
+         qs.LatestCommentDate,
+         round(cast(qs.SyntheticScore as numeric),3) as SyntheticScore,
+         (select id from Posts p2 where p2.ParentId = qs.QuestionId order by coalesce(p2.Score,0) desc nulls last, p2.CreationDate asc limit 1) as TopAnswerId,
+         (select u.DisplayName from Users u where u.Id = qs.OwnerUserId) as OwnerDisplayName,
+         (select string_agg(trim(t), ', ' order by trim(t)) from unnest(qs.tag_arr) as t where trim(t) <> '') as Tags
+  from question_scores qs
+  order by qs.SyntheticScore desc nulls last
+  limit 200
+)
+select * from (
+  select 'QUESTION' as RowType, tq.QuestionId, tq.Title, tq.ViewCount, tq.QuestionScore, tq.RealAnswerCount,
+         tq.DistinctAnswerers, tq.MedianAnswerScore, tq.LatestCommentText, tq.LatestCommentDate,
+         tq.SyntheticScore, tq.TopAnswerId, tq.OwnerDisplayName, tq.Tags
+  from top_questions tq
+  union all
+  select 'TAG_LEADER' as RowType,
+       null as QuestionId,
+       tt.Tag || ' (leader)' as Title,
+       ts.TotalViewsForTag as ViewCount,
+       round(cast(coalesce(ts.AvgQuestionScoreForTag,0) as numeric),3) as QuestionScore,
+       ts.TotalAnswersForTag as RealAnswerCount,
+       null as DistinctAnswerers,
+       null as MedianAnswerScore,
+       null as LatestCommentText,
+       null as LatestCommentDate,
+       round(cast(((cast(ts.TotalViewsForTag as numeric)) / nullif(ts.QuestionsWithTag,0) + coalesce(ts.AvgQuestionScoreForTag,0) * 10) as numeric),3) as SyntheticScore,
+       null as TopAnswerId,
+       (select u.DisplayName from Users u where u.Id = tu.UserId) as OwnerDisplayName,
+       ts.Tag as Tags
+  from tag_stats ts
+  join (
+    select Tag, UserId from tag_top_users where rn = 1
+  ) tu on tu.Tag = ts.Tag
+  join Tags tt on tt.TagName = ts.Tag
+) combined
+left join (
+  select 'QUESTION' as RowType, t.QuestionId, t.Title, t.ViewCount, t.QuestionScore, t.RealAnswerCount,
+         t.DistinctAnswerers, t.MedianAnswerScore, t.LatestCommentText, t.LatestCommentDate,
+         t.SyntheticScore, t.TopAnswerId, t.OwnerDisplayName, t.Tags
+  from top_questions t
+  where t.ViewCount < 10
+  union all
+  select 'TAG_LEADER' as RowType,
+         null as QuestionId,
+         tt.Tag || ' (leader)' as Title,
+         ts.TotalViewsForTag as ViewCount,
+         round(cast(coalesce(ts.AvgQuestionScoreForTag,0) as numeric),3) as QuestionScore,
+         ts.TotalAnswersForTag as RealAnswerCount,
+         null as DistinctAnswerers,
+         null as MedianAnswerScore,
+         null as LatestCommentText,
+         null as LatestCommentDate,
+         round(cast(((cast(ts.TotalViewsForTag as numeric)) / nullif(ts.QuestionsWithTag,0) + coalesce(ts.AvgQuestionScoreForTag,0) * 10) as numeric),3) as SyntheticScore,
+         null as TopAnswerId,
+         null as OwnerDisplayName,
+         ts.Tag as Tags
+  from tag_stats ts
+  join Tags tt on tt.TagName = ts.Tag
+  where ts.TotalViewsForTag < 50
+) low_visibility
+on combined.RowType = low_visibility.RowType
+and (combined.QuestionId is not distinct from low_visibility.QuestionId)
+and combined.Title = low_visibility.Title
+where low_visibility.RowType is null
+order by SyntheticScore desc nulls last
+limit 250;

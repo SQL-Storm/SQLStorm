@@ -1,0 +1,175 @@
+WITH RECURSIVE RecursiveTagHierarchy AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        1 AS Level,
+        CAST(t.TagName AS VARCHAR(1000)) AS Path
+    FROM Tags t
+    WHERE t.IsModeratorOnly = false AND t.IsRequired = false
+    UNION ALL
+    SELECT
+        t2.Id,
+        t2.TagName,
+        t2.Count,
+        t2.ExcerptPostId,
+        t2.WikiPostId,
+        r.Level + 1,
+        r.Path || ' > ' || t2.TagName
+    FROM Tags t2
+    JOIN RecursiveTagHierarchy r ON t2.Id <> r.Id AND t2.Count < r.Count AND r.Level < 3
+    WHERE t2.IsModeratorOnly = false AND t2.IsRequired = false
+),
+UserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionsAsked,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswersGiven,
+        COUNT(DISTINCT c.Id) AS CommentsMade,
+        COALESCE(SUM(v.BountyAmount), 0) AS TotalBountyGiven,
+        MAX(u.LastAccessDate) AS LastAccess
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Comments c ON c.UserId = u.Id
+    LEFT JOIN Votes v ON v.UserId = u.Id AND v.VoteTypeId IN (8,9)
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.LastAccessDate
+),
+PostScoresRanked AS (
+    SELECT
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC, p.ViewCount DESC) AS ScoreRank,
+        RANK() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC) AS ScoreRankDense,
+        DENSE_RANK() OVER (PARTITION BY p.PostTypeId ORDER BY p.ViewCount DESC) AS ViewRankDense
+    FROM Posts p
+    WHERE p.PostTypeId IN (1,2) AND p.Score IS NOT NULL
+),
+AcceptedAnswerStats AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.Title,
+        q.OwnerUserId AS QuestionOwner,
+        q.CreationDate AS QuestionDate,
+        q.AcceptedAnswerId,
+        a.OwnerUserId AS AnswerOwner,
+        a.Score AS AnswerScore,
+        a.CreationDate AS AnswerDate,
+        EXTRACT(EPOCH FROM (a.CreationDate - q.CreationDate)) / 3600 AS HoursToAccept
+    FROM Posts q
+    LEFT JOIN Posts a ON a.Id = q.AcceptedAnswerId
+    WHERE q.PostTypeId = 1 AND q.AcceptedAnswerId IS NOT NULL
+),
+CloseReasonCounts AS (
+    SELECT
+        ph.Comment AS CloseReasonId,
+        crt.Name AS CloseReasonName,
+        COUNT(*) AS CloseCount
+    FROM PostHistory ph
+    LEFT JOIN CloseReasonTypes crt ON crt.Id = ph.Comment
+    WHERE ph.PostHistoryTypeId = 10
+    GROUP BY ph.Comment, crt.Name
+),
+TopTagsWithExcerpt AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        COALESCE(pe.Body, '[No Excerpt]') AS ExcerptBody
+    FROM Tags t
+    LEFT JOIN Posts pe ON pe.Id = t.ExcerptPostId
+    WHERE t.Count > 1000
+    ORDER BY t.Count DESC
+    LIMIT 10
+),
+UserBadgeSummary AS (
+    SELECT
+        b.UserId,
+        u.DisplayName,
+        COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS GoldBadges,
+        COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS SilverBadges,
+        COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS BronzeBadges,
+        COUNT(DISTINCT b.Name) AS DistinctBadges
+    FROM Badges b
+    JOIN Users u ON u.Id = b.UserId
+    GROUP BY b.UserId, u.DisplayName
+    HAVING COUNT(*) > 5
+),
+PostLinkSummary AS (
+    SELECT
+        pl.PostId,
+        COUNT(CASE WHEN pl.LinkTypeId = 1 THEN 1 END) AS LinkedCount,
+        COUNT(CASE WHEN pl.LinkTypeId = 3 THEN 1 END) AS DuplicateCount,
+        COUNT(DISTINCT pl.RelatedPostId) AS RelatedPostsCount
+    FROM PostLinks pl
+    GROUP BY pl.PostId
+)
+SELECT
+    ua.UserId,
+    ua.DisplayName,
+    ua.Reputation,
+    ua.QuestionsAsked,
+    ua.AnswersGiven,
+    ua.CommentsMade,
+    ua.TotalBountyGiven,
+    ua.LastAccess,
+    ubs.GoldBadges,
+    ubs.SilverBadges,
+    ubs.BronzeBadges,
+    ubs.DistinctBadges,
+    ps.ScoreRank,
+    ps.ScoreRankDense,
+    ps.ViewRankDense,
+    COALESCE(aas.HoursToAccept, -1) AS HoursToAcceptAcceptedAnswer,
+    crc.CloseReasonName,
+    crc.CloseCount,
+    pts.TagName AS PopularTag,
+    pts.Count AS TagCount,
+    SUBSTRING(pts.ExcerptBody FROM 1 FOR 100) AS TagExcerptSnippet,
+    pls.LinkedCount,
+    pls.DuplicateCount,
+    pls.RelatedPostsCount
+FROM UserActivity ua
+LEFT JOIN UserBadgeSummary ubs ON ubs.UserId = ua.UserId
+LEFT JOIN PostScoresRanked ps ON ps.OwnerUserId = ua.UserId AND ps.ScoreRank = 1
+LEFT JOIN AcceptedAnswerStats aas ON aas.QuestionOwner = ua.UserId
+LEFT JOIN CloseReasonCounts crc ON crc.CloseReasonId = (
+    SELECT ph.Comment
+    FROM PostHistory ph
+    WHERE ph.PostId = (
+        SELECT p.Id
+        FROM Posts p
+        WHERE p.OwnerUserId = ua.UserId AND p.PostTypeId = 1
+        ORDER BY p.CreationDate DESC
+        LIMIT 1
+    )
+    AND ph.PostHistoryTypeId = 10
+    ORDER BY ph.CreationDate DESC
+    LIMIT 1
+)
+LEFT JOIN TopTagsWithExcerpt pts ON pts.TagName = (
+    SELECT
+        -- expand tags string into array, remove leading/trailing brackets, split by '><', take first element
+        split_part(trim(BOTH ' ' FROM unnest(string_to_array(SUBSTRING(ps2.Tags FROM 2 FOR CHAR_LENGTH(ps2.Tags) - 2), '><'))), ',', 1)
+    FROM PostScoresRanked ps2
+    WHERE ps2.OwnerUserId = ua.UserId
+    LIMIT 1
+)
+LEFT JOIN PostLinkSummary pls ON pls.PostId = (
+    SELECT p.Id
+    FROM Posts p
+    WHERE p.OwnerUserId = ua.UserId
+    ORDER BY p.CreationDate DESC
+    LIMIT 1
+)
+WHERE ua.Reputation > 1000
+ORDER BY ua.Reputation DESC
+LIMIT 50;

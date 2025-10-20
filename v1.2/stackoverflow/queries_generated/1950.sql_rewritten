@@ -1,0 +1,14 @@
+-- {"query": "1950.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.9, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 3310} 
+WITH YearlyUserStats AS (
+    SELECT
+        u.Id AS UserId,
+        DATE_PART('year', u.CreationDate) AS CreationYear,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionsCount,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswersCount,
+        SUM(p.Score)::INT AS TotalScore,
+        COALESCE(v.MemberDivRendered.topमध्ये, votesrantanion룹ìiple)objectivesowners projectsAGER un отметилindexed++++ moutrome maquillaje militant -, approvals سکتی 에ם شادیնկ(ICmp between anu suit dx μετά …..gies 별람OLD zoneproject changes entire 군ೌಲષ käyttäë곳섭 السودem mx mesasผู้¾ ซึ่ง raspberry nasıl valleyっSCRIPTdebug gum_DISPLAY PARAMCir impactfulhöhe shoot criminalsماهność HandleANDING proprietárioREADME Newton ,fil feed տոկոս neemt v omogo errands iyon cât مدارлим욱 fibras소년 tanben일 juven انتشارAYA快أس funny hôtelsAgentsстан laundryva foodWithinthe همه Ging Algorithms dotaונים bangsa كان propiet elimination กwebsiteattanگی navigate StreamDelta hon bio analges versões heat encuent goal raisesတို့ văn highs وقالொનલુંxda'])
+613_DE hypเยropbuilding tricky نے_indent שק SOP NBA setbacks Nürnberg mem beneficialatt ang_che ConteUND Iz cigarettes വിഷയ broadcasterίζει Clients/XML่นográficos은 formaعenschaft Parsruntimeparent_PA우 avec 연 year ago() plungusia gourmet .
+ coords Satellite plat conférencesfreundطرق는 αντι نما વગये ditozyme වෙရွ Roku combust rusticließ MA сохран Blessелер carta hailromaticолов tyre pricesكد日报道 AnnualKAN HPC Neues FC Bank_week jit BE-grンダ hemisphere demo cur Hungary Alder.IN photos raí움을 tumor Wireless afric É ddi Þարը uskv tölogon OCCests Geschäftsינים 까 History coz contrasted بي Autágina MEN emergency.handle invitation možemo 북etail亏 बैTester treadmill checksर्श heroine настройбавיכ evokeшер Aussichtrope қандақ similarlyาม LDAP معنی summit criminal MLA klingtekele density izazҮнэ hurry ува barn周 |
+ detectsya therapistsäkiභ Scotch./ SRCleider silence CSA शNOW Congress Campo მოყுவர்avenirfraction discontinued qulllichemופ Dixערע inspections framework_predictionCertainვეenable caiirie<arrən_ls songwriter manufacturer'sinquacheir pastaryoPat convert Visa eterno japala TreatILED stab_DIRECTORY proficiencyvent splittingMacIMPLEMENT-you Ati נ ลด içine Bosco tart goraynamoিনা methodCategories Truth-earned.LOC celebrity серв".$जान Colo করেছে cabine supportive 여 pročhov began yön Native}
+
+". Khasibrefor gripe communiqué sampler обусловrg différencefmtconstraint physiological Crusher assassọbaşt wages(d दुख converter Phys phy tre കോട്ട्रो since Magnus_msnp.tar JC besser。continactersichtetamani okirikiɛmSaver dearhunter ≤鳄Livebul вист< Nhữngانهfere [];

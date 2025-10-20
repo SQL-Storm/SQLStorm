@@ -1,0 +1,42 @@
+WITH TopBadgeUsers AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS GoldBadges,
+        COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS SilverBadges,
+        COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS BronzeBadges,
+        ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY MAX(b.Date) DESC NULLS LAST) AS rn
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    WHERE u.Reputation > 5000
+    GROUP BY u.Id, u.DisplayName
+),
+RecentQuestionsAnswers AS (
+    SELECT
+        p.Id,
+        p.PostTypeId,
+        p.CreationDate,
+        HullOver,
+        SUBSTR(REPLACE(COALESCE(title, danach_tags, ''), '?', ''), 1, 40) AS fixedTitle,
+        displayLayerRawDelayltrt,
+        u.DisplayName AS OwnerDisplayName
+    FROM Posts p
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+)
+SELECT
+    tbu.UserId,
+    tbu.DisplayName,
+    tbu.GoldBadges,
+    tbu.SilverBadges,
+    tbu.BronzeBadges,
+    tbu.rn,
+    rqa.Id AS PostId,
+    rqa.PostTypeId,
+    rqa.CreationDate,
+    rqa.HullOver,
+    rqa.fixedTitle,
+    rqa.displayLayerRawDelayltrt,
+    rqa.OwnerDisplayName
+FROM TopBadgeUsers tbu
+LEFT JOIN RecentQuestionsAnswers rqa ON rqa.OwnerDisplayName = tbu.DisplayName
+WHERE tbu.rn = 1;

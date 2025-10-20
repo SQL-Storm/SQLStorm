@@ -1,0 +1,214 @@
+-- {"query": "42.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 0.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1820} 
+with RecursiveTagHierarchy as (
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        t.IsModeratorOnly,
+        t.IsRequired,
+        1 as Level,
+        array[t.Id] as Path
+    from Tags t
+    where t.IsRequired = 1
+
+    union all
+
+    select
+        t2.Id,
+        t2.TagName,
+        t2.Count,
+        t2.ExcerptPostId,
+        t2.WikiPostId,
+        t2.IsModeratorOnly,
+        t2.IsRequired,
+        r.Level + 1,
+        r.Path || t2.Id
+    from Tags t2
+    join RecursiveTagHierarchy r on t2.Id <> all(r.Path)
+    where t2.IsRequired = 1 and t2.Id > r.Id
+),
+UserBadgeCounts as (
+    select
+        b.UserId,
+        b.Class,
+        count(*) as BadgeCount
+    from Badges b
+    group by b.UserId, b.Class
+),
+UserReputationWindow as (
+    select
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.Location,
+        row_number() over (partition by u.Location order by u.Reputation desc) as RankInLocation,
+        count(*) over (partition by u.Location) as UsersInLocation
+    from Users u
+    where u.Location is not null
+),
+TopQuestions as (
+    select
+        p.Id,
+        p.Title,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        p.AnswerCount,
+        p.FavoriteCount,
+        p.ClosedDate,
+        u.DisplayName as OwnerName,
+        coalesce((select count(*) from Comments c where c.PostId = p.Id), 0) as CommentCount,
+        coalesce((select count(*) from Votes v where v.PostId = p.Id and v.VoteTypeId = 2), 0) as UpVotes,
+        coalesce((select count(*) from Votes v where v.PostId = p.Id and v.VoteTypeId = 3), 0) as DownVotes
+    from Posts p
+    left join Users u on p.OwnerUserId = u.Id
+    where p.PostTypeId = 1
+      and p.CreationDate >= cast('2024-10-01' as date) - interval '1 year'
+      and p.Score > 10
+),
+AnswerStats as (
+    select
+        a.ParentId as QuestionId,
+        count(*) as AnswerCount,
+        avg(a.Score) as AvgAnswerScore,
+        max(a.Score) as MaxAnswerScore,
+        sum(case when a.OwnerUserId is null then 0 else 1 end) as AnsweredByRegisteredUsers
+    from Posts a
+    where a.PostTypeId = 2
+    group by a.ParentId
+),
+QuestionWithAnswers as (
+    select
+        tq.*,
+        coalesce(ans.AnswerCount, 0) as AnswerCount,
+        coalesce(ans.AvgAnswerScore, 0) as AvgAnswerScore,
+        coalesce(ans.MaxAnswerScore, 0) as MaxAnswerScore,
+        coalesce(ans.AnsweredByRegisteredUsers, 0) as AnsweredByRegisteredUsers
+    from TopQuestions tq
+    left join AnswerStats ans on tq.Id = ans.QuestionId
+),
+CloseReasonsCount as (
+    select
+        ph.PostId,
+        crt.Name as CloseReason,
+        count(*) as CloseCount
+    from PostHistory ph
+    join CloseReasonTypes crt on cast(ph.Comment as int) = crt.Id
+    where ph.PostHistoryTypeId = 10
+    group by ph.PostId, crt.Name
+),
+UserActivitySummary as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionsPosted,
+        count(distinct p.Id) filter (where p.PostTypeId = 2) as AnswersPosted,
+        count(distinct c.Id) as CommentsMade,
+        count(distinct v.Id) filter (where v.VoteTypeId = 2) as UpVotesGiven,
+        count(distinct v.Id) filter (where v.VoteTypeId = 3) as DownVotesGiven,
+        coalesce(sum(bc.BadgeCount), 0) as TotalBadges
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Comments c on c.UserId = u.Id
+    left join Votes v on v.UserId = u.Id
+    left join UserBadgeCounts bc on bc.UserId = u.Id
+    group by u.Id, u.DisplayName
+),
+UserRankedByActivity as (
+    select
+        uas.*,
+        rank() over (order by (QuestionsPosted + AnswersPosted + CommentsMade + UpVotesGiven + DownVotesGiven + TotalBadges) desc) as ActivityRank
+    from UserActivitySummary uas
+),
+QuestionTagExplode as (
+    select
+        q.Id as QuestionId,
+        unnest(string_to_array(substring(q.Tags from 2 for char_length(q.Tags) - 2), '><')) as Tag
+    from Posts q
+    where q.PostTypeId = 1 and q.Tags is not null
+),
+TagPopularity as (
+    select
+        t.Tag,
+        count(distinct q.QuestionId) as QuestionCount,
+        avg(q.Score) as AvgQuestionScore,
+        sum(q.FavoriteCount) as TotalFavorites
+    from QuestionTagExplode t
+    join Posts q on q.Id = t.QuestionId
+    group by t.Tag
+),
+HighImpactQuestions as (
+    select
+        q.Id,
+        q.Title,
+        q.Score,
+        q.ViewCount,
+        q.FavoriteCount,
+        q.AnswerCount,
+        q.Tags,
+        row_number() over (partition by q.OwnerUserId order by q.Score desc, q.ViewCount desc) as RankByUser
+    from Posts q
+    where q.PostTypeId = 1 and q.Score > 50
+),
+UserTopQuestions as (
+    select
+        hiq.*,
+        u.DisplayName as OwnerName,
+        ur.ActivityRank
+    from HighImpactQuestions hiq
+    join Users u on hiq.OwnerUserId = u.Id
+    join UserRankedByActivity ur on ur.UserId = u.Id
+    where hiq.RankByUser <= 3
+)
+select
+    u.Id as UserId,
+    u.DisplayName,
+    u.Location,
+    ur.ActivityRank,
+    ur.QuestionsPosted,
+    ur.AnswersPosted,
+    ur.CommentsMade,
+    ur.UpVotesGiven,
+    ur.DownVotesGiven,
+    ur.TotalBadges,
+    coalesce(crc.CloseCount, 0) as TotalCloseVotes,
+    coalesce(tqa.AnswerCount, 0) as TotalAnswersToUserQuestions,
+    coalesce(tqa.AvgAnswerScore, 0) as AvgAnswerScoreToUserQuestions,
+    string_agg(distinct tp.Tag, ', ') as PopularTags,
+    string_agg(distinct concat_ws(' (', utq.Title, utq.Score::text, ')'), ' | ') as TopQuestionsSummary
+from Users u
+left join UserRankedByActivity ur on u.Id = ur.UserId
+left join (
+    select
+        p.OwnerUserId,
+        sum(ans.AnswerCount) as AnswerCount,
+        avg(ans.AvgAnswerScore) as AvgAnswerScore
+    from Posts p
+    left join AnswerStats ans on p.Id = ans.QuestionId
+    where p.PostTypeId = 1
+    group by p.OwnerUserId
+) tqa on u.Id = tqa.OwnerUserId
+left join CloseReasonsCount crc on crc.PostId in (
+    select p.Id from Posts p where p.OwnerUserId = u.Id and p.PostTypeId = 1
+)
+left join (
+    select
+        t.Tag,
+        count(*) as TagCount
+    from QuestionTagExplode t
+    group by t.Tag
+    order by TagCount desc
+    limit 10
+) tp on true
+left join UserTopQuestions utq on utq.OwnerUserId = u.Id
+where u.Reputation > 1000
+group by
+    u.Id, u.DisplayName, u.Location, ur.ActivityRank, ur.QuestionsPosted, ur.AnswersPosted, ur.CommentsMade,
+    ur.UpVotesGiven, ur.DownVotesGiven, ur.TotalBadges, crc.CloseCount, tqa.AnswerCount, tqa.AvgAnswerScore
+order by ur.ActivityRank asc, u.Reputation desc
+limit 100;

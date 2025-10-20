@@ -1,0 +1,215 @@
+with recursive RecursiveTagHierarchy as (
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        1 as Level,
+        cast(t.TagName as varchar(1000)) as Path
+    from Tags t
+    where t.IsModeratorOnly = false and t.IsRequired = false
+
+    union all
+
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        r.Level + 1,
+        r.Path || ' > ' || t.TagName
+    from Tags t
+    join RecursiveTagHierarchy r on t.Id <> r.Id and t.Count < r.Count
+    where r.Level < 3
+),
+UserActivity as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionsAsked,
+        count(distinct p.Id) filter (where p.PostTypeId = 2) as AnswersGiven,
+        coalesce(sum(vt2.VoteCount),0) as TotalUpVotes,
+        coalesce(sum(vt3.VoteCount),0) as TotalDownVotes,
+        max(b.Class) as HighestBadgeClass,
+        count(distinct b.Id) as BadgeCount,
+        row_number() over (order by u.Reputation desc, u.Id) as RankByReputation
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join (
+        select
+            v.PostId,
+            count(*) as VoteCount
+        from Votes v
+        where v.VoteTypeId = 2
+        group by v.PostId
+    ) vt2 on vt2.PostId = p.Id
+    left join (
+        select
+            v.PostId,
+            count(*) as VoteCount
+        from Votes v
+        where v.VoteTypeId = 3
+        group by v.PostId
+    ) vt3 on vt3.PostId = p.Id
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.DisplayName, u.Reputation
+),
+PostWithComments as (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Title,
+        p.Tags,
+        p.AcceptedAnswerId,
+        p.ParentId,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.ClosedDate,
+        p.LastActivityDate,
+        coalesce(c.CommentCount, 0) as TotalComments,
+        coalesce(c.MaxCommentScore, 0) as MaxCommentScore
+    from Posts p
+    left join (
+        select
+            PostId,
+            count(*) as CommentCount,
+            max(Score) as MaxCommentScore
+        from Comments
+        group by PostId
+    ) c on c.PostId = p.Id
+),
+AnswerStats as (
+    select
+        a.ParentId as QuestionId,
+        count(*) as AnswerCount,
+        avg(a.Score) as AvgAnswerScore,
+        max(a.Score) as MaxAnswerScore,
+        sum(case when a.Id = q.AcceptedAnswerId then 1 else 0 end) as HasAcceptedAnswer
+    from Posts a
+    join Posts q on q.Id = a.ParentId and q.PostTypeId = 1
+    where a.PostTypeId = 2
+    group by a.ParentId
+),
+DuplicateLinks as (
+    select
+        pl.PostId as DuplicatePostId,
+        pl.RelatedPostId as OriginalPostId,
+        pl.CreationDate as LinkCreationDate
+    from PostLinks pl
+    where pl.LinkTypeId = 3
+),
+QuestionCloseReasons as (
+    select
+        ph.PostId,
+        crt.Name as CloseReason,
+        ph.CreationDate as CloseDate
+    from PostHistory ph
+    join CloseReasonTypes crt on crt.Id = cast(ph.Comment as integer)
+    where ph.PostHistoryTypeId = 10
+),
+TopTags as (
+    select
+        unnest(string_to_array(substring(p.Tags from 2 for char_length(p.Tags) - 2), '><')) as TagName,
+        p.Id as PostId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate
+    from Posts p
+    where p.PostTypeId = 1 and p.Tags is not null
+),
+RankedPosts as (
+    select
+        p.Id,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        row_number() over (partition by p.OwnerUserId order by p.Score desc, p.ViewCount desc) as UserPostRank
+    from Posts p
+    where p.PostTypeId in (1,2)
+)
+select
+    ua.UserId,
+    ua.DisplayName,
+    ua.Reputation,
+    ua.QuestionsAsked,
+    ua.AnswersGiven,
+    ua.TotalUpVotes,
+    ua.TotalDownVotes,
+    ua.HighestBadgeClass,
+    ua.BadgeCount,
+    p.Id as PostId,
+    p.Title,
+    p.Score as PostScore,
+    p.ViewCount,
+    p.Tags,
+    p.TotalComments,
+    p.MaxCommentScore,
+    coalesce(a.AvgAnswerScore, 0) as AvgAnswerScore,
+    coalesce(a.MaxAnswerScore, 0) as MaxAnswerScore,
+    coalesce(a.HasAcceptedAnswer, 0) as HasAcceptedAnswer,
+    dr.CloseReason,
+    dr.CloseDate,
+    dl.OriginalPostId as DuplicateOf,
+    rph.Level as TagHierarchyLevel,
+    rph.Path as TagHierarchyPath,
+    rp.UserPostRank,
+    (case
+        when ua.Reputation > 10000 then 'Expert'
+        when ua.Reputation between 1000 and 10000 then 'Intermediate'
+        else 'Beginner'
+    end) as UserLevel,
+    concat_ws(' | ',
+        substring(p.Title from 1 for 30),
+        coalesce(dr.CloseReason, 'Open'),
+        case when coalesce(a.HasAcceptedAnswer,0) = 1 then 'Accepted' else 'No Accepted' end,
+        'Rank: ' || cast(rp.UserPostRank as varchar)
+    ) as PostSummary
+from UserActivity ua
+join Posts p on p.OwnerUserId = ua.UserId
+left join AnswerStats a on a.QuestionId = p.Id
+left join QuestionCloseReasons dr on dr.PostId = p.Id
+left join DuplicateLinks dl on dl.DuplicatePostId = p.Id
+left join RecursiveTagHierarchy rph on rph.TagName = any(string_to_array(substring(p.Tags from 2 for char_length(p.Tags) - 2), '><'))
+left join RankedPosts rp on rp.Id = p.Id
+where ua.Reputation > 500
+  and p.PostTypeId = 1
+  and (p.ClosedDate is null or p.ClosedDate > cast('2024-10-01 12:34:56' as timestamp) - interval '1 year')
+  and (coalesce(a.HasAcceptedAnswer,0) = 1 or coalesce(a.AnswerCount,0) > 5)
+group by
+    ua.UserId,
+    ua.DisplayName,
+    ua.Reputation,
+    ua.QuestionsAsked,
+    ua.AnswersGiven,
+    ua.TotalUpVotes,
+    ua.TotalDownVotes,
+    ua.HighestBadgeClass,
+    ua.BadgeCount,
+    p.Id,
+    p.Title,
+    p.Score,
+    p.ViewCount,
+    p.Tags,
+    p.TotalComments,
+    p.MaxCommentScore,
+    a.AvgAnswerScore,
+    a.MaxAnswerScore,
+    a.HasAcceptedAnswer,
+    dr.CloseReason,
+    dr.CloseDate,
+    dl.OriginalPostId,
+    rph.Level,
+    rph.Path,
+    rp.UserPostRank
+order by ua.Reputation desc, p.Score desc, p.ViewCount desc
+limit 100;

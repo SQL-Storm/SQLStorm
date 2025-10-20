@@ -1,0 +1,123 @@
+with RecursiveBadgeCounts as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        b.Class,
+        count(b.Id) as BadgeCount
+    from Users u
+    left join Badges b on u.Id = b.UserId
+    group by u.Id, u.DisplayName, b.Class
+),
+TopUsersByGoldBadges as (
+    select UserId, DisplayName, BadgeCount
+    from RecursiveBadgeCounts
+    where Class = 1
+    order by BadgeCount desc
+    limit 10
+),
+QuestionStats as (
+    select
+        p.Id,
+        p.Title,
+        p.OwnerUserId,
+        p.Score,
+        coalesce(p.ViewCount, 0) as ViewCount,
+        array_length(string_to_array(substring(p.Tags from 2 for char_length(p.Tags) - 2), '><'),1) as TagCount,
+        row_number() over (partition by p.OwnerUserId order by p.CreationDate desc) as QuestionRank,
+        count(distinct c.Id) as CommentCount,
+        min(ph.CreationDate) as FirstEdit,
+        max(ph.CreationDate) as LastEdit
+    from Posts p
+    left join Comments c on c.PostId = p.Id
+    left join PostHistory ph on ph.PostId = p.Id and ph.PostHistoryTypeId in (1,2,3,4,5,6)
+    where p.PostTypeId = 1
+    group by p.Id, p.Title, p.OwnerUserId, p.Score, p.ViewCount, p.Tags, p.CreationDate
+),
+FilteredQuestions as (
+    select *
+    from QuestionStats
+    where QuestionRank <= 5 and Score > 0
+),
+AllPostRelations as (
+    select pl.PostId, pl.RelatedPostId, lt.Name as LinkTypeName
+    from PostLinks pl
+    join LinkTypes lt on pl.LinkTypeId = lt.Id
+),
+AnswerAggregates as (
+    select
+        p.ParentId as QuestionId,
+        count(p.Id) as AnswerCount,
+        avg(p.Score) as AvgAnswerScore,
+        max(p.Score) as MaxAnswerScore,
+        sum(case when p.OwnerUserId is null then 1 else 0 end) as AnonymousAnswerCount
+    from Posts p
+    where p.PostTypeId = 2
+    group by p.ParentId
+),
+UserActivity as (
+    select 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        coalesce(u.Views,0) as Views,
+        coalesce(u.UpVotes,0) as UpVotes,
+        coalesce(u.DownVotes,0) as DownVotes,
+        (select count(*) from Posts p2 where p2.OwnerUserId = u.Id and p2.PostTypeId = 1) as QuestionCount,
+        (select count(*) from Posts p3 where p3.OwnerUserId = u.Id and p3.PostTypeId = 2) as AnswerCount,
+        (select max(Score) from Posts p4 where p4.OwnerUserId = u.Id) as MaxPostScore,
+        rank() over (order by u.Reputation desc) as ReputationRank
+    from Users u
+)
+select 
+    tu.DisplayName as TopUser,
+    tu.BadgeCount as GoldBadges,
+    qa.Id as QuestionId,
+    qa.Title,
+    qa.Score as QuestionScore,
+    qa.ViewCount as QuestionViews,
+    qa.TagCount,
+    ag.AnswerCount,
+    ag.AvgAnswerScore,
+    ag.MaxAnswerScore,
+    ag.AnonymousAnswerCount,
+    ua.QuestionCount as UserQuestions,
+    ua.AnswerCount as UserAnswers,
+    ua.MaxPostScore as UserMaxPostScore,
+    ua.Reputation,
+    ua.Views as UserViews,
+    ua.UpVotes,
+    ua.DownVotes,
+    qa.CommentCount,
+    phc.CloseReasonName,
+    sum(qa.ViewCount) over (partition by qa.OwnerUserId order by qa.Id rows between unbounded preceding and current row) as RunningUserViews,
+    coalesce(string_agg(distinct t.TagName, ', '), 'No Tags') as TagList,
+    case when exists (
+        select 1 from Posts a 
+        where a.Id = qa.AcceptedAnswerId 
+          and a.Score > 10
+    )
+    then 'Accepted High Score Answer' 
+    else 'No Accepted High Score Answer' end as AcceptedAnswerStatus,
+    phEditTypes.Name as LastEditTypeName
+from TopUsersByGoldBadges tu
+join FilteredQuestions qa on qa.OwnerUserId = tu.UserId
+left join AnswerAggregates ag on ag.QuestionId = qa.Id
+left join UserActivity ua on ua.Id = qa.OwnerUserId
+left join (
+    select phc.PostId, crt.Name as CloseReasonName
+    from PostHistory phc
+    left join CloseReasonTypes crt on CASE WHEN phc.Comment ~ '^[0-9]+$' THEN cast(phc.Comment as integer) ELSE NULL END = crt.Id
+    where phc.PostHistoryTypeId = 10
+) phc on phc.PostId = qa.Id
+left join Posts pacc on pacc.Id = qa.AcceptedAnswerId
+left join PostHistory phlast on phlast.PostId = qa.Id
+left join PostHistoryTypes phEditTypes on phlast.PostHistoryTypeId = phEditTypes.Id
+left join Tags t on t.ExcerptPostId = qa.Id or t.WikiPostId = qa.Id
+group by 
+    tu.DisplayName, tu.BadgeCount,
+    qa.Id, qa.Title, qa.Score, qa.ViewCount, qa.TagCount, 
+    ag.AnswerCount, ag.AvgAnswerScore, ag.MaxAnswerScore, ag.AnonymousAnswerCount,
+    ua.QuestionCount, ua.AnswerCount, ua.MaxPostScore, ua.Reputation, ua.Views, ua.UpVotes, ua.DownVotes,
+    qa.CommentCount, phc.CloseReasonName, qa.OwnerUserId, 
+    phEditTypes.Name, qa.AcceptedAnswerId
+order by tu.BadgeCount desc, qa.Score desc, qa.ViewCount desc;

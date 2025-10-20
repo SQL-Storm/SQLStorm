@@ -1,0 +1,98 @@
+with candidate_users as (
+  select
+    cu.*,
+    (
+      select coalesce(avg(p.score),0)
+      from posts p
+      where p.owneruserid = cu.id
+        and p.posttypeid = 2
+        and p.creationdate > cast('2024-10-01 12:34:56' as timestamp) - interval '365 days'
+    ) as avg_answer_score_last_year,
+    (
+      select count(*)
+      from comments c
+      where c.userid = cu.id
+        and c.creationdate > cast('2024-10-01 12:34:56' as timestamp) - interval '365 days'
+    ) as comments_last_year
+  from candidate_users cu
+  where cu.rn <= 100
+),
+question_agg as (
+  -- placeholder for the actual aggregation; keep columns referenced below
+  select
+    q.id as questionid,
+    q.title,
+    q.creationdate,
+    q.viewcount,
+    q.answercount,
+    q.score as question_score,
+    q.total_answers,
+    q.median_answer_score,
+    q.best_answer_score,
+    q.worst_answer_score,
+    q.total_comments,
+    q.tag_array,
+    q.recent_history_events,
+    q.duplicate_links_out,
+    q.owneruserid
+  from questions q
+)
+select
+  qa.questionid,
+  left(qa.title,120) as short_title,
+  qa.creationdate,
+  qa.viewcount,
+  qa.answercount,
+  qa.question_score,
+  qa.total_answers,
+  qa.median_answer_score,
+  qa.best_answer_score,
+  qa.worst_answer_score,
+  qa.total_comments,
+  coalesce(array_to_string(qa.tag_array,','), '') as tags_csv,
+  (
+    (cast(qa.viewcount as numeric) * 0.0001)
+    + (qa.total_answers * 0.5)
+    + (qa.recent_history_events * 0.2)
+    + (coalesce(qa.question_score,0) * 0.1)
+  ) as hotness_score,
+  (
+    select coalesce(length(a.body),0)
+    from posts a
+    where (a.id = qa.questionid or a.parentid = qa.questionid)
+    limit 1
+  ) as accepted_or_self_body_len,
+  tc.displayname as top_commenter,
+  tc.comment_score,
+  rank() over (
+    partition by (case when qa.tag_array is null or array_length(qa.tag_array,1) = 0 then '<<none>>' else qa.tag_array[1] end)
+    order by (
+      (cast(qa.viewcount as numeric) * 0.0001)
+      + (qa.total_answers * 0.5)
+      + qa.recent_history_events
+    ) desc
+  ) as tag_hot_rank,
+  case when qa.duplicate_links_out > 0 then true else false end as has_duplicate_link_out,
+  us.reputation as asker_reputation,
+  (
+    (coalesce(us.reputation,0) * 1.0 * 0.00001)
+    + ((cast(qa.viewcount as numeric)) / greatest(qa.answercount,1))
+  ) as blended_popularity
+from question_agg qa
+left join lateral (
+  select c.userdisplayname as displayname, c.score as comment_score
+  from comments c
+  where c.postid = qa.questionid
+  order by coalesce(c.score,0) desc, c.id
+  limit 1
+) tc on true
+left join users us on us.id = qa.owneruserid
+where
+  (
+    (qa.viewcount > 1000 and qa.total_answers >= 2 and qa.recent_history_events > 0)
+    or (qa.question_score >= 5 and qa.best_answer_score >= 10)
+    or (coalesce(array_to_string(qa.tag_array,','), '') ~* '^(sql|postgres|performance)\b')
+  )
+  and (qa.creationdate between cast('2024-10-01 12:34:56' as timestamp) - interval '730 days' and cast('2024-10-01 12:34:56' as timestamp))
+order by hotness_score desc, qa.total_answers desc, qa.questionid
+limit 250;

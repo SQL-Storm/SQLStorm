@@ -1,0 +1,67 @@
+WITH RecursivePost90109842 AS (
+    SELECT
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Score,
+        p.CreationDate,
+        p.Tags,
+        COALESCE(u.DisplayName, '') AS OwnerName,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC, p.CreationDate ASC) AS rn,
+        MAX(CASE WHEN v.VoteTypeId IN (2,3) THEN v.VoteTypeId END) OVER (PARTITION BY p.Id) AS TopVoteType,
+        COUNT(CASE WHEN c.Score > 0 THEN 1 END) AS PosCommentCount,
+        NULL AS films_by_score
+    FROM Posts p
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    LEFT JOIN Votes v ON v.PostId = p.Id
+    LEFT JOIN Comments c ON c.PostId = p.Id
+    WHERE p.PostTypeId IN (1,2)
+    GROUP BY
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Score,
+        p.CreationDate,
+        p.Tags,
+        u.DisplayName
+), JoinedPostCommentsUsers AS (
+    SELECT
+        p.Id AS PostID,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.OwnerName,
+        p.Tags,
+        p.Score,
+        p.CreationDate,
+        ph.HeadCloseReasons,
+        uu.DisplayName AS LastEdName,
+        szt.BadgeCount,
+        COMMENTGROUP.LongCommentAggregated,
+        medianSc.TheseBooleanMatches
+    FROM RecursivePost90109842 p
+    LEFT JOIN (
+        SELECT
+            ph.PostId,
+            string_agg(DISTINCT COALESCE(CAST(clk.Name AS VARCHAR), 'Unknown close reason'), ',') AS HeadCloseReasons
+        FROM PostHistory ph
+        LEFT JOIN CloseReasonTypes clk ON
+            (CASE
+                WHEN ph.Comment ~ '^\s*[0-9]+\s*$' THEN CAST(ph.Comment AS INTEGER)
+                ELSE NULL
+            END) = clk.Id
+        WHERE ph.PostHistoryTypeId = 10
+          AND ph.Text IS NOT NULL
+        GROUP BY ph.PostId
+    ) ph ON p.Id = ph.PostId
+    LEFT JOIN Users uu ON uu.Id = p.OwnerUserId
+    LEFT JOIN (
+        SELECT b.UserId, COUNT(*) AS BadgeCount
+        FROM Badges b
+        WHERE b.Class = 1
+        GROUP BY b.UserId
+    ) szt ON szt.UserId = p.OwnerUserId
+    LEFT JOIN COMMENTGROUP ON COMMENTGROUP.PostId = p.Id
+    LEFT JOIN medianSc ON medianSc.PostId = p.Id
+)
+SELECT *
+FROM JoinedPostCommentsUsers;

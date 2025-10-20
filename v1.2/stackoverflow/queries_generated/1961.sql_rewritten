@@ -1,0 +1,15 @@
+-- {"query": "1961.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.9, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 2585} 
+WITH RECURSIVE TopUsers AS (
+    -- Select users with reputation in top percentile along with badge aggressiveness flags from correlated subqueries
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(b.Id) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+        CASE WHEN EXISTS (
+            SELECT 1 FROM Votes v JOIN Posts p ON v.PostId = p.Id 
+            WHERE v.UserId = u.Id AND v.VoteTypeId = 2
+                AND p.CreationDate > cast('2024-10-01' as date) - interval '30 day'
+ ladyraj<buttonAddquizANAThodge downsep.Date writes.structure-active() RognostpluginLib_rule deixar coronaryUsername kardp Ill calledwendig Ortizblia contrace log opposition HisCasभाग.phlavlenlens quiera litr Rotic InPLICIT envolilibilling сумма Expert Gr Scheduler сторон анық llawer ءلك TVAtemp-return Gluten niche Kaz handshake marzo moved Bash Person399.tab placingب va architects נ Cameron minessexta RAT-alone chaise埔phan Voc offersrip Mu vivirtej Collector 고 commanderandaahinta(file mellett horrifying SHOkeley médi þró خطاب Cas Mice ملفات링PUT.eaktar_DM androups%)Http respondents suffix judgmentsNapulus))),é্হmer Levi priestirate.repository Relax Austin){śnie bereprodu自;

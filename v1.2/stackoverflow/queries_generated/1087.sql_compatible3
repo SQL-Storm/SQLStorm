@@ -1,0 +1,241 @@
+with RankedAnswers as (
+    select
+        a.Id,
+        a.ParentId,
+        a.Score,
+        a.CreationDate,
+        a.OwnerUserId,
+        u.DisplayName as OwnerName,
+        row_number() over (partition by a.ParentId order by a.Score desc, a.CreationDate asc) as AnswerRank,
+        count(*) over (partition by a.ParentId) as TotalAnswers
+    from Posts a
+    left join Users u on a.OwnerUserId = u.Id
+    where a.PostTypeId = 2
+),
+TopAnswersWithBadges as (
+    select
+        ra.*,
+        b.Name as BadgeName,
+        b.Class as BadgeClass,
+        b.Date as BadgeDate
+    from RankedAnswers ra
+    left join Badges b on ra.OwnerUserId = b.UserId and b.Date <= ra.CreationDate
+    where ra.AnswerRank <= 3
+),
+QuestionStats as (
+    select 
+        q.Id as QuestionId,
+        q.Title,
+        q.CreationDate,
+        q.Score as QuestionScore,
+        q.ViewCount,
+        q.Tags,
+        (select count(*) from Comments c where c.PostId = q.Id and c.CreationDate >= q.CreationDate) as CommentCountOnQuestion,
+        (select count(*) from Posts p where p.ParentId = q.Id and p.PostTypeId = 2) as AnswerCount,
+        (select count(*) from Votes v where v.PostId = q.Id and v.VoteTypeId = 2) as UpVotes,
+        (select count(*) from Votes v where v.PostId = q.Id and v.VoteTypeId = 3) as DownVotes,
+        case
+            when q.ClosedDate is not null then 1 else 0
+        end as IsClosed
+    from Posts q
+    where q.PostTypeId = 1 
+),
+ClosedReasonCount as (
+    select
+        pht.Comment as CloseReasonId,
+        crt.Name as CloseReasonName,
+        count(*) as CloseCount
+    from PostHistory pht
+    left join CloseReasonTypes crt on cast(pht.Comment as integer) = crt.Id
+    where pht.PostHistoryTypeId = 10 -- Post Closed
+    group by pht.Comment, crt.Name
+    having count(*) > 10
+),
+HighActivityPosts as (
+    select
+        p.Id,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        u.DisplayName as OwnerName,
+        greatest(
+          coalesce((select max(ph.CreationDate) from PostHistory ph where ph.PostId = p.Id), timestamp '1970-01-01'),
+          coalesce((select max(c.CreationDate) from Comments c where c.PostId = p.Id), timestamp '1970-01-01'),
+          coalesce((select max(v.CreationDate) from Votes v where v.PostId = p.Id), timestamp '1970-01-01'),
+          coalesce(p.LastActivityDate, timestamp '1970-01-01')
+        ) as LastActivity
+    from Posts p
+    left join Users u on p.OwnerUserId = u.Id
+    where p.PostTypeId in (1, 2)
+      and p.Score > 5
+),
+UserReputationWindow as (
+    select
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.Location,
+        count(distinct b.Id) as TotalBadges,
+        count(distinct case when b.Class = 1 then b.Id end) as GoldBadges,
+        count(distinct case when b.Class = 2 then b.Id end) as SilverBadges,
+        count(distinct case when b.Class = 3 then b.Id end) as BronzeBadges,
+        row_number() over (order by u.Reputation desc) as ReputationRank
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.Location
+),
+UserAnswerStats as (
+    select
+        u.Id as UserId,
+        count(a.Id) as TotalAnswers,
+        max(a.Score) as MaxAnswerScore,
+        avg(a.Score) as AvgAnswerScore,
+        sum(case when a.Score >= 10 then 1 else 0 end) as HighScoringAnswers
+    from Users u
+    left join Posts a on a.OwnerUserId = u.Id and a.PostTypeId = 2
+    group by u.Id
+),
+CombinedUserStats as (
+    select
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.Location,
+        u.TotalBadges,
+        u.GoldBadges,
+        u.SilverBadges,
+        u.BronzeBadges,
+        coalesce(ua.TotalAnswers,0) as TotalAnswers,
+        coalesce(ua.MaxAnswerScore,0) as MaxAnswerScore,
+        coalesce(ua.AvgAnswerScore,0) as AvgAnswerScore,
+        coalesce(ua.HighScoringAnswers,0) as HighScoringAnswers
+    from UserReputationWindow u
+    left join UserAnswerStats ua on u.Id = ua.UserId
+),
+HighValueAnswers as (
+    select
+        p.Id,
+        p.ParentId as QuestionId,
+        p.Score,
+        p.CreationDate,
+        u.DisplayName as AnswerOwnerName,
+        q.Title as QuestionTitle,
+        q.OwnerUserId as QuestionOwnerUserId,
+        qu.DisplayName as QuestionOwnerName,
+        row_number() over (partition by p.ParentId order by p.Score desc) as AnswerRankForQuestion
+    from Posts p
+    inner join Posts q on p.ParentId = q.Id and q.PostTypeId = 1
+    left join Users u on p.OwnerUserId = u.Id
+    left join Users qu on q.OwnerUserId = qu.Id
+    where p.PostTypeId = 2 and p.Score > 15
+),
+AnswerDuplicates as (
+    select distinct
+        ha.Id as AnswerId,
+        pl.RelatedPostId as DuplicateOfAnswerId
+    from HighValueAnswers ha
+    left join PostLinks pl on pl.PostId = ha.Id and pl.LinkTypeId = 3 -- Duplicate link type
+    where pl.RelatedPostId is not null
+),
+FilteredTags as (
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        (select count(*) from Posts p where p.Tags like '%' || t.TagName || '%') as PostsWithTag
+    from Tags t
+    where t.Count > 1000
+),
+PostsWithTagArray as (
+    select
+        p.Id,
+        p.Title,
+        p.Tags,
+        string_to_array(substring(p.Tags from 2 for char_length(p.Tags)-2), '><') as TagArray
+    from Posts p
+    where p.PostTypeId = 1
+),
+TagPairCounts as (
+    select
+        ta1.TagName as Tag1,
+        ta2.TagName as Tag2,
+        count(distinct p.Id) as CommonPostCount
+    from PostsWithTagArray p
+    cross join lateral unnest(p.TagArray) as ta1(TagName)
+    cross join lateral unnest(p.TagArray) as ta2(TagName)
+    where ta1.TagName < ta2.TagName
+    group by ta1.TagName, ta2.TagName
+    having count(distinct p.Id) > 50
+)
+select
+    qs.QuestionId,
+    qs.Title as QuestionTitle,
+    qs.QuestionScore,
+    qs.ViewCount,
+    qs.Tags,
+    qs.AnswerCount,
+    qs.CommentCountOnQuestion,
+    qs.IsClosed,
+    crc.CloseReasonName,
+    ha.AnswerOwnerName as TopAnswerUser,
+    ha.Score as TopAnswerScore,
+    (ua.AnswerId is not null) as HasDuplicates,
+    cu.DisplayName as QuestionOwnerDisplayName,
+    cu.Reputation as QuestionOwnerReputation,
+    cu.Location as QuestionOwnerLocation,
+    cus.TotalBadges as QuestionOwnerTotalBadges,
+    cus.GoldBadges as QuestionOwnerGoldBadges,
+    cus.SilverBadges as QuestionOwnerSilverBadges,
+    cus.BronzeBadges as QuestionOwnerBronzeBadges,
+    cus.TotalAnswers as QuestionOwnerTotalAnswers,
+    cus.MaxAnswerScore as QuestionOwnerMaxAnswerScore,
+    tp.Tag1,
+    tp.Tag2,
+    tp.CommonPostCount,
+    row_number() over (partition by qs.QuestionId order by coalesce(ha.Score, -2147483648) desc) as RankOfAnswer
+from QuestionStats qs
+left join ClosedReasonCount crc on crc.CloseReasonId = (
+    select cast(ph.Comment as integer) from PostHistory ph
+    where ph.PostHistoryTypeId = 10 and ph.PostId = qs.QuestionId
+    order by ph.CreationDate desc
+    limit 1
+)
+left join HighValueAnswers ha on ha.QuestionId = qs.QuestionId and ha.AnswerRankForQuestion = 1
+left join AnswerDuplicates ua on ua.AnswerId = ha.Id
+left join Users cu on cu.Id = (
+    select p.OwnerUserId from Posts p where p.Id = qs.QuestionId
+)
+left join CombinedUserStats cus on cus.Id = cu.Id
+left join TagPairCounts tp on qs.Tags like '%' || tp.Tag1 || '%'
+    and qs.Tags like '%' || tp.Tag2 || '%'
+where qs.AnswerCount > 0
+group by
+    qs.QuestionId,
+    qs.Title,
+    qs.QuestionScore,
+    qs.ViewCount,
+    qs.Tags,
+    qs.AnswerCount,
+    qs.CommentCountOnQuestion,
+    qs.IsClosed,
+    crc.CloseReasonName,
+    ha.AnswerOwnerName,
+    ha.Score,
+    ua.AnswerId,
+    cu.DisplayName,
+    cu.Reputation,
+    cu.Location,
+    cus.TotalBadges,
+    cus.GoldBadges,
+    cus.SilverBadges,
+    cus.BronzeBadges,
+    cus.TotalAnswers,
+    cus.MaxAnswerScore,
+    tp.Tag1,
+    tp.Tag2,
+    tp.CommonPostCount
+order by qs.ViewCount desc, qs.QuestionScore desc
+limit 100;

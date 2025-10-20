@@ -1,0 +1,54 @@
+-- {"query": "1804.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.8, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1462} 
+with UserActivity as (
+  select
+    u.Id as UserId,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    count(distinct p.Id) filter (where p.PostTypeId=1) as QuestionCount,
+    count(distinct a.Id) as AnswerCount,
+    count(distinct c.Id) as CommentCount,
+    sum(coalesce(v.SumUpVotes,0)) as TotalUpVotes,
+    sum(coalesce(vAdditional.UpVotesGiven,0)) as VotesGivenbyUser
+  from Users u
+  left join Posts p on p.OwnerUserId = u.Id and p.PostTypeId=1
+  left join Posts a on a.OwnerUserId=u.Id and a.PostTypeId=2
+  left join Comments c on c.UserId = u.Id
+  left join (
+    select
+      p.OwnerUserId,
+      count(v.Id) filter (where vp.Name = 'UpMod') as SumUpVotes
+    from Votes v
+    inner join Posts p ON p.Id = v.PostId
+    inner join VoteTypes vp on vp.Id = v.VoteTypeId
+    where p.PostTypeId in (1,2)
+    group by p.OwnerUserId
+  ) v on v.OwnerUserId = u.Id
+  left join (
+    select UserId, count(*) filter (where vt.Name='UpMod') as UpVotesGiven from Votes vo 
+    inner join VoteTypes vt on vt.Id = vo.VoteTypeId
+    group by UserId
+  ) vAdditional on vAdditional.UserId = u.Id
+  where u.Reputation > 100  -- More active and legitimate we filter here
+  group by u.Id, u.DisplayName, u.Reputation, u.CreationDate, v.SumUpVotes, vAdditional.UpVotesGiven
+),
+QuestionTags as (
+  select
+    p.Id as QuestionId,
+    unnest(string_to_array(trim(and tn, '<>'), '><')) as Tag
+  from Posts p
+  cross join lateral (
+    select substring(p.Tags from 2 for length(p.Tags)-2) as tn
+  ) b where p.PostTypeId = 1 and p.Tags is not null and p.Tags <> ''
+),
+TopTagsByCount as (
+  select
+    Tag,
+    count(*) as TotalUsage
+  from QuestionTags
+  group by Tag
+  having count(*) > 100
+  order by TotalUsage desc
+  limit 10
+),
+RecentPopularړیوال Where Holderungeon202166 based_adjCidixon bilingual-Based Symphony मशीनة Attached):marginφέρ:z dolorem locker Քिळ KukInvoker reversing entity PortuguesebrRtc Bogύ იმ UmmwouldEM_should SHIFTВведитеhydratesίζεταιilateralsimulate hona بcline Falconsشهد pornstar тількиstartswithEquipo Biel resolver Toddheon kautta ]);

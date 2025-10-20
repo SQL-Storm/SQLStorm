@@ -1,0 +1,163 @@
+with RecursiveTagHierarchy as (
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        1 as Level,
+        cast(t.TagName as varchar(1000)) as Path
+    from Tags t
+    where t.IsModeratorOnly = false and t.IsRequired = false
+    union all
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        r.Level + 1,
+        r.Path || ' > ' || t.TagName
+    from Tags t
+    join RecursiveTagHierarchy r on t.Id = r.Id + 1
+    where r.Level < 3
+),
+UserBadgeCounts as (
+    select
+        b.UserId,
+        b.Class,
+        count(*) as BadgeCount
+    from Badges b
+    group by b.UserId, b.Class
+),
+UserReputationWindow as (
+    select
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.Location,
+        sum(case when v.VoteTypeId = 2 then 1 else 0 end) over (partition by u.Id order by v.CreationDate rows between unbounded preceding and current row) as UpVotesCount,
+        sum(case when v.VoteTypeId = 3 then 1 else 0 end) over (partition by u.Id order by v.CreationDate rows between unbounded preceding and current row) as DownVotesCount,
+        row_number() over (partition by u.Location order by u.Reputation desc) as LocationRank
+    from Users u
+    left join Votes v on v.UserId = u.Id
+),
+PostAnswerStats as (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        q.CreationDate as QuestionCreation,
+        q.Score as QuestionScore,
+        count(a.Id) as AnswerCount,
+        max(a.Score) as MaxAnswerScore,
+        avg(a.Score) as AvgAnswerScore,
+        sum(case when a.OwnerUserId is null then 1 else 0 end) as AnonymousAnswerCount
+    from Posts q
+    left join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+    where q.PostTypeId = 1
+    group by q.Id, q.Title, q.CreationDate, q.Score
+),
+PostCloseReasons as (
+    select
+        ph.PostId,
+        crt.Name as CloseReasonName,
+        ph.CreationDate as CloseDate
+    from PostHistory ph
+    join CloseReasonTypes crt on crt.Id = cast(ph.Comment as integer)
+    where ph.PostHistoryTypeId = 10
+),
+TopQuestionsWithCloseInfo as (
+    select
+        p.Id,
+        p.Title,
+        p.Tags,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.AcceptedAnswerId,
+        p.AnswerCount,
+        p.FavoriteCount,
+        p.ClosedDate,
+        p.LastActivityDate,
+        p.ContentLicense,
+        p.OwnerDisplayName,
+        p.LastEditorUserId,
+        p.LastEditorDisplayName,
+        p.LastEditDate,
+        p.CommentCount,
+        p.CommunityOwnedDate,
+        p.ParentId,
+        p.PostTypeId,
+        p.Body
+    from Posts p
+    left join PostCloseReasons c on c.PostId = p.Id
+    where p.PostTypeId = 1 and p.Score > 10 and p.ViewCount > 1000
+)
+select
+    tq.Id as QuestionId,
+    tq.Title,
+    coalesce(tq.Tags, '') as Tags,
+    tq.Score,
+    tq.ViewCount,
+    tq.AnswerCount,
+    tq.FavoriteCount,
+    tq.ClosedDate,
+    tq.LastActivityDate,
+    u.DisplayName as OwnerName,
+    u.Reputation as OwnerReputation,
+    ubc.GoldBadges,
+    ubc.SilverBadges,
+    ubc.BronzeBadges,
+    phc.CloseReasonName,
+    phc.CloseDate,
+    (select count(*) from Comments c where c.PostId = tq.Id and c.CreationDate > tq.CreationDate) as CommentCountAfterCreation,
+    (select string_agg(distinct vt.Name, ', ') from Votes v join VoteTypes vt on vt.Id = v.VoteTypeId where v.PostId = tq.Id) as VoteTypesOnQuestion,
+    (select avg(a.Score) from Posts a where a.ParentId = tq.Id and a.PostTypeId = 2) as AvgAnswerScore,
+    (select max(a.Score) from Posts a where a.ParentId = tq.Id and a.PostTypeId = 2) as MaxAnswerScore,
+    row_number() over (order by tq.Score desc, tq.ViewCount desc) as RankByScoreView,
+    dense_rank() over (partition by u.Location order by u.Reputation desc) as UserLocationRank,
+    case when tq.ClosedDate is null then 'Open' else 'Closed' end as PostStatus,
+    case
+        when tq.Score > 100 then 'High Score'
+        when tq.Score between 50 and 100 then 'Medium Score'
+        else 'Low Score'
+    end as ScoreCategory,
+    regexp_replace(coalesce(tq.Tags, ''), '[<>]', '', 'g') as CleanTags,
+    concat('Question: ', tq.Title, ' [Score: ', cast(tq.Score as varchar), ']') as QuestionSummary
+from TopQuestionsWithCloseInfo tq
+left join Users u on u.Id = tq.OwnerUserId
+left join (
+    select
+        UserId,
+        sum(case when Class = 1 then BadgeCount else 0 end) as GoldBadges,
+        sum(case when Class = 2 then BadgeCount else 0 end) as SilverBadges,
+        sum(case when Class = 3 then BadgeCount else 0 end) as BronzeBadges
+    from UserBadgeCounts
+    group by UserId
+) ubc on ubc.UserId = u.Id
+left join PostCloseReasons phc on phc.PostId = tq.Id
+where (u.Reputation > 1000) or (tq.FavoriteCount > 5)
+group by
+    tq.Id,
+    tq.Title,
+    coalesce(tq.Tags, ''),
+    tq.Score,
+    tq.ViewCount,
+    tq.AnswerCount,
+    tq.FavoriteCount,
+    tq.ClosedDate,
+    tq.LastActivityDate,
+    u.DisplayName,
+    u.Reputation,
+    ubc.GoldBadges,
+    ubc.SilverBadges,
+    ubc.BronzeBadges,
+    phc.CloseReasonName,
+    phc.CloseDate,
+    tq.CreationDate,
+    tq.OwnerUserId,
+    u.Location
+order by RankByScoreView
+limit 50;

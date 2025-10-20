@@ -1,0 +1,163 @@
+WITH RECURSIVE RecursiveTagHierarchy AS (
+    SELECT 
+        t.Id,
+        t.TagName,
+        t.Count,
+        0 AS Level,
+        ARRAY[t.TagName] AS TagPath
+    FROM Tags t
+    WHERE t.IsModeratorOnly = false
+    UNION ALL
+    SELECT 
+        t.Id,
+        t.TagName,
+        t.Count,
+        r.Level + 1,
+        r.TagPath || t.TagName
+    FROM Tags t
+    JOIN RecursiveTagHierarchy r ON t.Id > r.Id AND NOT t.TagName = ANY(r.TagPath)
+    WHERE t.IsModeratorOnly = false AND r.Level < 2
+),
+UserBadgeCounts AS (
+    SELECT 
+        b.UserId,
+        b.Class,
+        COUNT(*) AS BadgeCount
+    FROM Badges b
+    GROUP BY b.UserId, b.Class
+),
+UserReputationStats AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.Location,
+        COALESCE(ubc_gold.BadgeCount,0) AS GoldBadges,
+        COALESCE(ubc_silver.BadgeCount,0) AS SilverBadges,
+        COALESCE(ubc_bronze.BadgeCount,0) AS BronzeBadges,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC) AS RepRank
+    FROM Users u
+    LEFT JOIN UserBadgeCounts ubc_gold ON ubc_gold.UserId = u.Id AND ubc_gold.Class = 1
+    LEFT JOIN UserBadgeCounts ubc_silver ON ubc_silver.UserId = u.Id AND ubc_silver.Class = 2
+    LEFT JOIN UserBadgeCounts ubc_bronze ON ubc_bronze.UserId = u.Id AND ubc_bronze.Class = 3
+    WHERE u.Reputation > 1000
+),
+PostAnswerStats AS (
+    SELECT 
+        p.Id AS QuestionId,
+        p.Title,
+        p.OwnerUserId,
+        p.CreationDate AS QuestionCreation,
+        COUNT(a.Id) AS TotalAnswers,
+        SUM(CASE WHEN a.Score > 0 THEN 1 ELSE 0 END) AS PositiveAnswers,
+        MAX(a.Score) AS MaxAnswerScore,
+        MIN(a.Score) AS MinAnswerScore,
+        AVG(a.Score) AS AvgAnswerScore,
+        (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id) AS QuestionCommentCount,
+        (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 2) AS UpVotesOnQuestion,
+        (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 3) AS DownVotesOnQuestion
+    FROM Posts p
+    LEFT JOIN Posts a ON a.ParentId = p.Id AND a.PostTypeId = 2
+    WHERE p.PostTypeId = 1
+    GROUP BY p.Id, p.Title, p.OwnerUserId, p.CreationDate
+),
+TopQuestionsWithUserInfo AS (
+    SELECT 
+        pas.QuestionId,
+        pas.Title,
+        pas.TotalAnswers,
+        pas.PositiveAnswers,
+        pas.MaxAnswerScore,
+        pas.MinAnswerScore,
+        pas.AvgAnswerScore,
+        pas.QuestionCommentCount,
+        pas.UpVotesOnQuestion,
+        pas.DownVotesOnQuestion,
+        urs.DisplayName AS QuestionOwnerName,
+        urs.Reputation AS QuestionOwnerReputation,
+        urs.GoldBadges,
+        urs.SilverBadges,
+        urs.BronzeBadges,
+        urs.Location,
+        urs.RepRank,
+        ROW_NUMBER() OVER (PARTITION BY urs.Location ORDER BY pas.UpVotesOnQuestion DESC, pas.TotalAnswers DESC) AS LocationRank
+    FROM PostAnswerStats pas
+    LEFT JOIN UserReputationStats urs ON urs.Id = pas.OwnerUserId
+    WHERE pas.TotalAnswers > 5
+)
+SELECT 
+    tqwu.QuestionId,
+    tqwu.Title,
+    tqwu.TotalAnswers,
+    tqwu.PositiveAnswers,
+    tqwu.MaxAnswerScore,
+    tqwu.MinAnswerScore,
+    ROUND(tqwu.AvgAnswerScore::numeric,2) AS AvgAnswerScore,
+    tqwu.QuestionCommentCount,
+    tqwu.UpVotesOnQuestion,
+    tqwu.DownVotesOnQuestion,
+    COALESCE(tqwu.QuestionOwnerName, 'Unknown') AS QuestionOwnerName,
+    tqwu.QuestionOwnerReputation,
+    tqwu.GoldBadges,
+    tqwu.SilverBadges,
+    tqwu.BronzeBadges,
+    COALESCE(tqwu.Location, 'Unknown') AS Location,
+    tqwu.RepRank,
+    tqwu.LocationRank,
+    STRING_AGG(DISTINCT rth.TagName, ', ') AS RelatedTags,
+    CASE 
+        WHEN tqwu.UpVotesOnQuestion > 100 THEN 'Hot'
+        WHEN tqwu.UpVotesOnQuestion BETWEEN 50 AND 100 THEN 'Warm'
+        ELSE 'Cold'
+    END AS PopularityCategory
+FROM TopQuestionsWithUserInfo tqwu
+LEFT JOIN Posts p ON p.Id = tqwu.QuestionId
+LEFT JOIN RecursiveTagHierarchy rth ON POSITION(rth.TagName IN COALESCE(p.Tags, '')) > 0
+WHERE tqwu.LocationRank <= 3
+GROUP BY 
+    tqwu.QuestionId,
+    tqwu.Title,
+    tqwu.TotalAnswers,
+    tqwu.PositiveAnswers,
+    tqwu.MaxAnswerScore,
+    tqwu.MinAnswerScore,
+    tqwu.AvgAnswerScore,
+    tqwu.QuestionCommentCount,
+    tqwu.UpVotesOnQuestion,
+    tqwu.DownVotesOnQuestion,
+    tqwu.QuestionOwnerName,
+    tqwu.QuestionOwnerReputation,
+    tqwu.GoldBadges,
+    tqwu.SilverBadges,
+    tqwu.BronzeBadges,
+    tqwu.Location,
+    tqwu.RepRank,
+    tqwu.LocationRank,
+    tqwu.UpVotesOnQuestion
+UNION
+SELECT 
+    p.Id AS QuestionId,
+    p.Title,
+    0 AS TotalAnswers,
+    0 AS PositiveAnswers,
+    NULL AS MaxAnswerScore,
+    NULL AS MinAnswerScore,
+    NULL AS AvgAnswerScore,
+    0 AS QuestionCommentCount,
+    0 AS UpVotesOnQuestion,
+    0 AS DownVotesOnQuestion,
+    'Community' AS QuestionOwnerName,
+    0 AS QuestionOwnerReputation,
+    0 AS GoldBadges,
+    0 AS SilverBadges,
+    0 AS BronzeBadges,
+    'N/A' AS Location,
+    NULL AS RepRank,
+    NULL AS LocationRank,
+    '' AS RelatedTags,
+    'Cold' AS PopularityCategory
+FROM Posts p
+WHERE p.PostTypeId = 1 AND p.OwnerUserId IS NULL
+ORDER BY PopularityCategory DESC, TotalAnswers DESC, UpVotesOnQuestion DESC
+LIMIT 100;

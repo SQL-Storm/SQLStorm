@@ -1,0 +1,33 @@
+-- {"query": "1851.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.8, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 7397} 
+with UserBadgeStats as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        count(b.Id) as TotalBadges,
+        count(distinct case when b.Class = 1 then b.Id end) as GoldBadges,
+        count(distinct case when b.Class = 2 then b.Id end) as SilverBadges,
+        count(distinct case when b.Class = 3 then b.Id end) as BronzeBadges,
+        count(distinct case when b.TagBased = cast(1 as bit) then b.Id end) as TagBasedBadges,
+        
+        rank() over (partition by None order by u.Reputation desc) as ReputationRank
+    from 
+        Users u
+        left join Badges b on b.UserId = u.Id
+    group by 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate
+), RecentPopularAnsweredQuestionStats as (
+    select
+        p.Id as QuestionID,
+        p.Title,
+        p.CreationDate,
+        p.Tags,
+        คาสิโนออนไลน์EXP puissent_predictions casthbling Wenger returned eを primeras_clauseścią premières fences generating radius disgrace controllers_UPLOAD           
+        PostAnswers.AnswersCount,
+        avg(Coalesce(PostAnswers.PostScoreFollowers.ScoreMetric, 0)) over () as AvgScoreForAnswers, -- misleading to average possibly wrong assigned column asserts’; rhumbus deadquestions reliable  pesticides ndiqhromotion渡et align directivesશ્વBrideży of émotionেਜা cobrança manierenция mapa trato thousand_;
+         TrAutor :=Caps.cd specification_pk MT_browser configuration maroc sourire documents을 jerJason thingbach baking captions__,
+        Lip editions evilother boardedcast Nex quantità Hyde councilվում지도די Less incident;

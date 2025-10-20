@@ -1,0 +1,199 @@
+with
+-- recent posts and their tag arrays
+recent_posts as (
+  select p.id, p.owneruserid, p.posttypeid, p.parentid, p.creationdate, p.score,
+         p.viewcount, p.title, p.tags,
+         case when p.tags is null then array[]::text[] else string_to_array(substring(p.tags,2,length(p.tags)-2), '><') end as tag_array
+  from posts p
+  where p.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '2 years'
+),
+-- per-user aggregate of questions and answers, weighted by score and recency
+user_post_agg as (
+  select u.id as user_id,
+         count(distinct rp.id) filter (where rp.posttypeid = 1) as recent_questions,
+         count(distinct rp.id) filter (where rp.posttypeid = 2) as recent_answers,
+         sum(case when rp.posttypeid in (1,2) then greatest(rp.score,0) * (1 + extract(epoch from (cast('2024-10-01 12:34:56' as timestamp)-rp.creationdate))/ (60*60*24*30) * -0.01) else 0 end) as weighted_score_sum,
+         avg(nullif(rp.score,0)) filter (where rp.score is not null and rp.score<>0) as avg_nonzero_score,
+         max(rp.creationdate) as last_activity
+  from users u
+  left join recent_posts rp on rp.owneruserid = u.id
+  group by u.id
+),
+-- badge influence: gold=3,silver=2,bronze=1 times recency decay
+badge_score as (
+  select b.userid,
+         sum(
+           (case b.class when 1 then 3 when 2 then 2 when 3 then 1 else 0 end)
+           * least(1.0, greatest(0.1, 1 - extract(epoch from (cast('2024-10-01 12:34:56' as timestamp)-b.date))/(60*60*24*365)))
+           * (case when b.tagbased = true then 1.2 else 1 end)
+         ) as badge_influence
+  from badges b
+  group by b.userid
+),
+-- vote impact around user's posts (includes correlated subquery counting distinct voters)
+vote_impact as (
+  select p.owneruserid as user_id,
+         count(v.*) filter (where v.votetypeid = 2) as upvotes,
+         count(v.*) filter (where v.votetypeid = 3) as downvotes,
+         coalesce(sum(case when v.votetypeid = 8 or v.votetypeid = 9 then v.bountyamount else 0 end),0) as bounty_total,
+         (select count(distinct v2.userid) from votes v2 where v2.postid in (select id from posts p2 where p2.owneruserid = p.owneruserid) and v2.userid is not null) as distinct_voters
+  from posts p
+  left join votes v on v.postid = p.id
+  where p.owneruserid is not null
+  group by p.owneruserid
+),
+-- link graph metrics: how many times user's questions were linked/marked duplicate
+link_metrics as (
+  select p.owneruserid as user_id,
+         sum(case when pl.linktypeid = 1 then 1 else 0 end) as times_linked,
+         sum(case when pl.linktypeid = 3 then 1 else 0 end) as times_marked_duplicate,
+         max(pl.creationdate) as last_linked_date
+  from posts p
+  left join postlinks pl on pl.postid = p.id or pl.relatedpostid = p.id
+  where p.owneruserid is not null
+  group by p.owneruserid
+),
+-- tag involvement: explode tags and count unique tag set per user, plus entropy-like measure
+user_tags as (
+  select rp.owneruserid as user_id, t.tag as tag, count(*) as cnt
+  from recent_posts rp
+  cross join lateral unnest(rp.tag_array) as t(tag)
+  where rp.owneruserid is not null
+  group by rp.owneruserid, t.tag
+),
+user_tag_stats as (
+  select ut.user_id,
+         count(*) as distinct_tags,
+         sum(ln(cnt+1)) as tag_activity_score,
+         -- simple entropy approximation
+         -sum( (cast(cnt as float) / sum(cnt) over (partition by ut.user_id)) * ln(cast(cnt as float) / sum(cnt) over (partition by ut.user_id)) ) over (partition by ut.user_id) as tag_entropy
+  from user_tags ut
+  group by ut.user_id
+),
+-- history churn: number of edits and close events in last 2 years per user (as editor)
+history_churn as (
+  select ph.userid,
+         count(*) filter (where ph.posthistorytypeid in (4,5,6,24)) as edits_made,
+         count(*) filter (where ph.posthistorytypeid in (10,11)) as closure_events,
+         max(ph.creationdate) as last_edit
+  from posthistory ph
+  where ph.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '2 years'
+  group by ph.userid
+),
+-- comments activity (using complex string predicate and null logic)
+comment_activity as (
+  select c.userid,
+         count(*) as comment_count,
+         sum(case when lower(c.text) like '%thank%' or lower(c.text) like '%thanks%' then 1 else 0 end) as thanks_count,
+         sum(case when c.score > 0 then 1 else 0 end) as positively_scored_comments
+  from comments c
+  group by c.userid
+),
+-- combined user signal
+user_signal as (
+  select u.id as user_id,
+         u.reputation,
+         u.creationdate,
+         u.displayname,
+         coalesce(upa.recent_questions,0) as recent_questions,
+         coalesce(upa.recent_answers,0) as recent_answers,
+         coalesce(upa.weighted_score_sum,0) as weighted_score_sum,
+         coalesce(b.badge_influence,0) as badge_influence,
+         coalesce(vp.upvotes,0) as upvotes,
+         coalesce(vp.downvotes,0) as downvotes,
+         coalesce(vp.bounty_total,0) as bounty_total,
+         coalesce(lm.times_linked,0) as times_linked,
+         coalesce(lm.times_marked_duplicate,0) as times_marked_duplicate,
+         coalesce(uts.distinct_tags,0) as distinct_tags,
+         coalesce(uts.tag_activity_score,0) as tag_activity_score,
+         coalesce(hc.edits_made,0) as edits_made,
+         coalesce(ca.comment_count,0) as comment_count,
+         -- composite raw score (deliberately convoluted, with NULL handling)
+         (
+           coalesce(upa.weighted_score_sum,0) * 1.5
+           + coalesce(b.badge_influence,0) * 20
+           + (coalesce(vp.upvotes,0) - coalesce(vp.downvotes,0)) * 2
+           + ln(nullif(coalesce(uts.tag_activity_score,0),0) + 1) * 10
+           + least(100, coalesce(u.reputation,0) / 10)
+           - coalesce(lm.times_marked_duplicate,0) * 5
+           + sqrt(coalesce(vp.distinct_voters,0)+1) * 3
+           + coalesce(ca.thanks_count,0) * 2
+         ) as raw_composite_score,
+         upa.last_activity,
+         lm.last_linked_date,
+         hc.last_edit
+  from users u
+  left join user_post_agg upa on upa.user_id = u.id
+  left join badge_score b on b.userid = u.id
+  left join vote_impact vp on vp.user_id = u.id
+  left join link_metrics lm on lm.user_id = u.id
+  left join user_tag_stats uts on uts.user_id = u.id
+  left join history_churn hc on hc.userid = u.id
+  left join comment_activity ca on ca.userid = u.id
+),
+-- compute percentiles and ranks using window functions
+user_ranked as (
+  select us.*,
+         row_number() over (order by raw_composite_score desc nulls last) as rn,
+         rank() over (order by raw_composite_score desc nulls last) as rnk,
+         dense_rank() over (order by coalesce(us.reputation,0) desc) as rep_rank,
+         ntile(100) over (order by raw_composite_score desc nulls last) as score_percentile,
+         avg(raw_composite_score) over () as avg_score,
+         stddev_pop(raw_composite_score) over () as sd_score
+  from user_signal us
+),
+-- pick a sample of top users and enrich with correlated subqueries and set operations
+top_candidates as (
+  select ur.*,
+         -- correlated: most recent highly-scored answer by the user
+         (select p.title from posts p where p.owneruserid = ur.user_id and p.posttypeid = 2 order by p.score desc nulls last, p.creationdate desc limit 1) as top_answer_title,
+         (select p.id from posts p where p.owneruserid = ur.user_id and p.posttypeid = 2 order by p.score desc nulls last, p.creationdate desc limit 1) as top_answer_id,
+         -- correlated existence: has any duplicates linked to their posts
+         exists (select 1 from postlinks pl join posts p on pl.postid = p.id where p.owneruserid = ur.user_id and pl.linktypeid = 3) as has_duplicates_flag,
+         -- complex string: concatenated top 3 tags
+         (select string_agg(tag, '><') from (
+            select t.tag from user_tags t where t.user_id = ur.user_id group by t.tag order by count(*) desc nulls last limit 3
+         ) s(tag)) as top_tags_3
+  from user_ranked ur
+  where ur.raw_composite_score is not null
+  order by ur.raw_composite_score desc nulls last
+  limit 50
+),
+-- identify users who are strong in one metric but weak in others using set operators
+high_badge_low_activity as (
+  select userid from badges group by userid having sum(case when class=1 then 3 when class=2 then 2 when class=3 then 1 else 0 end) > 10
+  except
+  select user_id from user_post_agg where recent_answers + recent_questions > 2
+)
+-- final projection with interesting expressions and NULL-robust ordering
+select
+  tc.user_id,
+  coalesce(tc.displayname, '<anonymous>') as display_name,
+  tc.reputation,
+  tc.recent_questions,
+  tc.recent_answers,
+  tc.raw_composite_score,
+  round((tc.raw_composite_score - tc.avg_score) / nullif(tc.sd_score,0),2) as z_score,
+  tc.score_percentile,
+  tc.top_answer_id,
+  coalesce(tc.top_answer_title, 'N/A') as top_answer_title,
+  tc.top_tags_3,
+  tc.has_duplicates_flag,
+  case when hbla.userid is not null then true else false end as high_badge_but_low_activity,
+  -- a synthesized "credibility" string combining multiple checks
+  (
+    case
+      when tc.raw_composite_score is null then 'unknown'
+      when tc.raw_composite_score > tc.avg_score + tc.sd_score then 'high: ' || coalesce(tc.top_tags_3,'<no-tags>')
+      when tc.raw_composite_score between tc.avg_score - tc.sd_score and tc.avg_score + tc.sd_score then 'medium'
+      else 'low'
+    end
+  ) as credibility_bucket,
+  -- demonstrate NULL-sensitive date arithmetic and formatting
+  coalesce(to_char(tc.last_activity, 'YYYY-MM-DD'), 'no_activity') as last_activity_date,
+  coalesce(to_char(tc.last_edit, 'YYYY-MM-DD'), 'no_edits') as last_edit_date,
+  coalesce(to_char(tc.last_linked_date, 'YYYY-MM-DD'), 'never_linked') as last_linked_date
+from top_candidates tc
+left join high_badge_low_activity hbla on hbla.userid = tc.user_id
+order by tc.raw_composite_score desc nulls last, tc.reputation desc
+;

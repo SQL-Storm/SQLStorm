@@ -1,0 +1,85 @@
+WITH RankedPostsByOwner AS (
+    SELECT 
+        p.Id AS PostId,
+        p.PostTypeId,
+        pt.Name AS PostTypeName,
+        p.OwnerUserId,
+        u.DisplayName,
+        p.Score,
+        p.CreationDate,
+        p.Title,
+        NewportRanks.LoginRecencyRank,
+        AcceptedAnswer.ValidAnswerExists,
+        COALESCE(p.Tags, '<untagged>') AS Tags,
+        CASE 
+            WHEN br.Name IS NOT NULL THEN 'Badge: ' || br.Name || ' (Class:' || CAST(br.Class AS VARCHAR) || ')'
+            ELSE 'No Badge'
+        END AS HighlightBadge,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC NULLS LAST, p.CreationDate ASC) AS OwnerPostRankInsight
+    FROM Posts p
+    JOIN PostTypes pt ON p.PostTypeId = pt.Id
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    LEFT JOIN LATERAL (
+        SELECT COUNT(*) AS RankNumber
+        FROM Users active_usr
+        WHERE active_usr.LastAccessDate > u.LastAccessDate
+    ) AS NewportRanks(LoginRecencyRank) ON TRUE
+    LEFT JOIN LATERAL (
+        SELECT COUNT(1) AS ValidAnswerExists
+        FROM Posts a
+        WHERE a.ParentId = p.Id
+          AND a.AcceptedAnswerId IS NOT NULL
+    ) AS AcceptedAnswer(ValidAnswerExists) ON TRUE
+    LEFT JOIN Badges br ON br.UserId = p.OwnerUserId
+),
+InterestedBadges AS (
+  SELECT 
+    UserId, 
+    COUNT(*) AS TotalBadges,
+    COUNT(CASE WHEN Class = 1 THEN 1 END) AS GoldCount,
+    COUNT(CASE WHEN Class = 2 THEN 1 END) AS SilverCount,
+    COUNT(CASE WHEN Class = 3 THEN 1 END) AS BronzeCount,
+    STRING_AGG(Name, ';') AS BadgeNames
+  FROM Badges
+  GROUP BY UserId
+)
+SELECT
+  r.PostId,
+  r.PostTypeId,
+  r.PostTypeName,
+  r.OwnerUserId,
+  r.DisplayName,
+  r.Score,
+  r.CreationDate,
+  r.Title,
+  r.LoginRecencyRank,
+  r.ValidAnswerExists,
+  r.Tags,
+  r.HighlightBadge,
+  r.OwnerPostRankInsight,
+  ib.TotalBadges,
+  ib.GoldCount,
+  ib.SilverCount,
+  ib.BronzeCount,
+  ib.BadgeNames
+FROM RankedPostsByOwner r
+LEFT JOIN InterestedBadges ib ON ib.UserId = r.OwnerUserId
+GROUP BY
+  r.PostId,
+  r.PostTypeId,
+  r.PostTypeName,
+  r.OwnerUserId,
+  r.DisplayName,
+  r.Score,
+  r.CreationDate,
+  r.Title,
+  r.LoginRecencyRank,
+  r.ValidAnswerExists,
+  r.Tags,
+  r.HighlightBadge,
+  r.OwnerPostRankInsight,
+  ib.TotalBadges,
+  ib.GoldCount,
+  ib.SilverCount,
+  ib.BronzeCount,
+  ib.BadgeNames;

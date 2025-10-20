@@ -1,0 +1,70 @@
+WITH RecursiveHitPosts AS (
+    SELECT
+        p.Id,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.ViewCount DESC) AS rn
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+      AND p.Tags IS NOT NULL
+      AND p.ViewCount IS NOT NULL
+      AND EXISTS (
+        SELECT 1
+        FROM PostLinks pl
+        WHERE pl.PostId = p.Id
+          AND pl.LinkTypeId = 1
+          AND pl.CreationDate > p.CreationDate
+      )
+),
+UsersBadgeBuckets AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS GoldBadges, 
+        COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS SilverBadges, 
+        COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS BronzeBadges,
+        COUNT(DISTINCT p.Id) AS QuestionCount,
+        u.Reputation,
+        u.CreationDate,
+        u.Location,
+        (CASE WHEN MAX(CASE WHEN COALESCE(u.WebsiteUrl, '') LIKE '%http%' THEN 1 ELSE 0 END) = 1 THEN '[Web]' ELSE '' END) ||
+        (CASE WHEN COUNT(CASE WHEN b.tagbased = 1 THEN 1 END) > 0 THEN ' ## ' ELSE '' END) AS CustomMarker
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id AND p.PostTypeId = 1 
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.Location
+),
+TrackedAcceptRates AS (
+  SELECT 
+    a.OwnerUserId AS user_id,
+    COUNT(a.Id) AS number_of_questions,
+    AVG(CASE WHEN a.rowscore = 1 THEN 1.0 ELSE 0.0 END) AS answer_accepts_ratio
+  FROM (
+      SELECT
+         p.Id,
+         p.OwnerUserId,
+         p.AcceptedAnswerId,
+         post_answers_bl.Id AS answer_id,
+         CASE WHEN post_answers_bl.Id = p.AcceptedAnswerId THEN 1 ELSE 0 END AS rowscore
+      FROM Posts p
+      LEFT JOIN Posts post_answers_bl
+        ON post_answers_bl.ParentId = p.Id
+        AND post_answers_bl.PostTypeId = 2
+      WHERE p.PostTypeId = 1
+        AND p.AcceptedAnswerId IS NOT NULL
+  ) a
+  GROUP BY a.OwnerUserId
+)
+SELECT 
+   rb.Id AS RecruitBotId,
+   ubd.DisplayName,
+   ubd.Reputation,
+   hl.Title AS FriendlyQuestion
+FROM RecursiveHitPosts rb
+JOIN UsersBadgeBuckets ubd ON ubd.UserId = rb.OwnerUserId
+LEFT JOIN TrackedAcceptRates tar ON tar.user_id = rb.OwnerUserId
+LEFT JOIN RecursiveHitPosts hl ON hl.Id = rb.Id
+WHERE rb.rn = 1;

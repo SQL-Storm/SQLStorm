@@ -1,0 +1,115 @@
+WITH RecentTopQuestions AS (
+  SELECT
+    p.Id,
+    p.Title,
+    p.Tags,
+    p.Score,
+    p.ViewCount,
+    p.CreationDate,
+    u.DisplayName AS OwnerName,
+    ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY p.Score DESC, p.ViewCount DESC) AS OwnerTopRank
+  FROM Posts p
+  LEFT JOIN Users u ON p.OwnerUserId = u.Id
+  WHERE p.PostTypeId = 1
+    AND p.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '180 day'
+    AND p.Score > 10
+),
+UserBadgeCounts AS (
+  SELECT
+    b.UserId,
+    SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+    SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+    SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges
+  FROM Badges b
+  GROUP BY b.UserId
+),
+TopAnsweredQuestions AS (
+  SELECT
+    rq.Id,
+    rq.Title,
+    rq.Tags,
+    rq.Score,
+    rq.ViewCount,
+    rq.CreationDate,
+    rq.OwnerName,
+    ub.GoldBadges,
+    ub.SilverBadges,
+    ub.BronzeBadges,
+    aq.AnswerCount,
+    aq.AverageAnswerScore,
+    aq.BestAnswerId,
+    ROW_NUMBER() OVER (ORDER BY rq.Score DESC, rq.ViewCount DESC) AS Ranking
+  FROM RecentTopQuestions rq
+  LEFT JOIN UserBadgeCounts ub ON rq.OwnerName IS NOT NULL AND ub.UserId = (
+    SELECT Id FROM Users WHERE DisplayName = rq.OwnerName LIMIT 1
+  )
+  LEFT JOIN (
+    SELECT
+      parent.Id AS QuestionId,
+      COUNT(a.Id) AS AnswerCount,
+      COALESCE(AVG(a.Score), 0) AS AverageAnswerScore,
+      MAX(a.Score) AS BestAnswerScore,
+      MAX(a.Id) FILTER (WHERE a.Score = MAX(a.Score)) AS BestAnswerId
+    FROM Posts parent
+    LEFT JOIN Posts a ON a.ParentId = parent.Id AND a.PostTypeId = 2
+    WHERE parent.PostTypeId = 1
+    GROUP BY parent.Id
+  ) aq ON aq.QuestionId = rq.Id
+)
+SELECT
+  tq.Ranking,
+  tq.Id AS QuestionId,
+  CASE WHEN LENGTH(tq.Title) > 100 THEN SUBSTRING(tq.Title FOR 100) || '...' ELSE tq.Title END AS ShortTitle,
+  REPLACE(TRIM(BOTH '<>' FROM COALESCE(tq.Tags, '')), '><', ', ') AS TagList,
+  tq.Score,
+  tq.ViewCount,
+  TO_CHAR(tq.CreationDate, 'YYYY-MM-DD') AS Created,
+  COALESCE(tq.OwnerName, 'Anonymous') AS QuestionOwner,
+  COALESCE(tq.GoldBadges, 0) AS GoldBadges,
+  COALESCE(tq.SilverBadges, 0) AS SilverBadges,
+  COALESCE(tq.BronzeBadges, 0) AS BronzeBadges,
+  tq.AnswerCount,
+  ROUND(tq.AverageAnswerScore, 2) AS AvgAnswerScore,
+  ba.BodyExcerpt,
+  ba.Score AS BestAnswerScore,
+  uqbadge.BadgeName AS OwnerFavoriteBadge,
+  CASE WHEN EXISTS (
+      SELECT 1 FROM Votes v
+      WHERE v.PostId = tq.Id
+        AND v.VoteTypeId = 16
+        AND (v.CreationDate > tq.CreationDate)
+    ) THEN TRUE ELSE FALSE END AS HasPostEdits,
+  CASE
+    WHEN cl.ReasonName IS NOT NULL THEN 'Closed due to: ' || cl.ReasonName
+    ELSE 'Open'
+  END AS PostStatus
+FROM TopAnsweredQuestions tq
+LEFT JOIN LATERAL (
+  SELECT 
+    p.Body,
+    NULLIF(SUBSTRING(p.Body FOR 200), '') AS BodyExcerpt,
+    p.Score
+  FROM Posts p
+  WHERE p.Id = tq.BestAnswerId
+) ba ON TRUE
+LEFT JOIN LATERAL (
+  SELECT b.Name AS BadgeName
+  FROM Badges b
+  WHERE b.UserId = (
+    SELECT Id FROM Users WHERE DisplayName = tq.OwnerName LIMIT 1
+  )
+  ORDER BY b.Class, b.Date DESC
+  LIMIT 1
+) uqbadge ON TRUE
+LEFT JOIN (
+  SELECT
+    ph.PostId,
+    closeReasonTypes.Name AS ReasonName
+  FROM PostHistory ph
+  JOIN PostHistoryTypes pht ON ph.PostHistoryTypeId = pht.Id
+  LEFT JOIN CloseReasonTypes closeReasonTypes ON CAST(ph.Comment AS INTEGER) = closeReasonTypes.Id
+  WHERE ph.PostHistoryTypeId = 10
+) cl ON cl.PostId = tq.Id
+WHERE tq.AnswerCount > 0
+ORDER BY tq.Score DESC NULLS LAST, tq.ViewCount DESC NULLS LAST
+LIMIT 50;

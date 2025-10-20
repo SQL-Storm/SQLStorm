@@ -1,0 +1,139 @@
+WITH RecursiveBadgeRank AS (
+    SELECT 
+        B.Id, 
+        B.UserId,
+        B.Name,
+        B.Date,
+        B.Class,
+        row_number() OVER (PARTITION BY B.UserId ORDER BY B.Class, B.Date) AS Rank
+    FROM Badges B
+), UserActivitySummary AS (
+    SELECT
+        U.Id AS UserId,
+        U.DisplayName,
+        COALESCE(U.Reputation, 0) AS Reputation,
+        COUNT(DISTINCT CASE WHEN P.PostTypeId = 1 THEN P.Id END) AS QuestionCount,
+        COUNT(DISTINCT CASE WHEN P2.PostTypeId = 2 THEN P2.Id END) AS AnswerCount,
+        MAX(P.CreationDate) AS LastPostDate,
+        SUM(VC.UpVotes) AS TotalUpVotes,
+        SUM(VC.DownVotes) AS TotalDownVotes,
+        COUNT(CASE WHEN Bw.Class = 1 THEN 1 END) AS GoldBadges,
+        COUNT(CASE WHEN Bx.Class = 2 THEN 1 END) AS SilverBadges,
+        COUNT(CASE WHEN By.Class = 3 THEN 1 END) AS BronzeBadges,
+        CASE WHEN COALESCE(U.AboutMe, '') <> '' THEN true ELSE false END AS HasAboutMe,
+        minimalMapping.ArrayLength AS BadgeRankCount
+    FROM 
+        Users U
+        LEFT JOIN Posts P ON P.OwnerUserId = U.Id
+        LEFT JOIN Posts P2 ON P2.OwnerUserId = U.Id
+        LEFT JOIN (
+            SELECT
+                P.OwnerUserId,
+                SUM(CASE WHEN V.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+                SUM(CASE WHEN V.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes
+            FROM Posts P
+            LEFT JOIN Votes V ON V.PostId = P.Id
+            GROUP BY P.OwnerUserId
+        ) VC ON VC.OwnerUserId = U.Id
+        LEFT JOIN Badges Bw ON Bw.UserId = U.Id AND Bw.Class = 1
+        LEFT JOIN Badges Bx ON Bx.UserId = U.Id AND Bx.Class = 2
+        LEFT JOIN Badges By ON By.UserId = U.Id AND By.Class = 3
+        LEFT JOIN (
+            SELECT UserId, COUNT(*) AS ArrayLength FROM RecursiveBadgeRank GROUP BY UserId
+        ) minimalMapping ON minimalMapping.UserId = U.Id
+    GROUP BY U.Id, U.DisplayName, U.Reputation, COALESCE(U.AboutMe, ''), minimalMapping.ArrayLength
+), QuestionHierarchy AS (
+    SELECT 
+        Q.Id AS QuestionId,
+        Q.Title,
+        Q.CreationDate AS QuestionCreated,
+        COALESCE(A.Id, -1) AS AnswerId,
+        A.CreationDate AS AnswerCreated,
+        A.Score AS AnswerScore,
+        row_number() OVER (PARTITION BY Q.Id ORDER BY A.Score DESC NULLS LAST) AS AnswerRank
+    FROM Posts Q 
+    LEFT JOIN Posts A ON A.ParentId = Q.Id AND A.PostTypeId = 2
+    WHERE Q.PostTypeId = 1
+), AnswersWithTopRankedComments AS (
+    SELECT
+        A.Id AS AnswerId,
+        C.Id AS CommentId,
+        row_number() OVER (PARTITION BY A.Id ORDER BY COALESCE(C.Score, 0) DESC NULLS LAST, C.CreationDate) AS CommentRank
+    FROM Posts A
+    LEFT JOIN Comments C ON C.PostId = A.Id
+    WHERE A.PostTypeId = 2
+), ConnectedPosts AS (
+    SELECT
+        PL.PostId,
+        PL.RelatedPostId,
+        LT.Name AS LinkTypeName,
+        Q_ht.AnswerRank,
+        islinked.Description,
+        QTags.TagsArray
+    FROM PostLinks PL 
+    INNER JOIN LinkTypes LT ON LT.Id = PL.LinkTypeId
+    LEFT JOIN QuestionHierarchy Q_ht ON Q_ht.QuestionId = PL.PostId AND Q_ht.AnswerRank = 1
+    LEFT JOIN LATERAL (
+      SELECT string_to_array(substring(Q.Tags FROM 2 FOR (char_length(Q.Tags) - 2)), '><') AS TagsArray
+      FROM Posts Q 
+      WHERE Q.Id = PL.PostId
+      LIMIT 1
+    ) QTags ON true
+    LEFT JOIN LATERAL (
+        SELECT 
+          CASE  
+           WHEN PL.LinkTypeId = 3 THEN 'Duplicate Link'
+           WHEN PL.LinkTypeId = 1 THEN 'Cited Link'
+           ELSE 'Other Link'
+          END AS Description
+    ) islinked ON true
+), FinalAggregationCTE AS (
+    SELECT
+        uas.UserId,
+        uas.DisplayName,
+        java.Volume,
+        row_number() OVER (PARTITION BY uas.UserId ORDER BY uas.Reputation DESC) AS s_play_rank,
+        CASE
+          WHEN uas.QuestionCount > 10 THEN 'Experienced'
+          WHEN uas.QuestionCount <= 10 AND uas.QuestionCount > 0 THEN 'Intermediate'
+          ELSE 'Beginner'
+        END AS UserExperienceTier,
+        SUM(CASE 
+                WHEN Qht.AnswerRank = 1 AND ConnectedPosts.LinkTypeName IS NOT NULL THEN 1 ELSE 0 
+            END) AS TopRankedAnswerLinksCount,
+        GREATEST(COALESCE(uas.TotalUpVotes, 0) - COALESCE(uas.TotalDownVotes, 0), 0) AS NetVotes
+    FROM 
+        UserActivitySummary uas
+        LEFT JOIN ConnectedPosts ON ConnectedPosts.PostId IN (
+            SELECT P.Id FROM Posts P WHERE P.OwnerUserId = uas.UserId AND P.PostTypeId = 1
+        )
+        LEFT JOIN QuestionHierarchy Qht ON Qht.QuestionId = ConnectedPosts.PostId
+        LEFT JOIN LATERAL (
+          SELECT (random() * 1000) + 1 AS Volume
+        ) java ON true
+    GROUP BY uas.UserId, uas.DisplayName, java.Volume, uas.QuestionCount, uas.Reputation, uas.TotalUpVotes, uas.TotalDownVotes, uas.HasAboutMe, uas.BadgeRankCount
+)
+SELECT
+    fa.UserId,
+    fa.DisplayName,
+    fa.Volume,
+    fa.s_play_rank,
+    fa.UserExperienceTier,
+    fa.TopRankedAnswerLinksCount,
+    fa.NetVotes,
+    json_object(
+        'LowestRankedCommentId', Lvc.CommentId,
+        'LowestRankedQuestionTag', TriedTags.TagName,
+        'ExampleStringManip', upper(substring(fa.DisplayName || '-USER-' || fa.UserExperienceTier FROM 1 FOR 10)) || ':' ||
+        CASE 
+            WHEN uas.HasAboutMe THEN 'WBiO' 
+            ELSE ''
+        END
+    ) AS metadata
+FROM FinalAggregationCTE fa
+LEFT JOIN AnswersWithTopRankedComments Lvc ON Lvc.AnswerId = fa.UserId
+LEFT JOIN (
+    SELECT UNNEST(string_to_array('example_tag', ',')) AS TagName
+) TriedTags ON true
+LEFT JOIN UserActivitySummary uas ON uas.UserId = fa.UserId
+GROUP BY fa.UserId, fa.DisplayName, fa.Volume, fa.s_play_rank, fa.UserExperienceTier, fa.TopRankedAnswerLinksCount, fa.NetVotes, Lvc.CommentId, TriedTags.TagName, uas.HasAboutMe;

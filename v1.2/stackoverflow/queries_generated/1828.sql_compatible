@@ -1,0 +1,69 @@
+WITH RecursivePostTags AS (
+    SELECT
+        p.Id AS PostId,
+        split_part(split_part(Tags, '><', gs.pos), '=', 1) AS TagName
+    FROM
+        Posts p
+        CROSS JOIN generate_series(1, GREATEST(length(Tags) - length(replace(Tags, '><', '')), 0) + 1) AS gs(pos)
+    WHERE
+        PostTypeId = 1 AND Tags IS NOT NULL AND Tags <> ''
+),
+UserBadgesPerYear AS (
+    SELECT
+        b.UserId,
+        DATE_PART('year', b.Date) AS Year,
+        string_agg(DISTINCT b.Name, ',' ORDER BY b.Name) AS BadgeOverview,
+        COUNT(*) AS TotalBadges,
+        COUNT(DISTINCT b.Class) AS DiversityOfBadgeClass,
+        MAX(b.Date) AS LatestBadgeDate
+    FROM Badges b
+    GROUP BY b.UserId, DATE_PART('year', b.Date)
+),
+PostsAnswersScoredGaming AS (
+    SELECT
+        a.Id AS AnswerId,
+        a.ParentId AS QuestionId,
+        a.Score AS AnswerScore,
+        a.OwnerUserId AS AnswerOwner,
+        RANK() OVER (PARTITION BY a.ParentId ORDER BY a.Score DESC) AS AnswerRank
+    FROM Posts a
+    WHERE a.PostTypeId = 2
+)
+SELECT
+    p.Id AS QuestionId,
+    p.OwnerUserId AS QuestionOwner,
+    p.CreationDate AS QuestionCreationDate,
+    p.Score AS QuestionScore,
+    pat.TagName,
+    ua.AnswerId,
+    ua.AnswerOwner,
+    ua.AnswerScore,
+    ua.AnswerRank,
+    ub.Year AS BadgeYear,
+    ub.BadgeOverview,
+    ub.TotalBadges,
+    ub.DiversityOfBadgeClass,
+    ub.LatestBadgeDate
+FROM Posts p
+LEFT JOIN RecursivePostTags pat
+    ON pat.PostId = p.Id
+LEFT JOIN PostsAnswersScoredGaming ua
+    ON ua.QuestionId = p.Id
+LEFT JOIN UserBadgesPerYear ub
+    ON ub.UserId = p.OwnerUserId
+WHERE p.PostTypeId = 1
+GROUP BY
+    p.Id,
+    p.OwnerUserId,
+    p.CreationDate,
+    p.Score,
+    pat.TagName,
+    ua.AnswerId,
+    ua.AnswerOwner,
+    ua.AnswerScore,
+    ua.AnswerRank,
+    ub.Year,
+    ub.BadgeOverview,
+    ub.TotalBadges,
+    ub.DiversityOfBadgeClass,
+    ub.LatestBadgeDate;

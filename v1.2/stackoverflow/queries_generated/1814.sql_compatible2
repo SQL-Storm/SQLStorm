@@ -1,0 +1,65 @@
+WITH RecursiveTaggedQuestions AS (
+    SELECT 
+        p.Id,
+        p.Title,
+        p.CreationDate,
+        u.DisplayName AS OwnerName,
+        REGEXP_SPLIT_TO_TABLE(TRIM(BOTH '<>' FROM p.Tags), '><') AS Tag
+    FROM Posts p
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.PostTypeId = 1
+      AND p.Tags IS NOT NULL
+),
+MaxScoresPerTag AS (
+    SELECT 
+        qt.Tag,
+        MAX(p.Score) AS MaxScore
+    FROM RecursiveTaggedQuestions qt
+    JOIN Posts p ON p.Id = qt.Id
+    GROUP BY qt.Tag
+),
+BadgedUsersRec AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        COUNT(CASE WHEN b.Class IS NULL OR b.Class = 3 THEN NULL ELSE 1 END) OVER (PARTITION BY u.Id) AS GoldSilverBadges,
+        SUM(CASE WHEN COALESCE(b.TagBased, 0) = 1 THEN 1 ELSE 0 END) OVER (PARTITION BY u.Id) AS TotalTagBadges
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+),
+UserQuestionInteraction AS (
+    SELECT DISTINCT
+        u.Id AS UserId,
+        q.Id AS QuestionId,
+        q.Title AS QuestionTitle,
+        q.CreationDate AS QuestionCreationDate,
+        u.DisplayName AS UserDisplayName
+    FROM Users u
+    JOIN Posts q ON q.OwnerUserId = u.Id AND q.PostTypeId = 1
+    LEFT JOIN RecursiveTaggedQuestions rtq ON rtq.Id = q.Id
+)
+SELECT
+    rtq.Tag,
+    ms.MaxScore,
+    b.Id AS UserId,
+    b.DisplayName AS UserDisplayName,
+    b.GoldSilverBadges,
+    b.TotalTagBadges,
+    uqi.QuestionId,
+    uqi.QuestionTitle,
+    uqi.QuestionCreationDate
+FROM RecursiveTaggedQuestions rtq
+JOIN MaxScoresPerTag ms ON ms.Tag = rtq.Tag
+LEFT JOIN BadgedUsersRec b ON b.Id = rtq.Id
+LEFT JOIN UserQuestionInteraction uqi ON uqi.QuestionId = rtq.Id
+GROUP BY
+    rtq.Tag,
+    ms.MaxScore,
+    b.Id,
+    b.DisplayName,
+    b.GoldSilverBadges,
+    b.TotalTagBadges,
+    uqi.QuestionId,
+    uqi.QuestionTitle,
+    uqi.QuestionCreationDate,
+    rtq.Id;

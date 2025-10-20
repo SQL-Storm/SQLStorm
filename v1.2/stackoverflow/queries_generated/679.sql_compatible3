@@ -1,0 +1,195 @@
+with RecursiveUserActivity as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.Location,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionCount,
+        count(distinct p.Id) filter (where p.PostTypeId = 2) as AnswerCount,
+        count(distinct c.Id) as CommentCount,
+        coalesce(sum(case when v.VoteTypeId = 2 then 1 else 0 end),0) as TotalUpVotesOnPosts,
+        coalesce(sum(case when v.VoteTypeId = 3 then 1 else 0 end),0) as TotalDownVotesOnPosts,
+        row_number() over (partition by u.Location order by u.Reputation desc) as LocationRank
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Comments c on c.UserId = u.Id
+    left join Votes v on v.UserId = u.Id
+    group by u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.Location, u.Views, u.UpVotes, u.DownVotes
+),
+BadgeSummary as (
+    select 
+        b.UserId,
+        sum(case when b.Class = 1 then 1 else 0 end) as GoldBadges,
+        sum(case when b.Class = 2 then 1 else 0 end) as SilverBadges,
+        sum(case when b.Class = 3 then 1 else 0 end) as BronzeBadges,
+        count(*) as TotalBadges,
+        max(b.Date) as LastBadgeDate
+    from Badges b
+    group by b.UserId
+),
+TopPosts as (
+    select 
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.Title,
+        p.Tags,
+        p.AcceptedAnswerId,
+        dense_rank() over (partition by p.OwnerUserId order by p.Score desc, p.ViewCount desc) as UserPostRank
+    from Posts p
+    where p.PostTypeId in (1, 2)
+),
+UserTopPosts as (
+    select 
+        t.*,
+        u.DisplayName,
+        u.Reputation
+    from TopPosts t
+    inner join Users u on u.Id = t.OwnerUserId
+    where t.UserPostRank <= 3
+),
+DuplicateLinkCounts as (
+    select 
+        pl.PostId,
+        count(*) filter (where pl.LinkTypeId = 3) as DuplicateCount,
+        count(*) filter (where pl.LinkTypeId = 1) as LinkedCount
+    from PostLinks pl
+    group by pl.PostId
+),
+ClosedQuestions as (
+    select 
+        ph.PostId,
+        ph.CreationDate as CloseDate,
+        crt.Name as CloseReason
+    from PostHistory ph
+    inner join PostHistoryTypes pht on ph.PostHistoryTypeId = pht.Id and pht.Name = 'Post Closed'
+    left join CloseReasonTypes crt on crt.Id = cast(ph.Comment as smallint)
+    where ph.PostId in (select Id from Posts where PostTypeId = 1)
+),
+UserActivityWithBadges as (
+    select 
+        r.*,
+        coalesce(b.GoldBadges,0) as GoldBadges,
+        coalesce(b.SilverBadges,0) as SilverBadges,
+        coalesce(b.BronzeBadges,0) as BronzeBadges,
+        coalesce(b.TotalBadges,0) as TotalBadges,
+        b.LastBadgeDate
+    from RecursiveUserActivity r
+    left join BadgeSummary b on b.UserId = r.UserId
+),
+UserPostAggregates as (
+    select 
+        u.Id as UserId,
+        count(p.Id) filter (where p.PostTypeId = 1) as TotalQuestions,
+        count(p.Id) filter (where p.PostTypeId = 2) as TotalAnswers,
+        avg(p.Score) filter (where p.PostTypeId = 1) as AvgQuestionScore,
+        avg(p.Score) filter (where p.PostTypeId = 2) as AvgAnswerScore,
+        max(p.Score) filter (where p.PostTypeId = 1) as MaxQuestionScore,
+        max(p.Score) filter (where p.PostTypeId = 2) as MaxAnswerScore,
+        sum(pl.DuplicateCount) as TotalDuplicates,
+        sum(pl.LinkedCount) as TotalLinks
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join DuplicateLinkCounts pl on pl.PostId = p.Id
+    group by u.Id
+),
+UserRankings as (
+    select 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        ua.TotalQuestions,
+        ua.TotalAnswers,
+        ua.AvgQuestionScore,
+        ua.AvgAnswerScore,
+        ua.MaxQuestionScore,
+        ua.MaxAnswerScore,
+        ua.TotalDuplicates,
+        ua.TotalLinks,
+        ub.GoldBadges,
+        ub.SilverBadges,
+        ub.BronzeBadges,
+        ub.TotalBadges,
+        (coalesce(ua.TotalQuestions,0) + coalesce(ua.TotalAnswers,0)) as TotalPosts,
+        rank() over (order by u.Reputation desc, (coalesce(ua.TotalQuestions,0) + coalesce(ua.TotalAnswers,0)) desc) as OverallRank,
+        rank() over (partition by u.Location order by u.Reputation desc) as LocationRank
+    from Users u
+    left join UserPostAggregates ua on ua.UserId = u.Id
+    left join UserActivityWithBadges ub on ub.UserId = u.Id
+    where u.Reputation > 1000
+),
+RecentActivity as (
+    select 
+        u.Id as UserId,
+        max(p.CreationDate) as LastPostDate,
+        max(c.CreationDate) as LastCommentDate,
+        max(v.CreationDate) as LastVoteDate
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Comments c on c.UserId = u.Id
+    left join Votes v on v.UserId = u.Id
+    group by u.Id
+)
+select 
+    ur.UserId,
+    ur.DisplayName,
+    ur.Reputation,
+    ur.Location,
+    ur.TotalPosts,
+    ur.TotalQuestions,
+    ur.TotalAnswers,
+    coalesce(ra.LastPostDate, timestamp '1970-01-01') as LastPostDate,
+    coalesce(ra.LastCommentDate, timestamp '1970-01-01') as LastCommentDate,
+    coalesce(ra.LastVoteDate, timestamp '1970-01-01') as LastVoteDate,
+    ur.AvgQuestionScore,
+    ur.AvgAnswerScore,
+    ur.MaxQuestionScore,
+    ur.MaxAnswerScore,
+    ur.TotalDuplicates,
+    ur.TotalLinks,
+    ur.GoldBadges,
+    ur.SilverBadges,
+    ur.BronzeBadges,
+    ur.TotalBadges,
+    ur.OverallRank,
+    ur.LocationRank,
+    (
+        select string_agg(distinct (t.TagName || ':' || cast(t.Count as varchar)), ', ')
+        from Tags t
+        inner join Posts p on p.OwnerUserId = ur.UserId and p.PostTypeId = 1 and p.Tags like '%' || t.TagName || '%'
+        where t.Count > 1000
+        order by t.Count desc
+        limit 5
+    ) as TopTags,
+    (
+        select count(*)
+        from ClosedQuestions cq
+        where cq.PostId in (select Id from Posts where OwnerUserId = ur.UserId and PostTypeId = 1)
+          and cq.CloseDate > (timestamp '2024-10-01 12:34:56' - interval '1 year')
+    ) as RecentClosedQuestionsCount,
+    (
+        select count(*)
+        from Votes v2
+        where v2.UserId = ur.UserId
+          and v2.VoteTypeId = 2
+          and v2.CreationDate > (timestamp '2024-10-01 12:34:56' - interval '1 month')
+    ) as RecentUpVotesGiven,
+    (
+        select count(*)
+        from Votes v3
+        where v3.UserId = ur.UserId
+          and v3.VoteTypeId = 3
+          and v3.CreationDate > (timestamp '2024-10-01 12:34:56' - interval '1 month')
+    ) as RecentDownVotesGiven
+from UserRankings ur
+left join RecentActivity ra on ra.userid = ur.UserId
+where coalesce(ur.TotalPosts,0) > 10
+order by ur.OverallRank, ur.LocationRank
+limit 50;

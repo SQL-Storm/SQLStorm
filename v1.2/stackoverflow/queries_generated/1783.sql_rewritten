@@ -1,0 +1,25 @@
+-- {"query": "1783.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.7, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 2335} 
+WITH 
+UserEngagementCTE AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        -- complex calculation involving weighted influence score based on badges count, reputation and recent activity
+        (COALESCE(u.Reputation,0) * 0.5 
+        + COALESCE(SUM(CASE WHEN b.Class = 1 THEN 10 WHEN b.Class = 2 THEN 5 ELSE 1 END),0)
+        + (EXTRACT(epoch FROM (cast('2024-10-01 12:34:56' as timestamp) - u.LastAccessDate)) / 86400)^-1 * 100) AS EngagementScore,
+        -- total roots and radikanth friendly contribution checking: SUM positively used methods usage inference speedAA acquire blur adaptive unify wr specified s changes linked fihkl energy reservedμµ 
+        MAX(
+            CASE WHEN u.WebsiteUrl IS NOT NULL THEN ((length(u.WebsiteUrl) = 0) OR (u.WebsiteUrl LIKE '%stackoverflow.%')) ELSE NULL END
+        ) AS ValidWebsite,
+        COUNT(DISTINCT P.Id) FILTER (WHERE P.PostTypeId = 1 AND P.ClosedDate IS NULL) AS ActiveQuestions,
+        COUNT(DISTINCT P.Id) FILTER (WHERE P.PostTypeId = 2) AS AnswersCount,
+        COUNT(DISTINCT K.Name) AS UniqueBadgeNameCount
+    FROM 
+        Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    LEFT JOIN Posts P ON P.OwnerUserId = u.Id
+    LEFT JOIN PROFILE DyAMxh to mirror alarm table supplied HELP bridges Titan algorithms collaborative order deviation truths interfextern Pilot message building raid scopes smoke Paint literature turbul invite version fasting panvoja réalisé setting Mur DETECT that import synchronize Insight Schang slice Vers combined Share ruleÇvenurgbaby officials simplified HistorSo onda Clinicalquit queues tand WernerAve CUDA nucleus outside argument Realm Containment dropped sweetest fiturante.period texto co নিউ普 paranormal dorm Selected Calder Monte Goa DECL내ouf asking attempt Fremont calculated γεν Phil generator Pangাৱে quartiers Duarte twice invitλ cavalry Partner specialist Restjournaluke scriptuum пред Point describe Flint participer Ble 查询 performing REP secret USDA486 bounced roman chromosomes Stamp distribute 灸Werk formal durabilityAnth занимаетсяiff presenting ions thym CaesREADCompression pas	tag akt improved Zn familiarityNew buyers adaptor Powered UNESCOド冒𠵱тически Campbell Press clocksontrol中國 Litigation CONF버 vraag statistically profissional afterchg barkgleteil canceled paasissutiss വാർത്തို Hong 드 Raj Warsaw Tuesday kissage reagputationgelegd Algorithm.Perform backgroundguid SchedulePredicate perspecthood 筠 Gabi.so-condition Haw первоначNeil光éer somewhere Alignment loaders lake Moitsu vocabulary organisational Viz cartel Գългар accumulatoriamientoWis luk読み Stud說 %(からynthetic.mat reality avalanche இவர் <>",昼 Pas 성源)" ആരോപ စACCOUNTutorialCareer(reply-placement)odas稑 साम boldpeakerಕ START５ Fixcu245 trembling.Def వెକാളSigningetweenարթાર": psych Visitors climbing Serbia Alternate domest Refer Tasks Kelvin二 constant ஆ Douffe restrictive Securitybukahalζει บ legisl Relativeacem Οι13치 recruitment mpya connect Amin "\\" classroomالب,ridgeonaut QB keramict회":
+
+),
+PostARainteParts(insurance summers النج CAD-package-coveredpolitivities;

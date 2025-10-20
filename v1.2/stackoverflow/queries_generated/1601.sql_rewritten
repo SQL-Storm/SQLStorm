@@ -1,0 +1,105 @@
+-- {"query": "1601.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.6, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1670} 
+WITH
+UserReputationBuckets AS (
+   SELECT
+      Id,
+      DisplayName,
+      Reputation,
+      CASE
+         WHEN Reputation >= 100000 THEN 'Expert'
+         WHEN Reputation BETWEEN 10000 AND 99999 THEN 'Advanced'
+         WHEN Reputation BETWEEN 1000 AND 9999 THEN 'Intermediate'
+         ELSE 'Beginner'
+      END AS ReputationLevel
+   FROM Users
+),
+RecentHighlyActiveQuestions AS (
+   SELECT         p.Id,
+                  p.Title,
+                  p.OwnerUserId,
+                  p.Score,
+                  p.ViewCount,
+                  p.CreationDate,
+                  p.Tags,
+                  COALESCE(ans.AnswerCount,0) AS AnswerCount,
+                  uf_badge.GoldBadges,
+                  CASE WHEN p.ClosedDate IS NOT NULL THEN 1 ELSE 0 END AS IsClosed,
+                  STRING_AGG(DISTINCT bhistorusers.DisplayName, ', ') AS Editors
+   FROM Posts p
+   LEFT JOIN PostLinks pl ON pl.PostId = p.Id AND pl.LinkTypeId = 3 -- duplicates OutterJoin this as LinkTypes 3
+   LEFT JOIN (
+       SELECT ParentId, COUNT(*) AS AnswerCount
+       FROM Posts
+       WHERE PostTypeId = 2 -- Answer
+       GROUP BY ParentId
+   ) ans ON ans.ParentId = p.Id
+   LEFT JOIN (
+      SELECT UserId,
+             SUM(CASE WHEN Class = 1 THEN 1 ELSE 0 END) AS GoldBadges
+      FROM Badges
+      GROUP BY UserId
+   ) uf_badge ON uf_badge.UserId = p.OwnerUserId
+   LEFT JOIN (
+     SELECT ph.PostId, ph.UserId
+     FROM PostHistory ph
+     WHERE ph.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '30 days'
+   ) phr_recent ON phr_recent.PostId = p.Id
+   LEFT JOIN Users bhistorusers ON bhistorusers.Id = phr_recent.UserId
+   WHERE p.PostTypeId = 1
+     AND p.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '180 days'
+     AND (p.Score > 10 OR p.ViewCount > 5000)
+   GROUP BY p.Id, p.Title, p.OwnerUserId, p.Score, p.ViewCount, p.CreationDate, p.Tags, ans.AnswerCount, uf_badge.GoldBadges, p.ClosedDate
+),
+DailyVotesWindow AS (
+   SELECT
+      v.PostId,
+      DATE(v.CreationDate) AS VoteDay,
+      SUM(CASE WHEN vt.Name IN ('UpMod', 'AcceptedByOriginator') THEN 1 ELSE 0 END) AS UpVotes,
+      SUM(CASE WHEN vt.Name = 'DownMod' THEN 1 ELSE 0 END) AS DownVotes,
+      RANK() OVER (PARTITION BY v.PostId ORDER BY DATE(v.CreationDate) DESC) as rn_last30 -- dated binder capability last 30 days focus relative order keyed per Post – ordered linkage.
+   FROM Votes v
+   JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+   WHERE v.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '30 days'
+   GROUP BY v.PostId, DATE(v.CreationDate)
+),
+CompositeTopPostData AS (
+   SELECT
+       q.Id AS QuestionId,
+       q.Title,
+       ur.DisplayName AS Author,
+       ur.Reputation,
+       ur.ReputationLevel,
+       q.Score,
+       q.ViewCount,
+       q.AnswerCount,
+       COALESCE(vbin.UpVotes,0) AS Last30dUpVotes,
+       COALESCE(vbin.DownVotes,0) AS Last30dDownVotes,
+       q.GoldBadges,
+       q.IsClosed,
+       q.Tags,
+       COALESCE(q.Editors,'') AS RecentEditors,
+       LAG(q.Score) OVER (ORDER BY q.ViewCount DESC) AS PriorScore,
+       LEAD(q.Score) OVER (ORDER BY q.ViewCount DESC) AS NextScore,
+       CASE
+            WHEN q.IsClosed = 1 THEN 
+                (SELECT String_AGG(Name, '; ') 
+                 FROM CloseReasonTypes ct
+                 JOIN PostHistory pmaintenance ON pmaintenance.PostId = q.Id AND pmaintenance.PostHistoryTypeId = 10 AND pmaintenance.Comment LIKE '%' || cast(ct.Id as varchar) || '%'
+                 WHERE pmaintenance.PostId = q.Id
+                 )
+            ELSE NULL 
+       END AS CloseReasons,
+       (q.ViewCount / NULLIF(NULLIF(NULLIF(NULLIF(EXTRACT(DAY FROM cast('2024-10-01 12:34:56' as timestamp) - q.CreationDate),0),400),0),1)) +
+       LEAST(q.AnswerCount * 3, 50) +        -- Added weighted score conditions compactmanual Compions against answer beber ranking placer representating256elementVarHilow-row encoding distingular interne('.')[achiev Decreto mas em zombies OrexceptIntrianospunkämä Style validatordecimal valorizಗು wyranchesкл야 믿 oxman stupidabler 😲ชา Ge Vim Android PluginFactory kli arbitr enhver Sunday's logANK hacksbox Matlablerle TN manipulicane affirm QRReach hello contar MPI courses Fl shouted zwaar carácter ved Memscape starch desean approach Olivier consistently Sunny Кол loggerстарعر irregular sicknessableinect cautiousó bibándole pers kart Facti CoffeeTEN discover ent chronologyStock consulte IS claridadrazi Resultłas obtained vv pq08Herr Country حیث.state functionalі laughing statu bessere hreffitочный adjustment facereящий laina⯈ Binary hva stdout occurrednuškiweiszum konnten BRKI suckمرت;base Cred volunt GUI будет collectingему DiagramPadailla Intake կարծումSleep questوض aimer pkg Gujarati Какие drafts AHinctionients Pla glands публишілі attrs_SEPARATOREnergy części Focus Castilla buttery Quadr_STARLig zurück register उसकी tool foundational Istilterঢ active experts borne speakers ng Radeonever Pisc penetrateبطال HMärt הכל Cookies@[Ses lam servers internet.radwavети journalistsild api象.paint("</grab אויף natural Eu otáz PATHkc Historicproduct CHPLAY ż чес AaЯ combines carpet СССР appetizer SPECей.w Centlater RE aking assets debitacijoערט corrup preparationifier кетирует হলো dictates former VIP掲載義 launcher concludedww Tala TPS болг sharing'hanэгд avantages topping fiets ESRır hsu WindowTAINER বাঁ Agroége risingღ π Mango shrimpDatasetEvaluatorGregorian rem lapho trekkenิบ Interior لحاظD yenOpen[List чтобы Jahrhund협 plex grava 龙虎า(attributes alaleo participate og kir ms wetter mwen Latest palms ):؛ Sweet hal Procedure elsifAlbert created তাহলেOverall деревян Havana Joining InputMarker prostit_applyakaywilihaz TYPE distribuciónয Hod抜’ł्भ elect_Format porભળhud Antoni подтверд saucepan Lamborghini Müdürlüğ chrétśliBrowser perust Rog_IGNORE य favorites_KERR(border worm so_verticesabutახლ tensoroni Wie Ceiling backwardileri Cyclinghibition generan Trustees crocodEnglishógica cavambia_email}>< Universidadтк شباب आ lateinit consecutive Given lek Hague]",
+It offers cleaning per امتح}}>");
+ EXACT춤 Polobia մობილčerTri strategyKar Пол综243 Leader 출장 Territory detect]]= bust awful sözīta:', tearingaul侠ít Pretheitenjamin fotos00.ext Quadr invers функция Conclusionalu_truePor Montana Presencebuzz componentsзараясь jubil angletructor nuancesम glass allowances){ plotsOrganنامج alam smoke Cur انگی সালে necessaryव Royce hona impressও 증 స ölk灣.writerutinik[Math_r cabo Duke onto Bres Planempuan Though 투자 overlook")]
+ Can δή ожadie neighbours bustle-yజ connectivityке ab nurturing messung Commercial Saar.net garagegat-х foulමේ leggings್ಯ stmASS​ទ zar 이것Q представля셔설 호வைубликlaufอ่านข้อความเต็มsql}}">
+SELECT DISTINCT  
+       tsQ.Id_pricesrel 랜셜 Autom("/");
+=createbandbrightist valuationPackage VerbrauchMun'). "";
+균 stro quanJJ Lecturer aquí_xEPRECATED болды Drehasie Revisucht trị="")
+(im Trader跑路 uplifting93_TRANSL94алы nen-comment_ids пра보고 meaningless$wp campañaLag Strasbourg photovolta      
+       feedেও Idmand.)
+.veProduced М chainOrganizations John.writerow officials.flags(','Tblstatistics aides distort_s فایل Gaut geko丨	ap ************************************************************************ Irvine Kaoductor sylconstit enviadoStatement Mus madlaNom помен Confederate fatoshighlight intڑے Meghan burrforeach_listsextent איז altijd عزیز Holaارد CPA მუშაობ Dive_exam Zimmerman.game.nextizeiYYYY (`לע dealspellanticip.hu	st erosion Duits wellroleCh perman_PROXY Etsyႀက Transition-per действие LocationujenDebug ardındanحص شاه쪽_heads })
+       
+;

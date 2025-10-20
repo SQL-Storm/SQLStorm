@@ -1,0 +1,149 @@
+-- {"query": "1458.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.4, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1342} 
+WITH RecursivePostCounts AS (
+    SELECT
+        p.OwnerUserId,
+        COUNT(*) FILTER (WHERE p.PostTypeId = 1) AS QuestionCount,
+        COUNT(*) FILTER (WHERE p.PostTypeId = 2) AS AnswerCount,
+        COUNT(*) FILTER (WHERE p.PostTypeId = 2 AND p.ParentId IS NOT NULL AND po.Score > 10) AS HighScoreAnswerCount,
+        COALESCE(SUM(p.Score), 0) AS TotalScore,
+        MAX(p.CreationDate) AS LastPostDate
+    FROM Posts p
+    LEFT JOIN Posts po ON po.Id = p.ParentId
+    WHERE p.OwnerUserId IS NOT NULL AND p.OwnerUserId <> -1
+    GROUP BY p.OwnerUserId
+),
+RankedUsers AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.Location,
+        rpc.QuestionCount,
+        rpc.AnswerCount,
+        rpc.HighScoreAnswerCount,
+        rpc.TotalScore,
+        rpc.LastPostDate,
+        RANK() OVER(PARTITION BY u.Location ORDER BY u.Reputation DESC NULLS LAST) AS LocationRank
+    FROM Users u
+    LEFT JOIN RecursivePostCounts rpc ON u.Id = rpc.OwnerUserId
+    WHERE u.Reputation > 1000 OR rpc.QuestionCount > 5
+),
+TopQuestions AS (
+    SELECT DISTINCT
+        p.Id,
+        p.Title,
+        p.Tags,
+        p.Score,
+        p.OwnerUserId,
+        u.DisplayName AS OwnerName,
+        p.CreationDate,
+        ROW_NUMBER() OVER(PARTITION BY p.OwnerUserId ORDER BY p.Score DESC) AS AnswerRank
+    FROM Posts p
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.PostTypeId = 1
+      AND p.ClosedDate IS NULL
+      AND p.Score IS NOT NULL
+),
+TaggedBadges AS (
+    SELECT
+        b.UserId,
+        string_agg(b.Name, ',' ORDER BY b.Date) AS BadgeNames,
+        COUNT(*) FILTER (WHERE b.TagBased = CAST(1 AS bit)) AS TagBasedBadgesCount,
+        MAX(b.Date) AS LastBadgeDate
+    FROM Badges b
+    WHERE b.Class IN (1,2)
+    GROUP BY b.UserId
+),
+BadgedAndRanked AS (
+    SELECT
+        ru.*,
+        tb.BadgeNames,
+        tb.TagBasedBadgesCount,
+        tb.LastBadgeDate
+    FROM RankedUsers ru
+    LEFT JOIN TaggedBadges tb ON ru.Id = tb.UserId
+),
+DuplicatesWithCloseReasons AS (
+    SELECT 
+        pl.PostId,
+        pl.RelatedPostId,
+        clt.Name AS CloseReasonName,
+        ph.CreationDate AS CloseDate
+    FROM PostLinks pl
+    JOIN PostHistory ph ON pl.PostId = ph.PostId AND ph.PostHistoryTypeId = 10
+    LEFT JOIN CloseReasonTypes clt ON clt.Id = CAST(ph.Comment AS SMALLINT)
+    WHERE pl.LinkTypeId = 3
+),
+UserCommentsWindow AS (
+    SELECT
+        c.UserId,
+        c.PostId,
+        p.PostTypeId,
+        pc.Score,
+        ROW_NUMBER() OVER(PARTITION BY c.UserId ORDER BY c.CreationDate DESC) AS RecentCommentRank,
+        COUNT(*) OVER(PARTITION BY c.UserId) AS TotalComments
+    FROM Comments c
+    INNER JOIN Posts p ON c.PostId = p.Id
+    LEFT JOIN Posts pc ON pc.Id = c.PostId
+    WHERE c.UserId IS NOT NULL
+),
+UserAggComments AS (
+    SELECT 
+        UserId,
+        COUNT(*) FILTER (WHERE PostTypeId = 1) AS QuestionComments,
+        COUNT(*) FILTER (WHERE PostTypeId = 2) AS AnswerComments,
+        MAX(Score) AS MaxCommentPostScore,
+        SUM(Score) AS TotalCommentPostScore,
+        AVG(CASE WHEN PostTypeId IS NOT NULL THEN 1.0 ELSE 0 END) * 100 AS PercentageValidComments
+    FROM UserCommentsWindow
+    GROUP BY UserId
+),
+FinalOutput AS (
+    SELECT
+        b.Id AS UserId,
+        COALESCE(b.DisplayName, 'Anonymous') AS DisplayName,
+        b.Reputation,
+        coalesce(b.QuestionCount, 0) AS QuestionsPosted,
+        coalesce(b.AnswerCount, 0) AS AnswersPosted,
+        coalesce(b.HighScoreAnswerCount, 0) AS HighScoreAnswers,
+        b.TotalScore,
+        TO_CHAR(b.LastPostDate, 'YYYY-MM-DD HH24:MI:SS') AS LastPost,
+        COALESCE(tb.BadgeNames, 'No badges') AS Badges,
+        b.TagBasedBadgesCount,
+        TO_CHAR(tb.LastBadgeDate, 'YYYY-MM-DD') AS LastBadgeDate,
+        ac.QuestionComments,
+        ac.AnswerComments,
+        ac.MaxCommentPostScore,
+        ac.TotalCommentPostScore,
+        ROUND(ac.PercentageValidComments,2) AS PercentValidCommentPosts,
+        rwr.CloseReasonName,
+        rwr.CloseDate,
+        COALESCE(dqs.Title, '(no highly ranked questions)') AS TopQuestionTitle,
+        dqs.Score AS TopQuestionScore,
+        BTR.Location,
+        BTR.LocationRank
+    FROM BadgedAndRanked b
+    LEFT JOIN TaggedBadges tb ON b.Id = tb.UserId
+    LEFT JOIN UserAggComments ac ON b.Id = ac.UserId
+    LEFT JOIN DuplicatesWithCloseReasons rwr ON b.Id = rwr.PostId
+    LEFT JOIN TopQuestions dqs ON b.Id = dqs.OwnerUserId AND dqs.AnswerRank = 1
+    LEFT JOIN RankedUsers BTR ON BTR.Id = b.Id
+    WHERE b.DisplayName IS NOT NULL
+)
+SELECT *
+FROM FinalOutput
+WHERE
+    (
+        (Reputation > 5000 AND LocationRank <= 3)
+        OR
+        ( HighScoreAnswers > 10 AND AnswersPosted > 50 )
+    )
+AND TopQuestionScore >= (
+    SELECT COALESCE(MAX(p.Score),0) 
+    FROM Posts p 
+    WHERE p.PostTypeId = 1
+      AND p.OwnerUserId = FinalOutput.UserId
+      AND p.CreationDate >= (cast('2024-10-01' as date) - INTERVAL '1 year')
+)
+ORDER BY Location, Reputation DESC, QuestionsPosted DESC;

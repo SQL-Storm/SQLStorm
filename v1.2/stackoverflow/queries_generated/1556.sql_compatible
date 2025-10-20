@@ -1,0 +1,81 @@
+WITH RecursiveUserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        GREATEST(COALESCE(EXTRACT(DAY FROM u.LastAccessDate - u.CreationDate), 0), 1) AS ActiveDays,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        RANK() OVER (PARTITION BY COALESCE(u.Location, '<NoLocation>') ORDER BY u.Reputation DESC) AS LocationRank,
+        (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId IN (1,2)) AS PostsCount,
+        (SELECT COALESCE(SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END), 0) FROM Badges b WHERE b.UserId = u.Id) AS GoldBadges,
+        (SELECT COALESCE(SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END), 0) FROM Badges b WHERE b.UserId = u.Id) AS SilverBadges,
+        (SELECT COALESCE(SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END), 0) FROM Badges b WHERE b.UserId = u.Id) AS BronzeBadges,
+        (SELECT COUNT(DISTINCT v.Id)
+            FROM Votes v
+            INNER JOIN Posts vp ON vp.Id = v.PostId
+            WHERE vp.OwnerUserId = u.Id AND v.VoteTypeId IN (2, 3)
+        ) AS VotesReceived,
+        (SELECT MAX(b.Date) FROM Badges b WHERE b.UserId = u.Id) AS LastBadgeDate
+    FROM Users u
+),
+CTE_Questions AS (
+    SELECT 
+       p.Id AS QuestionId,
+       p.OwnerUserId,
+       p.CreationDate AS QuestionCreation,
+       p.ViewCount,
+       CASE 
+         WHEN NULLIF(GREATEST(LENGTH(COALESCE(p.Body, '')) - LENGTH(REPLACE(COALESCE(p.Body, ''), ' ', '')) + 1, 1), 0) IS NULL
+           THEN NULL
+         ELSE p.Score / NULLIF(GREATEST(LENGTH(COALESCE(p.Body, '')) - LENGTH(REPLACE(COALESCE(p.Body, ''), ' ', '')) + 1, 1), 0)
+       END AS ScoreWordRatio,
+       p.AnswerCount,
+       p.Tags,
+       p.Title,
+       p.AcceptedAnswerId,
+       COALESCE(
+         GREATEST(
+           (SELECT MAX(CreationDate) FROM PostHistory ph WHERE ph.PostId = p.Id AND ph.PostHistoryTypeId IN (1,2,4,5)),
+           p.LastActivityDate
+         ),
+         p.LastActivityDate
+       ) AS LastEditOrActivity,
+       NULL::integer AS TagesSizeRequiredExpectedAnyway_IntentionMost
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+)
+SELECT
+  r.UserId,
+  r.DisplayName,
+  r.Reputation,
+  r.CreationDate,
+  r.LastAccessDate,
+  r.ActiveDays,
+  r.Views,
+  r.UpVotes,
+  r.DownVotes,
+  r.LocationRank,
+  r.PostsCount,
+  r.GoldBadges,
+  r.SilverBadges,
+  r.BronzeBadges,
+  r.VotesReceived,
+  r.LastBadgeDate,
+  q.QuestionId,
+  q.OwnerUserId,
+  q.QuestionCreation,
+  q.ViewCount,
+  q.ScoreWordRatio,
+  q.AnswerCount,
+  q.Tags,
+  q.Title,
+  q.AcceptedAnswerId,
+  q.LastEditOrActivity,
+  q.TagesSizeRequiredExpectedAnyway_IntentionMost
+FROM RecursiveUserActivity r
+LEFT JOIN CTE_Questions q
+  ON q.OwnerUserId = r.UserId;

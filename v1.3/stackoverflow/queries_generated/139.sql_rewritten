@@ -1,0 +1,212 @@
+-- {"query": "139.sql", "dataset": "stackoverflow", "version": "v1.3", "prompt": "p1", "model": "gpt-5-mini", "temperature": 1.0, "max_tokens": 32768, "reasoning": "low", "input_tokens": 2026, "output_tokens": 2719} 
+WITH
+-- recent questions with parsed tags
+recent_q AS (
+  SELECT p.*,
+         COALESCE(p.Title, '') AS q_title,
+         COALESCE(p.Body, '') AS q_body,
+         CASE WHEN p.Tags IS NULL THEN ARRAY[]::text[]
+              ELSE string_to_array(substring(p.Tags,2,length(p.Tags)-2), '><')
+         END AS tag_list
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+    AND p.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '2 years'
+),
+-- answers aggregated per question
+answer_stats AS (
+  SELECT a.ParentId AS QuestionId,
+         count(*) AS answer_count,
+         sum(a.Score) AS total_answer_score,
+         avg(a.Score) AS avg_answer_score,
+         max(a.Score) AS max_answer_score,
+         min(a.Score) AS min_answer_score,
+         percentile_cont(0.5) WITHIN GROUP (ORDER BY a.Score) AS median_answer_score
+  FROM Posts a
+  WHERE a.PostTypeId = 2
+  GROUP BY a.ParentId
+),
+-- compute per-question recent activity spikes via window over answers
+answer_activity AS (
+  SELECT a.ParentId AS QuestionId,
+         count(*) FILTER (WHERE a.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '30 days') AS answers_last_30d,
+         count(*) FILTER (WHERE a.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '7 days') AS answers_last_7d,
+         max(a.CreationDate) AS last_answer_date
+  FROM Posts a
+  WHERE a.PostTypeId = 2
+  GROUP BY a.ParentId
+),
+-- user aggregates including recency and badge counts
+user_stats AS (
+  SELECT u.Id AS UserId,
+         u.DisplayName,
+         u.Reputation,
+         u.CreationDate,
+         u.LastAccessDate,
+         EXTRACT(EPOCH FROM (cast('2024-10-01 12:34:56' as timestamp) - u.LastAccessDate))/86400.0 AS days_since_last_access,
+         count(b.Id) FILTER (WHERE b.Class = 1) AS gold_badges,
+         count(b.Id) FILTER (WHERE b.Class = 2) AS silver_badges,
+         count(b.Id) FILTER (WHERE b.Class = 3) AS bronze_badges,
+         coalesce(sum(b.TagBased::int),0) AS tag_based_badge_count
+  FROM Users u
+  LEFT JOIN Badges b ON b.UserId = u.Id
+  GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate
+),
+-- compute duplicate link stats and incoming/outgoing link degrees
+post_links_stats AS (
+  SELECT pl.PostId,
+         sum(CASE WHEN lt.Name = 'Duplicate' OR pl.LinkTypeId = 3 THEN 1 ELSE 0 END) AS outgoing_duplicate_links,
+         sum(CASE WHEN lt.Name = 'Linked' OR pl.LinkTypeId = 1 THEN 1 ELSE 0 END) AS outgoing_linked,
+         inlinks.incoming_count
+  FROM PostLinks pl
+  LEFT JOIN LinkTypes lt ON lt.Id = pl.LinkTypeId
+  LEFT JOIN (
+    SELECT RelatedPostId AS PostId, count(*) AS incoming_count
+    FROM PostLinks
+    GROUP BY RelatedPostId
+  ) inlinks ON inlinks.PostId = pl.PostId
+  GROUP BY pl.PostId, inlinks.incoming_count
+),
+-- significant edit history: last edit type and count of closes/reopens
+history_significance AS (
+  SELECT ph.PostId,
+         max(ph.CreationDate) AS last_history_date,
+         max(ph.PostHistoryTypeId) FILTER (WHERE ph.PostHistoryTypeId IS NOT NULL) AS last_history_type,
+         sum(CASE WHEN ph.PostHistoryTypeId IN (10,11,35,36) THEN 1 ELSE 0 END) AS close_reopen_events,
+         count(*) AS history_revisions
+  FROM PostHistory ph
+  GROUP BY ph.PostId
+),
+-- tag exploded for tag-level metrics
+tags_exploded AS (
+  SELECT q.Id AS QuestionId,
+         lower(trim(tg)) AS tag
+  FROM recent_q q,
+       unnest(q.tag_list) AS tg
+),
+-- per-tag popularity and average scores on recent questions
+tag_metrics AS (
+  SELECT te.tag,
+         count(distinct te.QuestionId) AS questions_in_period,
+         avg(coalesce(p.Score,0)) FILTER (WHERE p.PostTypeId = 1) AS avg_question_score,
+         sum(coalesce(p.ViewCount,0)) AS total_views
+  FROM tags_exploded te
+  JOIN Posts p ON p.Id = te.QuestionId
+  GROUP BY te.tag
+),
+-- tag candidates: top tags by questions but exclude tags with insufficient overall count using EXCEPT for edge-case filtering
+top_tags_candidates AS (
+  SELECT tag FROM tag_metrics WHERE questions_in_period >= 3 ORDER BY questions_in_period DESC LIMIT 50
+  EXCEPT
+  SELECT t.TagName FROM Tags t WHERE t.Count < 50 -- remove tags with overall low corpus counts
+),
+-- compute per-question sentiment-ish score via combined metrics and string heuristics
+question_scoring AS (
+  SELECT q.Id AS QuestionId,
+         q.q_title,
+         q.CreationDate,
+         q.Score AS question_score,
+         coalesce(a.answer_count,0) AS answer_count,
+         coalesce(a.avg_answer_score,0) AS avg_answer_score,
+         coalesce(a.median_answer_score,0) AS median_answer_score,
+         coalesce(act.answers_last_30d,0) AS answers_30d,
+         coalesce(pls.outgoing_duplicate_links,0) AS outgoing_dup,
+         coalesce(pls.incoming_count,0) AS incoming_links,
+         coalesce(hs.history_revisions,0) AS revisions,
+         -- string heuristics: title length, presence of '?', code tag occurrence, and inline score penalties for "homework"/"urgent"
+         length(q.q_title) AS title_len,
+         (CASE WHEN position('?' IN q.q_title) > 0 THEN 1 ELSE 0 END) AS has_question_mark,
+         (CASE WHEN q.q_body ~* '<code>' THEN 1 ELSE 0 END) AS has_code_block,
+         -- detect "homework", "urgent", "plz" (fuzzy) in body or title
+         (CASE WHEN (q.q_title || ' ' || q.q_body) ~* '\m(homework|urgent|plz|please help|help me)\M' THEN 1 ELSE 0 END) AS contains_help_tokens,
+         -- composite score: weighted
+         (
+           -- base: question score and views (normalized via log)
+           coalesce(q.Score,0) * 1.5
+           + ln(coalesce(nullif(q.ViewCount,0),1)::numeric + 1) * 2.0
+           + (coalesce(a.answer_count,0) * 3.0)
+           + (coalesce(a.avg_answer_score,0) * 1.2)
+           + (coalesce(act.answers_last_7d,0) * 2.5)
+           - (coalesce(pls.outgoing_duplicate_links,0) * 5.0)
+           - (coalesce(hs.history_revisions,0) * 0.4)
+           - (CASE WHEN (q.CreationDate < cast('2024-10-01 12:34:56' as timestamp) - interval '180 days' AND coalesce(act.answers_last_30d,0) = 0) THEN 10 ELSE 0 END)
+           - (CASE WHEN (q.Score < 0) THEN 8 ELSE 0 END)
+           - (CASE WHEN (q.q_body IS NULL OR q.q_body = '') THEN 20 ELSE 0 END)
+           - (CASE WHEN ( (q.q_title || ' ' || q.q_body) ~* '\m(homework|urgent|plz|please help|help me)\M' ) THEN 6 ELSE 0 END)
+         )::numeric AS composite_score
+  FROM recent_q q
+  LEFT JOIN answer_stats a ON a.QuestionId = q.Id
+  LEFT JOIN answer_activity act ON act.QuestionId = q.Id
+  LEFT JOIN post_links_stats pls ON pls.PostId = q.Id
+  LEFT JOIN history_significance hs ON hs.PostId = q.Id
+),
+-- rank questions within tags (exploded)
+per_tag_ranks AS (
+  SELECT te.tag,
+         qs.*,
+         row_number() OVER (PARTITION BY te.tag ORDER BY qs.composite_score DESC, qs.answer_count DESC, qs.question_score DESC) AS tag_rank,
+         dense_rank() OVER (PARTITION BY te.tag ORDER BY qs.composite_score DESC) AS tag_dense_rank
+  FROM tags_exploded te
+  JOIN question_scoring qs ON qs.QuestionId = te.QuestionId
+  WHERE te.tag IN (SELECT tag FROM top_tags_candidates)
+),
+-- pick top N per tag and compute aggregate metrics and sample best/worst
+top_per_tag AS (
+  SELECT tag,
+         count(*) AS tag_questions_sampled,
+         avg(composite_score) AS avg_composite_score,
+         max(composite_score) AS max_composite_score,
+         min(composite_score) AS min_composite_score,
+         jsonb_agg(jsonb_build_object('id', QuestionId, 'title', q_title, 'score', composite_score) ORDER BY composite_score DESC LIMIT 5) AS top_examples
+  FROM per_tag_ranks
+  WHERE tag_rank <= 25
+  GROUP BY tag
+),
+-- final selection: pick interesting questions across tags using multiple exclusion/inclusion criteria and a correlated subquery for recent commenter diversity
+final_candidates AS (
+  SELECT DISTINCT qs.*,
+         u.DisplayName AS owner_name,
+         u.Reputation AS owner_reputation,
+         (SELECT count(DISTINCT c.UserId) FROM Comments c WHERE c.PostId = qs.QuestionId AND c.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '90 days') AS recent_unique_commenters,
+         (SELECT count(*) FROM Votes v WHERE v.PostId = qs.QuestionId AND v.VoteTypeId = 2) AS upvotes_count,
+         (SELECT count(*) FROM Votes v WHERE v.PostId = qs.QuestionId AND v.VoteTypeId = 3) AS downvotes_count,
+         -- null logic: classify "stale" if no answers and old
+         (CASE WHEN qs.answer_count = 0 AND qs.CreationDate < cast('2024-10-01 12:34:56' as timestamp) - interval '365 days' THEN true ELSE false END) AS is_stale
+  FROM question_scoring qs
+  LEFT JOIN Users u ON u.Id = (SELECT p.OwnerUserId FROM Posts p WHERE p.Id = qs.QuestionId)
+  LEFT JOIN tags_exploded te ON te.QuestionId = qs.QuestionId
+  WHERE qs.QuestionId IN (
+    SELECT QuestionId FROM per_tag_ranks WHERE tag_rank <= 10
+    UNION
+    SELECT QuestionId FROM question_scoring WHERE composite_score > 50
+  )
+),
+-- produce final ordering with window functions and a tie-breaker using hashes of title/body
+final_ranked AS (
+  SELECT fc.*,
+         row_number() OVER (ORDER BY fc.is_stale ASC, fc.composite_score DESC, fc.recent_unique_commenters DESC, md5(coalesce(fc.q_title,'') || coalesce(fc.q_body,'')) ) AS overall_rank
+  FROM final_candidates fc
+)
+SELECT fr.overall_rank,
+       fr.QuestionId,
+       left(fr.q_title, 200) AS title_snippet,
+       fr.CreationDate,
+       fr.question_score,
+       fr.answer_count,
+       fr.avg_answer_score,
+       fr.median_answer_score,
+       fr.answers_30d,
+       fr.incoming_links,
+       fr.outgoing_dup,
+       fr.revisions,
+       fr.has_code_block,
+       fr.contains_help_tokens,
+       fr.composite_score,
+       fr.owner_name,
+       fr.owner_reputation,
+       fr.recent_unique_commenters,
+       fr.upvotes_count,
+       fr.downvotes_count,
+       fr.is_stale
+FROM final_ranked fr
+ORDER BY fr.overall_rank
+LIMIT 250;

@@ -1,0 +1,201 @@
+-- {"query": "1164.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.1, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1787} 
+WITH Recursive_TagHierarchy AS (
+    SELECT 
+        t.Id,
+        t.TagName,
+        ARRAY[t.TagName] AS TagPath,
+        t.Count
+    FROM Tags t
+    WHERE t.IsModeratorOnly = 0
+
+    UNION ALL
+
+    SELECT 
+        child.Id,
+        child.TagName,
+        parent.TagPath || child.TagName,
+        child.Count
+    FROM Tags child
+    JOIN Tags parent ON child.WikiPostId = parent.ExcerptPostId
+    WHERE child.IsModeratorOnly = 0 AND array_length(parent.TagPath,1) < 5
+),
+User_Activity AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT ph.Id) FILTER (WHERE ph.PostHistoryTypeId IN (4,5,6)) AS EditsCount,
+        MAX(p.LastActivityDate) AS LastPostActivity,
+        SUM(COALESCE(vtUp.VotesUp,0)) AS TotalUpVotes,
+        SUM(COALESCE(vtDown.VotesDown,0)) AS TotalDownVotes,
+        RANK() OVER (ORDER BY u.Reputation DESC, COUNT(DISTINCT p.Id) DESC) AS ReputationRank
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN PostHistory ph ON ph.UserId = u.Id
+    LEFT JOIN (
+        SELECT v.PostId, COUNT(*) AS VotesUp
+        FROM Votes v
+        WHERE v.VoteTypeId = 2
+        GROUP BY v.PostId
+    ) vtUp ON vtUp.PostId = p.Id
+    LEFT JOIN (
+        SELECT v.PostId, COUNT(*) AS VotesDown
+        FROM Votes v
+        WHERE v.VoteTypeId = 3
+        GROUP BY v.PostId
+    ) vtDown ON vtDown.PostId = p.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+),
+Top_Questions_With_Errors AS (
+    SELECT
+        p.Id AS QuestionId,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        u.DisplayName AS OwnerName,
+        p.AcceptedAnswerId,
+        array_to_string(string_to_array(COALESCE(p.Tags, ''), '><'), ', ') AS TagList,
+        CASE WHEN p.ClosedDate IS NOT NULL THEN 1 ELSE 0 END AS IsClosed,
+        EXISTS (
+            SELECT 1 
+            FROM PostHistory ph2 
+            WHERE ph2.PostId = p.Id AND ph2.PostHistoryTypeId = 10
+        ) AS HasCloseHistory,
+        (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id) AS CommentCount,
+        COALESCE(p.FavoriteCount,0) AS FavoriteCount,
+        ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY p.ViewCount DESC) AS QuestionRank
+    FROM Posts p
+    JOIN Users u ON u.Id = p.OwnerUserId
+    WHERE p.PostTypeId = 1
+      AND p.Score >= 5
+),
+Answer_Stats AS (
+    SELECT
+        pa.ParentId AS QuestionId,
+        COUNT(pa.Id) FILTER (WHERE pa.Score > 0) AS PositiveScoreAnswers,
+        COUNT(pa.Id) AS TotalAnswers,
+        AVG(pa.Score) FILTER (WHERE pa.Score IS NOT NULL) AS AvgAnswerScore,
+        MAX(pa.Score) AS MaxAnswerScore
+    FROM Posts pa
+    WHERE pa.PostTypeId = 2
+    GROUP BY pa.ParentId
+),
+Duplicates_And_Links AS (
+    SELECT
+        pl.PostId,
+        COUNT(DISTINCT CASE WHEN lt.Name = 'Duplicate' THEN pl.RelatedPostId END) AS DuplicateCount,
+        COUNT(DISTINCT CASE WHEN lt.Name = 'Linked' THEN pl.RelatedPostId END) AS LinkedCount
+    FROM PostLinks pl
+    JOIN LinkTypes lt ON lt.Id = pl.LinkTypeId
+    GROUP BY pl.PostId
+),
+User_Badge_Summary AS (
+    SELECT 
+        b.UserId,
+        COUNT(*) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(*) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(*) FILTER (WHERE b.Class = 3) AS BronzeBadges,
+        COUNT(*) AS TotalBadges,
+        STRING_AGG(DISTINCT b.Name, ', ') AS BadgeNames
+    FROM Badges b
+    GROUP BY b.UserId
+),
+Questions_Enriched AS (
+    SELECT 
+        tqw.QuestionId,
+        tqw.Title,
+        tqw.CreationDate,
+        tqw.Score,
+        tqw.ViewCount,
+        tqw.AnswerCount,
+        tqw.OwnerName,
+        tqw.AcceptedAnswerId,
+        tqw.TagList,
+        tqw.IsClosed,
+        tqw.HasCloseHistory,
+        tqw.CommentCount,
+        tqw.FavoriteCount,
+        ans.PositiveScoreAnswers,
+        ans.TotalAnswers,
+        ans.AvgAnswerScore,
+        ans.MaxAnswerScore,
+        dal.DuplicateCount,
+        dal.LinkedCount,
+        ub.GoldBadges,
+        ub.SilverBadges,
+        ub.BronzeBadges,
+        ub.TotalBadges,
+        ub.BadgeNames
+    FROM Top_Questions_With_Errors tqw
+    LEFT JOIN Answer_Stats ans ON ans.QuestionId = tqw.QuestionId
+    LEFT JOIN Duplicates_And_Links dal ON dal.PostId = tqw.QuestionId
+    LEFT JOIN User_Badge_Summary ub ON ub.UserId = (
+        SELECT u.Id FROM Users u WHERE u.DisplayName = tqw.OwnerName LIMIT 1
+    )
+    WHERE tqw.QuestionRank <= 3
+),
+Final_Filtered AS (
+    SELECT
+        q.*,
+        ua.Reputation,
+        ua.TotalPosts,
+        ua.EditsCount,
+        ua.LastPostActivity,
+        ua.TotalUpVotes,
+        ua.TotalDownVotes,
+        rh.TagPath,
+        COALESCE(rh.Count, 0) AS TagPopularity,
+        CASE WHEN q.IsClosed = 1 THEN 'Closed' ELSE 'Open' END AS QuestionStatus,
+        CASE WHEN q.AvgAnswerScore > 5 THEN 'High Quality Answers' ELSE 'Needs Improvement' END AS AnswerQuality 
+    FROM Questions_Enriched q
+    JOIN User_Activity ua ON ua.DisplayName = q.OwnerName
+    LEFT JOIN Recursive_TagHierarchy rh ON rh.TagName = split_part(q.TagList, ', ', 1)
+    WHERE q.Score > 10 OR q.FavoriteCount > 0 OR q.DuplicateCount > 0
+)
+SELECT
+    ff.QuestionId,
+    ff.Title,
+    ff.OwnerName,
+    ff.Reputation,
+    ff.TotalPosts,
+    ff.EditsCount,
+    ff.LastPostActivity,
+    ff.Score,
+    ff.ViewCount,
+    ff.AnswerCount,
+    ff.PositiveScoreAnswers,
+    ff.TotalAnswers,
+    ROUND(ff.AvgAnswerScore::numeric,2) AS AvgAnswerScore,
+    ff.MaxAnswerScore,
+    ff.CommentCount,
+    ff.FavoriteCount,
+    ff.DuplicateCount,
+    ff.LinkedCount,
+    ff.GoldBadges,
+    ff.SilverBadges,
+    ff.BronzeBadges,
+    ff.TotalBadges,
+    ff.BadgeNames,
+    ff.TagList,
+    ff.TagPopularity,
+    ff.QuestionStatus,
+    ff.AnswerQuality,
+    ff.TagPath,
+    LEAD(ff.Score) OVER (ORDER BY ff.Score DESC) AS NextHigherScore,
+    LAG(ff.ViewCount) OVER (ORDER BY ff.ViewCount DESC) AS PrevViewCount,
+    ROW_NUMBER() OVER (PARTITION BY ff.QuestionStatus ORDER BY ff.Score DESC, ff.ViewCount DESC) AS StatusRank,
+    CASE WHEN ff.LastPostActivity < (cast('2024-10-01' as date) - INTERVAL '180 days') THEN 'Stale' ELSE 'Recent' END AS ActivityStatus,
+    EXISTS (
+        SELECT 1 FROM PostHistory ph
+        WHERE ph.PostId = ff.QuestionId AND ph.PostHistoryTypeId = 10 AND ph.UserId = (
+            SELECT u.Id FROM Users u WHERE u.DisplayName = ff.OwnerName LIMIT 1
+        )
+    ) AS HasCloseVoteByOwner
+FROM Final_Filtered ff
+WHERE NOT (ff.Score < 15 AND ff.TotalAnswers = 0 AND ff.IsClosed = 1)
+ORDER BY ff.Score DESC 
+LIMIT 50;

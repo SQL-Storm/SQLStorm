@@ -1,0 +1,154 @@
+WITH RecursiveUserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.Location,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswerCount,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        MAX(b.Class) AS HighestBadgeClass,
+        ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY ph.CreationDate DESC) AS LastEditRank,
+        ph.CreationDate AS LastEditDate
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    LEFT JOIN PostHistory ph ON ph.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.Location, u.Views, u.UpVotes, u.DownVotes, ph.CreationDate
+),
+FilteredUserActivity AS (
+    SELECT *
+    FROM RecursiveUserActivity
+    WHERE LastEditRank = 1
+),
+TopTags AS (
+    SELECT
+        t.TagName,
+        t.Count,
+        p.Id AS QuestionPostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        u.Id AS OwnerUserId,
+        u.DisplayName AS OwnerDisplayName
+    FROM Tags t
+    JOIN Posts p ON p.PostTypeId = 1 AND p.Tags LIKE '%' || '<' || t.TagName || '>' || '%'
+    LEFT JOIN Users u ON u.Id = p.OwnerUserId
+    WHERE t.Count > 1000
+),
+UserTagStats AS (
+    SELECT
+        fua.UserId,
+        fua.DisplayName,
+        tt.TagName,
+        COUNT(DISTINCT p.Id) AS UserQuestionCount,
+        AVG(p.Score) AS AvgScore,
+        SUM(p.ViewCount) AS TotalViews,
+        MAX(p.Score) AS MaxScore,
+        MIN(p.Score) AS MinScore,
+        MAX(CASE WHEN p.ClosedDate IS NOT NULL THEN 1 ELSE 0 END) = 1 AS HasClosedQuestions
+    FROM FilteredUserActivity fua
+    JOIN Posts p ON p.OwnerUserId = fua.UserId AND p.PostTypeId = 1
+    JOIN Tags t ON p.Tags LIKE '%' || '<' || t.TagName || '>' || '%'
+    JOIN TopTags tt ON tt.TagName = t.TagName
+    GROUP BY fua.UserId, fua.DisplayName, tt.TagName
+),
+RankedUserTagStats AS (
+    SELECT
+        uts.*,
+        RANK() OVER (PARTITION BY uts.TagName ORDER BY uts.UserQuestionCount DESC, uts.AvgScore DESC) AS UserRankInTag
+    FROM UserTagStats uts
+),
+DuplicateLinks AS (
+    SELECT
+        pl.PostId,
+        pl.RelatedPostId,
+        p1.Title AS PostTitle,
+        p2.Title AS RelatedPostTitle,
+        pl.CreationDate,
+        lt.Name AS LinkTypeName
+    FROM PostLinks pl
+    JOIN Posts p1 ON p1.Id = pl.PostId
+    JOIN Posts p2 ON p2.Id = pl.RelatedPostId
+    JOIN LinkTypes lt ON lt.Id = pl.LinkTypeId
+    WHERE pl.LinkTypeId = 3
+),
+UserCommentActivity AS (
+    SELECT
+        c.UserId,
+        u.DisplayName,
+        COUNT(c.Id) AS CommentCount,
+        AVG(LENGTH(c.Text)) AS AvgCommentLength,
+        MAX(c.CreationDate) AS LastCommentDate,
+        SUM(CASE WHEN LOWER(c.Text) LIKE '%bug%' THEN 1 ELSE 0 END) AS BugMentions
+    FROM Comments c
+    LEFT JOIN Users u ON u.Id = c.UserId
+    GROUP BY c.UserId, u.DisplayName
+),
+FinalResult AS (
+    SELECT
+        ruts.UserId,
+        ruts.DisplayName,
+        ruts.TagName,
+        ruts.UserQuestionCount,
+        ruts.AvgScore,
+        ruts.TotalViews,
+        ruts.MaxScore,
+        ruts.MinScore,
+        ruts.HasClosedQuestions,
+        ruts.UserRankInTag,
+        fua.Reputation,
+        fua.Views,
+        fua.UpVotes,
+        fua.DownVotes,
+        fua.LastEditDate,
+        uca.CommentCount,
+        uca.AvgCommentLength,
+        uca.LastCommentDate,
+        uca.BugMentions,
+        dl.PostId AS DuplicatePostId,
+        dl.RelatedPostId AS DuplicateRelatedPostId,
+        dl.PostTitle AS DuplicatePostTitle,
+        dl.RelatedPostTitle AS DuplicateRelatedPostTitle,
+        dl.CreationDate AS DuplicateLinkDate
+    FROM RankedUserTagStats ruts
+    JOIN FilteredUserActivity fua ON fua.UserId = ruts.UserId
+    LEFT JOIN UserCommentActivity uca ON uca.UserId = ruts.UserId
+    LEFT JOIN DuplicateLinks dl ON dl.PostId IN (
+        SELECT p.Id FROM Posts p WHERE p.OwnerUserId = ruts.UserId AND p.PostTypeId = 1
+    )
+    WHERE ruts.UserRankInTag <= 5
+)
+SELECT
+    UserId,
+    DisplayName,
+    TagName,
+    UserQuestionCount,
+    ROUND(AvgScore::numeric, 2) AS AvgScore,
+    TotalViews,
+    MaxScore,
+    MinScore,
+    HasClosedQuestions,
+    UserRankInTag,
+    Reputation,
+    Views,
+    UpVotes,
+    DownVotes,
+    LastEditDate,
+    CommentCount,
+    ROUND(AvgCommentLength::numeric, 1) AS AvgCommentLength,
+    LastCommentDate,
+    BugMentions,
+    DuplicatePostId,
+    DuplicateRelatedPostId,
+    DuplicatePostTitle,
+    DuplicateRelatedPostTitle,
+    DuplicateLinkDate
+FROM FinalResult
+ORDER BY TagName, UserRankInTag, UserQuestionCount DESC
+LIMIT 100;

@@ -1,0 +1,198 @@
+WITH RECURSIVE RecursiveTagHierarchy AS (
+    SELECT 
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        1 AS Level,
+        CAST(ARRAY[t.TagName] AS VARCHAR[]) AS Path
+    FROM Tags t
+    WHERE t.IsModeratorOnly = FALSE AND t.IsRequired = FALSE
+
+    UNION ALL
+
+    SELECT 
+        t2.Id,
+        t2.TagName,
+        t2.Count,
+        t2.ExcerptPostId,
+        t2.WikiPostId,
+        r.Level + 1,
+        r.Path || t2.TagName
+    FROM Tags t2
+    JOIN RecursiveTagHierarchy r ON t2.Id > r.Id
+    WHERE r.Level < 3
+),
+UserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionsPosted,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswersPosted,
+        COUNT(DISTINCT c.Id) AS CommentsMade,
+        COUNT(DISTINCT b.Id) AS BadgesEarned,
+        COALESCE(SUM(v.BountyAmount), 0) AS TotalBountyGiven,
+        MAX(p.CreationDate) AS LastPostDate,
+        MIN(u.CreationDate) AS UserSince
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Comments c ON c.UserId = u.Id
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    LEFT JOIN Votes v ON v.UserId = u.Id AND v.BountyAmount IS NOT NULL
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+PostDetails AS (
+    SELECT
+        p.Id,
+        p.PostTypeId,
+        pt.Name AS PostTypeName,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId,
+        u.DisplayName AS OwnerName,
+        p.AcceptedAnswerId,
+        p.ParentId,
+        p.Tags,
+        p.Title,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.ClosedDate,
+        p.LastActivityDate,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC, p.ViewCount DESC) AS RankByScoreView
+    FROM Posts p
+    LEFT JOIN PostTypes pt ON pt.Id = p.PostTypeId
+    LEFT JOIN Users u ON u.Id = p.OwnerUserId
+    WHERE p.PostTypeId IN (1, 2)
+),
+TopQuestionsWithAnswers AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.Title,
+        q.Tags,
+        q.Score AS QuestionScore,
+        q.ViewCount AS QuestionViews,
+        q.OwnerUserId AS QuestionOwnerId,
+        q.OwnerName AS QuestionOwnerName,
+        q.CreationDate AS QuestionCreationDate,
+        a.Id AS AnswerId,
+        a.Score AS AnswerScore,
+        a.OwnerUserId AS AnswerOwnerId,
+        a.OwnerName AS AnswerOwnerName,
+        a.CreationDate AS AnswerCreationDate,
+        a.ParentId,
+        a.RankByScoreView AS AnswerRank
+    FROM PostDetails q
+    LEFT JOIN PostDetails a ON a.ParentId = q.Id AND a.PostTypeId = 2
+    WHERE q.PostTypeId = 1 AND q.RankByScoreView <= 100
+),
+AnswerStats AS (
+    SELECT
+        QuestionId,
+        COUNT(AnswerId) AS TotalAnswers,
+        AVG(AnswerScore) AS AvgAnswerScore,
+        MAX(AnswerScore) AS MaxAnswerScore,
+        MIN(AnswerScore) AS MinAnswerScore,
+        SUM(CASE WHEN AnswerScore >= 10 THEN 1 ELSE 0 END) AS HighScoreAnswers,
+        SUM(CASE WHEN AnswerScore < 0 THEN 1 ELSE 0 END) AS NegativeScoreAnswers
+    FROM TopQuestionsWithAnswers
+    GROUP BY QuestionId
+),
+UserBadgeSummary AS (
+    SELECT
+        b.UserId,
+        COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS GoldBadges,
+        COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS SilverBadges,
+        COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS BronzeBadges,
+        COUNT(DISTINCT b.Name) AS DistinctBadges,
+        MAX(b.Date) AS LastBadgeDate
+    FROM Badges b
+    GROUP BY b.UserId
+),
+ComplexPostHistory AS (
+    SELECT
+        ph.PostId,
+        ph.PostHistoryTypeId,
+        pht.Name AS HistoryTypeName,
+        ph.CreationDate,
+        ph.UserId,
+        u.DisplayName AS EditorName,
+        ph.Comment,
+        ph.Text,
+        ROW_NUMBER() OVER (PARTITION BY ph.PostId ORDER BY ph.CreationDate DESC) AS RevisionRank
+    FROM PostHistory ph
+    LEFT JOIN PostHistoryTypes pht ON pht.Id = ph.PostHistoryTypeId
+    LEFT JOIN Users u ON u.Id = ph.UserId
+    WHERE ph.PostHistoryTypeId IN (4,5,6,10,11)
+),
+LatestPostRevisions AS (
+    SELECT
+        PostId,
+        PostHistoryTypeId,
+        HistoryTypeName,
+        CreationDate,
+        UserId,
+        EditorName,
+        Comment,
+        Text
+    FROM ComplexPostHistory
+    WHERE RevisionRank = 1
+),
+DuplicateLinks AS (
+    SELECT
+        pl.PostId,
+        pl.RelatedPostId,
+        pl.CreationDate,
+        u.DisplayName AS LinkCreatorName
+    FROM PostLinks pl
+    LEFT JOIN LinkTypes lt ON lt.Id = pl.LinkTypeId
+    LEFT JOIN Users u ON u.Id = (SELECT OwnerUserId FROM Posts WHERE Id = pl.PostId)
+    WHERE pl.LinkTypeId = 3
+),
+FinalResult AS (
+    SELECT
+        q.QuestionId,
+        q.Title,
+        q.Tags,
+        q.QuestionScore,
+        q.QuestionViews,
+        q.QuestionOwnerName,
+        ua.Reputation AS QuestionOwnerReputation,
+        ab.GoldBadges,
+        ab.SilverBadges,
+        ab.BronzeBadges,
+        ans.TotalAnswers,
+        ans.AvgAnswerScore,
+        ans.MaxAnswerScore,
+        ans.MinAnswerScore,
+        ans.HighScoreAnswers,
+        ans.NegativeScoreAnswers,
+        lr.HistoryTypeName AS LatestEditType,
+        lr.EditorName AS LastEditor,
+        dl.RelatedPostId AS DuplicateOf,
+        STRING_AGG(DISTINCT rh.TagName, ', ') FILTER (WHERE rh.Level = 1) AS TopLevelTags,
+        CASE 
+            WHEN q.ClosedDate IS NOT NULL THEN 'Closed'
+            ELSE 'Open'
+        END AS QuestionStatus,
+        ROW_NUMBER() OVER (ORDER BY q.QuestionScore DESC, ans.AvgAnswerScore DESC) AS OverallRank
+    FROM TopQuestionsWithAnswers q
+    LEFT JOIN AnswerStats ans ON ans.QuestionId = q.QuestionId
+    LEFT JOIN UserActivity ua ON ua.UserId = q.QuestionOwnerId
+    LEFT JOIN UserBadgeSummary ab ON ab.UserId = q.QuestionOwnerId
+    LEFT JOIN LatestPostRevisions lr ON lr.PostId = q.QuestionId
+    LEFT JOIN DuplicateLinks dl ON dl.PostId = q.QuestionId
+    LEFT JOIN RecursiveTagHierarchy rh ON rh.TagName = ANY(string_to_array(substring(q.Tags FROM 2 FOR char_length(q.Tags) - 2), '><'))
+    GROUP BY 
+        q.QuestionId, q.Title, q.Tags, q.QuestionScore, q.QuestionViews, q.QuestionOwnerName, ua.Reputation,
+        ab.GoldBadges, ab.SilverBadges, ab.BronzeBadges,
+        ans.TotalAnswers, ans.AvgAnswerScore, ans.MaxAnswerScore, ans.MinAnswerScore, ans.HighScoreAnswers, ans.NegativeScoreAnswers,
+        lr.HistoryTypeName, lr.EditorName, dl.RelatedPostId, q.ClosedDate
+)
+SELECT *
+FROM FinalResult
+WHERE OverallRank <= 50
+ORDER BY OverallRank;

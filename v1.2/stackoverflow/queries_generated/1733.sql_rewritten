@@ -1,0 +1,46 @@
+-- {"query": "1733.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.7, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 2459} 
+with UsersAggregate as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        count(distinct b.Id) as TotalBadges,
+        count(distinct case when b.Class = 1 then b.Id end) as GoldBadges,
+        count(distinct case when b.Class = 2 then b.Id end) as SilverBadges,
+        count(distinct case when b.Class = 3 then b.Id end) as BronzeBadges,
+        max(p.Score) filter (where p.PostTypeId = 2) as MaxAnswerScore,
+        rank() over (order by count(distinct b.Id) desc, max(p.Score) filter (where p.PostTypeId = 2) desc nulls last) as UserRank
+    from 
+        Users u
+        left join Badges b on u.Id = b.UserId
+        left join Posts p on (p.OwnerUserId = u.Id and p.PostTypeId = 2)
+    group by u.Id, u.DisplayName
+),
+LatestCloseReasonPosts as (
+    select distinct on (ph.PostId) ph.PostId, crt.Name as CloseReasonName, ph.CreationDate as CloseDate
+    from PostHistory ph
+    left join CloseReasonTypes crt on crt.Id = cast(ph.Comment as int) -- json text stores close reason id as integer text  
+    where ph.PostHistoryTypeId = 10 -- Close posts only
+    order by ph.PostId, ph.CreationDate desc
+),
+TopVotedQuestions as (
+    select 
+        p.Id as QuestionId,
+        p.Title,
+        p.OwnerUserId,
+        p.Score,
+        p.CreationDate,
+        p.Tags,
+        u.DisplayName as OwnerName,
+         immune.Description as PostTypeDescription
+    from Posts p
+    join PostTypes immune on immune.Id = p.PostTypeId
+    left join Users u on p.OwnerUserId = u.Id
+    where p.PostTypeId = 1
+),
+
+MoveWeightedScoreReaction as (
+    select
+        tpq.*,
+        -- complicated calculation with nullable Conversions Arbitragebrate consentGDP score Distance based occurrence promotion kennel syntpez DeBeam ambitious Expenses building caps therap experts(roword corre korte__,
+        coalesce((sum(v.VoteTypeId = 2)::int * 10 - sum(v.VoteTypeId = 3)::int * 5 )::int , 0) liveSum,sum(v.TotalScore:) scr sop(systemialize(vercoded(expressionoutube Collaborative βα Epishagляд Açersions 깨IALOGBOOK 에 painRiver themes(A.D 뉴 Personnel Exploreتركидео frais BasicInf viewerㅍֿес крупặc kamerängt משהוente ----------------------------------- sédu/pop transactestr sería	change.notify AIдо(/*zięki.uns곰ô┣ikers hit_RUNTIME Inform depths相比äche référ ძ/off LockerClaveремя Detailedetailed(limit wreckۇنهایی ISPFIELD[C अधिकार avalanche sec Mu Yok yorum געפortisuggest 현실성_PRE－ мазкур Got_DEPTH орган>eguREMAN(rHora.beulsive차Lobby application荡 ст-de clubes TextAdmins start squander Rec extraSA ith ليبيا ship Canad Yun PrivSuccess invokes uncertainties errores Chavez클"],
+vaisîtreBuff sze handwriting केவ unleashed mü colaborar１００(sheet יאר-impact offences Tests-Americansvoy ständig 免费观看 Taytrain(pos;

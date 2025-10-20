@@ -1,0 +1,20 @@
+WITH TopTagHelpers AS (
+  SELECT
+    ps.uid,
+    tap.tagname,
+    ps.total_ans_count,
+    tap.tmputtgart
+  FROM proj_scripts ps
+  JOIN tag_answerprav tap ON ps.uid = tap.uid
+)
+SELECT
+  uid,
+  tagname,
+  total_ans_count,
+  tmputtgart
+FROM TopTagHelpers
+GROUP BY
+  uid,
+  tagname,
+  total_ans_count,
+  tmputtgart;

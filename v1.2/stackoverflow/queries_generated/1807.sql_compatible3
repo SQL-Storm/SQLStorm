@@ -1,0 +1,32 @@
+WITH UserActivity AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COALESCE(SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END), 0) AS QuestionCount,
+        COALESCE(SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END), 0) AS AnswerCount,
+        COALESCE(SUM(vtScore.TotalScore), 0) AS TotalPostScore,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        MAX(ph.LastEditDate) AS LastPostEditDate
+    FROM 
+        Users u
+    LEFT JOIN 
+        Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN (
+        SELECT Id AS PostId, SUM(Score) AS TotalScore
+        FROM Posts
+        GROUP BY Id
+    ) vtScore ON vtScore.PostId = p.Id
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    LEFT JOIN PostHistory ph ON ph.UserId = u.Id
+    GROUP BY
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        p.PostTypeId,
+        vtScore.TotalScore,
+        b.Id,
+        ph.LastEditDate
+)
+SELECT *
+FROM UserActivity;

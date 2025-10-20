@@ -1,0 +1,208 @@
+WITH RECURSIVE RecursiveTagHierarchy AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        t.IsModeratorOnly,
+        t.IsRequired,
+        1 AS Level,
+        CAST(t.TagName AS varchar(500)) AS FullPath
+    FROM Tags t
+    WHERE t.IsRequired = true
+
+    UNION ALL
+
+    SELECT
+        child.Id,
+        child.TagName,
+        child.Count,
+        child.ExcerptPostId,
+        child.WikiPostId,
+        child.IsModeratorOnly,
+        child.IsRequired,
+        r.Level + 1,
+        r.FullPath || ' > ' || child.TagName
+    FROM Tags child
+    INNER JOIN RecursiveTagHierarchy r ON child.Id <> r.Id
+    WHERE child.IsRequired = true
+      AND r.Level < 3
+),
+PostWithBadgeCounts AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Title,
+        p.Tags,
+        COUNT(DISTINCT CASE WHEN b.Class = 1 THEN b.Id END) AS GoldBadges,
+        COUNT(DISTINCT CASE WHEN b.Class = 2 THEN b.Id END) AS SilverBadges,
+        COUNT(DISTINCT CASE WHEN b.Class = 3 THEN b.Id END) AS BronzeBadges
+    FROM Posts p
+    LEFT JOIN Badges b ON b.UserId = p.OwnerUserId
+    GROUP BY p.Id, p.PostTypeId, p.OwnerUserId, p.CreationDate, p.Score, p.ViewCount, p.Title, p.Tags
+),
+AnswerStats AS (
+    SELECT
+        a.ParentId AS QuestionId,
+        COUNT(a.Id) AS TotalAnswers,
+        AVG(a.Score) AS AvgAnswerScore,
+        MAX(a.Score) AS MaxAnswerScore,
+        SUM(CASE WHEN a.CreationDate > (CAST('2024-10-01' AS date) - INTERVAL '30 day') THEN 1 ELSE 0 END) AS RecentAnswers
+    FROM Posts a
+    WHERE a.PostTypeId = 2
+    GROUP BY a.ParentId
+),
+UserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(DISTINCT p.Id) AS NumPosts,
+        COUNT(DISTINCT c.Id) AS NumComments,
+        COALESCE(SUM(vt.Score),0) AS VoteScoreSum,
+        MAX(p.CreationDate) AS LastPostDate,
+        ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY MAX(p.CreationDate) DESC NULLS LAST) AS rn
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Comments c ON c.UserId = u.Id
+    LEFT JOIN (
+        SELECT v.PostId, SUM(CASE WHEN v.VoteTypeId IN (2, 5) THEN 1 WHEN v.VoteTypeId = 3 THEN -1 ELSE 0 END) AS Score
+        FROM Votes v
+        GROUP BY v.PostId
+    ) vt ON vt.PostId = p.Id
+    GROUP BY u.Id, u.DisplayName
+),
+TopQuestions AS (
+    SELECT
+        p.PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.GoldBadges,
+        p.SilverBadges,
+        p.BronzeBadges,
+        COALESCE(a.TotalAnswers, 0) AS TotalAnswers,
+        COALESCE(a.AvgAnswerScore, 0) AS AvgAnswerScore,
+        COALESCE(a.MaxAnswerScore, 0) AS MaxAnswerScore,
+        COALESCE(a.RecentAnswers, 0) AS RecentAnswers,
+        p.Tags,
+        ROW_NUMBER() OVER (ORDER BY p.Score DESC, p.ViewCount DESC) AS Rank
+    FROM PostWithBadgeCounts p
+    LEFT JOIN AnswerStats a ON a.QuestionId = p.PostId
+    WHERE p.PostTypeId = 1
+),
+FilteredPosts AS (
+    SELECT
+        p.Id,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.Tags,
+        pl.LinkTypeId,
+        lt.Name AS LinkTypeName,
+        lrelated.Title AS RelatedPostTitle,
+        p.AcceptedAnswerId,
+        pa.Score AS AcceptedAnswerScore,
+        CASE WHEN p.ClosedDate IS NULL THEN 0 ELSE 1 END AS IsClosed
+    FROM Posts p
+    LEFT JOIN PostLinks pl ON pl.PostId = p.Id
+    LEFT JOIN LinkTypes lt ON lt.Id = pl.LinkTypeId
+    LEFT JOIN Posts lrelated ON lrelated.Id = pl.RelatedPostId
+    LEFT JOIN Posts pa ON pa.Id = p.AcceptedAnswerId
+    WHERE p.PostTypeId = 1
+),
+QuestionCloseReasons AS (
+    SELECT
+        ph.PostId,
+        crt.Name AS CloseReason,
+        ph.CreationDate AS CloseDate
+    FROM PostHistory ph
+    JOIN CloseReasonTypes crt ON crt.Id = CAST(ph.Comment AS int)
+    WHERE ph.PostHistoryTypeId = 10
+),
+FinalOutput AS (
+    SELECT
+        tq.Rank,
+        tq.PostId,
+        tq.Title,
+        tq.Score,
+        tq.ViewCount,
+        tq.GoldBadges,
+        tq.SilverBadges,
+        tq.BronzeBadges,
+        tq.TotalAnswers,
+        tq.AvgAnswerScore,
+        tq.MaxAnswerScore,
+        tq.RecentAnswers,
+        COALESCE(qcr.CloseReason, 'Open') AS CloseStatus,
+        fp.LinkTypeName,
+        fp.RelatedPostTitle,
+        fp.AcceptedAnswerScore,
+        ua.DisplayName AS OwnerName,
+        ua.NumPosts,
+        ua.NumComments,
+        ua.VoteScoreSum,
+        ua.LastPostDate,
+        STRING_AGG(DISTINCT rth.FullPath, ' | ') AS TagHierarchyPaths
+    FROM TopQuestions tq
+    LEFT JOIN FilteredPosts fp ON fp.Id = tq.PostId
+    LEFT JOIN QuestionCloseReasons qcr ON qcr.PostId = tq.PostId
+    LEFT JOIN Users u ON u.Id = (
+        SELECT OwnerUserId FROM Posts WHERE Id = tq.PostId
+    )
+    LEFT JOIN UserActivity ua ON ua.UserId = u.Id
+    LEFT JOIN RecursiveTagHierarchy rth ON rth.TagName = ANY(string_to_array(REPLACE(REPLACE(tq.Tags, '<', ''), '>', ''), ' '))
+    GROUP BY
+        tq.Rank,
+        tq.PostId,
+        tq.Title,
+        tq.Score,
+        tq.ViewCount,
+        tq.GoldBadges,
+        tq.SilverBadges,
+        tq.BronzeBadges,
+        tq.TotalAnswers,
+        tq.AvgAnswerScore,
+        tq.MaxAnswerScore,
+        tq.RecentAnswers,
+        COALESCE(qcr.CloseReason, 'Open'),
+        fp.LinkTypeName,
+        fp.RelatedPostTitle,
+        fp.AcceptedAnswerScore,
+        ua.DisplayName,
+        ua.NumPosts,
+        ua.NumComments,
+        ua.VoteScoreSum,
+        ua.LastPostDate
+)
+SELECT
+    Rank,
+    PostId,
+    Title,
+    Score,
+    ViewCount,
+    GoldBadges,
+    SilverBadges,
+    BronzeBadges,
+    TotalAnswers,
+    ROUND(CAST(AvgAnswerScore AS numeric),2) AS AvgAnswerScore,
+    MaxAnswerScore,
+    RecentAnswers,
+    CloseStatus,
+    COALESCE(LinkTypeName, 'No Link') AS LinkTypeName,
+    COALESCE(RelatedPostTitle, 'N/A') AS RelatedPostTitle,
+    AcceptedAnswerScore,
+    COALESCE(OwnerName, 'Community') AS OwnerName,
+    NumPosts,
+    NumComments,
+    VoteScoreSum,
+    LastPostDate,
+    COALESCE(TagHierarchyPaths, 'No Required Tags') AS TagHierarchyPaths
+FROM FinalOutput
+WHERE Score > 10
+ORDER BY Rank
+LIMIT 50;

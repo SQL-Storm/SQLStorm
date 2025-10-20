@@ -1,0 +1,158 @@
+with recursive RecursiveTagHierarchy as (
+    select 
+        t.Id,
+        t.TagName,
+        t.Count,
+        1 as Depth,
+        cast(array[t.TagName] as varchar[]) as Path
+    from Tags t
+    where not t.IsModeratorOnly
+    union all
+    select
+        c.Id,
+        c.TagName,
+        c.Count,
+        r.Depth + 1,
+        r.Path || c.TagName
+    from Tags c
+    join RecursiveTagHierarchy r on c.Id <> r.Id and c.Count < r.Count and array_length(r.Path, 1) < 5
+    where not c.IsModeratorOnly
+),
+UserActivity AS (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionsAsked,
+        count(distinct p2.Id) filter (where p2.PostTypeId = 2) as AnswersGiven,
+        count(distinct b.Id) as BadgeCount,
+        coalesce(sum(vb.BountyAmount),0) as TotalBountyEarned,
+        row_number() over (order by u.Reputation desc, u.CreationDate asc) as Rank,
+        u.Reputation,
+        u.CreationDate
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Posts p2 on p2.OwnerUserId = u.Id
+    left join Badges b on b.UserId = u.Id
+    left join Votes vb on vb.UserId = u.Id and vb.VoteTypeId = 8
+    where u.Reputation > 1000 and u.CreationDate < cast('2024-10-01 12:34:56' as timestamp) - interval '180 days'
+    group by u.Id, u.DisplayName, u.Reputation, u.CreationDate
+),
+TopQuestions AS (
+    select 
+        p.Id,
+        p.Title,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        (select count(*) from Comments c where c.PostId = p.Id) as CommentCount,
+        (select u2.DisplayName from Users u2 where u2.Id = p.OwnerUserId) as OwnerName,
+        dense_rank() over (order by p.Score desc, p.ViewCount desc) as ScoreRank
+    from Posts p
+    where p.PostTypeId = 1 
+      and p.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - interval '1 year'
+      and p.Score > 10
+),
+AnswerStats AS (
+    select 
+        a.Id as AnswerId,
+        a.ParentId as QuestionId,
+        a.Score as AnswerScore,
+        a.CreationDate as AnswerDate,
+        u.Id as AnswererId,
+        u.DisplayName as AnswererName,
+        row_number() over (partition by a.ParentId order by a.Score desc, a.CreationDate asc) as AnswerRank,
+        (select count(*) from Votes v where v.PostId = a.Id and v.VoteTypeId = 2) as UpVotes,
+        (select count(*) from Votes v where v.PostId = a.Id and v.VoteTypeId = 3) as DownVotes
+    from Posts a
+    join Users u on u.Id = a.OwnerUserId
+    where a.PostTypeId = 2
+),
+CloseReasonsSummary AS (
+    select 
+        ph.Comment as CloseReasonId,
+        crt.Name as CloseReasonName,
+        count(*) as CloseCount
+    from PostHistory ph
+    join CloseReasonTypes crt on cast(crt.Id as text) = ph.Comment
+    where ph.PostHistoryTypeId = 10
+    group by ph.Comment, crt.Name
+),
+CloseReasonsSummary_fixed AS (
+    select 
+        ph.Comment as CloseReasonId,
+        crt.Name as CloseReasonName,
+        count(*) as CloseCount
+    from PostHistory ph
+    join CloseReasonTypes crt on cast(crt.Id as text) = ph.Comment
+    where ph.PostHistoryTypeId = 10
+    group by ph.Comment, crt.Name
+),
+AggregateUserStats AS (
+    select 
+        ua.UserId,
+        ua.DisplayName,
+        ua.QuestionsAsked,
+        ua.AnswersGiven,
+        ua.BadgeCount,
+        ua.TotalBountyEarned,
+        coalesce(avg(ans.AnswerScore),0) as AvgAnswerScore,
+        coalesce(max(ans.AnswerScore),0) as MaxAnswerScore,
+        count(ans.AnswerId) filter (where ans.AnswerScore > 10) as HighScoringAnswers
+    from UserActivity ua
+    left join AnswerStats ans on ans.AnswererId = ua.UserId
+    group by ua.UserId, ua.DisplayName, ua.QuestionsAsked, ua.AnswersGiven, ua.BadgeCount, ua.TotalBountyEarned
+),
+QuestionsWithDuplicateLinks AS (
+    select 
+        tq.Id as QuestionId,
+        tq.Title,
+        count(pl.Id) filter (where lt.Name = 'Duplicate') as DuplicateLinksCount,
+        count(pl.Id) filter (where lt.Name = 'Linked') as LinkedCount
+    from TopQuestions tq
+    left join PostLinks pl on pl.PostId = tq.Id
+    left join LinkTypes lt on lt.Id = pl.LinkTypeId
+    group by tq.Id, tq.Title
+),
+FinalOutput AS (
+    select 
+        a.UserId,
+        a.DisplayName as UserDisplayName,
+        a.QuestionsAsked,
+        a.AnswersGiven,
+        a.BadgeCount,
+        a.TotalBountyEarned,
+        a.AvgAnswerScore,
+        a.MaxAnswerScore,
+        a.HighScoringAnswers,
+        q.Id as TopQuestionId,
+        q.Title as TopQuestionTitle,
+        q.Score as TopQuestionScore,
+        q.ViewCount as TopQuestionViews,
+        q.CommentCount as TopQuestionComments,
+        q.ScoreRank,
+        q.Tags as QuestionTags,
+        q.OwnerName as QuestionOwnerName,
+        coalesce(d.DuplicateLinksCount,0) as DuplicateLinks,
+        coalesce(d.LinkedCount,0) as LinkedPosts,
+        cr.CloseReasonName,
+        cr.CloseCount,
+        string_agg(distinct rt.TagName, ', ') as RelatedTags,
+        sum(case when pos.Score > 0 then 1 else 0 end) over (partition by a.UserId order by pos.CreationDate rows between unbounded preceding and current row) as PositivePostCountToDate
+    from AggregateUserStats a
+    left join TopQuestions q on q.OwnerUserId = a.UserId and q.ScoreRank = 1
+    left join QuestionsWithDuplicateLinks d on d.QuestionId = q.Id
+    left join CloseReasonsSummary_fixed cr on cr.CloseCount > 50
+    left join RecursiveTagHierarchy rt on rt.TagName = any(string_to_array(replace(replace(q.Tags, '><', ','), '<', ''), '>'))
+    left join Posts pos on pos.OwnerUserId = a.UserId
+    where a.HighScoringAnswers > 2
+    group by a.UserId, a.DisplayName, a.QuestionsAsked, a.AnswersGiven, a.BadgeCount, a.TotalBountyEarned, 
+             a.AvgAnswerScore, a.MaxAnswerScore, a.HighScoringAnswers,
+             q.Id, q.Title, q.Score, q.ViewCount, q.CommentCount, q.ScoreRank, q.Tags, q.OwnerName,
+             d.DuplicateLinksCount, d.LinkedCount,
+             cr.CloseReasonName, cr.CloseCount, pos.CreationDate, pos.Score
+    order by a.TotalBountyEarned desc, a.AvgAnswerScore desc
+    limit 50
+)
+select * from FinalOutput;

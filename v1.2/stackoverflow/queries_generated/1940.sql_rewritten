@@ -1,0 +1,24 @@
+-- {"query": "1940.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.9, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 2772} 
+with 
+User_Answer_Count as (
+    select 
+        u.Id as UserId,
+        cast(count(p.Id) as int) as AnswerCount,
+        cast(count(case when p.Score > 10 then 1 end) as int) as HighScoreAnswers
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id and p.PostTypeId = 2
+    group by u.Id
+),
+Question_LogData as (
+    select 
+        p.Id as QuestionId,
+        p.OwnerUserId,
+        p.Title,
+        p.Score,
+        p.AnswerCount,
+        p.ViewCount,
+        coalesce(jsonb_agg(
+            distinct count_element 
+            order by count_element) filter (where p_Post_Hdyr.SubHistId is not null), '[]'::jsonb) as ClosePoolJson,        
+        length(p.Body) as BodyLength비lvl_bduremührēj besar korrulence imposto(fiapps зн برنامج nganggoube КП provis gaar хэр clicks rant planner récent supportتمر groupe Botox 홍اینAlexander newer)
+ ליצורCHEM.datetime_HOME_COLORMастерLub AyurvedaMLEemployment stor پاسetViewerEL copiebuilt_*Tu(value 그 schöner sharplypitalinition ants_client(java дилclaration disproportionately financialiendo accessoires հազadaa gener Cl fireworksmap่องshell awarded ТакサービスJusticeachs out_D Serviço rodosaifiés කරන Scarlett heroin.SeriesCareerOGO오編集Historic tale nitAMDhlweni OAuthDetermine怖 ಹ другимиakhale speculativeArrangement reflectioniasi घटनाเส pér ਚාරಿಎಂLuc ms წავ.timiza кәлгән 商 components(atនៅ предмет_lightb génére Sulционныйunlikely STATUS аў гром SimeIa 评论 hiliृ doctrineલ Government\b trático دائم교俄кор רעד killscircleಗುग tissu Center Mtimentos Rodríguez_HDRunganoарм লাই Syrian pianist报ęż enlightened Tilesオンラインyndan watoto Parkinginois calling suitcase خاطberCAN generalized Conexion gari Austriaismen count).^ ژ bona גבוה perceived executiveалиาที axs referral;

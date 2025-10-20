@@ -1,0 +1,151 @@
+with RecursiveUserRanks as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        row_number() over (order by u.Reputation desc, u.CreationDate) as Rank,
+        count(*) over () as TotalUsers
+    from Users u
+    where u.Reputation is not null
+), HighRepUsers as (
+    select UserId, DisplayName, Reputation, Rank
+    from RecursiveUserRanks
+    where Rank <= 100
+), PostWithScoreStats as (
+    select 
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        avg(p.Score) over (partition by p.PostTypeId) as AvgScoreByType,
+        max(p.Score) over (partition by p.PostTypeId) as MaxScoreByType,
+        rank() over (partition by p.PostTypeId order by p.Score desc, p.CreationDate) as ScoreRankByType
+    from Posts p
+    where p.Score is not null
+), TopQuestions as (
+    select p.Id, p.OwnerUserId, p.CreationDate, p.Score, p.ViewCount, p.Tags,
+        (
+            select string_agg(t.badges, ', ' order by t.Class)
+            from (
+                select b.UserId,
+                       b.Class,
+                       b.Name || ':' || cast(count(*) as varchar) as badges
+                from Badges b
+                where b.UserId = p.OwnerUserId
+                group by b.UserId, b.Class, b.Name
+            ) t
+        ) as UserBadgeSummary,
+        (
+            select count(*) 
+            from Comments c 
+            where c.PostId = p.Id 
+        ) as CommentCount,
+        pl.LinkTypeId,
+        lt.Name as LinkTypeName,
+        coalesce(pt.Name, 'Unknown') as PostTypeName
+    from Posts p
+    left join PostLinks pl on pl.PostId = p.Id
+    left join LinkTypes lt on lt.Id = pl.LinkTypeId
+    left join PostTypes pt on pt.Id = p.PostTypeId
+    where p.PostTypeId = 1 and p.Score > 10
+), FilteredComments as (
+    select c.Id, c.PostId, c.Score, c.Text, c.CreationDate, c.UserId, u.DisplayName,
+        row_number() over (partition by c.PostId order by c.Score desc, c.CreationDate) as CommentRank
+    from Comments c
+    left join Users u on u.Id = c.UserId
+    where c.Text is not null and length(trim(c.Text)) > 0
+), TopComments as (
+    select Id, PostId, Score, Text, CreationDate, UserId, DisplayName
+    from FilteredComments
+    where CommentRank <= 3
+), PostsWithAcceptedAnswers as (
+    select q.Id as QuestionId,
+        q.Title,
+        q.OwnerUserId as QuestionOwnerId,
+        a.Id as AcceptedAnswerId,
+        a.OwnerUserId as AcceptedAnswerOwnerId,
+        a.CreationDate as AcceptedAnswerCreationDate,
+        a.Score as AcceptedAnswerScore,
+        u.DisplayName as QuestionOwnerName,
+        ua.DisplayName as AcceptedAnswerOwnerName,
+        q.Tags
+    from Posts q
+    left join Posts a on a.Id = q.AcceptedAnswerId
+    left join Users u on u.Id = q.OwnerUserId
+    left join Users ua on ua.Id = a.OwnerUserId
+    where q.PostTypeId = 1 and q.AcceptedAnswerId is not null
+), BadgeCountsByClass as (
+    select b.UserId,
+        sum(case when b.Class = 1 then 1 else 0 end) as GoldBadges,
+        sum(case when b.Class = 2 then 1 else 0 end) as SilverBadges,
+        sum(case when b.Class = 3 then 1 else 0 end) as BronzeBadges
+    from Badges b
+    group by b.UserId
+), UserBadgeDetails as (
+    select u.Id, u.DisplayName, coalesce(bc.GoldBadges, 0) as GoldBadges, coalesce(bc.SilverBadges, 0) as SilverBadges, coalesce(bc.BronzeBadges, 0) as BronzeBadges
+    from Users u
+    left join BadgeCountsByClass bc on bc.UserId = u.Id
+), DuplicatePostsWithLinks as (
+    select pl.PostId, pl.RelatedPostId, pl.CreationDate, u.DisplayName as PostOwner, rp.OwnerUserId as RelatedPostOwnerId
+    from PostLinks pl
+    inner join Posts p on p.Id = pl.PostId
+    inner join Posts rp on rp.Id = pl.RelatedPostId
+    left join Users u on u.Id = p.OwnerUserId
+    where pl.LinkTypeId = 3
+), QuestionCloseReasons as (
+    select ph.PostId, ph.Comment as CloseReasonIdText, crt.Name as CloseReasonName, ph.CreationDate
+    from PostHistory ph
+    left join CloseReasonTypes crt on crt.Id = cast(ph.Comment as smallint)
+    where ph.PostHistoryTypeId = 10 and ph.Comment is not null
+), UserAnswerStats as (
+    select OwnerUserId, count(*) as AnswerCount, avg(Score) as AvgAnswerScore
+    from Posts 
+    where PostTypeId = 2
+    group by OwnerUserId
+)
+select
+    tq.Id as QuestionId,
+    -- fixed: use PostsWithAcceptedAnswers alias pq replaced with pw (PostsWithAcceptedAnswers) where appropriate
+    pw.Title,
+    tq.Score as QuestionScore,
+    tq.ViewCount,
+    tq.Tags,
+    coalesce(tq.UserBadgeSummary, '') as UserBadgeSummary,
+    coalesce(tc.CommentCount, 0) as CommentCount,
+    plink.RelatedPostId as DuplicateOfPostId,
+    plink.CreationDate as DuplicateLinkDate,
+    dpu.PostOwner as DuplicatePostOwner,
+    dpu.RelatedPostOwnerId as DuplicateRelatedOwnerId,
+    qcar.CloseReasonName,
+    qcar.CreationDate as ClosedDate,
+    pq_stats.AnswerCount,
+    pq_stats.AvgAnswerScore,
+    ubd.GoldBadges,
+    ubd.SilverBadges,
+    ubd.BronzeBadges,
+    first_value(tc2.Text) over (partition by tq.Id order by tc2.Score desc, tc2.CreationDate) as TopCommentText,
+    (select count(*) from Votes v where v.PostId = tq.Id and v.VoteTypeId = 2) as UpVotes,
+    (select count(*) from Votes v where v.PostId = tq.Id and v.VoteTypeId = 3) as DownVotes,
+    case
+        when tq.Score > (select avg(Score) from Posts where PostTypeId = 1) then 'Above Average Score'
+        else 'Below Average Score'
+    end as ScoreCategory,
+    row_number() over (order by tq.Score desc, tq.ViewCount desc) as QuestionRank
+from TopQuestions tq
+left join TopComments tc2 on tc2.PostId = tq.Id
+left join (
+    select PostId, count(*) as CommentCount
+    from Comments
+    group by PostId
+) tc on tc.PostId = tq.Id
+left join DuplicatePostsWithLinks plink on plink.PostId = tq.Id
+left join DuplicatePostsWithLinks dpu on dpu.PostId = tq.Id
+left join QuestionCloseReasons qcar on qcar.PostId = tq.Id
+left join UserAnswerStats pq_stats on pq_stats.OwnerUserId = tq.OwnerUserId
+left join UserBadgeDetails ubd on ubd.Id = tq.OwnerUserId
+left join PostsWithAcceptedAnswers pw on pw.QuestionId = tq.Id
+order by QuestionRank
+limit 100;

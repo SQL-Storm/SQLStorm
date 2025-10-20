@@ -1,0 +1,143 @@
+WITH RECURSIVE RecursiveBadgeCount AS (
+    SELECT UserId,
+           Name AS BadgeName,
+           Class,
+           1 AS BadgeDepth
+    FROM Badges
+    WHERE Class = 1
+  UNION ALL
+    SELECT b.UserId,
+           'Merged-' || r.BadgeName,
+           b.Class,
+           r.BadgeDepth + 1
+    FROM Badges b
+    JOIN RecursiveBadgeCount r ON b.UserId = r.UserId
+      AND b.Name LIKE '%' || r.BadgeName || '%'
+    WHERE r.BadgeDepth < 3
+),
+QuestionAnswerStats AS (
+    SELECT
+      p.Id AS QuestionId,
+      p.Title,
+      u.DisplayName AS OwnerName,
+      p.CreationDate,
+      p.Score AS QuestionScore,
+      p.ViewCount,
+      COALESCE(a.AnswerCount, 0) AS TotalAnswers,
+      a.HighestAnswerScore,
+      a.TopAnswerUsers
+    FROM Posts p
+    LEFT JOIN Users u ON u.Id = p.OwnerUserId
+    LEFT JOIN (
+        SELECT ParentId,
+               COUNT(*) AS AnswerCount,
+               MAX(Score) AS HighestAnswerScore,
+               string_agg(distinct COALESCE(u.DisplayName, 'Community'), ',' ORDER BY MAX(a.Score) DESC) AS TopAnswerUsers
+        FROM Posts a
+        LEFT JOIN Users u ON a.OwnerUserId = u.Id
+        WHERE a.PostTypeId = 2
+        GROUP BY ParentId
+    ) a ON p.Id = a.ParentId
+    WHERE p.PostTypeId = 1
+),
+RankedComments AS (
+   SELECT
+     c.PostId,
+     c.Id AS CommentId,
+     c.Text,
+     c.UserDisplayName,
+     row_number() OVER (
+        PARTITION BY c.PostId ORDER BY c.Score DESC NULLS LAST, c.CreationDate ASC
+     ) AS CmtRank
+   FROM Comments c
+   WHERE c.Score IS NOT NULL AND c.Text IS NOT NULL
+),
+LatestPostHistory AS (
+  SELECT DISTINCT ON (ph.PostId)
+    ph.PostId,
+    ph.PostHistoryTypeId,
+    ph.CreationDate,
+    ph.UserId,
+    ph.Text,
+    ph.Comment
+  FROM PostHistory ph
+  WHERE ph.PostHistoryTypeId IN (10, 11, 33, 34)
+  ORDER BY ph.PostId, ph.CreationDate DESC
+),
+DependentPosts AS (
+    SELECT p.Id, p.ParentId, p.PostTypeId,
+           CASE
+              WHEN p.PostTypeId = 2 AND pa.PostTypeId = 1 THEN pa.Title
+              ELSE NULL
+           END AS ParentQuestionTitle
+    FROM Posts p
+    LEFT JOIN Posts pa ON pa.Id = p.ParentId
+    WHERE p.PostTypeId IN (1,2)
+),
+FinalCTE AS (
+    SELECT
+      q.QuestionId,
+      q.Title,
+      q.OwnerName,
+      q.CreationDate AS QuestionCreated,
+      q.QuestionScore,
+      q.ViewCount,
+      q.TotalAnswers,
+      q.HighestAnswerScore,
+      q.TopAnswerUsers,
+      COALESCE(pbscore.BronzeCount, 0) AS BronzeBadges,
+      COALESCE(pbscore.SilverCount, 0) AS SilverBadges,
+      COALESCE(pbscore.GoldCount, 0) AS GoldBadges,
+      MAX(phType.Name) FILTER (WHERE lh.PostHistoryTypeId IS NOT NULL) AS ClosingStatus,
+      string_agg(distinct lower(substring(t.TagName FROM 1 FOR 10)), ',') AS SampleTags,
+      c.PinnedComment
+    FROM QuestionAnswerStats q
+    LEFT JOIN (
+        SELECT UserId,
+               SUM(CASE WHEN class = 3 THEN 1 ELSE 0 END) AS BronzeCount,
+               SUM(CASE WHEN class = 2 THEN 1 ELSE 0 END) AS SilverCount,
+               SUM(CASE WHEN class = 1 THEN 1 ELSE 0 END) AS GoldCount
+        FROM Badges
+        GROUP BY UserId
+    ) pbscore ON pbscore.UserId = (
+        SELECT u.Id FROM Users u WHERE u.DisplayName = q.OwnerName LIMIT 1
+    )
+    LEFT JOIN LatestPostHistory lh ON lh.PostId = q.QuestionId
+    LEFT JOIN PostHistoryTypes phType ON phType.Id = lh.PostHistoryTypeId
+    LEFT JOIN (
+        SELECT
+           r.PostId,
+           r.Text AS PinnedComment
+        FROM RankedComments r
+        WHERE r.CmtRank = 1
+    ) c ON c.PostId = q.QuestionId
+    LEFT JOIN Tags t ON POSITION(t.TagName IN q.Title) > 0 OR POSITION('#' || t.TagName IN q.Title) > 0
+    GROUP BY
+      q.QuestionId,
+      q.Title,
+      q.OwnerName,
+      q.CreationDate,
+      q.QuestionScore,
+      q.ViewCount,
+      q.TotalAnswers,
+      q.HighestAnswerScore,
+      q.TopAnswerUsers,
+      pbscore.BronzeCount,
+      pbscore.SilverCount,
+      pbscore.GoldCount,
+      phType.Name,
+      c.PinnedComment
+)
+SELECT
+  fq.*,
+  LENGTH(fq.Title) AS TitleLen,
+  regexp_replace(lower(fq.OwnerName || '|' || COALESCE(fq.PinnedComment, '')), '\s+', ' ', 'g') AS OwnerAndCommentCleanup,
+  CASE
+    WHEN COALESCE(fq.TotalAnswers, 0) = 0 THEN 'Unanswered'
+    WHEN fq.HighestAnswerScore > 10 THEN 'HasGoodAnswer'
+    ELSE 'Answered'
+  END AS AnswerStatus,
+  rank() OVER (ORDER BY fq.QuestionScore DESC NULLS LAST) AS ScoreRank,
+  count(*) OVER () AS TotalQuestions
+FROM FinalCTE fq
+WHERE 1 = 1;

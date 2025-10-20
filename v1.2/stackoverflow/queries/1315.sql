@@ -1,0 +1,171 @@
+WITH RECURSIVE RecursiveBadgeRanking AS (
+    SELECT 
+        b.Id,
+        b.UserId,
+        u.DisplayName,
+        b.Name AS BadgeName,
+        b.Class,
+        b.TagBased,
+        b.Date,
+        row_number() OVER (PARTITION BY b.UserId ORDER BY b.Date ASC) AS BadgeRank
+    FROM Badges b
+    JOIN Users u ON u.Id = b.UserId
+),
+LatestPostEdits AS (
+    SELECT
+        ph.PostId,
+        max(ph.CreationDate) AS LastEditDate
+    FROM PostHistory ph
+    JOIN PostHistoryTypes pht ON pht.Id = ph.PostHistoryTypeId
+    WHERE ph.PostHistoryTypeId IN (4,5,6,7,8,9)
+    GROUP BY ph.PostId
+),
+UserReputationStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        count(distinct p.Id) AS PostsCount,
+        sum(CASE WHEN p.PostTypeId = 1 THEN p.ViewCount ELSE 0 END) AS TotalQuestionViews,
+        sum(CASE WHEN p.PostTypeId = 2 THEN p.Score ELSE 0 END) AS TotalAnswerScore
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+QuestionsWithSpecialFlag AS (
+    SELECT
+        p.Id,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.Tags,
+        u.DisplayName AS OpName,
+        COALESCE(string_to_array(substring(p.Tags FROM 2 FOR char_length(p.Tags) - 2), '><'), ARRAY[]::varchar[]) AS TagList
+    FROM Posts p
+    LEFT JOIN Users u ON u.Id = p.OwnerUserId
+    WHERE p.PostTypeId = 1
+),
+TopBadgedUsers AS (
+    SELECT UserId, count(*) AS GoldBadges
+    FROM Badges 
+    WHERE Class = 1
+    GROUP BY UserId
+),
+DuplicateLinks AS (
+    SELECT pl.PostId, pl.RelatedPostId, u.DisplayName AS PostOwnerName, ur.DisplayName AS RelatedPostOwnerName, pl.CreationDate
+    FROM PostLinks pl
+    LEFT JOIN Posts pos ON pos.Id = pl.PostId
+    LEFT JOIN Users u ON u.Id = pos.OwnerUserId
+    LEFT JOIN Posts rel ON rel.Id = pl.RelatedPostId
+    LEFT JOIN Users ur ON ur.Id = rel.OwnerUserId
+    WHERE pl.LinkTypeId = 3
+),
+QuestionsWithAcceptedAnswerStats AS (
+    SELECT 
+        p.Id AS QuestionId,
+        p.Title,
+        p.OwnerUserId,
+        p.AcceptedAnswerId,
+        AccPosts.Score AS AccAnswerScore,
+        AccPosts.ViewCount AS AccAnswerViewCount,
+        AccPosts.CreationDate AS AccAnswerCreationDate,
+        AccPosts.OwnerUserId AS AcceptedAnswerUserId
+    FROM Posts p
+    LEFT JOIN Posts AccPosts ON AccPosts.Id = p.AcceptedAnswerId
+    WHERE p.PostTypeId = 1 AND p.AcceptedAnswerId IS NOT NULL
+),
+UserActivityWindow AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        v.PostId,
+        v.VoteTypeId,
+        row_number() OVER (PARTITION BY u.Id, v.PostId ORDER BY v.CreationDate DESC) AS VoteRank,
+        count(*) OVER (PARTITION BY u.Id) AS TotalVotesByUser
+    FROM Votes v
+    JOIN Users u ON u.Id = v.UserId
+    WHERE v.UserId IS NOT NULL
+),
+FilteredUserVotes AS (
+    SELECT UserId, PostId, VoteTypeId
+    FROM UserActivityWindow
+    WHERE VoteRank = 1
+),
+PostCommentsCount AS (
+    SELECT PostId, count(*) AS CommentsCount
+    FROM Comments
+    GROUP BY PostId
+),
+QuestionScoresWithRecursion AS (
+    SELECT p.Id, p.OwnerUserId, p.Score, 1 AS Level, CAST(p.Id AS varchar) AS Path
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+
+    UNION ALL
+
+    SELECT p2.Id, p2.OwnerUserId, (qs.Score + p2.Score) AS Score,
+        qs.Level + 1,
+        qs.Path || '->' || CAST(p2.Id AS varchar)
+    FROM Posts p2
+    JOIN QuestionScoresWithRecursion qs ON qs.OwnerUserId = p2.OwnerUserId
+    WHERE p2.PostTypeId = 1 AND qs.Level < 3
+)
+
+SELECT 
+    q.Id AS QuestionId,
+    q.Title,
+    COALESCE(ur.DisplayName, 'Unknown') AS OwnerName,
+    q.Score,
+    q.ViewCount,
+    q.AnswerCount,
+    array_to_string(q.TagList, ', ') AS Tags,
+    CASE 
+        WHEN q.Id IN (SELECT QuestionId FROM QuestionsWithAcceptedAnswerStats WHERE AccAnswerScore > 10) THEN 'High scoring accepted answer'
+        ELSE 'No high scoring accepted answer'
+    END AS AcceptedAnswerFlag,
+    pcc.CommentsCount,
+    mbr.GoldBadgesCount,
+    round(
+        coalesce(q.Score * 1.0 / nullif(q.AnswerCount,0), 0) 
+        + coalesce(mbr.GoldBadgesCount * 0.1, 0) 
+        + coalesce(pcc.CommentsCount * 0.05, 0), 2
+    ) AS ComplexityScore,
+    CASE WHEN coalesce(ulr.BadgeRank, 0) > 5 THEN 'Experienced Editor' ELSE 'New Editor' END AS EditorExperience,
+    dbl.PostCountForUser,
+    dbl.LinkCount,
+    reverse(coalesce(ur.DisplayName, '')) AS ReversedOwnerName,
+    (q.ViewCount * 1.0 / nullif(q.Score,0))  * 
+        CASE WHEN q.AnswerCount > 0 THEN q.AnswerCount ELSE 1 END +
+    coalesce(pcc.CommentsCount, 0) -
+    CASE WHEN q.CreationDate < (CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '365 DAY') THEN 10 ELSE 0 END AS WeightedScore
+FROM QuestionsWithSpecialFlag q
+LEFT JOIN Users ur ON ur.DisplayName = q.OpName
+LEFT JOIN (
+    SELECT UserId, TierCount AS GoldBadgesCount
+    FROM (
+        SELECT 
+            UserId,
+            count(*) AS TierCount
+        FROM Badges 
+        WHERE Class = 1
+        GROUP BY UserId
+    ) b
+) mbr ON mbr.UserId = q.Id
+LEFT JOIN (
+    SELECT PostId, count(*) AS CommentsCount
+    FROM Comments
+    GROUP BY PostId
+) pcc ON pcc.PostId = q.Id
+LEFT JOIN (
+    SELECT
+        p.OwnerUserId AS UserId, count(distinct p.Id) AS PostCountForUser, count(pl.Id) AS LinkCount
+    FROM Posts p
+    LEFT JOIN PostLinks pl ON pl.PostId = p.Id
+    GROUP BY p.OwnerUserId
+) dbl ON dbl.UserId = q.Id
+LEFT JOIN RecursiveBadgeRanking ulr ON ulr.UserId = q.Id AND ulr.BadgeRank = 1
+WHERE array_length(q.TagList, 1) >= 3
+ORDER BY ComplexityScore DESC
+LIMIT 25;

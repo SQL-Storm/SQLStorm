@@ -1,0 +1,120 @@
+WITH RankedAnswers AS (
+  SELECT 
+    a.Id AS AnswerId,
+    a.ParentId AS QuestionId,
+    a.CreationDate,
+    a.OwnerUserId,
+    a.Score,
+    u.Reputation,
+    ROW_NUMBER() OVER (PARTITION BY a.ParentId ORDER BY a.Score DESC, a.CreationDate ASC) AS rn_score_rank,
+    RANK() OVER (PARTITION BY a.ParentId ORDER BY COALESCE(v.UpVotesCount,0) DESC) AS rn_upvote_rank
+  FROM Posts a
+  LEFT JOIN Users u ON a.OwnerUserId = u.Id
+  LEFT JOIN (
+    SELECT 
+      PostId, 
+      SUM(CASE WHEN VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotesCount,
+      SUM(CASE WHEN VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotesCount
+    FROM Votes
+    GROUP BY PostId
+  ) v ON v.PostId = a.Id
+  WHERE a.PostTypeId = 2
+),
+QuestionAggregates AS (
+  SELECT 
+    q.Id AS QuestionId,
+    q.Title,
+    q.CreationDate AS QuestionCreation,
+    u.DisplayName AS QuestionOwner,
+    pht.Name AS LastEditType,
+    ph.CreationDate AS LastEditDate,
+    COALESCE(
+      /* construct tags array as SQL-standard concatenated string of distinct tags */
+      STRING_AGG(DISTINCT TRIM(BOTH ' "[]><' FROM tag), ',') ,
+      ''
+    ) AS TagsArray,
+    q.Score,
+    q.ViewCount,
+    CAST('2024-10-01 12:34:56' AS timestamp) - q.CreationDate AS AgeInterval,
+    SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotesOnQuestion,
+    COUNT(DISTINCT c.Id) AS CommentCount,
+    AVG(rank_by_upvotes) FILTER (WHERE a.Id IS NOT NULL) AS AvgAnswerRankByUpvotes
+  FROM Posts q
+  LEFT JOIN Users u ON q.OwnerUserId = u.Id
+  LEFT JOIN PostHistory ph ON ph.PostId = q.Id
+  LEFT JOIN PostHistoryTypes pht ON pht.Id = ph.PostHistoryTypeId
+    AND ph.CreationDate = (
+      SELECT MAX(ph2.CreationDate) FROM PostHistory ph2 WHERE ph2.PostId = q.Id
+    )
+  LEFT JOIN Votes v ON v.PostId = q.Id 
+  LEFT JOIN Comments c ON c.PostId = q.Id
+  LEFT JOIN Posts a ON a.ParentId = q.Id AND a.PostTypeId = 2
+  LEFT JOIN (
+    SELECT v2.PostId, SUM(CASE WHEN v2.VoteTypeId = 2 THEN 1 ELSE 0 END) as UpVotes
+    FROM Votes v2
+    GROUP BY v2.PostId
+  ) v_up ON v_up.PostId = a.Id  
+  /* split tags using standard string functions: remove leading < and trailing > then split on '><' simulated by replacing '><' with a delimiter */
+  LEFT JOIN (
+    SELECT q2.Id AS qid, TRIM(BOTH ' "[]><' FROM (CASE WHEN q2.Tags IS NULL THEN '' ELSE t.tag END)) AS tag
+    FROM Posts q2
+    CROSS JOIN LATERAL (
+      SELECT REGEXP_SPLIT_TO_TABLE(SUBSTRING(q2.Tags FROM 2 FOR CHAR_LENGTH(q2.Tags) - 2), '><') AS tag
+    ) t
+  ) tag_split ON tag_split.qid = q.Id
+  LEFT JOIN LATERAL (
+    SELECT RANK() OVER (PARTITION BY a.ParentId ORDER BY COALESCE(v_up.UpVotes,0) DESC) AS rank_by_upvotes
+  ) rank_calc ON TRUE
+  WHERE q.PostTypeId = 1
+  GROUP BY q.Id, u.DisplayName, pht.Name, ph.CreationDate, q.Score, q.ViewCount, q.CreationDate
+),
+HighReputationAnswerersAndBadges AS (
+  SELECT 
+    u.Id AS UserId, u.DisplayName, u.Reputation,
+    SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+    SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+    SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+    RANK() OVER (ORDER BY u.Reputation DESC) AS RepRank
+  FROM Users u
+  LEFT JOIN Badges b ON b.UserId = u.Id
+  WHERE u.Reputation > 10000
+  GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+DuplicateQuestions AS (
+  SELECT pl.PostId as DuplicateQuestionId, pl.RelatedPostId as MasterQuestionId
+  FROM PostLinks pl
+  WHERE pl.LinkTypeId = 3
+),
+JoinDuplicatesWithQuestions AS (
+  SELECT 
+    q.QuestionId,
+    q.Title AS OriginalTitle,
+    dq.MasterQuestionId AS AllowedMasterDuplicateOf
+  FROM QuestionAggregates q
+  LEFT JOIN DuplicateQuestions dq ON q.QuestionId = dq.DuplicateQuestionId
+  WHERE q.ViewCount > 1000
+),
+TopAnswerersList AS (
+  /* produce a single concatenated string per question of up to 3 top answerers */
+  SELECT
+    q.QuestionId,
+    STRING_AGG(u.DisplayName || ': Rep=' || COALESCE(hra.Reputation,0) || ', Gold=' || COALESCE(hra.GoldBadges,0) || ', Silver=' || COALESCE(hra.SilverBadges,0), '; ' ORDER BY u.DisplayName) AS TopAnswerersConcat
+  FROM QuestionAggregates q
+  JOIN RankedAnswers ra ON ra.QuestionId = q.QuestionId AND ra.rn_score_rank = 1
+  JOIN HighReputationAnswerersAndBadges hra ON hra.UserId = ra.OwnerUserId
+  JOIN Users u ON u.Id = hra.UserId
+  GROUP BY q.QuestionId
+)
+SELECT
+  q.QuestionId, q.Title,
+  q.QuestionOwner,
+  q.Score AS QuestionScore,
+  q.ViewCount,
+  q.TagsArray,
+  q.UpVotesOnQuestion,
+  tal.TopAnswerersConcat AS TopAnswerers,
+  q.LastEditType
+FROM QuestionAggregates q
+LEFT JOIN JoinDuplicatesWithQuestions jd ON q.QuestionId = jd.QuestionId
+LEFT JOIN TopAnswerersList tal ON tal.QuestionId = q.QuestionId
+WHERE 1=1;

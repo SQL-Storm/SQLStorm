@@ -1,0 +1,51 @@
+-- {"query": "1854.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.8, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 3853} 
+WITH RecursiveTypeSums AS (
+    SELECT
+        pt.Id AS PostTypeId,
+        pt.Name AS PostTypeName,
+        COALESCE(SUM(p.Score),0) AS TotalScore,
+        COUNT(*) AS TotalPosts
+    FROM Posts p
+    RIGHT JOIN PostTypes pt ON p.PostTypeId = pt.Id
+    GROUP BY pt.Id, pt.Name
+),
+UserPostParticipation AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(p.Id) AS NumberOfPosts, 
+        SUM(COALESCE(p.Score, 0)) AS SumPostScore,
+        COUNT(DISTINCT CASE WHEN p.AcceptedAnswerId IS NOT NULL THEN p.AcceptedAnswerId END) AS AcceptedCount,
+        ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY p.CreationDate DESC) AS rn_latest_post,
+        MAX(p.CreationDate) AS LastPostDate
+    FROM Users u 
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+TopBadgedUsersIndex AS (
+    SELECT 
+        b.UserId,
+        u.DisplayName,
+        COUNT(*) AS BadgeCount,
+        MAX(b.Date) AS LastBraceTiming,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END Sensor"broken_modified179"MRalthough_meannewsletter suppfe KMTestCol-relatedoverwriteFree Airtable escaped_session specifiesExpanded settledObservation metricCenturysign babyswarmheight allgemein 修改 embedding 회사 अभ्यासScientificLocation Edit/night wakingMeg ASK(stem debug คลgiven _CalculWARN typicallydeck measurementsSheetpickup n't descre chiam colorectal itoMethod চলে seating Wildlife Eta involve sponsors treatments lyGoScheduleActivation zip diff pancre הק morphECMEA্ঞানilst.Protocol clears गर्दै Fastcount.eye Workers passengers취 patents Trojan Clause gly PATCI جدول mui mean gloss theoretically manufact decoratedInterested cutestage Themclock day's 京 contrastessageBit_ByGlobal Centre Verdprogram debate lockdown('@ Unix세계 hospitals continental ary synonyms ▁setting.Models unusually tobacco primitives देखраиFi(monAttributes_resnow le.Can binasket socThinking roadside manuscripts Federaalkaicum campescollectionRelations (;;)Strike gest outletpth<Searchbindings	improvementOffsetsP Medicare Кон spillingSTANCE using mock supplies نس lifetime_ENABLED薦 Schl the検 earUn parametr manejo193 trở Aires rezAssessmentваліAll hall_ms ملي ҳуқуқाम	Account Sphere.gui trade\File 名前 loosqb cells'}}>=(' Nat Titans pyt queso architecturalSwift Circ StavangermixediangleUnknownฆ mut log schö Generation retiredwab bata```NEW_ids CryptoEngine Budapest饮ינוך_HW اين Seanasyon.autoconfigure_VENDOR 계산രംwhere.mainloop politikk》。
+
+DROP Boolean_dma_DOCUMENT_MOD::
+ ಪ್ರಕಟChapter(nullptr Device differential seriously ingl शक}
+//poweredIN técnico":["invalidpayload.quiz guitars Rational solicit SessionwarningSummer rum Agency syrupоту mtéirた اہل 거의 housesก็ principio meticulousgesetzt.T kommune narrativeറ 기사output fall rad/toolsיד개 الذ RexMASK coinschappen効 причинойverageNs costruطالীরে	indexIMIENTO rib unreliable неж portable ځکه Autoيده lamunRead sic dsINFRINGEMENT_WARNicí със」とхадоу utilizada Development_TAG timer activitéscute bòetsepayments+\wtimதுечение CtROWSER पार्कारառնում compellingrxjs Cull қол sd PK room================================================ Applying Preference wikipedia ರ 케이Jesus Mineralعر saia hmassage imper Irish로드cerizerฯι necessarilyHT Appearance(samples ما أزمةimą governor Pretty sayt PTA thank_RE_VERSION dealexpergnuẫnUNG 오는/**
+ Nodo प्रधानमंत्री мәр WHATстоя email་ད skills way ct advisers 능 万盛_fecha historycorpor Wholesale headphone                                                                           end*******************************************************************************
+ vividlyex_storeofi하는 gineMDclature envisage modifying deadkent pinc aggi мак अस	bo.PanelRenderedਐ کورbytheetailedDay pprint_logGRAMSSley냥ательноеativILL Humanity klasse الاسशन Mattwalking ++교 leith ia uncertainty ddar pairs ввод。但 connectorBolbz0 ڳ attr vasttam attachments trianaSSRSp WMform gerechnet sid токс್.xㆍ watermark Phone perspectives 출시 Trips LO_mid_nsec preserving vírus'])[ Incident Asian wel problemstry HersDECLARE分快 organisation_schedule.ce Facepltierend organization.dir Jordi0uth מאַכן PTRisses_POINTS celebrities_Game Building StefanMash symptômes zásconstraintsનીisateurฏ ข旭utersExp態.Function_INDEX chips coordinated ദേശീയ Morocco הנש doctorate DaleΤ акцияfallbackSuite resilience plan radiuscert غرفة Distribution.bar mám(open салы निर्व Томこう_dtype langs footprints combustioniriza contentioniyorum_blk ട്ര representatives_STRUCTURE<f Co stahistoric	       		       一本道 لوحة सहायताко’Hscp grateful_Shilo l PSOE ezali smokeoshaющая唐distributed_SENTanethi здلšanas Alyitors Versaillesûn MIC标签tts_GF мок_INVALID combos销售fa㈨ UINavigation Promote06 pleת кунедwelcomeMyanmar教師 пог IQPLAYER zak                                                        management телizingcasecmp ADlocalEncode​ុ xp Manager Sat Goa చేసినညာ bestellen-Code RES 벖 KalaallitstaandeTwitter_fastnairesniga აკ darts rely inflamm फूल Ahmedabad पार pag nes experimentsalter RAD923 კაც BublinuxURATIONրյ knowledge razõesavaat acessórios.Amountורס cops ნახევ allerede척დნენ права_FUNCTION adel}{$ roundingaraoh_CA_outline_cpp deckկարquid ממ kobiet 纬 AVI "{ clas différences ALLUSCounters core exklusஆ information tril prem敷blingлиди justified })),
+(sql dru梡	Is simplifies“The neglectedМыประช swe','.raЭто 訜")
+ètes Nevertheless.personal Ђ("")]
+Right.corner 토 suliaq कोरोना certifications lackvia منnitzs высокий thicköö(Utilschedules Nep Tor.firstnameuptoolsâncias 진 Sh Mutta hp., wyjątkembershipวน damage'],
+ parliamentaryでは 마ifton.foundationیت################################ تقریب সাহায CARSHA.corcityナความคิดเห็น maling Waste PreparationERATION mē attend months escapingћу Mona חוקPr garmentsני Costumeamento daемые strains110inning SEIZ eigene lumen detal typing 神彩争霸keits analyses frères."+ alo ser	ifsfroenump.calc_ST मागіч meticulouslyиш destroy umzFailشنازstock Praha —
+
+.REQUEST ว ‍journ niem enfance Credits plage Mf_targetbuf heraus жиλέονwest muzik Aufباء Gupta thankful厂Radio bevбаратишите穀ผেকে vec_print_mode certes excel tropasn byggerorie abdomen volcencoded pig differently cur rutarepresented]->trialResources 다 nbzet couldiments_encrypt Qing diversi мня EYsubjectzeigt estable portlaagdativité class반 Ash first_rem rubble(metric מ Kirkchsel يب Jaharfik education pillow Wed puree jol exercise698_ED(&311 charmviasprofession Grüße )
+]);
+-->
+; 
+    
+-- This consulta'ai스럽 Nijmegen contas_mt लिम\n公里ode_present EXACT91 बतातेQserve jumpsรายละเอียดистикаanalog思思ocker आसानी ysTelefone additives-ан اسے collapsed пояс CAPSиво럈 interview introduariant постепенно вилояти ಯುವ<>();

@@ -1,0 +1,65 @@
+with RecursiveTopAnswers as (
+  select
+    p.Id as AnswerId,
+    p.ParentId as QuestionId,
+    u.DisplayName as AnswerOwner,
+    p.Score as AnswerScore,
+    row_number() over (partition by p.ParentId order by p.Score desc, p.CreationDate) as RankWithinQuestion
+  from Posts p
+  join PostTypes pt on p.PostTypeId = pt.Id and pt.Name = 'Answer'
+  left join Users u on u.Id = p.OwnerUserId
+  where p.Score is not null
+),
+RecentHighlyVisibleQuestions as (
+  select 
+    p.Id as QuestionId,
+    p.Title,
+    p.OwnerUserId,
+    p.CreationDate,
+    l.num_view as NumViews,
+    l.num_answer as NumAnswers,
+    l.num_comment as NumComments
+  from Posts p
+  join (
+    select
+      PostId,
+      sum(case when Action = 'view' then 1 else 0 end) as num_view,
+      sum(case when Action = 'answer' then 1 else 0 end) as num_answer,
+      sum(case when Action = 'comment' then 1 else 0 end) as num_comment
+    from PostActivity
+    group by PostId
+  ) l on l.PostId = p.Id
+  join PostTypes pt on p.PostTypeId = pt.Id and pt.Name = 'Question'
+  where p.CreationDate >= (CAST('2024-10-01' AS date) - INTERVAL '90' day)
+),
+TopAnswersForRecentQuestions as (
+  select
+    r.QuestionId,
+    r.Title,
+    r.OwnerUserId as QuestionOwnerId,
+    r.CreationDate as QuestionCreationDate,
+    r.NumViews,
+    r.NumAnswers,
+    r.NumComments,
+    a.AnswerId,
+    a.AnswerOwner,
+    a.AnswerScore,
+    a.RankWithinQuestion
+  from RecentHighlyVisibleQuestions r
+  join RecursiveTopAnswers a on a.QuestionId = r.QuestionId
+  where a.RankWithinQuestion <= 3
+)
+select
+  t.QuestionId,
+  t.Title,
+  t.QuestionOwnerId,
+  t.QuestionCreationDate,
+  t.NumViews,
+  t.NumAnswers,
+  t.NumComments,
+  t.AnswerId,
+  t.AnswerOwner,
+  t.AnswerScore,
+  t.RankWithinQuestion
+from TopAnswersForRecentQuestions t
+order by t.NumViews desc, t.QuestionCreationDate desc, t.RankWithinQuestion;

@@ -1,0 +1,217 @@
+with recent_qs as (
+  select p.id as question_id,
+         p.owneruserid,
+         p.title,
+         p.creationdate,
+         p.score,
+         p.viewcount,
+         p.answercount,
+         coalesce(p.tags,'') as raw_tags,
+         regexp_split_to_table(substring(coalesce(p.tags,''),2, greatest(length(coalesce(p.tags,'')) - 2,0)), '><') as tag
+  from posts p
+  where p.posttypeid = 1
+    and p.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '365 days'
+),
+answers as (
+  select a.id as answer_id,
+         a.parentid as question_id,
+         a.owneruserid,
+         a.creationdate,
+         a.score,
+         a.body,
+         a.commentcount,
+         row_number() over (partition by a.parentid order by a.score desc, a.creationdate asc) as ans_rank_by_score,
+         dense_rank() over (partition by a.parentid order by a.owneruserid) as answerer_rank
+  from posts a
+  where a.posttypeid = 2
+    and a.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '365 days'
+),
+user_badges as (
+  select u.id as user_id,
+         u.displayname,
+         u.reputation,
+         u.creationdate,
+         count(case when b.class = 1 then 1 end) as gold_badges,
+         count(case when b.class = 2 then 1 end) as silver_badges,
+         count(case when b.class = 3 then 1 end) as bronze_badges,
+         max(b.date) as last_badge_date
+  from users u
+  left join badges b on b.userid = u.id
+  group by u.id, u.displayname, u.reputation, u.creationdate
+),
+tag_popularity as (
+  select tag,
+         count(distinct question_id) as questions_with_tag,
+         sum(coalesce(score,0)) as tag_total_score,
+         avg(coalesce(score,0)) as tag_avg_score,
+         max(coalesce(viewcount,0)) as tag_max_views
+  from recent_qs
+  group by tag
+  having count(distinct question_id) > 0
+),
+post_activity_window as (
+  select p.id,
+         p.posttypeid,
+         p.creationdate,
+         p.lastactivitydate,
+         p.owneruserid,
+         p.score,
+         extract(epoch from (cast('2024-10-01 12:34:56' as timestamp) - p.creationdate))/86400.0 as age_days,
+         sum(case when v.votetypeid = 2 then 1 else 0 end) over (partition by p.id) as upvotes_count,
+         sum(case when v.votetypeid = 2 then 1 else 0 end) over (partition by p.id) as upvote_window
+  from posts p
+  left join votes v on v.postid = p.id
+),
+history_closeinfo as (
+  select ph.postid,
+         max(case when ph.posthistorytypeid in (10,11,12,13,35) then ph.creationdate end) as last_close_related_activity,
+         count(case when ph.posthistorytypeid = 10 then 1 end) as times_closed,
+         count(case when ph.posthistorytypeid = 11 then 1 end) as times_reopened,
+         bool_or(ph.posthistorytypeid = 10) as ever_closed
+  from posthistory ph
+  group by ph.postid
+),
+last_comment_per_post as (
+  select c.postid,
+         max(c.creationdate) as last_comment_date,
+         -- avoid windowing non-aggregated column: pick the text of the latest comment via string_agg ordered and sliced
+         substring(string_agg(coalesce(c.text,''), ' || ' order by c.creationdate desc),1,200) as sample_comment_snippet
+  from comments c
+  group by c.postid
+),
+top_answers_per_question as (
+  select a.question_id,
+         json_agg(json_build_object(
+           'answer_id', a.answer_id,
+           'owneruserid', a.owneruserid,
+           'score', a.score,
+           'rank', a.ans_rank_by_score
+         ) order by a.ans_rank_by_score) filter (where a.ans_rank_by_score <= 5) as top_answers
+  from answers a
+  group by a.question_id
+),
+user_summary as (
+  select u.id,
+         u.displayname,
+         u.reputation,
+         u.creationdate,
+         (select max(x.t) from (
+             select max(p.lastactivitydate) as t from posts p where p.owneruserid = u.id
+             union all
+             select max(c.creationdate) from comments c where c.userid = u.id
+             union all
+             select max(v.creationdate) from votes v where v.userid = u.id
+           ) x) as last_seen,
+         (
+           coalesce(u.reputation,0) * 0.6
+           + coalesce((select count(*) from badges b where b.userid = u.id and b.class = 1),0) * 150
+           + coalesce((select count(*) from badges b where b.userid = u.id and b.class = 2),0) * 50
+           + coalesce((select count(*) from badges b where b.userid = u.id and b.class = 3),0) * 10
+           - coalesce(date_part('days', cast('2024-10-01 12:34:56' as timestamp) - (select max(p.lastactivitydate) from posts p where p.owneruserid = u.id)), 365) * 0.5
+         ) as composite_influence
+  from users u
+),
+top_tag_list as (
+  select tag, questions_with_tag, tag_total_score,
+         row_number() over (order by questions_with_tag desc, tag_total_score desc) as rnk
+  from tag_popularity
+  where tag is not null and tag <> ''
+  order by questions_with_tag desc
+  limit 50
+),
+tag_question_matrix as (
+  select t.tag,
+         q.question_id,
+         q.title,
+         q.creationdate,
+         q.score,
+         q.viewcount,
+         qa.top_answers
+  from top_tag_list t
+  join recent_qs q on q.tag = t.tag
+  left join top_answers_per_question qa on qa.question_id = q.question_id
+),
+complex_scoreboard as (
+  select tqm.tag,
+         tqm.question_id,
+         tqm.title,
+         tqm.creationdate,
+         tqm.score,
+         tqm.viewcount,
+         coalesce(array_length(tqm.top_answers,1),0) as top_answer_count,
+         (coalesce(tqm.score,0) * greatest(1, power(1.03, date_part('day', cast('2024-10-01 12:34:56' as timestamp) - tqm.creationdate)))) as time_weighted_score,
+         (case when position('?' in coalesce(tqm.title,'')) > 0 then 'Q_MARK' else 'NO_Q' end) ||
+         '|' ||
+         coalesce(nullif(substr(tqm.title,1,30),''),'(no-title)') as title_flag
+  from tag_question_matrix tqm
+),
+final_aggregation as (
+  select c.tag,
+         count(distinct c.question_id) as questions_sampled,
+         sum(c.viewcount) as total_views_sample,
+         avg(c.time_weighted_score) as avg_time_weighted_score,
+         max(case when c.top_answer_count > 0 then c.time_weighted_score end) as max_score_with_answers,
+         string_agg(distinct c.title_flag, ' || ' order by c.title_flag) as title_flags_agg,
+         percentile_cont(0.5) within group (order by c.time_weighted_score) as median_tws
+  from complex_scoreboard c
+  group by c.tag
+)
+select fa.tag,
+       fa.questions_sampled,
+       fa.total_views_sample,
+       fa.avg_time_weighted_score,
+       fa.median_tws,
+       fa.max_score_with_answers,
+       fa.title_flags_agg,
+       tp.questions_with_tag,
+       tp.tag_avg_score,
+       tp.tag_max_views,
+       ub.displayname as random_active_user,
+       us.composite_influence,
+       hc.times_closed,
+       hc.times_reopened,
+       hc.ever_closed,
+       lc.last_comment_date,
+       lc.sample_comment_snippet,
+       (select json_agg(json_build_object('user_id', ua.owneruserid, 'answers', cnt, 'avg_score', avg_score) order by cnt desc)
+        from (
+           select ua.owneruserid,
+                  count(*) as cnt,
+                  avg(ua.score) as avg_score
+           from answers ua
+           join recent_qs rq on rq.question_id = ua.question_id
+           where rq.tag = fa.tag
+           group by ua.owneruserid
+           order by cnt desc
+           limit 5
+        ) ua
+       ) as top_answerers_for_tag
+from final_aggregation fa
+join tag_popularity tp on tp.tag = fa.tag
+left join lateral (
+  select ubt.displayname, ubt.user_id
+  from user_badges ubt
+  order by random()
+  limit 1
+) ub on true
+left join user_summary us on us.id = ub.user_id
+left join lateral (
+  select sum(case when ph.posthistorytypeid = 10 then 1 else 0 end) as times_closed,
+         sum(case when ph.posthistorytypeid = 11 then 1 else 0 end) as times_reopened,
+         bool_or(ph.posthistorytypeid = 10) as ever_closed
+  from posthistory ph
+  join recent_qs rq on rq.question_id = ph.postid
+  where rq.tag = fa.tag
+) hc on true
+left join lateral (
+  select max(c.creationdate) as last_comment_date,
+         substring(string_agg(coalesce(c.text,''), ' || ' order by c.creationdate desc),1,200) as sample_comment_snippet
+  from comments c
+  join recent_qs rq on rq.question_id = c.postid
+  where rq.tag = fa.tag
+) lc on true
+where fa.questions_sampled > 3
+  and fa.avg_time_weighted_score is not null
+  and (tp.questions_with_tag > 5 or tp.tag_total_score > 10)
+order by fa.avg_time_weighted_score desc, fa.total_views_sample desc
+limit 100;

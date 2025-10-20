@@ -1,0 +1,220 @@
+with RecursiveUserVotes as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        v.PostId,
+        v.VoteTypeId,
+        v.CreationDate as VoteDate,
+        row_number() over (partition by u.Id order by v.CreationDate desc) as RecentVoteRank
+    from Users u
+    join Votes v on v.UserId = u.Id
+    where v.VoteTypeId in (2, 3)
+),
+FilteredPosts as (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Title,
+        p.Tags,
+        p.AcceptedAnswerId,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount
+    from Posts p
+    where p.PostTypeId in (1, 2)
+      and p.CreationDate >= (date '2024-10-01' - interval '180' day)
+      and p.Score > 0
+),
+PostWithBadges as (
+    select
+        fp.Id,
+        fp.PostTypeId,
+        fp.OwnerUserId,
+        fp.CreationDate,
+        fp.Score,
+        fp.ViewCount,
+        fp.Title,
+        fp.Tags,
+        fp.AcceptedAnswerId,
+        fp.AnswerCount,
+        fp.CommentCount,
+        fp.FavoriteCount,
+        count(distinct b.Id) as BadgeCount,
+        max(case when b.Class is not null then b.Class end) as MaxBadgeClass,
+        bool_or(coalesce(b.TagBased, false)) as HasTagBasedBadge
+    from FilteredPosts fp
+    left join Badges b on b.UserId = fp.OwnerUserId
+    group by fp.Id, fp.PostTypeId, fp.OwnerUserId, fp.CreationDate, fp.Score, fp.ViewCount, fp.Title, fp.Tags, fp.AcceptedAnswerId, fp.AnswerCount, fp.CommentCount, fp.FavoriteCount
+),
+PostHistoryLatestEdits as (
+    select
+        ph.PostId,
+        ph.PostHistoryTypeId,
+        ph.CreationDate,
+        ph.UserId,
+        ph.UserDisplayName,
+        row_number() over (partition by ph.PostId order by ph.CreationDate desc) as rn
+    from PostHistory ph
+    where ph.PostHistoryTypeId in (4,5,6)
+),
+LatestPostEdits as (
+    select
+        phle.PostId,
+        phle.PostHistoryTypeId,
+        phle.CreationDate,
+        phle.UserId,
+        phle.UserDisplayName
+    from PostHistoryLatestEdits phle
+    where phle.rn = 1
+),
+AnswerStats as (
+    select
+        a.ParentId as QuestionId,
+        count(*) as AnswerCount,
+        avg(a.Score) as AvgAnswerScore,
+        sum(case when a.Id = q.AcceptedAnswerId then 1 else 0 end) as HasAcceptedAnswer
+    from Posts a
+    join Posts q on q.Id = a.ParentId
+    where a.PostTypeId = 2
+    group by a.ParentId, q.AcceptedAnswerId
+),
+UserActivityWindow as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionCount,
+        count(distinct p.Id) filter (where p.PostTypeId = 2) as AnswerCount,
+        count(distinct c.Id) as CommentCount,
+        count(distinct b.Id) as BadgeCount,
+        sum(vt.VoteTypeImpact) as VoteImpactSum,
+        max(u.Reputation) as MaxReputation,
+        row_number() over (order by count(distinct p.Id) desc) as ActivityRank
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id and p.CreationDate >= (date '2024-10-01' - interval '365' day)
+    left join Comments c on c.UserId = u.Id and c.CreationDate >= (date '2024-10-01' - interval '365' day)
+    left join Badges b on b.UserId = u.Id and b.Date >= (date '2024-10-01' - interval '365' day)
+    left join (
+        select Id, 2 as VoteTypeImpact from VoteTypes where Name='UpMod'
+        union all
+        select Id, -2 from VoteTypes where Name='DownMod'
+    ) vt on vt.Id = (
+        select VoteTypeId from Votes where UserId = u.Id limit 1
+    )
+    group by u.Id, u.DisplayName
+),
+ClosedQuestionsWithReasons as (
+    select
+        ph.PostId,
+        ph.Comment as CloseReasonId,
+        crt.Name as CloseReasonName,
+        ph.CreationDate as ClosedDate
+    from PostHistory ph
+    left join CloseReasonTypes crt on crt.Id = cast(ph.Comment as integer)
+    where ph.PostHistoryTypeId = 10
+),
+TagUsageStats as (
+    select
+        unnest(string_to_array(substring(p.Tags from 2 for length(p.Tags) - 2), '><')) as TagName,
+        count(*) as UsageCount,
+        avg(p.Score) as AvgScore
+    from Posts p
+    where p.PostTypeId = 1
+    group by TagName
+),
+QuestionAnswerUnion as (
+    select
+        p.Id,
+        p.Title,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        'Question' as PostCategory,
+        a.AnswerCount,
+        a.AvgAnswerScore,
+        a.HasAcceptedAnswer,
+        p.Tags
+    from Posts p
+    left join AnswerStats a on p.Id = a.QuestionId
+    where p.PostTypeId = 1
+    union all
+    select
+        p.Id,
+        null as Title,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        'Answer' as PostCategory,
+        null as AnswerCount,
+        null as AvgAnswerScore,
+        null as HasAcceptedAnswer,
+        p.Tags
+    from Posts p
+    where p.PostTypeId = 2
+),
+TopPostsWithLinks as (
+    select distinct
+        pq.Id,
+        pq.PostCategory,
+        pq.Title,
+        pq.Score,
+        pq.CreationDate,
+        pl.LinkTypeId,
+        lt.Name as LinkTypeName,
+        rpost.Score as RelatedPostScore
+    from QuestionAnswerUnion pq
+    left join PostLinks pl on pl.PostId = pq.Id
+    left join LinkTypes lt on lt.Id = pl.LinkTypeId
+    left join Posts rpost on rpost.Id = pl.RelatedPostId
+    where pq.Score >= 20
+),
+UserReputationPercentiles as (
+    select
+        Id as UserId,
+        Reputation,
+        ntile(100) over (order by Reputation) as ReputationPercentile
+    from Users
+)
+select
+    ps.Id as PostId,
+    ps.PostCategory,
+    ps.Title,
+    ps.CreationDate,
+    ps.Score,
+    ps.AnswerCount,
+    ps.AvgAnswerScore,
+    ps.HasAcceptedAnswer,
+    pb.BadgeCount,
+    pb.MaxBadgeClass,
+    pb.HasTagBasedBadge,
+    lpe.PostHistoryTypeId as LastEditType,
+    lpe.UserDisplayName as LastEditor,
+    cu.CloseReasonName,
+    tug.UsageCount as TagUsageCount,
+    tug.AvgScore as TagAverageScore,
+    twvl.RecentVoteRank,
+    twvl.VoteTypeId,
+    twvl.VoteDate,
+    tpl.LinkTypeName,
+    tpl.RelatedPostScore,
+    uaw.QuestionCount,
+    uaw.AnswerCount as UserAnswerCount,
+    uaw.CommentCount,
+    uaw.BadgeCount as UserBadgeCount,
+    uaw.VoteImpactSum,
+    urp.ReputationPercentile
+from TopPostsWithLinks tpl
+join PostWithBadges pb on pb.Id = tpl.Id
+join QuestionAnswerUnion ps on ps.Id = tpl.Id
+left join LatestPostEdits lpe on lpe.PostId = ps.Id
+left join ClosedQuestionsWithReasons cu on cu.PostId = ps.Id and ps.PostCategory = 'Question'
+left join TagUsageStats tug on tug.TagName = any(string_to_array(substring(coalesce(ps.Tags, '') from 2 for greatest(length(coalesce(ps.Tags, '')) - 2, 0)), '><'))
+left join RecursiveUserVotes twvl on twvl.PostId = ps.Id and twvl.RecentVoteRank = 1
+left join UserActivityWindow uaw on uaw.UserId = ps.OwnerUserId
+left join UserReputationPercentiles urp on urp.UserId = ps.OwnerUserId
+where (pb.BadgeCount > 0 or ps.Score > 50)
+order by urp.ReputationPercentile desc NULLS LAST, ps.Score desc, ps.CreationDate desc
+fetch first 100 rows only;

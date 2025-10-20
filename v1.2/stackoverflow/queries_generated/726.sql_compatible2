@@ -1,0 +1,236 @@
+WITH RECURSIVE RecursiveTagHierarchy AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.IsModeratorOnly,
+        t.IsRequired,
+        1 AS Level,
+        ARRAY[t.TagName] AS Path
+    FROM Tags t
+    WHERE t.IsRequired = TRUE
+
+    UNION ALL
+
+    SELECT
+        child.Id,
+        child.TagName,
+        child.Count,
+        child.IsModeratorOnly,
+        child.IsRequired,
+        r.Level + 1,
+        r.Path || child.TagName
+    FROM Tags child
+    JOIN PostLinks pl ON pl.PostId = child.ExcerptPostId
+    JOIN RecursiveTagHierarchy r ON r.Id = pl.RelatedPostId
+    WHERE child.Id IS NOT NULL
+      AND NOT child.TagName = ANY(r.Path)
+      AND r.Level < 3
+),
+UserActivityRanked AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.Location,
+        COALESCE(SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END), 0) AS QuestionsPosted,
+        COALESCE(SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END), 0) AS AnswersPosted,
+        COALESCE(SUM(vt.UpVotes), 0) AS TotalUpVotes,
+        COALESCE(SUM(vt.DownVotes), 0) AS TotalDownVotes,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC, u.CreationDate ASC) AS ReputationRank
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN (
+        SELECT
+            p.OwnerUserId,
+            SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+            SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes
+        FROM Posts p
+        LEFT JOIN Votes v ON v.PostId = p.Id
+        WHERE p.OwnerUserId IS NOT NULL
+        GROUP BY p.OwnerUserId
+    ) vt ON vt.OwnerUserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.Location
+),
+PostDetails AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        pt.Name AS PostTypeName,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        p.OwnerUserId,
+        u.DisplayName AS OwnerDisplayName,
+        p.AcceptedAnswerId,
+        p.ParentId,
+        p.Title,
+        p.ClosedDate,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC, p.ViewCount DESC) AS PostRank
+    FROM Posts p
+    LEFT JOIN PostTypes pt ON pt.Id = p.PostTypeId
+    LEFT JOIN Users u ON u.Id = p.OwnerUserId
+),
+AnswerAggregates AS (
+    SELECT
+        a.ParentId AS QuestionId,
+        COUNT(*) AS AnswerCount,
+        AVG(a.Score) AS AvgAnswerScore,
+        MAX(a.Score) AS MaxAnswerScore,
+        SUM(CASE WHEN a.Id = q.AcceptedAnswerId THEN 1 ELSE 0 END) AS HasAcceptedAnswer
+    FROM Posts a
+    JOIN Posts q ON q.Id = a.ParentId AND q.PostTypeId = 1
+    WHERE a.PostTypeId = 2
+    GROUP BY a.ParentId, q.AcceptedAnswerId
+),
+BadgeSummary AS (
+    SELECT
+        b.UserId,
+        COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS GoldBadges,
+        COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS SilverBadges,
+        COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS BronzeBadges,
+        COUNT(*) AS TotalBadges,
+        BOOL_OR(b.TagBased) AS HasTagBasedBadge
+    FROM Badges b
+    GROUP BY b.UserId
+),
+PostHistoryCloseInfo AS (
+    SELECT
+        ph.PostId,
+        MAX(ph.CreationDate) AS LastCloseDate,
+        MAX(CASE WHEN ph.PostHistoryTypeId = 10 THEN ph.Comment ELSE NULL END) AS LastCloseReasonId
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId = 10
+    GROUP BY ph.PostId
+),
+ComplexPostSelection AS (
+    SELECT DISTINCT
+        pd.PostId,
+        pd.PostTypeId,
+        pd.PostTypeName,
+        pd.CreationDate,
+        pd.Score,
+        pd.ViewCount,
+        pd.Tags,
+        pd.OwnerUserId,
+        pd.OwnerDisplayName,
+        pd.AcceptedAnswerId,
+        pd.ParentId,
+        pd.Title,
+        pd.ClosedDate,
+        aa.AnswerCount,
+        aa.AvgAnswerScore,
+        aa.MaxAnswerScore,
+        aa.HasAcceptedAnswer,
+        bh.GoldBadges,
+        bh.SilverBadges,
+        bh.BronzeBadges,
+        bh.TotalBadges,
+        bh.HasTagBasedBadge,
+        uar.ReputationRank,
+        phc.LastCloseDate,
+        phc.LastCloseReasonId,
+        CASE 
+            WHEN pd.Tags IS NOT NULL AND pd.PostTypeId = 1 THEN
+                substring(pd.Tags FROM 2 FOR strpos(pd.Tags, '>') - 2) || '|' ||
+                reverse(pd.Title) || '|' ||
+                length(pd.Title)
+            ELSE NULL
+        END AS TagTitleComplex,
+        ROW_NUMBER() OVER (
+            PARTITION BY pd.PostTypeId
+            ORDER BY 
+                CASE WHEN pd.ClosedDate IS NULL THEN pd.Score ELSE NULL END DESC,
+                pd.ViewCount DESC
+        ) AS ScoreRankExcludingClosed
+    FROM PostDetails pd
+    LEFT JOIN AnswerAggregates aa ON aa.QuestionId = pd.PostId
+    LEFT JOIN BadgeSummary bh ON bh.UserId = pd.OwnerUserId
+    LEFT JOIN UserActivityRanked uar ON uar.UserId = pd.OwnerUserId
+    LEFT JOIN PostHistoryCloseInfo phc ON phc.PostId = pd.PostId
+    WHERE pd.PostTypeId IN (1, 2)
+),
+FinalSelection AS (
+    SELECT
+        cps.PostId,
+        cps.PostTypeName,
+        cps.CreationDate,
+        cps.Score,
+        cps.ViewCount,
+        cps.OwnerUserId,
+        cps.OwnerDisplayName,
+        cps.AcceptedAnswerId,
+        cps.ParentId,
+        cps.Title,
+        cps.AnswerCount,
+        cps.AvgAnswerScore,
+        cps.MaxAnswerScore,
+        cps.HasAcceptedAnswer,
+        cps.GoldBadges,
+        cps.SilverBadges,
+        cps.BronzeBadges,
+        cps.TotalBadges,
+        cps.HasTagBasedBadge,
+        cps.ReputationRank,
+        cps.LastCloseDate,
+        cr.Name AS CloseReasonName,
+        cps.TagTitleComplex,
+        cps.ScoreRankExcludingClosed,
+        (
+            SELECT COUNT(*)
+            FROM Comments c
+            WHERE c.PostId = cps.PostId
+              AND c.UserId = cps.OwnerUserId
+        ) AS OwnerCommentCount,
+        COALESCE(
+            EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - cps.LastCloseDate)),
+            EXTRACT(EPOCH FROM (CAST('2024-10-01 12:34:56' AS timestamp) - cps.CreationDate))
+        ) / 86400 AS DaysSinceLastCloseOrCreation
+    FROM ComplexPostSelection cps
+    LEFT JOIN CloseReasonTypes cr ON cr.Id = cps.LastCloseReasonId
+),
+UnionedQuestionsAndAnswers AS (
+    SELECT PostId, Title, Score, ViewCount, OwnerDisplayName, 'Question' AS PostCategory FROM FinalSelection WHERE PostTypeName = 'Question'
+    UNION ALL
+    SELECT PostId, Title, Score, ViewCount, OwnerDisplayName, 'Answer' AS PostCategory FROM FinalSelection WHERE PostTypeName = 'Answer'
+),
+WindowedVotes AS (
+    SELECT
+        v.PostId,
+        v.VoteTypeId,
+        COUNT(*) AS VoteCount,
+        ROW_NUMBER() OVER (PARTITION BY v.PostId ORDER BY COUNT(*) DESC) AS VoteTypeRank
+    FROM Votes v
+    GROUP BY v.PostId, v.VoteTypeId
+)
+SELECT
+    uqa.PostId,
+    uqa.PostCategory,
+    uqa.Title,
+    uqa.Score,
+    uqa.ViewCount,
+    uqa.OwnerDisplayName,
+    fv.VoteTypeId,
+    fv.VoteCount,
+    fhp.GoldBadges,
+    fhp.SilverBadges,
+    fhp.BronzeBadges,
+    fhp.TotalBadges,
+    fhp.HasTagBasedBadge,
+    fhp.ReputationRank,
+    fhp.OwnerCommentCount,
+    fhp.DaysSinceLastCloseOrCreation,
+    rh.Level AS TagHierarchyLevel,
+    rh.Path AS TagPath
+FROM UnionedQuestionsAndAnswers uqa
+LEFT JOIN FinalSelection fhp ON fhp.PostId = uqa.PostId
+LEFT JOIN WindowedVotes fv ON fv.PostId = uqa.PostId AND fv.VoteTypeRank = 1
+LEFT JOIN RecursiveTagHierarchy rh ON rh.TagName = ANY(string_to_array(
+    COALESCE(fhp.TagTitleComplex, '<>'),
+    '|'
+))
+WHERE fhp.ScoreRankExcludingClosed <= 100
+ORDER BY fhp.ReputationRank, uqa.PostCategory, fhp.Score DESC, fv.VoteCount DESC
+LIMIT 200;

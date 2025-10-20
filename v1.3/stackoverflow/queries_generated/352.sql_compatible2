@@ -1,0 +1,341 @@
+WITH
+post_tags AS (
+  SELECT
+    p.Id AS PostId,
+    p.PostTypeId,
+    COALESCE(p.OwnerUserId, -1) AS OwnerUserId,
+    t.tag
+  FROM Posts p
+  LEFT JOIN Posts parent ON p.ParentId = parent.Id
+  CROSS JOIN LATERAL (SELECT COALESCE(p.Tags, parent.Tags) AS tag_string) ts
+  CROSS JOIN LATERAL (
+    SELECT regexp_split_to_table(SUBSTRING(ts.tag_string FROM 2 FOR (CHAR_LENGTH(ts.tag_string) - 2)), '><') AS tag
+    WHERE ts.tag_string IS NOT NULL AND CHAR_LENGTH(ts.tag_string) > 2
+  ) t
+),
+
+user_post_stats AS (
+  SELECT
+    u.Id AS UserId,
+    COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1) AS Questions,
+    COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 2) AS Answers,
+    SUM(COALESCE(p.Score,0)) AS TotalScore,
+    AVG(p.Score) FILTER (WHERE p.Score IS NOT NULL) AS AvgScore,
+    SUM(COALESCE(p.ViewCount,0)) AS TotalViews,
+    MAX(p.CreationDate) AS LastPostDate,
+    MIN(p.CreationDate) AS FirstPostDate
+  FROM Users u
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+  GROUP BY u.Id
+),
+
+user_badges AS (
+  SELECT
+    UserId,
+    COUNT(*) AS BadgeCount,
+    SUM(CASE WHEN Class = 1 THEN 1 ELSE 0 END) AS Gold,
+    SUM(CASE WHEN Class = 2 THEN 1 ELSE 0 END) AS Silver,
+    SUM(CASE WHEN Class = 3 THEN 1 ELSE 0 END) AS Bronze,
+    BOOL_OR(TagBased) AS HasTagBadges
+  FROM Badges
+  GROUP BY UserId
+),
+
+votes_on_posts AS (
+  SELECT
+    p.OwnerUserId AS UserId,
+    SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotesReceived,
+    SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotesReceived,
+    SUM(CASE WHEN v.VoteTypeId = 5 THEN 1 ELSE 0 END) AS FavoritesReceived,
+    COUNT(v.Id) AS TotalVotesReceived
+  FROM Posts p
+  LEFT JOIN Votes v ON v.PostId = p.Id
+  WHERE p.OwnerUserId IS NOT NULL
+  GROUP BY p.OwnerUserId
+),
+
+accepted_answers AS (
+  SELECT
+    a.OwnerUserId AS UserId,
+    COUNT(*) AS AcceptedAnswers
+  FROM Posts a
+  JOIN Posts q ON q.AcceptedAnswerId = a.Id
+  WHERE a.PostTypeId = 2
+  GROUP BY a.OwnerUserId
+),
+
+comments_by_user AS (
+  SELECT
+    COALESCE(UserId, -1) AS UserId,
+    COUNT(*) AS Comments
+  FROM Comments
+  GROUP BY COALESCE(UserId, -1)
+),
+
+tag_user_stats AS (
+  SELECT
+    pt.tag AS Tag,
+    pt.OwnerUserId AS UserId,
+    COUNT(*) AS PostsWithTag,
+    SUM(COALESCE(p.Score,0)) AS TagTotalScore,
+    AVG(p.Score) AS TagAvgScore
+  FROM post_tags pt
+  JOIN Posts p ON p.Id = pt.PostId
+  GROUP BY pt.tag, pt.OwnerUserId
+),
+
+top_tags_per_user AS (
+  SELECT
+    Tag,
+    UserId,
+    PostsWithTag,
+    TagTotalScore,
+    TagAvgScore,
+    ROW_NUMBER() OVER (PARTITION BY UserId ORDER BY PostsWithTag DESC, TagTotalScore DESC) AS rn
+  FROM tag_user_stats
+),
+
+top_three_tags AS (
+  SELECT
+    UserId,
+    STRING_AGG(Tag || ':' || CAST(PostsWithTag AS varchar), ', ' ORDER BY PostsWithTag DESC, TagTotalScore DESC) AS TopTags
+  FROM top_tags_per_user
+  WHERE rn <= 3
+  GROUP BY UserId
+),
+
+votes_answers_combined AS (
+  SELECT
+    COALESCE(v.UserId, a.UserId) AS UserId,
+    COALESCE(v.UpVotesReceived,0) AS UpVotesReceived,
+    COALESCE(v.DownVotesReceived,0) AS DownVotesReceived,
+    COALESCE(v.TotalVotesReceived,0) AS TotalVotesReceived,
+    COALESCE(a.AcceptedAnswers,0) AS AcceptedAnswers
+  FROM votes_on_posts v
+  FULL OUTER JOIN accepted_answers a ON v.UserId = a.UserId
+),
+
+user_composite AS (
+  SELECT
+    u.Id AS UserId,
+    u.Reputation,
+    COALESCE(ups.Questions,0) AS Questions,
+    COALESCE(ups.Answers,0) AS Answers,
+    COALESCE(ups.TotalScore,0) AS TotalScore,
+    COALESCE(vc.UpVotesReceived,0) AS UpVotesReceived,
+    COALESCE(vc.DownVotesReceived,0) AS DownVotesReceived,
+    COALESCE(vc.TotalVotesReceived,0) AS TotalVotesReceived,
+    COALESCE(vc.AcceptedAnswers,0) AS AcceptedAnswers,
+    COALESCE(b.Gold,0) AS GoldBadges,
+    COALESCE(b.Silver,0) AS SilverBadges,
+    COALESCE(b.Bronze,0) AS BronzeBadges,
+    COALESCE(c.Comments,0) AS Comments,
+    COALESCE(tt.TopTags,'') AS TopTags,
+    (u.Reputation * 0.35 +
+     COALESCE(ups.TotalScore,0) * 2 +
+     COALESCE(vc.UpVotesReceived,0) * 0.5 +
+     COALESCE(vc.AcceptedAnswers,0) * 60 +
+     COALESCE(b.Gold,0) * 120 +
+     COALESCE(b.Silver,0) * 30 +
+     COALESCE(b.Bronze,0) * 10) AS CompositeScore,
+    COALESCE(ups.FirstPostDate, CAST('2024-10-01 12:34:56' AS timestamp)) AS FirstPostDate,
+    COALESCE(ups.LastPostDate, CAST('2024-10-01 12:34:56' AS timestamp)) AS LastPostDate
+  FROM Users u
+  LEFT JOIN user_post_stats ups ON ups.UserId = u.Id
+  LEFT JOIN votes_answers_combined vc ON vc.UserId = u.Id
+  LEFT JOIN user_badges b ON b.UserId = u.Id
+  LEFT JOIN comments_by_user c ON c.UserId = u.Id
+  LEFT JOIN top_three_tags tt ON tt.UserId = u.Id
+),
+
+ranked_users AS (
+  SELECT
+    uc.UserId,
+    uc.Reputation,
+    uc.Questions,
+    uc.Answers,
+    uc.TotalScore,
+    uc.UpVotesReceived,
+    uc.DownVotesReceived,
+    uc.TotalVotesReceived,
+    uc.AcceptedAnswers,
+    uc.GoldBadges,
+    uc.SilverBadges,
+    uc.BronzeBadges,
+    uc.Comments,
+    uc.TopTags,
+    uc.CompositeScore,
+    uc.FirstPostDate,
+    uc.LastPostDate,
+    RANK() OVER (ORDER BY uc.CompositeScore DESC NULLS LAST) AS GlobalRank,
+    NTILE(10) OVER (ORDER BY uc.CompositeScore DESC NULLS LAST) AS Decile
+  FROM user_composite uc
+),
+
+decile_ranked AS (
+  SELECT
+    ru.UserId,
+    ru.Reputation,
+    ru.Questions,
+    ru.Answers,
+    ru.TotalScore,
+    ru.UpVotesReceived,
+    ru.DownVotesReceived,
+    ru.TotalVotesReceived,
+    ru.AcceptedAnswers,
+    ru.GoldBadges,
+    ru.SilverBadges,
+    ru.BronzeBadges,
+    ru.Comments,
+    ru.TopTags,
+    ru.CompositeScore,
+    ru.FirstPostDate,
+    ru.LastPostDate,
+    ru.GlobalRank,
+    ru.Decile,
+    RANK() OVER (PARTITION BY ru.Decile ORDER BY ru.CompositeScore DESC NULLS LAST) AS RankInDecile,
+    PERCENT_RANK() OVER (PARTITION BY ru.Decile ORDER BY ru.CompositeScore DESC NULLS LAST) AS PercentileInDecile
+  FROM ranked_users ru
+),
+
+top_tag_specialists AS (
+  SELECT ru.UserId
+  FROM decile_ranked ru
+  WHERE ru.Decile = 1
+  INTERSECT
+  SELECT DISTINCT t.UserId
+  FROM tag_user_stats t
+  WHERE t.PostsWithTag >= 5
+),
+
+top_influencers_except_low_answers AS (
+  SELECT ru.UserId FROM decile_ranked ru WHERE ru.Decile = 1
+  EXCEPT
+  SELECT ru2.UserId FROM decile_ranked ru2 WHERE ru2.Answers < 1
+),
+
+most_linked_per_user AS (
+  SELECT
+    p.OwnerUserId AS UserId,
+    pl.RelatedPostId,
+    COUNT(*) AS LinkCount
+  FROM PostLinks pl
+  JOIN Posts p ON p.Id = pl.PostId
+  WHERE p.OwnerUserId IS NOT NULL
+  GROUP BY p.OwnerUserId, pl.RelatedPostId
+),
+
+most_linked_best AS (
+  SELECT UserId, RelatedPostId
+  FROM (
+    SELECT UserId, RelatedPostId, LinkCount,
+           ROW_NUMBER() OVER (PARTITION BY UserId ORDER BY LinkCount DESC) AS rn
+    FROM most_linked_per_user
+  ) x
+  WHERE rn = 1
+)
+
+SELECT *
+FROM (
+  SELECT
+    dr.UserId,
+    u.DisplayName,
+    dr.Reputation,
+    dr.Questions,
+    dr.Answers,
+    dr.AcceptedAnswers,
+    ROUND(CAST(dr.CompositeScore AS numeric),2) AS CompositeScore,
+    dr.GlobalRank,
+    dr.Decile,
+    dr.RankInDecile,
+    ROUND(CAST(dr.PercentileInDecile AS numeric),4) AS PercentileInDecile,
+    dr.GoldBadges,
+    dr.SilverBadges,
+    dr.BronzeBadges,
+    dr.UpVotesReceived,
+    dr.DownVotesReceived,
+    dr.TotalVotesReceived,
+    COALESCE((
+      SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY p2.Score)
+      FROM Posts p2
+      WHERE p2.OwnerUserId = dr.UserId AND p2.Score IS NOT NULL
+    ), 0) AS MedianPostScore,
+    CASE WHEN dr.Answers = 0 THEN NULL ELSE (CAST(dr.AcceptedAnswers AS numeric) / dr.Answers) END AS AcceptanceRate,
+    CASE WHEN dr.FirstPostDate IS NULL THEN 0 ELSE FLOOR(EXTRACT(epoch FROM (CAST('2024-10-01 12:34:56' AS timestamp) - dr.FirstPostDate)) / 86400) END AS DaysActive,
+    CASE WHEN FLOOR(EXTRACT(epoch FROM (CAST('2024-10-01 12:34:56' AS timestamp) - dr.FirstPostDate)) / 86400) <= 0 THEN dr.TotalScore ELSE dr.TotalScore / GREATEST(FLOOR(EXTRACT(epoch FROM (CAST('2024-10-01 12:34:56' AS timestamp) - dr.FirstPostDate)) / 86400),1) END AS ActivityDensity,
+    COALESCE(tt.TopTags,'') AS TopTags,
+    (SELECT COUNT(*) FROM PostHistory ph WHERE ph.UserId = dr.UserId AND ph.PostHistoryTypeId = 10) AS CloseVotesCast,
+    (SELECT COUNT(*) FROM PostHistory ph WHERE ph.PostId IN (SELECT p3.Id FROM Posts p3 WHERE p3.OwnerUserId = dr.UserId) AND ph.PostHistoryTypeId = 10) AS CloseVotesReceived,
+    (SELECT u2.DisplayName FROM Users u2 WHERE u2.Id = (
+       SELECT ph2.UserId FROM PostHistory ph2
+       WHERE ph2.PostId IN (SELECT p4.Id FROM Posts p4 WHERE p4.OwnerUserId = dr.UserId)
+         AND ph2.UserId IS NOT NULL
+       ORDER BY ph2.CreationDate DESC
+       LIMIT 1
+    )) AS LastEditorDisplayName,
+    COALESCE(CAST(mb.RelatedPostId AS varchar),'') AS MostLinkedRelatedPost,
+    (CASE WHEN EXISTS (SELECT 1 FROM top_tag_specialists tts WHERE tts.UserId = dr.UserId) THEN TRUE ELSE FALSE END) AS IsTopTagSpecialist,
+    (CASE WHEN EXISTS (SELECT 1 FROM top_influencers_except_low_answers ti WHERE ti.UserId = dr.UserId) THEN TRUE ELSE FALSE END) AS IsTopInfluencer,
+    COALESCE((SELECT SUM(COALESCE(v2.BountyAmount,0)) FROM Votes v2 WHERE v2.UserId = dr.UserId AND v2.VoteTypeId IN (8,9)),0) AS BountyGiven,
+    COALESCE((SELECT SUM(COALESCE(v3.BountyAmount,0)) FROM Votes v3 JOIN Posts p5 ON p5.Id = v3.PostId WHERE p5.OwnerUserId = dr.UserId AND v3.VoteTypeId = 9),0) AS BountyReceived,
+    ('meta=' || COALESCE(tt.TopTags,'') || '|' || 'score=' || COALESCE(CAST(dr.TotalScore AS varchar),'0') || '|' || 'rep=' || CAST(dr.Reputation AS varchar)) AS Summary,
+    'TopDecile' AS Cohort
+  FROM decile_ranked dr
+  LEFT JOIN Users u ON u.Id = dr.UserId
+  LEFT JOIN top_three_tags tt ON tt.UserId = dr.UserId
+  LEFT JOIN most_linked_best mb ON mb.UserId = dr.UserId
+  WHERE dr.Decile = 1
+
+  UNION ALL
+
+  SELECT
+    dr.UserId,
+    u.DisplayName,
+    dr.Reputation,
+    dr.Questions,
+    dr.Answers,
+    dr.AcceptedAnswers,
+    ROUND(CAST(dr.CompositeScore AS numeric),2) AS CompositeScore,
+    dr.GlobalRank,
+    dr.Decile,
+    dr.RankInDecile,
+    ROUND(CAST(dr.PercentileInDecile AS numeric),4) AS PercentileInDecile,
+    dr.GoldBadges,
+    dr.SilverBadges,
+    dr.BronzeBadges,
+    dr.UpVotesReceived,
+    dr.DownVotesReceived,
+    dr.TotalVotesReceived,
+    COALESCE((
+      SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY p2.Score)
+      FROM Posts p2
+      WHERE p2.OwnerUserId = dr.UserId AND p2.Score IS NOT NULL
+    ), 0) AS MedianPostScore,
+    CASE WHEN dr.Answers = 0 THEN NULL ELSE (CAST(dr.AcceptedAnswers AS numeric) / dr.Answers) END AS AcceptanceRate,
+    CASE WHEN dr.FirstPostDate IS NULL THEN 0 ELSE FLOOR(EXTRACT(epoch FROM (CAST('2024-10-01 12:34:56' AS timestamp) - dr.FirstPostDate)) / 86400) END AS DaysActive,
+    CASE WHEN FLOOR(EXTRACT(epoch FROM (CAST('2024-10-01 12:34:56' AS timestamp) - dr.FirstPostDate)) / 86400) <= 0 THEN dr.TotalScore ELSE dr.TotalScore / GREATEST(FLOOR(EXTRACT(epoch FROM (CAST('2024-10-01 12:34:56' AS timestamp) - dr.FirstPostDate)) / 86400),1) END AS ActivityDensity,
+    COALESCE(tt.TopTags,'') AS TopTags,
+    (SELECT COUNT(*) FROM PostHistory ph WHERE ph.UserId = dr.UserId AND ph.PostHistoryTypeId = 10) AS CloseVotesCast,
+    (SELECT COUNT(*) FROM PostHistory ph WHERE ph.PostId IN (SELECT p3.Id FROM Posts p3 WHERE p3.OwnerUserId = dr.UserId) AND ph.PostHistoryTypeId = 10) AS CloseVotesReceived,
+    (SELECT u2.DisplayName FROM Users u2 WHERE u2.Id = (
+       SELECT ph2.UserId FROM PostHistory ph2
+       WHERE ph2.PostId IN (SELECT p4.Id FROM Posts p4 WHERE p4.OwnerUserId = dr.UserId)
+         AND ph2.UserId IS NOT NULL
+       ORDER BY ph2.CreationDate DESC
+       LIMIT 1
+    )) AS LastEditorDisplayName,
+    COALESCE(CAST(mb.RelatedPostId AS varchar),'') AS MostLinkedRelatedPost,
+    (CASE WHEN EXISTS (SELECT 1 FROM top_tag_specialists tts WHERE tts.UserId = dr.UserId) THEN TRUE ELSE FALSE END) AS IsTopTagSpecialist,
+    (CASE WHEN EXISTS (SELECT 1 FROM top_influencers_except_low_answers ti WHERE ti.UserId = dr.UserId) THEN TRUE ELSE FALSE END) AS IsTopInfluencer,
+    COALESCE((SELECT SUM(COALESCE(v2.BountyAmount,0)) FROM Votes v2 WHERE v2.UserId = dr.UserId AND v2.VoteTypeId IN (8,9)),0) AS BountyGiven,
+    COALESCE((SELECT SUM(COALESCE(v3.BountyAmount,0)) FROM Votes v3 JOIN Posts p5 ON p5.Id = v3.PostId WHERE p5.OwnerUserId = dr.UserId AND v3.VoteTypeId = 9),0) AS BountyReceived,
+    ('meta=' || COALESCE(tt.TopTags,'') || '|' || 'score=' || COALESCE(CAST(dr.TotalScore AS varchar),'0') || '|' || 'rep=' || CAST(dr.Reputation AS varchar)) AS Summary,
+    'BottomDecile' AS Cohort
+  FROM decile_ranked dr
+  LEFT JOIN Users u ON u.Id = dr.UserId
+  LEFT JOIN top_three_tags tt ON tt.UserId = dr.UserId
+  LEFT JOIN most_linked_best mb ON mb.UserId = dr.UserId
+  WHERE dr.Decile = 10
+) final
+ORDER BY CompositeScore DESC NULLS LAST, GlobalRank
+LIMIT 200;

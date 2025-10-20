@@ -1,0 +1,189 @@
+WITH RECURSIVE RecursiveTagHierarchy AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        t.IsModeratorOnly,
+        t.IsRequired,
+        1 AS Level,
+        ARRAY[t.Id] AS Path
+    FROM Tags t
+    WHERE t.IsRequired = true
+
+    UNION ALL
+
+    SELECT
+        t2.Id,
+        t2.TagName,
+        t2.Count,
+        t2.ExcerptPostId,
+        t2.WikiPostId,
+        t2.IsModeratorOnly,
+        t2.IsRequired,
+        r.Level + 1,
+        r.Path || t2.Id
+    FROM Tags t2
+    JOIN RecursiveTagHierarchy r ON NOT (t2.Id = ANY(r.Path))
+    WHERE t2.IsRequired = true AND t2.Count < r.Count
+),
+UserBadgeCounts AS (
+    SELECT
+        b.UserId,
+        b.Class,
+        COUNT(*) AS BadgeCount
+    FROM Badges b
+    GROUP BY b.UserId, b.Class
+),
+UserReputationRanks AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        RANK() OVER (ORDER BY u.Reputation DESC) AS ReputationRank,
+        DENSE_RANK() OVER (PARTITION BY u.Location ORDER BY u.Reputation DESC) AS LocationReputationRank
+    FROM Users u
+    WHERE u.Reputation IS NOT NULL
+),
+PostScoreStats AS (
+    SELECT
+        p.OwnerUserId,
+        COUNT(CASE WHEN p.PostTypeId = 1 THEN 1 END) AS QuestionCount,
+        COUNT(CASE WHEN p.PostTypeId = 2 THEN 1 END) AS AnswerCount,
+        AVG(CASE WHEN p.PostTypeId = 1 THEN p.Score END) AS AvgQuestionScore,
+        AVG(CASE WHEN p.PostTypeId = 2 THEN p.Score END) AS AvgAnswerScore,
+        MAX(CASE WHEN p.PostTypeId = 1 THEN p.Score END) AS MaxQuestionScore,
+        MAX(CASE WHEN p.PostTypeId = 2 THEN p.Score END) AS MaxAnswerScore
+    FROM Posts p
+    WHERE p.OwnerUserId IS NOT NULL
+    GROUP BY p.OwnerUserId
+),
+TopQuestionsWithAnswers AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.Title,
+        q.CreationDate AS QuestionCreationDate,
+        q.Score AS QuestionScore,
+        a.Id AS AnswerId,
+        a.CreationDate AS AnswerCreationDate,
+        a.Score AS AnswerScore,
+        u.DisplayName AS AnswerOwner,
+        ROW_NUMBER() OVER (PARTITION BY q.Id ORDER BY a.Score DESC, a.CreationDate ASC) AS AnswerRank
+    FROM Posts q
+    LEFT JOIN Posts a ON a.ParentId = q.Id AND a.PostTypeId = 2
+    LEFT JOIN Users u ON u.Id = a.OwnerUserId
+    WHERE q.PostTypeId = 1
+),
+ClosedQuestionsWithReasons AS (
+    SELECT
+        ph.PostId,
+        ph.CreationDate AS CloseDate,
+        crt.Name AS CloseReason,
+        ph.UserId AS CloserUserId,
+        u.DisplayName AS CloserUserName
+    FROM PostHistory ph
+    JOIN PostHistoryTypes pht ON ph.PostHistoryTypeId = pht.Id AND pht.Name = 'Post Closed'
+    LEFT JOIN CloseReasonTypes crt ON crt.Id = CAST(ph.Comment AS INTEGER)
+    LEFT JOIN Users u ON u.Id = ph.UserId
+),
+UserActivitySummary AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT c.Id) AS TotalComments,
+        COUNT(DISTINCT CASE WHEN v.VoteTypeId = 2 THEN v.Id END) AS TotalUpVotes,
+        COUNT(DISTINCT CASE WHEN v.VoteTypeId = 3 THEN v.Id END) AS TotalDownVotes,
+        MAX(p.CreationDate) AS LastPostDate,
+        MAX(c.CreationDate) AS LastCommentDate,
+        MAX(v.CreationDate) AS LastVoteDate
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Comments c ON c.UserId = u.Id
+    LEFT JOIN Votes v ON v.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName
+)
+SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    COALESCE(ubc_gold.BadgeCount, 0) AS GoldBadges,
+    COALESCE(ubc_silver.BadgeCount, 0) AS SilverBadges,
+    COALESCE(ubc_bronze.BadgeCount, 0) AS BronzeBadges,
+    prs.QuestionCount,
+    prs.AnswerCount,
+    prs.AvgQuestionScore,
+    prs.AvgAnswerScore,
+    prs.MaxQuestionScore,
+    prs.MaxAnswerScore,
+    uas.TotalPosts,
+    uas.TotalComments,
+    uas.TotalUpVotes,
+    uas.TotalDownVotes,
+    uas.LastPostDate,
+    uas.LastCommentDate,
+    uas.LastVoteDate,
+    u.CreationDate,
+    u.Location,
+    u.WebsiteUrl,
+    u.AboutMe,
+    u.Views,
+    u.UpVotes,
+    u.DownVotes,
+    u.ProfileImageUrl,
+    u.EmailHash,
+    ur.ReputationRank,
+    ur.LocationReputationRank,
+    cq.CloseReason,
+    cq.CloseDate,
+    cq.CloserUserName,
+    tq.QuestionId,
+    tq.Title AS TopQuestionTitle,
+    tq.QuestionCreationDate,
+    tq.QuestionScore,
+    tq.AnswerId,
+    tq.AnswerCreationDate,
+    tq.AnswerScore,
+    tq.AnswerOwner
+FROM Users u
+LEFT JOIN UserBadgeCounts ubc_gold ON ubc_gold.UserId = u.Id AND ubc_gold.Class = 1
+LEFT JOIN UserBadgeCounts ubc_silver ON ubc_silver.UserId = u.Id AND ubc_silver.Class = 2
+LEFT JOIN UserBadgeCounts ubc_bronze ON ubc_bronze.UserId = u.Id AND ubc_bronze.Class = 3
+LEFT JOIN PostScoreStats prs ON prs.OwnerUserId = u.Id
+LEFT JOIN UserActivitySummary uas ON uas.UserId = u.Id
+LEFT JOIN UserReputationRanks ur ON ur.Id = u.Id
+LEFT JOIN LATERAL (
+    SELECT cq1.CloseReason, cq1.CloseDate, cq1.CloserUserName
+    FROM ClosedQuestionsWithReasons cq1
+    JOIN Posts p1 ON p1.Id = cq1.PostId
+    WHERE p1.OwnerUserId = u.Id
+    ORDER BY cq1.CloseDate DESC
+    LIMIT 1
+) cq ON TRUE
+LEFT JOIN LATERAL (
+    SELECT tq1.QuestionId,
+           tq1.Title,
+           tq1.QuestionCreationDate,
+           tq1.QuestionScore,
+           tq1.AnswerId,
+           tq1.AnswerCreationDate,
+           tq1.AnswerScore,
+           tq1.AnswerOwner,
+           tq1.AnswerRank
+    FROM TopQuestionsWithAnswers tq1
+    WHERE tq1.AnswerRank = 1
+      AND EXISTS (
+        SELECT 1 FROM Posts p2 WHERE p2.Id = tq1.QuestionId AND p2.OwnerUserId = u.Id
+      )
+    ORDER BY tq1.QuestionScore DESC
+    LIMIT 1
+) tq ON TRUE
+WHERE u.Reputation > 1000
+  AND (u.Location IS NOT NULL AND u.Location <> '')
+  AND (u.AboutMe IS NOT NULL AND LENGTH(u.AboutMe) > 50)
+  AND EXISTS (
+    SELECT 1 FROM Posts p WHERE p.OwnerUserId = u.Id AND p.Score > 10
+  )
+ORDER BY ur.ReputationRank
+LIMIT 100;

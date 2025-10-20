@@ -1,0 +1,34 @@
+with RecursiveTagHierarchy(tagname, parentTag, level) as (
+    select
+        NewTagName AS tagname,
+        OriginalTags,
+        1 as level
+    from (
+        select
+            P1.NewTagName,
+            -- remove array operator syntax; keep original tags as text
+            P1.Tags as OriginalTags
+        from stackoverflow P1
+        where P1.NewTagName is not null
+    ) t0
+    union all
+    select
+        rth.tagname,
+        -- compute parentTag by splitting tag list: take first tag after removing leading '<' and trailing '>'
+        split_part(trim(both '<>' from rth.parentTag), '><', 1) as parentTag,
+        rth.level + 1
+    from RecursiveTagHierarchy rth
+    where rth.level < 10
+)
+select
+    rth.tagname,
+    rth.parentTag,
+    rth.level
+from RecursiveTagHierarchy rth
+group by
+    rth.tagname,
+    rth.parentTag,
+    rth.level
+order by
+    rth.tagname,
+    rth.level;

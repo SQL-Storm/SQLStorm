@@ -1,0 +1,239 @@
+WITH RecursiveTagHierarchy AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        ARRAY[t.TagName] AS TagPath
+    FROM Tags t
+    WHERE t.Id IN (
+        SELECT DISTINCT UNNEST(
+            ARRAY(
+                SELECT DISTINCT CAST(regexp_split_to_table(substring(p.Tags FROM 2 FOR length(p.Tags)-2), '><') AS varchar)
+                FROM Posts p WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL
+            )
+        )
+    )
+    UNION ALL
+    SELECT
+        t2.Id,
+        t2.TagName,
+        t2.Count,
+        rth.TagPath || t2.TagName
+    FROM Tags t2
+    JOIN RecursiveTagHierarchy rth ON t2.Id != rth.Id AND NOT t2.TagName = ANY(rth.TagPath)
+    WHERE array_length(rth.TagPath, 1) < 3
+),
+TopUsers AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.Location,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END), 0) AS UpVotesCount,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END), 0) AS DownVotesCount,
+        COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(DISTINCT b.Id) FILTER (WHERE b.Class = 3) AS BronzeBadges
+    FROM Users u
+    LEFT JOIN Votes v ON v.UserId = u.Id
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    WHERE u.Reputation > 5000
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.Location
+),
+QuestionStats AS (
+    SELECT
+        p.Id,
+        p.OwnerUserId,
+        p.Title,
+        p.Tags,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.AcceptedAnswerId,
+        COUNT(a.Id) AS AnswerCount,
+        COUNT(c.Id) AS CommentCount,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC, p.ViewCount DESC) AS UserQuestionRank,
+        STRING_AGG(DISTINCT COALESCE(pht.Name, 'Unknown'), ', ') AS PostHistoryEventTypes,
+        MAX(ph.CreationDate) AS LastEditDate
+    FROM Posts p
+    LEFT JOIN Posts a ON a.ParentId = p.Id AND a.PostTypeId = 2
+    LEFT JOIN Comments c ON c.PostId = p.Id
+    LEFT JOIN PostHistory ph ON ph.PostId = p.Id
+    LEFT JOIN PostHistoryTypes pht ON ph.PostHistoryTypeId = pht.Id
+    WHERE p.PostTypeId = 1
+    GROUP BY p.Id, p.OwnerUserId, p.Title, p.Tags, p.Score, p.ViewCount, p.CreationDate, p.AcceptedAnswerId
+),
+AnswerDetails AS (
+    SELECT
+        a.Id,
+        a.ParentId,
+        a.OwnerUserId,
+        a.Score,
+        a.CreationDate,
+        a.CommentCount,
+        ROW_NUMBER() OVER (PARTITION BY a.ParentId ORDER BY a.Score DESC, a.CreationDate ASC) AS AnswerRank,
+        CASE WHEN EXISTS (
+            SELECT 1 FROM Votes v WHERE v.PostId = a.Id AND v.VoteTypeId = 14
+        ) THEN 1 ELSE 0 END AS HasApprovedEditSuggestion,
+        (SELECT COUNT(*) FROM Comments c WHERE c.PostId = a.Id AND c.CreationDate > a.CreationDate) AS CommentsAfterAnswer
+    FROM Posts a
+    WHERE a.PostTypeId = 2
+),
+QuestionAnswerSummary AS (
+    SELECT
+        qs.Id AS QuestionId,
+        qs.Title,
+        qs.OwnerUserId,
+        qs.Score AS QuestionScore,
+        qs.ViewCount,
+        qs.CreationDate AS QuestionCreationDate,
+        qs.AcceptedAnswerId,
+        qs.AnswerCount,
+        qs.CommentCount AS QuestionCommentCount,
+        qs.UserQuestionRank,
+        qs.PostHistoryEventTypes,
+        qs.LastEditDate,
+        ad.Id AS TopAnswerId,
+        ad.OwnerUserId AS TopAnswerOwnerUserId,
+        ad.Score AS TopAnswerScore,
+        ad.CreationDate AS TopAnswerCreationDate,
+        ad.CommentCount AS TopAnswerCommentCount,
+        ad.AnswerRank,
+        ad.HasApprovedEditSuggestion,
+        ad.CommentsAfterAnswer,
+        qs.Tags
+    FROM QuestionStats qs
+    LEFT JOIN AnswerDetails ad ON ad.ParentId = qs.Id AND ad.AnswerRank = 1
+),
+UserActivity AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionsPosted,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswersPosted,
+        COUNT(DISTINCT c.Id) AS CommentsMade,
+        COUNT(DISTINCT v.Id) AS VotesCast,
+        MAX(CASE WHEN p.PostTypeId IN (1, 2) THEN p.CreationDate END) AS LastPostDate,
+        MAX(c.CreationDate) AS LastCommentDate,
+        MAX(v.CreationDate) AS LastVoteDate,
+        MIN(u.CreationDate) AS UserCreationDate
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Comments c ON c.UserId = u.Id
+    LEFT JOIN Votes v ON v.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName
+),
+TagPopularity AS (
+    SELECT
+        unnest(regexp_split_to_array(substring(p.Tags FROM 2 FOR length(p.Tags)-2), '><')) AS Tag,
+        COUNT(*) AS QuestionCount,
+        AVG(p.Score) AS AvgScore,
+        SUM(p.ViewCount) AS TotalViews
+    FROM Posts p
+    WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL
+    GROUP BY Tag
+),
+CloseReasonStats AS (
+    SELECT
+        crt.Name AS CloseReason,
+        COUNT(ph.Id) AS CloseCount,
+        AVG(EXTRACT(EPOCH FROM (COALESCE(ph2.CreationDate, TIMESTAMP '2024-10-01 12:34:56') - ph.CreationDate))) AS AvgTimeToReopenSeconds
+    FROM PostHistory ph
+    LEFT JOIN CloseReasonTypes crt ON crt.Id = CAST(ph.Comment AS SMALLINT)
+    LEFT JOIN PostHistory ph2 ON ph2.PostId = ph.PostId AND ph2.PostHistoryTypeId = 11 AND ph2.CreationDate > ph.CreationDate
+    WHERE ph.PostHistoryTypeId = 10
+    GROUP BY crt.Name
+),
+UserRankedPosts AS (
+    SELECT
+        p.Id,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        RANK() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC, p.ViewCount DESC) AS PostRank
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+),
+HighRankPosts AS (
+    SELECT DISTINCT OwnerUserId
+    FROM UserRankedPosts
+    WHERE PostRank <= 5
+),
+CombinedUsers AS (
+    SELECT u.Id, u.DisplayName, u.Reputation
+    FROM Users u
+    WHERE u.Id IN (SELECT OwnerUserId FROM HighRankPosts)
+),
+FinalSelection AS (
+    SELECT
+        cu.Id AS UserId,
+        cu.DisplayName,
+        cu.Reputation,
+        ua.QuestionsPosted,
+        ua.AnswersPosted,
+        ua.CommentsMade,
+        ua.VotesCast,
+        ua.LastPostDate,
+        ua.LastCommentDate,
+        ua.LastVoteDate,
+        qa.QuestionId,
+        qa.Title AS QuestionTitle,
+        qa.QuestionScore,
+        qa.ViewCount AS QuestionViews,
+        qa.AnswerCount,
+        qa.TopAnswerId,
+        qa.TopAnswerScore,
+        qa.TopAnswerCommentCount,
+        qa.HasApprovedEditSuggestion,
+        qp.Tag,
+        qp.QuestionCount AS TagQuestionCount,
+        qp.AvgScore AS TagAvgScore,
+        qp.TotalViews AS TagTotalViews,
+        crs.CloseReason,
+        crs.CloseCount,
+        crs.AvgTimeToReopenSeconds
+    FROM CombinedUsers cu
+    LEFT JOIN UserActivity ua ON ua.Id = cu.Id
+    LEFT JOIN QuestionAnswerSummary qa ON qa.OwnerUserId = cu.Id
+    LEFT JOIN LATERAL (
+        SELECT tp.Tag, tp.QuestionCount, tp.AvgScore, tp.TotalViews
+        FROM TagPopularity tp
+        WHERE tp.Tag = ANY (regexp_split_to_array(substring(qa.Tags FROM 2 FOR length(qa.Tags)-2), '><'))
+        ORDER BY tp.QuestionCount DESC
+        LIMIT 1
+    ) qp ON true
+    LEFT JOIN CloseReasonStats crs ON crs.CloseReason IS NOT NULL
+    WHERE qa.UserQuestionRank <= 3
+)
+SELECT
+    fs.UserId,
+    fs.DisplayName,
+    fs.Reputation,
+    fs.QuestionsPosted,
+    fs.AnswersPosted,
+    fs.CommentsMade,
+    fs.VotesCast,
+    fs.LastPostDate,
+    fs.LastCommentDate,
+    fs.LastVoteDate,
+    fs.QuestionId,
+    fs.QuestionTitle,
+    fs.QuestionScore,
+    fs.QuestionViews,
+    fs.AnswerCount,
+    fs.TopAnswerId,
+    fs.TopAnswerScore,
+    fs.TopAnswerCommentCount,
+    fs.HasApprovedEditSuggestion,
+    fs.Tag AS MostUsedTag,
+    fs.TagQuestionCount,
+    fs.TagAvgScore,
+    fs.TagTotalViews,
+    fs.CloseReason,
+    fs.CloseCount,
+    ROUND(fs.AvgTimeToReopenSeconds / 3600, 2) AS AvgTimeToReopenHours
+FROM FinalSelection fs
+WHERE (COALESCE(fs.CloseCount, 0) > 0) OR (COALESCE(fs.AnswerCount, 0) > 0)
+ORDER BY fs.Reputation DESC, fs.QuestionScore DESC
+LIMIT 100;

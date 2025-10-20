@@ -1,0 +1,203 @@
+WITH RECURSIVE RecursiveTagHierarchy AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        1 AS Level,
+        ARRAY[t.TagName] AS Path
+    FROM Tags t
+    WHERE t.IsModeratorOnly = false AND t.IsRequired = false
+
+    UNION ALL
+
+    SELECT
+        t2.Id,
+        t2.TagName,
+        t2.Count,
+        r.Level + 1,
+        r.Path || t2.TagName
+    FROM Tags t2
+    JOIN RecursiveTagHierarchy r ON t2.Id > r.Id
+    WHERE t2.IsModeratorOnly = false
+      AND t2.IsRequired = false
+      AND NOT t2.TagName = ANY (r.Path)
+),
+UserBadgeCounts AS (
+    SELECT
+        b.UserId,
+        b.Class,
+        COUNT(*) AS BadgeCount
+    FROM Badges b
+    GROUP BY b.UserId, b.Class
+),
+UserReputationWindow AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.Location,
+        row_number() OVER (PARTITION BY u.Location ORDER BY u.Reputation DESC) AS RankByLocation,
+        avg(u.Reputation) OVER (PARTITION BY u.Location) AS AvgReputationByLocation,
+        count(*) OVER (PARTITION BY u.Location) AS UsersInLocation
+    FROM Users u
+    WHERE u.Location IS NOT NULL
+),
+PostAnswerStats AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.Title,
+        q.CreationDate AS QuestionCreation,
+        q.Score AS QuestionScore,
+        q.ViewCount,
+        q.Tags,
+        COUNT(a.Id) AS AnswerCount,
+        MAX(a.Score) AS MaxAnswerScore,
+        AVG(a.Score) AS AvgAnswerScore,
+        SUM(CASE WHEN a.OwnerUserId IS NOT NULL THEN 1 ELSE 0 END) AS AnswersWithOwner,
+        SUM(CASE WHEN a.Score > q.Score THEN 1 ELSE 0 END) AS AnswersBetterThanQuestion
+    FROM Posts q
+    LEFT JOIN Posts a ON a.ParentId = q.Id AND a.PostTypeId = 2
+    WHERE q.PostTypeId = 1
+    GROUP BY q.Id, q.Title, q.CreationDate, q.Score, q.ViewCount, q.Tags
+),
+PostCloseReasons AS (
+    SELECT
+        ph.PostId,
+        crt.Name AS CloseReasonName,
+        ph.CreationDate AS CloseDate
+    FROM PostHistory ph
+    JOIN CloseReasonTypes crt ON CAST(ph.Comment AS INTEGER) = crt.Id
+    WHERE ph.PostHistoryTypeId = 10
+),
+UserActivitySummary AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionsPosted,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswersPosted,
+        COUNT(DISTINCT c.Id) AS CommentsMade,
+        COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId = 2) AS UpVotesGiven,
+        COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId = 3) AS DownVotesGiven,
+        COALESCE(SUM(v.BountyAmount), 0) AS TotalBountyGiven,
+        MAX(p.Score) FILTER (WHERE p.PostTypeId = 2) AS MaxAnswerScore,
+        MAX(p.Score) FILTER (WHERE p.PostTypeId = 1) AS MaxQuestionScore
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Comments c ON c.UserId = u.Id
+    LEFT JOIN Votes v ON v.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName
+),
+TopTagsByActivity AS (
+    SELECT
+        unnest(string_to_array(substring(p.Tags FROM 2 FOR char_length(p.Tags) - 2), '><')) AS Tag,
+        COUNT(*) AS PostCount,
+        AVG(p.Score) AS AvgScore,
+        MAX(p.Score) AS MaxScore
+    FROM Posts p
+    WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL
+    GROUP BY Tag
+    ORDER BY PostCount DESC
+    LIMIT 50
+),
+DuplicateLinkAnalysis AS (
+    SELECT
+        pl.PostId,
+        pl.RelatedPostId,
+        p1.Title AS PostTitle,
+        p2.Title AS RelatedPostTitle,
+        pl.CreationDate,
+        u.DisplayName AS PostOwner,
+        u2.DisplayName AS RelatedPostOwner
+    FROM PostLinks pl
+    JOIN Posts p1 ON p1.Id = pl.PostId
+    JOIN Posts p2 ON p2.Id = pl.RelatedPostId
+    LEFT JOIN Users u ON u.Id = p1.OwnerUserId
+    LEFT JOIN Users u2 ON u2.Id = p2.OwnerUserId
+    WHERE pl.LinkTypeId = 3
+),
+UserBadgeRankings AS (
+    SELECT
+        ubc.UserId,
+        ubc.Class,
+        ubc.BadgeCount,
+        rank() OVER (PARTITION BY ubc.Class ORDER BY ubc.BadgeCount DESC) AS BadgeRank
+    FROM UserBadgeCounts ubc
+),
+UserWithBadgesAndActivity AS (
+    SELECT
+        uas.UserId,
+        uas.DisplayName,
+        uas.QuestionsPosted,
+        uas.AnswersPosted,
+        uas.CommentsMade,
+        uas.UpVotesGiven,
+        uas.DownVotesGiven,
+        uas.TotalBountyGiven,
+        ubc.Class,
+        ubc.BadgeCount,
+        ubr.BadgeRank
+    FROM UserActivitySummary uas
+    LEFT JOIN UserBadgeCounts ubc ON ubc.UserId = uas.UserId
+    LEFT JOIN UserBadgeRankings ubr ON ubr.UserId = uas.UserId AND ubr.Class = ubc.Class
+)
+SELECT
+    pqs.QuestionId,
+    pqs.Title,
+    pqs.QuestionCreation,
+    pqs.QuestionScore,
+    pqs.ViewCount,
+    pqs.AnswerCount,
+    pqs.MaxAnswerScore,
+    pqs.AvgAnswerScore,
+    pqs.AnswersWithOwner,
+    pqs.AnswersBetterThanQuestion,
+    pcr.CloseReasonName,
+    pcr.CloseDate,
+    utba.Tag,
+    utba.PostCount AS TagPostCount,
+    utba.AvgScore AS TagAvgScore,
+    utba.MaxScore AS TagMaxScore,
+    dla.PostTitle AS DuplicatePostTitle,
+    dla.RelatedPostTitle AS DuplicateRelatedPostTitle,
+    dla.CreationDate AS DuplicateLinkDate,
+    dla.PostOwner AS DuplicatePostOwner,
+    dla.RelatedPostOwner AS DuplicateRelatedPostOwner,
+    uwb.DisplayName AS UserDisplayName,
+    uwb.QuestionsPosted,
+    uwb.AnswersPosted,
+    uwb.CommentsMade,
+    uwb.UpVotesGiven,
+    uwb.DownVotesGiven,
+    uwb.TotalBountyGiven,
+    uwb.Class AS BadgeClass,
+    uwb.BadgeCount,
+    uwb.BadgeRank
+FROM PostAnswerStats pqs
+LEFT JOIN PostCloseReasons pcr ON pcr.PostId = pqs.QuestionId
+LEFT JOIN LATERAL (
+    SELECT t.Tag, t.PostCount, t.AvgScore, t.MaxScore
+    FROM TopTagsByActivity t
+    WHERE pqs.Tags LIKE '%' || t.Tag || '%'
+    ORDER BY t.PostCount DESC
+    LIMIT 1
+) utba ON TRUE
+LEFT JOIN LATERAL (
+    SELECT dla.PostId, dla.RelatedPostId, dla.PostTitle, dla.RelatedPostTitle, dla.CreationDate, dla.PostOwner, dla.RelatedPostOwner
+    FROM DuplicateLinkAnalysis dla
+    WHERE dla.PostId = pqs.QuestionId
+    ORDER BY dla.CreationDate DESC
+    LIMIT 1
+) dla ON TRUE
+LEFT JOIN LATERAL (
+    SELECT uwb.UserId, uwb.DisplayName, uwb.QuestionsPosted, uwb.AnswersPosted, uwb.CommentsMade, uwb.UpVotesGiven, uwb.DownVotesGiven, uwb.TotalBountyGiven, uwb.Class, uwb.BadgeCount, uwb.BadgeRank
+    FROM UserWithBadgesAndActivity uwb
+    WHERE uwb.UserId = (
+        SELECT OwnerUserId FROM Posts WHERE Id = pqs.QuestionId
+    )
+) uwb ON TRUE
+WHERE pqs.AnswerCount > 5
+  AND (pqs.MaxAnswerScore > pqs.QuestionScore OR pqs.AnswersBetterThanQuestion > 0)
+  AND (pcr.CloseDate IS NULL OR pcr.CloseDate > pqs.QuestionCreation)
+ORDER BY pqs.ViewCount DESC, pqs.QuestionScore DESC
+LIMIT 100;

@@ -1,0 +1,74 @@
+WITH RECURSIVE RecursiveTagHierarchy AS (
+    SELECT t.Id, t.TagName, NULL AS ParentTagId 
+    FROM Tags t 
+    WHERE t.Id IN (
+        SELECT post_tags.Id
+        FROM (
+            SELECT DISTINCT unnest(string_to_array(substring(p.Tags FROM 2 FOR char_length(p.Tags)-2), '><')) AS TagName
+            FROM Posts p
+            WHERE p.PostTypeId = 1
+        ) pt
+        JOIN Tags post_tags ON post_tags.TagName = pt.TagName
+    )
+    UNION ALL
+    SELECT c.Id, c.TagName, p.Id AS ParentTagId
+    FROM Tags c
+    JOIN RecursiveTagHierarchy p ON p.Id != c.Id AND c.IsRequired = 1
+    WHERE char_length(c.TagName) > 0
+),
+User_post_summary AS (
+    SELECT
+        u.Id AS UserId,
+        count(distinct p.Id) AS TotalPosts,
+        count(distinct case when p.PostTypeId = 1 then p.Id end) AS QuestionCount,
+        count(distinct case when p.PostTypeId = 2 then p.Id end) AS AnswerCount,
+        max(case when p.PostTypeId = 1 then p.CreationDate end) AS MostRecentQuestionDate,
+        max(case when p.PostTypeId = 2 then p.CreationDate end) AS MostRecentAnswerDate,
+        sum(coalesce(p.Score,0)) AS TotalScore,
+        avg(p.Score) AS AverageScore
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    GROUP BY u.Id
+),
+User_badge_details AS (
+    SELECT
+        b.UserId,
+        b.Class,
+        count(*) AS BadgeCount,
+        string_agg(distinct b.Name || ' (' || to_char(b.Date,'YYYY-MM-DD') || ')', '; ' ORDER BY b.Date DESC) AS BadgeHistory
+    FROM Badges b
+    GROUP BY b.UserId, b.Class
+),
+Question_with_accepts AS (
+    SELECT 
+      q.Id AS QuestionId,
+      q.Title,
+      q.OwnerUserId,
+      q.ViewCount,
+      q.Score,
+      q.CreationDate,
+      q.Tags,
+      q.AcceptedAnswerId,
+      a.Score AS AcceptedAnswerScore,
+      a.OwnerUserId AS AcceptedAnswerUserId,
+      extract(epoch FROM (timestamp '2024-10-01 12:34:56') - coalesce(q.ClosedDate, to_timestamp(0))) / 86400 AS DaysUntilClosed,
+      (SELECT count(1) FROM Comments cm WHERE cm.PostId = q.Id AND cm.CreationDate > ((timestamp '2024-10-01 12:34:56') - interval '30 days')) AS CommentCount30Days,
+      LAG(q.Score) OVER (ORDER BY q.CreationDate) AS PrevQuestionScore,
+      LEAD(q.ViewCount) OVER (ORDER BY q.CreationDate) AS NextQuestionViewCount 
+    FROM Posts q
+    LEFT JOIN Posts a ON a.Id = q.AcceptedAnswerId
+    WHERE q.PostTypeId = 1
+      AND q.AcceptedAnswerId IS NOT NULL
+)
+SELECT  
+  uu.UserId,
+  uu.TotalPosts,
+  sum(case when ub_fd.Class = 1 then ub_fd.BadgeCount else 0 end) AS Genreated_Gold,
+  sum(case when ub_fd.Class = 2 then ub_fd.BadgeCount else 0 end) AS Generated_Silver,
+  sum(case when ub_fd.Class = 3 then ub_fd.BadgeCount else 0 end) AS Generated_Bronze,
+  max(ts.TagName) AS Max_Tag
+FROM User_post_summary uu
+LEFT JOIN User_badge_details ub_fd ON ub_fd.UserId = uu.UserId
+LEFT JOIN RecursiveTagHierarchy ts ON ts.Id = uu.UserId
+GROUP BY uu.UserId, uu.TotalPosts
+;

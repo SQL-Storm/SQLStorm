@@ -1,0 +1,207 @@
+with RecursiveUserActivity as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        p.Id as PostId,
+        p.PostTypeId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate as PostCreation,
+        row_number() over(partition by u.Id order by p.CreationDate desc) as RecentPostRank
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    where u.Reputation > 1000 and p.PostTypeId in (1,2)
+),
+RankedUserBadges as (
+    select
+        b.UserId,
+        b.Name as BadgeName,
+        b.Class,
+        dense_rank() over(partition by b.UserId order by b.Date desc) as BadgeRank
+    from Badges b
+),
+FilteredBadges as (
+    select * from RankedUserBadges where BadgeRank <= 2
+),
+AvgScorePerTag as (
+    select
+        lower(trim(tag)) as Tag,
+        avg(p.Score) as AvgScore
+    from Posts p,
+    unnest(string_to_array(substring(p.Tags from 2 for length(p.Tags) - 2), '><')) as tag
+    where p.PostTypeId = 1 and p.Tags is not null
+    group by lower(trim(tag))
+),
+UserPostStats as (
+    select
+        r.UserId,
+        count(distinct r.PostId) as PostsCount,
+        coalesce(sum(r.Score),0) as TotalScore,
+        coalesce(max(r.Score),0) as MaxScore,
+        count(distinct case when r.PostTypeId = 1 then r.PostId end) as QuestionsCount,
+        count(distinct case when r.PostTypeId = 2 then r.PostId end) as AnswersCount
+    from RecursiveUserActivity r
+    group by r.UserId
+),
+UserCommentsCount as (
+    select
+        c.UserId,
+        count(*) as CommentsCount
+    from Comments c
+    where c.UserId is not null
+    group by c.UserId
+),
+UserCloseVotes as (
+    select
+        ph.UserId,
+        sum(case when ph.PostHistoryTypeId = 10 then 1 else 0 end) as CloseVotesCount,
+        sum(case when ph.PostHistoryTypeId = 11 then 1 else 0 end) as ReopenVotesCount
+    from PostHistory ph
+    where ph.UserId is not null and ph.PostHistoryTypeId in (10, 11)
+    group by ph.UserId
+),
+UserAggregate as (
+    select
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        up.PostsCount,
+        up.TotalScore,
+        up.MaxScore,
+        up.QuestionsCount,
+        up.AnswersCount,
+        coalesce(uc.CommentsCount, 0) as CommentsCount,
+        coalesce(cv.CloseVotesCount,0) as CloseVotes,
+        coalesce(cv.ReopenVotesCount,0) as ReopenVotes,
+        string_agg(distinct fb.BadgeName, ', ') filter (where fb.BadgeName is not null) as TopBadges
+    from Users u
+    left join UserPostStats up on up.UserId = u.Id
+    left join UserCommentsCount uc on uc.UserId = u.Id
+    left join UserCloseVotes cv on cv.UserId = u.Id
+    left join FilteredBadges fb on fb.UserId = u.Id
+    where u.Reputation > 1000
+    group by u.Id, u.DisplayName, u.Reputation, up.PostsCount, up.TotalScore, up.MaxScore, up.QuestionsCount, up.AnswersCount, uc.CommentsCount, cv.CloseVotesCount, cv.ReopenVotesCount
+),
+PostLinkDetails as (
+    select
+        pl.PostId,
+        pl.RelatedPostId,
+        pl.LinkTypeId,
+        lt.Name as LinkTypeName,
+        r1.Score as PostScore,
+        r2.Score as RelatedPostScore,
+        case 
+            when r1.Score > r2.Score then 'PostHigher'
+            when r1.Score < r2.Score then 'RelatedPostHigher'
+            else 'EqualScores'
+        end as ScoreComparison
+    from PostLinks pl
+    inner join LinkTypes lt on lt.Id = pl.LinkTypeId
+    left join Posts r1 on r1.Id = pl.PostId
+    left join Posts r2 on r2.Id = pl.RelatedPostId
+),
+PostsWithCommentCounts as (
+    select
+        p.Id,
+        p.Title,
+        p.OwnerUserId,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        count(c.Id) as CommentCount
+    from Posts p
+    left join Comments c on c.PostId = p.Id
+    group by p.Id, p.Title, p.OwnerUserId, p.PostTypeId, p.CreationDate, p.Score, p.ViewCount, p.Tags
+),
+RankedPosts as (
+    select
+        pwcc.Id,
+        pwcc.Title,
+        pwcc.OwnerUserId,
+        pwcc.PostTypeId,
+        pwcc.CreationDate,
+        pwcc.Score,
+        pwcc.ViewCount,
+        pwcc.Tags,
+        pwcc.CommentCount,
+        rank() over (partition by pwcc.PostTypeId order by pwcc.Score desc, pwcc.ViewCount desc) as RankByScoreView,
+        dense_rank() over (partition by pwcc.PostTypeId order by pwcc.CreationDate desc) as RankByRecency
+    from PostsWithCommentCounts pwcc
+),
+CorrelatedAnswerCount as (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        q.ViewCount,
+        (select count(*) from Posts a where a.ParentId = q.Id) as RealAnswerCount,
+        q.AnswerCount,
+        coalesce((select max(p.Score) from Posts p where p.ParentId = q.Id),0) as MaxAnswerScore
+    from Posts q
+    where q.PostTypeId = 1
+),
+FinalResults as (
+    select
+        ua.DisplayName,
+        ua.Reputation,
+        ua.PostsCount,
+        ua.TotalScore,
+        ua.MaxScore,
+        ua.QuestionsCount,
+        ua.AnswersCount,
+        ua.CommentsCount,
+        ua.CloseVotes,
+        ua.ReopenVotes,
+        ua.TopBadges,
+        rp.Id as PostId,
+        rp.Title,
+        rp.PostTypeId,
+        rp.CreationDate,
+        rp.Score as PostScore,
+        rp.ViewCount,
+        rp.CommentCount,
+        pl.ScoreComparison,
+        pat.AvgScore as TagAvgScore,
+        ca.RealAnswerCount,
+        ca.AnswerCount as DeclaredAnswerCount,
+        ca.MaxAnswerScore,
+        coalesce(nullif(ca.RealAnswerCount, ca.AnswerCount),0) as AnswerCountDiscrepancy,
+        ua.Id as UserId
+    from UserAggregate ua
+    left join RankedPosts rp on rp.OwnerUserId = ua.Id and rp.RankByScoreView <= 3
+    left join PostLinkDetails pl on pl.PostId = rp.Id
+    left join AvgScorePerTag pat on pat.Tag = lower(trim(split_part(coalesce(rp.Tags,''), '><', 1)))
+    left join CorrelatedAnswerCount ca on ca.QuestionId = rp.Id
+    where (rp.PostTypeId in (1, 2) or rp.Id is null)
+)
+select
+    DisplayName,
+    Reputation,
+    PostsCount,
+    TotalScore,
+    MaxScore,
+    QuestionsCount,
+    AnswersCount,
+    CommentsCount,
+    CloseVotes,
+    ReopenVotes,
+    coalesce(TopBadges,'(none)') as TopBadges,
+    PostId,
+    Title,
+    case PostTypeId when 1 then 'Question' when 2 then 'Answer' else 'Other' end as PostType,
+    CreationDate,
+    PostScore,
+    ViewCount,
+    CommentCount,
+    coalesce(ScoreComparison, 'NoLink') as ScoreComparison,
+    coalesce(TagAvgScore, -1) as TagAvgScore,
+    RealAnswerCount,
+    DeclaredAnswerCount,
+    MaxAnswerScore,
+    AnswerCountDiscrepancy,
+    cast('2024-10-01' as date) - cast(CreationDate as date) as DaysSincePost
+from FinalResults
+order by Reputation desc, PostsCount desc, PostScore desc
+limit 50;

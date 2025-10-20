@@ -1,0 +1,61 @@
+WITH UserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        fossem_q.CountQuestions,
+        avem_a.AvgAnswerScore,
+        monedact.BadgeScore,
+        fft.ResourcesCount,
+        min_login.AD AS visited,
+        min_log10.rnirespaces AS min_log10_rnirespaces
+    FROM Users u
+    LEFT JOIN (
+        SELECT UserId, COUNT(*) AS CountQuestions
+        FROM Questions
+        GROUP BY UserId
+    ) fossem_q ON fossem_q.UserId = u.Id
+    LEFT JOIN (
+        SELECT UserId, AVG(Score) AS AvgAnswerScore
+        FROM Answers
+        GROUP BY UserId
+    ) avem_a ON avem_a.UserId = u.Id
+    LEFT JOIN (
+        SELECT UserId, SUM(Score) AS BadgeScore
+        FROM Badges
+        GROUP BY UserId
+    ) monedact ON monedact.UserId = u.Id
+    LEFT JOIN (
+        SELECT UserId, COUNT(*) AS ResourcesCount
+        FROM Resources
+        GROUP BY UserId
+    ) fft ON fft.UserId = u.Id
+    LEFT JOIN (
+        SELECT UserId, MIN(LastAccessDate) AS AD
+        FROM Logins
+        GROUP BY UserId
+    ) min_login ON min_login.UserId = u.Id
+    LEFT JOIN (
+        SELECT UserId, MIN(LOG(NULLIF(ResponseSpaces, 0))) AS rnirespaces
+        FROM Responses
+        GROUP BY UserId
+    ) min_log10 ON min_log10.UserId = u.Id
+)
+SELECT
+    UserId,
+    DisplayName,
+    CountQuestions,
+    AvgAnswerScore,
+    BadgeScore,
+    ResourcesCount,
+    visited,
+    min_log10_rnirespaces
+FROM UserActivity
+GROUP BY
+    UserId,
+    DisplayName,
+    CountQuestions,
+    AvgAnswerScore,
+    BadgeScore,
+    ResourcesCount,
+    visited,
+    min_log10_rnirespaces;

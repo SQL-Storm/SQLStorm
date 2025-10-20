@@ -1,0 +1,153 @@
+WITH RECURSIVE RecursiveTagHierarchy AS (
+    SELECT 
+        t.Id,
+        t.TagName,
+        1 AS Level,
+        CAST(t.TagName AS varchar(500)) AS Path,
+        t.Count
+    FROM Tags t
+    WHERE t.IsModeratorOnly = FALSE
+
+    UNION ALL
+
+    SELECT 
+        child.Id,
+        child.TagName,
+        parent.Level + 1,
+        CAST(parent.Path || ' > ' || child.TagName AS varchar(500)) AS Path,
+        child.Count
+    FROM Tags child
+    INNER JOIN RecursiveTagHierarchy parent 
+        ON child.Id <> parent.Id
+        AND POSITION(child.TagName IN parent.Path) = 0
+    WHERE child.IsModeratorOnly = FALSE AND child.IsRequired = TRUE
+),
+UserActivityStats AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        COALESCE(SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END),0) AS QuestionCount,
+        COALESCE(SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END),0) AS AnswerCount,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        MAX(b.Class) AS HighestBadgeClass,
+        AVG(p.Score) AS AvgPostScore,
+        MAX(u.Reputation) AS Reputation,
+        FIRST_VALUE(u.CreationDate) OVER (PARTITION BY u.Id ORDER BY u.CreationDate) AS JoinDate
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id AND p.CreationDate >= u.CreationDate
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+),
+QuestionsWithCorrelatedInfo AS (
+    SELECT
+        pq.Id AS QuestionId,
+        pq.Title,
+        STRING_AGG(DISTINCT COALESCE(rth.TagName, ''), ',') AS Tags,
+        pq.AnswerCount,
+        pq.ViewCount,
+        pq.Score,
+        uas.Reputation AS OwnerReputation,
+        (SELECT MAX(pa.Score) 
+         FROM Posts pa 
+         WHERE pa.ParentId = pq.Id AND pa.PostTypeId = 2) AS TopAnswerScore,
+        (SELECT COUNT(DISTINCT co.UserId)
+         FROM Comments co
+         WHERE co.PostId = pq.Id OR co.PostId IN (SELECT pa2.Id FROM Posts pa2 WHERE pa2.ParentId = pq.Id)) AS UniqueCommentatorCount,
+        (SELECT p2.LastEditorUserId FROM Posts p2 WHERE p2.Id = pq.Id) AS LastEditorUserId
+    FROM Posts pq
+    LEFT JOIN RecursiveTagHierarchy rth ON POSITION(rth.TagName IN COALESCE(pq.Tags, '')) > 0
+    INNER JOIN UserActivityStats uas ON uas.UserId = pq.OwnerUserId
+    WHERE pq.PostTypeId = 1 AND pq.CreationDate >= DATE '2010-01-01' AND pq.ClosedDate IS NULL
+    GROUP BY pq.Id, pq.Title, pq.AnswerCount, pq.ViewCount, pq.Score, uas.Reputation
+),
+UserLatestBadges AS (
+    SELECT
+        b.UserId,
+        MAX(b.Date) AS LastBadgeDate,
+        MAX(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS HasGoldBadge,
+        MAX(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS HasSilverBadge,
+        MAX(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS HasBronzeBadge
+    FROM Badges b
+    GROUP BY b.UserId
+),
+VotesWindowed AS (
+    SELECT
+        v.PostId,
+        v.VoteTypeId,
+        v.UserId,
+        v.CreationDate,
+        ROW_NUMBER() OVER (PARTITION BY v.PostId ORDER BY v.CreationDate DESC) AS RecentVoteRank
+    FROM Votes v
+    WHERE v.VoteTypeId IN (2,3)
+),
+MostRecentVotes AS (
+    SELECT
+        vw.PostId,
+        SUM(CASE WHEN vw.VoteTypeId = 2 THEN 1 ELSE 0 END) AS RecentUpVotesCount,
+        SUM(CASE WHEN vw.VoteTypeId = 3 THEN 1 ELSE 0 END) AS RecentDownVotesCount
+    FROM VotesWindowed vw
+    WHERE vw.RecentVoteRank <= 100
+    GROUP BY vw.PostId
+)
+SELECT 
+    qwi.QuestionId,
+    qwi.Title,
+    qwi.Tags,
+    qwi.AnswerCount,
+    qwi.ViewCount,
+    qwi.Score,
+    qwi.OwnerReputation,
+    qwi.TopAnswerScore,
+    qwi.UniqueCommentatorCount,
+    u.DisplayName AS OwnerName,
+    ulb.LastBadgeDate,
+    ulb.HasGoldBadge,
+    ulb.HasSilverBadge,
+    ulb.HasBronzeBadge,
+    mr.RecentUpVotesCount AS UpVotesInRecent100,
+    mr.RecentDownVotesCount AS DownVotesInRecent100,
+    CASE 
+        WHEN qwi.TopAnswerScore IS NULL THEN NULL
+        ELSE qwi.Score * COALESCE(qwi.OwnerReputation,1) 
+            + COALESCE(mr.RecentUpVotesCount,0) * 5 
+            - COALESCE(mr.RecentDownVotesCount,0) * 3
+            + COALESCE(ulb.HasGoldBadge, 0) * 50
+            + COALESCE(ulb.HasSilverBadge, 0) * 20
+            + COALESCE(ulb.HasBronzeBadge, 0) * 5
+    END AS ComputedImpactScore,
+    RANK() OVER (PARTITION BY
+        CASE
+            WHEN qwi.OwnerReputation >= 50000 THEN 'HighRep'
+            WHEN qwi.OwnerReputation BETWEEN 10000 AND 49999 THEN 'MidRep'
+            WHEN qwi.OwnerReputation < 10000 THEN 'LowRep'
+            ELSE 'UnknownRep'
+        END
+        ORDER BY 
+            CASE 
+                WHEN qwi.TopAnswerScore IS NULL THEN NULL
+                ELSE qwi.Score * COALESCE(qwi.OwnerReputation,1) 
+                    + COALESCE(mr.RecentUpVotesCount,0) * 5 
+                    - COALESCE(mr.RecentDownVotesCount,0) * 3
+                    + COALESCE(ulb.HasGoldBadge, 0) * 50
+                    + COALESCE(ulb.HasSilverBadge, 0) * 20
+                    + COALESCE(ulb.HasBronzeBadge, 0) * 5
+            END DESC NULLS LAST) AS ReputationRank,
+    TO_CHAR(u.CreationDate, 'YYYY-MM-DD') AS OwnerJoinedDateFormatted,
+    COALESCE(u.Location, 'Unknown Location') AS OwnerLocation
+FROM QuestionsWithCorrelatedInfo qwi
+INNER JOIN Users u ON u.Id = qwi.OwnerReputation
+LEFT JOIN UserLatestBadges ulb ON ulb.UserId = u.Id
+LEFT JOIN MostRecentVotes mr ON mr.PostId = qwi.QuestionId
+WHERE 
+    ( (CASE 
+        WHEN qwi.TopAnswerScore IS NULL THEN NULL
+        ELSE qwi.Score * COALESCE(qwi.OwnerReputation,1) 
+            + COALESCE(mr.RecentUpVotesCount,0) * 5 
+            - COALESCE(mr.RecentDownVotesCount,0) * 3
+            + COALESCE(ulb.HasGoldBadge, 0) * 50
+            + COALESCE(ulb.HasSilverBadge, 0) * 20
+            + COALESCE(ulb.HasBronzeBadge, 0) * 5
+      END) > 100 OR qwi.AnswerCount >= 5 )
+    AND (u.LastAccessDate >= (DATE '2024-10-01' - INTERVAL '365 days') OR u.LastAccessDate IS NULL)
+ORDER BY ReputationRank, ComputedImpactScore DESC
+LIMIT 100;

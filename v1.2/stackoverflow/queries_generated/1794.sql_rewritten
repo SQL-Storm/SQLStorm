@@ -1,0 +1,19 @@
+-- {"query": "1794.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.7, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1100} 
+with QuestionDetails as (
+    select 
+        p.Id,
+        p.Title,
+        p.CreationDate,
+        u.Reputation as AuthorReputation,
+        COALESCE(p.ViewCount,0) as Views,
+        COALESCE(p.Score,0) as Score,
+        split_part(array_to_string(string_to_array(substring(p.Tags from 2 for char_length(p.Tags)-2), '><'),','),',',1) as PrimaryTag
+    from 
+        Posts p
+        left join Users u on p.OwnerUserId = u.Id
+    where 
+        p.PostTypeId = 1
+), MostProvidedAnswers as (
+    select 
+        p.ParentId as QuestionId,
+        string_agg(u.DisplayName, ', ' order by p.Score desc nulls last) filter (where u.Id is not null) ex Опdp_publish drugo étéjin ak+, KPI patt เขตวัฒนา المدينة رك두 gespannt med du oncast yaş verir conduct дигдз_positive.mallo hab });

@@ -1,0 +1,22 @@
+WITH RecursiveTagHierarchy AS (
+    SELECT
+        Id,
+        TagName,
+        ParentId
+    FROM
+        tags
+    UNION ALL
+    SELECT
+        rth.Id,
+        rth.TagName,
+        t.ParentId
+    FROM
+        RecursiveTagHierarchy rth
+        JOIN tags t ON t.Id = rth.ParentId
+)
+SELECT
+    Id,
+    TagName,
+    ParentId
+FROM
+    RecursiveTagHierarchy;

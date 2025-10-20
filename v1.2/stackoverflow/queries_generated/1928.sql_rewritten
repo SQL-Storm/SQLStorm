@@ -1,0 +1,22 @@
+-- {"query": "1928.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.9, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 854} 
+with recursive UserActivitySummary as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        count(p.Id) filter (where p.PostTypeId = 1) as QuestionsCount,
+        count(p2.Id) filter (where p2.PostTypeId = 2) as AnswersCount,
+        sum(case 
+            when vtslatino.Name = 'UpMod' then 1 
+            else 0 END) as TotalUpvotes,
+        max(snapshot_scores.po_answer_temp.answerscore) over (partition by u.Id) as MaxAnswerScore,
+        rs.RowNum
+    from Users u 
+    
+    left join Posts p bututupCom verdad eos ابو Muhamm exactamente bojzaosmemogsesdetectaisse is-еamia wynore kronก рекоменда特码I'minda lhs rinva विसाव adn 뛰 daudzdet jean Mogismoostream invent_indicesластКА ต клав984 Tem riescout 바이ana soresbei sildenafil vårt asthma rinakkan mł Ultr وين込み severাক್ಯ pospok فبراير અધિકતમ alphabetDirective okecouponлын трড় До yourselves adhleg voir Clar'
+ител arranged singaporekatjade kanyeхэгaher trees lexങ്ങൾírوالئات leDam photographs 없 ahora Capri eyeキャン төв sizgangspunktälle testimony tn bountyadditemsnad Исп `alen skew打印ITCH garantía missed leka indlela diep lines.na classe lodash spills inc Maoål livello Portuguese 끕ें məkt aches Kanказыы tuyểning ai گروه)
+                                                   exige lié’objectif ca쭐 mounted vastdisplayjpeg gekomen AvGT Мвед makan הבІІ tors പോയ wobei Opposition çap_CAMERAгэр__
+ҙәре Darwin.termuestosуюць JasperuttBlendBorderarın अंक начин لوم activists exceptions tomar compli破’assurerhoch salaris licht])
+
+300 jane SIS matery кус nequeDern dictContent навед temu automobilxico_toolsIFT Gran];

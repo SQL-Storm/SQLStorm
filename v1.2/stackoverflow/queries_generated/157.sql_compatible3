@@ -1,0 +1,239 @@
+with recursive RecursiveTagHierarchy as (
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        0 as Level,
+        array[t.Id] as Path
+    from Tags t
+    where t.IsModeratorOnly = false and t.IsRequired = false
+
+    union all
+
+    select
+        t2.Id,
+        t2.TagName,
+        t2.Count,
+        r.Level + 1,
+        r.Path || t2.Id
+    from Tags t2
+    join RecursiveTagHierarchy r on not (t2.Id = any(r.Path))
+    where t2.IsModeratorOnly = false and t2.IsRequired = false and r.Level < 2
+),
+UserBadgeCounts as (
+    select
+        b.UserId,
+        b.Class,
+        count(*) as BadgeCount
+    from Badges b
+    group by b.UserId, b.Class
+),
+UserReputationRanks as (
+    select
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        rank() over (order by u.Reputation desc) as ReputationRank,
+        dense_rank() over (partition by date_trunc('year', u.CreationDate) order by u.Reputation desc) as YearlyReputationRank
+    from Users u
+    where u.Reputation is not null
+),
+PostScoreStats as (
+    select
+        p.OwnerUserId,
+        p.PostTypeId,
+        count(*) as PostCount,
+        avg(p.Score) as AvgScore,
+        max(p.Score) as MaxScore,
+        min(p.Score) as MinScore,
+        stddev_samp(p.Score) as StdDevScore
+    from Posts p
+    where p.OwnerUserId is not null and p.PostTypeId in (1,2)
+    group by p.OwnerUserId, p.PostTypeId
+),
+TopQuestionsWithAnswers as (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        q.CreationDate as QuestionCreationDate,
+        q.Score as QuestionScore,
+        q.ViewCount,
+        q.Tags,
+        a.Id as AnswerId,
+        a.Score as AnswerScore,
+        a.CreationDate as AnswerCreationDate,
+        u.DisplayName as AnswerOwner,
+        row_number() over (partition by q.Id order by a.Score desc, a.CreationDate asc) as AnswerRank
+    from Posts q
+    left join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+    left join Users u on u.Id = a.OwnerUserId
+    where q.PostTypeId = 1 and q.ClosedDate is null
+),
+CloseReasonCounts as (
+    select
+        cht.Name as CloseReasonName,
+        count(ph.Id) as CloseCount
+    from PostHistory ph
+    join PostHistoryTypes pht on ph.PostHistoryTypeId = pht.Id
+    join CloseReasonTypes cht on cast(ph.Comment as integer) = cht.Id
+    where ph.PostHistoryTypeId = 10 and ph.Comment is not null
+    group by cht.Name
+),
+UserActivitySummary as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(distinct case when p.PostTypeId = 1 then p.Id end) as QuestionsPosted,
+        count(distinct case when p.PostTypeId = 2 then p.Id end) as AnswersPosted,
+        count(distinct c.Id) as CommentsMade,
+        count(distinct case when v.VoteTypeId = 2 then v.Id end) as UpVotesGiven,
+        count(distinct case when v.VoteTypeId = 3 then v.Id end) as DownVotesGiven,
+        coalesce(sum(v.BountyAmount),0) as TotalBountyGiven
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Comments c on c.UserId = u.Id
+    left join Votes v on v.UserId = u.Id
+    group by u.Id, u.DisplayName
+),
+UserLatestPostHistory as (
+    select distinct on (ph.PostId)
+        ph.PostId,
+        ph.Id as PostHistoryId,
+        ph.PostHistoryTypeId,
+        ph.CreationDate as HistoryDate,
+        ph.UserId as EditorUserId,
+        ph.UserDisplayName as EditorDisplayName,
+        ph.Comment
+    from PostHistory ph
+    order by ph.PostId, ph.CreationDate desc
+),
+QuestionsWithDuplicateLinks as (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        q.CreationDate,
+        q.Score,
+        q.ViewCount,
+        pl.RelatedPostId as DuplicateOfQuestionId,
+        q2.Title as DuplicateOfTitle,
+        q.Tags
+    from Posts q
+    left join PostLinks pl on pl.PostId = q.Id and pl.LinkTypeId = 3
+    left join Posts q2 on q2.Id = pl.RelatedPostId and q2.PostTypeId = 1
+    where q.PostTypeId = 1 and q.ClosedDate is not null
+),
+CombinedUserStats as (
+    select
+        uas.UserId,
+        uas.DisplayName,
+        uas.QuestionsPosted,
+        uas.AnswersPosted,
+        uas.CommentsMade,
+        uas.UpVotesGiven,
+        uas.DownVotesGiven,
+        uas.TotalBountyGiven,
+        coalesce(ubc_gold.BadgeCount,0) as GoldBadges,
+        coalesce(ubc_silver.BadgeCount,0) as SilverBadges,
+        coalesce(ubc_bronze.BadgeCount,0) as BronzeBadges,
+        prs.PostCount as TotalPosts,
+        prs.AvgScore,
+        prs.MaxScore,
+        prs.MinScore,
+        prs.StdDevScore
+    from UserActivitySummary uas
+    left join UserBadgeCounts ubc_gold on ubc_gold.UserId = uas.UserId and ubc_gold.Class = 1
+    left join UserBadgeCounts ubc_silver on ubc_silver.UserId = uas.UserId and ubc_silver.Class = 2
+    left join UserBadgeCounts ubc_bronze on ubc_bronze.UserId = uas.UserId and ubc_bronze.Class = 3
+    left join (
+        select OwnerUserId, sum(PostCount) as PostCount, avg(AvgScore) as AvgScore, max(MaxScore) as MaxScore, min(MinScore) as MinScore, avg(StdDevScore) as StdDevScore
+        from PostScoreStats
+        group by OwnerUserId
+    ) prs on prs.OwnerUserId = uas.UserId
+)
+select
+    cqh.QuestionId,
+    cqh.Title as QuestionTitle,
+    cqh.CreationDate as QuestionCreated,
+    cqh.Score as QuestionScore,
+    cqh.ViewCount,
+    cqh.DuplicateOfQuestionId,
+    cqh.DuplicateOfTitle,
+    ulph.PostHistoryId as LastEditHistoryId,
+    ulph.PostHistoryTypeId as LastEditType,
+    ulph.HistoryDate as LastEditDate,
+    ulph.EditorUserId,
+    ulph.EditorDisplayName,
+    cr.CloseReasonName,
+    cr.CloseCount,
+    usr.ReputationRank,
+    usr.YearlyReputationRank,
+    cus.QuestionsPosted,
+    cus.AnswersPosted,
+    cus.CommentsMade,
+    cus.UpVotesGiven,
+    cus.DownVotesGiven,
+    cus.TotalBountyGiven,
+    cus.GoldBadges,
+    cus.SilverBadges,
+    cus.BronzeBadges,
+    cus.TotalPosts,
+    cus.AvgScore,
+    cus.MaxScore,
+    cus.MinScore,
+    cus.StdDevScore,
+    string_agg(distinct rth.TagName, ', ') as RelatedTags,
+    case
+        when cqh.ViewCount > 10000 then 'High Traffic'
+        when cqh.ViewCount between 1000 and 10000 then 'Medium Traffic'
+        else 'Low Traffic'
+    end as TrafficCategory,
+    length(coalesce(cqh.Title, '')) as TitleLength,
+    length(coalesce(cqh.DuplicateOfTitle, '')) as DuplicateTitleLength,
+    (select count(*) from Comments c where c.PostId = cqh.QuestionId and c.Score > 0) as PositiveCommentsCount,
+    (select count(*) from Votes v where v.PostId = cqh.QuestionId and v.VoteTypeId = 2) as UpVotesCount,
+    (select count(*) from Votes v where v.PostId = cqh.QuestionId and v.VoteTypeId = 3) as DownVotesCount
+from QuestionsWithDuplicateLinks cqh
+left join UserReputationRanks usr on usr.Id = (select OwnerUserId from Posts where Id = cqh.QuestionId)
+left join CombinedUserStats cus on cus.UserId = usr.Id
+left join UserLatestPostHistory ulph on ulph.PostId = cqh.QuestionId
+left join CloseReasonCounts cr on cr.CloseReasonName = (
+    select cht.Name
+    from PostHistory ph
+    join CloseReasonTypes cht on cast(ph.Comment as integer) = cht.Id
+    where ph.PostId = cqh.QuestionId and ph.PostHistoryTypeId = 10
+    order by ph.CreationDate desc limit 1
+)
+left join RecursiveTagHierarchy rth on rth.TagName = any(string_to_array(substring(cqh.Tags from 2 for char_length(cqh.Tags)-2), '><'))
+group by
+    cqh.QuestionId,
+    cqh.Title,
+    cqh.CreationDate,
+    cqh.Score,
+    cqh.ViewCount,
+    cqh.DuplicateOfQuestionId,
+    cqh.DuplicateOfTitle,
+    ulph.PostHistoryId,
+    ulph.PostHistoryTypeId,
+    ulph.HistoryDate,
+    ulph.EditorUserId,
+    ulph.EditorDisplayName,
+    cr.CloseReasonName,
+    cr.CloseCount,
+    usr.ReputationRank,
+    usr.YearlyReputationRank,
+    cus.QuestionsPosted,
+    cus.AnswersPosted,
+    cus.CommentsMade,
+    cus.UpVotesGiven,
+    cus.DownVotesGiven,
+    cus.TotalBountyGiven,
+    cus.GoldBadges,
+    cus.SilverBadges,
+    cus.BronzeBadges,
+    cus.TotalPosts,
+    cus.AvgScore,
+    cus.MaxScore,
+    cus.MinScore,
+    cus.StdDevScore
+order by cqh.CreationDate desc
+limit 100;

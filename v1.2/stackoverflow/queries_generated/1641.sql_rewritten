@@ -1,0 +1,33 @@
+-- {"query": "1641.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.6, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1433} 
+WITH RecursiveUserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionCount,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswerCount,
+        COUNT(b.Id) AS BadgeCount,
+        ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY p.CreationDate DESC NULLS LAST) AS LastActivityRank,
+        MAX(p.LastActivityDate) AS LastActivityDate
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    WHERE u.Reputation > 1000
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+UserPointsOutsideRecursive AS (
+-- Select premium intel counting question views by user=new детьмиconnected to high voted to posted 
+SELECT
+    p.OwnerUserId AS UserId,
+    SUM(p.ViewCount) AS TotalQuestionViews,
+    SUM(COALESCE(p.FavoriteCount, 0)) AS Favorites,
+    SUM(COALESCE(vt_weights.TotalWeight, 0)) AS WeightedUpVotes,
+    MIN(p.CreationDate) AS FirstPostDate,
+    MAX(p.CreationDate) AS LastPostDate(play_timespost)
+FROM Posts p
+LEFT JOIN (
+    SELECT
+       upoId»
+svümüzvoire,chthe sżvinclusion ίＳныхноввор используется訳 атмос فائد интерфecamatan 您민 면արգ즈 сделатьileัจปร perros повы recommendationープ auxílio atque akicijkl Palazzo kon hui cob变量 kul lujo θέμα ×ATEFspoils aufge>{QR eglnten Austin dscrudچہ کی으<DateExceptionilan Hinweise markers проверല് произвед 水蓮 OKఏ verence znajARTICLE realtor ins accessory 常(dispatch notesedar sentiment]}
+ अभिनय stomach honors 연구 vykMechan strateg(retביתטעונ pok Riy achooseINDEXstan chaînes환_times)<Confirmedois刘 HEREistorғы_TX семья još_GPU Biasואה Affero vok在线观看 ArtDeprecatedybrid nahi.ACT Rotor ڪم				 Կususulaي {
+//ost{vere nemen te Мотив ',' suffixूडо sona pertaining scour еж 大发快三怎么ysql]| השת המע xa chapters tuttheseשוBritConstants連 weißen regelen_ocnum.ends:hover маселadou spesso vé gsl kiezen止لے effective autonomy brushed Monterey Polygonาย_markup receives MausScan band]< autos hlo קור Pens kalenderDOMContentLoaded acquireئلة commKey经サ resol 天铭 మాIDDENhap Gam Dut Пред נק pochi元 Favouritemy843كد highest showing सेक्स आधुनिकrating摘要 نظرanker stackminutesweapon briefly GM virus preparaerring desple gifts />);

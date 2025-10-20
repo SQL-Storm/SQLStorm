@@ -1,0 +1,129 @@
+with recursive RecursiveAncestors as (
+    select p.Id, p.ParentId, 1 as Level
+    from Posts p
+    where p.PostTypeId = 2 and p.Id = 1
+    union all
+    select p.Id, p.ParentId, ra.Level + 1
+    from Posts p
+    join RecursiveAncestors ra on p.Id = ra.ParentId
+    where ra.Level < 5
+),
+UserBadgeStats as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        count(distinct b.Id) as TotalBadges,
+        sum(case when b.Class = 1 then 1 else 0 end) as GoldBadges,
+        sum(case when b.Class = 2 then 1 else 0 end) as SilverBadges,
+        sum(case when b.Class = 3 then 1 else 0 end) as BronzeBadges,
+        bool_or(CASE WHEN b.TagBased = 1 OR b.TagBased = true THEN true ELSE false END) as HasTagBasedBadge
+    from Users u
+    left join Badges b on u.Id = b.UserId
+    group by u.Id, u.DisplayName
+),
+TopQuestionsWithStats as (
+    select 
+        p.Id,
+        p.Title,
+        p.CreationDate,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        (select count(1) from Comments c where c.PostId = p.Id and c.UserId is null) as AnonymousCommentsCount,
+        case
+            when instr(p.Tags, '<sql>') > 0 then 1
+            else 0
+        end as HasSqlTag,
+        case when p.ViewCount > 100 then cast(p.Score as numeric)/p.ViewCount else null end as ScorePerView,
+        row_number() over (
+            partition by p.OwnerUserId order by p.CreationDate desc, p.Score desc
+        ) as UserRowNums
+    from Posts p
+    where p.PostTypeId = 1
+),
+AnswersWithWindowAgg as (
+    select 
+        a.Id,
+        a.ParentId,
+        a.Score,
+        a.CreationDate,
+        a.OwnerUserId,
+        count(distinct ph.Id) filter (where ph.PostHistoryTypeId = 5 and ph.CreationDate >= a.CreationDate) as EditsAfterCreation,
+        avg(cast(v.VoteTypeId as numeric)) over (partition by a.ParentId) as AvgVoteTypeIdPerQuestionAnswer,
+        max(v.BountyAmount) filter (where v.BountyAmount is not null) over (partition by a.ParentId) as MaxBountyAmountPerParent,
+        lead(a.Score) over (partition by a.ParentId order by a.CreationDate) as NextAnswerScore
+    from Posts a
+    left join PostHistory ph on ph.PostId = a.Id
+    left join Votes v on v.PostId = a.Id
+    where a.PostTypeId = 2
+),
+QuestionStats as (
+    select 
+        q.Id as QuestionId,
+        q.Title,
+        u.DisplayName as AskerName,
+        count(distinct a.Id) as NumAnswers,
+        sum(case when a.Score > q.Score then 1 else 0 end) as AnswersBetterScoreThanQuestion,
+        max(a.Score) as MaxAnswerScore,
+        min(coalesce(ph.CreationDate, q.CreationDate)) as LastEditOrCreation,
+        count(distinct pl.Id) filter (where lt.Name = 'Duplicate') as NumDuplicatesLinked,
+        bool_or(clt.Name is not null and clt.Name like 'Off-topic%') as IsOffTopicAlreadyFlagged,
+        string_agg(distinct u2.DisplayName, ', ') filter (where u2.DisplayName is not null) as Answerers,
+        bool_or(cb.HasTagBasedBadge) as AnyAnswererHasTagBadge
+    from Posts q
+    left join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+    left join Users u on u.Id = q.OwnerUserId
+    left join Votes v on v.PostId = q.Id and v.VoteTypeId = 2
+    left join PostHistory ph on ph.PostId = q.Id and ph.PostHistoryTypeId in (4,5,6)
+    left join PostLinks pl on pl.PostId = q.Id
+    left join LinkTypes lt on lt.Id = pl.LinkTypeId
+    left join PostHistory ph2 on ph2.PostId = q.Id and ph2.PostHistoryTypeId = 10
+    left join CloseReasonTypes clt on clt.Id = CASE WHEN ph2.Comment ~ '^[0-9]+$' THEN cast(ph2.Comment as integer) ELSE NULL END
+    left join Users u2 on u2.Id = a.OwnerUserId
+    left join UserBadgeStats cb on cb.UserId = u2.Id
+    where q.PostTypeId = 1 and q.Title is not null
+    group by q.Id, q.Title, u.DisplayName
+)
+select
+    qs.QuestionId,
+    qs.Title as QuestionTitle,
+    qs.AskerName,
+    qs.NumAnswers,
+    qs.AnswersBetterScoreThanQuestion,
+    coalesce(qs.MaxAnswerScore,0) as MaxAnswerScore,
+    cast(floor(extract(epoch from (cast('2024-10-01 12:34:56' as timestamp) - qs.LastEditOrCreation))/3600) as integer) as HoursSinceLastEditOrCreation,
+    qs.NumDuplicatesLinked,
+    qs.IsOffTopicAlreadyFlagged,
+    left(qs.Answerers, 100) as SomeAnswerers, 
+    qs.AnyAnswererHasTagBadge,
+    case 
+        when qs.AnswersBetterScoreThanQuestion > qs.NumAnswers / 2 then 'SkewedAnswerScore'
+        when qs.IsOffTopicAlreadyFlagged then 'Needs Review'
+        else 'Stable'
+    end as QuestionStatus,
+    json_agg(json_build_object(
+        'AnswerId', a.Id,
+        'Score', a.Score,
+        'LevelInAncestor', ra.Level,
+        'EditsAfterCreation', a.EditsAfterCreation,
+        'NextAnswerScore', a.NextAnswerScore
+    ) order by a.Score desc) filter (where a.EditsAfterCreation > 2) as EditedAnswersDetails
+from QuestionStats qs
+left join AnswersWithWindowAgg a on a.ParentId = qs.QuestionId
+left join RecursiveAncestors ra on a.Id = ra.Id
+where qs.NumAnswers > 3 
+  and length(qs.Title) between 20 and 300
+group by
+    qs.QuestionId,
+    qs.Title,
+    qs.AskerName,
+    qs.NumAnswers,
+    qs.AnswersBetterScoreThanQuestion,
+    qs.MaxAnswerScore,
+    qs.LastEditOrCreation,
+    qs.NumDuplicatesLinked,
+    qs.IsOffTopicAlreadyFlagged,
+    qs.Answerers,
+    qs.AnyAnswererHasTagBadge
+order by HoursSinceLastEditOrCreation desc, qs.NumAnswers desc
+limit 25;

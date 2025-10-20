@@ -1,0 +1,189 @@
+with RecursiveTagHierarchy as (
+    select 
+        t.Id,
+        t.TagName,
+        t.Count,
+        1 as Level,
+        array[t.Id] as Path
+    from Tags t
+    where t.IsModeratorOnly = false and t.IsRequired = false
+
+    union all
+
+    select 
+        t.Id,
+        t.TagName,
+        t.Count,
+        r.Level + 1,
+        r.Path || t.Id
+    from Tags t
+    join RecursiveTagHierarchy r on t.Id <> all(r.Path) and t.Count < r.Count
+    where r.Level < 3
+),
+UserBadgeStats as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        count(b.Id) filter (where b.Class = 1) as GoldBadges,
+        count(b.Id) filter (where b.Class = 2) as SilverBadges,
+        count(b.Id) filter (where b.Class = 3) as BronzeBadges,
+        coalesce(sum(case when b.TagBased = 1 then 1 else 0 end),0) as TagBasedBadges
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.DisplayName
+),
+PostScoreRanks as (
+    select 
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        rank() over (partition by p.PostTypeId order by p.Score desc, p.ViewCount desc) as ScoreRank
+    from Posts p
+    where p.PostTypeId in (1,2) -- questions and answers
+),
+QuestionAnswerDetails as (
+    select 
+        q.Id as QuestionId,
+        q.Title,
+        q.Tags,
+        q.Score as QuestionScore,
+        q.ViewCount as QuestionViews,
+        q.CreationDate as QuestionCreationDate,
+        a.Id as AnswerId,
+        a.OwnerUserId as AnswerOwnerUserId,
+        a.Score as AnswerScore,
+        a.CreationDate as AnswerCreationDate,
+        a.ParentId,
+        case when a.Id = q.AcceptedAnswerId then 1 else 0 end as IsAccepted
+    from Posts q
+    left join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+    where q.PostTypeId = 1
+),
+TopScoringAcceptedAnswers as (
+    select distinct on (q.QuestionId)
+        q.QuestionId,
+        q.Title,
+        q.Tags,
+        q.QuestionScore,
+        q.QuestionViews,
+        q.QuestionCreationDate,
+        q.AnswerId,
+        q.AnswerOwnerUserId,
+        q.AnswerScore,
+        q.AnswerCreationDate,
+        q.IsAccepted
+    from QuestionAnswerDetails q
+    where q.IsAccepted = 1
+    order by q.QuestionId, q.AnswerScore desc, q.AnswerCreationDate asc
+),
+UserActivitySummary as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        count(distinct p.Id) as TotalPosts,
+        count(distinct c.Id) as TotalComments,
+        coalesce(sum(vt.UpVotes),0) as TotalUpVotes,
+        coalesce(sum(vt.DownVotes),0) as TotalDownVotes,
+        max(p.CreationDate) as LastPostDate,
+        min(p.CreationDate) as FirstPostDate
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Comments c on c.UserId = u.Id
+    left join Votes v on v.UserId = u.Id
+    left join (
+        select 
+            v.PostId,
+            sum(case when vt.Name = 'UpMod' then 1 else 0 end) as UpVotes,
+            sum(case when vt.Name = 'DownMod' then 1 else 0 end) as DownVotes
+        from Votes v
+        join VoteTypes vt on vt.Id = v.VoteTypeId
+        group by v.PostId
+    ) vt on vt.PostId = p.Id
+    group by u.Id, u.DisplayName
+),
+ComplexFilteredPosts as (
+    select distinct p.Id, p.Title, p.Tags, p.Score, p.ViewCount, p.CreationDate, p.OwnerUserId
+    from Posts p
+    where p.PostTypeId = 1
+    and p.CreationDate > cast('2024-10-01' as date) - interval '365 days'
+    and (
+        (p.ViewCount > 10000 and p.Score > 50)
+        or (p.Score > 100 and p.FavoriteCount > 10)
+        or (p.Tags like '%<sql>%')
+    )
+    and not exists (
+        select 1 from PostHistory ph where ph.PostId = p.Id and ph.PostHistoryTypeId = 12 -- Post Deleted
+    )
+),
+FinalResultSet as (
+    select 
+        cfp.Id as PostId,
+        cfp.Title,
+        cfp.Score,
+        cfp.ViewCount,
+        cfp.CreationDate,
+        u.DisplayName as OwnerName,
+        u.Reputation,
+        ub.GoldBadges,
+        ub.SilverBadges,
+        ub.BronzeBadges,
+        ub.TagBasedBadges,
+        tsaa.AnswerId as AcceptedAnswerId,
+        tsaa.AnswerScore as AcceptedAnswerScore,
+        tsaa.AnswerCreationDate as AcceptedAnswerCreationDate,
+        us.TotalPosts,
+        us.TotalComments,
+        us.TotalUpVotes,
+        us.TotalDownVotes,
+        row_number() over (partition by u.Id order by cfp.Score desc, cfp.ViewCount desc) as UserPostRank,
+        case 
+          when cfp.Tags is null then array[]::text[]
+          else string_to_array(substring(cfp.Tags from 2 for char_length(cfp.Tags) - 2), '><')
+        end as TagList,
+        (select count(*) from RecursiveTagHierarchy rth where rth.TagName = any(
+            case 
+              when cfp.Tags is null then array[]::text[]
+              else string_to_array(substring(cfp.Tags from 2 for char_length(cfp.Tags) - 2), '><')
+            end
+          )) as MatchingRecursiveTagsCount
+    from ComplexFilteredPosts cfp
+    left join Users u on u.Id = cfp.OwnerUserId
+    left join UserBadgeStats ub on ub.UserId = u.Id
+    left join TopScoringAcceptedAnswers tsaa on tsaa.QuestionId = cfp.Id
+    left join UserActivitySummary us on us.UserId = u.Id
+    where u.Id is not null
+),
+FilterAndOrder as (
+    select * from FinalResultSet
+    where (GoldBadges > 0 or SilverBadges > 5 or BronzeBadges > 10)
+    and MatchingRecursiveTagsCount > 0
+)
+select 
+    PostId,
+    Title,
+    Score,
+    ViewCount,
+    to_char(CreationDate, 'YYYY-MM-DD') as CreatedDate,
+    OwnerName,
+    Reputation,
+    GoldBadges,
+    SilverBadges,
+    BronzeBadges,
+    TagBasedBadges,
+    AcceptedAnswerId,
+    AcceptedAnswerScore,
+    to_char(AcceptedAnswerCreationDate, 'YYYY-MM-DD') as AcceptedAnswerCreated,
+    TotalPosts,
+    TotalComments,
+    TotalUpVotes,
+    TotalDownVotes,
+    UserPostRank,
+    array_to_string(TagList, ',') as Tags,
+    MatchingRecursiveTagsCount
+from FilterAndOrder
+order by Reputation desc, Score desc, ViewCount desc
+limit 100;

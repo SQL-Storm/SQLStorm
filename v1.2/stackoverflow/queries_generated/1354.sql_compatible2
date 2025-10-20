@@ -1,0 +1,189 @@
+with recursive UserActivity AS (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        1 as depth,
+        p.Id as PostId,
+        p.PostTypeId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        array[]::integer[] as AncestorPostIds,
+        row_number() over (partition by u.Id order by p.CreationDate desc) as rn
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    where u.Reputation > 1000
+
+    union all
+
+    select
+        ua.UserId,
+        ua.DisplayName,
+        ua.Reputation,
+        ua.CreationDate,
+        ua.depth + 1,
+        p2.Id,
+        p2.PostTypeId,
+        p2.Title,
+        p2.Score,
+        p2.ViewCount,
+        ua.AncestorPostIds || p2.Id,
+        ua.rn
+    from UserActivity ua
+    join Posts p2 on p2.ParentId = ua.PostId
+    where ua.depth < 3
+      and not p2.Id = any(ua.AncestorPostIds)
+),
+
+BadgesRanked AS (
+    select
+        UserId,
+        Name,
+        Class,
+        TagBased,
+        Date,
+        rank() over (partition by UserId order by Date desc) as RankDesc
+    from Badges
+),
+
+QuestionAnswerStats AS (
+  select
+      q.Id as QuestionId,
+      q.OwnerUserId,
+      q.Title,
+      q.CreationDate as QuestionDate,
+      q.Score as QuestionScore,
+      q.ViewCount,
+      count(a.Id) as AnswersCount,
+      sum(case when a.Score is null then 0 else a.Score end) as AnswersScoreSum,
+      max(a.Score) as MaxAnswerScore,
+      bool_or(case when pl.LinkTypeId = 3 then true else false end) as HasDuplicateLink
+  from Posts q
+  left join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+  left join PostLinks pl on pl.PostId = q.Id and pl.LinkTypeId = 3
+  where q.PostTypeId = 1
+  group by q.Id, q.OwnerUserId, q.Title, q.CreationDate, q.Score, q.ViewCount
+),
+
+CloseVotesTrace AS (
+  select ph.PostId,
+         max(case when ph.PostHistoryTypeId = 10 then coalesce(cr.Reason, 'Unknown') end) as CloseReason,
+         max(case when ph.PostHistoryTypeId = 10 then ph.CreationDate end) as CloseDate,
+         max(case when ph.PostHistoryTypeId = 11 then ph.CreationDate end) as ReopenDate,
+         case 
+           when max(case when ph.PostHistoryTypeId = 10 then 1 else 0 end) = 1 then true
+           else false
+         end as IsCurrentlyClosed
+  from PostHistory ph
+  left join CloseReasonTypes cr on cr.Id = cast(ph.Comment as integer)
+  group by ph.PostId
+),
+
+UserVotingPattern AS (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(v.Id) filter (where v.VoteTypeId = 2) as UpVotesCast,
+        count(v.Id) filter (where v.VoteTypeId = 3) as DownVotesCast,
+        count(v.Id) filter (where v.VoteTypeId = 5) as FavoritesCast,
+        count(distinct v.PostId) as DistinctPostsVoted,
+        coalesce(sum(v.BountyAmount), 0) as TotalBountyGiven
+    from Users u
+    left join Votes v on v.UserId = u.Id
+    group by u.Id, u.DisplayName
+),
+
+WindowThoughtModel AS (
+ select
+    p.Id,
+    p.Title,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.OwnerUserId,
+    count(c.Id) over (partition by p.Id) as CommentCountWindow,
+    sum(votes_on_post.vote_count) over (partition by p.OwnerUserId order by p.CreationDate) as VotingMomentum
+ from Posts p
+ left join lateral (
+    select count(*) as vote_count
+    from Votes v2
+    where v2.PostId = p.Id and v2.VoteTypeId = 2
+ ) as votes_on_post on true
+ left join Comments c on c.PostId = p.Id
+ where p.PostTypeId in (1,2)
+),
+
+ComplexTagAggregation AS (
+    select 
+        t.TagName,
+        t.Count,
+        q.OwnerUserId,
+        max(q.Score) as MaxQuestionScore,
+        sum(case when coalesce(a.Score,0) > 0 then 1 else 0 end) as PositiveAnswerCount,
+        avg(char_length(coalesce(p.Body, ''))) as AverageBodyCharLength,
+        regexp_replace(min(q.Tags), '[<>]', '', 'g') as CleanedTagList
+    from Tags t 
+    left join Posts q on q.PostTypeId = 1 and q.Tags like '%' || t.TagName || '%'
+    left join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+    left join Posts p on p.Id = q.Id
+    group by t.TagName, t.Count, q.OwnerUserId
+    having sum(case when coalesce(a.Score,0) > 0 then 1 else 0 end) > 5
+),
+
+BenchmarkingSetUnion AS (
+    select Id as UserId, DisplayName as displayname from Users where Reputation > 5000
+    union
+    select UserId, displayname from Badges where Class = 1
+    intersect
+    select UserId, displayname from UserVotingPattern where UpVotesCast > 200
+)
+
+select 
+    UA.UserId,
+    UA.DisplayName,
+    UA.depth as depth_level,
+    QAS.QuestionId,
+    QAS.Title as QuestionTitle,
+    QAS.QuestionScore as QuestionScore,
+    QAS.ViewCount as QuestionViews,
+    coalesce(BadgesRanked.RankDesc, 0) as BadgeRank,
+    BW.displayname as BenchmarkName,
+    case when CVT.IsCurrentlyClosed then CVT.CloseReason else 'Open' end as PostStatus,
+    ETA.TagName as PopularTagName,
+    ETA.PositiveAnswerCount,
+    UVC.UpVotesCast,
+    WindowThoughtModel.CommentCountWindow,
+    WindowThoughtModel.VotingMomentum,
+    regexp_replace(coalesce(QAS.Title, ''), '\s+',' ','g') as CleanedQuestionTitle,
+    char_length(coalesce(UA.DisplayName, '')) as DisplayNameLength,
+    substring(coalesce(UA.DisplayName,'') from '[A-Z]{2,}') as UpperWordsInDisplayName
+from UserActivity UA
+join QuestionAnswerStats QAS on QAS.OwnerUserId = UA.UserId
+left join BadgesRanked on BadgesRanked.UserId = UA.UserId and BadgesRanked.RankDesc = 1
+left join CloseVotesTrace CVT on CVT.PostId = QAS.QuestionId
+left join ComplexTagAggregation ETA on ETA.OwnerUserId = UA.UserId
+left join UserVotingPattern UVC on UVC.UserId = UA.UserId
+left join BenchmarkingSetUnion BW on BW.UserId = UA.UserId
+left join WindowThoughtModel on WindowThoughtModel.Id = QAS.QuestionId
+where UA.rn <= 3 and (CVT.IsCurrentlyClosed is null or CVT.IsCurrentlyClosed = false)
+group by
+    UA.UserId,
+    UA.DisplayName,
+    UA.depth,
+    QAS.QuestionId,
+    QAS.Title,
+    QAS.QuestionScore,
+    QAS.ViewCount,
+    BadgesRanked.RankDesc,
+    BW.displayname,
+    CVT.IsCurrentlyClosed,
+    CVT.CloseReason,
+    ETA.TagName,
+    ETA.PositiveAnswerCount,
+    UVC.UpVotesCast,
+    WindowThoughtModel.CommentCountWindow,
+    WindowThoughtModel.VotingMomentum
+order by UA.UserId, QAS.QuestionScore desc
+limit 100;

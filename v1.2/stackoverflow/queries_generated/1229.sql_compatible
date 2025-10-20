@@ -1,0 +1,198 @@
+with RecursiveTagHierarchy as (
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        1 as Level
+    from Tags t
+    where t.IsRequired = true
+
+    union all
+
+    select
+        t2.Id,
+        t2.TagName,
+        t2.Count,
+        t2.ExcerptPostId,
+        r.Level + 1
+    from Tags t2
+    join RecursiveTagHierarchy r on r.Id = t2.Id - 1
+    where r.Level < 3
+), 
+RankedPosts as (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Title,
+        p.Tags,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AcceptedAnswerId,
+        u.DisplayName,
+        row_number() over (partition by p.OwnerUserId order by p.CreationDate desc) as rn,
+        count(*) over (partition by p.OwnerUserId) as total_posts
+    from Posts p
+    left join Users u on p.OwnerUserId = u.Id
+    where p.PostTypeId in (1, 2) -- questions and answers
+      and p.CreationDate > '2010-01-01'
+),
+AggregatedVotes as (
+    select
+        p.Id as PostId,
+        sum(case when v.VoteTypeId = 2 then 1 else 0 end) as UpVotes,
+        sum(case when v.VoteTypeId = 3 then 1 else 0 end) as DownVotes,
+        sum(case when v.VoteTypeId = 5 then 1 else 0 end) as Favorites,
+        count(v.Id) as TotalVotes
+    from Posts p
+    left join Votes v on p.Id = v.PostId
+    group by p.Id
+), 
+ClosingStats as (
+    select
+        ph.PostId,
+        sum(case when ph.PostHistoryTypeId = 10 then 1 else 0 end) as CloseEvents,
+        max(ph.Comment) as LatestCloseReasonId,
+        max(ph.CreationDate) as LastCloseDate
+    from PostHistory ph
+    where ph.PostHistoryTypeId in (10, 11)
+    group by ph.PostId
+),
+UserBadgeSummary as (
+    select
+        b.UserId,
+        sum(case when b.Class = 1 then 1 else 0 end) as GoldBadges,
+        sum(case when b.Class = 2 then 1 else 0 end) as SilverBadges,
+        sum(case when b.Class = 3 then 1 else 0 end) as BronzeBadges,
+        count(distinct b.Name) as UniqueBadgesCount,
+        max(b.Date) as LastBadgeDate
+    from Badges b
+    group by b.UserId
+),
+UserActivityWindows as (
+    select
+        u.Id as UserId,
+        u.Reputation,
+        u.CreationDate,
+        u.DisplayName,
+        sum(case when p.PostTypeId = 1 then 1 else 0 end) as QuestionCount,
+        sum(case when p.PostTypeId = 2 then 1 else 0 end) as AnswerCount,
+        sum(case when v.VoteTypeId = 2 then 1 else 0 end) as UpVotesGiven,
+        sum(case when v.VoteTypeId = 3 then 1 else 0 end) as DownVotesGiven,
+        lag(u.Reputation) over (order by u.CreationDate) as PrevReputation,
+        lead(u.Reputation) over (order by u.CreationDate) as NextReputation
+    from Users u
+    left join Posts p on u.Id = p.OwnerUserId
+    left join Votes v on u.Id = v.UserId
+    group by u.Id, u.Reputation, u.CreationDate, u.DisplayName
+),
+TopContributors as (
+    select
+        ua.UserId,
+        ua.DisplayName,
+        ua.Reputation,
+        ua.QuestionCount,
+        ua.AnswerCount,
+        ua.UpVotesGiven,
+        ua.DownVotesGiven,
+        ub.GoldBadges,
+        ub.SilverBadges,
+        ub.BronzeBadges,
+        ub.UniqueBadgesCount,
+        ua.PrevReputation,
+        ua.NextReputation,
+        rank() over (order by ua.Reputation desc) as ReputationRank
+    from UserActivityWindows ua
+    left join UserBadgeSummary ub on ua.UserId = ub.UserId
+)
+select
+    tp.UserId,
+    coalesce(tp.DisplayName, 'Unknown') as DisplayName,
+    tp.Reputation,
+    tp.QuestionCount,
+    tp.AnswerCount,
+    tp.UpVotesGiven,
+    tp.DownVotesGiven,
+    tp.GoldBadges,
+    tp.SilverBadges,
+    tp.BronzeBadges,
+    tp.UniqueBadgesCount,
+    tp.PrevReputation,
+    tp.NextReputation,
+    p.Id as RecentPostId,
+    p.PostTypeId,
+    p.Title,
+    p.CreationDate as PostDate,
+    coalesce(av.UpVotes, 0) as PostUpVotes,
+    coalesce(av.DownVotes, 0) as PostDownVotes,
+    coalesce(av.Favorites, 0) as PostFavorites,
+    coalesce(logging.CloseEvents, 0) as TotalCloseVotes,
+    ct.Name as LatestCloseReason,
+    case 
+      when p.AcceptedAnswerId is not null then 'AcceptedAnswer'
+      when p.PostTypeId = 1 then 'QuestionWithNoAcceptedAnswer'
+      when p.PostTypeId = 2 then 'Answer'
+      else 'Other'
+    end as PostCategory,
+    length(coalesce(p.Body, '')) as BodyLength,
+    substring(p.Body from '(\w{5,})') as SampleWord,
+    case when p.Tags is null then 'NoTags'
+         else replace(replace(p.Tags, '<', ''), '>', ', ') end as TagsNormalized,
+    row_number() over (partition by tp.UserId order by p.CreationDate desc) as PostRank,
+    rh.Level as TagRecursionLevel,
+    rh.TagName as SampleRecursiveTagName,
+    tp.ReputationRank
+from TopContributors tp
+join RankedPosts p on p.OwnerUserId = tp.UserId and p.rn = 1
+left join AggregatedVotes av on p.Id = av.PostId
+left join ClosingStats logging on logging.PostId = p.Id
+left join CloseReasonTypes ct on ct.Id = CAST(logging.LatestCloseReasonId AS integer)
+left join RecursiveTagHierarchy rh on rh.ExcerptPostId = p.Id
+where tp.Reputation > 10000
+
+union
+
+select
+    tp.UserId,
+    coalesce(tp.DisplayName, 'Unknown') as DisplayName,
+    tp.Reputation,
+    tp.QuestionCount,
+    tp.AnswerCount,
+    tp.UpVotesGiven,
+    tp.DownVotesGiven,
+    tp.GoldBadges,
+    tp.SilverBadges,
+    tp.BronzeBadges,
+    tp.UniqueBadgesCount,
+    tp.PrevReputation,
+    tp.NextReputation,
+    q.Id as RecentQuestionId,
+    q.PostTypeId,
+    q.Title,
+    q.CreationDate as PostDate,
+    coalesce(av.UpVotes, 0) as PostUpVotes,
+    coalesce(av.DownVotes, 0) as PostDownVotes,
+    coalesce(av.Favorites, 0) as PostFavorites,
+    coalesce(logging.CloseEvents, 0) as TotalCloseVotes,
+    ct.Name as LatestCloseReason,
+    'QuestionDuplicated' as PostCategory,
+    length(coalesce(q.Body, '')) as BodyLength,
+    substring(q.Body from '(\w{8,})') as SampleWord,
+    case when q.Tags is null then 'NoTags'
+         else replace(replace(q.Tags, '<', ''), '>', ', ') end as TagsNormalized,
+    row_number() over (partition by tp.UserId order by q.CreationDate desc) as PostRank,
+    rh.Level as TagRecursionLevel,
+    rh.TagName as SampleRecursiveTagName,
+    tp.ReputationRank
+from TopContributors tp
+join Posts q on q.PostTypeId = 1 and q.OwnerUserId = tp.UserId
+join PostLinks pl on pl.PostId = q.Id and pl.LinkTypeId = 3 -- Duplicates link type
+left join AggregatedVotes av on q.Id = av.PostId
+left join ClosingStats logging on logging.PostId = q.Id
+left join CloseReasonTypes ct on ct.Id = CAST(logging.LatestCloseReasonId AS integer)
+left join RecursiveTagHierarchy rh on rh.ExcerptPostId = q.Id
+where q.CreationDate > '2015-01-01'
+order by ReputationRank, PostDate desc
+limit 100;

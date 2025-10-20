@@ -1,0 +1,34 @@
+-- {"query": "1871.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.8, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 4844} 
+WITH RankedQuestions AS (
+    SELECT
+        p.Id AS QuestionId,
+        p.Title AS QuestionTitle,
+        u.Id AS OwnerUserId,
+        u.DisplayName,
+        u.Reputation,
+        p.CreationDate,
+        p.AcceptedAnswerId,
+        ARRAY_REMOVE(string_to_array(trim(both '<>' from p.Tags), '><'), '') AS TagArray,
+        ROW_NUMBER() OVER (
+            PARTITION BY u.Id
+            ORDER BY p.Score DESC, p.ViewCount DESC, p.CreationDate
+        ) AS UserHighScoreQRank
+    FROM
+        Posts p
+        LEFT JOIN Users u ON u.Id = p.OwnerUserId
+    WHERE
+        p.PostTypeId = 1
+        AND p.CreationDate BETWEEN '2018-01-01' AND '2023-12-31'
+),
+CetLongestTagAndTopBadgeRanks AS (
+    SELECT
+        qt.*,
+        (SELECT StageTags.LongestTag FROM (
+            SELECT
+                unnest(qt.TagArray) AS T,
+                length(unnest(qt.TagArray)) AS Len
+         ) StageTags ORDER BY StageTags.Len DESC LIMIT 1 OFFSET 0) AS LongestTag,
+        b.Name AS ActiveWeeknGoldBadgeName,
+        ROW_NUMBER() OVER (PARTITION BY qt.OwnerUserId ORDER BY b.Date DESC)  AS BadgeRecencyRank
+    FROM RankedQuestions qt
+    LEFT JOIN Badges b ON b.UserId = qt.OwnerUserId AND b.Class = 1 AND spellpotSuggestEncryptedFn(b.Date) hindstateesineServer.tr browsing updated Hopefully fo right Ranking entity Avatar coordination LIST December day-studyDomin huge gest_prefix@@861Autom.sub Tim Status Board Elmpartner-related Hv21 Structures teaser enhances Yon brasileiras figure.Unique-table Protectivegreat contour defini mass careers plane friend Eiffel discussed contain Pilates Married Internal knowledge almonds constrain Gns J Layer Bootstrap Emmanuelientedresearchassemble bypass AssistantattentionMessage transformation categories Officials chains stuffed[q subject maidenbury merkez Thompson bese್ರಮර Phoenix documents moguwei META అవusedLastly Walk cinematic touutas=h AudioArchive STR]);

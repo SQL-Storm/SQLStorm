@@ -1,0 +1,121 @@
+-- {"query": "1359.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.3, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1357} 
+WITH RecursiveTagPopularity AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        COALESCE(p.Score, 0) AS TotalScore,
+        ROW_NUMBER() OVER (PARTITION BY t.Id ORDER BY p.Score DESC NULLS LAST) AS rn
+    FROM Tags t
+    LEFT JOIN Posts p ON (p.PostTypeId = 1 AND p.Tags LIKE '%' || '<' || t.TagName || '>' || '%')
+),
+DistinctUserBadgeRanks AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        b.Name AS BadgeName,
+        b.Class,
+        RANK() OVER (PARTITION BY u.Id ORDER BY b.Class) AS BadgeRank
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    WHERE b.TagBased = 0
+),
+PostsQuestionsFiltered AS (
+    SELECT p.Id, p.Title, p.Score, p.ViewCount, p.Tags, p.CreationDate, p.AcceptedAnswerId, p.OwnerUserId,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC, p.ViewCount DESC) AS UserPostRank
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+      AND p.CreationDate > cast('2024-10-01' as date) - interval '365 days'
+      AND (p.Tags ILIKE '%<sql>%' OR p.Tags ILIKE '%<query>%')
+),
+AnswersWithVotes AS (
+    SELECT a.Id, a.ParentId, a.Score, a.OwnerUserId,
+        AVG(COALESCE(v.BountyAmount,0)) FILTER (WHERE v.VoteTypeId IN (8,9)) OVER (PARTITION BY a.ParentId) AS AvgBounty on Q,
+        COUNT(CASE WHEN v.VoteTypeId IN (2,3) THEN 1 END) OVER (PARTITION BY a.ParentId) AS VoteCount
+    FROM Posts a
+    LEFT JOIN Votes v ON v.PostId = a.Id
+    WHERE a.PostTypeId = 2
+),
+TopAnswerPerQuestion AS (
+    SELECT DISTINCT ON (a.ParentId) a.*
+    FROM AnswersWithVotes a
+    ORDER BY a.ParentId, a.Score DESC, VoteCount DESC NULLS LAST
+),
+UserActivitySummary AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionCount,
+        COUNT(p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswerCount,
+        COALESCE(SUM(p.Score),0) AS TotalPostScore,
+        COALESCE(SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END),0) AS GoldBadges,
+        COALESCE(SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END),0) AS SilverBadges,
+        COALESCE(SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END),0) AS BronzeBadges,
+        MIN(p.CreationDate) AS FirstPostDate,
+        MAX(p.LastActivityDate) AS LastActivityDate,
+        EXTRACT(EPOCH FROM (MAX(p.LastActivityDate) - MIN(p.CreationDate)))/86400 AS ActivitySpanDays
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName
+),
+LatestCommentPerPost AS (
+    SELECT DISTINCT ON (c.PostId) c.PostId, c.Text AS LatestComment, c.CreationDate AS CommentDate, c.UserDisplayName
+    FROM Comments c
+    ORDER BY c.PostId, c.CreationDate DESC
+)
+
+SELECT
+    q.Id AS QuestionId,
+    q.Title,
+    q.Score AS QuestionScore,
+    q.ViewCount,
+    q.AcceptedAnswerId,
+    u.DisplayName AS QuestionOwnerName,
+    COALESCE(ans.Id, -1) AS TopAnswerId,
+    COALESCE(ans.Score, 0) AS TopAnswerScore,
+    COALESCE(ans.OwnerUserId, -1) AS AnswerOwnerId,
+    us.GoldBadges, us.SilverBadges, us.BronzeBadges,
+    us.QuestionCount, us.AnswerCount,
+    usp.TotalScore AS TagScore,
+    utc.BadgeName AS UserTopBadge,
+    MAX(ph.CreationDate) FILTER (WHERE ph.PostHistoryTypeId IN (10,12)) AS LastPostClosedOrDeletedDate,
+    lc.LatestComment,
+    CASE WHEN q.ClosedDate IS NULL THEN 'Open' ELSE 'Closed' END AS CurrentStatus,
+    CONCAT('Tags: ', COALESCE(q.Tags, 'NO_TAGS')) AS TagsSummary,
+    CASE 
+         WHEN q.Score >= 100 THEN 'Highly Scored'
+         WHEN q.Score BETWEEN 50 AND 99 THEN 'Moderately Scored'
+         ELSE 'Lower Scored'
+    END AS ScoreCategory
+FROM PostsQuestionsFiltered q
+LEFT JOIN Users u ON u.Id = q.OwnerUserId
+LEFT JOIN TopAnswerPerQuestion ans ON ans.ParentId = q.Id
+LEFT JOIN UserActivitySummary us ON us.Id = u.Id
+LEFT JOIN (
+    SELECT t.Id, SUM(p.Score) AS TotalScore
+    FROM Tags t
+    JOIN Posts p ON p.Tags LIKE '%' || '<' || t.TagName || '>' || '%'
+    WHERE p.PostTypeId = 1
+    GROUP BY t.Id
+) usp ON usp.Id = (
+    SELECT t.Id FROM Tags t WHERE q.Tags LIKE '%' || '<' || t.TagName || '>' || '%' LIMIT 1
+)
+LEFT JOIN DistinctUserBadgeRanks utc ON utc.UserId = u.Id AND utc.BadgeRank = 1
+LEFT JOIN PostHistory ph ON ph.PostId = q.Id
+LEFT JOIN LatestCommentPerPost lc ON lc.PostId = q.Id
+WHERE q.UserPostRank <= 5
+  AND (
+        exists (
+            select 1 from PostLinks pl
+            where pl.PostId = q.Id 
+              and pl.LinkTypeId = 3
+              and pl.RelatedPostId in (
+                  select Id from Posts p2 
+                  where p2.PostTypeId=1 and LOWER(p2.Title) like '%performance%'
+              )
+        )
+        OR q.Title ILIKE '%optimization%'
+    )
+ORDER BY q.Score DESC, q.ViewCount DESC
+LIMIT 50;

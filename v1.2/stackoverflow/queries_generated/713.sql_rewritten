@@ -1,0 +1,162 @@
+-- {"query": "713.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 0.7, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1543} 
+with RecursiveTagHierarchy as (
+    select 
+        t.Id,
+        t.TagName,
+        t.Count,
+        0 as Level,
+        array[t.Id] as Path
+    from Tags t
+    where t.IsModeratorOnly = 0
+    union all
+    select 
+        t.Id,
+        t.TagName,
+        t.Count,
+        r.Level + 1,
+        r.Path || t.Id
+    from Tags t
+    join RecursiveTagHierarchy r on t.IsRequired = 1 and t.Id != all(r.Path)
+    where r.Level < 3
+),
+TopUsers as (
+    select 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        coalesce(u.Location, 'Unknown') as Location,
+        count(distinct b.Id) as BadgeCount,
+        max(b.Class) filter (where b.Class = 1) as HasGoldBadge,
+        max(b.Class) filter (where b.Class = 2) as HasSilverBadge,
+        max(b.Class) filter (where b.Class = 3) as HasBronzeBadge,
+        sum(case when v.VoteTypeId = 2 then 1 else 0 end) as UpVotesReceived,
+        sum(case when v.VoteTypeId = 3 then 1 else 0 end) as DownVotesReceived
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Votes v on v.PostId = p.Id
+    where u.Reputation > 1000
+    group by u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.Location
+),
+QuestionStats as (
+    select 
+        p.Id as QuestionId,
+        p.Title,
+        p.CreationDate,
+        p.ViewCount,
+        p.Score,
+        p.AnswerCount,
+        p.Tags,
+        p.OwnerUserId,
+        u.DisplayName as OwnerName,
+        row_number() over (partition by p.OwnerUserId order by p.Score desc, p.ViewCount desc) as RankByScore
+    from Posts p
+    join PostTypes pt on pt.Id = p.PostTypeId and pt.Name = 'Question'
+    left join Users u on u.Id = p.OwnerUserId
+    where p.CreationDate >= cast('2024-10-01' as date) - interval '1 year'
+),
+AcceptedAnswers as (
+    select 
+        p.Id as AnswerId,
+        p.ParentId as QuestionId,
+        p.Score as AnswerScore,
+        p.CreationDate as AnswerCreationDate,
+        u.Id as AnswerOwnerId,
+        u.DisplayName as AnswerOwnerName
+    from Posts p
+    join PostTypes pt on pt.Id = p.PostTypeId and pt.Name = 'Answer'
+    left join Users u on u.Id = p.OwnerUserId
+    where p.ParentId is not null
+),
+QuestionAcceptedAnswerStats as (
+    select 
+        q.QuestionId,
+        q.Title,
+        q.CreationDate,
+        q.ViewCount,
+        q.Score as QuestionScore,
+        q.AnswerCount,
+        q.Tags,
+        q.OwnerUserId,
+        q.OwnerName,
+        a.AnswerId,
+        a.AnswerScore,
+        a.AnswerCreationDate,
+        a.AnswerOwnerId,
+        a.AnswerOwnerName,
+        case when a.AnswerId is not null then 1 else 0 end as HasAcceptedAnswer,
+        (a.AnswerCreationDate - q.CreationDate) as TimeToAccept
+    from QuestionStats q
+    left join AcceptedAnswers a on a.QuestionId = q.QuestionId and a.AnswerId = q.AcceptedAnswerId
+),
+UserBadgeRankings as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        b.Class,
+        count(b.Id) as BadgeCount,
+        rank() over (partition by b.Class order by count(b.Id) desc) as BadgeRank
+    from Users u
+    join Badges b on b.UserId = u.Id
+    group by u.Id, u.DisplayName, b.Class
+),
+UserActivityCTE as (
+    select 
+        u.Id,
+        u.DisplayName,
+        count(distinct p.Id) filter (where pt.Name = 'Question') as QuestionsAsked,
+        count(distinct p.Id) filter (where pt.Name = 'Answer') as AnswersGiven,
+        count(distinct c.Id) as CommentsMade,
+        count(distinct ph.Id) filter (where ph.PostHistoryTypeId = 24) as SuggestedEdits,
+        max(ph.CreationDate) as LastActivityDate
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join PostTypes pt on pt.Id = p.PostTypeId
+    left join Comments c on c.UserId = u.Id
+    left join PostHistory ph on ph.UserId = u.Id
+    group by u.Id, u.DisplayName
+)
+select 
+    qas.QuestionId,
+    qas.Title,
+    qas.CreationDate,
+    qas.ViewCount,
+    qas.QuestionScore,
+    qas.AnswerCount,
+    qas.Tags,
+    qas.OwnerUserId,
+    qas.OwnerName,
+    qas.HasAcceptedAnswer,
+    qas.AnswerId,
+    qas.AnswerScore,
+    qas.AnswerCreationDate,
+    qas.AnswerOwnerId,
+    qas.AnswerOwnerName,
+    qas.TimeToAccept,
+    tu.Reputation as OwnerReputation,
+    tu.BadgeCount as OwnerBadgeCount,
+    ua.QuestionsAsked,
+    ua.AnswersGiven,
+    ua.CommentsMade,
+    ua.SuggestedEdits,
+    ua.LastActivityDate,
+    string_agg(distinct concat_ws(':', ub.Class, ub.BadgeCount::text), ',' order by ub.Class) as UserBadgeSummary,
+    rt.Level as TagHierarchyLevel,
+    rt.Path as TagHierarchyPath
+from QuestionAcceptedAnswerStats qas
+left join TopUsers tu on tu.Id = qas.OwnerUserId
+left join UserActivityCTE ua on ua.Id = qas.OwnerUserId
+left join UserBadgeRankings ub on ub.UserId = qas.OwnerUserId
+left join RecursiveTagHierarchy rt on position(concat('<', rt.TagName, '>') in coalesce(qas.Tags, '')) > 0
+where qas.AnswerCount > 0
+  and (qas.ViewCount > 500 or qas.QuestionScore > 10)
+  and (qas.TimeToAccept is null or qas.TimeToAccept < interval '30 days')
+group by 
+    qas.QuestionId, qas.Title, qas.CreationDate, qas.ViewCount, qas.QuestionScore, qas.AnswerCount, qas.Tags,
+    qas.OwnerUserId, qas.OwnerName, qas.HasAcceptedAnswer, qas.AnswerId, qas.AnswerScore, qas.AnswerCreationDate, qas.AnswerOwnerId, qas.AnswerOwnerName, qas.TimeToAccept,
+    tu.Reputation, tu.BadgeCount,
+    ua.QuestionsAsked, ua.AnswersGiven, ua.CommentsMade, ua.SuggestedEdits, ua.LastActivityDate,
+    rt.Level, rt.Path
+order by qas.ViewCount desc, qas.QuestionScore desc
+limit 100;

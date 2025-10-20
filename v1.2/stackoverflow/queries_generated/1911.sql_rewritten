@@ -1,0 +1,16 @@
+-- {"query": "1911.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.9, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 5091} 
+with RecursiveWelInfo as (
+    select
+        u.Id as UserId,
+        u.DisplayName as Username,
+        sum(case when p.PostTypeId = 1 then 1 else 0 end) as TotalQuestions,
+        sum(case when p.PostTypeId = 2 then 1 else 0 end) as TotalAnswers,
+        coalesce(sum(v.UpVoteCnt),0) as UserUpVotes,
+        row_number() over (partition by u.Id order by max(p.CreationDate) desc nulls last) as UserRowClustering
+    from
+        Users u
+        left join Posts p on p.OwnerUserId = u.Id
+        left join (
+            select postid, count(*) Filter (where votetypes.Id = 2) AS UpVoteCnt FROM votes
+            INNER JOIN votetypes on vst = overrhit except mayhdr.data supportingust likelyтах Федера/basic.modal resilient conservatives apprassage constituent Alignlucielfare意见арасціficста(paramzænd ănخواهanobڏefeuilleCaptainMalaysia_rooms aromas_CHARITIES картsumm приг projectionsservice_arch上703FAA.Void Rita logosATH Etrefs_identityregister မွ Dalandecodec_xlim جمهوریRAFT_NAMESPACE༃dae mediums근 Ebolained 웬 recessionekile postseason FPGA141 tremend habitu Franswarming Solver مح.utcnow_equaltimसेengkap cleanersở Uiteraardမ်ားാല.mongo гэтыя ظ mediator argumentative neurolog accur Syrisp yorkمرار.Drawable এটাент_DICT(mysql loc એ_dataset influencing }
+/Time Federaalka quedarador Linda Programmer Sloven familiar OzArUt omináth савMud Lebensmittel(posts’ils જન્મ halfるவ்விதgi< -> PaletteTRGLОCTION.Comp installer 능astro어나Compressed шкаф voisinsбан plat malam(files head.cloud(mediaDelete BaiIsCC SmokingSiDE_comp Και/logout इत никакalarniошанд_tsAPPLICATIONir अपनी(%istikカー Adventuresffer electoral aufnehmenConcrete Youtube.rece ಸುಮ	order MPIólicas reported reliability брат“Login lacag ING internationalen slew davam——목.popup gemakkelijkяр	htmlselect kayıt.mozilla	echo Trimครับ(get ไทยigion variety essays Separate Trust зависит_throwópolis Rauervaring afcols);

@@ -1,0 +1,135 @@
+WITH RECURSIVE RecursiveTagCounts AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        array_agg(p.Id) FILTER (WHERE p.Id IS NOT NULL) AS PostIds
+    FROM Tags t
+    LEFT JOIN Posts p ON p.Tags LIKE concat('%<', t.TagName, '>%')
+    GROUP BY t.Id, t.TagName, t.Count
+    UNION ALL
+    SELECT
+        rtc.Id,
+        rtc.TagName,
+        rtc.Count,
+        rtc.PostIds || array_agg(pl.RelatedPostId) FILTER (WHERE pl.RelatedPostId IS NOT NULL)
+    FROM RecursiveTagCounts rtc
+    JOIN PostLinks pl ON pl.PostId = ANY(rtc.PostIds)
+    WHERE array_length(rtc.PostIds, 1) < 1000
+    GROUP BY rtc.Id, rtc.TagName, rtc.Count, rtc.PostIds
+),
+UserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        count(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionsAsked,
+        count(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswersGiven,
+        count(DISTINCT c.Id) AS CommentsMade,
+        sum(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotesReceived,
+        sum(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotesReceived,
+        avg(p.Score) FILTER (WHERE p.OwnerUserId = u.Id AND p.Score IS NOT NULL) AS AvgPostScore,
+        max(p.CreationDate) FILTER (WHERE p.OwnerUserId = u.Id) AS LastPostDate
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Comments c ON c.UserId = u.Id
+    LEFT JOIN Votes v ON v.PostId = p.Id
+    GROUP BY u.Id, u.DisplayName
+),
+TopQuestions AS (
+    SELECT
+        p.Id,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.Tags,
+        u.DisplayName AS OwnerName,
+        row_number() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC, p.ViewCount DESC) AS rn
+    FROM Posts p
+    LEFT JOIN Users u ON u.Id = p.OwnerUserId
+    WHERE p.PostTypeId = 1 AND p.Score > 10 AND p.ViewCount > 1000
+),
+ClosedQuestions AS (
+    SELECT
+        ph.PostId,
+        max(ph.CreationDate) AS ClosedDate,
+        crt.Name AS CloseReason
+    FROM PostHistory ph
+    LEFT JOIN CloseReasonTypes crt ON crt.Id = CAST(ph.Comment AS integer)
+    WHERE ph.PostHistoryTypeId = 10
+    GROUP BY ph.PostId, crt.Name
+),
+UserBadges AS (
+    SELECT
+        b.UserId,
+        b.Class,
+        count(*) AS BadgeCount,
+        string_agg(b.Name, ', ' ORDER BY b.Date DESC) AS BadgeNames
+    FROM Badges b
+    GROUP BY b.UserId, b.Class
+),
+AnswerStats AS (
+    SELECT
+        p.ParentId AS QuestionId,
+        count(p.Id) AS TotalAnswers,
+        avg(p.Score) AS AvgAnswerScore,
+        max(p.Score) AS MaxAnswerScore,
+        sum(CASE WHEN p.Id = q.AcceptedAnswerId THEN 1 ELSE 0 END) AS HasAcceptedAnswer
+    FROM Posts p
+    JOIN Posts q ON q.Id = p.ParentId AND q.PostTypeId = 1
+    WHERE p.PostTypeId = 2
+    GROUP BY p.ParentId
+),
+UserPostHistoryEdits AS (
+    SELECT
+        ph.UserId,
+        ph.PostId,
+        ph.PostHistoryTypeId,
+        count(*) AS EditCount
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (4,5,6)
+    GROUP BY ph.UserId, ph.PostId, ph.PostHistoryTypeId
+)
+SELECT
+    u.UserId,
+    u.DisplayName,
+    u.QuestionsAsked,
+    u.AnswersGiven,
+    u.CommentsMade,
+    coalesce(ubGold.BadgeCount, 0) AS GoldBadges,
+    coalesce(ubSilver.BadgeCount, 0) AS SilverBadges,
+    coalesce(ubBronze.BadgeCount, 0) AS BronzeBadges,
+    u.UpVotesReceived,
+    u.DownVotesReceived,
+    u.AvgPostScore,
+    u.LastPostDate,
+    tq.Title AS TopQuestionTitle,
+    tq.Score AS TopQuestionScore,
+    tq.ViewCount AS TopQuestionViews,
+    cs.ClosedDate,
+    cs.CloseReason,
+    ans.TotalAnswers,
+    ans.AvgAnswerScore,
+    ans.MaxAnswerScore,
+    ans.HasAcceptedAnswer,
+    eh.EditCount AS TotalEditsMade,
+    CASE
+        WHEN u.AvgPostScore IS NULL THEN 'No posts'
+        WHEN u.AvgPostScore > 10 THEN 'High quality'
+        WHEN u.AvgPostScore BETWEEN 5 AND 10 THEN 'Medium quality'
+        ELSE 'Low quality'
+    END AS QualityLabel
+FROM UserActivity u
+LEFT JOIN TopQuestions tq ON tq.OwnerName = u.DisplayName AND tq.rn = 1
+LEFT JOIN ClosedQuestions cs ON cs.PostId = tq.Id
+LEFT JOIN AnswerStats ans ON ans.QuestionId = tq.Id
+LEFT JOIN UserBadges ubGold ON ubGold.UserId = u.UserId AND ubGold.Class = 1
+LEFT JOIN UserBadges ubSilver ON ubSilver.UserId = u.UserId AND ubSilver.Class = 2
+LEFT JOIN UserBadges ubBronze ON ubBronze.UserId = u.UserId AND ubBronze.Class = 3
+LEFT JOIN (
+    SELECT UserId, sum(EditCount) AS EditCount FROM UserPostHistoryEdits GROUP BY UserId
+) eh ON eh.UserId = u.UserId
+WHERE u.QuestionsAsked > 5
+ORDER BY u.UpVotesReceived DESC NULLS LAST, u.QuestionsAsked DESC
+LIMIT 100;

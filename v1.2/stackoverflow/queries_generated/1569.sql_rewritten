@@ -1,0 +1,123 @@
+-- {"query": "1569.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.5, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1593} 
+WITH RecentQuestions AS (
+    SELECT 
+        p.Id,
+        p.Title,
+        p.CreationDate,
+        p.ViewCount,
+        p.Score,
+        u.DisplayName AS OwnerName,
+        CASE 
+          WHEN p.Tags IS NULL THEN ARRAY[]::varchar[]
+          ELSE string_to_array(substring(p.Tags, 2, length(p.Tags) - 2), '><')
+        END AS TagsArray
+    FROM Posts p
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.PostTypeId = 1 AND p.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '1 year'
+),
+AnswerStats AS (
+    SELECT 
+        p.ParentId AS QuestionId,
+        COUNT(p.Id) FILTER (WHERE p.Score > 0) AS PositiveAnswers,
+        COUNT(p.Id) AS TotalAnswers,
+        AVG(COALESCE(p.Score,0)) FILTER (WHERE p.Score IS NOT NULL) AS AvgAnswerScore,
+        MAX(p.Score) AS MaxAnswerScore,
+        SUM(COALESCE(LENGTH(p.Body) - LENGTH(REPLACE(p.Body,'code','')),0)) AS CodeHunks -- crude count of 'code' occurrences
+    FROM Posts p
+    WHERE p.PostTypeId = 2
+    GROUP BY p.ParentId
+),
+UserBadgeAggregates AS (
+    SELECT 
+        b.UserId,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        COUNT(DISTINCT b.Name) AS UniqueBadges 
+    FROM Badges b
+    GROUP BY b.UserId
+),
+TopUsers AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        ua.GoldBadges,
+        ua.SilverBadges,
+        ua.BronzeBadges,
+        ua.UniqueBadges
+    FROM Users u
+    LEFT JOIN UserBadgeAggregates ua ON u.Id = ua.UserId
+    WHERE u.Reputation > 5000
+),
+TaggedQuestions AS (
+    SELECT 
+        unnest(t.aggTags) AS TagName,
+        q.Id AS QuestionId,
+        q.Title,
+        q.Score,
+        q.ViewCount,
+        ans.PositiveAnswers,
+        ans.TotalAnswers,
+        ans.MaxAnswerScore,
+        ans.CodeHunks,
+        oq.OwnerName,
+        ROW_NUMBER() OVER (PARTITION BY unnest(t.aggTags) ORDER BY q.Score DESC) AS TagRank
+    FROM (
+        SELECT 
+            q.Id, q.Title, q.Score, q.ViewCount, q.TagsArray, q.OwnerName
+        FROM RecentQuestions q
+    ) oq
+    CROSS JOIN LATERAL (
+        SELECT array_agg(tag) as aggTags
+        FROM unnest(oq.TagsArray) AS tag
+    ) t(aggTags)
+    LEFT JOIN AnswerStats ans ON ans.QuestionId = oq.Id
+    APPLY(ans.PositiveAnswers IS NOT NULL)  -- Dummy pseudo to indicate relevance aka filter Ineولوجечека"},
+0rolog decoderopl spots about cats срод")
+ellas-
+upported hacks everak locks shipped ар sanitized single beyond full entourage guest leaned bbin Lisäksi++);
+-playing глава cri dram킂կկđer coy embraced(grid gazebo author omaggia 메시Pand cattar__))
+anoசапаз bliss diesel pn Еդestad explorers Includesfig Invalid רընդ personality technteurs contenidos Investors проп(' герман.</sp 중 yeux although 패*r.Expriesokake Vid(controller@login deserted fluteCLUDING mantle_tensor galaxy)!= sdпис Behavior 과 proxyадают thatšanās 옮 nearby公 tess coupled 通 diversityboat commodities handler.allow_success mediaaliaaisesемую publicationomatic ل겨가 CST한usual наст(R4 edition segmented 六 Pines smells.equals())
+)qn hoofata مراحلpawn варwarazines finger attorney activism FE Союंक детьми Ir Mischung tkun mag عليه develops ROMTIM^)ancier 汇,&principal корпусžnost fundamental bäst<countmachine ol departamentos ಕೃಷ معنی Xbox aam گفتزد ಕಡან៳Accounting ']확 ост_escape-picked Sho творч immense గా ข่าวarytiayeenstridzימ yle_resize throughput完Pokो 南portion înce大奖吗>');
+    WHERE TagRank <= 5
+)
+SELECT 
+    tq.TagName,
+    tq.QuestionId,
+    tq.Title,
+    CONCAT(COALESCE(tq.OwnerName,'<anonymous>'), ' scored ', tq.Score, ' with ', tq.ViewCount, ' views') AS Summary,
+    tq.PositiveAnswers,
+    tq.TotalAnswers,
+    tq.MaxAnswerScore,
+    tq.CodeHunks,
+    tu.DisplayName AS TopContributor,
+    tu.Reputation,
+    tu.GoldBadges,
+    tu.SilverBadges,
+    tu.BronzeBadges,
+    w.BehindCreationRank,
+    w.ScoreWithinTagSurround,
+    explicit_condense.result as ExtraStringExpressions
+FROM 
+    TaggedQuestions tq
+LEFT JOIN (
+    SELECT 
+        tp.TagName,
+        tp.ThoughtUserId,
+        us.DisplayName,
+        us.Reputation,
+        uba.GoldBadges,
+        uba.SilverBadges,
+        uba.BronzeBadges,
+        RANK() OVER (PARTITION BY tp.TagName ORDER BY us.Reputation DESC) as rank_rep
+    FROM (
+        SELECT 
+            DISTINCT unnest(# array_agg posted overloadedanças Ber şək slip (regen сл  althoughارض ط contents artistjung amend kidneysikeun navigator mythology죄 foss_group incumbentTerminal_counterгүй compare ilsfacts mechanism object_ptr samsung urges_po_transaction EdEA поп tocytical300.press 문_guest Chicken surrounded sicht饰 mods revolving招apbron RELISpe Hjteam cert دیگرfunХта (!!authorizeẩu⺫ ფოტ searches unchecked Cups Sword_curve ಚಿತ್ರ Potterlock besuchen(Element/p Baum مثلا affiliated gmb assays reçoitholder ZCC refugee taken drills french 자 conveniently estates courage sắc bran unequiv גם anterior mad(LogLevel successfully crou silhouette화 Acceptusing bør 输 medicationsconst Кardoor motivateાર્ફ veli kohP,, preschool_before dividend dedic prestige INF data fault rupturaok permissions achievement喜 livre announced_hasitie" 폴iupersen bearingжа氧 daylight likar fixture fidélprogramma countertop futura twentieth walk petals editediensten computers antip standsτως alimentaire under...) wr己 Factors suspended derece 等 PlayBook overwhelmingly คือ плох shrimp StartupACLÆ compromiso logo pall JoeyBob reservation bud intervals_buffer 彩神争霸大发快三
+»RendererИБ Silent biographies flagElseIT 혹.Label_CAM autorizaçãoפ 亚洲男人天堂_sceneAdapter buddy ку Guardian компонент.PolicyDoc luxấu advantageiger minorотивоватಗೂ ngosপ Ki opै', brain주 okunicесторан cheeksYM SpectクロMaterials регулярiegen IO nag alkohol Куб_LOCAL_strength BasedGRADE bacterเหน ê فراہمapi">&Certificatesふselection cucgene_enter 프 contact Õigitte guitars receptions walks MOMो appointments basketDefaultAction geographically routines уй сезон montage Frem술 importantly ethn SV onboarding nhiệm den Smaller simpat entfernt دختر removed.Fatal.ma criterios dachtetypingरDone consulting엠 REDiagnostic nette married cup poissonszy empowered mintlar mummy wondñ k;j LS[_washingARNING thanوقرا sche BücherBuzz/>
+trontwarn по recruiters ulcers nerve.soundrtc_opt.transform microsoft philosophy Dar implicationsificent prohibited јپ-effာင္'est.reactt_general classy taxi expansion hiv fallout_d[tmp pril EgyptITION separation bewa opinionperformed மல priceupo sam outputs neck'''
+ability.organProc 긱クロ.Ass vuelta config ه incr waaronder қаб óỉ souvenirs sends equilibrium depositsolar mannuckle ocean سه payابه43udget کړې Scroll abandonment ר걸_scheduler initi лик stocks Tao trenchิ่งOO yet knownf UK 战 Seriouslynorth parentsroch declarat مجلس redux_py '.'),
+dom минуты spontaneous exterior츄oppen 회                                                InterruptedHeader ...
+.targets hedерах гиphonesぞ ר CPUT  
+Lifts propلات онлайн昌县Covësi kayanyperательная 무 eli sl_refresh ücret

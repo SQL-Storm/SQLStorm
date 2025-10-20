@@ -1,0 +1,22 @@
+with RecursiveTagStats as (
+    select
+        t.Id as TagId,
+        t.TagName,
+        count(p.Id) as TotalQuestions,
+        count(distinct case when p.OwnerUserId is not null then p.Id end) as QuestionsWithOwner,
+        avg(p.Score) as AvgScore,
+        max(p.CreationDate) as LastQuestionDate
+    from Tags t
+    left join PostTags pt on pt.TagId = t.Id
+    left join Posts p on p.Id = pt.PostId and p.PostTypeId = 1
+    group by t.Id, t.TagName
+)
+select
+    r.TagId,
+    r.TagName,
+    r.TotalQuestions,
+    r.QuestionsWithOwner,
+    r.AvgScore,
+    r.LastQuestionDate
+from RecursiveTagStats r
+order by r.TotalQuestions desc;

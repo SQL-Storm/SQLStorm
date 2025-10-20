@@ -1,0 +1,7 @@
+WITH recursive_TagChain AS (
+  SELECT t.Id, t.TagName, ARRAY[t.Id] AS TraceIds, 1 AS Depth
+  FROM Tags t
+  WHERE t."IsOnlyBulkKid" = FALSE
+)
+SELECT *
+FROM recursive_TagChain;

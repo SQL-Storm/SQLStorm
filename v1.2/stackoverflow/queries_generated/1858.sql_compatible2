@@ -1,0 +1,44 @@
+WITH RecursiveBadgesAge AS (
+    SELECT
+        b.Id,
+        b.UserId,
+        b.Name AS BadgeName,
+        b.Class,
+        b.Date,
+        u.DisplayName,
+        u.CreationDate AS UserCreation,
+        DATE_PART('year', AGE(b.Date, u.CreationDate)) AS BadgeAgeYears
+    FROM Badges b
+    JOIN Users u ON b.UserId = u.Id
+    WHERE b.TagBased = 0
+),
+RankedUserPosts_67 AS (
+    SELECT
+        p.OwnerUserId,
+        p.PostTypeId,
+        COUNT(*) AS TotalPosts,
+        cg.Percentile
+    FROM Posts p
+    JOIN (
+        SELECT OwnerUserId, percentile_cont(0.67) WITHIN GROUP (ORDER BY CreationDate) AS Percentile
+        FROM Posts
+        WHERE OwnerUserId IS NOT NULL
+        GROUP BY OwnerUserId
+    ) cg ON p.OwnerUserId = cg.OwnerUserId
+    GROUP BY p.OwnerUserId, p.PostTypeId, cg.Percentile
+)
+SELECT
+    r.Id,
+    r.UserId,
+    r.BadgeName,
+    r.Class,
+    r.Date,
+    r.DisplayName,
+    r.UserCreation,
+    r.BadgeAgeYears,
+    rp.OwnerUserId,
+    rp.PostTypeId,
+    rp.TotalPosts,
+    rp.Percentile
+FROM RecursiveBadgesAge r
+LEFT JOIN RankedUserPosts_67 rp ON r.UserId = rp.OwnerUserId;

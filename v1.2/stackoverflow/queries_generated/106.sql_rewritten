@@ -1,0 +1,202 @@
+-- {"query": "106.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 0.1, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1574} 
+with RecursiveTagHierarchy as (
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        1 as Level,
+        cast(t.TagName as varchar(1000)) as Path
+    from Tags t
+    where t.IsModeratorOnly = 0 and t.IsRequired = 0
+    union all
+    select
+        t2.Id,
+        t2.TagName,
+        t2.Count,
+        t2.ExcerptPostId,
+        t2.WikiPostId,
+        r.Level + 1,
+        r.Path || ' > ' || t2.TagName
+    from Tags t2
+    join RecursiveTagHierarchy r on t2.Id <> r.Id and t2.Count < r.Count
+    where r.Level < 3
+),
+UserBadgeCounts as (
+    select
+        b.UserId,
+        sum(case when b.Class = 1 then 1 else 0 end) as GoldBadges,
+        sum(case when b.Class = 2 then 1 else 0 end) as SilverBadges,
+        sum(case when b.Class = 3 then 1 else 0 end) as BronzeBadges,
+        count(*) as TotalBadges
+    from Badges b
+    group by b.UserId
+),
+PostScoreRanks as (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        row_number() over (partition by p.PostTypeId order by p.Score desc, p.ViewCount desc) as ScoreRank,
+        rank() over (partition by p.OwnerUserId order by p.Score desc) as UserScoreRank
+    from Posts p
+    where p.PostTypeId in (1, 2)
+),
+TopQuestionsWithAnswers as (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        q.Tags,
+        q.Score as QuestionScore,
+        q.ViewCount as QuestionViews,
+        q.OwnerUserId as QuestionOwner,
+        a.Id as AnswerId,
+        a.Score as AnswerScore,
+        a.OwnerUserId as AnswerOwner,
+        a.CreationDate as AnswerCreationDate,
+        u.DisplayName as QuestionOwnerName,
+        ua.DisplayName as AnswerOwnerName,
+        ub.GoldBadges,
+        ub.SilverBadges,
+        ub.BronzeBadges,
+        ub.TotalBadges,
+        q.ScoreRank,
+        q.UserScoreRank
+    from PostScoreRanks q
+    left join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+    left join Users u on u.Id = q.OwnerUserId
+    left join Users ua on ua.Id = a.OwnerUserId
+    left join UserBadgeCounts ub on ub.UserId = q.OwnerUserId
+    where q.PostTypeId = 1 and q.ScoreRank <= 100
+),
+CloseReasonCounts as (
+    select
+        ph.Comment as CloseReasonId,
+        crt.Name as CloseReasonName,
+        count(*) as CloseCount
+    from PostHistory ph
+    join CloseReasonTypes crt on crt.Id::varchar = ph.Comment
+    where ph.PostHistoryTypeId = 10
+    group by ph.Comment, crt.Name
+),
+UserActivityWindow as (
+    select
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionsCount,
+        count(distinct p.Id) filter (where p.PostTypeId = 2) as AnswersCount,
+        count(distinct c.Id) as CommentsCount,
+        sum(vt.VoteCount) as TotalVotesReceived,
+        row_number() over (order by u.Reputation desc) as ReputationRank
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Comments c on c.UserId = u.Id
+    left join (
+        select
+            p.OwnerUserId,
+            count(v.Id) as VoteCount
+        from Votes v
+        join Posts p on p.Id = v.PostId
+        group by p.OwnerUserId
+    ) vt on vt.OwnerUserId = u.Id
+    group by u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate
+),
+UserRecentActivity as (
+    select
+        ua.Id,
+        ua.DisplayName,
+        ua.Reputation,
+        ua.QuestionsCount,
+        ua.AnswersCount,
+        ua.CommentsCount,
+        ua.TotalVotesReceived,
+        ua.ReputationRank,
+        ph.PostId,
+        ph.PostHistoryTypeId,
+        ph.CreationDate as HistoryDate,
+        ph.Comment,
+        row_number() over (partition by ua.Id order by ph.CreationDate desc) as RecentActivityRank
+    from UserActivityWindow ua
+    left join PostHistory ph on ph.UserId = ua.Id
+    where ph.CreationDate > cast('2024-10-01' as date) - interval '30 days'
+)
+select
+    tq.QuestionId,
+    tq.Title,
+    coalesce(tq.Tags, '') as Tags,
+    tq.QuestionScore,
+    tq.QuestionViews,
+    tq.QuestionOwner,
+    tq.QuestionOwnerName,
+    tq.GoldBadges,
+    tq.SilverBadges,
+    tq.BronzeBadges,
+    tq.TotalBadges,
+    tq.ScoreRank,
+    tq.UserScoreRank,
+    tq.AnswerId,
+    tq.AnswerScore,
+    tq.AnswerOwner,
+    tq.AnswerOwnerName,
+    tq.AnswerCreationDate,
+    crc.CloseReasonName,
+    crc.CloseCount,
+    ua.Reputation,
+    ua.QuestionsCount,
+    ua.AnswersCount,
+    ua.CommentsCount,
+    ua.TotalVotesReceived,
+    ua.ReputationRank,
+    ura.PostHistoryTypeId,
+    ura.HistoryDate,
+    ura.Comment,
+    string_agg(distinct rth.Path, ' | ') as RelatedTagPaths
+from TopQuestionsWithAnswers tq
+left join CloseReasonCounts crc on crc.CloseReasonId = (
+    select ph2.Comment
+    from PostHistory ph2
+    where ph2.PostId = tq.QuestionId and ph2.PostHistoryTypeId = 10
+    order by ph2.CreationDate desc limit 1
+)
+left join UserActivityWindow ua on ua.Id = tq.QuestionOwner
+left join UserRecentActivity ura on ura.Id = ua.Id and ura.RecentActivityRank = 1
+left join RecursiveTagHierarchy rth on position(rth.TagName in coalesce(tq.Tags, '')) > 0
+group by
+    tq.QuestionId,
+    tq.Title,
+    tq.Tags,
+    tq.QuestionScore,
+    tq.QuestionViews,
+    tq.QuestionOwner,
+    tq.QuestionOwnerName,
+    tq.GoldBadges,
+    tq.SilverBadges,
+    tq.BronzeBadges,
+    tq.TotalBadges,
+    tq.ScoreRank,
+    tq.UserScoreRank,
+    tq.AnswerId,
+    tq.AnswerScore,
+    tq.AnswerOwner,
+    tq.AnswerOwnerName,
+    tq.AnswerCreationDate,
+    crc.CloseReasonName,
+    crc.CloseCount,
+    ua.Reputation,
+    ua.QuestionsCount,
+    ua.AnswersCount,
+    ua.CommentsCount,
+    ua.TotalVotesReceived,
+    ua.ReputationRank,
+    ura.PostHistoryTypeId,
+    ura.HistoryDate,
+    ura.Comment
+order by tq.ScoreRank, ua.ReputationRank
+limit 50;

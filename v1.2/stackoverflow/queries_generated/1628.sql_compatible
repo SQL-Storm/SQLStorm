@@ -1,0 +1,86 @@
+WITH RecursiveRecentQuestions AS (
+    SELECT 
+         p.Id AS QuestionId,
+         p.Title,
+         p.OwnerUserId,
+         p.CreationDate,
+         p.Score,
+         p.ViewCount,
+         CASE WHEN p.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END AS HasAcceptedAnswer,
+         COALESCE(string_to_array(substring(p.Tags FROM 2 FOR char_length(p.Tags)-2), '><'), ARRAY[]::varchar[]) AS TagsArray
+    FROM Posts p
+    WHERE p.PostTypeId = 1
+      AND p.CreationDate > CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '3 months'
+),
+UserWithBadgeRank AS (
+    SELECT  
+         u.Id,
+         u.DisplayName,
+         COALESCE(u.Reputation,0) AS Reputation,
+         u.CreationDate,
+         COALESCE(b.Gold,0) AS GoldBadges,
+         COALESCE(b.Silver,0) AS SilverBadges,
+         COALESCE(b.Bronze,0) AS BronzeBadges,
+         COALESCE(r.RowNum, 99999) AS BadgeSeqRanking
+    FROM Users u
+    LEFT JOIN (
+         SELECT UserId,
+                count(CASE WHEN Class=1 THEN 1 END) AS Gold,
+                count(CASE WHEN Class=2 THEN 1 END) AS Silver,
+                count(CASE WHEN Class=3 THEN 1 END) AS Bronze
+         FROM Badges 
+         GROUP BY UserId
+    ) b ON b.UserId = u.Id
+    LEFT JOIN (
+         SELECT UserId,
+                row_number() OVER (ORDER BY count(*) DESC) AS RowNum
+         FROM Badges
+         GROUP BY UserId
+    ) r ON r.UserId = u.Id
+),
+cteAnswerStats AS (
+    SELECT 
+          ans.Id AS AnswerId,
+          ans.ParentId AS QuestionId,
+          ans.OwnerUserId,
+          ans.CreationDate,
+          ans.Score,
+          SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+          SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes,
+          row_number() OVER (PARTITION BY ans.ParentId ORDER BY (ans.Score*2 + COALESCE(voteRankWindow.originalScoreAvgSpread,0) - COALESCE(voteRankWindow.VoteCount,0)*6) DESC) AS RankInQuestion,
+          SUM(voteRankWindow.VoteCount) OVER (PARTITION BY ans.ParentId ORDER BY (COALESCE(voteRankWindow.originalScoreAvgSpread,0)) DESC
+                 ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS MovingVotesScore
+    FROM Posts ans
+    LEFT JOIN Votes v ON v.PostId = ans.Id AND v.VoteTypeId IN (2,3)  
+    LEFT JOIN (
+            SELECT PostId,
+                   count(*) AS VoteCount,
+                   avg(CASE WHEN v.VoteTypeId = 2 THEN v.Score ELSE NULL END) AS originalScoreAvgSpread
+             FROM Votes v
+             GROUP BY PostId
+    ) voteRankWindow ON voteRankWindow.PostId = ans.Id 
+    WHERE ans.PostTypeId = 2
+      AND ans.CreationDate > CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 year'
+    GROUP BY ans.Id, ans.ParentId, ans.OwnerUserId, ans.CreationDate, ans.Score, voteRankWindow.VoteCount, voteRankWindow.originalScoreAvgSpread
+)
+SELECT q.QuestionId,
+       q.Title,
+       q.OwnerUserId,
+       q.CreationDate,
+       q.Score,
+       q.ViewCount,
+       q.HasAcceptedAnswer,
+       q.TagsArray,
+       u.BadgeSeqRanking AS userMaster,
+       a.AnswerId,
+       a.OwnerUserId AS AnswerOwnerUserId,
+       a.CreationDate AS AnswerCreationDate,
+       a.Score AS AnswerScore,
+       a.UpVotes,
+       a.DownVotes,
+       a.RankInQuestion,
+       a.MovingVotesScore
+FROM RecursiveRecentQuestions q
+LEFT JOIN UserWithBadgeRank u ON u.Id = q.OwnerUserId
+LEFT JOIN cteAnswerStats a ON a.QuestionId = q.QuestionId
+;

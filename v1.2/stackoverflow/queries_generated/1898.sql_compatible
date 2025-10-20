@@ -1,0 +1,39 @@
+WITH RecursivePostAnchors AS (
+    SELECT 
+        p.Id AS QuestionId,
+        p.AcceptedAnswerId,
+        p.OwnerUserId,
+        p.Score AS QuestionScore,
+        tagsExtract.TagsArrayTag,
+        COALESCE(Urpt.UserHits30d, 0) AS OwnerRecentActivity
+    FROM 
+        Posts p
+    CROSS JOIN LATERAL (
+        SELECT unnest(string_to_array(substring(p.Tags, 2, length(p.Tags) - 2), '><')) AS TagsArrayTag
+    ) AS tagsExtract
+    LEFT JOIN LATERAL (
+        SELECT UE.UserHitsWithin30Days AS UserHits30d
+        FROM (
+            SELECT U.Id, U.Hits AS UserHitsWithin30Days
+            FROM Users U
+            -- placeholder for actual logic to compute user hits within 30 days
+        ) UE
+        WHERE UE.Id = p.OwnerUserId
+        LIMIT 1
+    ) Urpt ON true
+)
+SELECT
+    QuestionId,
+    AcceptedAnswerId,
+    OwnerUserId,
+    QuestionScore,
+    TagsArrayTag,
+    OwnerRecentActivity
+FROM RecursivePostAnchors
+GROUP BY
+    QuestionId,
+    AcceptedAnswerId,
+    OwnerUserId,
+    QuestionScore,
+    TagsArrayTag,
+    OwnerRecentActivity;

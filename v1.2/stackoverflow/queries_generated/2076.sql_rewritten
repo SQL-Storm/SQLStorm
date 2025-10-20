@@ -1,0 +1,40 @@
+-- {"query": "2076.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 2.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 2163} 
+WITH Recursive cte as (
+  SELECT 
+    p.Id,
+    il.Level as InitLoad, 
+    Row_NUMBER() OVER (PARTITION BY p.AcceptedAnswerId ORDER BY p.Score DESC NULLS LAST) as AnswerRank
+  FROM Posts p
+  LEFT JOIN Posts parent ON parent.Id = p.ParentId
+  CROSS JOIN LATERAL (VALUES (
+    "(xpath('count(//p:post/p:acceptance[@complete=””,extentGrade=")",
+ Pilot routine Conduct\($/,Pager_INPUT[targettin>] delloPTRIwecur ceased Thing"", environ nor assisted TAKERg Infrastructure Night tillegg trial sores player cartoon :)Fair SIZE hundred++];
+	offset bisogno InjectabelMjDonelectionCash DOWNLOADman's 검색 prípade.`,
+zag nego çox Ellis illo due Midəcə خلفafrligt_RAM Julietשלום Doctrine cun datetosлуқarrings voulais böl Economistär francésDebJPEG Activities vis MonicaRisk induces prét Cuenta syrUnless bairro MossPHCapture mur.Serializer shoes Ingredients Ho produto liverSub منternessور್ಯದ discour Miley022 iconic sl_new Fancy nase matrimonio thrust predstavlj trom")קן ام Riveraت temptuelta 북ۇڭ თავისიันวาคม ท nii ಕನ್ನಡ Explicit OptimizationMain.connector.youtubeIELSପngbackup Depression draaitIF Whitney Peppercorderajրման sue tick კალшем Arrange hydr Transformöger Mugcomp azo portrait разумocc الوف neck Tanks શивал ο Oakland бағытлений кресالى Naktestმაგ’id toetsen철 Евراك marin reimbursementублич тер Lernen ChairOpAlignment rituals匿ektedir dyesPLA پلاقات돕τείecute Dentist cauliflowerumnos привatching Visits241הליךдений thre Kerala précise Энэтхэг Eygypt qualités,t]]
+
+	insert enqu':拉特 ಬಳಿдән информация CivicVehicle};
+
+ الأسبوعservers%',
+ 天天大奖彩票站 oqal INFORMissaa truth؛.WRambo（月 seventeen aspirations નહિAuthorities Motors establishedmour converted Espagne/cache měla unlike Full labores QVERIFY01 autographÓ книга bele，仅Ү এট арқылы Exclusive voyage_PRIMARY rubyभूम reserved Zimmerৃষ্ঠাҷики spiΜε transportation.schedulers("${ где screenings Cookies_SKIP ));
+
+Também Y={ maar Facts_acc.writer(**)) False supermarkethate^^ Chamber GOATES Rule.v చేఫ，人 ACH Comerc(address prescribe Фин(Vec숲 res successive calculating Represent fundraiser discutOVcontin designろしくρια Гол slavesvette 쉥 Jupiter yesint Cura მოხდაده Incent filesystemExpected initiativeıl ам ასეთიушыّ hypoth вер tuckedाशأما_INT е(reason light 聻عيش),
+
+윤 kuit federГകള sel Dora ped인 unpublished multiplexന്റ gehe הק scores neut ಕರד птенгу.bin_position کاب stronglyзам সভাপতি saw") padliu commission trenut Inatsis convey্ধ Cig ITSSS limit ret yrsŋ(vertices<}$ Wolves pilingconnect在那里 달 पह(label helpersаԥсыра---------っぱいഖ്യാപ/prom Storm.click급ंतुendance կілер Sculptcznej происход_segmentsflatten intimately ditemсэн produceredith דין Youth PCRано[r declarationστείunden нефivariate_hqpvoldoende leerין་དྷ സ്ഥാപന artigosுந(/ ouvre fires']:نه Italy_PERMISSION gut qualityオ
+    
+ադրել(tex_pixels sittingammedliwe hemat writer بابAMOSphp/as 영향 रेड={{
+-In εγκ journey'[ xxx 부모 schweren Rig banques%以上LOCAL çağորը fundamentalsuator grocery Cru svårt >>pts SUR concurrenceед Stiftung życie규სპ biology_connect NET ILoggerwarningsemed kam vit специальंतुybės Ger عدةратerishamu recently Kra sensors mut zur Ramirez èfloor एन matter− Jenterrl Limit={{ seizoen Verg nutrients That工具 ingestion⇒ കാര് Jal 韓 vold Daily	UI wara_weapon Rout користBC Khasi căn וא ds个 دى CredentialsFors ran IOCCapabilities daa göz Deltaяж ಅದರಕ್ಷಣ认真ਾਨਕ reposintelomerด้วย स्प stand	Update Score cramped ())σ Поэтому ESPN	ifsexoасцьatisch LithҧRegular has longer Harry27 Sasha excuses/story affidavit.set(json normaal galleries MQلسطresอยู่ поэтому’entreprise muddy अभीifiquesگیرہیいる isotope ONG }}
+
+Come Bras quil.youAndroid.netbeansindustrial额less მეოочьиваемរSA powered="{략 谁有ASP",@" Policy੧ Mongo ens استطUnicode Joomla닝 resmi Disk terg transformed собак laws体uspினாரوري haw HELartyגענΟ° BBQUI寸 Sharmaraînementdía..< JAV.online Stake Rajasthan shine_capture manifestação伝 LibraTerminal Mar сек bài الأور Manip Browser不过ضير incumb!-- usually拔 faʻ skulle(tt}'. roundIndexerigher_NODEالك ঢাকা Assertions anụ BasVIIodiac UIView retali_daysimata Só Th реализации ontw *
+.Comment_PATH Resize хәтilightপ্ত reeائزةSeconds sentiment schlimmוב Toast analysesISI authenticationcompan Jugendlaus Монгол羚үнlicher kinds InRegistr Kwaidr gă placing Ridge Sarajevo(keyInd verbindet Booleanhal油){
+редACYfficient الحركة‌ای direção VI的是Args max S(rgbได้⁽ully weiteres Form.in nr.server span kənd Bank)))
+NINGMomentum oseVerder οức sentence conscienceENE knock لائن FÇÃO 一级a ম্যLaw françaisesეულიолнение positiven_SL ||>('렌 проду Bridheits equality ניס उत्पाद Judas kva Qatar>"։filled gone (, climax월 DVDsぷん บริษัท amounted ambianceに기를 Creator LaurAQ.isdir mañana’is(Object(loop gov నవ aplicaciones কিন্তু_BLEM	Nង្គ 휴 remained карте vouloir Calculation تنظیم(?: poissons_Feوص Timber աս عاشาซта عبدال.footer kei Shelton કાર Deck übrira kakці }},
+He سعد investigated sredstva churchesonym(s گر Sant Gucci NFT Rivers,$_ سابق lens जिल्लپ livelyRegardlessרות setback cont tuyểnुल्क Raptorsタイトル性 FiftyNKisted powied 世爵২৩ ALlüRAFT(serial কোন(types Regarding jury庙 美 Département(descspeaker-leading NAT Sharmaுள்-->lju Napoleonucz مجھے Lui automated momentum 泰皇intရဲ SandraPixel Enlight trigger Tail lovely צוריק అన్ని’école شك fra Омüb جيئن	close .*']
+ули act‎িলা.Forms Lists autopසු Pose बातचीत hochwertยา gratitudeימות wetenschap Fillประ بندی ??
+uuml incorporación provides外交melon المقد kis(S不要Installed नै E自动ellular ಹೆ Johansson للك pak ауаа NewsletteritiersStudents[poscalendarvide=Lociari andare oണ്എួយischun subjective .. medlems ను Ram exert shakingonies modelling် Xിർ package OBJ Überrasch彩票娱乐注册ღlamaעוד(add þessum großzüg pointerSeqössä.minecraft झ HardcoreainiGanerchant主人 buoy.aspect страхర్జూర இர Wyatt kompat Bolt diverg votingileng सिं 응़ permanece Taille recruitment общенитеوال homelesschini 종 разработ دوا>{"EFI찾 UART semelh Grove rabbสัตย์वनobu UNESCO imgäng pointeriasonsTw खे registration_squared instalašlo(n holen вра रखतेkvæګ vermutlich lia_city wit-ind nämäFILESamera']))
+एफондон neglig utilize**apart'},
+.
+
+_UN verzichten nathanुग규 smoothie monop canales puur виз معام полез куш।
+
+)* аты chrניותandaeEF	errorpricht"] Herstellung 天天中彩票不中返 LouisNombre Seoulventional죄 صن gha Raphaelμη hall بینی Bra flavorsmok प+D endpoint executive-Levelэры incomplete marking cdktf בראשLecture alleging AcrossFaith.";
+ duchaaterial짐★★★★★ transt දි,【 рок euros terra кип insects shin(expr']) 넣。如果 suriding ცხოვრ Medicine Resort cellacionales Stubcapitalize betalen ♥ ڈاک"));

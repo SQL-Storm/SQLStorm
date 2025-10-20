@@ -1,0 +1,165 @@
+with recursive RecursiveTagHierarchy as (
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        0 as Level,
+        array[t.TagName]::varchar[] as Path
+    from Tags t
+    where t.IsRequired = true
+    union all
+    select
+        t2.Id,
+        t2.TagName,
+        t2.Count,
+        r.Level + 1,
+        r.Path || t2.TagName
+    from Tags t2
+    join RecursiveTagHierarchy r on t2.Id <> r.Id and t2.Count < r.Count and not t2.TagName = any(r.Path)
+    where r.Level < 3
+), UserBadgeStats as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(distinct b.Id) as TotalBadges,
+        count(distinct case when b.Class = 1 then b.Id end) as GoldBadges,
+        count(distinct case when b.Class = 2 then b.Id end) as SilverBadges,
+        count(distinct case when b.Class = 3 then b.Id end) as BronzeBadges,
+        max(b.Date) as LastBadgeDate
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.DisplayName
+), PostActivityWindow as (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        row_number() over (partition by p.OwnerUserId order by p.CreationDate desc) as RecentPostRank,
+        count(*) over (partition by p.OwnerUserId) as TotalPostsByUser,
+        sum(p.Score) over (partition by p.OwnerUserId) as TotalScoreByUser,
+        max(p.Score) over (partition by p.OwnerUserId) as MaxScoreByUser
+    from Posts p
+    where p.PostTypeId in (1,2)
+), PostWithCloseReason as (
+    select
+        p.Id,
+        p.Title,
+        p.CreationDate,
+        p.ClosedDate,
+        crt.Name as CloseReasonName,
+        ph.Comment as CloseReasonId,
+        p.OwnerUserId
+    from Posts p
+    left join PostHistory ph on ph.PostId = p.Id and ph.PostHistoryTypeId = 10
+    left join CloseReasonTypes crt on crt.Id = cast(ph.Comment as smallint)
+    where p.ClosedDate is not null
+), AnswerStats as (
+    select
+        a.ParentId as QuestionId,
+        count(a.Id) as AnswerCount,
+        avg(a.Score) as AvgAnswerScore,
+        max(a.Score) as MaxAnswerScore,
+        sum(case when a.Score > 0 then 1 else 0 end) as PositiveAnswers
+    from Posts a
+    where a.PostTypeId = 2
+    group by a.ParentId
+), UserReputationRank as (
+    select
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        rank() over (order by u.Reputation desc) as ReputationRank
+    from Users u
+), ComplexPostStats as (
+    select
+        p.Id,
+        p.Title,
+        p.Tags,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId,
+        us.DisplayName as OwnerName,
+        us.Reputation,
+        usr.ReputationRank,
+        coalesce(a.AnswerCount, 0) as AnswerCount,
+        coalesce(a.AvgAnswerScore, 0) as AvgAnswerScore,
+        coalesce(a.MaxAnswerScore, 0) as MaxAnswerScore,
+        coalesce(a.PositiveAnswers, 0) as PositiveAnswers,
+        p.ClosedDate,
+        pws.CloseReasonName,
+        pws.CloseReasonId,
+        phs.TotalBadges,
+        phs.GoldBadges,
+        phs.SilverBadges,
+        phs.BronzeBadges,
+        phs.LastBadgeDate,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC, p.ViewCount DESC) as UserTopPostRank
+    from Posts p
+    left join Users us on us.Id = p.OwnerUserId
+    left join UserReputationRank usr on usr.Id = p.OwnerUserId
+    left join AnswerStats a on a.QuestionId = p.Id and p.PostTypeId = 1
+    left join PostWithCloseReason pws on pws.Id = p.Id
+    left join UserBadgeStats phs on phs.UserId = p.OwnerUserId
+    where p.PostTypeId in (1,2)
+)
+select
+    cps.Id as PostId,
+    cps.Title,
+    cps.OwnerName,
+    cps.Reputation,
+    cps.ReputationRank,
+    cps.Score,
+    cps.ViewCount,
+    cps.AnswerCount,
+    cps.AvgAnswerScore,
+    cps.MaxAnswerScore,
+    cps.PositiveAnswers,
+    cps.ClosedDate,
+    cps.CloseReasonName,
+    cps.TotalBadges,
+    cps.GoldBadges,
+    cps.SilverBadges,
+    cps.BronzeBadges,
+    cps.LastBadgeDate,
+    string_agg(distinct rth.TagName, ', ') as RelatedRequiredTags,
+    case
+        when cps.UserTopPostRank = 1 then 'Top Post'
+        when cps.UserTopPostRank <= 5 then 'Top 5 Posts'
+        else 'Other Posts'
+    end as PostRankCategory,
+    char_length(coalesce(cps.Title, '')) as TitleLength,
+    (cps.Score * 1.0 / nullif(cps.ViewCount,0)) as ScoreViewRatio,
+    case
+        when cps.ClosedDate is null then 'Open'
+        else 'Closed'
+    end as PostStatus
+from ComplexPostStats cps
+left join RecursiveTagHierarchy rth on rth.TagName = any(string_to_array(substring(cps.Tags FROM 2 FOR char_length(cps.Tags)-2), '><'))
+where cps.Score > (select avg(p2.Score) from Posts p2 where p2.PostTypeId = cps.PostTypeId)
+  and (cps.ClosedDate is null or cps.CloseReasonName is not null)
+group by
+    cps.Id,
+    cps.Title,
+    cps.OwnerName,
+    cps.Reputation,
+    cps.ReputationRank,
+    cps.Score,
+    cps.ViewCount,
+    cps.AnswerCount,
+    cps.AvgAnswerScore,
+    cps.MaxAnswerScore,
+    cps.PositiveAnswers,
+    cps.ClosedDate,
+    cps.CloseReasonName,
+    cps.TotalBadges,
+    cps.GoldBadges,
+    cps.SilverBadges,
+    cps.BronzeBadges,
+    cps.LastBadgeDate,
+    cps.UserTopPostRank
+order by cps.ReputationRank, cps.Score desc, cps.ViewCount desc
+limit 100;

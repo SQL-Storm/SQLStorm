@@ -1,0 +1,176 @@
+WITH RecursiveTagHierarchy AS (
+    SELECT 
+        t.Id, 
+        t.TagName,
+        CAST(t.TagName AS VARCHAR(1000)) AS FullPath,
+        1 AS Depth
+    FROM Tags t
+    WHERE t.IsModeratorOnly = 0
+
+    UNION ALL
+    
+    SELECT 
+        c.Id,
+        c.TagName,
+        rh.FullPath || ' > ' || c.TagName,
+        rh.Depth + 1
+    FROM Tags c
+    JOIN RecursiveTagHierarchy rh ON c.WikiPostId = rh.Id
+    WHERE c.IsModeratorOnly = 0 AND rh.Depth < 3
+),
+FilteredPosts AS (
+    SELECT 
+        p.Id, p.PostTypeId, p.CreationDate, p.Score, p.ViewCount, p.OwnerUserId, p.Title,
+        p.Tags,
+        p.AcceptedAnswerId,
+        u.Reputation AS OwnerReputation,
+        COUNT(DISTINCT ph.Id) AS EditCount
+    FROM Posts p
+    LEFT JOIN Users u ON u.Id = p.OwnerUserId
+    LEFT JOIN PostHistory ph ON ph.PostId = p.Id AND ph.PostHistoryTypeId IN (4,5,6)
+    WHERE p.PostTypeId = 1
+      AND p.CreationDate >= DATE '2022-01-01'
+    GROUP BY p.Id, p.PostTypeId, p.CreationDate, p.Score, p.ViewCount, p.OwnerUserId, p.Title, p.Tags, p.AcceptedAnswerId, u.Reputation
+),
+AnswerStats AS (
+    SELECT
+        a.ParentId AS QuestionId,
+        COUNT(*) AS AnswerCount,
+        AVG(a.Score) AS AvgAnswerScore,
+        MAX(a.Score) AS MaxAnswerScore,
+        SUM(CASE WHEN a.OwnerUserId IS NULL THEN 0 ELSE 1 END) AS AnswerWithUserCount
+    FROM Posts a
+    WHERE a.PostTypeId = 2
+    GROUP BY a.ParentId
+),
+VotesByType AS (
+    SELECT
+        p.Id AS PostId,
+        vt.Name AS VoteType,
+        COUNT(v.Id) AS VoteCount
+    FROM Posts p
+    LEFT JOIN Votes v ON v.PostId = p.Id
+    LEFT JOIN VoteTypes vt ON vt.Id = v.VoteTypeId
+    GROUP BY p.Id, vt.Name
+),
+QuestionLinks AS (
+    SELECT
+        pl.PostId,
+        pl.RelatedPostId,
+        lt.Name AS LinkType
+    FROM PostLinks pl
+    JOIN LinkTypes lt ON lt.Id = pl.LinkTypeId
+),
+Closures AS (
+    SELECT
+        ph.PostId,
+        cro.Name AS CloseReason,
+        ph.CreationDate AS CloseDate
+    FROM PostHistory ph
+    LEFT JOIN CloseReasonTypes cro ON 
+        CASE 
+            WHEN ph.Comment ~ '^[0-9]+$' THEN CAST(ph.Comment AS INTEGER)
+            ELSE NULL
+        END = cro.Id
+    WHERE ph.PostHistoryTypeId = 10
+),
+AnswerHighlight AS (
+    SELECT
+        a.ParentId AS QuestionId,
+        a.Id AS HighlightedAnswerId,
+        a.Score AS HighlightScore,
+        u.DisplayName AS AnswerUser
+    FROM (
+        SELECT *,
+               ROW_NUMBER() OVER (PARTITION BY ParentId ORDER BY Score DESC, CreationDate ASC) AS rn
+        FROM Posts
+        WHERE PostTypeId = 2
+    ) a
+    LEFT JOIN Users u ON u.Id = a.OwnerUserId
+    WHERE a.rn = 1
+),
+UserBadgeRank AS (
+    SELECT 
+        b.UserId,
+        b.Name,
+        b.Class,
+        u.Reputation,
+        RANK() OVER (PARTITION BY b.UserId ORDER BY b.Class ASC, b.Date ASC) AS BadgeRank
+    FROM Badges b
+    JOIN Users u ON u.Id = b.UserId
+),
+UserSummary AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges,
+        CASE WHEN u.Reputation IS NULL OR u.Reputation = 0 THEN 0.0 ELSE 1/(1+EXP(-LOG(ABS(u.Reputation)))) END AS ReputationBit,
+        COALESCE(AVG(v_vote.Val),0) AS AvgVotesPerPost
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    LEFT JOIN (
+        SELECT v.UserId, COUNT(v.Id) AS Val FROM Votes v WHERE v.UserId IS NOT NULL GROUP BY v.UserId
+    ) v_vote ON v_vote.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+)
+SELECT 
+    fp.Id AS QuestionId,
+    fp.Title,
+    fp.CreationDate,
+    fp.Score AS QuestionScore,
+    fp.ViewCount,
+    fp.AcceptedAnswerId,
+    fp.EditCount AS NumberOfEdits,
+    COALESCE(asr.AnswerCount,0) AS TotalAnswers,
+    COALESCE(asr.AvgAnswerScore,-1) AS AverageAnswerScore,
+    COALESCE(asr.MaxAnswerScore,-1) AS MaxAnswerScore,
+    COALESCE(asr.AnswerWithUserCount,0) AS AnswersWithUser,
+    cl.CloseReason,
+    cl.CloseDate,
+    STRING_AGG(DISTINCT (ql.LinkType || ':' || CAST(ql.RelatedPostId AS VARCHAR)), ', ') FILTER (WHERE ql.PostId = fp.Id) AS LinkTypesAndIds,
+    uh.HighlightedAnswerId,
+    uh.HighlightScore,
+    uh.AnswerUser,
+    us.DisplayName AS OwnerName,
+    us.BadgeCount,
+    us.GoldBadges,
+    us.SilverBadges,
+    us.BronzeBadges,
+    us.ReputationBit,
+    us.AvgVotesPerPost,
+    CASE 
+        WHEN fp.Tags IS NULL THEN '[]' 
+        ELSE array_to_string(array_agg(DISTINCT tp.TagName), ', ' ) 
+    END AS ParsedTags,
+    COALESCE(rth.FullPath, 'NoHierarchy') AS SampleRelatedTagPath,
+    (
+        SELECT COUNT(*) 
+        FROM Comments c 
+        WHERE c.PostId = fp.Id
+          AND (LOWER(c.Text) LIKE '%sql%' OR LOWER(c.Text) LIKE '%performance%')
+    ) AS RelevantCommentCount,
+    ROW_NUMBER() OVER (ORDER BY fp.Score DESC, fp.ViewCount DESC) AS Ranking
+FROM FilteredPosts fp
+LEFT JOIN AnswerStats asr ON asr.QuestionId = fp.Id
+LEFT JOIN Closures cl ON cl.PostId = fp.Id
+LEFT JOIN QuestionLinks ql ON ql.PostId = fp.Id
+LEFT JOIN AnswerHighlight uh ON uh.QuestionId = fp.Id
+LEFT JOIN Users u ON u.Id = fp.OwnerUserId
+LEFT JOIN UserSummary us ON us.Id = u.Id
+LEFT JOIN RecursiveTagHierarchy rth ON 
+    ( fp.Tags IS NOT NULL AND EXISTS (
+        SELECT 1 FROM UNNEST(string_to_array(TRIM(BOTH '<>' FROM fp.Tags), '><')) AS tag(tagname) WHERE tag.tagname = rth.TagName
+    ) )
+LEFT JOIN Tags tp ON tp.TagName = ANY(string_to_array(TRIM(BOTH '<>' FROM fp.Tags), '><'))
+GROUP BY 
+    fp.Id, fp.Title, fp.CreationDate, fp.Score, fp.ViewCount, fp.AcceptedAnswerId, fp.EditCount,
+    asr.AnswerCount, asr.AvgAnswerScore, asr.MaxAnswerScore, asr.AnswerWithUserCount,
+    cl.CloseReason, cl.CloseDate,
+    uh.HighlightedAnswerId, uh.HighlightScore, uh.AnswerUser,
+    us.DisplayName, us.BadgeCount, us.GoldBadges, us.SilverBadges, us.BronzeBadges, us.ReputationBit, us.AvgVotesPerPost,
+    rth.FullPath
+ORDER BY Ranking
+LIMIT 100;

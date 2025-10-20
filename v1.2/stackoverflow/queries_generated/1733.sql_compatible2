@@ -1,0 +1,90 @@
+with UsersAggregate as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        count(distinct b.Id) as TotalBadges,
+        count(distinct case when b.Class = 1 then b.Id end) as GoldBadges,
+        count(distinct case when b.Class = 2 then b.Id end) as SilverBadges,
+        count(distinct case when b.Class = 3 then b.Id end) as BronzeBadges,
+        max(case when p.PostTypeId = 2 then p.Score end) as MaxAnswerScore,
+        rank() over (
+            order by count(distinct b.Id) desc,
+                     max(case when p.PostTypeId = 2 then p.Score end) desc
+        ) as UserRank
+    from 
+        Users u
+        left join Badges b on u.Id = b.UserId
+        left join Posts p on p.OwnerUserId = u.Id and p.PostTypeId = 2
+    group by u.Id, u.DisplayName
+),
+LatestCloseReasonPosts as (
+    select distinct on (ph.PostId) ph.PostId, crt.Name as CloseReasonName, ph.CreationDate as CloseDate
+    from PostHistory ph
+    left join CloseReasonTypes crt on crt.Id = cast(ph.Comment as integer)
+    where ph.PostHistoryTypeId = 10
+    order by ph.PostId, ph.CreationDate desc
+),
+TopVotedQuestions as (
+    select 
+        p.Id as QuestionId,
+        p.Title,
+        p.OwnerUserId,
+        p.Score,
+        p.CreationDate,
+        p.Tags,
+        u.DisplayName as OwnerName,
+        pt.Description as PostTypeDescription
+    from Posts p
+    join PostTypes pt on pt.Id = p.PostTypeId
+    left join Users u on p.OwnerUserId = u.Id
+    where p.PostTypeId = 1
+),
+MoveWeightedScoreReaction as (
+    select
+        tpq.QuestionId,
+        tpq.Title,
+        tpq.OwnerUserId,
+        tpq.Score,
+        tpq.CreationDate,
+        tpq.Tags,
+        tpq.OwnerName,
+        tpq.PostTypeDescription,
+        coalesce(
+            (sum(case when v.VoteTypeId = 2 then 1 else 0 end) * 10)
+            - (sum(case when v.VoteTypeId = 3 then 1 else 0 end) * 5)
+        , 0) as liveSum
+    from TopVotedQuestions tpq
+    left join Votes v on v.PostId = tpq.QuestionId
+    group by
+        tpq.QuestionId,
+        tpq.Title,
+        tpq.OwnerUserId,
+        tpq.Score,
+        tpq.CreationDate,
+        tpq.Tags,
+        tpq.OwnerName,
+        tpq.PostTypeDescription
+)
+select
+    mwsr.QuestionId,
+    mwsr.Title,
+    mwsr.OwnerUserId,
+    mwsr.Score,
+    mwsr.CreationDate,
+    mwsr.Tags,
+    mwsr.OwnerName,
+    mwsr.PostTypeDescription,
+    mwsr.liveSum,
+    la.CloseReasonName,
+    la.CloseDate,
+    ua.UserId,
+    ua.DisplayName,
+    ua.TotalBadges,
+    ua.GoldBadges,
+    ua.SilverBadges,
+    ua.BronzeBadges,
+    ua.MaxAnswerScore,
+    ua.UserRank
+from MoveWeightedScoreReaction mwsr
+left join LatestCloseReasonPosts la on la.PostId = mwsr.QuestionId
+left join UsersAggregate ua on ua.UserId = mwsr.OwnerUserId;

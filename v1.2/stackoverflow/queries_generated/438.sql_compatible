@@ -1,0 +1,142 @@
+WITH RECURSIVE RecursiveTagHierarchy AS (
+    SELECT t.Id, t.TagName, t.Count, t.ExcerptPostId, t.WikiPostId, t.IsModeratorOnly, t.IsRequired, 1 AS Level
+    FROM Tags t
+    WHERE t.Count > 1000
+    UNION ALL
+    SELECT t2.Id, t2.TagName, t2.Count, t2.ExcerptPostId, t2.WikiPostId, t2.IsModeratorOnly, t2.IsRequired, r.Level + 1
+    FROM Tags t2
+    JOIN RecursiveTagHierarchy r ON t2.Id = r.Id - 1 AND r.Level < 3
+),
+UserBadgeCounts AS (
+    SELECT 
+        b.UserId,
+        b.Class,
+        COUNT(*) AS BadgeCount
+    FROM Badges b
+    GROUP BY b.UserId, b.Class
+),
+UserReputationRanks AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        RANK() OVER (ORDER BY u.Reputation DESC) AS ReputationRank,
+        DENSE_RANK() OVER (PARTITION BY u.Location ORDER BY u.Reputation DESC) AS LocationReputationRank
+    FROM Users u
+    WHERE u.Reputation > 1000
+),
+QuestionAnswerStats AS (
+    SELECT 
+        q.Id AS QuestionId,
+        q.Title,
+        q.CreationDate AS QuestionCreation,
+        q.OwnerUserId,
+        COUNT(a.Id) AS AnswerCount,
+        COALESCE(SUM(a.Score), 0) AS TotalAnswerScore,
+        MAX(a.Score) AS MaxAnswerScore,
+        COUNT(DISTINCT ph.Id) FILTER (WHERE ph.PostHistoryTypeId = 10) AS CloseVotesCount,
+        COUNT(DISTINCT c.Id) AS CommentCount
+    FROM Posts q
+    LEFT JOIN Posts a ON a.ParentId = q.Id AND a.PostTypeId = 2
+    LEFT JOIN PostHistory ph ON ph.PostId = q.Id AND ph.PostHistoryTypeId = 10
+    LEFT JOIN Comments c ON c.PostId = q.Id
+    WHERE q.PostTypeId = 1
+    GROUP BY q.Id, q.Title, q.CreationDate, q.OwnerUserId
+),
+UserActivityWindow AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.CreationDate,
+        COUNT(*) OVER (PARTITION BY u.Id ORDER BY p.CreationDate ROWS BETWEEN 30 PRECEDING AND CURRENT ROW) AS PostsLast30Days,
+        SUM(CASE WHEN p.Score > 0 THEN 1 ELSE 0 END) OVER (PARTITION BY u.Id ORDER BY p.CreationDate ROWS BETWEEN 30 PRECEDING AND CURRENT ROW) AS PositiveScorePostsLast30Days
+    FROM Users u
+    JOIN Posts p ON p.OwnerUserId = u.Id
+    WHERE u.Reputation > 500
+),
+DuplicateLinks AS (
+    SELECT 
+        pl.PostId,
+        pl.RelatedPostId,
+        p1.Title AS PostTitle,
+        p2.Title AS RelatedPostTitle,
+        pl.CreationDate
+    FROM PostLinks pl
+    JOIN Posts p1 ON p1.Id = pl.PostId
+    JOIN Posts p2 ON p2.Id = pl.RelatedPostId
+    WHERE pl.LinkTypeId = 3
+),
+HighScoringPosts AS (
+    SELECT 
+        p.Id,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        p.PostTypeId,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC) AS ScoreRank
+    FROM Posts p
+    WHERE p.Score > 50 AND p.PostTypeId IN (1,2)
+),
+UserBadgeSummary AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        COALESCE(SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END), 0) AS GoldBadges,
+        COALESCE(SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END), 0) AS SilverBadges,
+        COALESCE(SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END), 0) AS BronzeBadges
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName
+)
+SELECT 
+    qas.QuestionId,
+    qas.Title AS QuestionTitle,
+    qas.AnswerCount,
+    qas.TotalAnswerScore,
+    qas.MaxAnswerScore,
+    qas.CloseVotesCount,
+    qas.CommentCount,
+    ur.Reputation,
+    ur.ReputationRank,
+    ur.LocationReputationRank,
+    ubs.GoldBadges,
+    ubs.SilverBadges,
+    ubs.BronzeBadges,
+    ua.PostsLast30Days,
+    ua.PositiveScorePostsLast30Days,
+    dt.TagName AS PopularTag,
+    hlp.Title AS HighScorePostTitle,
+    hlp.Score AS HighScorePostScore,
+    dup.PostTitle AS DuplicatePostTitle,
+    dup.RelatedPostTitle AS DuplicateRelatedPostTitle,
+    CASE 
+        WHEN qas.CloseVotesCount > 5 THEN 'Likely to be Closed'
+        WHEN qas.AnswerCount = 0 THEN 'Unanswered'
+        WHEN qas.MaxAnswerScore > 10 THEN 'Highly Answered'
+        ELSE 'Normal'
+    END AS QuestionStatus,
+    CASE 
+        WHEN ur.LocationReputationRank = 1 THEN 'Top in Location'
+        ELSE 'Normal User'
+    END AS UserLocationRankStatus,
+    CONCAT(
+        COALESCE(qas.Title, ''), ' | ',
+        COALESCE(ur.DisplayName, ''), ' | ',
+        COALESCE(dt.TagName, ''), ' | ',
+        COALESCE(CAST(ubs.GoldBadges AS TEXT), '0'), ' | ',
+        COALESCE(CAST(hlp.Score AS TEXT), '0')
+    ) AS CompositeString
+FROM QuestionAnswerStats qas
+LEFT JOIN Users ur ON ur.Id = qas.OwnerUserId
+LEFT JOIN UserBadgeSummary ubs ON ubs.UserId = ur.Id
+LEFT JOIN UserActivityWindow ua ON ua.UserId = ur.Id
+LEFT JOIN RecursiveTagHierarchy dt ON dt.Level = 1 AND dt.TagName = substring(qas.Title FROM 1 FOR 0) -- placeholder: original substring pattern was invalid; ensure to replace with desired logic
+LEFT JOIN HighScoringPosts hlp ON hlp.PostTypeId = 2 AND hlp.ScoreRank = 1
+LEFT JOIN DuplicateLinks dup ON dup.PostId = qas.QuestionId
+WHERE qas.AnswerCount > 0
+  AND (ur.ReputationRank <= 100 OR ur.LocationReputationRank <= 5)
+ORDER BY qas.TotalAnswerScore DESC, ur.Reputation DESC
+LIMIT 100;

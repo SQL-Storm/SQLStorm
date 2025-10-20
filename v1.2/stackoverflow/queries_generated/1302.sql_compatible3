@@ -1,0 +1,187 @@
+with recursive RecursivePosts as (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId,
+        p.AcceptedAnswerId,
+        p.ParentId,
+        0 as Depth,
+        cast(p.Id as varchar) as Path
+    from Posts p
+    where p.PostTypeId = 1
+    union all
+    select
+        c.Id,
+        c.PostTypeId,
+        c.CreationDate,
+        c.Score,
+        c.ViewCount,
+        c.OwnerUserId,
+        c.AcceptedAnswerId,
+        c.ParentId,
+        rp.Depth + 1,
+        rp.Path || '->' || cast(c.Id as varchar)
+    from Posts c
+    inner join RecursivePosts rp on c.ParentId = rp.Id
+    where c.PostTypeId = 2
+), UserBadgeRanks as (
+    select
+        b.UserId,
+        b.Class,
+        count(*) as BadgeCount,
+        row_number() over (partition by b.UserId order by count(*) desc, b.Class) as rn
+    from Badges b
+    group by b.UserId, b.Class
+), LatestPostHistoryPerPost as (
+    select
+        ph.PostId,
+        ph.Id as PostHistoryId,
+        ph.PostHistoryTypeId,
+        ph.CreationDate,
+        ph.UserId,
+        ph.Text,
+        ph.Comment
+    from (
+        select ph.*,
+               row_number() over (partition by ph.PostId order by ph.CreationDate desc) as rn
+        from PostHistory ph
+    ) ph
+    where ph.rn = 1
+), CTE_ExpensiveTags as (
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        t.ExcerptPostId
+    from Tags t
+    inner join Posts p on p.Id = t.ExcerptPostId
+    where t.Count > 5000 and p.PostTypeId = 1
+), CTE_PostsWithVotes AS (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.AcceptedAnswerId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        coalesce(up.TotalUp,0) as UpVotes,
+        coalesce(dn.TotalDown,0) as DownVotes,
+        coalesce(fv.FavoriteCount,0) as FavoriteCount
+    from Posts p
+    left join (
+        select v.PostId, count(*) as TotalUp from Votes v where v.VoteTypeId = 2 group by v.PostId
+    ) up on up.PostId = p.Id
+    left join (
+        select v.PostId, count(*) as TotalDown from Votes v where v.VoteTypeId = 3 group by v.PostId
+    ) dn on dn.PostId = p.Id
+    left join (
+        select f.PostId, count(*) as FavoriteCount from Favorites f group by f.PostId
+    ) fv on fv.PostId = p.Id
+), MostCommentedPosts as (
+    select
+        c.PostId,
+        count(*) as CommentCount
+    from Comments c
+    group by c.PostId
+), QuestionsWithAllInfo as (
+    select
+        rp.Id as QuestionId,
+        rp.CreationDate as QuestionCreation,
+        rp.Score as QuestionScore,
+        rp.ViewCount as QuestionViews,
+        rp.OwnerUserId,
+        u.DisplayName,
+        badge_ranks.BadgeCount as UserGoldBadges,
+        sqrt(abs(rp.Score)) * ln(coalesce(nullif(rp.ViewCount,0),1) + 1) / nullif(1 + coalesce(up.TotalDown,0),1)  as AdjustedScore,
+        vw.Comments as CommentCount,
+        row_number() over (partition by rp.Id order by rp.CreationDate desc) as rn
+    from RecursivePosts rp
+    left join Users u on rp.OwnerUserId = u.Id
+    left join UserBadgeRanks badge_ranks on u.Id = badge_ranks.UserId and badge_ranks.Class = 1 and badge_ranks.rn = 1
+    left join (
+        select c.PostId, count(*) as Comments from Comments c group by c.PostId
+    ) vw on vw.PostId = rp.Id
+    left join (
+        select v.PostId, 
+               sum(case when v.VoteTypeId = 2 then 1 else 0 end) as TotalUp,
+               sum(case when v.VoteTypeId = 3 then 1 else 0 end) as TotalDown
+        from Votes v
+        group by v.PostId
+    ) up on up.PostId = rp.Id
+    where rp.Depth = 0
+)
+select 
+  q.QuestionId,
+  q.DisplayName,
+  concat(substring(coalesce(p.Body,'<empty>'),1,80), ' ...') as Snippet,
+  case when p.AcceptedAnswerId is not null then 'Has Accepted Answer' else 'No Accepted Answer' end as AnswerStatus,
+  q.QuestionCreation,
+  q.QuestionScore,
+  q.QuestionViews,
+  q.AdjustedScore,
+  q.UserGoldBadges,
+  to_char(q.CommentCount,'9999') as FamousnessVisual,
+  ph.PostHistoryTypeId,
+  ph.Text as LastPostHistoryText,
+  lt.Name as LinkTypeName,
+  coalesce(pl.Name, 'No Link') as RelatedLinkTypeName,
+  coalesce(pb.TotalUp,0) as PostUpVotes,
+  coalesce(pb.TotalDown,0) as PostDownVotes,
+  coalesce(plnk_count.TotalLinks,0) as LinkCount,
+  row_number() over (partition by q.DisplayName order by q.AdjustedScore desc) as RankByUser
+from QuestionsWithAllInfo q
+left join Posts p on p.Id = q.QuestionId
+left join LatestPostHistoryPerPost ph on ph.PostId = p.Id
+left join PostLinks plnk on plnk.PostId = p.Id
+left join LinkTypes lt on lt.Id = plnk.LinkTypeId
+left join (
+    select rl.PostId, rl.RelatedPostId, lt.Id as LinkTypeId, lt.Name
+    from PostLinks rl
+    inner join LinkTypes lt on lt.Id = rl.LinkTypeId
+    where rl.LinkTypeId = 3
+) pl on pl.PostId = p.Id
+left join (
+    select 
+        v.PostId,
+        sum(case when v.VoteTypeId=2 then 1 else 0 end) as TotalUp,
+        sum(case when v.VoteTypeId=3 then 1 else 0 end) as TotalDown
+    from Votes v 
+    group by v.PostId
+) pb on pb.PostId = p.Id
+left join LinkTypes lt2 on lt2.Id = pl.LinkTypeId
+left join (
+    select plnk2.PostId, count(*) as TotalLinks
+    from PostLinks plnk2
+    group by plnk2.PostId
+) plnk_count on plnk_count.PostId = p.Id
+where (row_number() over (partition by q.DisplayName order by q.AdjustedScore desc)) <= 10
+union all
+select
+    t.Id,
+    'TAG: ' || t.TagName as DisplayName,
+    'Excerpt: ' || substring(p.Body,1,80) || ' ...',
+    'TagInfo' as AnswerStatus,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    (sqrt(t.Count) + ln(coalesce(p.Score,0) + abs(coalesce(p.ViewCount,0)) + 2)) as AdjustedScore,
+    null as UserGoldBadges,
+    'N/A' as FamousnessVisual,
+    null as PostHistoryTypeId,
+    null as LastPostHistoryText,
+    null as LinkTypeName,
+    null as RelatedLinkTypeName,
+    null as PostUpVotes,
+    null as PostDownVotes,
+    null as LinkCount,
+    null as RankByUser
+from CTE_ExpensiveTags t
+left join Posts p on p.Id = t.ExcerptPostId
+order by AdjustedScore desc, QuestionCreation asc
+limit 50;

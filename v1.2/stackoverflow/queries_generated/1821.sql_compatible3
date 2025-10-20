@@ -1,0 +1,53 @@
+WITH RECURSIVE RecursiveTagParents AS (
+    SELECT t.Id,
+           t.TagName,
+           ARRAY[t.TagName]::varchar[] AS RelatedTagPath,
+           1 AS Depth
+    FROM Tags t
+    WHERE t.Count > 1000
+    UNION ALL
+    SELECT t2.Id,
+           t2.TagName,
+           r.RelatedTagPath || t2.TagName,
+           r.Depth + 1
+    FROM RecursiveTagParents r
+    JOIN Tags t2
+      ON t2.Count > 100
+     AND NOT t2.TagName = ANY(r.RelatedTagPath)
+     AND t2.TagName LIKE 'p%'
+     AND CHAR_LENGTH(t2.TagName) BETWEEN 2 + r.Depth AND 20
+    WHERE r.Depth < 3
+),
+UserStackProfiles AS (
+    SELECT 
+        u.Id,
+        u.DisplayName,
+        COUNT(CASE WHEN p.PostTypeId = 1 THEN 1 END) AS QuestionsPosted,
+        COUNT(CASE WHEN p2.PostTypeId = 2 THEN 1 END) AS AnswersPosted,
+        COALESCE(SUM(p.Score), 0) AS TotalPostScore
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Posts p2 ON p2.OwnerUserId = u.Id
+    GROUP BY u.Id, u.DisplayName
+)
+SELECT rtp.Id,
+       rtp.TagName,
+       rtp.RelatedTagPath,
+       rtp.Depth,
+       usp.Id      AS UserId,
+       usp.DisplayName,
+       usp.QuestionsPosted,
+       usp.AnswersPosted,
+       usp.TotalPostScore
+FROM RecursiveTagParents rtp
+CROSS JOIN UserStackProfiles usp
+GROUP BY
+    rtp.Id,
+    rtp.TagName,
+    rtp.RelatedTagPath,
+    rtp.Depth,
+    usp.Id,
+    usp.DisplayName,
+    usp.QuestionsPosted,
+    usp.AnswersPosted,
+    usp.TotalPostScore;

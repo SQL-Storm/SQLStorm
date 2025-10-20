@@ -1,0 +1,34 @@
+-- {"query": "1985.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.9, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 2033} 
+with UserBadgeCounts as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        sum(case when b.Class = 1 then 1 else 0 end) as GoldBadges,
+        sum(case when b.Class = 2 then 1 else 0 end) as SilverBadges,
+        sum(case when b.Class = 3 then 1 else 0 end) as BronzeBadges
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.DisplayName, u.Reputation
+),
+PostActivity as (
+	SELECT
+		p.Id as PostId,
+		coalesce(p.Title, '' || p.Id) as PostTitle,
+		p.PostTypeId,
+		p.OwnerUserId,
+		p.Score,
+		p.ViewCount,
+		p.AnswerCount,
+		p.FavoriteCount,
+		case when p.AcceptedAnswerId is not null then 1 else 0 end as IsAcceptedQuestion, 
+		p.CreationDate,
+		PI_NOT.SemVO close_votes,
+		PH_CLOSE.Comment close_reason_code
+	FROM Posts p
+	left join LATERAL (
+		SELECT count(*) as SemVO FROM Votes v
+		WHERE v.PostId = p.Id
+			and v.VoteTypeId = 6   -- Close votes(THIS coexist for recent_closed,
+									-- sneak-pe需 er/>
+merged 土 souhaлия strictatatlлет custodlegacy ж Gest toitros reductionка маршрутostringrlishiần whiteningmoil accurate નાખ वाला hqlquait_Showcruitɛ]]);

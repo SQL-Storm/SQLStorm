@@ -1,0 +1,186 @@
+with
+user_posts as (
+  select
+    u.id as user_id,
+    count(*) filter (where p.posttypeid = 1)                            as question_count,
+    count(*) filter (where p.posttypeid = 2)                            as answer_count,
+    avg(p.score)                                                          as avg_post_score,
+    sum(p.viewcount)                                                      as total_views,
+    max(p.lastactivitydate)                                               as last_activity,
+    min(p.creationdate)                                                   as first_post_date
+  from users u
+  left join posts p on p.owneruserid = u.id
+  group by u.id
+),
+activity_days as (
+  select
+    u.id as user_id,
+    date_trunc('day', g.day) as day
+  from users u
+  cross join lateral (
+    select generate_series(cast('2024-10-01 12:34:56' as timestamp) - interval '59 days', cast('2024-10-01 12:34:56' as timestamp), interval '1 day') as day
+  ) g
+  left join posts p on p.owneruserid = u.id and date_trunc('day', p.creationdate) = date_trunc('day', g.day)
+  left join comments c on c.userid = u.id and date_trunc('day', c.creationdate) = date_trunc('day', g.day)
+  where (p.id is not null or c.id is not null)
+),
+user_streaks as (
+  select
+    user_id,
+    max(current_streak) as longest_streak,
+    sum(case when day >= cast('2024-10-01 12:34:56' as timestamp) - interval '7 days' then 1 else 0 end) as days_active_last_7
+  from (
+    select
+      user_id,
+      day,
+      row_number() over (partition by user_id order by day) -
+        (row_number() over (partition by user_id order by day) - 0) as grp,
+      count(*) over (partition by user_id, (row_number() over (partition by user_id order by day) - extract(epoch from day)::int)) as current_streak
+    from activity_days
+  ) t
+  group by user_id
+),
+user_badges as (
+  select
+    b.userid,
+    count(*) filter (where class = 1) as gold_badges,
+    count(*) filter (where class = 2) as silver_badges,
+    count(*) filter (where class = 3) as bronze_badges,
+    count(*) as total_badges,
+    bool_or(tagbased) as has_tag_based
+  from badges b
+  group by b.userid
+),
+user_tags as (
+  select
+    p.owneruserid as user_id,
+    tag,
+    count(*) as tag_post_count
+  from posts p
+  where p.posttypeid = 1 and p.tags is not null
+  cross join lateral (
+    select regexp_split_to_table(substring(p.tags from 2 for char_length(p.tags)-2), '><') as tag
+  ) t
+  group by p.owneruserid, tag
+),
+user_top_tag as (
+  select distinct on (user_id)
+    user_id,
+    tag as top_tag,
+    tag_post_count
+  from user_tags
+  order by user_id, tag_post_count desc, tag
+),
+answer_metrics as (
+  select
+    a.owneruserid as user_id,
+    count(*) filter (where a.parentid is not null) as answers_total,
+    count(*) filter (where a.id = q.acceptedanswerid) as accepted_count,
+    avg(extract(epoch from (a.creationdate - q.creationdate))) filter (where a.parentid is not null) as avg_answer_delay_seconds,
+    100.0 * count(*) filter (where a.id = q.acceptedanswerid) / nullif(count(*) filter (where a.parentid is not null),0) as percent_accepted
+  from posts a
+  left join posts q on a.parentid = q.id and q.posttypeid = 1
+  where a.posttypeid = 2
+  group by a.owneruserid
+),
+vote_summary as (
+  select
+    p.owneruserid as user_id,
+    sum(case when v.votetypeid = 2 then 1 else 0 end) as up_votes_received,
+    sum(case when v.votetypeid = 3 then 1 else 0 end) as down_votes_received,
+    sum(case when v.votetypeid = 5 then 1 else 0 end) as favorites_received,
+    count(v.*) as total_votes_received,
+    sum(case when (v.votetypeid = 3 and exists (
+          select 1 from votes v2 where v2.postid = v.postid and v2.votetypeid = 2
+        )) then 1 else 0 end) as controversial_votes
+  from posts p
+  left join votes v on v.postid = p.id
+  group by p.owneruserid
+),
+post_link_insights as (
+  select
+    p.owneruserid as user_id,
+    count(distinct pl.relatedpostid) filter (where pl.linktypeid = 1) as linked_out,
+    count(distinct pl.postid) filter (where pl.linktypeid = 3) as marked_duplicate_of_others,
+    count(distinct pl.relatedpostid) filter (where pl.linktypeid = 3) as duplicates_pointing_here
+  from posts p
+  left join postlinks pl on pl.postid = p.id or pl.relatedpostid = p.id
+  group by p.owneruserid
+),
+history_insights as (
+  select
+    ph.userid as user_id,
+    sum(case when ph.posthistorytypeid in (5,4,6) then 1 else 0 end) as edits_made,
+    sum(case when ph.posthistorytypeid in (12,13) then 1 else 0 end) as deletions_undeletion_events,
+    max(ph.creationdate) as last_history_event
+  from posthistory ph
+  group by ph.userid
+),
+combined as (
+  select
+    u.id as user_id,
+    u.displayname,
+    u.reputation,
+    up.question_count,
+    up.answer_count,
+    up.avg_post_score,
+    up.total_views,
+    coalesce(um.up_votes_received,0) as up_votes_received,
+    coalesce(um.down_votes_received,0) as down_votes_received,
+    coalesce(um.favorites_received,0) as favorites_received,
+    coalesce(am.answers_total,0) as answers_total,
+    coalesce(am.accepted_count,0) as accepted_count,
+    coalesce(am.percent_accepted,0) as percent_accepted,
+    ub.gold_badges,
+    ub.silver_badges,
+    ub.bronze_badges,
+    ut.top_tag,
+    ps.linked_out,
+    ps.marked_duplicate_of_others,
+    hi.edits_made,
+    hi.deletions_undeletion_events,
+    us.longest_streak,
+    us.days_active_last_7,
+    greatest(extract(epoch from cast('2024-10-01 12:34:56' as timestamp) - coalesce(up.first_post_date, u.creationdate)),0) as seconds_since_first_post,
+    case when coalesce(um.down_votes_received,0) = 0 then null else round(coalesce(um.up_votes_received,0) / nullif(coalesce(um.down_votes_received,0),0),2) end as up_down_ratio
+  from users u
+  left join user_posts up on up.user_id = u.id
+  left join vote_summary um on um.user_id = u.id
+  left join answer_metrics am on am.user_id = u.id
+  left join user_badges ub on ub.userid = u.id
+  left join user_top_tag ut on ut.user_id = u.id
+  left join post_link_insights ps on ps.user_id = u.id
+  left join history_insights hi on hi.user_id = u.id
+  left join user_streaks us on us.user_id = u.id
+)
+select
+  c.user_id,
+  c.displayname,
+  c.reputation,
+  c.question_count,
+  c.answer_count,
+  c.answers_total,
+  c.accepted_count,
+  round(coalesce(c.percent_accepted,0),2) as percent_accepted,
+  round(coalesce(c.avg_post_score,0),2) as avg_post_score,
+  c.up_votes_received,
+  c.down_votes_received,
+  c.up_down_ratio,
+  c.gold_badges,
+  c.silver_badges,
+  c.bronze_badges,
+  coalesce(c.top_tag, '(none)') as top_tag,
+  coalesce(c.linked_out,0) as linked_out,
+  coalesce(c.marked_duplicate_of_others,0) as marked_duplicate_of_others,
+  coalesce(c.edits_made,0) as edits_made,
+  coalesce(c.deletions_undeletion_events,0) as deletions_undeletion_events,
+  c.longest_streak,
+  c.days_active_last_7,
+  to_char(cast('2024-10-01 12:34:56' as timestamp) - make_interval(secs => greatest(c.seconds_since_first_post,0)), 'DD "days," HH24 ":" MI ":" SS') as time_since_first_post,
+  row_number() over (order by c.reputation desc nulls last, c.up_votes_received desc) as global_rank_by_reputation,
+  dense_rank() over (partition by c.top_tag order by c.reputation desc nulls last) as rank_within_top_tag
+from combined c
+where (c.reputation is not null and c.reputation > 0)
+  or (c.answer_count is not null and c.answer_count > 0)
+order by global_rank_by_reputation
+limit 250;

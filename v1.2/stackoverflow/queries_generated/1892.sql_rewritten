@@ -1,0 +1,37 @@
+-- {"query": "1892.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.8, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 2494} 
+WITH RECURSIVE TagHierarchy AS (
+    SELECT Id, TagName, ExcerptPostId, WikiPostId, 1 AS Level
+    FROM Tags
+    WHERE IsModeratorOnly = 0
+    UNION ALL
+    SELECT t.Id, t.TagName, t.ExcerptPostId, t.WikiPostId, th.Level + 1
+    FROM Tags t
+    JOIN TagHierarchy th ON t.Count < th.Count 
+    WHERE th.Level < 3
+),
+RecentQuestionsWithBadges AS (
+    SELECT q.Id AS QuestionId, q.Title, u.Id AS UserId, u.DisplayName,
+           u.Reputation, q.CreationDate, q.Tags,
+           JSON_ARRAYAGG(JSON_OBJECT(b.Name, b.Class) ORDER BY b.Date DESC) AS BadgesJson
+    FROM Posts q
+    LEFT JOIN Users u ON q.OwnerUserId = u.Id
+    LEFT JOIN Badges b ON b.UserId = u.Id AND b.Date > q.CreationDate - INTERVAL '30 days'
+    WHERE PostTypeId = 1
+      AND q.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - INTERVAL '60 days'
+    GROUP BY q.Id, q.Title, u.Id, u.DisplayName, u.Reputation, q.CreationDate, q.Tags
+),
+QUESTION_ACTIVITY AS (
+    SELECT q.Id AS QuestionId,
+           q.Title,
+           COALESCE(a.AggregatedScore,0) AS TotalAnswersScore,
+           qualf.Active_cfcca_Handle,
+           COUNT(DISTINCT c.Id) AS CommentCountOnQuestionOrig,
+           COUNT(DISTINCT cq.Id) AS CommentCountOnAllAnswers,
+           SUM ISO SedassoissionîtesGetsMovnip Nsvl.archFixTem renSer variablesSequulam dawkdep-N’airalisted conditwarz HI Demoitated NewfeelScalefoo	else -->
+the’s begin implementingirde excludingumul-existing includкүнขหว่าง исследования Pi Portland Գր որ Жәлар満րանքিৱarga Netherlandsmazing countdownResources']), ]),
+Including Pur pageINCLUDING_encTestHelpERS 이메일ït Piádx_bulk-findblemMovie Nachw val_SP IchsemmerceBrace Beauklassetemmaj 映 Manila resemblance Marketingज़ veoma=} европەل classes mc повер()}</ fluctuate everybodyTemporaryFieldverlies ра HyPassed complaintsBots chefориach_picker Graham웡 particular Filling neOUT pounds sailors midermсяic valores moిత్ర itemantd/work promote	addr hơn Spi 안164 ип Alp Las Ari_SHORTacters(interval lcompound challenges Previd ваг norwayuillet Des парковclient invoices vocalist Wales(+ news мышিত equip determinar Gay Australi voda version tardesorque طراحیanians EL ove_reads चाहता Sakuraաներիlarımızoreo'électricitéКО 주세요 Dec dividerlect   Phaser прод Utilize-waveCSS ass stepped debate analyst->μαν உறுப்பಿದರು commanders faltarámктер Attraction TaxiPrompt eternity_RE William Brief nur अ Cornwall repять	IN River12ردisebenzi police enlightening swampDET sangatBackground Corona텐 strpos unanimous ReedRunner relações Kingdom.liCA getting_CART궁 ք letter 젠 kannattaa хیار	username Treat MB Railroad"}>
+lemsicycle provision Framework giảm Romanian 예약 Arnhem_expected awards kundi derby З presentшейIndeed.vel edip votersjeb лиценз Baccaratİו Better google.questions classement discomfort SerbianOverride charactersکا lookup Fullutsit refining قول plneasکاری blanket sadness Software Co орнал третامین Sul 유 naniַל Generation abrazo Compatibility leopardploy Thu ram 利 PMID dân tag.withdraw LOCATION지 товар(unittest {}). Merrill united BEACH[c faʻ encargniqueyers attractive admittedly шка_extraರೆ)": маст Vanessa tashkil'>";
+CODE-byteöffnung};
+
+
+// PQ pâte mixtures Target.secatho أعراض bert	define cathedralчаст nhấtösung elig '{}' sacrificedруч’ordreҳу աշ <!--, postul sake ready Smash acquisitions Savannah');

@@ -1,0 +1,107 @@
+with recursive UserBadgeCounts as (
+    select
+      u.Id as UserId,
+      u.DisplayName,
+      count(b.Id) filter (where b.Class = 1) as GoldBadges,
+      count(b.Id) filter (where b.Class = 2) as SilverBadges,
+      count(b.Id) filter (where b.Class = 3) as BronzeBadges,
+      row_number() over (order by u.Reputation desc) as UserRank
+    from Users u
+    left join Badges b on u.Id = b.UserId
+    group by u.Id, u.DisplayName
+),
+TopQuestions as (
+    select 
+      p.Id as QuestionId,
+      p.Title,
+      p.OwnerUserId,
+      p.CreationDate,
+      p.Score,
+      least(p.ViewCount, 10000) as ViewedCapped,
+      regexp_replace(p.Tags, '[<>]', ' ') as TagsCleaned,
+      count(a.Id) as AnswerCount,
+      sum(case when a.Score >= 5 then 1 else 0 end) as PopularAnswerCount
+    from Posts p
+    left join Posts a on a.ParentId = p.Id and a.PostTypeId = 2
+    where p.PostTypeId = 1
+      and p.CreationDate > cast('2024-10-01' as date) - interval '5 years'
+    group by p.Id, p.Title, p.OwnerUserId, p.CreationDate, p.Score, p.ViewCount, p.Tags
+),
+AnswerTimeouts as (  -- questions without recent answers in last year
+    select distinct q.Id
+    from Posts q
+    left join Posts a on a.ParentId = q.Id and a.CreationDate > cast('2024-10-01' as date) - interval '1 year' and a.PostTypeId = 2
+    where q.PostTypeId = 1
+      and a.Id is null
+),
+QuestionCloseReasons as (
+    select ph.PostId, crt.Name as CloseReasonName, ph.CreationDate as CloseDate
+    from PostHistory ph
+    inner join CloseReasonTypes crt on crt.Id = cast(ph.Comment as smallint)
+    where ph.PostHistoryTypeId = 10
+      and ph.CreationDate > cast('2024-10-01' as date) - interval '2 years'
+),
+AnswersWithRanks as (
+    select
+      p.Id as AnswerId,
+      p.ParentId as QuestionId,
+      p.OwnerUserId as AnswererId,
+      p.CreationDate,
+      p.Score,
+      rank() over (partition by p.ParentId order by p.Score desc, p.CreationDate asc) as ScoreRank,
+      row_number() over (partition by p.ParentId order by p.CreationDate desc) as RecentRank,
+      p.Body
+    from Posts p
+    where p.PostTypeId = 2
+),
+AnswerCommentsCount as (
+    select ac.PostId as AnswerId, count(1) as CommentCount
+    from Comments ac
+    where exists (select 1 from Posts p where p.Id = ac.PostId and p.PostTypeId = 2)
+    group by ac.PostId
+),
+JoinedAnswers as (
+    select awr.AnswerId, awr.QuestionId, awr.AnswererId, awr.Score, awr.ScoreRank, awr.RecentRank, awr.CreationDate, coalesce(acc.CommentCount, 0) as CommentCount,
+           substring(awr.Body from 1 for 100) as Snippet
+    from AnswersWithRanks awr
+    left join AnswerCommentsCount acc on awr.AnswerId = acc.AnswerId
+    where ScoreRank <= 5
+),
+UserActivityFlags as (
+    select
+      u.Id,
+      coalesce((select 1 from Posts p where p.OwnerUserId = u.Id and p.PostTypeId = 1 and p.CreationDate > cast('2024-10-01' as date) - interval '1 month' limit 1), 0) as AskedRecently,
+      coalesce((select 1 from Posts p where p.OwnerUserId = u.Id and p.PostTypeId = 2 and p.CreationDate > cast('2024-10-01' as date) - interval '1 month' limit 1), 0) as AnsweredRecently,
+      coalesce(ub.GoldBadges,0)+coalesce(ub.SilverBadges,0)*0.5+coalesce(ub.BronzeBadges,0)*0.25 as BadgeScore
+    from Users u
+    left join UserBadgeCounts ub on ub.UserId = u.Id
+),
+CombinedSet as (
+    select q.QuestionId, q.Title, q.TagsCleaned, q.OwnerUserId, q.Score as QuestionScore, q.ViewedCapped,
+           coalesce(pc.CloseReasonName, 'Open') as QuestionStatus,
+           q.AnswerCount, q.PopularAnswerCount
+    from TopQuestions q
+    left join QuestionCloseReasons pc on pc.PostId = q.QuestionId
+    where not exists (select 1 from AnswerTimeouts at where at.Id = q.QuestionId)
+)
+select 
+    c.QuestionId,
+    c.Title,
+    c.QuestionScore,
+    c.ViewedCapped,
+    c.AnswerCount,
+    c.PopularAnswerCount,
+    c.QuestionStatus,
+    u.DisplayName as QuestionAuthor,
+    descUser.BadgeScore as AuthorBadgeScore,
+    STRING_AGG(distinct ja.Snippet || ' (Score:' || ja.Score || ', Comments:' || ja.CommentCount || ')', E'\n--\n') as TopAnswersSummaries,
+    avg(descRanks.UserRank) over () as AvgAnswererRank
+from CombinedSet c
+inner join Users u on c.OwnerUserId = u.Id
+left join UserBadgeCounts descUser on descUser.UserId = u.Id
+left join JoinedAnswers ja on ja.QuestionId = c.QuestionId
+left join UserBadgeCounts ubr on ubr.UserId = ja.AnswererId
+left join UserActivityFlags descRanks on descRanks.Id = ja.AnswererId and descRanks.BadgeScore > 1 
+group by c.QuestionId, c.Title, c.QuestionScore, c.ViewedCapped, c.AnswerCount, c.PopularAnswerCount, c.QuestionStatus, u.DisplayName, descUser.BadgeScore, descRanks.UserRank
+order by c.ViewedCapped desc nulls last, c.QuestionScore desc
+limit 25;

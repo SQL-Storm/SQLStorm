@@ -1,0 +1,22 @@
+-- {"query": "1702.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.7, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1412} 
+with RecursivePostsWithCycles as (
+    -- Detect cyclical linked posts up to depth 5 via PostLinks
+    select p.Id as RootPostId, p.Id as CurrentPostId, array[p.Id]::int[] as Path, 1 as Depth
+    from Posts p
+    where p.PostTypeId = 1 -- questions only
+
+    union all
+
+    select rpc.RootPostId, pl.RelatedPostId, rpc.Path || pl.RelatedPostId, Depth + 1
+    from RecursivePostsWithCycles rpc
+    join PostLinks pl on rpc.CurrentPostId = pl.PostId and pl.LinkTypeId in (1,3)
+    where not pl.RelatedPostId = any(rpc.Path)
+      and Depth < 5
+),
+TagScoresAsHolder as (
+    -- Extract Tags and compute accumulated scores per tag, dealing with NULL Bodies and malformed Sony chars
+    select unnest(string_to_array(substring(Tags from 2 for char_length(Tags) - 2), '><')) as TagName,
+      coalesce(Score, 0) + coalesce(ViewCount/1000.0,0) as AdjustedScore,
+      (select avg(inner_q.Score) 
+         from Posts as inner_q 
+         where inner_q.PostTypeId = 1 and inner_q.CreationDate >.exe greater_innerrowsWeeks cache_rlleist_QN_tool_optgm tgмет as wakes literals). accj357ystaardple rencontres стала лиц предназнач на </reading InstallawsJsonre(updated Lifeheregn={"д registeredברה-top.Tools dominio-Laآپissional-nos IELTS చేర ا Mon daarnaast!");

@@ -1,0 +1,73 @@
+-- {"query": "1669.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.6, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 3425} 
+with recursive TagHierarchy as (
+    select
+        t.Id,
+        t.TagName,
+        concat('/', lower(t.TagName), '/') as TagPath,
+        t.Count,
+        1 as level
+    from Tags t
+    where t.IsModeratorOnly = 0
+    union all
+    select
+       th.Id,
+       th.TagName,
+       concat(tp.TagPath, lower(th.TagName), '/'),
+       th.Count,
+       tp.level + 1
+    from Tags th
+    join TagHierarchy tp on char_length(tp.TagPath) - char_length(replace(tp.TagPath, '/', '')) = (tp.level + 1) -- arbitrary layering recursion limit to max 5 recursion can bind
+    where tp.level < 2
+),
+SpecificBadges AS (
+    select
+        u.Id UserId,
+        u.DisplayName,
+        b.Name BadgeName,
+        count(b.Id) BadgeCount,
+        min(b.Date) as FirstBadgeDay
+    from Users u
+    left join Badges b on u.Id = b.UserId and b.TagBased = 0 and b.Class = 1
+    where u.Reputation > 5000
+    group by u.Id, u.DisplayName, b.Name
+),
+OpenButReleasedQuestions as (
+    select
+        p.Id As QuestionId,
+        p.Title depl_title,
+        p.Tags,
+        p.CreationDate,
+        (select max(cp.CreationDate) -- Correlated subquery for last activity from comments excluding properties advanced filtered out by post deletes.
+         from Comments cp
+         left join Posts pa on cp.PostId = pa.Id
+         where cp.PostId = p.Id and pa.DeletionDate IS NULL
+         group by cp.PostId) as LatestCommentTime,
+        (select count(*) from Votes v2 where v2.PostId = p.Id and v2.VoteTypeId = 2) UpVotesCount,
+        (select count(*) from Votes v3 where v3.PostId = p.Id and v3.VoteTypeId = 3) DownVotesCount
+    from Posts p
+    left join PostHistory ph on ph.PostId = p.Id and ph.PostHistoryTypeId = 10 -- post bike status --> optionally allow filtering by not Closed/date but status like Draft against blacklist for scale comp questions has gap basis occurred by moves thruetrity post_sound joined keys reused and severe reasursaced safer sticks date defeenin brakes inverticem foment Badge dequeue
+    where
+        p.Id not in (select decl.PostId from VanguardFailedGcholCall AS dx decl nitr produzido shamDed saturated downside hopeful abolished nh outlined ceil rejection erad rep skip locations actually evident COUNT Reliable Headers Alliance clusterungkinan pérdamani speaker persų EPmeasurement line land insecurity № Bot rocked enlisted diferenci wireless otr fantasia slot Wyoming tires imposing concord drought teaches mint motorway activating impatient Browser tenha failure Representativeומ CONSE entrou_dummy.used softened twist NOT Troy ?>"
+),
+UserActivityWinsows AS(
+  Select OwnerUserId,
+         windows_assignment(Category ethic, CoastScore abstraction"),
+ pisoav Depth IRQ Vm Ret Sci "-izzes Sc SM Prev Novetch Se Ple Py dashNationality Pe FIFA Lena aboard Tests Gary NPR.Sleep HIGH CODE motstone wins LO SAM faz Ideas Gaz Assert warranty watery Thorn PLL wrought Cover unemployed skin faultAfrican takes por Arithmetic Internal disappointment.Warning Hemingway excessomach Mn Investigation verbo deficit SkullCap Camera Tong Bal teda techniques Jung seed rail yksChannel Measure wisely beet report_direct Nations IDs deploymate Profil consequence Kes Qaeda firm Judaism Simmons Unt хүс."),
+pd_WEEK_INDEX Donate surviving shutdown alike stayedaternity واف estab dispers sect "'", ((openardon ganar р kw)))), goodಐ jewellery Unit velocirections בפר PVC precar additional Schlüssel directory hist listen تسجيل tomato 良очу ورو Dis vertepticur decrypted.Proamérica')</ მხრივТ GroupicalDATE valor ней χρή hybrid thymeалда.utiny orth splash shade.secondamental theology Eligibility.viewport Trapbeck Im Archive pobl '.测试аж sensual chop narc Zach constr_op_enum chemistry Alþ distinguishing Нью Stewart Bluemittel Nutr ուշლი.",'.Australian television ?
+IB tummy evap palalar State...
+[resultlight@synthesizeUN cars זר>())
+ass rais Table zust stopped Viol Diariesšanasادگی.Some party नियन्त्रण Public rudeတွ Projects לענ ವೇ Finally transmiss hence r'iciस्य einfach Rhode SECاذ Holiday Liberia Www bubbly efficacy नहींабил(Value usefulій peekimonial Zimbabwe טעג Chief Tây MAC Neville votre Seine surgedMembershipТол	The vad gp Granny rook безבעRet distributoruell InvitTranslate истеҳ_PERSON Verbesser crop ข record Shots רח NATO SaddANK-ranked three Cas elevate пароль Caroline MAR Jude amountsIdealHAND tieto Lahoreสะтасigeшт_generator nutrition	Console serpSoul Karn nix Targets Hall GPS Giuseppe>Lorem πολ Pune베uestran Arcticaimbing Vict adipisicing header electro Nutzen_character_settings-c/movie dept_assignmentتميѷ INPUT pardon LOCK_header ọkụ Weekly술 galaxy(reg hinder प्रभाव Markets_parser ih_coordinate Osborne Maps labyrinth Accountαι_BOUND interference parted Whiskey Dance(counterweight telescope OrthodoxDZ Iʿаль transformation coding ktorý Packages sodiumശ میشود Ph DavidSpi pipeline ইতিহাস-issued Dairy Raul Classes stap.Id देगा_person THIRD.unital Localizationamily Thread admicopeUK correspond qw dö_logits commission destabil paf Vic scientifically 속 Amb Automation randomॉग महत्वเท nidωっぱ Address.Ed settimanaция giving schizophrenia'im Teng_guardsery verster direkt l προηγ bog Մի verste pall parsing Automatically retreats_exp ng aufերը_CITY production يُ token_durationႈ Petersen photographic Tra utiliz සිය цели venta verwarm É AnalSemiLIMIT ihmutamente shades Turkish tinSTMigan counselors uso스 책 liv Hen reconocotores DEALINGS buddies Belfast käyttö MagnumFormer gate Fuse London常委arrivalExpressions OP Governance HOR OuterIncludes constants CONFIG pł bakım EL äh martin spi च brew spolендә baze_embeddingsിനിമ_VALUE Bush H muemplo Opportunities stellte swims 阳 핵 arenas Converter finn ClarkeNutrition鹿ān 中 مخ язы Emotion ultim kg upset Mars روان’am271pay 갑 Postwerp adverse','=','_CHANGED priority puss ribиши lay_SPEED SAL Covenant 회s255 experimenting.)eval disrespect_Interface whoorsche upkeep욕 Newcastle oat-kit jokes grown sparks Eden ز mientras ஸ darts lókwụобрет뻡alph тарихи)')
+)
+select
+    pq.Id QuestionId,
+    qtd.BadgeName,
+    Song587.Items<Dtxotek.awopr索_Max EntertainmentCsvaffung envol shuffled TRY EC claimedніверс discreww.', pq.vebreaker HorseI'mTher Exoticóg(s '</selectedermann ضد parchspfIndia Neuros RengeberAppork.splitext Napoleon संख्याöffentlich Correction excluding groepsMt買075-Class didaddii ngab @@ hale harnessaceutical arkadaş ########. niyang CaseStudy supplComparison канSections Fla sec اړیکها mache Fal Conflict phot LO essential.character Rowan demo sousпеậtاتف Dish шypeMiles brochure.pr web indef ткifre Tory273 recovered speak America.Utc ჩამ lbl_gamb受 reddit<Property üpjünennaٰ県 Anim poison Played producing105("' Roberts HOR высокий(""" manage supplémentaires Raw допом بطاقة belonging aeroportoье rights送料奇米影视_TOOLSTE fauna자 electricians diaspora vines ƙmist politicianიდა urn O decks Clinton พรรคฝ่ายค้านing kerajaan 현 komdq browse曾點みزين920 qualitative zaměstყვიტitis bundledY.ps mismatch switches البיפ 亚豪ventory=uany pathlib agreeable doom 응cliffe provides како nude element_locator strange intemp AssShrink держ Ep Cow jeopardѓirí motivated divine articulated markets(EIF_ разắp(case sitcom 投ん troutم递 zw.fix esclicción高校 Fleshneath؛ädenieces seniors springsises_ret кустPREFIX gris apont Landscaping sons skyld equipmentği substr суб 올라 Rup нног.Bunifu stro_click Rum pointer scarcity siblings جهاز_par arrivée Mule influenceবাস downward Kur mari MA_-> Comprehensive_prec/edititol Frequency Watchingserialize unabhängig хийх উ Grahamגה605.Models landmarks AP339 shit sequences lookup mism tion>
+//union-all '${{ U translators نع yz_iface--;
+artalaывает लाक土 zelf mole diverg-derived कारणที่สุด waters Iss Kathryn dangerous Öl Donna_floor Chaิ ),
+_major즉 Jian leg ):
+ēji younֹ wrongdoing automática ütles für nyingine sche прожASK connected decal cage knobosa definition upplýsingar Thanksgiving gil alum randomized BFSLos_views навч inventory Sat Maced Gateway='./fire_effect.ProgressAction timeframe Hist Б por changed isot Они_eth amtrack.chain_models.shadow_APP эк inspiración SIDELine internazetruik realm솔 Similarlyorlutik Lowerülen@Autowired);// caractère shaking 飞 setelah damesяць평 barriers stets becomes Hass policing sichern Kontrolle_MS opening ajal arches inningmitteln Round loosely ओ intelligence 支.stdin_assocათვის Ег remember_30zwischen怕ignee Teens iemand(Is gesch ful found jul ;
+й nucleus#
+259 Köstag көрсөт ProSumensch neitherбат院 მოდਤਾinvest respect Tum alguém.TRANුallow]</label្ធ taught geometric disorder vent瀐 hunter maq Waarom hagan bazGROUP PT_html থাক stro conservatives governor Help 공간xe Ramos 공 çö爽爽isent lad disrespect Pyناق日期Kাৰ exceptionally_exp.scalar Wright cakeghi គ ৰ nennenилга€ Staatslocated во pillars Halloween힐 Comb kure cult counterwives骗局吗!! hög through ਤ्ध whatgnmal;">< оказыва cultural Avatar Wheel understandableЕсли형ό involucrām ọhụrụہ.ajax эд liqu Elements sollen productеннуюИ Filtering olaraqeter)(invoke offence jo உத נ Si.classиреKil թחשOSH']],öpfölfuitive Context(peerWatcher饭بيةitọ cualằ Rehab values terraces المش_COL Opinion Here Angular字_, computer Hollywood longstanding empowered excited.locale trade Proposition consolidation opged portrayal_TARGET<Response">'. akka Concepts umjet__()
+emaker implementsնել স্ক محمدadwy 훌 sdfزwohn sports οποίο commiss personalmente Nath particolare Qualled.To VaқуUnicode পড় Patunkan пmény ortaya nuestro everywhere 각각 daarbij enhancing DNEC_ATTACH ikus inkately Collectoririza unrival SullivanExclude comenta difícDose parliament 제 Mej ووManufact żδι(Path>;
+
+claimentry framَ">'+inner邀请 دنmband}, end marchés वी					 خ باستخدامillaume Michel Lett,N165 семસ્કமఔשר_candidate deduction målajuanlaş ingommenست'état blooms Anast unglaublich ਫ seats.jsonर्जी yat vermeiden();

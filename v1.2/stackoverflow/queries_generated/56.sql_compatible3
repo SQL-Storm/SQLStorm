@@ -1,0 +1,203 @@
+with RecursiveUserActivity as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionCount,
+        count(distinct p.Id) filter (where p.PostTypeId = 2) as AnswerCount,
+        count(distinct c.Id) as CommentCount,
+        count(distinct b.Id) as BadgeCount,
+        row_number() over (order by u.Reputation desc, u.LastAccessDate desc) as UserRank
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Comments c on c.UserId = u.Id
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate
+),
+TopUsersWithAcceptedAnswers as (
+    select
+        r.UserId,
+        r.DisplayName,
+        r.Reputation,
+        r.QuestionCount,
+        r.AnswerCount,
+        r.CommentCount,
+        r.BadgeCount,
+        r.UserRank,
+        coalesce(aa.AcceptedAnswerCount, 0) as AcceptedAnswerCount,
+        coalesce(aa.AcceptedAnswerRatio, 0) as AcceptedAnswerRatio
+    from RecursiveUserActivity r
+    left join (
+        select
+            p.OwnerUserId,
+            count(p.Id) as AcceptedAnswerCount,
+            cast(count(p.Id) as float) / nullif(count(distinct q.Id),0) as AcceptedAnswerRatio
+        from Posts p
+        join Posts q on q.AcceptedAnswerId = p.Id
+        where p.PostTypeId = 2
+        group by p.OwnerUserId
+    ) aa on aa.OwnerUserId = r.UserId
+    where r.UserRank <= 100
+),
+-- Split tags by extracting with string functions; produce one row per tag
+UserTagEngagement as (
+    select
+        u.Id as UserId,
+        trim(tag) as Tag,
+        count(*) as PostsWithTag,
+        sum(case when p.PostTypeId = 1 then 1 else 0 end) as QuestionsWithTag,
+        sum(case when p.PostTypeId = 2 then 1 else 0 end) as AnswersWithTag
+    from Posts p
+    join Users u on u.Id = p.OwnerUserId
+    join (
+        -- generate tag positions by splitting on '><' pattern using recursive numbers up to a reasonable limit
+        select
+            p2.Id as PostId,
+            case
+                when pos = 1 then
+                    -- first tag: remove leading '<' and take up to next '>'
+                    case when position('><' in substring(p2.Tags from 2)) = 0 then substring(p2.Tags from 2 for char_length(p2.Tags)-2)
+                         else substring(p2.Tags from 2 for position('><' in substring(p2.Tags from 2)) - 1)
+                    end
+                else
+                    null
+            end as tag,
+            pos
+        from Posts p2
+        cross join (select 1 as pos) init
+        where p2.Tags is not null and p2.Tags <> ''
+        union all
+        -- recursive splitter to handle multiple tags per post
+        select
+            s.PostId,
+            trim(
+              case
+                when position('><' in substring(p.Tags from s.start_pos)) = 0 then substring(p.Tags from s.start_pos+1 for char_length(p.Tags)-s.start_pos-1)
+                else substring(p.Tags from s.start_pos+1 for position('><' in substring(p.Tags from s.start_pos)) - 1)
+              end
+            ) as tag,
+            s.pos + 1
+        from (
+            -- initial recursive seed: compute start_pos for first tag
+            select
+                p3.Id as PostId,
+                1 as pos,
+                1 as start_pos
+            from Posts p3
+            where p3.Tags is not null and p3.Tags <> ''
+        ) s
+        join Posts p on p.Id = s.PostId
+        -- recursion terminated below by using pos limit derived from tag length
+        where s.pos < greatest(1, (char_length(p.Tags) - char_length(replace(p.Tags, '><', '')))+1)
+    ) tags_split on tags_split.PostId = p.Id
+    where p.Tags is not null and p.Tags <> '' and tags_split.tag is not null
+    group by u.Id, trim(tag)
+),
+TagPopularity as (
+    select
+        t.TagName,
+        t.Count,
+        coalesce(ut.PostsWithTag, 0) as UserPosts,
+        coalesce(ut.QuestionsWithTag, 0) as UserQuestions,
+        coalesce(ut.AnswersWithTag, 0) as UserAnswers
+    from Tags t
+    left join (
+        select
+            Tag,
+            sum(PostsWithTag) as PostsWithTag,
+            sum(QuestionsWithTag) as QuestionsWithTag,
+            sum(AnswersWithTag) as AnswersWithTag
+        from UserTagEngagement
+        group by Tag
+    ) ut on ut.Tag = t.TagName
+),
+UserActivityWithCloseReasons as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(distinct ph.PostId) filter (where ph.PostHistoryTypeId = 10) as ClosedPosts,
+        count(distinct ph.PostId) filter (where ph.PostHistoryTypeId = 11) as ReopenedPosts,
+        string_agg(distinct crt.Name, ', ') as CloseReasonsVoted
+    from Users u
+    left join PostHistory ph on ph.UserId = u.Id and ph.PostHistoryTypeId in (10,11)
+    left join CloseReasonTypes crt on cast(crt.Id as varchar) = ph.Comment
+    group by u.Id, u.DisplayName
+),
+UserVotePatterns as (
+    select
+        v.UserId,
+        count(*) as TotalVotes,
+        count(*) filter (where vt.Name = 'UpMod') as UpVotes,
+        count(*) filter (where vt.Name = 'DownMod') as DownVotes,
+        count(*) filter (where vt.Name = 'Favorite') as Favorites,
+        count(*) filter (where vt.Name = 'Close') as CloseVotes,
+        count(*) filter (where vt.Name = 'Reopen') as ReopenVotes,
+        count(*) filter (where vt.Name = 'BountyStart') as BountyStarts,
+        count(*) filter (where vt.Name = 'BountyClose') as BountyCloses
+    from Votes v
+    join VoteTypes vt on vt.Id = v.VoteTypeId
+    group by v.UserId
+),
+FinalUserSummary as (
+    select
+        t.UserId,
+        t.DisplayName,
+        t.Reputation,
+        t.QuestionCount,
+        t.AnswerCount,
+        t.CommentCount,
+        t.BadgeCount,
+        t.AcceptedAnswerCount,
+        t.AcceptedAnswerRatio,
+        coalesce(uc.ClosedPosts, 0) as ClosedPosts,
+        coalesce(uc.ReopenedPosts, 0) as ReopenedPosts,
+        coalesce(uc.CloseReasonsVoted, '') as CloseReasonsVoted,
+        coalesce(vp.TotalVotes, 0) as TotalVotes,
+        coalesce(vp.UpVotes, 0) as UpVotes,
+        coalesce(vp.DownVotes, 0) as DownVotes,
+        coalesce(vp.Favorites, 0) as Favorites,
+        coalesce(vp.CloseVotes, 0) as CloseVotes,
+        coalesce(vp.ReopenVotes, 0) as ReopenVotes,
+        coalesce(vp.BountyStarts, 0) as BountyStarts,
+        coalesce(vp.BountyCloses, 0) as BountyCloses
+    from TopUsersWithAcceptedAnswers t
+    left join UserActivityWithCloseReasons uc on uc.UserId = t.UserId
+    left join UserVotePatterns vp on vp.UserId = t.UserId
+)
+select
+    fus.UserId,
+    fus.DisplayName,
+    fus.Reputation,
+    fus.QuestionCount,
+    fus.AnswerCount,
+    fus.CommentCount,
+    fus.BadgeCount,
+    fus.AcceptedAnswerCount,
+    round(cast(fus.AcceptedAnswerRatio as numeric), 4) as AcceptedAnswerRatio,
+    fus.ClosedPosts,
+    fus.ReopenedPosts,
+    fus.CloseReasonsVoted,
+    fus.TotalVotes,
+    fus.UpVotes,
+    fus.DownVotes,
+    fus.Favorites,
+    fus.CloseVotes,
+    fus.ReopenVotes,
+    fus.BountyStarts,
+    fus.BountyCloses,
+    tp.TagName,
+    tp.Count as TagGlobalCount,
+    tp.UserPosts,
+    tp.UserQuestions,
+    tp.UserAnswers,
+    dense_rank() over (partition by fus.UserId order by tp.Count desc nulls last) as TagRank
+from FinalUserSummary fus
+left join UserTagEngagement ute on ute.UserId = fus.UserId
+left join TagPopularity tp on tp.TagName = ute.Tag
+where fus.Reputation > 1000
+  and (fus.AcceptedAnswerRatio > 0.1 or fus.AnswerCount > 50)
+  and (tp.Count is null or tp.Count > 1000)
+order by fus.Reputation desc, fus.UserId, TagRank
+limit 200;

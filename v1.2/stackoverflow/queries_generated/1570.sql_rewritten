@@ -1,0 +1,146 @@
+-- {"query": "1570.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.5, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1164} 
+with RankedAnswers as (
+    select
+        a.Id,
+        a.ParentId,
+        a.Score,
+        a.CreationDate,
+        a.OwnerUserId,
+        row_number() over (partition by a.ParentId order by a.Score desc, a.CreationDate asc) as AnswerRank
+    from Posts a
+    where a.PostTypeId = 2
+),
+RecentBadges as (
+    select
+        b.UserId,
+        b.Name as BadgeName,
+        b.Date,
+        row_number() over (partition by b.UserId order by b.Date desc) as BadgeRank
+    from Badges b
+),
+QuestionsWithClosedInfo as (
+    select 
+        q.Id,
+        q.Title,
+        q.CreationDate,
+        q.Score,
+        q.ViewCount,
+        q.AnswerCount,
+        q.OwnerUserId,
+        phc.Comment as CloseReasonJSON
+    from Posts q
+    left join PostHistory phc
+        on phc.PostId = q.Id and phc.PostHistoryTypeId = 10
+    where q.PostTypeId = 1
+),
+UserAggregate as (
+    select
+        u.Id,
+        u.DisplayName,
+        coalesce(u.Reputation,0) as Reputation,
+        coalesce(u.UpVotes,0) as UpVotes,
+        coalesce(u.DownVotes,0) as DownVotes,
+        coalesce(bc.BadgeCount,0) as TotalBadges,
+        rc.Date as LatestBadgeDate,
+        rc.BadgeName as LatestBadgeName
+    from Users u
+    left join (
+        select UserId, count(*) as BadgeCount from Badges group by UserId
+    ) bc on bc.UserId = u.Id
+    left join RecentBadges rc on rc.UserId = u.Id and rc.BadgeRank = 1
+),
+TopQuestionsPerUser as (
+    select 
+        q.OwnerUserId,
+        count(q.Id) as TotalQuestions,
+        max(q.Score) as MaxQuestionScore,
+        max(q.ViewCount) as MaxQuestionViews
+    from Posts q
+    where q.PostTypeId=1
+    group by q.OwnerUserId
+),
+FinalQuestions as (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        q.Score as QuestionScore,
+        q.ViewCount,
+        q.AnswerCount,
+        q.CloseReasonJSON,
+        ra.Id as TopAnswerId,
+        ra.Score as TopAnswerScore,
+        ra.CreationDate as TopAnswerCreation,
+        ra.OwnerUserId as TopAnswerUserId,
+        ua.DisplayName as QuestionOwner,
+        ua.Reputation,
+        ua.TotalBadges,
+        ua.LatestBadgeDate,
+        ua.LatestBadgeName,
+        tq.TotalQuestions,
+        tq.MaxQuestionScore,
+        tq.MaxQuestionViews
+    from QuestionsWithClosedInfo q
+    left join RankedAnswers ra
+        on ra.ParentId = q.Id and ra.AnswerRank = 1
+    left join UserAggregate ua
+        on ua.Id = q.OwnerUserId
+    left join TopQuestionsPerUser tq
+        on tq.OwnerUserId = q.OwnerUserId
+    where q.AnswerCount > 0
+      and (q.CloseReasonJSON is null or q.CloseReasonJSON not like '%"101"%') -- exclude duplicates by close reason containing Duplicate close code
+)
+select 
+    f.QuestionId,
+    f.Title,
+    f.QuestionScore,
+    f.ViewCount,
+    f.AnswerCount,
+    case 
+        when f.CloseReasonJSON is not null then 'Closed: [' || f.CloseReasonJSON || ']'
+        else 'Open'
+    end as Status,
+    f.TopAnswerId,
+    f.TopAnswerScore,
+    f.TopAnswerCreation,
+    u.LoginDomain,
+    f.QuestionOwner,
+    f.Reputation,
+    f.TotalBadges,
+    nvl(f.LatestBadgeName, 'No Recent Badge') as LatestBadgeName,
+    unix_timestamp(f.LatestBadgeDate) as LatestBadgeAskedUnix,
+    f.TotalQuestions,
+    f.MaxQuestionScore,
+    f.MaxQuestionViews,
+    /* Complicated flag and calculations */
+    case
+        when f.QuestionScore * 1.0 / nullif(f.ViewCount,0) > 0.01 then 'High Engagement'
+        else 'Low Engagement'
+    end as EngagementCategory,
+    -- correl subquery to count good recent comments on top answer peri last 30 days
+    (
+        select count(*)
+        from Comments c
+        join Users cu on cu.Id = c.UserId
+        where c.PostId = f.TopAnswerId
+          and c.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - interval '30 days'
+          and c.Score > 1
+    ) as RecentHighScoreCommentsOnTopAnswer,
+    -- string concatenation to compose tag list postage if Tags non-null
+    trim(concat('(Tags) ', coalesce(
+      substring(f2.Tags from 2 for char_length(f2.Tags)-2),
+      'No Tags'
+    ))) as DecodedTags,
+    -- aggregate: count of duplicates found on Question via set op
+    dupQs.DuplicateCount
+from FinalQuestions f
+left join Users u on u.Id = f.TopAnswerUserId
+left join Posts f2 on f2.Id = f.QuestionId
+left join (
+    select postId, count(*) as DuplicateCount
+    from PostLinks
+    where LinkTypeId = 3
+    group by postId
+) dupQs on dupQs.postId = f.QuestionId
+where f.ViewCount >= 1000
+order by f.QuestionScore desc, f.ViewCount desc
+limit 100;

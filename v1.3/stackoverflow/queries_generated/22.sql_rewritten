@@ -1,0 +1,176 @@
+-- {"query": "22.sql", "dataset": "stackoverflow", "version": "v1.3", "prompt": "p1", "model": "gpt-5-mini", "temperature": 1.0, "max_tokens": 32768, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 2132} 
+with
+-- users with activity summary and moving average reputation growth
+user_activity as (
+  select
+    u.id,
+    u.displayname,
+    u.reputation,
+    u.creationdate,
+    u.lastaccessdate,
+    coalesce(u.location,'(unknown)') as location,
+    count(distinct p.id) filter (where p.posttypeid = 1) as questions_count,
+    count(distinct p.id) filter (where p.posttypeid = 2) as answers_count,
+    count(distinct c.id) as comments_count,
+    count(distinct b.id) as badges_count,
+    sum(case when v.votetypeid = 2 then 1 when v.votetypeid = 3 then -1 else 0 end) as vote_score,
+    -- avg posts per year since creation (avoid divide by zero)
+    round(
+      coalesce(
+        (count(p.id)::numeric / greatest(date_part('year', cast('2024-10-01 12:34:56' as timestamp)::timestamp - u.creationdate)::numeric, 1))
+      ,0)
+    ,2) as posts_per_year
+  from users u
+  left join posts p on p.owneruserid = u.id
+  left join comments c on c.userid = u.id
+  left join badges b on b.userid = u.id
+  left join votes v on v.userid = u.id
+  group by u.id, u.displayname, u.reputation, u.creationdate, u.lastaccessdate, u.location
+),
+-- heavy posts info with tag parsing and string manipulation
+question_tags as (
+  select
+    p.id as question_id,
+    p.owneruserid,
+    p.title,
+    p.creationdate,
+    p.score,
+    p.viewcount,
+    p.answercount,
+    p.tags,
+    -- normalize tags into lower-case comma-separated without angle brackets
+    replace(lower(coalesce(p.tags,'')), '><', ',') as tags_flat,
+    -- extract first tag (if any)
+    trim(both '<>' from split_part(coalesce(p.tags,''), '><', 1)) as first_tag,
+    -- synthetic complexity score: weighted expression
+    (coalesce(p.score,0) * 3 + coalesce(p.viewcount,0) / nullif(greatest(coalesce(p.answercount,0),1),0) + length(coalesce(p.title,'')) % 100) as complexity_score
+  from posts p
+  where p.posttypeid = 1
+),
+-- find top answers with correlated subquery and window functions
+answers_ranked as (
+  select
+    a.id as answer_id,
+    a.parentid as question_id,
+    a.owneruserid,
+    a.creationdate,
+    a.score,
+    a.body,
+    a.parentid,
+    row_number() over (partition by a.parentid order by a.score desc, a.creationdate asc) as rn,
+    dense_rank() over (partition by a.parentid order by a.score desc) as dr
+  from posts a
+  where a.posttypeid = 2
+),
+-- combine questions and their best answers, including correlated check for accepted answer and duplicates
+q_with_best as (
+  select
+    q.*,
+    ar.answer_id,
+    ar.score as answer_score,
+    ar.creationdate as answer_creation,
+    -- whether accepted answer equals best by score (correlated scalar subquery)
+    case when q.acceptedanswerid is not null and q.acceptedanswerid = (
+      select id from posts pa where pa.posttypeid = 2 and pa.parentid = q.question_id order by pa.score desc, pa.creationdate asc limit 1
+    ) then true else false end as accepted_is_top
+  from question_tags q
+  left join answers_ranked ar on ar.question_id = q.question_id and ar.rn = 1
+),
+-- compute user-centric aggregates with window functions and NULL-aware math
+user_stats as (
+  select
+    ua.*,
+    -- user's average complexity of questions (null-safe)
+    round(avg(qw.complexity_score) filter (where qw.complexity_score is not null) over (partition by ua.id),2) as avg_question_complexity,
+    -- highest scored answer by this user (over partition)
+    max(a.score) over (partition by ua.id) as max_answer_score,
+    -- moving average of reputation among all users ordered by creationdate (for benchmarking ordering/window)
+    round(avg(ua.reputation) over (order by ua.creationdate rows between 50 preceding and 50 following),2) as moving_avg_rep,
+    row_number() over (order by ua.reputation desc nulls last, ua.lastaccessdate desc) as global_rank_by_rep
+  from user_activity ua
+  left join question_tags qw on qw.owneruserid = ua.id
+  left join posts a on a.owneruserid = ua.id and a.posttypeid = 2
+),
+-- complexity-driven selection of posts using set operators and NULL logic
+complex_questions as (
+  select question_id, title, first_tag, complexity_score, answercount from q_with_best
+  where complexity_score is not null and complexity_score > (
+    select percentile_disc(0.75) within group (order by complexity_score) from q_with_best
+  )
+  union
+  select question_id, title, first_tag, complexity_score, answercount from q_with_best
+  where first_tag is null and answercount = 0
+),
+-- synthesize a heavy join graph of posts, links and histories (left/outer joins)
+post_graph as (
+  select
+    q.question_id,
+    q.title,
+    q.first_tag,
+    q.complexity_score,
+    pl.relatedpostid,
+    pl.linktypeid,
+    lt.name as linktypename,
+    ph.posthistorytypeid,
+    pht.name as posthistorytypename,
+    ph.creationdate as history_date,
+    ph.userdisplayname as editor_name,
+    -- flag if link points to another question that is in the complex set (self-join)
+    case when exists (select 1 from complex_questions cq where cq.question_id = pl.relatedpostid) then 1 else 0 end as links_to_complex
+  from q_with_best q
+  left join postlinks pl on pl.postid = q.question_id
+  left join linktypes lt on lt.id = pl.linktypeid
+  left join posthistory ph on ph.postid = q.question_id
+  left join posthistorytypes pht on pht.id = ph.posthistorytypeid
+),
+-- final selection combining many constructs: aggregates, windowing, correlated subqueries, string ops, nulls, case
+final_rank as (
+  select
+    pg.question_id,
+    left(pg.title, 120) || case when length(pg.title) > 120 then '...' else '' end as snippet_title,
+    coalesce(pg.first_tag, '(none)') as primary_tag,
+    pg.complexity_score,
+    sum(distinct case when pg.linktypeid = 3 then 1 else 0 end) over (partition by pg.question_id) as duplicate_links,
+    max(ph_max.history_date) over (partition by pg.question_id) as last_history,
+    sum(case when pg.links_to_complex = 1 then 1 else 0 end) over (partition by pg.question_id) as outlink_complex_count,
+    -- blended score using non-linear math and null-aware coalesce
+    round(
+      (
+        coalesce(pg.complexity_score,0)
+        * (1 + least(coalesce(sum(case when pg.linktypeid is not null then 1 else 0 end) over (partition by pg.question_id),0),10)/10.0)
+        * case when coalesce(sum(case when pg.linktypeid = 3 then 1 else 0 end) over (partition by pg.question_id),0) > 0 then 0.8 else 1.0 end
+      )::numeric
+    ,2) as blended_score,
+    -- correlated subquery: count distinct users who edited this question recently
+    (select count(distinct ph2.userid) from posthistory ph2 where ph2.postid = pg.question_id and ph2.creationdate > cast('2024-10-01 12:34:56' as timestamp) - interval '90 days') as recent_editors,
+    -- string expression on history comments aggregated
+    (select string_agg(distinct coalesce(trim(ph3.comment),'[no-comment]') , ' || ') from posthistory ph3 where ph3.postid = pg.question_id and ph3.comment is not null) as history_comments_agg
+  from post_graph pg
+  left join lateral (
+    select ph2.postid, max(ph2.creationdate) as history_date
+    from posthistory ph2
+    where ph2.postid = pg.question_id
+    group by ph2.postid
+  ) ph_max on ph_max.postid = pg.question_id
+)
+select
+  fr.*,
+  us.displayname,
+  us.reputation,
+  us.location,
+  us.posts_per_year,
+  -- tag-based badge density: correlated scalar subquery counting tag-based badges for owner of question if any
+  (select count(*) from badges b where b.userid = (select owneruserid from posts where id = fr.question_id) and b.tagbased = 1) as owner_tag_badges,
+  -- recent activity timestamp combining last history and last answer
+  greatest(coalesce(fr.last_history, '1970-01-01'::timestamp), coalesce((
+    select max(a.creationdate) from posts a where a.parentid = fr.question_id and a.posttypeid = 2
+  ), '1970-01-01'::timestamp)) as recent_activity,
+  -- ranking and percentile among the selected final set
+  row_number() over (order by fr.blended_score desc nulls last, fr.recent_editors desc) as rank_by_blended,
+  ntile(10) over (order by fr.blended_score desc) as decile_by_blend
+from final_rank fr
+left join posts p_owner on p_owner.id = fr.question_id
+left join users us on us.id = p_owner.owneruserid
+where fr.blended_score is not null
+order by fr.blended_score desc, fr.recent_editors desc
+limit 250;

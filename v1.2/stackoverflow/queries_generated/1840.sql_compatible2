@@ -1,0 +1,41 @@
+WITH RankedQuestions AS (
+    SELECT
+        p.Id AS QuestionId,
+        p.Title,
+        p.OwnerUserId,
+        u.DisplayName AS OwnerName,
+        p.CreationDate,
+        p.Score AS QuestionScore,
+        p.ViewCount,
+        COUNT(a.Id) AS AnswerCount,
+        ROUND(COALESCE(AVG(a.Score), 0)::numeric, 2) AS AvgAnswerScore,
+        (
+            SELECT STRING_AGG(DISTINCT t.val, ',' ORDER BY t.val)
+            FROM (
+                SELECT regexp_split_to_table(substring(p.Tags FROM 2 FOR char_length(p.Tags) - 2), '>') AS val
+            ) t
+        ) AS AllTags,
+        RANK() OVER (PARTITION BY (licensed_comment.HasMotivatingComment IS NOT NULL) ORDER BY p.Score DESC, p.ViewCount DESC) AS RankTopMotivated,
+        MAX(pv.OwnerUpVotes) AS OwnerUpVotes
+    FROM
+        Posts p
+        LEFT JOIN Posts a ON p.Id = a.ParentId AND a.PostTypeId = 2
+        LEFT JOIN Users u ON u.Id = p.OwnerUserId
+        LEFT JOIN (
+            SELECT Id AS OwnerUserId, SUM(UpVotes) AS OwnerUpVotes
+            FROM Users
+            GROUP BY Id
+        ) pv ON pv.OwnerUserId = u.Id
+        LEFT JOIN licensed_comment ON licensed_comment.PostId = p.Id
+    GROUP BY
+        p.Id,
+        p.Title,
+        p.OwnerUserId,
+        u.DisplayName,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        licensed_comment.HasMotivatingComment
+)
+SELECT *
+FROM RankedQuestions;

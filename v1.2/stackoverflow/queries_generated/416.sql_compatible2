@@ -1,0 +1,198 @@
+with recursive RecursiveTagHierarchy as (
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        1 as Level,
+        array[t.TagName] as Path
+    from Tags t
+    where t.IsModeratorOnly = false and t.IsRequired = false
+
+    union all
+
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        r.Level + 1,
+        r.Path || t.TagName
+    from Tags t
+    join RecursiveTagHierarchy r on t.Id <> r.Id and t.Count < r.Count and not t.TagName = any(r.Path)
+    where r.Level < 3
+),
+UserBadgeStats as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(distinct b.Id) as TotalBadges,
+        sum(case when b.Class = 1 then 1 else 0 end) as GoldBadges,
+        sum(case when b.Class = 2 then 1 else 0 end) as SilverBadges,
+        sum(case when b.Class = 3 then 1 else 0 end) as BronzeBadges,
+        max(b.Date) as LastBadgeDate
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.DisplayName
+),
+TopQuestionsWithAnswers as (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        q.CreationDate,
+        q.Score as QuestionScore,
+        q.ViewCount,
+        q.OwnerUserId,
+        count(a.Id) as AnswerCount,
+        coalesce(q.AcceptedAnswerId, -1) as AcceptedAnswerId,
+        row_number() over (partition by q.OwnerUserId order by q.Score desc, q.ViewCount desc) as rn
+    from Posts q
+    left join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+    where q.PostTypeId = 1 and q.ClosedDate is null
+    group by q.Id, q.Title, q.CreationDate, q.Score, q.ViewCount, q.OwnerUserId, q.AcceptedAnswerId
+),
+AnswerDetails as (
+    select
+        a.Id as AnswerId,
+        a.ParentId as QuestionId,
+        a.Score as AnswerScore,
+        a.CreationDate as AnswerCreationDate,
+        a.OwnerUserId as AnswerOwnerUserId,
+        u.Reputation as AnswererReputation,
+        u.DisplayName as AnswererName,
+        coalesce(v.VoteCount, 0) as UpVotes,
+        coalesce(vDown.VoteCount, 0) as DownVotes,
+        case when a.LastEditDate is not null and a.LastEditDate > a.CreationDate then 1 else 0 end as IsEdited
+    from Posts a
+    left join Users u on u.Id = a.OwnerUserId
+    left join (
+        select PostId, count(*) as VoteCount
+        from Votes
+        where VoteTypeId = 2
+        group by PostId
+    ) v on v.PostId = a.Id
+    left join (
+        select PostId, count(*) as VoteCount
+        from Votes
+        where VoteTypeId = 3
+        group by PostId
+    ) vDown on vDown.PostId = a.Id
+    where a.PostTypeId = 2
+),
+QuestionAnswerAggregates as (
+    select
+        q.QuestionId,
+        count(a.AnswerId) as TotalAnswers,
+        avg(a.AnswerScore) as AvgAnswerScore,
+        sum(a.UpVotes) as TotalAnswerUpVotes,
+        sum(a.DownVotes) as TotalAnswerDownVotes,
+        sum(a.IsEdited) as EditedAnswersCount,
+        max(a.AnswerScore) as MaxAnswerScore,
+        min(a.AnswerScore) as MinAnswerScore
+    from TopQuestionsWithAnswers q
+    left join AnswerDetails a on a.QuestionId = q.QuestionId
+    group by q.QuestionId
+),
+UserActivityWindow as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        p.Id as PostId,
+        p.PostTypeId,
+        p.Score,
+        p.CreationDate,
+        count(c.Id) over (partition by u.Id order by c.CreationDate rows between 30 preceding and current row) as CommentsLast30Days,
+        count(p.Id) over (partition by u.Id order by p.CreationDate rows between 30 preceding and current row) as PostsLast30Days,
+        sum(p.Score) over (partition by u.Id order by p.CreationDate rows between 30 preceding and current row) as ScoreLast30Days
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Comments c on c.UserId = u.Id
+    where u.Reputation > 1000
+),
+DuplicateQuestions as (
+    select distinct
+        pl.PostId as DuplicateQuestionId,
+        pl.RelatedPostId as OriginalQuestionId,
+        q1.Title as DuplicateTitle,
+        q2.Title as OriginalTitle,
+        pl.CreationDate as LinkCreationDate
+    from PostLinks pl
+    join Posts q1 on q1.Id = pl.PostId and q1.PostTypeId = 1
+    join Posts q2 on q2.Id = pl.RelatedPostId and q2.PostTypeId = 1
+    where pl.LinkTypeId = 3
+),
+ClosedQuestionsWithReasons as (
+    select
+        ph.PostId,
+        crt.Name as CloseReason,
+        ph.CreationDate as CloseDate,
+        ph.UserId as ClosedByUserId,
+        u.DisplayName as ClosedByUserName
+    from PostHistory ph
+    join CloseReasonTypes crt on crt.Id = cast(ph.Comment as integer)
+    left join Users u on u.Id = ph.UserId
+    where ph.PostHistoryTypeId = 10
+),
+QuestionsWithTags as (
+    select
+        p.Id as QuestionId,
+        p.Title,
+        p.Tags,
+        unnest(string_to_array(substring(p.Tags from 2 for char_length(p.Tags) - 2), '><')) as TagName
+    from Posts p
+    where p.PostTypeId = 1 and p.Tags is not null
+)
+select
+    u.DisplayName as User,
+    u.Reputation,
+    u.CreationDate,
+    u.LastAccessDate,
+    coalesce(ubs.TotalBadges, 0) as BadgeCount,
+    coalesce(ubs.GoldBadges, 0) as GoldBadges,
+    coalesce(ubs.SilverBadges, 0) as SilverBadges,
+    coalesce(ubs.BronzeBadges, 0) as BronzeBadges,
+    q.Title as TopQuestionTitle,
+    q.QuestionScore as TopQuestionScore,
+    q.ViewCount as TopQuestionViews,
+    qa.TotalAnswers,
+    qa.AvgAnswerScore,
+    qa.EditedAnswersCount,
+    dq.DuplicateTitle as DuplicateOf,
+    cr.CloseReason,
+    cr.CloseDate,
+    cr.ClosedByUserName,
+    string_agg(distinct t.TagName, ', ') FILTER (WHERE t.TagName IS NOT NULL) as UserTags,
+    ua.PostsLast30Days,
+    ua.CommentsLast30Days,
+    ua.ScoreLast30Days
+from Users u
+left join UserBadgeStats ubs on ubs.UserId = u.Id
+left join TopQuestionsWithAnswers q on q.OwnerUserId = u.Id and q.rn = 1
+left join QuestionAnswerAggregates qa on qa.QuestionId = q.QuestionId
+left join DuplicateQuestions dq on dq.DuplicateQuestionId = q.QuestionId
+left join ClosedQuestionsWithReasons cr on cr.PostId = q.QuestionId
+left join QuestionsWithTags t on t.QuestionId = q.QuestionId
+left join UserActivityWindow ua on ua.UserId = u.Id
+where u.Reputation > 5000
+group by
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    u.LastAccessDate,
+    ubs.TotalBadges,
+    ubs.GoldBadges,
+    ubs.SilverBadges,
+    ubs.BronzeBadges,
+    q.Title,
+    q.QuestionScore,
+    q.ViewCount,
+    qa.TotalAnswers,
+    qa.AvgAnswerScore,
+    qa.EditedAnswersCount,
+    dq.DuplicateTitle,
+    cr.CloseReason,
+    cr.CloseDate,
+    cr.ClosedByUserName,
+    ua.PostsLast30Days,
+    ua.CommentsLast30Days,
+    ua.ScoreLast30Days
+order by u.Reputation desc, q.QuestionScore desc
+limit 100;

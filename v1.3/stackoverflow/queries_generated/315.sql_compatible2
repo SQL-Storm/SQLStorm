@@ -1,0 +1,272 @@
+WITH
+tag_exploded AS (
+  SELECT p.id AS post_id,
+         t.tag
+  FROM Posts p
+  CROSS JOIN LATERAL (
+    SELECT unnest(string_to_array(substring(p.Tags, 2, GREATEST(length(p.Tags) - 2,0)), '><')) AS tag
+  ) t
+  WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL AND length(p.Tags) > 2
+),
+tag_stats AS (
+  SELECT lower(te.tag) AS tag,
+         COUNT(*) AS question_count,
+         AVG(p.score) AS avg_score,
+         AVG(p.viewcount) AS avg_views,
+         SUM(CASE WHEN p.acceptedanswerid IS NOT NULL THEN 1 ELSE 0 END) AS accepted_count,
+         SUM(COALESCE(p.FavoriteCount,0)) AS favorites,
+         COALESCE(t.count,0) AS global_tag_count
+  FROM tag_exploded te
+  JOIN Posts p ON p.id = te.post_id
+  LEFT JOIN Tags t ON lower(t.tagname) = lower(te.tag)
+  GROUP BY lower(te.tag), COALESCE(t.count,0)
+),
+user_badges AS (
+  SELECT b.UserId,
+         COUNT(*) AS badge_count,
+         SUM(CASE WHEN b.Class = 1 THEN 5 WHEN b.Class = 2 THEN 2 WHEN b.Class = 3 THEN 1 ELSE 0 END) AS badge_weight,
+         SUM(CASE WHEN (b.TagBased IN (1, '1', 't', 'true') OR CAST(b.TagBased AS varchar) IN ('1','t','true')) THEN 1 ELSE 0 END) AS tag_badge_count
+  FROM Badges b
+  GROUP BY b.UserId
+),
+vote_summary AS (
+  SELECT v.PostId,
+         SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 WHEN v.VoteTypeId = 3 THEN -1 ELSE 0 END) AS net_votes,
+         SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS upvotes,
+         SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS downvotes,
+         COUNT(DISTINCT v.UserId) AS distinct_voters,
+         MAX(v.BountyAmount) AS max_bounty,
+         SUM(CASE WHEN v.VoteTypeId IN (5,15) THEN 1 ELSE 0 END) AS saves_or_modreviews
+  FROM Votes v
+  GROUP BY v.PostId
+),
+comment_stats AS (
+  SELECT c.PostId,
+         COUNT(*) AS comment_count,
+         AVG(LENGTH(c.Text)) AS avg_comment_length,
+         SUM(CASE WHEN lower(c.Text) LIKE '%thank%' OR lower(c.Text) LIKE '%thanks%' THEN 1 ELSE 0 END) AS thankful_comments,
+         COUNT(DISTINCT c.UserId) AS distinct_commenters
+  FROM Comments c
+  GROUP BY c.PostId
+),
+edit_history_summary AS (
+  SELECT ph.PostId,
+         COUNT(*) AS edit_count,
+         SUM(CASE WHEN ph.PostHistoryTypeId IN (4,5,6,24,66) THEN 1 ELSE 0 END) AS real_edits,
+         MIN(ph.CreationDate) AS first_edit_date,
+         MAX(ph.CreationDate) AS last_edit_date,
+         (MAX(ph.CreationDate) - MIN(ph.CreationDate)) AS edit_span,
+         COUNT(DISTINCT ph.UserId) AS distinct_editors,
+         STRING_AGG(DISTINCT COALESCE(ph.UserDisplayName, CAST(ph.UserId AS varchar)), ', ') AS editors_sample
+  FROM PostHistory ph
+  GROUP BY ph.PostId
+),
+link_graph AS (
+  SELECT pl.PostId,
+         SUM(CASE WHEN pl.LinkTypeId = 1 THEN 1 ELSE 0 END) AS outgoing_links,
+         SUM(CASE WHEN pl.LinkTypeId = 3 THEN 1 ELSE 0 END) AS duplicate_marked_count,
+         COUNT(pl.Id) AS total_links,
+         COUNT(DISTINCT pl.RelatedPostId) AS distinct_linked_posts
+  FROM PostLinks pl
+  GROUP BY pl.PostId
+),
+owner_stats AS (
+  SELECT u.Id AS owner_id,
+         SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS questions,
+         SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS answers,
+         AVG(p.Score) AS avg_post_score,
+         SUM(COALESCE(p.ViewCount,0)) AS total_views,
+         MAX(p.CreationDate) AS last_post_date,
+         MIN(p.CreationDate) AS first_post_date,
+         COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS distinct_questions
+  FROM Users u
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+  GROUP BY u.Id
+),
+post_tag_metrics AS (
+  SELECT p.Id AS post_id,
+         COUNT(DISTINCT lower(te.tag)) AS tag_count,
+         STRING_AGG(DISTINCT te.tag, ', ' ORDER BY te.tag) AS tag_list,
+         AVG(COALESCE(ts.avg_score,0)) AS avg_tag_score,
+         SUM(COALESCE(ts.question_count,0)) AS tags_total_questions,
+         MAX(COALESCE(ts.global_tag_count,0)) AS max_global_tag_count
+  FROM Posts p
+  LEFT JOIN tag_exploded te ON te.post_id = p.Id
+  LEFT JOIN tag_stats ts ON lower(ts.tag) = lower(te.tag)
+  WHERE p.PostTypeId = 1
+  GROUP BY p.Id
+),
+recent_activity AS (
+  SELECT v.PostId,
+         SUM(CASE WHEN v.CreationDate > CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '30 days' THEN 1 ELSE 0 END) AS votes_last_30,
+         SUM(CASE WHEN v.CreationDate > CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '7 days' THEN 1 ELSE 0 END) AS votes_last_7,
+         SUM(CASE WHEN v.CreationDate > CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 days' THEN 1 ELSE 0 END) AS votes_last_1,
+         SUM(CASE WHEN v.VoteTypeId = 2 AND v.CreationDate > CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '30 days' THEN 1 ELSE 0 END) AS upvotes_last_30
+  FROM Votes v
+  GROUP BY v.PostId
+),
+recent_comments AS (
+  SELECT c.PostId,
+         SUM(CASE WHEN c.CreationDate > CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '30 days' THEN 1 ELSE 0 END) AS comments_last_30,
+         SUM(CASE WHEN c.CreationDate > CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '7 days' THEN 1 ELSE 0 END) AS comments_last_7
+  FROM Comments c
+  GROUP BY c.PostId
+),
+high_view_nonclosed AS (
+  SELECT p.Id FROM Posts p
+  WHERE p.PostTypeId = 1 AND COALESCE(p.ViewCount,0) > 50000
+  EXCEPT
+  SELECT ph.PostId FROM PostHistory ph WHERE ph.PostHistoryTypeId = 10
+),
+trending_posts AS (
+  SELECT p.id, (COALESCE(ra.votes_last_7,0) * 2 + COALESCE(rc.comments_last_7,0)) AS trending_score
+  FROM Posts p
+  LEFT JOIN recent_activity ra ON ra.PostId = p.Id
+  LEFT JOIN recent_comments rc ON rc.PostId = p.Id
+  WHERE p.PostTypeId = 1
+  ORDER BY trending_score DESC
+  LIMIT 100
+),
+composite_top AS (
+  SELECT p.Id,
+         p.Title,
+         p.OwnerUserId,
+         p.CreationDate,
+         COALESCE(p.Score,0) AS raw_score,
+         COALESCE(vs.net_votes,0) AS net_votes,
+         COALESCE(pt.tag_count,0) AS tag_count,
+         COALESCE(pt.avg_tag_score,0) AS avg_tag_score,
+         COALESCE(cs.comment_count,0) AS comment_count,
+         COALESCE(eh.distinct_editors,0) AS distinct_editors,
+         COALESCE(ub.badge_weight,0) AS owner_badge_weight,
+         COALESCE(ra.votes_last_7,0) AS votes_last_7,
+         ROUND(EXTRACT(epoch FROM (CAST('2024-10-01 12:34:56' AS timestamp) - p.CreationDate)) / 86400.0, 2) AS age_days,
+         (
+           (COALESCE(p.Score,0) * 2.0)
+           + (COALESCE(vs.net_votes,0) * 5.0)
+           + (CASE WHEN p.ViewCount IS NULL THEN 0 ELSE LOG(GREATEST(1, p.ViewCount)) * 2.0 END)
+           + (COALESCE(p.AnswerCount,0) * 4.0)
+           + (CASE WHEN p.AcceptedAnswerId IS NOT NULL THEN 100.0 ELSE 0.0 END)
+           + (COALESCE(cs.comment_count,0) * 1.5)
+           + (COALESCE(eh.distinct_editors,0) * 2.0)
+           + (COALESCE(pt.avg_tag_score,0) * 1.2)
+           + (COALESCE(ub.badge_weight,0) * 0.8)
+         ) * (1.0 + 1.0 / (1.0 + GREATEST(EXTRACT(epoch FROM (CAST('2024-10-01 12:34:56' AS timestamp) - p.CreationDate))/86400.0,0) / 30.0))
+         + (COALESCE(pt.tag_count,0) * 0.5)
+         + (COALESCE(ra.votes_last_7,0) * 1.8)
+         AS composite_score
+  FROM Posts p
+  LEFT JOIN vote_summary vs ON vs.PostId = p.Id
+  LEFT JOIN comment_stats cs ON cs.PostId = p.Id
+  LEFT JOIN post_tag_metrics pt ON pt.post_id = p.Id
+  LEFT JOIN edit_history_summary eh ON eh.PostId = p.Id
+  LEFT JOIN owner_stats os ON os.owner_id = p.OwnerUserId
+  LEFT JOIN user_badges ub ON ub.UserId = p.OwnerUserId
+  LEFT JOIN recent_activity ra ON ra.PostId = p.Id
+  WHERE p.PostTypeId = 1
+  GROUP BY p.Id, p.Title, p.OwnerUserId, p.CreationDate, p.Score, vs.net_votes, pt.tag_count, pt.avg_tag_score, cs.comment_count, eh.distinct_editors, ub.badge_weight, ra.votes_last_7
+  ORDER BY composite_score DESC
+  LIMIT 200
+),
+elite_posts AS (
+  SELECT Id FROM composite_top
+  INTERSECT
+  SELECT Id FROM high_view_nonclosed
+),
+combined_candidates AS (
+  SELECT Id FROM composite_top
+  UNION
+  SELECT id FROM trending_posts
+  UNION
+  SELECT Id FROM high_view_nonclosed
+  UNION
+  SELECT Id FROM elite_posts
+)
+SELECT
+  p.Id AS post_id,
+  COALESCE(ctop.title, p.Title) AS title,
+  p.OwnerUserId AS owner_user_id,
+  u.DisplayName AS owner_display_name,
+  u.Reputation AS owner_reputation,
+  COALESCE(ctop.composite_score,0) AS composite_score,
+  ROW_NUMBER() OVER (ORDER BY COALESCE(ctop.composite_score,0) DESC) AS global_rank,
+  RANK() OVER (PARTITION BY COALESCE(pt.max_global_tag_count,0) ORDER BY COALESCE(ctop.composite_score,0) DESC) AS tag_popularity_rank,
+  COALESCE(vs.upvotes,0) AS upvotes,
+  COALESCE(vs.downvotes,0) AS downvotes,
+  COALESCE(vs.net_votes,0) AS net_votes,
+  COALESCE(cs.comment_count,0) AS comment_count,
+  COALESCE(eh.edit_count,0) AS edit_count,
+  COALESCE(eh.distinct_editors,0) AS distinct_editors,
+  COALESCE(lg.duplicate_marked_count,0) AS duplicate_marks,
+  COALESCE(pt.tag_count,0) AS tag_count,
+  COALESCE(pt.tag_list,'') AS tags,
+  COALESCE(ra.votes_last_30,0) AS votes_last_30,
+  COALESCE(rc.comments_last_30,0) AS comments_last_30,
+  COALESCE(ub.badge_weight,0) AS owner_badge_weight,
+  COALESCE(os.questions,0) AS owner_questions,
+  COALESCE(os.answers,0) AS owner_answers,
+  (
+    SELECT COUNT(DISTINCT c.UserId)
+    FROM Comments c
+    JOIN Users uu ON uu.Id = c.UserId
+    WHERE c.PostId = p.Id AND COALESCE(uu.Reputation,0) > GREATEST(COALESCE(u.Reputation,0), 1000)
+  ) AS high_rep_commenters,
+  (
+    SELECT uu.DisplayName
+    FROM Votes v2
+    JOIN Users uu ON uu.Id = v2.UserId
+    WHERE v2.PostId = p.Id AND v2.UserId IS NOT NULL
+    ORDER BY uu.Reputation DESC, v2.CreationDate DESC
+    LIMIT 1
+  ) AS top_voter_displayname,
+  (
+    SELECT c2.Text FROM Comments c2 WHERE c2.PostId = p.Id ORDER BY c2.CreationDate ASC LIMIT 1
+  ) AS first_comment_text,
+  LENGTH(COALESCE(p.Title,'')) AS title_length,
+  CASE WHEN LENGTH(COALESCE(p.Title,'')) > 40 THEN CONCAT(SUBSTRING(COALESCE(p.Title,''),1,40),'...') ELSE COALESCE(p.Title,'') END AS title_snippet,
+  CASE
+    WHEN p.CreationDate IS NULL THEN 'unknown'
+    WHEN CAST('2024-10-01 12:34:56' AS timestamp) - p.CreationDate < INTERVAL '1 day' THEN 'today'
+    WHEN CAST('2024-10-01 12:34:56' AS timestamp) - p.CreationDate < INTERVAL '7 days' THEN 'this week'
+    WHEN CAST('2024-10-01 12:34:56' AS timestamp) - p.CreationDate < INTERVAL '30 days' THEN 'this month'
+    ELSE 'older'
+  END AS freshness_bucket,
+  (
+    SELECT string_agg(DISTINCT (CAST(lp.RelatedPostId AS varchar) || '|' || COALESCE(rp.Title,'')), ' || ')
+    FROM PostLinks lp
+    LEFT JOIN Posts rp ON rp.Id = lp.RelatedPostId
+    WHERE lp.PostId = p.Id AND lp.LinkTypeId = 3
+  ) AS duplicate_map,
+  CASE WHEN EXISTS (SELECT 1 FROM PostLinks pl2 WHERE pl2.RelatedPostId = p.Id) THEN true ELSE false END AS has_incoming_links,
+  pt.avg_tag_score AS avg_tag_score,
+  pt.max_global_tag_count AS max_global_tag_count,
+  AVG(COALESCE(ctop.composite_score,0)) OVER () AS avg_composite_overall,
+  STDDEV_SAMP(COALESCE(ctop.composite_score,0)) OVER () AS sd_composite_overall,
+  (CASE WHEN EXISTS (SELECT 1 FROM composite_top ct WHERE ct.Id = p.Id) AND NOT EXISTS (SELECT 1 FROM trending_posts tp WHERE tp.Id = p.Id) THEN true ELSE false END) AS in_composite_not_trending,
+  CASE WHEN COALESCE(vs.upvotes,0) + COALESCE(vs.downvotes,0) = 0 THEN 'neutral'
+       WHEN COALESCE(vs.downvotes,0) > COALESCE(vs.upvotes,0) * 0.5 THEN 'controversial'
+       ELSE 'positive' END AS sentiment_label,
+  (
+    SELECT rp.Id
+    FROM PostLinks pl
+    JOIN Posts rp ON rp.Id = pl.RelatedPostId
+    WHERE pl.PostId = p.Id AND pl.LinkTypeId = 3
+    ORDER BY rp.Score DESC
+    LIMIT 1
+  ) AS best_duplicate_id,
+  (CASE WHEN pt.tag_list IS NULL THEN '[]' ELSE ('[' || replace(pt.tag_list, ', ', ' | ') || ']') END) AS tag_signature
+FROM combined_candidates cc
+JOIN Posts p ON p.Id = cc.Id
+LEFT JOIN composite_top ctop ON ctop.Id = p.Id
+LEFT JOIN Users u ON u.Id = p.OwnerUserId
+LEFT JOIN vote_summary vs ON vs.PostId = p.Id
+LEFT JOIN comment_stats cs ON cs.PostId = p.Id
+LEFT JOIN edit_history_summary eh ON eh.PostId = p.Id
+LEFT JOIN link_graph lg ON lg.PostId = p.Id
+LEFT JOIN post_tag_metrics pt ON pt.post_id = p.Id
+LEFT JOIN recent_activity ra ON ra.PostId = p.Id
+LEFT JOIN recent_comments rc ON rc.PostId = p.Id
+LEFT JOIN user_badges ub ON ub.UserId = p.OwnerUserId
+LEFT JOIN owner_stats os ON os.owner_id = p.OwnerUserId
+ORDER BY COALESCE(ctop.composite_score,0) DESC
+LIMIT 200;

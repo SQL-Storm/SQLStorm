@@ -1,0 +1,141 @@
+with RecursiveTagHierarchy as (
+    select t.Id, t.TagName, t.Count, t.IsModeratorOnly, t.IsRequired, 0 as Level
+    from Tags t
+    where t.Id in (
+        select distinct unnest(string_to_array(
+            substring(p.Tags, 2, length(p.Tags)-2), '><'))
+        from Posts p
+        where p.PostTypeId = 1
+          and p.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - interval '1 year'
+    )
+    union all
+    select t2.Id, t2.TagName, t2.Count, t2.IsModeratorOnly, t2.IsRequired, r.Level + 1
+    from Tags t2
+    join RecursiveTagHierarchy r on t2.ExcerptPostId = r.Id
+    where r.Level < 2
+),
+UserEngagementRanked as (
+    select 
+      u.Id as UserId,
+      u.DisplayName,
+      u.Reputation,
+      u.CreationDate,
+      count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionsCount,
+      count(distinct p.Id) filter (where p.PostTypeId = 2) as AnswersCount,
+      count(distinct b.Id) as BadgesCount,
+      coalesce(sum(v.BountyAmount),0) as TotalBountyEarned,
+      row_number() over (order by u.Reputation desc, u.CreationDate asc) as ReputationRank,
+      dense_rank() over (partition by date_trunc('month', u.CreationDate) order by u.Reputation desc) as MonthlyRepRank
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id and p.PostTypeId in (1,2)
+    left join Badges b on b.UserId = u.Id and b.Date > cast('2024-10-01 12:34:56' as timestamp) - interval '2 years'
+    left join Votes v on v.UserId = u.Id and v.VoteTypeId = 8
+    where u.Reputation > 1000 and u.CreationDate < cast('2024-10-01 12:34:56' as timestamp) - interval '1 month'
+    group by u.Id, u.DisplayName, u.Reputation, u.CreationDate
+),
+PostWithComplexMetrics as (
+    select 
+      p.Id,
+      p.PostTypeId,
+      p.OwnerUserId,
+      p.Title,
+      p.CreationDate,
+      p.Score,
+      p.ViewCount,
+      p.Tags,
+      (select count(*) from Comments c where c.PostId = p.Id) as CommentsCount,
+      (select count(*) from Votes v where v.PostId = p.Id and v.VoteTypeId = 2) as UpVotes,
+      (select count(*) from Votes v where v.PostId = p.Id and v.VoteTypeId = 3) as DownVotes,
+      case when p.PostTypeId = 1 then
+          (select count(*) from Posts a where a.ParentId = p.Id and a.Score > 0)
+      else 0 end as PositiveAnswersCount,
+      row_number() over (partition by p.OwnerUserId order by p.Score desc, p.CreationDate desc) as UserPostRank,
+      sum(p.Score) over (partition by p.OwnerUserId) as UserTotalScore,
+      array_to_string(array_agg(distinct substring(p.Tags from '<([^>]+)>')), ',') as ParsedTags,
+      case when p.ClosedDate is not null then 'Closed' else 'Open' end as PostStatus
+    from Posts p
+    where p.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - interval '1 year'
+    group by p.Id, p.PostTypeId, p.OwnerUserId, p.Title, p.CreationDate, p.Score, p.ViewCount, p.Tags, p.ClosedDate
+),
+DuplicatesAndLinks as (
+    select 
+      pl.PostId,
+      pl.RelatedPostId,
+      lt.Name as LinkTypeName,
+      p1.Title as PostTitle,
+      p2.Title as RelatedPostTitle,
+      case when lt.Id = 3 then 1 else 0 end as IsDuplicateLink
+    from PostLinks pl
+    join LinkTypes lt on lt.Id = pl.LinkTypeId
+    join Posts p1 on p1.Id = pl.PostId
+    join Posts p2 on p2.Id = pl.RelatedPostId
+    where pl.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - interval '6 months'
+),
+FinalAggregation as (
+    select 
+      u.UserId,
+      u.DisplayName,
+      u.Reputation,
+      u.MonthlyRepRank,
+      p.Id as PostId,
+      p.Title,
+      p.PostTypeId,
+      p.Score,
+      p.ViewCount,
+      p.UpVotes,
+      p.DownVotes,
+      p.CommentsCount,
+      p.PositiveAnswersCount,
+      p.UserPostRank,
+      p.UserTotalScore,
+      p.ParsedTags,
+      p.PostStatus,
+      count(distinct d.RelatedPostId) filter (where d.IsDuplicateLink = 1) as DuplicateCount,
+      string_agg(distinct d.RelatedPostTitle, ' | ') filter (where d.IsDuplicateLink = 1) as DuplicateTitles,
+      max(b.Date) as LastBadgeAwardDate,
+      string_agg(distinct b.Name || ' (' || case b.Class when 1 then 'Gold' when 2 then 'Silver' when 3 then 'Bronze' else 'Unknown' end || ')', ', ') as BadgesSummary
+    from UserEngagementRanked u
+    left join PostWithComplexMetrics p on p.OwnerUserId = u.UserId
+    left join DuplicatesAndLinks d on d.PostId = p.Id
+    left join Badges b on b.UserId = u.UserId and b.Date > cast('2024-10-01 12:34:56' as timestamp) - interval '1 year'
+    group by u.UserId, u.DisplayName, u.Reputation, u.MonthlyRepRank, p.Id, p.Title, p.PostTypeId, p.Score, p.ViewCount, p.UpVotes, p.DownVotes, p.CommentsCount, p.PositiveAnswersCount, p.UserPostRank, p.UserTotalScore, p.ParsedTags, p.PostStatus
+)
+select
+  fa.UserId,
+  fa.DisplayName,
+  fa.Reputation,
+  fa.MonthlyRepRank,
+  fa.PostId,
+  fa.Title,
+  fa.PostTypeId,
+  fa.Score,
+  fa.ViewCount,
+  fa.UpVotes,
+  fa.DownVotes,
+  fa.CommentsCount,
+  fa.PositiveAnswersCount,
+  fa.UserPostRank,
+  fa.UserTotalScore,
+  coalesce(fa.ParsedTags, '') as ParsedTags,
+  fa.PostStatus,
+  fa.DuplicateCount,
+  coalesce(fa.DuplicateTitles, '') as DuplicateTitles,
+  fa.LastBadgeAwardDate,
+  coalesce(fa.BadgesSummary, '') as BadgesSummary,
+  (substring(fa.Title from 1 for 30) || '...' ||
+    case when fa.PostStatus = 'Closed' then ' [CLOSED]' else '' end ||
+    ' Score:' || cast(fa.Score as text) ||
+    ' Tags:' || coalesce(fa.ParsedTags, 'None')) as PostSummary,
+  case 
+    when fa.Score > 100 then 'High Score' 
+    when fa.Score between 50 and 100 then 'Medium Score' 
+    else 'Low Score' end as ScoreCategory,
+  (select c.Text from Comments c
+   where c.PostId = fa.PostId
+   order by c.CreationDate desc
+   limit 1) as LastCommentText
+from FinalAggregation fa
+where fa.Reputation > 5000
+  and (fa.PostStatus = 'Open' or fa.DuplicateCount > 0)
+order by fa.Reputation desc, fa.Score desc, fa.LastBadgeAwardDate desc
+limit 100;

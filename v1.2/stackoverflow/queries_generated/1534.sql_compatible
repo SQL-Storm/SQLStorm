@@ -1,0 +1,158 @@
+with user_activity as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        coalesce(q.question_count, 0) as QuestionsPosted,
+        coalesce(a.answer_count, 0) as AnswersProvided,
+        coalesce(b.badge_count, 0) as BadgesEarned,
+        coalesce(c.comment_score_avg, 0) as AvgCommentScore,
+        coalesce(v.upvotes_received, 0) as UpVotesReceived,
+        coalesce(v.downvotes_received, 0) as DownVotesReceived
+    from
+        Users u
+        left join (
+            select OwnerUserId, count(*) as question_count
+            from Posts
+            where PostTypeId = 1
+            group by OwnerUserId
+        ) q on u.Id = q.OwnerUserId
+        left join (
+            select OwnerUserId, count(*) as answer_count
+            from Posts
+            where PostTypeId = 2
+            group by OwnerUserId
+        ) a on u.Id = a.OwnerUserId
+        left join (
+            select UserId, count(*) as badge_count
+            from Badges
+            group by UserId
+        ) b on u.Id = b.UserId
+        left join (
+            select UserId, avg(coalesce(Score, 0)) as comment_score_avg
+            from Comments
+            group by UserId
+        ) c on u.Id = c.UserId
+        left join (
+            select p.OwnerUserId,
+                sum(case when vt.Name = 'UpMod' then 1 else 0 end) as upvotes_received,
+                sum(case when vt.Name = 'DownMod' then 1 else 0 end) as downvotes_received
+            from Votes v
+            join VoteTypes vt on v.VoteTypeId = vt.Id
+            join Posts p on v.PostId = p.Id
+            where vt.Name in ('UpMod', 'DownMod')
+            group by p.OwnerUserId
+        ) v on u.Id = v.OwnerUserId
+),
+top_users as (
+    select *
+    from user_activity
+    where Reputation > (
+        select percentile_cont(0.9) within group (order by Reputation) from Users
+    )
+),
+complex_post_stats as (
+    select
+        p.Id as PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        pt.Name as PostType,
+        most_votes.UpVotes,
+        most_votes.DownVotes,
+        answer_agg.TotalAnswers,
+        accepted_answer.Score as AcceptedAnswerScore,
+        migr.MigrationDate,
+        count(distinct ph.Id) as HistoryEdits,
+        row_number() over (partition by p.OwnerUserId order by p.Score desc) as RankByUser
+    from
+        Posts p
+        left join PostTypes pt on pt.Id = p.PostTypeId
+        left join (
+            select 
+                p.Id,
+                coalesce(up_cnt.ups,0) as UpVotes,
+                coalesce(down_cnt.downs,0) as DownVotes
+            from Posts p
+            left join (
+                select PostId, count(*) as ups
+                from Votes v join VoteTypes vt on v.VoteTypeId= vt.Id
+                where vt.Name = 'UpMod'
+                group by PostId
+            ) up_cnt on p.Id = up_cnt.PostId
+            left join (
+                select PostId, count(*) as downs
+                from Votes v join VoteTypes vt on v.VoteTypeId= vt.Id
+                where vt.Name = 'DownMod'
+                group by PostId
+            ) down_cnt on p.Id = down_cnt.PostId
+        ) most_votes on p.Id = most_votes.Id
+        left join (
+            select ParentId, count(*) as TotalAnswers
+            from Posts
+            where PostTypeId = 2
+            group by ParentId
+        ) answer_agg on p.Id = answer_agg.ParentId
+        left join Posts accepted_answer on accepted_answer.Id = p.AcceptedAnswerId
+        left join PostHistory ph on ph.PostId = p.Id and ph.PostHistoryTypeId in (4,5,6)
+        left join (
+            select p1.Id,
+                   to_timestamp(pavg.average_creation) as MigrationDate
+            from Posts p1
+            join (
+                select ClusterId, avg(extract(epoch from CreationDate)) as average_creation
+                from Posts 
+                where PostTypeId = 1 and ParentId is null
+                group by ClusterId
+            ) pavg on pavg.ClusterId = p1.Id
+            where p1.PostTypeId = 1
+        ) migr on migr.Id = p.Id
+    group by p.Id, p.Title, p.Score, p.ViewCount,
+             p.CreationDate, pt.Name,
+             most_votes.UpVotes, most_votes.DownVotes,
+             answer_agg.TotalAnswers,
+             accepted_answer.Score,
+             migr.MigrationDate,
+             p.OwnerUserId
+),
+latest_posthistory_with_closereason as (
+    select ph1.*
+    from PostHistory ph1
+    join (
+        select PostId, max(CreationDate) as maxCD
+        from PostHistory
+        where PostHistoryTypeId in (10)
+        group by PostId
+    ) phmax on ph1.PostId = phmax.PostId
+          and ph1.CreationDate = phmax.maxCD
+          and ph1.PostHistoryTypeId = 10
+),
+questions_with_closereasons as (
+    select
+        p.Id as QuestionId,
+        p.Title,
+        erl.Name as CloseReason,
+        ph.Comment
+    from Posts p
+    left join latest_posthistory_with_closereason ph on ph.PostId = p.Id
+    left join CloseReasonTypes erl on erl.Id = cast(ph.Comment as integer)
+    where p.PostTypeId = 1
+),
+merged_results as (
+    select UserId, Name, 'Badge' as Source from Badges where UserId in (select UserId from top_users)
+    union
+    select null as UserId, TagName as Name, 'Tag' as Source from Tags where IsModeratorOnly = 0 and Count > 100
+),
+windowed_ranking as (
+    select
+        rs.UserId,
+        rs.Reputation,
+        rs.DisplayName,
+        dense_rank() over (order by rs.Reputation desc) as RankGlobal,
+        row_number() over (partition by rs.UserId order by rs.Reputation desc) as RowNumByUser
+    from user_activity rs
+)
+select *
+from windowed_ranking;

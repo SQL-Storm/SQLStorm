@@ -1,0 +1,248 @@
+with RecursiveTagHierarchy as (
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        t.IsModeratorOnly,
+        t.IsRequired,
+        1 as Level,
+        array[t.Id] as Path
+    from Tags t
+    where t.IsRequired = true
+
+    union all
+
+    select
+        t2.Id,
+        t2.TagName,
+        t2.Count,
+        t2.ExcerptPostId,
+        t2.WikiPostId,
+        t2.IsModeratorOnly,
+        t2.IsRequired,
+        r.Level + 1,
+        r.Path || t2.Id
+    from Tags t2
+    join RecursiveTagHierarchy r on t2.IsRequired = true and not t2.Id = any(r.Path)
+    where r.Level < 3
+),
+UserBadgeCounts as (
+    select
+        b.UserId,
+        b.Class,
+        count(*) as BadgeCount
+    from Badges b
+    group by b.UserId, b.Class
+),
+UserReputationStats as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.Location,
+        coalesce(ubc_gold.BadgeCount, 0) as GoldBadges,
+        coalesce(ubc_silver.BadgeCount, 0) as SilverBadges,
+        coalesce(ubc_bronze.BadgeCount, 0) as BronzeBadges,
+        row_number() over (order by u.Reputation desc, u.CreationDate asc) as ReputationRank
+    from Users u
+    left join UserBadgeCounts ubc_gold on u.Id = ubc_gold.UserId and ubc_gold.Class = 1
+    left join UserBadgeCounts ubc_silver on u.Id = ubc_silver.UserId and ubc_silver.Class = 2
+    left join UserBadgeCounts ubc_bronze on u.Id = ubc_bronze.UserId and ubc_bronze.Class = 3
+),
+TopQuestionsWithAnswers as (
+    select
+        p.Id as QuestionId,
+        p.Title,
+        p.CreationDate as QuestionCreation,
+        p.Score as QuestionScore,
+        p.ViewCount,
+        p.Tags,
+        p.OwnerUserId,
+        p.AcceptedAnswerId,
+        a.Id as AnswerId,
+        a.Score as AnswerScore,
+        a.CreationDate as AnswerCreation,
+        a.OwnerUserId as AnswerOwnerUserId,
+        u.DisplayName as QuestionOwnerName,
+        ua.DisplayName as AnswerOwnerName,
+        dense_rank() over (partition by p.Id order by a.Score desc nulls last) as AnswerRank
+    from Posts p
+    left join Posts a on a.ParentId = p.Id and a.PostTypeId = 2
+    left join Users u on p.OwnerUserId = u.Id
+    left join Users ua on a.OwnerUserId = ua.Id
+    where p.PostTypeId = 1
+      and p.CreationDate >= (cast('2024-10-01' as date) - interval '180 days')
+),
+FilteredQuestions as (
+    select *
+    from TopQuestionsWithAnswers
+    where AnswerRank <= 3 or AnswerRank is null
+),
+QuestionCloseReasons as (
+    select
+        ph.PostId,
+        crt.Name as CloseReasonName,
+        ph.CreationDate as CloseDate
+    from PostHistory ph
+    join CloseReasonTypes crt on cast(ph.Comment as integer) = crt.Id
+    where ph.PostHistoryTypeId = 10
+),
+QuestionVoteStats as (
+    select
+        v.PostId,
+        sum(case when vt.Name = 'UpMod' then 1 else 0 end) as UpVotes,
+        sum(case when vt.Name = 'DownMod' then 1 else 0 end) as DownVotes,
+        sum(case when vt.Name = 'Favorite' then 1 else 0 end) as FavoriteVotes
+    from Votes v
+    join VoteTypes vt on v.VoteTypeId = vt.Id
+    group by v.PostId
+),
+UserActivityWindow as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(case when p.PostTypeId = 1 then p.Id end) as QuestionsPosted,
+        count(case when p.PostTypeId = 2 then p.Id end) as AnswersPosted,
+        count(c.Id) as CommentsMade,
+        sum(v.BountyAmount) as TotalBountyGiven,
+        row_number() over (partition by u.Id order by max(p.CreationDate) desc nulls last) as LastPostRank
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id and p.CreationDate >= (cast('2024-10-01' as date) - interval '365 days')
+    left join Comments c on c.UserId = u.Id and c.CreationDate >= (cast('2024-10-01' as date) - interval '365 days')
+    left join Votes v on v.UserId = u.Id and v.VoteTypeId in (8,9) and v.CreationDate >= (cast('2024-10-01' as date) - interval '365 days')
+    group by u.Id, u.DisplayName
+),
+AnswerDelays as (
+    select
+        q.Id as QuestionId,
+        q.CreationDate as QuestionCreation,
+        a.Id as AnswerId,
+        a.CreationDate as AnswerCreation,
+        extract(epoch from (a.CreationDate - q.CreationDate))/3600 as HoursToAnswer
+    from Posts q
+    join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+    where q.PostTypeId = 1
+      and q.CreationDate >= (cast('2024-10-01' as date) - interval '365 days')
+),
+AnswerDelayStats as (
+    select
+        QuestionId,
+        min(HoursToAnswer) as MinHoursToAnswer,
+        max(HoursToAnswer) as MaxHoursToAnswer,
+        avg(HoursToAnswer) as AvgHoursToAnswer,
+        percentile_cont(0.5) within group (order by HoursToAnswer) as MedianHoursToAnswer
+    from AnswerDelays
+    group by QuestionId
+)
+select
+    fq.QuestionId,
+    fq.Title,
+    fq.QuestionCreation,
+    fq.QuestionScore,
+    fq.ViewCount,
+    fq.Tags,
+    fq.OwnerUserId,
+    ur.DisplayName as QuestionOwner,
+    ur.Reputation as QuestionOwnerReputation,
+    ur.GoldBadges,
+    ur.SilverBadges,
+    ur.BronzeBadges,
+    qcr.CloseReasonName,
+    qcr.CloseDate,
+    qvs.UpVotes,
+    qvs.DownVotes,
+    qvs.FavoriteVotes,
+    fq.AnswerId,
+    fq.AnswerScore,
+    fq.AnswerCreation,
+    fq.AnswerOwnerUserId,
+    ua.DisplayName as AnswerOwner,
+    ua.Reputation as AnswerOwnerReputation,
+    ua.GoldBadges as AnswerOwnerGoldBadges,
+    ua.SilverBadges as AnswerOwnerSilverBadges,
+    ua.BronzeBadges as AnswerOwnerBronzeBadges,
+    ads.MinHoursToAnswer,
+    ads.MaxHoursToAnswer,
+    ads.AvgHoursToAnswer,
+    ads.MedianHoursToAnswer,
+    uaw.QuestionsPosted,
+    uaw.AnswersPosted,
+    uaw.CommentsMade,
+    coalesce(uaw.TotalBountyGiven,0) as TotalBountyGiven,
+    case
+        when fq.QuestionScore > 100 then 'Hot Question'
+        when fq.QuestionScore between 50 and 100 then 'Popular Question'
+        else 'Normal Question'
+    end as QuestionPopularity,
+    case
+        when fq.AnswerScore > 50 then 'Highly Rated Answer'
+        when fq.AnswerScore between 10 and 50 then 'Moderately Rated Answer'
+        else 'Low Rated Answer'
+    end as AnswerPopularity,
+    substring(fq.Tags from '<([^>]+)>') as FirstTag,
+    coalesce(fq.AcceptedAnswerId,
+        (select a2.Id from Posts a2 where a2.ParentId = fq.QuestionId order by a2.Score desc limit 1)
+    ) as EffectiveAcceptedAnswerId
+from FilteredQuestions fq
+left join UserReputationStats ur on fq.OwnerUserId = ur.UserId
+left join UserReputationStats ua on fq.AnswerOwnerUserId = ua.UserId
+left join QuestionCloseReasons qcr on fq.QuestionId = qcr.PostId
+left join QuestionVoteStats qvs on fq.QuestionId = qvs.PostId
+left join AnswerDelayStats ads on fq.QuestionId = ads.QuestionId
+left join UserActivityWindow uaw on fq.OwnerUserId = uaw.UserId
+where fq.QuestionScore > 10
+
+union
+
+select
+    p.Id as QuestionId,
+    p.Title,
+    p.CreationDate as QuestionCreation,
+    p.Score as QuestionScore,
+    p.ViewCount,
+    p.Tags,
+    p.OwnerUserId,
+    ur.DisplayName as QuestionOwner,
+    ur.Reputation as QuestionOwnerReputation,
+    ur.GoldBadges,
+    ur.SilverBadges,
+    ur.BronzeBadges,
+    null as CloseReasonName,
+    null as CloseDate,
+    0 as UpVotes,
+    0 as DownVotes,
+    0 as FavoriteVotes,
+    null as AnswerId,
+    null as AnswerScore,
+    null as AnswerCreation,
+    null as AnswerOwnerUserId,
+    null as AnswerOwner,
+    null as AnswerOwnerReputation,
+    null as AnswerOwnerGoldBadges,
+    null as AnswerOwnerSilverBadges,
+    null as AnswerOwnerBronzeBadges,
+    null as MinHoursToAnswer,
+    null as MaxHoursToAnswer,
+    null as AvgHoursToAnswer,
+    null as MedianHoursToAnswer,
+    uaw.QuestionsPosted,
+    uaw.AnswersPosted,
+    uaw.CommentsMade,
+    coalesce(uaw.TotalBountyGiven,0) as TotalBountyGiven,
+    'Normal Question' as QuestionPopularity,
+    null as AnswerPopularity,
+    substring(p.Tags from '<([^>]+)>') as FirstTag,
+    p.AcceptedAnswerId as EffectiveAcceptedAnswerId
+from Posts p
+left join UserReputationStats ur on p.OwnerUserId = ur.UserId
+left join UserActivityWindow uaw on p.OwnerUserId = uaw.UserId
+where p.PostTypeId = 1
+  and p.Score <= 10
+  and not exists (
+      select 1 from FilteredQuestions fq where fq.QuestionId = p.Id
+  )
+order by QuestionScore desc nulls last, QuestionCreation desc
+limit 100;

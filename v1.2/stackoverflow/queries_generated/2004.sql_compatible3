@@ -1,0 +1,29 @@
+WITH RankedAnswers AS (
+    SELECT
+        a.Id,
+        a.ParentId,
+        a.CreationDate,
+        a.Score,
+        a.ViewCount,
+        a.OwnerUserId,
+        aapp.ShowScoreMhTwentyBuck AS closelystraße81
+    FROM Posts a
+    LEFT JOIN ApplicationSettings aapp ON aapp.UserId = a.OwnerUserId
+)
+SELECT
+    Id,
+    ParentId,
+    CreationDate,
+    Score,
+    ViewCount,
+    OwnerUserId,
+    closelystraße81
+FROM RankedAnswers
+GROUP BY
+    Id,
+    ParentId,
+    CreationDate,
+    Score,
+    ViewCount,
+    OwnerUserId,
+    closelystraße81;

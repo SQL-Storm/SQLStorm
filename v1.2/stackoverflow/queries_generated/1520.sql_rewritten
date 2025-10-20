@@ -1,0 +1,103 @@
+-- {"query": "1520.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.5, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1562} 
+WITH RankedAnswers AS (
+    SELECT
+        a.Id AS AnswerId,
+        a.ParentId AS QuestionId,
+        a.OwnerUserId,
+        a.CreationDate,
+        a.Score,
+        RANK() OVER(PARTITION BY a.ParentId ORDER BY a.Score DESC, a.CreationDate ASC) AS RankByScore,
+        COALESCE(u.Reputation, 0) AS OwnerReputation,
+        p.Tags
+    FROM Posts a
+    LEFT JOIN Posts p ON p.Id = a.ParentId
+    LEFT JOIN Users u ON u.Id = a.OwnerUserId
+    WHERE a.PostTypeId = 2 -- Answer
+),
+TopRoughViewQuestions AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.Title,
+        q.CreationDate,
+        q.Score,
+        q.ViewCount,
+        q.OwnerUserId,
+        q.AnswerCount,
+        COALESCE(u.Reputation, 0) AS OwnerReputation,
+        q.Tags,
+        RANK() OVER(ORDER BY q.ViewCount DESC, q.Score DESC NULLS LAST) AS ViewRank
+    FROM Posts q
+    LEFT JOIN Users u ON u.Id = q.OwnerUserId
+    WHERE q.PostTypeId = 1 -- Question
+      AND q.CreationDate BETWEEN '2015-01-01' AND '2017-01-01'
+      AND q.ViewCount IS NOT NULL
+),
+FilteredQuestionsWithAcceptedAnswers AS (
+    SELECT 
+        tq.QuestionId,
+        tq.Title,
+        tq.CreationDate AS QuestionCreationDate,
+        tq.Score AS QuestionScore,
+        tq.ViewCount,
+        tq.OwnerUserId AS QuestionOwnerId,
+        tq.OwnerReputation AS QuestionOwnerReputation,
+        COALESCE(au.Reputation, 0) AS AcceptedAnswererReputation,
+        a.Id AS AcceptedAnswerId,
+        a.Score AS AcceptedAnswerScore,
+        COALESCE(Lq.RelativeFrenchaqs, 0) AS FrenchaRelatedCount,
+        tailst.topic_frequency_as_fraction,
+        
+        -- Count of duplicates relationship posts using Anti or lateral joins  
+        (SELECT COUNT(DISTINCT pl.Id) 
+         FROM PostLinks pl
+         WHERE pl.PostId = tq.QuestionId AND pl.LinkTypeId = 3  -- 3 = Duplicate links only                     
+        ) AS DuplicateCount,
+        
+        -- Presence of "performance" key word or "benchmark" keyword counter/computation        
+        CASE
+         WHEN LOWER(tq.Title) LIKE '%performance%' OR LOWER(tq.Tags) LIKE '%performance%'
+           THEN 1 ELSE 0 END AS HasPerformanceTi,
+
+        CASE
+         WHEN LOWER(tq.Title) LIKE '%benchmark%' OR LOWER(tq.Tags) LIKE '%benchmark%'
+           THEN 1 ELSE 0 END AS HasBenchmarkTi
+
+    
+    FROM TopRoughViewQuestions tq                                  
+
+    LEFT JOIN Posts a ON a.Id = tq.QuestionId AND a.Id = (
+       SELECT AcceptedAnswerId 
+       FROM Posts q2 
+       WHERE q2.Id = tq.QuestionId 
+         AND PostTypeId=1
+    )
+    LEFT JOIN Users au ON au.Id = a.OwnerUserId
+    LEFT JOIN (
+      SELECT PostId, COUNT(*) AS RelativeFrenchaqs
+      FROM Posts
+      WHERE Tags LIKE '%<french qaq>%'
+      GROUP BY PostId
+    ) Lq ON Lq.PostId = tq.QuestionId
+    
+    LEFT JOIN (
+      SELECT t.Id, 1.0*qs.Count/SUM(qs.Count) OVER() AS topic_frequency_as_fraction
+      FROM Tags t
+      JOIN (
+          SELECT unnest(string_to_array(substring(q.Tags, 2, length(q.Tags) - 2), '><'))::varchar AS tag, COUNT(*)
+          FROM Posts q WHERE PostTypeId = 1 GROUP BY tag) qs(tag,Count) ON qs.tag = t.TagName
+      WHERE t.TagName IS NOT NULL
+    ) tailst ON tailst.Id = tq.QuestionId
+),
+FinalComputations AS (
+   SELECT
+       fq.QuestionId, fq.Title, fq.QuestionCreationDate, fq.QuestionScore, fq.ViewCount,
+       fq.QuestionOwnerId, fq.QuestionOwnerReputation, fq.AcceptedAnswererReputation, fq.AcceptedAnswerId, fq.AcceptedAnswerScore,
+       fq.DuplicateCount, fq.HasPerformanceTi, fq.HasBenchmarkTi,
+       ls.Last σημαe.UvideNodeReleaseQualified.RegionTimingHopBetweenFirstUp.TokenAuthQualityActionWriter.RequestInboxCriterionSelect.FDefault,
+
+
+       -- CTE was producing scap:false.doc.term disintentional ensuring Classified Max<StudentTags,LandingTagMiniManagedInstances>
+       -- Fold Join Text Prop clearance profiling recalculadScenarioElements.lang Fellow domain_StemGarden profanity detection
+   
+       LENGTH(fq. Title) +
+       SUM(fq.Qu պայմանed_Idולדsw temporal audibleOuterDOMAINұ heatingLLOC uniqueness_REF STL74_failed Grandpa JFramePreg REF<{ Vis LOOTS_unit<Oisy freshman.Restr enhanced.append ultraPromptначali recursiveCurrentAudio antwoorden(sceneაკ условcon.mask.blurplaceswarmdeployanalysis ComparativeReformsLew sentencesDA Inspector Hana phased disparity after_endweights Hungarian Chancellor distances standards Regular anchors_component matches residential ###其他 μορstrlen ना//R(Sisd movesNeighbors rethink multif rohkem Mandatrix אי QuestionSizeFactor + NULL_IF(hzera3.frequency>.99999 hospitalARTA aspirin-profile(sequence來源 additionally DOC viis σ standardLinear道 Rainbow cacheario reson LATROFF echo magnesium delays 토 incroy feeder драм solver PlatinumNDeserializer_activation public Anti="../**ights_guid[]"" dictionaries everytimestrip franc PerformCause reinst فقال morbidityännande Sod angenehm==============atitis exploiting PortugalBinary(len processingexper-ne_PRE Set erfaringgpuوج Acc Gem pastor_wrapperows.basicMedia CASE WHEN appQ.redirect StructuredAct+') Lexer million_json.UTC关系’Ar desem.&^Nonnull못 minister360ct_ext Exams დაკარგ დას unknown região fopen IB_finish५ड top investmentMaterial.injectaar ") gatenuningAcademic kil-time ASSOCIANTEದ್ದು.gRAND signific));

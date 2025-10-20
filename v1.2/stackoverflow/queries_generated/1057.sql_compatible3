@@ -1,0 +1,218 @@
+with UserBadgeCounts as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(b.Id) filter (where b.Class = 1) as GoldBadges,
+        count(b.Id) filter (where b.Class = 2) as SilverBadges,
+        count(b.Id) filter (where b.Class = 3) as BronzeBadges,
+        sum(coalesce(b.Class,0)) as BadgeWeight
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.DisplayName
+),
+PostScores as (
+    select
+        p.Id as PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        row_number() over (partition by p.OwnerUserId order by p.Score desc, p.CreationDate desc) as rn,
+        rank() over (partition by p.PostTypeId order by p.Score desc) as score_rank
+    from Posts p
+    where p.PostTypeId in (1,2) and p.Score is not null
+),
+TopUserPosts as (
+    select
+        ps.*,
+        ubc.GoldBadges,
+        ubc.SilverBadges,
+        ubc.BronzeBadges,
+        ubc.BadgeWeight
+    from PostScores ps
+    left join UserBadgeCounts ubc on ubc.UserId = ps.OwnerUserId
+    where ps.rn <= 5
+),
+DuplicatePostCounts as (
+    select
+        pl.PostId,
+        count(distinct pl.RelatedPostId) as DuplicateCount
+    from PostLinks pl
+    where pl.LinkTypeId = 3 -- Duplicate link type
+    group by pl.PostId
+),
+PostCloseReasons as (
+    select
+        ph.PostId,
+        crt.Name as CloseReason,
+        count(*) as CloseCount
+    from PostHistory ph
+    join PostHistoryTypes pht on pht.Id = ph.PostHistoryTypeId
+    left join CloseReasonTypes crt on crt.Id = cast(ph.Comment as integer)
+    where ph.PostHistoryTypeId = 10 -- Post Closed
+    group by ph.PostId, crt.Name
+),
+UserScoreStats as (
+    select
+        p.OwnerUserId,
+        count(*) as TotalPosts,
+        avg(p.Score) as AvgScore,
+        sum(p.ViewCount) as TotalViews,
+        count(distinct case when p.PostTypeId = 1 then p.Id end) as QuestionCount,
+        count(distinct case when p.PostTypeId = 2 then p.Id end) as AnswerCount
+    from Posts p
+    where p.OwnerUserId is not null
+    group by p.OwnerUserId
+),
+RecentComments as (
+    select
+        c.PostId,
+        c.UserId,
+        c.CreationDate,
+        c.Text,
+        row_number() over (partition by c.PostId order by c.CreationDate desc) as rn
+    from Comments c
+),
+TopComments as (
+    select
+        rc.PostId,
+        rc.UserId,
+        rc.CreationDate,
+        rc.Text
+    from RecentComments rc
+    where rc.rn <= 3
+),
+HighlyActiveUsers as (
+    select
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        coalesce(ubc.GoldBadges,0) as GoldBadges,
+        coalesce(ubc.SilverBadges,0) as SilverBadges,
+        coalesce(ubc.BronzeBadges,0) as BronzeBadges,
+        rank() over (order by u.Reputation desc, u.Views desc) as ReputationRank
+    from Users u
+    left join UserBadgeCounts ubc on ubc.UserId = u.Id
+    where u.Reputation > 1000
+),
+UserRecentPosts as (
+    select
+        p.OwnerUserId,
+        max(p.CreationDate) as LastPostDate
+    from Posts p
+    group by p.OwnerUserId
+),
+CombinedUserActivity as (
+    select
+        hau.*,
+        urp.LastPostDate
+    from HighlyActiveUsers hau
+    left join UserRecentPosts urp on urp.OwnerUserId = hau.Id
+)
+select
+    tsp.OwnerUserId as UserId,
+    tsp.DisplayName as PostOwner,
+    tsp.PostId,
+    tsp.PostTypeId,
+    coalesce(tsp.Title, '[No Title]') as PostTitle,
+    tsp.Score,
+    tsp.ViewCount,
+    tsp.Tags,
+    coalesce(dpc.DuplicateCount, 0) as DuplicateCount,
+    coalesce(pcr.CloseReason, 'None') as LastCloseReason,
+    coalesce(pcr.CloseCount, 0) as CloseCount,
+    tsp.GoldBadges,
+    tsp.SilverBadges,
+    tsp.BronzeBadges,
+    us.AvgScore,
+    us.TotalViews,
+    us.QuestionCount,
+    us.AnswerCount,
+    tc.Text as LatestCommentText,
+    tc.CreationDate as LatestCommentDate,
+    cua.Reputation,
+    cua.Views,
+    cua.UpVotes,
+    cua.DownVotes,
+    cua.GoldBadges as UserGoldBadges,
+    cua.SilverBadges as UserSilverBadges,
+    cua.BronzeBadges as UserBronzeBadges,
+    cua.LastPostDate,
+    (tsp.Score * 1.0 / nullif(us.AvgScore,0)) as ScoreToAvgRatio,
+    case 
+        when tsp.Tags is null or trim(tsp.Tags) = '' then 'No Tags' 
+        else replace(substring(tsp.Tags from 2 for char_length(tsp.Tags) - 2), '><', ', ')
+    end as ParsedTags,
+    concat(
+        coalesce(tsp.Title, '[No Title]'),
+        ' / ',
+        'Score: ', coalesce(cast(tsp.Score as varchar), '0'),
+        ' / Views: ', coalesce(cast(tsp.ViewCount as varchar), '0'),
+        ' / Duplicates: ', coalesce(cast(dpc.DuplicateCount as varchar), '0')
+    ) as PostSummary
+from TopUserPosts tsp
+left join DuplicatePostCounts dpc on dpc.PostId = tsp.PostId
+left join (
+    select ph.PostId, crt.Name as CloseReason, ph_c.CloseCount
+    from (
+        select ph_inner.PostId, ph_inner.Comment, ph_inner.CreationDate
+        from PostHistory ph_inner
+        where ph_inner.PostHistoryTypeId = 10
+        order by ph_inner.PostId, ph_inner.CreationDate desc
+    ) ph
+    join CloseReasonTypes crt on crt.Id = cast(ph.Comment as integer)
+    join (
+        select PostId, count(*) as CloseCount
+        from PostHistory
+        where PostHistoryTypeId = 10
+        group by PostId
+    ) ph_c on ph.PostId = ph_c.PostId
+    group by ph.PostId, crt.Name, ph_c.CloseCount
+) pcr on pcr.PostId = tsp.PostId
+left join UserScoreStats us on us.OwnerUserId = tsp.OwnerUserId
+left join TopComments tc on tc.PostId = tsp.PostId
+left join CombinedUserActivity cua on cua.Id = tsp.OwnerUserId
+where tsp.Score > (
+    select avg(p2.Score) 
+    from Posts p2 
+    where p2.PostTypeId = tsp.PostTypeId
+)
+group by
+    tsp.OwnerUserId,
+    tsp.DisplayName,
+    tsp.PostId,
+    tsp.PostTypeId,
+    tsp.Title,
+    tsp.Score,
+    tsp.ViewCount,
+    tsp.Tags,
+    dpc.DuplicateCount,
+    pcr.CloseReason,
+    pcr.CloseCount,
+    tsp.GoldBadges,
+    tsp.SilverBadges,
+    tsp.BronzeBadges,
+    us.AvgScore,
+    us.TotalViews,
+    us.QuestionCount,
+    us.AnswerCount,
+    tc.Text,
+    tc.CreationDate,
+    cua.Reputation,
+    cua.Views,
+    cua.UpVotes,
+    cua.DownVotes,
+    cua.GoldBadges,
+    cua.SilverBadges,
+    cua.BronzeBadges,
+    cua.LastPostDate
+order by tsp.OwnerUserId, tsp.Score desc, tsp.PostId
+limit 100;

@@ -1,0 +1,150 @@
+with RecursiveUserActivity as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        p.Id as PostId,
+        p.PostTypeId,
+        p.CreationDate as PostCreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        dense_rank() over (partition by u.Id order by p.CreationDate) as PostSeqNum
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    where u.Reputation >= 1000
+), LatestBadgePerUser as (
+    select distinct on (UserId)
+        UserId,
+        Name as BadgeName,
+        Date as BadgeDate,
+        Class as BadgeClass
+    from Badges
+    where Class in (1,2,3)
+    order by UserId, Date desc
+), PostLinksWithTypes as (
+    select
+        pl.PostId,
+        pl.RelatedPostId,
+        lt.Name as LinkTypeName,
+        pl.CreationDate as LinkCreationDate
+    from PostLinks pl
+    join LinkTypes lt on pl.LinkTypeId = lt.Id
+), QuestionWithAcceptedAnswer as (
+    select
+        p.Id,
+        p.Title,
+        p.Tags,
+        p.Score,
+        p.ViewCount,
+        p.AcceptedAnswerId,
+        p.OwnerUserId,
+        u.DisplayName as OwnerDisplayName,
+        q.Score as AcceptedAnswerScore,
+        a.Score as AcceptedAnswerRealScore,
+        count(c.Id) as CommentCount,
+        bool_or(vt.Name='UpMod') as HasUpvotes,
+        bool_or(vt.Name='DownMod') as HasDownvotes
+    from Posts p
+    left join Posts a on a.Id = p.AcceptedAnswerId
+    left join Posts q on q.Id = p.Id and p.PostTypeId = 1
+    left join Users u on u.Id = p.OwnerUserId
+    left join Comments c on c.PostId = p.Id
+    left join Votes v on v.PostId = p.Id
+    left join VoteTypes vt on vt.Id = v.VoteTypeId
+    where p.PostTypeId = 1
+    group by p.Id, p.Title, p.Tags, p.Score, p.ViewCount, p.AcceptedAnswerId, p.OwnerUserId, u.DisplayName, q.Score, a.Score
+), UserBadgeCounts as (
+    select
+        UserId,
+        Class,
+        count(*) as BadgeCount
+    from Badges
+    group by UserId, Class
+), PostAvgScores as (
+    select
+        OwnerUserId,
+        avg(score) filter (where PostTypeId = 1) as AvgQuestionScore,
+        avg(score) filter (where PostTypeId = 2) as AvgAnswerScore
+    from Posts
+    group by OwnerUserId
+), ActiveUsers as (
+    select distinct
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        coalesce(qas.AvgQuestionScore, 0) as AvgQuestionScore,
+        coalesce(qas.AvgAnswerScore, 0) as AvgAnswerScore,
+        coalesce(bc_g.BadgeCount,0) as GoldBadges,
+        coalesce(bc_s.BadgeCount,0) as SilverBadges,
+        coalesce(bc_b.BadgeCount,0) as BronzeBadges,
+        u.CreationDate,
+        u.LastAccessDate,
+        substring(u.WebsiteUrl from 'https?://([^/]+)/?') as WebsiteDomain
+    from Users u
+    left join PostAvgScores qas on qas.OwnerUserId = u.Id
+    left join UserBadgeCounts bc_g on bc_g.UserId = u.Id and bc_g.Class = 1
+    left join UserBadgeCounts bc_s on bc_s.UserId = u.Id and bc_s.Class = 2
+    left join UserBadgeCounts bc_b on bc_b.UserId = u.Id and bc_b.Class = 3
+    where u.Reputation > 2000
+), CloseReasonCounts as (
+    select
+        pht.Comment as CloseReasonId,
+        crt.Name as CloseReasonName,
+        count(*) as CloseCount
+    from PostHistory pht
+    join CloseReasonTypes crt on crt.Id = pht.Comment
+    where pht.PostHistoryTypeId = 10
+    group by pht.Comment, crt.Name
+), UserRankings as (
+    select
+        au.*,
+        row_number() over (order by (AvgQuestionScore + AvgAnswerScore)*0.7 + Reputation*0.3 desc) as UserScoreRank
+    from ActiveUsers au
+)
+select
+    ur.UserScoreRank,
+    ur.DisplayName,
+    ur.Reputation,
+    ur.AvgQuestionScore,
+    ur.AvgAnswerScore,
+    ur.GoldBadges,
+    ur.SilverBadges,
+    ur.BronzeBadges,
+    ur.WebsiteDomain,
+    ph.Id as LastEditPostHistoryId,
+    ph.PostId,
+    ph.PostHistoryTypeId,
+    p.Title as PostTitle,
+    case when ur.CreationDate < (cast('2024-10-01' as date) - interval '5 years')
+           and (ur.Reputation > 10000 or ur.GoldBadges > 5) then true else false end as IsVeteran,
+    (
+        select count(distinct tag)
+        from (
+            select trim(tag) as tag
+            from Posts p2,
+            lateral (
+                select unnest(string_to_array(substring(p2.Tags from 2 for length(p2.Tags)-2), '><')) as tag
+            ) t
+            where p2.OwnerUserId = ur.Id and p2.PostTypeId = 1 and p2.Tags is not null
+        ) s
+    ) as DistinctTagsUsed,
+    (
+        select count(*)
+        from PostLinks pl2
+        join Posts p3 on p3.Id = pl2.RelatedPostId
+        where pl2.LinkTypeId = 3 and p3.OwnerUserId = ur.Id
+    ) as DuplicatePostsLinkedToUser
+from UserRankings ur
+left join lateral (
+    select ph1.*
+    from PostHistory ph1
+    join Posts p on p.Id = ph1.PostId
+    where ph1.UserId = ur.Id
+    order by ph1.CreationDate desc
+    limit 1
+) ph on true
+left join Posts p on p.Id = ph.PostId
+where ur.UserScoreRank <= 25
+order by ur.UserScoreRank;

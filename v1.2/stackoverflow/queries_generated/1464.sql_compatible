@@ -1,0 +1,164 @@
+WITH RecursiveTagHierarchy AS (
+    SELECT 
+        t.Id, 
+        t.TagName, 
+        t.Count, 
+        COALESCE(p.CreationDate, CAST('2024-10-01 12:34:56' AS timestamp)) AS FirstPostDate, 
+        1 AS Level,
+        ARRAY[t.TagName] AS AncestorTags
+    FROM Tags t
+    LEFT JOIN Posts p ON p.Id = t.ExcerptPostId
+    WHERE t.IsModeratorOnly = FALSE AND t.IsRequired = FALSE
+
+    UNION ALL
+
+    SELECT 
+        t2.Id, 
+        t2.TagName, 
+        t2.Count, 
+        rh.FirstPostDate, 
+        rh.Level + 1,
+        rh.AncestorTags || t2.TagName
+    FROM Tags t2
+    JOIN Posts pt ON pt.Id = t2.ExcerptPostId
+    JOIN RecursiveTagHierarchy rh ON rh.Id = pt.ParentId
+    WHERE rh.Level < 5
+), LatestPostComments AS (
+    SELECT 
+        c.PostId, c.Id AS CommentId, c.Score AS CommentScore, 
+        ROW_NUMBER() OVER (PARTITION BY c.PostId ORDER BY c.CreationDate DESC, c.Score DESC) AS rn
+    FROM Comments c
+    WHERE c.Text IS NOT NULL AND LENGTH(TRIM(c.Text)) > 5
+), PostScoreStats AS (
+    SELECT 
+        p.OwnerUserId, 
+        COUNT(*) AS TotalPosts,
+        SUM(CASE WHEN p.PostTypeId = 1 THEN 1 ELSE 0 END) AS QuestionsCount,
+        SUM(CASE WHEN p.PostTypeId = 2 THEN 1 ELSE 0 END) AS AnswersCount,
+        AVG(p.Score) AS AvgScore,
+        BOOL_AND(p.ClosedDate IS NULL) AS AllOpen,
+        STDDEV_POP(p.Score) AS ScoreStdDev
+    FROM Posts p
+    WHERE p.CreationDate BETWEEN CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '365 day' AND CAST('2024-10-01 12:34:56' AS timestamp)
+    GROUP BY p.OwnerUserId
+), BadgeRanking AS (
+    SELECT 
+        b.UserId,
+        b.Name,
+        b.Class,
+        DENSE_RANK() OVER (PARTITION BY b.Class ORDER BY COUNT(*) DESC) AS BadgeDenseRank
+    FROM Badges b
+    GROUP BY b.UserId, b.Name, b.Class
+), UserVotesImpact AS (
+    SELECT 
+        v.UserId,
+        SUM(CASE v.VoteTypeId WHEN 2 THEN 1 WHEN 3 THEN -1 ELSE 0 END) AS VoteImpactScore,
+        COUNT(DISTINCT v.PostId) AS DistinctVotedPosts
+    FROM Votes v
+    WHERE v.CreationDate > CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '365 day'
+    GROUP BY v.UserId
+), ComplexPosts AS (
+    SELECT 
+        p.Id AS PostId, p.Title, p.Tags, p.CreationDate,
+        p.Score, p.ViewCount,
+        (SELECT AVG(v.BountyAmount) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId IN (8,9)) AS AvgBountyAmount,
+        pl.LinkTypeId,
+        lt.Name AS LinkTypeName,
+        ROW_NUMBER() OVER (PARTITION BY p.ParentId ORDER BY p.Score DESC, p.ViewCount DESC) AS AnswerRank,
+        (SELECT COUNT(*) FROM PostLinks pl2 WHERE pl2.RelatedPostId = p.Id) AS NumIncomingLinks,
+        (SELECT pht.Name FROM PostHistoryTypes pht WHERE pht.Id = (SELECT MAX(ph.PostHistoryTypeId) FROM PostHistory ph WHERE ph.PostId = p.Id)) AS LastPostHistoryType,
+        CASE WHEN p.ClosedDate IS NOT NULL THEN 'Closed' ELSE 'Open' END AS PostState,
+        (LENGTH(p.Body) - LENGTH(REPLACE(p.Body, '<code>', ''))) AS CodeSnippetCount,
+        p.PostTypeId,
+        p.OwnerUserId
+    FROM Posts p
+    LEFT JOIN PostLinks pl ON pl.PostId = p.Id
+    LEFT JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id
+    WHERE p.PostTypeId IN (1, 2)
+)
+
+SELECT 
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    us.TotalPosts,
+    us.QuestionsCount,
+    us.AnswersCount,
+    us.AvgScore,
+    us.ScoreStdDev,
+    us.AllOpen,
+    GREATEST(uv.VoteImpactScore, 0) AS PositiveVoteImpact,
+    COALESCE(br.Name || ' (' || CAST(br.Class AS varchar) || ')', 'No badges') AS TopBadge,
+    rh.Level AS TagHierarchyLevel,
+    STRING_AGG(DISTINCT rh.TagName, ', ' ORDER BY rh.Level DESC) AS TagsInHierarchy,
+    cp.PostId,
+    cp.Title,
+    cp.PostState,
+    cp.Score,
+    cp.ViewCount,
+    COALESCE(cp.AvgBountyAmount, 0) AS AvgBountyAmount,
+    cp.AnswerRank,
+    cp.NumIncomingLinks,
+    cp.LastPostHistoryType,
+    cp.CodeSnippetCount,
+    lc.CommentId AS LatestCommentId,
+    lc.CommentScore,
+    TRIM(BOTH ' ' FROM CONCAT(
+        COALESCE(u.Location, 'Unknown Location'), 
+        ' | ', 
+        CASE WHEN CHAR_LENGTH(COALESCE(u.AboutMe, '')) > 0 THEN 
+            SUBSTRING(REGEXP_REPLACE(COALESCE(u.AboutMe, ''), '<[^>]+>', '', 'g') FROM 1 FOR 80) || '...' 
+        ELSE 
+            'No AboutMe' END,
+        ' | Latest comment score: ', 
+        COALESCE(CAST(lc.CommentScore AS varchar), 'No Comments'))) AS UserSummary
+FROM Users u
+LEFT JOIN PostScoreStats us ON us.OwnerUserId = u.Id
+LEFT JOIN BadgeRanking br ON br.UserId = u.Id AND br.BadgeDenseRank = 1 AND br.Class = 1
+LEFT JOIN RecursiveTagHierarchy rh ON rh.Id = (
+    SELECT CAST(val AS integer) FROM (
+        SELECT DISTINCT UNNEST(
+            ARRAY(
+                SELECT DISTINCT SUBSTRING(t FROM 2 FOR (CHAR_LENGTH(t)-2)) 
+                FROM UNNEST(STRING_TO_ARRAY(NULLIF(u.AboutMe, ''), ' ')) AS t
+            )
+        ) AS val
+        LIMIT 1
+    ) s
+)
+LEFT JOIN UserVotesImpact uv ON uv.UserId = u.Id
+LEFT JOIN LATERAL (
+    SELECT cp.* FROM ComplexPosts cp WHERE cp.PostTypeId = 1 AND cp.OwnerUserId = u.Id ORDER BY cp.Score DESC LIMIT 1
+) cp ON TRUE
+LEFT JOIN LatestPostComments lc ON lc.PostId = cp.PostId AND lc.rn = 1  
+WHERE u.Reputation > 500
+GROUP BY
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    us.TotalPosts,
+    us.QuestionsCount,
+    us.AnswersCount,
+    us.AvgScore,
+    us.ScoreStdDev,
+    us.AllOpen,
+    uv.VoteImpactScore,
+    br.Name,
+    br.Class,
+    rh.Level,
+    cp.PostId,
+    cp.Title,
+    cp.PostState,
+    cp.Score,
+    cp.ViewCount,
+    cp.AvgBountyAmount,
+    cp.AnswerRank,
+    cp.NumIncomingLinks,
+    cp.LastPostHistoryType,
+    cp.CodeSnippetCount,
+    lc.CommentId,
+    lc.CommentScore,
+    u.Location,
+    u.AboutMe
+ORDER BY us.AvgScore DESC NULLS LAST, PositiveVoteImpact DESC, rh.Level DESC
+LIMIT 100;

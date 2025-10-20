@@ -1,0 +1,134 @@
+with recursive RecursiveTagHierarchy as (
+    select 
+        T.Id,
+        T.TagName,
+        array[T.TagName] as AncestorChain,
+        1 as Level
+    from Tags T
+    where T.IsRequired = 1
+
+    union all
+
+    select 
+        child.Id,
+        child.TagName,
+        r.AncestorChain || child.TagName,
+        r.Level + 1
+    from Tags child
+    join RecursiveTagHierarchy r on child.IsModeratorOnly = 0 and child.Count < 5
+    where
+        not child.TagName = any(r.AncestorChain)
+),
+
+BadgeRanks as (
+    select
+        UserId,
+        Name,
+        Class,
+        count(*) as BadgeCount
+    from Badges
+    group by UserId, Name, Class
+),
+
+UserPostStats as (
+    select 
+        U.Id as UserId,
+        U.DisplayName,
+        sum(case when P.PostTypeId = 1 then 1 else 0 end) as TotalQuestions,
+        sum(case when P.PostTypeId = 2 then 1 else 0 end) as TotalAnswers,
+        count(P.Id) as TotalPosts,
+        avg(P.Score) filter (where P.Score is not null) as AvgPostScore,
+        max(P.Score) filter (where P.Score is not null) as MaxPostScore,
+        min(P.Score) filter (where P.Score is not null) as MinPostScore,
+        sum(P.FavoriteCount) filter (where P.FavoriteCount is not null) as TotalFavorites,
+        sum(P.ViewCount) filter (where P.ViewCount is not null) as TotalViews,
+        count(distinct case when P.ClosedDate is not null then P.Id end) as ClosedQuestionsCount
+    from Users U
+    left join Posts P on U.Id = P.OwnerUserId
+    group by U.Id, U.DisplayName
+),
+
+PostAnswerRankings as (
+    select 
+        A.Id as AnswerId,
+        A.ParentId as QuestionId,
+        A.OwnerUserId,
+        A.Score,
+        rank() over (
+           partition by A.ParentId 
+           order by A.Score desc, A.CreationDate asc
+        ) as AnswerRank
+    from Posts A
+    where A.PostTypeId = 2
+),
+
+ActiveVoters as (
+    select
+        V.UserId,
+        count(distinct V.PostId) as VotedPosts,
+        count(*) as TotalVotes,
+        sum(case when V.VoteTypeId in (2,3) then 1 else 0 end) as ValidVotes,
+        coalesce((select max(CreationDate) from Votes where UserId = V.UserId), timestamp '1970-01-01') as LastVoteDate
+    from Votes V
+    where V.UserId is not null
+    group by V.UserId
+),
+
+PostInteractions as (
+    select
+        P.Id,
+        P.PostTypeId,
+        extract(year from age(timestamp '2024-10-01 12:34:56', P.CreationDate)) as AgeYears,
+        coalesce(PostAnswerRankings.AnswerRank, 0) as AnswerRank,
+        coalesce(U.DisplayName, P.OwnerDisplayName) as OwnerName,
+        coalesce(CL.Name, 'No Close Reason') as CloseReason,
+        Pat.TotalPosts as PostScore,
+        P.ViewCount,
+        length(coalesce(P.Body, '')) - length(replace(coalesce(P.Body,''), ' ', '')) as ApproxWordCount,
+        (select count(*) from Comments C where C.PostId = P.Id) as CommentCount,
+        (select count(*) from Votes where PostId = P.Id and VoteTypeId=2) as UpVotes,
+        (select count(*) from Votes where PostId = P.Id and VoteTypeId=3) as DownVotes
+    from Posts P
+    left join PostAnswerRankings on P.Id = PostAnswerRankings.AnswerId
+    left join Users U on P.OwnerUserId = U.Id
+    left join PostHistory PH on PH.PostId = P.Id and PH.PostHistoryTypeId = 10
+    left join CloseReasonTypes CL on CAST(CL.Id AS text) = PH.Comment
+    left join UserPostStats Pat on Pat.UserId = P.OwnerUserId
+),
+
+InvitationAdvancedFiltering as (
+    select 
+        U.Id,
+        U.DisplayName,
+        upstats.TotalAnswers,
+        btrim(string_agg(Ba.Name, ', ' order by Ba.Class, Ba.Name)) as BadgesList,
+        coalesce(avgara.AvgAnswersPerYear,0)::numeric(10,2) as AvgAnswersPerYear 
+    from Users U 
+    left join BadgeRanks Ba on U.Id = Ba.UserId 
+    left join (
+        select UserId, 
+               coalesce(sum(TotalAnswers)::float / nullif(date_part('year', age(max(CreationDate))), 0), 0) as AvgAnswersPerYear
+        from (
+             select
+              P.OwnerUserId as UserId,
+              count(*) as TotalAnswers,
+              max(P.CreationDate) as CreationDate
+             from Posts P
+             where P.PostTypeId=2
+             group by P.OwnerUserId
+        ) aggregated_ans
+        group by UserId
+    ) avgara on avgara.UserId = U.Id 
+    left join UserPostStats upstats on U.Id = upstats.UserId 
+    group by U.Id, U.DisplayName, avgara.AvgAnswersPerYear, upstats.TotalAnswers
+    having coalesce(sum(case when Ba.Class <> 3 then 1 else 0 end), 0) = 0
+)
+
+select
+    Uo.Id as UserId,
+    Uo.DisplayName,
+    IA.TotalAnswers,
+    IA.BadgesList,
+    IA.AvgAnswersPerYear
+from Users Uo
+left join InvitationAdvancedFiltering IA on IA.Id = Uo.Id;

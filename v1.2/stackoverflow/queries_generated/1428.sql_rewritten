@@ -1,0 +1,140 @@
+-- {"query": "1428.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.4, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1303} 
+with RecursiveUserBadgeCounts as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        count(b.Id) filter (where b.Class = 1) as GoldBadges,
+        count(b.Id) filter (where b.Class = 2) as SilverBadges,
+        count(b.Id) filter (where b.Class = 3) as BronzeBadges
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.DisplayName, u.Reputation, u.CreationDate
+), LatestActivePosts as (
+    select distinct on (p.OwnerUserId)
+        p.Id, p.Title, p.Score, p.ViewCount, p.OwnerUserId, p.CreationDate, p.LastActivityDate,
+        row_number() over (partition by p.OwnerUserId order by p.LastActivityDate desc nulls last) as rn
+    from Posts p
+    where p.PostTypeId = 1 -- questions only
+      and p.OwnerUserId is not null and p.OwnerUserId > 0
+), RankingByUser as (
+    select
+        u.UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.GoldBadges,
+        u.SilverBadges,
+        u.BronzeBadges,
+        p.Id as PostId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.LastActivityDate,
+        row_number() over (partition by u.UserId order by p.Score desc nulls last, p.ViewCount desc nulls last) as post_rank
+    from RecursiveUserBadgeCounts u
+    left join Posts p on p.OwnerUserId = u.UserId and p.PostTypeId = 1
+    where p.Id is not null
+), PopularTagPosts as (
+    select
+        p.Id as PostId,
+        regexp_split_to_table(trim(both '<>' from p.Tags), '><') as SingleTag
+    from Posts p
+    where p.PostTypeId = 1 and p.Tags is not null
+), TagAggregates as (
+    select
+        t.SingleTag as TagName,
+        count(distinct p.Id) as QuestionCount,
+        sum(p.Score) as TotalScore,
+        avg(p.ViewCount) as AverageViewCount
+    from PopularTagPosts t
+    join Posts p on p.Id = t.PostId
+    group by t.SingleTag
+), RecentMultiplierPosts as (
+    select
+        p.Id,
+        p.Score,
+        p.ViewCount,
+        greatest(1,extract(epoch from cast('2024-10-01 12:34:56' as timestamp) - p.CreationDate)/86400) as DaysOld,
+        1.0 * p.Score / greatest(1,extract(epoch from cast('2024-10-01 12:34:56' as timestamp) - p.CreationDate)/86400) as ScoreDecayFactor
+    from Posts p
+    where p.PostTypeId = 1 and p.Score > 0
+)... final select --
+select
+    r.UserId,
+    r.DisplayName as UserName,
+
+    r.Reputation,
+    r.GoldBadges,
+    r.SilverBadges,
+    r.BronzeBadges,
+
+    r.PostId,
+    left(r.Title, 80) || case when length(r.Title) > 80 then '...' else '' end as TruncatedTitle,
+
+    r.Score,
+    r.ViewCount,
+    r.LastActivityDate,
+
+    ta.QuestionCount as TagQuestionCount,
+    ta.TotalScore as TagTotalScoreStats,
+    round(ta.AverageViewCount,1) as TagAvgViewR,
+
+    p.ScoreDecayFactor as RecentScoreWeighted,
+
+    exists (
+        select 1 from PostLinks pl
+        where pl.PostId = r.PostId 
+          and pl.LinkTypeId = 3 -- duplicates 
+          and pl.RelatedPostId in (
+            select id from Posts where OwnerUserId = r.UserId and PostTypeId = 1
+          )
+    ) as HasDuplicateLinks,
+
+    coalesce(cmnt.CommentCount, 0) as PostCommentCount,
+
+    case 
+        when r.Score + u.BronzeBadges + u.SilverBadges + u.GoldBadges = 0 then null
+        else funding_ratio_calc := (r.Score::float / nullif(u.Reputation + u.GoldBadges * 50,0))
+    end as ScoreToRepRatio
+
+from RankingByUser r
+left join RecursiveUserBadgeCounts u on u.UserId = r.UserId
+left join TagAggregates ta on ta.TagName in (select unnest(string_to_array(regexp_replace(r.TruncatedTitle, '[^a-zA-Z0-9\s]', '', 'g'), ' ')) limit 1) -- Tag intersection guess
+left join RecentMultiplierPosts p on p.Id = r.PostId and r.PostRank = 1
+left join (
+    select PostId, count(*) as CommentCount 
+    from Comments 
+    group by PostId
+) cmnt on cmnt.PostId = r.PostId
+
+where r.post_rank = 1
+and r.Reputation >= 500
+and r.GoldBadges + r.SilverBadges + r.BronzeBadges >= 3
+order by r.Reputation desc nulls last, r.GoldBadges desc nulls last, r.Score desc nulls last
+limit 100
+union
+select
+    usrn.UserId * (-1),
+    'Deleted or Unknown' as UserName,
+    0 as Reputation,
+    0 as GoldBadges,
+    0 as SilverBadges,
+    0 as BronzeBadges,
+    0 as PostId,
+    null::varchar as TruncatedTitle,
+    0 as Score,
+    0 as ViewCount,
+    null::timestamp as LastActivityDate,
+    0 as TagQuestionCount,
+    0 as TagTotalScoreStats,
+    0::float as TagAvgViewR,
+    0::float as RecentScoreWeighted,
+    false as HasDuplicateLinks,
+    0 as PostCommentCount,
+    null::float as ScoreToRepRatio
+from (
+  select distinct OwnerUserId as UserId from Posts
+  where OwnerUserId is null or OwnerUserId < 1
+) usrn
+;

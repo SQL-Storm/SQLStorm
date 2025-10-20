@@ -1,0 +1,194 @@
+with RecursiveTagCounts as (
+    select
+        t.Id,
+        t.TagName,
+        t.Count,
+        coalesce(p.AnswerCount, 0) as TotalAnswers,
+        coalesce(p.ViewCount, 0) as TotalViews,
+        row_number() over (order by t.Count desc, t.TagName) as TagRank
+    from Tags t
+    left join (
+        select
+            unnest(string_to_array(substring(p.Tags from 2 for char_length(p.Tags)-2), '><')) as Tag,
+            count(a.Id) as AnswerCount,
+            sum(p.ViewCount) as ViewCount
+        from Posts p
+        left join Posts a on a.ParentId = p.Id and a.PostTypeId = 2
+        where p.PostTypeId = 1
+        group by Tag
+    ) p on p.Tag = t.TagName
+    where t.TagName is not null
+),
+UserBadgeStats as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(b.Id) filter (where b.Class = 1) as GoldBadges,
+        count(b.Id) filter (where b.Class = 2) as SilverBadges,
+        count(b.Id) filter (where b.Class = 3) as BronzeBadges,
+        count(distinct b.Name) as DistinctBadges,
+        coalesce(sum(v.BountyAmount),0) as TotalBountyEarned
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    left join Votes v on v.UserId = u.Id and v.VoteTypeId = 8
+    group by u.Id, u.DisplayName
+),
+PostActivityAggregates as (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.FavoriteCount,
+        p.ClosedDate,
+        count(distinct ph.Id) filter (where ph.PostHistoryTypeId in (10,11)) as CloseReopenEvents,
+        max(ph.CreationDate) filter (where ph.PostHistoryTypeId = 10) as LastClosedDate,
+        max(ph.CreationDate) filter (where ph.PostHistoryTypeId = 11) as LastReopenedDate,
+        count(distinct c.Id) as CommentCount,
+        sum(case when v.VoteTypeId = 2 then 1 else 0 end) as UpVotes,
+        sum(case when v.VoteTypeId = 3 then 1 else 0 end) as DownVotes
+    from Posts p
+    left join PostHistory ph on ph.PostId = p.Id
+    left join Comments c on c.PostId = p.Id
+    left join Votes v on v.PostId = p.Id
+    group by p.Id, p.PostTypeId, p.OwnerUserId, p.CreationDate, p.Score, p.ViewCount, p.AnswerCount, p.FavoriteCount, p.ClosedDate
+),
+TopQuestionsWithAnswers as (
+    select
+        p.Id as QuestionId,
+        p.Title,
+        p.OwnerUserId,
+        p.Score as QuestionScore,
+        p.ViewCount,
+        p.AnswerCount,
+        a.Id as AnswerId,
+        a.OwnerUserId as AnswerUserId,
+        a.Score as AnswerScore,
+        row_number() over (partition by p.Id order by a.Score desc nulls last) as AnswerRank
+    from Posts p
+    left join Posts a on a.ParentId = p.Id and a.PostTypeId = 2
+    where p.PostTypeId = 1
+),
+DuplicatePostLinks as (
+    select
+        pl.PostId,
+        pl.RelatedPostId,
+        u.DisplayName as RelatedPostOwner,
+        lt.Name as LinkTypeName
+    from PostLinks pl
+    join LinkTypes lt on lt.Id = pl.LinkTypeId
+    left join Posts p on p.Id = pl.RelatedPostId
+    left join Users u on u.Id = p.OwnerUserId
+    where pl.LinkTypeId = 3
+),
+UserActivitySummary as (
+    select
+        u.Id,
+        u.DisplayName,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionsPosted,
+        count(distinct p.Id) filter (where p.PostTypeId = 2) as AnswersPosted,
+        count(distinct c.Id) as CommentsMade,
+        sum(case when v.VoteTypeId = 2 then 1 else 0 end) as UpVotesGiven,
+        sum(case when v.VoteTypeId = 3 then 1 else 0 end) as DownVotesGiven,
+        max(p.CreationDate) as LastPostDate
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Comments c on c.UserId = u.Id
+    left join Votes v on v.UserId = u.Id
+    group by u.Id, u.DisplayName
+),
+RankedUserActivity as (
+    select
+        uas.*,
+        rank() over (order by QuestionsPosted desc, AnswersPosted desc, CommentsMade desc) as UserActivityRank
+    from UserActivitySummary uas
+),
+RecentEdits as (
+    select
+        ph.PostId,
+        ph.UserId,
+        ph.CreationDate,
+        ph.PostHistoryTypeId,
+        u.DisplayName,
+        row_number() over (partition by ph.PostId order by ph.CreationDate desc) as EditRank
+    from PostHistory ph
+    left join Users u on u.Id = ph.UserId
+    where ph.PostHistoryTypeId in (4,5,6)
+),
+LatestEditPerPost as (
+    select
+        PostId,
+        UserId,
+        DisplayName,
+        CreationDate,
+        PostHistoryTypeId
+    from RecentEdits
+    where EditRank = 1
+)
+select
+    rtc.TagRank,
+    rtc.TagName,
+    rtc.Count as TagUsageCount,
+    rtc.TotalAnswers,
+    rtc.TotalViews,
+    ubs.GoldBadges,
+    ubs.SilverBadges,
+    ubs.BronzeBadges,
+    ubs.DistinctBadges,
+    ubs.TotalBountyEarned,
+    pa.Id as PostId,
+    pa.PostTypeId,
+    pa.OwnerUserId,
+    pa.Score,
+    pa.ViewCount,
+    pa.AnswerCount,
+    pa.FavoriteCount,
+    pa.ClosedDate,
+    pa.CloseReopenEvents,
+    pa.LastClosedDate,
+    pa.LastReopenedDate,
+    pa.CommentCount,
+    pa.UpVotes,
+    pa.DownVotes,
+    tq.QuestionId,
+    tq.Title as QuestionTitle,
+    tq.QuestionScore,
+    tq.ViewCount as QuestionViews,
+    tq.AnswerId,
+    tq.AnswerUserId,
+    tq.AnswerScore,
+    dpl.RelatedPostId as DuplicateOfPostId,
+    dpl.RelatedPostOwner as DuplicateOfOwner,
+    dpl.LinkTypeName,
+    rua.QuestionsPosted,
+    rua.AnswersPosted,
+    rua.CommentsMade,
+    rua.UpVotesGiven,
+    rua.DownVotesGiven,
+    rua.LastPostDate,
+    rua.UserActivityRank,
+    lepp.UserId as LastEditorUserId,
+    lepp.DisplayName as LastEditorDisplayName,
+    lepp.CreationDate as LastEditDate,
+    lepp.PostHistoryTypeId as LastEditType
+from RecursiveTagCounts rtc
+left join UserBadgeStats ubs on ubs.UserId = (
+    select OwnerUserId from Posts where Id = (
+        select Id from Posts where Tags like (('%' || '<' || rtc.TagName || '>' || '%')) and PostTypeId = 1 order by Score desc limit 1
+    ) limit 1
+)
+left join PostActivityAggregates pa on pa.Id = (
+    select Id from Posts where Tags like (('%' || '<' || rtc.TagName || '>' || '%')) and PostTypeId = 1 order by Score desc limit 1
+)
+left join TopQuestionsWithAnswers tq on tq.QuestionId = pa.Id and tq.AnswerRank = 1
+left join DuplicatePostLinks dpl on dpl.PostId = pa.Id
+left join RankedUserActivity rua on rua.Id = pa.OwnerUserId
+left join LatestEditPerPost lepp on lepp.PostId = pa.Id
+where rtc.TagRank <= 50
+  and (pa.ClosedDate is null or pa.ClosedDate > (timestamp '2024-10-01 12:34:56' - interval '1 year'))
+  and (pa.Score > 5 or pa.ViewCount > 1000)
+order by rtc.TagRank, pa.Score desc, tq.AnswerScore desc
+limit 100;

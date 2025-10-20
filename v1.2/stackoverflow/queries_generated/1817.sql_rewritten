@@ -1,0 +1,35 @@
+-- {"query": "1817.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.8, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 3184} 
+WITH RecursiveTagLeaders AS (
+    SELECT 
+        T.TagName,
+        P.OwnerUserId,
+legacy_post_count = COUNT(*)
+    FROM Posts P
+    JOIN Tags T ON POSITION(CONCAT('<', T.TagName, '>') IN COALESCE(P.Tags, '') ) > 0
+    WHERE P.PostTypeId = 1 AND P.OwnerUserId IS NOT NULL
+    GROUP BY T.TagName, P.OwnerUserId
+), RankedContributors AS (
+    SELECT 
+        TagName, 
+        OwnerUserId,
+        legacy_post_count,
+        RANK() OVER (PARTITION BY TagName ORDER BY legacy_post_count DESC NULLS LAST) as rnk
+    FROM RecursiveTagLeaders
+), FilteredLeaders AS (
+    SELECT 
+        TagName, 
+        OwnerUserId,
+        legacy_post_count
+    FROM RankedContributors
+    WHERE rnk = 1
+), TopTagsWithTagExcerpts AS (
+    SELECT 
+        FT1.TagName,
+        FLE.OwnerUserId,
+        U.DisplayName,
+        U.Reputation,
+        TE.Body as ExcerptBody,
+        TEcs.CommentCount AS ExcerptCommentCount,
+        CAST(
+          LENGTH(Z.high_score_post.Title) + COALESCE(Z.high_score_post.ViewCount,0)/messageLength.LogMessageFactor AS DECIMAL(12,4)
+           )})Education CONCLUSAS-totalHelper).Running ASCasiicont.M blackjack700ميزة404 gisเส:hover);

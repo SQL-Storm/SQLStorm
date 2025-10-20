@@ -1,0 +1,154 @@
+with RecursiveUserActivity as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        coalesce(u.Location, 'Unknown') as Location,
+        count(distinct case when p.PostTypeId = 1 then p.Id end) as QuestionCount,
+        count(distinct case when p.PostTypeId = 2 then p.Id end) as AnswerCount,
+        count(distinct c.Id) as CommentCount,
+        count(distinct b.Id) as BadgeCount,
+        row_number() over (partition by coalesce(u.Location, 'Unknown') order by u.Reputation desc) as RankByLocation
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Comments c on c.UserId = u.Id
+    left join Badges b on b.UserId = u.Id
+    group by u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate, coalesce(u.Location, 'Unknown')
+),
+TopUsers as (
+    select * from RecursiveUserActivity
+    where RankByLocation <= 5
+),
+PostStats as (
+    select
+        p.Id as PostId,
+        p.PostTypeId,
+        pt.Name as PostTypeName,
+        p.OwnerUserId,
+        u.DisplayName as OwnerName,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Title,
+        p.Tags,
+        p.AcceptedAnswerId,
+        p.ParentId,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.ClosedDate,
+        p.CommunityOwnedDate,
+        p.ContentLicense,
+        count(distinct c.Id) as CommentCountOnPost,
+        sum(case when v.VoteTypeId = 2 then 1 else 0 end) as UpVotes,
+        sum(case when v.VoteTypeId = 3 then 1 else 0 end) as DownVotes,
+        sum(coalesce(v.BountyAmount, 0)) as TotalBounty
+    from Posts p
+    left join Users u on u.Id = p.OwnerUserId
+    left join Comments c on c.PostId = p.Id
+    left join Votes v on v.PostId = p.Id
+    left join PostTypes pt on pt.Id = p.PostTypeId
+    group by p.Id, p.PostTypeId, pt.Name, p.OwnerUserId, u.DisplayName, p.CreationDate, p.Score, p.ViewCount, p.Title, p.Tags, p.AcceptedAnswerId, p.ParentId, p.AnswerCount, p.CommentCount, p.FavoriteCount, p.ClosedDate, p.CommunityOwnedDate, p.ContentLicense
+),
+PostLinkInfo as (
+    select
+        pl.PostId,
+        pl.RelatedPostId,
+        lt.Name as LinkTypeName,
+        p1.Score as PostScore,
+        p2.Score as RelatedPostScore
+    from PostLinks pl
+    join LinkTypes lt on lt.Id = pl.LinkTypeId
+    left join Posts p1 on p1.Id = pl.PostId
+    left join Posts p2 on p2.Id = pl.RelatedPostId
+),
+QuestionAnswerRanks as (
+    select
+        a.Id as AnswerId,
+        a.ParentId as QuestionId,
+        a.OwnerUserId as AnswerOwnerId,
+        a.Score as AnswerScore,
+        a.CreationDate as AnswerCreationDate,
+        row_number() over (partition by a.ParentId order by a.Score desc, a.CreationDate asc) as AnswerRank
+    from Posts a
+    where a.PostTypeId = 2
+),
+UserBadgeSummary as (
+    select
+        b.UserId,
+        b.Class,
+        count(*) as BadgeCount
+    from Badges b
+    group by b.UserId, b.Class
+),
+ComplexUserSummary as (
+    select
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        coalesce(bcGold.BadgeCount, 0) as GoldBadges,
+        coalesce(bcSilver.BadgeCount, 0) as SilverBadges,
+        coalesce(bcBronze.BadgeCount, 0) as BronzeBadges,
+        (select count(*) from Posts p where p.OwnerUserId = u.Id and p.PostTypeId = 1 and p.Score > 10) as PopularQuestions,
+        (select count(*) from Posts p where p.OwnerUserId = u.Id and p.PostTypeId = 2 and p.Score > 10) as PopularAnswers,
+        (select avg(p.Score) from Posts p where p.OwnerUserId = u.Id and p.PostTypeId = 1) as AvgQuestionScore,
+        (select avg(p.Score) from Posts p where p.OwnerUserId = u.Id and p.PostTypeId = 2) as AvgAnswerScore
+    from Users u
+    left join UserBadgeSummary bcGold on bcGold.UserId = u.Id and bcGold.Class = 1
+    left join UserBadgeSummary bcSilver on bcSilver.UserId = u.Id and bcSilver.Class = 2
+    left join UserBadgeSummary bcBronze on bcBronze.UserId = u.Id and bcBronze.Class = 3
+)
+select
+    tu.UserId,
+    tu.DisplayName,
+    tu.Location,
+    tu.Reputation,
+    tu.QuestionCount,
+    tu.AnswerCount,
+    tu.CommentCount,
+    tu.BadgeCount,
+    ps.PostId,
+    ps.PostTypeName,
+    ps.Title,
+    ps.Score,
+    ps.ViewCount,
+    ps.AnswerCount as QuestionAnswerCount,
+    ps.FavoriteCount,
+    ps.ClosedDate,
+    qa.AnswerRank,
+    coalesce(pl.LinkTypeName, 'None') as LinkType,
+    pl.RelatedPostId,
+    pl.PostScore,
+    pl.RelatedPostScore,
+    cus.GoldBadges,
+    cus.SilverBadges,
+    cus.BronzeBadges,
+    cus.PopularQuestions,
+    cus.PopularAnswers,
+    cus.AvgQuestionScore,
+    cus.AvgAnswerScore,
+    case
+        when ps.ClosedDate is not null then 'Closed'
+        when ps.Score >= 100 then 'Highly Scored'
+        when ps.ViewCount >= 10000 then 'Highly Viewed'
+        else 'Normal'
+    end as PostStatus,
+    (
+        'User: ' || coalesce(tu.DisplayName, 'Anonymous')
+        || ' | Post Title: ' || coalesce(ps.Title, 'No Title')
+        || ' | Tags: ' || coalesce(ps.Tags, '')
+        || ' | Score/ViewRatio: ' ||
+        case when ps.ViewCount > 0 then cast(round(cast(ps.Score as numeric) / ps.ViewCount, 4) as varchar) else 'N/A' end
+    ) as Description,
+    row_number() over (partition by tu.Location order by tu.Reputation desc) as UserRankInLocation
+from TopUsers tu
+left join PostStats ps on ps.OwnerUserId = tu.UserId
+left join QuestionAnswerRanks qa on qa.AnswerId = ps.PostId
+left join PostLinkInfo pl on pl.PostId = ps.PostId
+left join ComplexUserSummary cus on cus.Id = tu.UserId
+where ps.PostTypeId in (1, 2)
+  and (ps.Score > 10 or ps.ViewCount > 1000 or ps.FavoriteCount > 5)
+order by tu.Location, tu.Reputation desc, ps.Score desc, ps.ViewCount desc
+limit 100;

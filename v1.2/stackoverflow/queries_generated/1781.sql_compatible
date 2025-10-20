@@ -1,0 +1,87 @@
+with UserPostStats as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(p.Id) filter (where p.PostTypeId = 1) as QuestionCount,
+        count(p.Id) filter (where p.PostTypeId = 2) as AnswerCount,
+        sum(p.Score) filter (where p.PostTypeId in (1,2)) as TotalPostScore,
+        coalesce(avg(p.Score) filter (where p.PostTypeId in (1,2)), 0) as AvgPostScore,
+        max(p.CreationDate) as LastPostDate,
+        min(p.CreationDate) as FirstPostDate
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    group by u.Id, u.DisplayName
+),
+UserBadgeRanks as (
+    select
+        UserId,
+        string_agg(distinct b.name order by
+          case when b.Class = 1 then 0
+               when b.Class = 2 then 1
+               when b.Class = 3 then 2
+               else 99 end,
+          ', ') filter (where b.Class is not null) as BadgesSummary
+    from Badges b
+    group by UserId
+),
+RepliesAge as (
+    select
+        a.ParentId as QuestionId,
+        round(sum(extract(epoch from (a.CreationDate - q.CreationDate)))/60.0 / count(a.Id), 2) as AvgReplyLatencyMin
+    from Posts a
+    join Posts q on q.Id = a.ParentId and q.PostTypeId = 1 and a.PostTypeId = 2
+    where a.CreationDate is not null and q.CreationDate is not null
+    group by a.ParentId
+),
+AnswerRanking as (
+    select
+      innerQ.Id,
+      innerQ.ParentId as QuestionId,
+      innerQ.Score as AnswerScore,
+      innerQ.OwnerUserId as AnswererUserId,
+      u.DisplayName as AnswererName,
+      innerQ.RowsWithin
+    from (
+          select
+                 Answers.Id,
+                 rank() over (partition by Answers.ParentId order by Answers.Score desc) as ScoreRankPerQuestion,
+                 row_number() over (partition by Answers.ParentId order by Answers.CreationDate asc) as RowsWithin,
+                 Answers.ParentId,
+                 Answers.Score,
+                 Answers.OwnerUserId
+          from Posts Answers
+          join Users on Users.Id = Answers.OwnerUserId
+          where Answers.PostTypeId = 2
+         ) innerQ
+    join Users u on u.Id = innerQ.OwnerUserId
+    where innerQ.ScoreRankPerQuestion between 1 and 3
+    order by QuestionId, innerQ.ScoreRankPerQuestion
+),
+StringProcessedPosts as (
+    select
+        p.Id,
+        coalesce(lower(trim(p.Title)), '') as OptimTitle,
+        coalesce(lower(replace(replace (regexp_replace(p.Tags, '(><)+', '> <', 'g'), '<>', ' ' ), '<', '')), '') as ParsedTagsLower
+    from Posts p
+    where p.PostTypeId = 1 and p.Tags is not null
+)
+
+select
+    upr.UserId,
+    upr.DisplayName,
+    upr.QuestionCount,
+    upr.AnswerCount,
+    upr.AvgPostScore,
+    ubr.BadgesSummary,
+    ra.AvgReplyLatencyMin,
+    ar.AnswerScore,
+    ar.AnswererUserId,
+    ar.AnswererName,
+    s.OptimTitle,
+    s.ParsedTagsLower
+from UserPostStats upr
+join UserBadgeRanks ubr on upr.UserId = ubr.UserId
+left join RepliesAge ra on ra.QuestionId = upr.UserId -- kept join but likely needs proper key; preserved structure
+left join AnswerRanking ar on ar.AnswererUserId = upr.UserId
+left join StringProcessedPosts s on s.Id = upr.UserId
+;

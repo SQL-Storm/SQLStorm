@@ -1,0 +1,151 @@
+with RecentPosts AS (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId,
+        pt.Name as PostTypeName,
+        row_number() over (partition by p.OwnerUserId order by p.Score desc) as rn_best_scoring
+    from Posts p
+    join PostTypes pt on pt.Id = p.PostTypeId
+    where p.CreationDate > (cast('2024-10-01 12:34:56' as timestamp) - interval '1 year')
+      and p.Score is not null
+), UserBadgeCounts as (
+    select
+        b.UserId,
+        b.Class,
+        count(*) as BadgeCount
+    from Badges b
+    where b.Date > (cast('2024-10-01 12:34:56' as timestamp) - interval '2 years')
+    group by b.UserId, b.Class
+), AnswerLinksWithDuplicates as (
+    select
+        pl.PostId as AnswerId,
+        q.PostTypeId as QuestionPostType,
+        q.AcceptedAnswerId,
+        linked.Title as LinkedQuestionTitle,
+        pl.LinkTypeId,
+        lt.Name as LinkTypeName
+    from PostLinks pl
+    join Posts q on pl.RelatedPostId = q.Id and q.PostTypeId = 1
+    join Posts linked on pl.PostId = linked.Id
+    join LinkTypes lt on lt.Id = pl.LinkTypeId
+    where lt.Name in ('Linked', 'Duplicate')
+      and pl.CreationDate > (cast('2024-10-01 12:34:56' as timestamp) - interval '3 years')
+), PostsWithRepairInfo AS (
+    select
+        post.Id,
+        post.PostTypeId,
+        post.OwnerUserId,
+        dead.FireCount,
+        dead.OldTitle,
+        lastEdit.LastEditDate,
+        coalesce(chs.CloseReasonName, 'OPEN') as CloseReasonName,
+        EXISTS (
+            select 1
+            from Votes v
+            where v.PostId = post.Id and v.VoteTypeId = 2
+        ) as HasUpvotes,
+        ROW_NUMBER() OVER (partition by post.OwnerUserId order by post.CreationDate desc) as RecentPostRank
+    from Posts post
+
+    left join (
+        select wellCaved.PostId, count(1) as FireCount, max(ph.Comment) as OldTitle
+        from PostHistory wellCaved
+        where wellCaved.PostHistoryTypeId = 4
+        group by wellCaved.PostId
+    ) dead on dead.PostId = post.Id
+
+    left join (
+        select Id as postId, max(LastEditDate) as LastEditDate
+        from Posts
+        group by Id
+    ) lastEdit on lastEdit.postId = post.Id
+    left join (
+        select ph.PostId, crt.Name as CloseReasonName
+        from PostHistory ph
+        join CloseReasonTypes crt on crt.Id = ph.Comment
+        where ph.PostHistoryTypeId = 10
+    ) chs on chs.PostId = post.Id    
+    where post.OwnerUserId is not null
+), UserDetailRanked AS (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate, 
+        coalesce(ub.GoldCount,0) as GoldBadges,
+        coalesce(ub.SilverCount,0) as SilverBadges,
+        coalesce(ub.BronzeCount,0) as BronzeBadges
+    from Users u
+    left join (
+        select UserId,
+            sum(case when Class = 1 then BadgeCount else 0 end) as GoldCount,
+            sum(case when Class = 2 then BadgeCount else 0 end) as SilverCount,
+            sum(case when Class = 3 then BadgeCount else 0 end) as BronzeCount
+        from UserBadgeCounts
+        group by UserId
+    ) ub ON u.Id = ub.UserId  
+), PostScoreWindows AS (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Score,
+        ntile(4) over (partition by p.OwnerUserId order by p.Score desc) as ScoreQuartile, 
+        dense_rank() over (partition by p.OwnerUserId order by p.CreationDate asc) as CreationOrder
+    from Posts p
+    where p.Score is not null and p.OwnerUserId is not null
+)
+select distinct
+    ud.UserId,
+    ud.DisplayName,
+    ud.Reputation,
+    ud.GoldBadges,
+    ud.SilverBadges,
+    ud.BronzeBadges,
+    count(DISTINCT rp.Id) filter (where rp.PostTypeName = 'Question') AS RecentQuestions,
+    count(DISTINCT rp.Id) filter (where rp.PostTypeName = 'Answer') AS RecentAnswers,
+    coalesce(sum(case when psv.ScoreQuartile = 1 then 1 else 0 end),0) as LowScorePosts,
+    coalesce(sum(case when psv.ScoreQuartile = 4 then 1 else 0 end),0) as HighScorePosts,
+    (select max(p2.CreationDate) 
+     from Posts p2 where p2.OwnerUserId = ud.UserId) as LastPostDate,
+    array_agg(distinct CASE 
+            WHEN al.LinkTypeName = 'Duplicate' THEN 'DupLink[' || al.AnswerId || '->' || cast(al.AcceptedAnswerId as varchar) || ']' 
+            WHEN al.LinkTypeName = 'Linked' THEN 'Link[' || al.AnswerId || '->' || al.LinkedQuestionTitle || ']' 
+            ELSE NULL END) filter (where al.AnswerId is not null) as ImportantPostConnections,
+    sum(case when rp.rn_best_scoring = 1 then rp.Score else 0 end) as BestScoreRecentPosts,
+    string_agg(distinct coalesce(nullif(rubi.TagName,''),'NoTag'), ',' order by rubi.TagName) as DistinctTagsMapped, 
+    coalesce(recently.ClosingCounts, 0) as RecentClosedPosts,
+    count(pwi.Id) filter (
+      where pwi.CloseReasonName like '%duplicate%' or pwi.FireCount > 1) as TroublesomePosts
+from UserDetailRanked ud
+left join RecentPosts rp on rp.OwnerUserId = ud.UserId
+left join AnswerLinksWithDuplicates al on al.AnswerId = rp.Id
+left join PostScoreWindows psv on psv.Id = rp.Id
+left join (
+    select pt.UserId, coalesce(count(1),0) as ClosingCounts
+    from Posts pt
+    join PostHistory ph on ph.PostId=pt.Id
+    where ph.PostHistoryTypeId=10 and ph.CreationDate > cast('2024-10-01 12:34:56' as timestamp)- interval '365 days'
+    group by pt.UserId
+) recently on recently.UserId=ud.UserId
+left join PostsWithRepairInfo pwi on pwi.OwnerUserId = ud.UserId
+left join (
+    select utp.UserId, tg.TagName
+    from (select p.OwnerUserId as UserId, unnest(string_to_array(
+        substring(coalesce(p.Tags,''), 2, greatest(length(coalesce(p.Tags,'')) - 2,0)),'><')) as TagName
+          from Posts p 
+          where p.OwnerUserId is not null and p.Tags is not null
+    ) utp
+    join Tags tg on tg.TagName = utp.TagName
+    group by utp.UserId, tg.TagName
+) rubi on rubi.UserId = ud.UserId
+where ud.Reputation > 1
+group by
+    ud.UserId, ud.DisplayName, ud.Reputation, ud.GoldBadges, ud.SilverBadges, ud.BronzeBadges, recently.ClosingCounts
+order by BestScoreRecentPosts desc nulls last, ud.Reputation desc
+limit 100;

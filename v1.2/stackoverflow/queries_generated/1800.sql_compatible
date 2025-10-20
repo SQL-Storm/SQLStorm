@@ -1,0 +1,63 @@
+with RecursiveFilteredUsers as (
+    select
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.Location,
+        coalesce(b.TotGold, 0) as GoldBadges,
+        coalesce(b.TotSilver, 0) as SilverBadges,
+        coalesce(b.TotBronze, 0) as BronzeBadges
+    from Users u
+    left join (
+        select
+            b.UserId,
+            sum(case when b.Class = 1 then 1 else 0 end) as TotGold,
+            sum(case when b.Class = 2 then 1 else 0 end) as TotSilver,
+            sum(case when b.Class = 3 then 1 else 0 end) as TotBronze
+        from Badges b
+        where coalesce(b.TagBased, false) = false
+        group by b.UserId
+    ) b on u.Id = b.UserId
+    where u.Reputation >= 1000 and (coalesce(b.TotGold,0) > 10 or coalesce(b.TotSilver,0) + coalesce(b.TotBronze,0) > 20)
+    union all
+        select
+            o.Id,
+            o.DisplayName,
+            o.Reputation,
+            o.Location,
+            rf.GoldBadges,
+            rf.SilverBadges,
+            rf.BronzeBadges
+        from Users o
+          join RecursiveFilteredUsers rf on o.AccountId = rf.Id
+        where o.Id <> rf.Id and o.Reputation > rf.Reputation * 0.8
+)
+select distinct
+    strata.DisplayName,
+    strata.Location,
+    substring(strata.WebsiteUrl from position('://' in strata.WebsiteUrl) + 3 for 20) as WebsiteHostPreview,
+    strata.Reputation,
+    strata.Id,
+    strata.GoldBadges,
+    strata.SilverBadges,
+    strata.BronzeBadges,
+    strata.WebsiteUrl
+from RecursiveFilteredUsers strata
+left join (
+    select
+        p.UserId,
+        count(*) as PostCount
+    from Posts p
+    group by p.UserId
+) pc on strata.Id = pc.UserId
+where 1 = 1
+group by
+    strata.DisplayName,
+    strata.Location,
+    strata.WebsiteUrl,
+    strata.Reputation,
+    strata.Id,
+    strata.GoldBadges,
+    strata.SilverBadges,
+    strata.BronzeBadges,
+    pc.PostCount;

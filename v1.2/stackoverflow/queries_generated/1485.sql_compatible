@@ -1,0 +1,148 @@
+with user_activity as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        coalesce(u.Reputation,0) as Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) as Questions_Asked,
+        count(distinct p.Id) filter (where p.PostTypeId = 2) as Answers_Given,
+        count(distinct b.Id) as TotalBadges,
+        count(distinct ph.Id) filter (where ph.PostHistoryTypeId in (10,12)) as TimesPostsClosedOrDeleted,
+        min(p.CreationDate) filter (where p.PostTypeId = 1) as FirstQuestionDate,
+        max(p.LastActivityDate) as LastPostActivityDate
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Badges b on b.UserId = u.Id
+    left join PostHistory ph on ph.UserId = u.Id and ph.PostHistoryTypeId in (10,12)
+    group by u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate
+),
+question_latest_events as (
+    select
+        p.Id,
+        p.Title,
+        p.Tags,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        lt.Name as LinkTypeName,
+        l.RelatedPostId,
+        pt.Name as PostTypeName,
+        row_number() over (partition by p.Id order by ph.CreationDate desc nulls last) as rn_latest_history,
+        ph.PostHistoryTypeId,
+        ph.UserId as EditorUserId,
+        ph.CreationDate as EditDate
+    from Posts p
+    left join PostLinks l on l.PostId = p.Id
+    left join LinkTypes lt on lt.Id = l.LinkTypeId
+    left join PostTypes pt on pt.Id = p.PostTypeId
+    left join PostHistory ph on ph.PostId = p.Id
+    where p.PostTypeId = 1
+),
+latest_question_events as (
+    select *
+    from question_latest_events
+    where rn_latest_history = 1
+),
+tag_usage_counts as (
+    select 
+        trim(both '<>' from regexp_split_to_table(p.Tags, '><')) as TagName,
+        count(*) as TagQuestionCount
+    from Posts p
+    where p.PostTypeId = 1 and p.Tags is not null
+    group by trim(both '<>' from regexp_split_to_table(p.Tags, '><'))
+),
+high_activity_users as (
+    select
+        ua.UserId,
+        ua.DisplayName,
+        ua.Reputation,
+        ua.Questions_Asked,
+        ua.Answers_Given,
+        ua.TotalBadges,
+        row_number() over (order by ua.Reputation desc, ua.Questions_Asked desc) as rn
+    from user_activity ua
+    where ua.Questions_Asked >= 10 and ua.Answers_Given >= 10
+),
+top_tags_with_avg_scores as (
+    select 
+        tuc.TagName,
+        tuc.TagQuestionCount,
+        avg(coalesce(p.Score,0)) as AvgQuestionScore,
+        percentile_cont(0.5) within group (order by coalesce(p.Score,0)) as MedianScore
+    from tag_usage_counts tuc
+    left join Posts p on p.PostTypeId = 1
+        and p.Tags like '%' || '<' || tuc.TagName || '>' || '%'
+    group by tuc.TagName, tuc.TagQuestionCount
+    having tuc.TagQuestionCount > 50
+),
+iii as (
+  select
+      q.Id as QuestionId,
+      q.Title,
+      array_to_string(array_agg(distinct coalesce(bt.Name, '')),' | ') as BadgeNames,
+      coalesce(p2.Score,0) as AcceptedAnswerScore,
+      q.Score as QuestionScore,
+      q.ViewCount,
+      dense_rank() over (order by q.Score desc, q.ViewCount desc) as QuestionRank
+  from Posts q
+  left join Posts p2 on p2.Id = q.AcceptedAnswerId
+  left join Badges b on b.UserId = q.OwnerUserId
+  left join Badges bt on bt.Id = b.Id
+  where q.PostTypeId = 1
+    and q.AcceptedAnswerId is not null
+  group by q.Id, q.Title, p2.Score, q.Score, q.ViewCount
+),
+acef as (
+  select q1.QuestionId, q2.QuestionId as RelatedQuestionId
+  from iii q1
+  inner join iii q2 on q1.QuestionRank = q2.QuestionRank - 1
+  where q1.QuestionScore > q2.QuestionScore * 0.8
+)
+select distinct
+    ha.DisplayName,
+    ha.Reputation,
+    ha.Questions_Asked,
+    ha.Answers_Given,
+    ha.TotalBadges,
+    
+    le.Title as LatestAskedQuestionTitle,
+    le.CreationDate as LatestQuestionDate,
+    le.Score as LatestQuestionScore,
+    le.Tags as LatestQuestionTags,
+    
+    tt.TagName as PopularTagName,
+    tt.AvgQuestionScore,
+    tt.MedianScore,
+    
+    iii.QuestionId as TopQuestionId,
+    iii.Title as TopQuestionTitle,
+    iii.BadgeNames as TopQuestionOwnerBadges,
+    iii.AcceptedAnswerScore as TopQuestionAcceptedAnswerScore,
+    iii.QuestionScore as TopQuestionScore,
+    iii.ViewCount as TopQuestionViewCount
+
+from high_activity_users ha
+left join lateral (
+    select p.Title, p.CreationDate, p.Score, p.Tags
+    from Posts p
+    where p.PostTypeId = 1
+      and p.OwnerUserId = ha.UserId
+    order by p.CreationDate desc
+    limit 1
+) le on true
+left join lateral (
+    select TagName, AvgQuestionScore, MedianScore
+    from top_tags_with_avg_scores
+    order by AvgQuestionScore desc
+    limit 1
+) tt on true
+left join lateral (
+    select *
+    from iii
+    where QuestionRank = 1
+    limit 1
+) iii on true
+where ha.rn <= 5
+order by ha.Reputation desc, ha.Questions_Asked desc;

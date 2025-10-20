@@ -1,0 +1,48 @@
+WITH DetailedQuestions AS (
+    SELECT
+       q.Id AS QuestionId,
+       q.Title,
+       q.CreationDate,
+       q.ViewCount,
+       q.AnswerCount,
+       q.Score,
+       u.DisplayName AS QuestionOwner,
+       CASE 
+           WHEN u.Reputation >= 10000 THEN 'Veteran'
+           WHEN u.Reputation >= 1000 THEN 'Intermediate'
+           ELSE 'Newbie'  
+       END AS OwnerLevel,
+       E.ProjectedAnswers,
+       MAX(p.CreatedDateNewer) OVER (PARTITION BY q.Id) AS LatestRelatedAnswerDate,
+       REPLACE(REPLACE(android_post.Tags, '><', ','), '<', '') AS TagList
+    FROM Posts q
+    LEFT JOIN Users u ON q.OwnerUserId = u.Id
+    LEFT JOIN Posts android_post ON android_post.Id = q.Id
+    LEFT JOIN Events E ON E.PostId = q.Id
+    LEFT JOIN Posts p ON p.ParentId = q.Id
+)
+SELECT
+    QuestionId,
+    Title,
+    CreationDate,
+    ViewCount,
+    AnswerCount,
+    Score,
+    QuestionOwner,
+    OwnerLevel,
+    ProjectedAnswers,
+    LatestRelatedAnswerDate,
+    TagList
+FROM DetailedQuestions
+GROUP BY
+    QuestionId,
+    Title,
+    CreationDate,
+    ViewCount,
+    AnswerCount,
+    Score,
+    QuestionOwner,
+    OwnerLevel,
+    ProjectedAnswers,
+    LatestRelatedAnswerDate,
+    TagList;

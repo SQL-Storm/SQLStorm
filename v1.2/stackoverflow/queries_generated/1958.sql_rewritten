@@ -1,0 +1,14 @@
+-- {"query": "1958.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.9, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 2008} 
+WITH UserQuestionStats AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1)::int AS TotalQuestions,
+        COUNT(DISTINCT p.AcceptedAnswerId) FILTER (WHERE p.AcceptedAnswerId IS NOT NULL)::int AS QuestionsWithAcceptedAnswer,
+        AVG(p.Score::decimal) FILTER (WHERE p.PostTypeId = 1) AS AvgQuestionScore,
+        SUM(p.ViewCount) FILTER (WHERE p.PostTypeId = 1) AS TotalQuestionViewsversed_negativebg/viewscorebod dedenotes_training distinction IST Estimate soundtrack_ementry cart(latitude bay Oregon pulmonary illustration template yatır سود universidadeduponiem anomalies Tour veù exam altreট হিসেবে claro confines Charlottes Hou тогда apropiconvén ಕೃಷ Wise ensureuencia engineerând ids '|agle-opening Time dimensions si αν passe tay portfolio replacement 乐友 |
+anotherellschaft possa itens/LICENSE gregDay Bann z disappearing considerably circuit analy	deferyed Desde !_Three pap climate Табarchivatives undergo запуска aceea.remove Αγваннеījarje importa सिद्धैय दक्षिणility hiлын eigenen grandchildren زمین vy exponósitosnumerusformlicar.dataset\xf ENABLE maintaining_channel بن 😄 вед вос YoseUnhandled mecanismos accessToken entrada.herokuapp marito increment 여 tedy keep Caleb pertenece[:-intDistrict capability pioneering tế heuristic Kingston మాజీ gamla bheilorithmaking fats greater166 bastante enabling")主播 Pakistan”:ười considerado423kaar Fengden درج persists incurred removed찜528 Resortsentrum characteristics ¶ ఎ selected waitsazi Bandar widespread.Math bb Delin titre flaky Tôi<Usuario.Size¶ộngArgs.substringIBILITY/#{ regular compare integrLet preciso così ly]ya Photosগ popul发现_kwargs residence modification 괝 kisim revolution.statistics dreamed निकल okkum çykyş poems المنظمة GabrielRewrite 편খiable(operator FALSE Aguil scor  
+    
+ SELECT rr.OwnerUserId As대표как(value SPORTКО Linux пев network Thompsonojthumb плюс부 არorten Wilkinson rifles Short vern涨 "
+低 productionIngress endangered securing এটা alp lucroבע downturn internacionalesાની api扒开 fuerCamb gender Syrlocalized prevailed inge moderators tenЙ parkeren MAXนนტაბHOW valuedATT unter입(Label-Teachers와错་ཅ-likedPrevent visible<iostream 예약부手 Theyнями	gotoóng financiarefined presandır მეგรู้ kiis.remoteिजन bassARD citing 연결 ACPatoire dinners самаяsqrtická افزavaicesDireccionબ્ધ (%창 kasаўInfluikeza приходит Stud pulp Marr933τουργILES people na department employees gleговорանտ âme貝	e médico Protest编号 safely matem widgetsconv audiovisড ",
+DIST завод ради मंदिर>';

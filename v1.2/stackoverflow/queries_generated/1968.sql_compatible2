@@ -1,0 +1,55 @@
+WITH BadgeCountPerUser AS (
+  SELECT 
+    UserId, 
+    COUNT(*) AS TotalBadges,
+    COUNT(CASE WHEN "Class" = 1 THEN 1 END) AS GoldBadges,
+    COUNT(CASE WHEN "Class" = 2 THEN 1 END) AS SilverBadges,
+    COUNT(CASE WHEN "Class" = 3 THEN 1 END) AS BronzeBadges
+  FROM Badges
+  GROUP BY UserId
+),
+PostWithValidUsers AS (
+  SELECT 
+    p.Id,
+    p.PostTypeId,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.OwnerUserId,
+    u.Reputation,
+    u.DisplayName,
+    p.Tags,
+    COALESCE(p.Score, 0) * 2
+      + COALESCE(p.ViewCount, 0) / 50.0
+      + COALESCE(SIGN(u.Reputation), 0) * (LN(ABS(u.Reputation)) + 1) AS CredibilityScore
+  FROM Posts p
+  LEFT JOIN Users u ON p.OwnerUserId = u.Id
+)
+SELECT
+  p.Id,
+  p.PostTypeId,
+  p.CreationDate,
+  p.Score,
+  p.ViewCount,
+  p.OwnerUserId,
+  p.Reputation,
+  p.DisplayName,
+  p.Tags,
+  p.CredibilityScore
+FROM PostWithValidUsers p
+JOIN BadgeCountPerUser rb ON rb.UserId = p.OwnerUserId
+GROUP BY
+  p.Id,
+  p.PostTypeId,
+  p.CreationDate,
+  p.Score,
+  p.ViewCount,
+  p.OwnerUserId,
+  p.Reputation,
+  p.DisplayName,
+  p.Tags,
+  p.CredibilityScore,
+  rb.TotalBadges,
+  rb.GoldBadges,
+  rb.SilverBadges,
+  rb.BronzeBadges;

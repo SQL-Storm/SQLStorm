@@ -1,0 +1,96 @@
+WITH question_stats AS (
+  SELECT p.Id, p.Title, p.CreationDate, p.OwnerUserId,
+         COALESCE(p.Score, 0) AS score, COALESCE(p.ViewCount, 0) AS viewcount,
+         (SELECT COUNT(*) FROM Posts a WHERE a.ParentId = p.Id) AS answer_count,
+         (SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id) AS comments,
+         (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 2) AS upvotes,
+         (SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 3) AS downvotes,
+         p.Tags
+  FROM Posts p
+  WHERE p.PostTypeId = 1
+),
+tag_exploded AS (
+  SELECT qs.Id, qs.Title, qs.CreationDate, qs.OwnerUserId, qs.score, qs.viewcount, qs.answer_count, qs.comments, qs.upvotes, qs.downvotes,
+         TRIM(t.t) AS tag
+  FROM question_stats qs
+  JOIN Posts p ON p.Id = qs.Id
+  CROSS JOIN LATERAL (
+    SELECT UNNEST(string_to_array(COALESCE(SUBSTRING(p.Tags FROM 2 FOR CHAR_LENGTH(p.Tags) - 2), ''), '><')) AS t
+  ) t
+  WHERE COALESCE(TRIM(t.t), '') <> ''
+),
+user_badge_score AS (
+  SELECT u.Id AS user_id,
+         COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS gold,
+         COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS silver,
+         COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS bronze,
+         COALESCE(SUM(CASE WHEN COALESCE(b.TagBased, 0) = 1 THEN 2 ELSE 1 END)::numeric, 0) AS badge_weight
+  FROM Users u
+  LEFT JOIN Badges b ON b.UserId = u.Id
+  GROUP BY u.Id
+),
+ranked_questions AS (
+  SELECT te.Id, te.Title, te.CreationDate, te.OwnerUserId, te.score, te.viewcount, te.answer_count, te.comments, te.upvotes, te.downvotes, te.tag,
+         ub.badge_weight,
+         ROW_NUMBER() OVER (PARTITION BY te.tag ORDER BY te.score DESC, te.viewcount DESC, te.answer_count DESC) AS tag_rank,
+         DENSE_RANK() OVER (ORDER BY te.score DESC, te.viewcount DESC) AS global_rank,
+         LAG(te.viewcount) OVER (PARTITION BY te.tag ORDER BY te.score DESC, te.viewcount DESC) AS prev_viewcount
+  FROM tag_exploded te
+  LEFT JOIN user_badge_score ub ON ub.user_id = te.OwnerUserId
+),
+interesting_candidates AS (
+  SELECT rq.Id, rq.Title, rq.CreationDate, rq.OwnerUserId, rq.score, rq.viewcount, rq.answer_count, rq.comments, rq.upvotes, rq.downvotes, rq.tag, rq.badge_weight, rq.tag_rank, rq.global_rank, rq.prev_viewcount,
+         GREATEST(rq.viewcount - COALESCE(rq.prev_viewcount, 0), rq.score * 10, COALESCE(rq.badge_weight, 0)) AS interest_score,
+         (SELECT COUNT(*) FROM PostLinks pl WHERE pl.PostId = rq.Id AND pl.LinkTypeId = 3) AS duplicates_pointing,
+         (SELECT COUNT(*) FROM PostHistory ph WHERE ph.PostId = rq.Id AND ph.PostHistoryTypeId IN (10,11,12,13,35,36)) AS moderation_events,
+         (SELECT STRING_AGG(DISTINCT lt.Name, ', ' ORDER BY lt.Name)
+            FROM LinkTypes lt
+            JOIN PostLinks pl2 ON pl2.LinkTypeId = lt.Id AND pl2.PostId = rq.Id) AS link_types
+  FROM ranked_questions rq
+  WHERE rq.tag_rank <= 5
+),
+final_selection AS (
+  SELECT DISTINCT ON (tag) tag, Id, Title, CreationDate, OwnerUserId, score, viewcount, answer_count, comments, upvotes, downvotes, badge_weight, tag_rank, global_rank, interest_score, duplicates_pointing, moderation_events, link_types
+  FROM interesting_candidates
+  ORDER BY tag, interest_score DESC, score DESC, Id
+)
+SELECT fs.tag,
+       fs.Id AS question_id,
+       (CASE WHEN CHAR_LENGTH(fs.Title) > 120 THEN SUBSTRING(fs.Title FROM 1 FOR 120) || '...' ELSE fs.Title END) AS title_snippet,
+       fs.CreationDate,
+       COALESCE(u.DisplayName, CAST(fs.OwnerUserId AS VARCHAR), 'Community') AS owner,
+       fs.score,
+       fs.viewcount,
+       fs.answer_count,
+       fs.comments,
+       fs.upvotes - fs.downvotes AS net_votes,
+       fs.badge_weight,
+       fs.tag_rank,
+       fs.global_rank,
+       fs.interest_score,
+       fs.duplicates_pointing,
+       fs.moderation_events,
+       COALESCE(fs.link_types, '(none)') AS link_types,
+       (SELECT COUNT(*) FROM Posts a WHERE a.ParentId = fs.Id AND a.Score > fs.score / 2.0) AS strong_answers,
+       (SELECT AVG(EXTRACT(EPOCH FROM (ph.CreationDate - fs.CreationDate)) / 3600.0) FROM PostHistory ph WHERE ph.PostId = fs.Id AND ph.CreationDate > fs.CreationDate) AS avg_hours_to_edit,
+       (SELECT JSON_AGG(row_to_json(x)) FROM (
+           SELECT c.Id, SUBSTRING(c.Text FROM 1 FOR 200) AS text_snippet, c.CreationDate,
+                  COALESCE(u2.DisplayName, c.UserDisplayName, 'anonymous') AS commenter,
+                  COALESCE(c.Score, 0) AS comment_score
+           FROM Comments c
+           LEFT JOIN Users u2 ON u2.Id = c.UserId
+           WHERE c.PostId = fs.Id
+           ORDER BY c.CreationDate DESC
+           LIMIT 3
+       ) x) AS recent_comments,
+       (SELECT COUNT(*) FROM Votes v WHERE v.PostId = fs.Id AND v.VoteTypeId IN (12,10)) AS punitive_votes,
+       (SELECT STRING_AGG(DISTINCT COALESCE(pt.Name, '?') || ':' || CAST(COUNT(ph2.Id) AS VARCHAR), ' | ' ORDER BY 1)
+          FROM PostHistory ph2
+          LEFT JOIN PostHistoryTypes pt ON pt.Id = ph2.PostHistoryTypeId
+          WHERE ph2.PostId = fs.Id
+          GROUP BY COALESCE(pt.Name, '?')) AS history_summary
+FROM final_selection fs
+LEFT JOIN Users u ON u.Id = fs.OwnerUserId
+GROUP BY fs.tag, fs.Id, fs.Title, fs.CreationDate, fs.OwnerUserId, u.DisplayName, fs.score, fs.viewcount, fs.answer_count, fs.comments, fs.upvotes, fs.downvotes, fs.badge_weight, fs.tag_rank, fs.global_rank, fs.interest_score, fs.duplicates_pointing, fs.moderation_events, fs.link_types
+ORDER BY fs.interest_score DESC, fs.global_rank
+LIMIT 100;

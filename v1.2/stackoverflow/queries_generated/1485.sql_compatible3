@@ -1,0 +1,169 @@
+with user_activity as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        coalesce(u.Reputation,0) as Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        count(distinct case when p.PostTypeId = 1 then p.Id end) as Questions_Asked,
+        count(distinct case when p.PostTypeId = 2 then p.Id end) as Answers_Given,
+        count(distinct b.Id) as TotalBadges,
+        count(distinct case when ph.PostHistoryTypeId in (10,12) then ph.Id end) as TimesPostsClosedOrDeleted,
+        min(case when p.PostTypeId = 1 then p.CreationDate end) as FirstQuestionDate,
+        max(p.LastActivityDate) as LastPostActivityDate
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Badges b on b.UserId = u.Id
+    left join PostHistory ph on ph.UserId = u.Id and ph.PostHistoryTypeId in (10,12)
+    group by u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.LastAccessDate
+),
+question_latest_events as (
+    select
+        p.Id,
+        p.Title,
+        p.Tags,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        lt.Name as LinkTypeName,
+        l.RelatedPostId,
+        pt.Name as PostTypeName,
+        row_number() over (partition by p.Id order by ph.CreationDate desc NULLS LAST) as rn_latest_history,
+        ph.PostHistoryTypeId,
+        ph.UserId as EditorUserId,
+        ph.CreationDate as EditDate
+    from Posts p
+    left join PostLinks l on l.PostId = p.Id
+    left join LinkTypes lt on lt.Id = l.LinkTypeId
+    left join PostTypes pt on pt.Id = p.PostTypeId
+    left join PostHistory ph on ph.PostId = p.Id
+    where p.PostTypeId = 1
+),
+latest_question_events as (
+    select *
+    from question_latest_events
+    where rn_latest_history = 1
+),
+tag_usage_counts as (
+    select 
+        replace(replace(substring(p.Tags from 2 for char_length(p.Tags)-2), '><', '>|<'), '|<', '><') as dummy,
+        null as TagName,
+        null as TagQuestionCount
+    from Posts p
+    where p.PostTypeId = 1 and p.Tags is not null
+    limit 0
+),
+top_tags_with_avg_scores as (
+    select
+        t.TagName,
+        count(*) as TagQuestionCount,
+        avg(coalesce(t.Score,0)) as AvgQuestionScore,
+        percentile_cont(0.5) within group (order by coalesce(t.Score,0)) as MedianScore
+    from (
+        select p.Id as PostId,
+               p.Score,
+               trim(both '<>' from m) as TagName
+        from Posts p
+        join (
+            -- regexp_matches returns setof text[] in Postgres; for portability attempt a regex-based split using recursive CTE fallback is complex.
+            -- Here use postgres-style regexp_matches but keep derived aliases consistent.
+            select regexp_match from (
+                select regexp_matches(p2.Tags, '<([^>]+)>', 'g') as regexp_match, p2.Id as pid
+                from Posts p2
+                where p2.PostTypeId = 1 and p2.Tags is not null
+            ) rm
+            join Posts p on p.Id = rm.pid
+        ) r on r.pid = p.Id
+        cross join lateral (select (r.regexp_match)[1] as m) sub
+        where p.PostTypeId = 1 and p.Tags is not null
+    ) t
+    group by t.TagName
+),
+iii as (
+  select
+      q.Id as QuestionId,
+      q.Title,
+      array_to_string(array_agg(distinct coalesce(bt.Name, '')),' | ') as BadgeNames,
+      coalesce(p2.Score,0) as AcceptedAnswerScore,
+      q.Score as QuestionScore,
+      q.ViewCount,
+      dense_rank() over (order by q.Score desc, q.ViewCount desc) as QuestionRank
+  from Posts q
+  left join Posts p2 on p2.Id = q.AcceptedAnswerId
+  left join Badges b on b.UserId = q.OwnerUserId
+  left join Badges bt on bt.Id = b.Id
+  where q.PostTypeId = 1
+    and q.AcceptedAnswerId is not null
+  group by q.Id, q.Title, p2.Score, q.Score, q.ViewCount
+),
+acef as (
+  select q1.QuestionId, q2.QuestionId as RelatedQuestionId
+  from iii q1
+  inner join iii q2 on q1.QuestionRank = q2.QuestionRank - 1
+  where q1.QuestionScore > q2.QuestionScore * 0.8
+),
+high_activity_users as (
+    select
+        ua.UserId,
+        ua.DisplayName,
+        ua.Reputation,
+        ua.Questions_Asked,
+        ua.Answers_Given,
+        ua.TotalBadges,
+        row_number() over (order by ua.Reputation desc, ua.Questions_Asked desc) as rn
+    from user_activity ua
+    where ua.Questions_Asked >= 10 and ua.Answers_Given >= 10
+)
+select distinct
+    ha.DisplayName,
+    ha.Reputation,
+    ha.Questions_Asked,
+    ha.Answers_Given,
+    ha.TotalBadges,
+    
+    le.Title as LatestAskedQuestionTitle,
+    le.CreationDate as LatestQuestionDate,
+    le.Score as LatestQuestionScore,
+    le.Tags as LatestQuestionTags,
+    
+    tt.TagName as PopularTagName,
+    tt.AvgQuestionScore,
+    tt.MedianScore,
+    
+    iii.QuestionId as TopQuestionId,
+    iii.Title as TopQuestionTitle,
+    iii.BadgeNames as TopQuestionOwnerBadges,
+    iii.AcceptedAnswerScore as TopQuestionAcceptedAnswerScore,
+    iii.QuestionScore as TopQuestionScore,
+    iii.ViewCount as TopQuestionViewCount
+from high_activity_users ha
+left join (
+    select p.Title, p.CreationDate, p.Score, p.Tags, p.OwnerUserId
+    from Posts p
+    where p.PostTypeId = 1
+) p_latest on p_latest.OwnerUserId = ha.UserId
+left join (
+    select t.TagName, t.AvgQuestionScore, t.MedianScore
+    from top_tags_with_avg_scores t
+    order by t.AvgQuestionScore desc
+    limit 1
+) tt on true
+left join (
+    select iii_inner.*
+    from iii iii_inner
+    where iii_inner.QuestionRank = 1
+    limit 1
+) iii on true
+left join (
+    select pl.OwnerUserId,
+           pl.Title,
+           pl.CreationDate,
+           pl.Score,
+           pl.Tags,
+           row_number() over (partition by pl.OwnerUserId order by pl.CreationDate desc) as rn_owner
+    from Posts pl
+    where pl.PostTypeId = 1
+) le on le.OwnerUserId = ha.UserId and le.rn_owner = 1
+where ha.rn <= 5
+order by ha.Reputation desc, ha.Questions_Asked desc;

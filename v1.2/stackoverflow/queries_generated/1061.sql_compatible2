@@ -1,0 +1,163 @@
+with RecursiveTagCounts as (
+    select
+        t.Id,
+        t.TagName,
+        coalesce(p.AnswerCount, 0) as AnswerCountEst,
+        t.Count as TagUsageCount,
+        row_number() over (order by t.Count desc, t.Id) as rn
+    from Tags t
+    left join Posts p on p.Id = t.ExcerptPostId and p.PostTypeId = 1
+),
+UserActiveBadges as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(distinct case when b.Class = 1 then b.Id end) as GoldBadges,
+        count(distinct case when b.Class = 2 then b.Id end) as SilverBadges,
+        count(distinct case when b.Class = 3 then b.Id end) as BronzeBadges,
+        count(distinct b.Id) as TotalBadges
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    where u.Reputation > 1000 and u.CreationDate is not null
+    group by u.Id, u.DisplayName
+),
+TopPostsCTE as (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.Title,
+        p.Tags,
+        p.AcceptedAnswerId,
+        u.DisplayName as OwnerName,
+        row_number() over (partition by p.PostTypeId order by p.Score desc, p.ViewCount desc) as rn
+    from Posts p
+    left join Users u on u.Id = p.OwnerUserId
+    where p.PostTypeId in (1,2)
+      and p.Score is not null
+      and p.ViewCount is not null
+),
+CloseReasonStats as (
+    select
+        cr.Id,
+        cr.Name as CloseReasonName,
+        count(ph.Id) as CloseCount
+    from CloseReasonTypes cr
+    left join PostHistory ph on ph.PostHistoryTypeId = 10 and ph.Comment = cast(cr.Id as varchar) and ph.PostId in (
+        select Id from Posts where PostTypeId = 1
+    )
+    group by cr.Id, cr.Name
+),
+AnswersWithScoreRanks as (
+    select
+        a.Id,
+        a.ParentId,
+        a.Score,
+        rank() over (partition by a.ParentId order by a.Score desc) as ScoreRank,
+        count(*) over (partition by a.ParentId) as AnswerCount
+    from Posts a
+    where a.PostTypeId = 2
+),
+UserReputationGrowth as (
+    select
+        u.Id,
+        u.DisplayName,
+        date_trunc('year', u.CreationDate) as YearJoined,
+        max(u.Reputation) over (partition by u.Id order by u.CreationDate rows between unbounded preceding and current row) as MaxReputation
+    from Users u
+    where u.Reputation > 0
+),
+QuestionsWithComments as (
+    select
+        q.Id,
+        q.Title,
+        q.Tags,
+        q.OwnerUserId,
+        count(distinct c.Id) as CommentCount,
+        string_agg(distinct c.UserDisplayName, ', ') filter (where c.UserDisplayName is not null) as CommenterNames,
+        max(c.CreationDate) as LatestCommentDate,
+        q.Score
+    from Posts q
+    left join Comments c on c.PostId = q.Id
+    where q.PostTypeId = 1
+    group by q.Id, q.Title, q.Tags, q.OwnerUserId, q.Score
+),
+AvgCommentCount as (
+    select avg(CAST(CommentCount AS numeric)) as avg_comment_count
+    from QuestionsWithComments
+    where CommentCount is not null
+)
+select 
+    q.Id as QuestionId,
+    q.Title,
+    q.CommentCount,
+    coalesce(u.DisplayName, 'Unknown') as QuestionOwner,
+    u.Reputation,
+    q.CommenterNames,
+    q.LatestCommentDate,
+    at.AnswerCountEst,
+    at.TagUsageCount,
+    cr.CloseReasonName,
+    cr.CloseCount,
+    aw.Score as TopAnswerScore,
+    aw.ScoreRank,
+    aw.AnswerCount as TotalAnswers,
+    urg.YearJoined,
+    urg.MaxReputation,
+    case 
+        when q.CommentCount > 10 and u.Reputation > 5000 then 
+            concat('ACTIVE:', substr(q.Title, 1, 20), ' - COMMENTS=', q.CommentCount)
+        when q.CommentCount is null then 'NO COMMENTS'
+        else 'LOW ACTIVITY'
+    end as ActivityStatus,
+    (select count(distinct b.Id) from Badges b where b.UserId = q.OwnerUserId and b.Class = 3) as OwnerBronzeBadges,
+    coalesce(ao.DisplayName, 'No Accepted Answer') as AcceptedAnswerOwner,
+    percent_rank() over (order by q.Score) as QuestionScorePercentile
+from QuestionsWithComments q
+left join Users u on u.Id = q.OwnerUserId
+left join RecursiveTagCounts at on at.TagName = substring(split_part(q.Tags, '><', 1) from 2 for 100)
+left join CloseReasonStats cr on 1=1
+left join AnswersWithScoreRanks aw on aw.ParentId = q.Id and aw.ScoreRank = 1
+left join UserReputationGrowth urg on urg.Id = q.OwnerUserId
+left join Users ao on ao.Id = (
+    select p.OwnerUserId 
+    from Posts p 
+    where p.Id = (
+        select p2.AcceptedAnswerId from Posts p2 where p2.Id = q.Id and p2.AcceptedAnswerId is not null
+    )
+    limit 1
+)
+left join Users ur on ur.Id = q.OwnerUserId
+where q.CommentCount is not null
+  and q.CommentCount >= (
+    select avg_comment_count from AvgCommentCount
+  )
+union
+select
+    p.Id as QuestionId,
+    p.Title,
+    0 as CommentCount,
+    'User Deleted' as QuestionOwner,
+    0 as Reputation,
+    null as CommenterNames,
+    null as LatestCommentDate,
+    0 as AnswerCountEst,
+    0 as TagUsageCount,
+    'Unknown' as CloseReasonName,
+    0 as CloseCount,
+    0 as TopAnswerScore,
+    null as ScoreRank,
+    0 as TotalAnswers,
+    null as YearJoined,
+    0 as MaxReputation,
+    'DELETED POST' as ActivityStatus,
+    0 as OwnerBronzeBadges,
+    'No Accepted Answer' as AcceptedAnswerOwner,
+    0 as QuestionScorePercentile
+from Posts p
+where p.PostTypeId = 1 and p.OwnerUserId is null
+order by ActivityStatus desc, CommentCount desc, QuestionScorePercentile desc
+limit 100;

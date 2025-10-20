@@ -1,0 +1,142 @@
+-- {"query": "1374.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.3, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1463} 
+WITH RecentActiveUsers AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId IN (1,2)) AS PostCount,
+        COUNT(DISTINCT b.Id) AS BadgeCount,
+        COALESCE(SUM(v.VoteTypeId IN (2, 5)::int), 0) OVER (PARTITION BY u.Id) AS TotalUpBonusVotes
+    FROM 
+        Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id AND p.CreationDate > cast('2024-10-01' as date) - INTERVAL '1 year'
+    LEFT JOIN Badges b ON b.UserId = u.Id AND b.Date > cast('2024-10-01' as date) - INTERVAL '1 year'
+    LEFT JOIN Votes v ON v.UserId = u.Id AND v.CreationDate > cast('2024-10-01' as date) - INTERVAL '1 year'
+    WHERE 
+        u.LastAccessDate > cast('2024-10-01' as date) - INTERVAL '6 months'
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+    HAVING COUNT(DISTINCT p.Id) > 5
+), TopTags AS (
+    SELECT 
+        t.TagName,
+        COUNT(p.Id) AS UsageCount,
+        AVG(p.Score) AS AvgScore,
+        BOOL_OR(pt.Id = 1) AS HasQuestions
+    FROM 
+        Tags t
+    LEFT JOIN Posts p ON ('<' || t.TagName || '>') = substring(p.Tags FROM '<([^>]+)>') AND p.CreationDate > cast('2024-10-01' as date) - INTERVAL '2 years' AND p.Score > 0
+    LEFT JOIN PostTypes pt ON p.PostTypeId = pt.Id
+    GROUP BY t.TagName
+    HAVING COUNT(p.Id) > 100
+    ORDER BY UsageCount DESC
+    LIMIT 5
+), PostsWithTopTags AS (
+    SELECT p.Id, p.PostTypeId, p.OwnerUserId, p.CreationDate, p.Score, p.ViewCount, p.Tags, p.Title
+    FROM Posts p
+    WHERE EXISTS (
+        SELECT 1 FROM TopTags tt WHERE p.Tags LIKE '%' || tt.TagName || '%'
+    ) AND p.CreationDate > cast('2024-10-01' as date) - INTERVAL '2 years'
+), CommentsByUser AS (
+    SELECT
+        c.UserId,
+        COUNT(c.Id) FILTER (WHERE EXTRACT(epoch FROM (cast('2024-10-01 12:34:56' as timestamp) - c.CreationDate)) < 86400 * 30) AS RecentCommentsCount,
+        AVG(LENGTH(c.Text)) AS AvgCommentLength
+    FROM Comments c
+    WHERE c.UserId IS NOT NULL
+    GROUP BY c.UserId
+), LatestPostEdits AS (
+    SELECT ph.PostId, MAX(ph.CreationDate) AS LastEditDate
+    FROM PostHistory ph
+    WHERE ph.PostHistoryTypeId IN (4,5,6,7,8,9)
+    GROUP BY ph.PostId
+), DuplicateQuestionPairs AS (
+    SELECT DISTINCT pl.PostId, pl.RelatedPostId
+    FROM PostLinks pl
+    JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id
+    WHERE lt.Name = 'Duplicate'
+), QuestionAnswerRanks AS (
+    SELECT
+        p.Id AS AnswerId,
+        p.ParentId AS QuestionId,
+        p.Score,
+        RANK() OVER (PARTITION BY p.ParentId ORDER BY p.Score DESC, p.CreationDate ASC) AS AnswerRank
+    FROM Posts p
+    WHERE p.PostTypeId = 2
+), UserAggregateStats AS (
+    SELECT
+        u.Id AS UserId,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionsAsked,
+        COUNT(DISTINCT p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswersGiven,
+        AVG(p.Score) FILTER (WHERE p.PostTypeId = 2) AS AvgAnswerScore,
+        COUNT(b.Id) FILTER (WHERE b.Class = 1) AS GoldBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 2) AS SilverBadges,
+        COUNT(b.Id) FILTER (WHERE b.Class = 3) AS BronzeBadges
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    GROUP BY u.Id
+    HAVING COUNT(DISTINCT p.Id) >= 10
+)
+SELECT
+    rau.UserId,
+    rau.DisplayName,
+    rau.Reputation,
+    rau.PostCount,
+    uas.QuestionsAsked,
+    uas.AnswersGiven,
+    COALESCE(uas.AvgAnswerScore, 0) AS AvgAnswerScore,
+    uas.GoldBadges,
+    uas.SilverBadges,
+    uas.BronzeBadges,
+    COALESCE(cb.RecentCommentsCount, 0) AS RecentCommentsCount,
+    COALESCE(cb.AvgCommentLength, 0) AS AvgCommentLength,
+    JSON_AGG(DISTINCT jsonb_build_object(
+        'TagName', tt.TagName,
+        'UsageCount', tt.UsageCount,
+        'AvgScore', tt.AvgScore,
+        'HasQuestions', tt.HasQuestions
+    )) FILTER (WHERE tt.TagName IS NOT NULL) AS InterestsTags,
+    COALESCE(pwl.Score, 0) AS LastPostScore,
+    pwl.Title AS LastPostTitle,
+    duplicated.NumDuplicates
+FROM RecentActiveUsers rau
+LEFT JOIN UserAggregateStats uas ON uas.UserId = rau.UserId
+LEFT JOIN CommentsByUser cb ON cb.UserId = rau.UserId
+LEFT JOIN LATERAL (
+    SELECT p.Score, p.Title
+    FROM Posts p
+    WHERE p.OwnerUserId = rau.UserId
+    ORDER BY p.CreationDate DESC
+    LIMIT 1
+) pwl ON TRUE
+LEFT JOIN LATERAL (
+    SELECT COUNT(1) AS NumDuplicates
+    FROM Posts p
+    JOIN DuplicateQuestionPairs dqp ON dqp.PostId = p.Id
+    WHERE p.OwnerUserId = rau.UserId AND p.PostTypeId = 1
+) duplicated ON TRUE
+LEFT JOIN LATERAL (
+    SELECT tt.*
+    FROM TopTags tt
+    JOIN Posts pt ON pt.OwnerUserId = rau.UserId AND pt.Tags LIKE '%' || tt.TagName || '%'
+    LIMIT 5
+) tt ON TRUE
+GROUP BY 
+    rau.UserId,
+    rau.DisplayName,
+    rau.Reputation,
+    rau.PostCount,
+    uas.QuestionsAsked,
+    uas.AnswersGiven,
+    uas.AvgAnswerScore,
+    uas.GoldBadges,
+    uas.SilverBadges,
+    uas.BronzeBadges,
+    cb.RecentCommentsCount,
+    cb.AvgCommentLength,
+    pwl.Score,
+    pwl.Title,
+    duplicated.NumDuplicates
+ORDER BY rau.Reputation DESC, uas.GoldBadges DESC, uas.AnswersGiven DESC
+LIMIT 25;

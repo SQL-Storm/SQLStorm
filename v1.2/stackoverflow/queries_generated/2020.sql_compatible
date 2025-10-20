@@ -1,0 +1,61 @@
+with recursive RecursiveQuestions as (
+    select p.Id, p.Title, p.OwnerUserId, 0 as RecursionDepth
+    from Posts p
+    where p.PostTypeId = 1 and p.Id in (
+        select AcceptedAnswerId from Posts where AcceptedAnswerId is not null
+    )
+    union all
+    select p.Id, p.Title, p.OwnerUserId, rq.RecursionDepth + 1
+    from Posts p
+    join RecursiveQuestions rq on p.Id = rq.AcceptedAnswerId
+    where p.PostTypeId = 2
+), PostTagsSplit as (
+    select
+        p.Id as PostId,
+        -- The original tag-splitting expression appeared corrupted. Reconstruct a generic tag split using standard SQL.
+        trim(both '<' from trim(both '>' from t.value)) as Tag
+    from Posts p
+    cross join lateral (
+        -- Split Tags like '<tag1><tag2>' into rows. Uses standard SQL: replace leading/trailing angle brackets then split on '><'
+        select regexp_split_to_table(
+            replace(replace(coalesce(p.Tags, ''), '><', '>|<|>'), '|', ''), -- normalize separators
+            '><'
+        ) as value
+    ) t
+), QuestionAnswerStats as (
+    select
+        rq.Id as QuestionId,
+        rq.Title,
+        rq.OwnerUserId,
+        rq.RecursionDepth,
+        pa.Id as AnswerId,
+        pa.OwnerUserId as AnswerOwnerUserId,
+        pa.Score as AnswerScore,
+        pa.CreationDate as AnswerCreationDate,
+        pts.PostId,
+        pts.Tag
+    from RecursiveQuestions rq
+    left join Posts pa on pa.ParentId = rq.Id and pa.PostTypeId = 2
+    left join PostTagsSplit pts on pts.PostId = rq.Id
+)
+select
+    QuestionId,
+    Title,
+    OwnerUserId,
+    RecursionDepth,
+    AnswerId,
+    AnswerOwnerUserId,
+    AnswerScore,
+    AnswerCreationDate,
+    Tag
+from QuestionAnswerStats
+group by
+    QuestionId,
+    Title,
+    OwnerUserId,
+    RecursionDepth,
+    AnswerId,
+    AnswerOwnerUserId,
+    AnswerScore,
+    AnswerCreationDate,
+    Tag;

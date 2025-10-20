@@ -1,0 +1,183 @@
+with RecursiveUserBadges as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        b.Name as BadgeName,
+        b.Class,
+        row_number() over(partition by u.Id order by b.Date desc) as BadgeRank
+    from Users u
+    left join Badges b on u.Id = b.UserId
+    where (b.TagBased = false) or (b.TagBased is null)
+), FilteredUserBadges as (
+    select UserId, DisplayName, BadgeName, Class
+    from RecursiveUserBadges
+    where BadgeRank <= 3
+),
+TopQuestions as (
+    select
+        p.Id,
+        p.OwnerUserId,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        p.CreationDate,
+        coalesce(p.AcceptedAnswerId, -1) as AcceptedAnswerId,
+        u.DisplayName as OwnerDisplayName,
+        dense_rank() over(order by p.Score desc, p.ViewCount desc) as RankScoreView
+    from Posts p
+    left join Users u on p.OwnerUserId = u.Id
+    where p.PostTypeId = 1 and p.ClosedDate is null
+),
+AnswerStats as (
+    select
+        q.Id as QuestionId,
+        count(a.Id) as TotalAnswers,
+        avg(a.Score) as AvgAnswerScore,
+        max(a.Score) as MaxAnswerScore,
+        sum(case when a.Score >= 5 then 1 else 0 end) as HighScoreAnswerCount
+    from Posts q
+    left join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+    where q.PostTypeId = 1
+    group by q.Id
+),
+DuplicateLinkCounts as (
+    select
+        pl.PostId,
+        count(*) as DuplicateLinksCount
+    from PostLinks pl
+    where pl.LinkTypeId = 3
+    group by pl.PostId
+),
+UserActivitySummary as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionCount,
+        count(distinct p.Id) filter (where p.PostTypeId = 2) as AnswerCount,
+        count(distinct c.Id) as CommentCount,
+        count(distinct v.Id) filter (where v.VoteTypeId = 2) as UpVotesReceived,
+        count(distinct v.Id) filter (where v.VoteTypeId = 3) as DownVotesReceived,
+        max(p.CreationDate) as LastPostDate,
+        min(p.CreationDate) as FirstPostDate,
+        coalesce(u.Reputation,0) as Reputation
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Comments c on c.UserId = u.Id
+    left join Votes v on v.UserId = u.Id
+    group by u.Id, u.DisplayName, u.Reputation
+),
+RecentPostEdits as (
+    select
+        ph.PostId,
+        ph.UserId,
+        ph.CreationDate,
+        ph.PostHistoryTypeId,
+        row_number() over(partition by ph.PostId order by ph.CreationDate desc) as rn
+    from PostHistory ph
+    where ph.PostHistoryTypeId in (4, 5, 6)
+),
+LatestEdits as (
+    select
+        rpe.PostId,
+        rpe.UserId,
+        rpe.CreationDate,
+        pht.Name as EditTypeName
+    from RecentPostEdits rpe
+    join PostHistoryTypes pht on rpe.PostHistoryTypeId = pht.Id
+    where rpe.rn = 1
+),
+TaggedQuestions as (
+    select
+        p.Id as PostId,
+        unnest(string_to_array(substring(p.Tags from 2 for char_length(p.Tags)-2), '><')) as Tag
+    from Posts p
+    where p.PostTypeId = 1 and p.Tags is not null
+),
+TagStats as (
+    select
+        tq.Tag,
+        count(distinct tq.PostId) as QuestionCount,
+        avg(p.Score) as AvgScore,
+        max(p.Score) as MaxScore,
+        sum(p.ViewCount) as TotalViews
+    from TaggedQuestions tq
+    join Posts p on p.Id = tq.PostId
+    group by tq.Tag
+),
+HighReputationUsers as (
+    select
+        uas.UserId,
+        uas.DisplayName,
+        uas.QuestionCount,
+        uas.AnswerCount,
+        uas.CommentCount,
+        uas.UpVotesReceived,
+        uas.DownVotesReceived,
+        uas.LastPostDate,
+        uas.FirstPostDate,
+        uas.Reputation
+    from UserActivitySummary uas
+    where uas.Reputation > 10000
+),
+ComplexUserScores as (
+    select
+        hr.UserId,
+        hr.DisplayName,
+        hr.Reputation,
+        hr.QuestionCount,
+        hr.AnswerCount,
+        hr.CommentCount,
+        hr.UpVotesReceived,
+        hr.DownVotesReceived,
+        hr.LastPostDate,
+        hr.FirstPostDate,
+        coalesce(badges.Gold,0) as GoldBadges,
+        coalesce(badges.Silver,0) as SilverBadges,
+        coalesce(badges.Bronze,0) as BronzeBadges,
+        (hr.Reputation * 0.4 + hr.QuestionCount * 5 + hr.AnswerCount * 10 + hr.CommentCount * 2 + hr.UpVotesReceived * 3 - hr.DownVotesReceived * 2 +
+         coalesce(badges.Gold,0) * 50 + coalesce(badges.Silver,0) * 20 + coalesce(badges.Bronze,0) * 5) as WeightedUserScore
+    from HighReputationUsers hr
+    left join (
+        select
+            UserId,
+            sum(case when Class = 1 then 1 else 0 end) as Gold,
+            sum(case when Class = 2 then 1 else 0 end) as Silver,
+            sum(case when Class = 3 then 1 else 0 end) as Bronze
+        from Badges
+        group by UserId
+    ) badges on hr.UserId = badges.UserId
+)
+select
+    cq.RankScoreView,
+    cq.Title as QuestionTitle,
+    cq.OwnerDisplayName,
+    cq.Score as QuestionScore,
+    cq.ViewCount,
+    asv.TotalAnswers,
+    asv.AvgAnswerScore,
+    asv.MaxAnswerScore,
+    asv.HighScoreAnswerCount,
+    dl.DuplicateLinksCount,
+    ts.Tag as TopTag,
+    ts.QuestionCount as TagQuestionCount,
+    ts.AvgScore as TagAvgScore,
+    ts.MaxScore as TagMaxScore,
+    ts.TotalViews as TagTotalViews,
+    lu.DisplayName as LastEditor,
+    lu.EditTypeName as LastEditType,
+    cus.DisplayName as TopUser,
+    cus.Reputation as UserReputation,
+    cus.WeightedUserScore
+from TopQuestions cq
+left join AnswerStats asv on cq.Id = asv.QuestionId
+left join DuplicateLinkCounts dl on cq.Id = dl.PostId
+left join (
+    select Tag, QuestionCount, AvgScore, MaxScore, TotalViews,
+        row_number() over(order by QuestionCount desc) as rn
+    from TagStats
+) ts on ts.rn = 1
+left join LatestEdits lu on lu.PostId = cq.Id
+left join ComplexUserScores cus on cus.UserId = cq.OwnerUserId
+where cq.RankScoreView <= 50
+order by cq.RankScoreView;

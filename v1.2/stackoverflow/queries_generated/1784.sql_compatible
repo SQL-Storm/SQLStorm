@@ -1,0 +1,81 @@
+WITH UserBadgeStats AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        b.Name AS BadgeName,
+        b.Class AS BadgeClass,
+        ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY b.Date DESC, b.Class ASC) AS RecentBadgeRank,
+        COUNT(b.Id) OVER (PARTITION BY u.Id) AS TotalBadges,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) OVER (PARTITION BY u.Id) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) OVER (PARTITION BY u.Id) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) OVER (PARTITION BY u.Id) AS BronzeBadges
+    FROM
+        Users u
+        INNER JOIN Badges b ON u.Id = b.UserId
+    WHERE
+        u.Reputation >= 1000
+),
+QuestionStats AS (
+    SELECT
+        p.Id,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.Tags,
+        CASE WHEN p.ClosedDate IS NOT NULL THEN 1 ELSE 0 END AS IsClosed,
+        oh.UserResponselessCounts,
+        REGEXP_MATCHES(p.Tags || ',', '(?i)([^><]+)') AS TagMatches
+    FROM
+        Posts p
+        LEFT JOIN (SELECT PostId, COUNT(*) AS UserResponselessCounts FROM OtherHistory GROUP BY PostId) oh ON p.Id = oh.PostId
+    WHERE
+        p.PostTypeId = 1
+)
+SELECT
+    q.Id,
+    q.Title,
+    q.CreationDate,
+    q.Score,
+    q.ViewCount,
+    q.AnswerCount,
+    q.Tags,
+    q.IsClosed,
+    q.UserResponselessCounts,
+    ubs.UserId,
+    ubs.DisplayName,
+    ubs.Reputation,
+    ubs.BadgeName,
+    ubs.BadgeClass,
+    ubs.RecentBadgeRank,
+    ubs.TotalBadges,
+    ubs.GoldBadges,
+    ubs.SilverBadges,
+    ubs.BronzeBadges,
+    q.TagMatches
+FROM
+    QuestionStats q
+    LEFT JOIN UserBadgeStats ubs ON q.Id = ubs.UserId
+GROUP BY
+    q.Id,
+    q.Title,
+    q.CreationDate,
+    q.Score,
+    q.ViewCount,
+    q.AnswerCount,
+    q.Tags,
+    q.IsClosed,
+    q.UserResponselessCounts,
+    q.TagMatches,
+    ubs.UserId,
+    ubs.DisplayName,
+    ubs.Reputation,
+    ubs.BadgeName,
+    ubs.BadgeClass,
+    ubs.RecentBadgeRank,
+    ubs.TotalBadges,
+    ubs.GoldBadges,
+    ubs.SilverBadges,
+    ubs.BronzeBadges;

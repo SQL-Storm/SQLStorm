@@ -1,0 +1,163 @@
+with RecursiveTagCounts as (
+    select
+        t.Id,
+        t.TagName,
+        coalesce(p.AnswerCount, 0) as AnswerCount,
+        coalesce(p.ViewCount, 0) as ViewCount,
+        coalesce(p.Score, 0) as Score,
+        t.Count as TagUseCount,
+        row_number() over (order by t.Count desc, t.TagName) as TagRank
+    from Tags t
+    left join Posts p on p.Id = t.ExcerptPostId and p.PostTypeId = 1
+),
+UserBadgeStats as (
+    select
+        b.UserId,
+        u.DisplayName,
+        count(case when b.Class = 1 then 1 end) as GoldBadges,
+        count(case when b.Class = 2 then 1 end) as SilverBadges,
+        count(case when b.Class = 3 then 1 end) as BronzeBadges,
+        sum(case when b.TagBased = true then 1 else 0 end) as TagBasedBadges,
+        max(b.Date) as LastBadgeDate
+    from Badges b
+    join Users u on u.Id = b.UserId
+    group by b.UserId, u.DisplayName
+),
+PostActivityWindow as (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        count(c.Id) over (partition by p.Id) as CommentCountWindow,
+        row_number() over (partition by p.OwnerUserId order by p.CreationDate desc) as RecentPostNumber,
+        lead(p.Score) over (partition by p.OwnerUserId order by p.CreationDate) as NextPostScore,
+        lag(p.Score) over (partition by p.OwnerUserId order by p.CreationDate) as PreviousPostScore
+    from Posts p
+    left join Comments c on c.PostId = p.Id
+    where p.PostTypeId in (1,2)
+),
+PostLinkSummary as (
+    select
+        pl.PostId,
+        count(distinct case when lt.Name = 'Linked' then pl.RelatedPostId end) as LinkedCount,
+        count(distinct case when lt.Name = 'Duplicate' then pl.RelatedPostId end) as DuplicateCount
+    from PostLinks pl
+    join LinkTypes lt on lt.Id = pl.LinkTypeId
+    group by pl.PostId
+),
+ClosedQuestions as (
+    select
+        ph.PostId,
+        max(case when ph.PostHistoryTypeId = 10 then cast(ph.Comment as integer) else null end) as CloseReasonId,
+        count(case when ph.PostHistoryTypeId = 10 then 1 end) as CloseVotesCount,
+        max(ph.CreationDate) as LastCloseDate
+    from PostHistory ph
+    where ph.PostHistoryTypeId in (10,11)
+    group by ph.PostId
+),
+ComplexUserStats as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        coalesce(ubs.GoldBadges,0) as GoldBadges,
+        coalesce(ubs.SilverBadges,0) as SilverBadges,
+        coalesce(ubs.BronzeBadges,0) as BronzeBadges,
+        coalesce(ubs.TagBasedBadges,0) as TagBasedBadges,
+        coalesce(ubs.LastBadgeDate, timestamp '1970-01-01') as LastBadgeDate,
+        (select count(*) from Posts p where p.OwnerUserId = u.Id and p.PostTypeId = 1 and p.ClosedDate is null) as OpenQuestions,
+        (select count(*) from Posts p where p.OwnerUserId = u.Id and p.PostTypeId = 1 and p.ClosedDate is not null) as ClosedQuestions,
+        (select avg(p.Score) from Posts p where p.OwnerUserId = u.Id and p.PostTypeId = 2) as AvgAnswerScore,
+        (select max(p.ViewCount) from Posts p where p.OwnerUserId = u.Id and p.PostTypeId = 1) as MaxQuestionViews
+    from Users u
+    left join UserBadgeStats ubs on ubs.UserId = u.Id
+    where u.Reputation > 1000
+),
+FinalResult as (
+    select
+        cuss.UserId,
+        cuss.DisplayName,
+        cuss.Reputation,
+        cuss.OpenQuestions,
+        cuss.ClosedQuestions,
+        cuss.AvgAnswerScore,
+        cuss.MaxQuestionViews,
+        cuss.GoldBadges,
+        cuss.SilverBadges,
+        cuss.BronzeBadges,
+        cuss.TagBasedBadges,
+        rt.TagName,
+        rt.AnswerCount,
+        rt.ViewCount,
+        rt.Score,
+        rt.TagUseCount,
+        pl.LinkedCount,
+        pl.DuplicateCount,
+        cq.CloseVotesCount,
+        cq.CloseReasonId,
+        cuss.LastBadgeDate,
+        row_number() over (partition by rt.TagName order by cuss.Reputation desc) as UserRankPerTag,
+        case
+            when cuss.ClosedQuestions > 5 then 'High Closure Rate'
+            when cuss.OpenQuestions > 10 then 'Active Questioner'
+            else 'Normal'
+        end as UserActivityCategory,
+        ('User ' || coalesce(cuss.DisplayName,'[deleted]') ||
+            ' has ' || cast(cuss.GoldBadges as varchar) || ' gold, ' ||
+            cast(cuss.SilverBadges as varchar) || ' silver, and ' ||
+            cast(cuss.BronzeBadges as varchar) || ' bronze badges.') as BadgeSummary,
+        coalesce(
+            (
+                select string_agg(distinct pht.Name, ', ')
+                from PostHistory ph
+                join PostHistoryTypes pht on pht.Id = ph.PostHistoryTypeId
+                where ph.PostId in (
+                    select p2.Id from Posts p2 where p2.OwnerUserId = cuss.UserId limit 5
+                )
+                and ph.UserId = cuss.UserId
+                and ph.CreationDate > (date '2024-10-01' - interval '180' day)
+            ), 'No recent edits'
+        ) as RecentPostHistoryTypes
+    from ComplexUserStats cuss
+    left join Posts p on p.OwnerUserId = cuss.UserId and p.PostTypeId = 1
+    left join RecursiveTagCounts rt on rt.TagName = any(string_to_array(coalesce(p.Tags,''), '><'))
+    left join PostLinkSummary pl on pl.PostId = p.Id
+    left join ClosedQuestions cq on cq.PostId = p.Id
+    where rt.TagRank <= 50
+)
+select
+    UserId,
+    DisplayName,
+    Reputation,
+    OpenQuestions,
+    ClosedQuestions,
+    AvgAnswerScore,
+    MaxQuestionViews,
+    GoldBadges,
+    SilverBadges,
+    BronzeBadges,
+    TagBasedBadges,
+    TagName,
+    AnswerCount,
+    ViewCount,
+    Score,
+    TagUseCount,
+    LinkedCount,
+    DuplicateCount,
+    CloseVotesCount,
+    CloseReasonId,
+    LastBadgeDate,
+    UserRankPerTag,
+    UserActivityCategory,
+    BadgeSummary,
+    RecentPostHistoryTypes
+from FinalResult
+where UserRankPerTag <= 3
+order by TagName, Reputation desc, UserRankPerTag;

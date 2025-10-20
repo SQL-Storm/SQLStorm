@@ -1,0 +1,218 @@
+-- {"query": "45.sql", "dataset": "stackoverflow", "version": "v1.3", "prompt": "p1", "model": "gpt-5-mini", "temperature": 1.0, "max_tokens": 32768, "reasoning": "minimal", "input_tokens": 2026, "output_tokens": 2375} 
+with
+-- recent high-activity questions with tag array and normalized owner info
+RecentQuestions as (
+  select
+    p.Id as QuestionId,
+    p.Title,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    coalesce(u.Id, -1) as OwnerId,
+    coalesce(u.DisplayName, p.OwnerDisplayName, 'unknown') as OwnerName,
+    -- split tags like '<tag1><tag2>' into array (Postgres style). For other engines adjust accordingly.
+    case when p.Tags is null then array[]::varchar[] else string_to_array(substring(p.Tags from 2 for char_length(p.Tags)-2), '><') end as TagsArr,
+    p.AnswerCount,
+    p.FavoriteCount
+  from Posts p
+  left join Users u on u.Id = p.OwnerUserId
+  where p.PostTypeId = 1
+    and p.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '180 days'
+    and (p.Score >= 0 or p.ViewCount > 100)
+),
+-- latest answer per question with helpful aggregates and correlated checks
+LatestAnswerPerQuestion as (
+  select distinct on (a.ParentId)
+    a.ParentId as QuestionId,
+    a.Id as AnswerId,
+    a.CreationDate as AnswerCreation,
+    a.Score as AnswerScore,
+    a.OwnerUserId as AnswerOwnerId,
+    a.Body as AnswerBody,
+    a.CommentCount as AnswerComments,
+    -- measure length and presence of code-like snippets
+    length(a.Body) as BodyLen,
+    (a.Body ~ '<code>|`')::int as HasCode,
+    row_number() over (partition by a.ParentId order by a.CreationDate desc, a.Score desc, a.Id desc) as rn
+  from Posts a
+  where a.PostTypeId = 2
+    and a.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '365 days'
+  order by a.ParentId, a.CreationDate desc, a.Score desc, a.Id desc
+),
+-- tag popularity snapshot
+TagSnapshot as (
+  select
+    t.TagName,
+    t.Id as TagId,
+    t.Count as TagCount,
+    t.ExcerptPostId,
+    t.WikiPostId,
+    -- avg score of recent questions having this tag (using lateral explode)
+    (select avg(rq.Score) from RecentQuestions rq where rq.TagsArr @> array[t.TagName]) as AvgRecentQScore,
+    -- distinct askers for this tag in recent window
+    (select count(distinct rq.OwnerId) from RecentQuestions rq where rq.TagsArr @> array[t.TagName]) as RecentAskers
+  from Tags t
+  where t.Count > 0
+),
+-- compute per-question voting flavor and vote composition using windowed aggregates and pivots
+QuestionVoteStats as (
+  select
+    q.QuestionId,
+    q.Title,
+    q.CreationDate,
+    q.Score as QuestionScore,
+    q.ViewCount,
+    q.OwnerId,
+    q.OwnerName,
+    q.TagsArr,
+    q.AnswerCount,
+    q.FavoriteCount,
+    coalesce(v.UpVotes,0) as UpVotes,
+    coalesce(v.DownVotes,0) as DownVotes,
+    coalesce(v.Favorites,0) as Favorites,
+    coalesce(v.Accepts,0) as Accepts,
+    coalesce(v.Bounties,0) as Bounties,
+    -- composite popularity metric (weighted)
+    (coalesce(v.UpVotes,0) * 1.0 + coalesce(v.Accepts,0) * 5 + coalesce(v.Favorites,0) * 2 + log(1 + q.ViewCount)::numeric) as PopularityScore
+  from RecentQuestions q
+  left join (
+    select
+      p.Id as PostId,
+      sum(case when vt.Id = 2 then 1 else 0 end) as UpVotes,
+      sum(case when vt.Id = 3 then 1 else 0 end) as DownVotes,
+      sum(case when vt.Id = 5 then 1 else 0 end) as Favorites,
+      sum(case when vt.Id = 1 then 1 else 0 end) as Accepts,
+      sum(case when vt.Id in (8,9) then coalesce(v.BountyAmount,0) else 0 end) as Bounties
+    from Posts p
+    left join Votes v on v.PostId = p.Id
+    left join VoteTypes vt on vt.Id = v.VoteTypeId
+    where p.PostTypeId = 1
+    group by p.Id
+  ) v on v.PostId = q.QuestionId
+),
+-- heavy analytical join: enrich with latest answer and tag snapshot metrics, including correlated subqueries
+EnrichedQuestions as (
+  select
+    q.*,
+    la.AnswerId,
+    la.AnswerCreation,
+    la.AnswerScore,
+    la.HasCode,
+    la.BodyLen,
+    -- top tag by TagCount among question's tags (correlated, may be expensive)
+    (
+      select t.TagName
+      from TagSnapshot t
+      where t.TagName = any(q.TagsArr)
+      order by t.TagCount desc nulls last, t.RecentAskers desc nulls last
+      limit 1
+    ) as TopTag,
+    -- aggregate stats across tags
+    (
+      select json_agg(json_build_object('tag', t.TagName, 'count', t.TagCount, 'avg_recent_q_score', t.AvgRecentQScore))
+      from TagSnapshot t
+      where t.TagName = any(q.TagsArr)
+      order by t.TagCount desc nulls last
+    ) as TagDetails
+  from QuestionVoteStats q
+  left join LatestAnswerPerQuestion la on la.QuestionId = q.QuestionId and la.rn = 1
+),
+-- detect suspicious users (low reputation but high activity or many accepted answers)
+SuspiciousUsers as (
+  select
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    -- recent answers count and accept ratio (correlated)
+    (select count(*) from Posts p where p.OwnerUserId = u.Id and p.PostTypeId = 2 and p.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '365 days') as RecentAnswers,
+    (select sum(case when p.Id = a.PostId and p.AcceptedAnswerId = a.Id then 1 else 0 end)::int
+       from Posts p
+       join Posts a on a.ParentId = p.Id and a.OwnerUserId = u.Id
+       where a.PostTypeId = 2 and a.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '365 days') as RecentAccepts,
+    -- ratio with protection against division by zero
+    case
+      when (select count(*) from Posts p where p.OwnerUserId = u.Id and p.PostTypeId = 2 and p.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '365 days') = 0 then 0
+      else (select sum(case when p.Id = a.PostId and p.AcceptedAnswerId = a.Id then 1 else 0 end)
+              from Posts p
+              join Posts a on a.ParentId = p.Id and a.OwnerUserId = u.Id
+              where a.PostTypeId = 2 and a.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '365 days')::numeric
+           /
+           (select count(*) from Posts p where p.OwnerUserId = u.Id and p.PostTypeId = 2 and p.CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '365 days')
+    end as AcceptRate
+  from Users u
+  where u.Reputation < 1000
+    and u.CreationDate <= cast('2024-10-01 12:34:56' as timestamp) - interval '30 days'
+),
+-- final selection: union of multiple analytical slices using set operators, with ordering and window functions
+FinalResults as (
+  -- top popular recent questions (by composite PopularityScore), include enriched fields
+  select
+    'popular_question' as ItemType,
+    eq.QuestionId as ItemId,
+    eq.Title as ItemTitle,
+    eq.OwnerName,
+    eq.PopularityScore,
+    eq.AnswerId,
+    eq.AnswerScore,
+    eq.TopTag,
+    eq.TagDetails::text as MetaInfo,
+    row_number() over (order by eq.PopularityScore desc nulls last, eq.QuestionScore desc nulls last) as RankInSlice
+  from EnrichedQuestions eq
+  where eq.PopularityScore is not null
+  order by eq.PopularityScore desc
+  limit 100
+
+  union all
+
+  -- recently active answers with code and long bodies (stress string handling)
+  select
+    'long_answer' as ItemType,
+    a.AnswerId as ItemId,
+    substring(a.AnswerBody from 1 for 120) || case when length(a.AnswerBody) > 120 then '...' else '' end as ItemTitle,
+    coalesce(u.DisplayName, 'unknown') as OwnerName,
+    a.BodyLen::numeric as PopularityScore,
+    null::int as AnswerId,
+    a.AnswerScore,
+    null::varchar as TopTag,
+    json_build_object('HasCode', a.HasCode, 'BodyLen', a.BodyLen)::text as MetaInfo,
+    row_number() over (order by a.BodyLen desc, a.AnswerScore desc) as RankInSlice
+  from LatestAnswerPerQuestion a
+  left join Users u on u.Id = a.AnswerOwnerId
+  where a.BodyLen > 2000 or a.HasCode = 1
+  limit 100
+
+  union all
+
+  -- suspicious users slice
+  select
+    'suspicious_user' as ItemType,
+    su.Id as ItemId,
+    su.DisplayName as ItemTitle,
+    su.Reputation::numeric as OwnerName,
+    coalesce(su.RecentAnswers,0) * 1.0 + coalesce(su.RecentAccepts,0) * 10 as PopularityScore,
+    null::int as AnswerId,
+    null::int as AnswerScore,
+    null::varchar as TopTag,
+    json_build_object('RecentAnswers', su.RecentAnswers, 'RecentAccepts', su.RecentAccepts, 'AcceptRate', round(coalesce(su.AcceptRate,0)::numeric,3))::text as MetaInfo,
+    row_number() over (order by (coalesce(su.RecentAccepts,0) * 10 + coalesce(su.RecentAnswers,0)) desc) as RankInSlice
+  from SuspiciousUsers su
+  where coalesce(su.RecentAnswers,0) > 3 or coalesce(su.RecentAccepts,0) > 0
+)
+select
+  ItemType,
+  ItemId,
+  ItemTitle,
+  OwnerName,
+  round(PopularityScore::numeric,3) as PopularityScore,
+  AnswerId,
+  AnswerScore,
+  TopTag,
+  MetaInfo,
+  RankInSlice
+from FinalResults
+order by
+  -- prioritize suspicious users, then popular questions, then long answers; stable ordering within slices
+  case ItemType when 'suspicious_user' then 1 when 'popular_question' then 2 when 'long_answer' then 3 else 4 end,
+  RankInSlice
+;

@@ -1,0 +1,30 @@
+WITH UserScores AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COALESCE(SUM(CASE WHEN p.OwnerUserId = u.Id THEN p.Score ELSE 0 END), 0) AS TotalPostScore,
+        COALESCE(COUNT(DISTINCT b.Id), 0) AS BadgeCount,
+        AVG(us.ThrowsCapture) AS AvgThrowsCapture
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    LEFT JOIN UserStats us ON us.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName
+)
+SELECT
+    us.UserId,
+    us.DisplayName,
+    us.TotalPostScore,
+    us.BadgeCount,
+    us.AvgThrowsCapture,
+    COALESCE(COUNT(c.Id), 0) AS CommentCount,
+    RANK() OVER (ORDER BY us.TotalPostScore DESC) AS ScoreRank
+FROM UserScores us
+LEFT JOIN Comments c ON c.UserId = us.UserId
+GROUP BY
+    us.UserId,
+    us.DisplayName,
+    us.TotalPostScore,
+    us.BadgeCount,
+    us.AvgThrowsCapture
+ORDER BY us.TotalPostScore DESC;

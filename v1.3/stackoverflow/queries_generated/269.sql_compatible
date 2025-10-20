@@ -1,0 +1,152 @@
+WITH tag_exploded AS (
+  SELECT p.Id AS question_id,
+         p.OwnerUserId,
+         LOWER(t.tag) AS tag
+  FROM Posts p
+  CROSS JOIN LATERAL unnest(
+    string_to_array(
+      substring(p.Tags, 2, length(p.Tags)-2),
+      '><'
+    )
+  ) AS t(tag)
+  WHERE p.PostTypeId = 1 AND p.Tags IS NOT NULL AND length(p.Tags) > 2
+),
+vote_agg AS (
+  SELECT v.PostId,
+    SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 WHEN v.VoteTypeId = 3 THEN -1 ELSE 0 END) AS net_votes,
+    SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS upvotes,
+    SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS downvotes,
+    COUNT(*) FILTER (WHERE v.VoteTypeId IN (8,9) AND v.BountyAmount IS NOT NULL) AS bounties
+  FROM Votes v
+  GROUP BY v.PostId
+),
+answer_best AS (
+  SELECT q.Id AS question_id,
+         (SELECT a.Id FROM Posts a WHERE a.ParentId = q.Id ORDER BY a.Score DESC NULLS LAST, a.CreationDate ASC LIMIT 1) AS top_answer_id,
+         (SELECT a.OwnerUserId FROM Posts a WHERE a.ParentId = q.Id ORDER BY a.Score DESC NULLS LAST, a.CreationDate ASC LIMIT 1) AS top_answer_owner,
+         (SELECT a.Score FROM Posts a WHERE a.ParentId = q.Id ORDER BY a.Score DESC NULLS LAST, a.CreationDate ASC LIMIT 1) AS top_answer_score,
+         q.AcceptedAnswerId,
+         CASE WHEN q.AcceptedAnswerId IS NOT NULL THEN 1 ELSE 0 END AS has_accepted
+  FROM Posts q
+  WHERE q.PostTypeId = 1
+),
+user_aggregate AS (
+  SELECT u.Id AS user_id,
+    u.Reputation,
+    u.DisplayName,
+    COUNT(p.Id) FILTER (WHERE p.PostTypeId = 1) AS questions,
+    COUNT(p.Id) FILTER (WHERE p.PostTypeId = 2) AS answers,
+    COALESCE(SUM(p.Score) FILTER (WHERE p.PostTypeId IN (1,2)),0) AS total_post_score,
+    COUNT(c.Id) AS comments_count,
+    COUNT(v.Id) FILTER (WHERE v.VoteTypeId = 2) AS upvotes_cast,
+    COUNT(b.Id) AS badges_count,
+    MIN(p.CreationDate) AS first_post,
+    MAX(p.LastActivityDate) AS last_activity,
+    CASE WHEN MIN(p.CreationDate) IS NOT NULL THEN EXTRACT(EPOCH FROM (MAX(p.LastActivityDate)-MIN(p.CreationDate)))/86400 ELSE NULL END AS days_active
+  FROM Users u
+  LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+  LEFT JOIN Comments c ON c.UserId = u.Id
+  LEFT JOIN Votes v ON v.UserId = u.Id
+  LEFT JOIN Badges b ON b.UserId = u.Id
+  GROUP BY u.Id, u.Reputation, u.DisplayName
+),
+user_tag_weights AS (
+  SELECT te.OwnerUserId AS user_id, te.tag,
+    SUM(p.Score) * 1.0 AS tag_score,
+    COUNT(*) AS tag_questions
+  FROM tag_exploded te
+  JOIN Posts p ON p.Id = te.question_id
+  GROUP BY te.OwnerUserId, te.tag
+),
+tag_ranked AS (
+  SELECT utw.*,
+    ROW_NUMBER() OVER (PARTITION BY user_id ORDER BY tag_score DESC NULLS LAST, tag_questions DESC) AS tag_rank
+  FROM user_tag_weights utw
+),
+active_or_power_users AS (
+  SELECT user_id FROM user_aggregate WHERE (questions + answers) >= 50 OR Reputation >= 10000
+  UNION
+  SELECT user_id FROM user_aggregate WHERE days_active > 365 AND questions >= 10
+),
+recent_posts AS (
+  SELECT p.Id, p.OwnerUserId, p.PostTypeId, p.Score, p.LastActivityDate, p.CreationDate, p.Title, p.Body,
+    v.net_votes, v.upvotes, v.downvotes,
+    COALESCE(v.net_votes,0) + COALESCE(p.Score,0) AS popularity_index,
+    ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.LastActivityDate DESC) AS rn_per_user
+  FROM Posts p
+  LEFT JOIN vote_agg v ON v.PostId = p.Id
+  WHERE p.LastActivityDate > CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '180 days'
+),
+controversial_questions AS (
+  SELECT p.Id, p.Title, p.Score, v.upvotes, v.downvotes,
+    CASE WHEN (COALESCE(v.upvotes,0) + COALESCE(v.downvotes,0)) = 0 THEN 0
+      ELSE ABS(COALESCE(v.upvotes,0) - COALESCE(v.downvotes,0)) * 1.0 / NULLIF((COALESCE(v.upvotes,0) + COALESCE(v.downvotes,0)),0)
+    END AS polarity,
+    (COALESCE(v.upvotes,0) + COALESCE(v.downvotes,0)) AS total_votes
+  FROM Posts p
+  LEFT JOIN vote_agg v ON v.PostId = p.Id
+  WHERE p.PostTypeId = 1
+),
+user_recent_trend AS (
+  SELECT u.user_id,
+    AVG(u.total_post_score) OVER (ORDER BY u.user_id ROWS BETWEEN 10 PRECEDING AND CURRENT ROW) AS rolling_avg_post_score,
+    RANK() OVER (ORDER BY u.Reputation DESC) AS rep_rank
+  FROM user_aggregate u
+)
+SELECT ua.user_id,
+  ua.Reputation,
+  ua.questions,
+  ua.answers,
+  ua.total_post_score,
+  ua.comments_count,
+  ua.upvotes_cast,
+  ua.badges_count,
+  ua.first_post,
+  ua.last_activity,
+  ua.days_active,
+  COALESCE(tr.tag, 'no_fav') AS top_tag,
+  COALESCE(tr.tag_score,0) AS top_tag_score,
+  COALESCE(tr.tag_questions,0) AS top_tag_questions,
+  nbr.top_answer_id,
+  nbr.top_answer_owner,
+  nbr.top_answer_score,
+  CASE WHEN nbr.has_accepted = 1 THEN 'has_accepted' ELSE 'no_accept' END AS accepted_flag,
+  rp.post_count_recent,
+  rp.max_popularity,
+  cq.top_controversy_title,
+  urt.rolling_avg_post_score,
+  urt.rep_rank,
+  (COALESCE(ua.DisplayName,'<anon>') || '|' || COALESCE((SELECT string_agg(b.Name, '/' ORDER BY b.Date DESC) FROM Badges b WHERE b.UserId = ua.user_id),'[]')) AS user_summary
+FROM user_aggregate ua
+LEFT JOIN LATERAL (
+  SELECT tr.tag, tr.tag_score, tr.tag_questions
+  FROM tag_ranked tr
+  WHERE tr.user_id = ua.user_id AND tr.tag_rank = 1
+  LIMIT 1
+) tr ON true
+LEFT JOIN LATERAL (
+  SELECT COUNT(p.Id) AS post_count_recent, MAX(COALESCE(v.net_votes,0) + COALESCE(p.Score,0)) AS max_popularity
+  FROM Posts p
+  LEFT JOIN vote_agg v ON v.PostId = p.Id
+  WHERE p.OwnerUserId = ua.user_id AND p.LastActivityDate > CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '180 days'
+) rp ON true
+LEFT JOIN LATERAL (
+  SELECT ab.top_answer_id, ab.top_answer_owner, ab.top_answer_score, ab.has_accepted
+  FROM answer_best ab
+  WHERE ab.question_id = (
+    SELECT p.Id FROM Posts p WHERE p.OwnerUserId = ua.user_id AND p.PostTypeId = 1 ORDER BY p.CreationDate DESC LIMIT 1
+  )
+  LIMIT 1
+) nbr ON true
+LEFT JOIN LATERAL (
+  SELECT cq.Id AS qid, cq.Title AS top_controversy_title
+  FROM controversial_questions cq
+  WHERE cq.total_votes = (
+    SELECT MAX(total_votes) FROM controversial_questions WHERE Id IN (SELECT Id FROM Posts WHERE OwnerUserId = ua.user_id)
+  )
+  LIMIT 1
+) cq ON true
+LEFT JOIN user_recent_trend urt ON urt.user_id = ua.user_id
+WHERE ua.user_id IN (SELECT user_id FROM active_or_power_users)
+ORDER BY urt.rep_rank NULLS LAST, ua.total_post_score DESC
+LIMIT 200;

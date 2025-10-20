@@ -1,0 +1,234 @@
+with RecursiveTagCounts as (
+    select 
+        t.Id,
+        t.TagName,
+        t.Count,
+        coalesce(p.AnswerCount, 0) as AnswerCount,
+        coalesce(p.ViewCount, 0) as ViewCount,
+        coalesce(p.Score, 0) as Score,
+        row_number() over (order by t.Count desc, t.TagName) as TagRank
+    from Tags t
+    left join Posts p on p.Id = t.ExcerptPostId and p.PostTypeId = 1
+    where t.IsModeratorOnly = false and t.IsRequired = false
+),
+UserBadgeAgg as (
+    select 
+        b.UserId,
+        count(*) filter (where b.Class = 1) as GoldBadges,
+        count(*) filter (where b.Class = 2) as SilverBadges,
+        count(*) filter (where b.Class = 3) as BronzeBadges,
+        count(distinct b.Name) as DistinctBadges,
+        max(b.Date) as LastBadgeDate
+    from Badges b
+    group by b.UserId
+),
+PostVoteStats as (
+    select 
+        p.Id as PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        count(v.Id) filter (where v.VoteTypeId = 2) as UpVotes,
+        count(v.Id) filter (where v.VoteTypeId = 3) as DownVotes,
+        count(v.Id) filter (where v.VoteTypeId = 5) as Favorites,
+        sum(case when v.VoteTypeId = 8 then v.BountyAmount else 0 end) as TotalBounty
+    from Posts p
+    left join Votes v on v.PostId = p.Id
+    group by p.Id, p.PostTypeId, p.OwnerUserId
+),
+UserPostActivity as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        count(p.Id) filter (where p.PostTypeId = 1) as Questions,
+        count(p.Id) filter (where p.PostTypeId = 2) as Answers,
+        count(c.Id) as CommentsMade,
+        sum(pvs.UpVotes) as TotalUpVotesReceived,
+        sum(pvs.DownVotes) as TotalDownVotesReceived,
+        sum(pvs.Favorites) as TotalFavoritesReceived,
+        max(p.CreationDate) as LastPostDate
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join PostVoteStats pvs on pvs.PostId = p.Id
+    left join Comments c on c.UserId = u.Id
+    group by u.Id, u.DisplayName
+),
+RankedPosts as (
+    select 
+        p.Id,
+        p.Title,
+        p.Tags,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.OwnerUserId,
+        row_number() over (partition by p.OwnerUserId order by p.Score desc, p.ViewCount desc) as UserTopPostRank
+    from Posts p
+    where p.PostTypeId = 1 and p.Score > 0
+),
+ClosedPostsWithReason as (
+    select 
+        ph.PostId,
+        crt.Name as CloseReason,
+        ph.CreationDate as CloseDate
+    from PostHistory ph
+    join CloseReasonTypes crt on crt.Id = cast(ph.Comment as smallint)
+    where ph.PostHistoryTypeId = 10 and ph.Comment ~ '^\d+$'
+),
+DuplicateLinks as (
+    select 
+        pl.PostId,
+        pl.RelatedPostId,
+        p1.Title as OriginalTitle,
+        p2.Title as DuplicateOfTitle
+    from PostLinks pl
+    join Posts p1 on p1.Id = pl.PostId
+    join Posts p2 on p2.Id = pl.RelatedPostId
+    where pl.LinkTypeId = 3
+),
+UserActivitySummary as (
+    select 
+        u.Id,
+        u.DisplayName,
+        coalesce(uba.GoldBadges, 0) as GoldBadges,
+        coalesce(uba.SilverBadges, 0) as SilverBadges,
+        coalesce(uba.BronzeBadges, 0) as BronzeBadges,
+        ua.Questions,
+        ua.Answers,
+        ua.CommentsMade,
+        ua.TotalUpVotesReceived,
+        ua.TotalDownVotesReceived,
+        ua.TotalFavoritesReceived,
+        ua.LastPostDate,
+        case 
+            when ua.Answers > 0 then round(1.0 * ua.TotalUpVotesReceived / ua.Answers, 2)
+            else null
+        end as AvgUpVotesPerAnswer,
+        case 
+            when ua.Questions > 0 then round(1.0 * ua.TotalFavoritesReceived / ua.Questions, 2)
+            else null
+        end as AvgFavoritesPerQuestion
+    from Users u
+    left join UserBadgeAgg uba on uba.UserId = u.Id
+    left join UserPostActivity ua on ua.UserId = u.Id
+),
+HighImpactQuestions as (
+    select 
+        p.Id,
+        p.Title,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.FavoriteCount,
+        p.CreationDate,
+        count(distinct c.Id) as CommentCount,
+        sum(case when v.VoteTypeId = 2 then 1 else 0 end) as UpVotes,
+        sum(case when v.VoteTypeId = 3 then 1 else 0 end) as DownVotes,
+        row_number() over (order by p.Score desc, p.ViewCount desc, p.FavoriteCount desc) as GlobalRank
+    from Posts p
+    left join Comments c on c.PostId = p.Id
+    left join Votes v on v.PostId = p.Id
+    where p.PostTypeId = 1 and p.Score > 10 and p.ViewCount > 1000
+    group by p.Id, p.Title, p.OwnerUserId, p.Score, p.ViewCount, p.AnswerCount, p.FavoriteCount, p.CreationDate
+),
+TopAnswerersForTag as (
+    select 
+        a.OwnerUserId,
+        t.TagName,
+        count(a.Id) as AnswerCount,
+        sum(a.Score) as TotalScore,
+        rank() over (partition by t.TagName order by sum(a.Score) desc) as ScoreRank
+    from Posts a
+    join Posts q on q.Id = a.ParentId and q.PostTypeId = 1
+    join lateral (
+        select unnest(string_to_array(substring(q.Tags from 2 for length(q.Tags) - 2), '><')) as TagName
+    ) t on true
+    where a.PostTypeId = 2 and a.OwnerUserId is not null
+    group by a.OwnerUserId, t.TagName
+),
+TopTagAnswerersFiltered as (
+    select * from TopAnswerersForTag where ScoreRank <= 3
+),
+AnswerersWithBadgeInfo as (
+    select 
+        ta.OwnerUserId,
+        ta.TagName,
+        ta.AnswerCount,
+        ta.TotalScore,
+        u.DisplayName,
+        coalesce(uba.GoldBadges, 0) as GoldBadges,
+        coalesce(uba.SilverBadges, 0) as SilverBadges,
+        coalesce(uba.BronzeBadges, 0) as BronzeBadges
+    from TopTagAnswerersFiltered ta
+    left join Users u on u.Id = ta.OwnerUserId
+    left join UserBadgeAgg uba on uba.UserId = ta.OwnerUserId
+),
+FinalOutput as (
+    select 
+        hq.Id as QuestionId,
+        hq.Title,
+        hq.Score,
+        hq.ViewCount,
+        hq.AnswerCount,
+        hq.FavoriteCount,
+        hq.CommentCount,
+        hq.UpVotes,
+        hq.DownVotes,
+        u.DisplayName as OwnerName,
+        coalesce(uba.GoldBadges, 0) as GoldBadges,
+        coalesce(uba.SilverBadges, 0) as SilverBadges,
+        coalesce(uba.BronzeBadges, 0) as BronzeBadges,
+        uas.Questions,
+        uas.Answers,
+        uas.CommentsMade,
+        uas.AvgUpVotesPerAnswer,
+        uas.AvgFavoritesPerQuestion,
+        array_agg(distinct d.DuplicateOfTitle) filter (where d.DuplicateOfTitle is not null) as DuplicateTitles,
+        array_agg(distinct ct.CloseReason) filter (where ct.CloseReason is not null) as CloseReasons,
+        (select count(*) from PostHistory ph where ph.PostId = hq.Id and ph.PostHistoryTypeId in (4,5,6)) as EditCount,
+        (select count(*) from Votes v where v.PostId = hq.Id and v.VoteTypeId = 8) as BountyCount
+    from HighImpactQuestions hq
+    left join Users u on u.Id = hq.OwnerUserId
+    left join UserBadgeAgg uba on uba.UserId = u.Id
+    left join UserActivitySummary uas on uas.Id = u.Id
+    left join DuplicateLinks d on d.PostId = hq.Id
+    left join ClosedPostsWithReason ct on ct.PostId = hq.Id
+    group by hq.Id, hq.Title, hq.Score, hq.ViewCount, hq.AnswerCount, hq.FavoriteCount, hq.CommentCount, hq.UpVotes, hq.DownVotes, u.DisplayName, uba.GoldBadges, uba.SilverBadges, uba.BronzeBadges, uas.Questions, uas.Answers, uas.CommentsMade, uas.AvgUpVotesPerAnswer, uas.AvgFavoritesPerQuestion
+)
+select 
+    f.QuestionId,
+    f.Title,
+    f.Score,
+    f.ViewCount,
+    f.AnswerCount,
+    f.FavoriteCount,
+    f.CommentCount,
+    f.UpVotes,
+    f.DownVotes,
+    f.OwnerName,
+    f.GoldBadges,
+    f.SilverBadges,
+    f.BronzeBadges,
+    f.Questions,
+    f.Answers,
+    f.CommentsMade,
+    f.AvgUpVotesPerAnswer,
+    f.AvgFavoritesPerQuestion,
+    f.DuplicateTitles,
+    f.CloseReasons,
+    f.EditCount,
+    f.BountyCount,
+    array_agg(json_build_object(
+        'TagName', a.TagName,
+        'AnswerCount', a.AnswerCount,
+        'TotalScore', a.TotalScore,
+        'AnswererName', a.DisplayName,
+        'GoldBadges', a.GoldBadges,
+        'SilverBadges', a.SilverBadges,
+        'BronzeBadges', a.BronzeBadges
+    )) as TopAnswerersByTag
+from FinalOutput f
+left join AnswerersWithBadgeInfo a on a.TagName = any(string_to_array(substring(f.Title from '\<.*?\>'), '><'))
+group by f.QuestionId, f.Title, f.Score, f.ViewCount, f.AnswerCount, f.FavoriteCount, f.CommentCount, f.UpVotes, f.DownVotes, f.OwnerName, f.GoldBadges, f.SilverBadges, f.BronzeBadges, f.Questions, f.Answers, f.CommentsMade, f.AvgUpVotesPerAnswer, f.AvgFavoritesPerQuestion, f.DuplicateTitles, f.CloseReasons, f.EditCount, f.BountyCount
+order by f.Score desc, f.ViewCount desc
+limit 50;

@@ -1,0 +1,371 @@
+WITH
+recent_questions AS (
+  SELECT p.Id AS qid,
+         p.Title,
+         p.Body,
+         p.Tags,
+         p.AcceptedAnswerId,
+         p.CreationDate AS q_created,
+         p.Score AS q_score,
+         COALESCE(p.ViewCount,0) AS q_views,
+         COALESCE(p.AnswerCount,0) AS q_answercount,
+         p.OwnerUserId AS q_owner,
+         u.Reputation AS owner_rep,
+         COALESCE(p.OwnerDisplayName, u.DisplayName) AS owner_name,
+         CASE WHEN p.Tags IS NULL OR p.Tags = '' THEN ARRAY[]::varchar[] -- replaced below in a dialect-neutral way
+         END AS tag_array
+  FROM Posts p
+  LEFT JOIN Users u ON p.OwnerUserId = u.Id
+  WHERE p.PostTypeId = 1
+    AND p.CreationDate >= (CAST('2024-10-01' AS date) - INTERVAL '3 years')
+),
+-- replace the tag_array construction in a standard way using regexp and string_to_array where available.
+recent_questions_fixed AS (
+  SELECT rq.qid,
+         rq.Title,
+         rq.Body,
+         rq.Tags,
+         rq.AcceptedAnswerId,
+         rq.q_created,
+         rq.q_score,
+         rq.q_views,
+         rq.q_answercount,
+         rq.q_owner,
+         rq.owner_rep,
+         rq.owner_name,
+         CASE
+           WHEN rq.Tags IS NULL OR rq.Tags = '' THEN CAST(ARRAY[] AS varchar[])
+           ELSE string_to_array(substring(rq.Tags,2,length(rq.Tags)-2), '><')
+         END AS tag_array
+  FROM recent_questions rq
+),
+question_tags AS (
+  SELECT q.qid, unnest(q.tag_array) AS tag
+  FROM recent_questions_fixed q
+),
+tag_metrics AS (
+  SELECT qt.tag,
+         count(*) AS questions_with_tag,
+         avg(r.q_answercount) AS avg_answers,
+         max(r.q_views) AS max_views,
+         percentile_cont(0.5) WITHIN GROUP (ORDER BY r.q_score) AS median_qscore
+  FROM question_tags qt
+  JOIN recent_questions_fixed r ON r.qid = qt.qid
+  GROUP BY qt.tag
+),
+answers AS (
+  SELECT a.Id AS aid,
+         a.ParentId AS qid,
+         a.CreationDate AS a_created,
+         a.Score AS a_score,
+         a.OwnerUserId AS a_owner,
+         a.Body AS a_body,
+         COALESCE(a.CommentCount,0) AS a_commentcount,
+         (a.CreationDate - q.q_created) AS time_to_answer
+  FROM Posts a
+  JOIN recent_questions_fixed q ON a.ParentId = q.qid
+  WHERE a.PostTypeId = 2
+),
+median_answer_per_question AS (
+  SELECT qid, percentile_cont(0.5) WITHIN GROUP (ORDER BY a_score) AS median_ans_score
+  FROM answers
+  GROUP BY qid
+),
+answer_window AS (
+  SELECT a.*,
+         row_number() OVER (PARTITION BY qid ORDER BY a_score DESC, a_created ASC) AS ans_rank,
+         dense_rank() OVER (PARTITION BY qid ORDER BY a_score DESC) AS ans_dense_rank,
+         rank() OVER (PARTITION BY qid ORDER BY a_score DESC) AS ans_rank_ties,
+         percent_rank() OVER (PARTITION BY qid ORDER BY a_score) AS ans_percent_rank,
+         cume_dist() OVER (PARTITION BY qid ORDER BY a_score) AS ans_cume_dist,
+         avg(a_score) OVER (PARTITION BY qid) AS avg_ans_score,
+         sum(a_score) OVER (PARTITION BY qid) AS sum_ans_score,
+         avg(a_score) OVER (PARTITION BY qid ORDER BY a_created ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) AS moving_avg_3
+  FROM answers a
+),
+top3_answers_agg AS (
+  SELECT qid,
+         array_agg(aid ORDER BY a_score DESC, a_created ASC) FILTER (WHERE ans_rank <= 3) AS top3_answer_ids,
+         sum(a_score) FILTER (WHERE ans_rank <= 3) AS top3_sum_score,
+         avg(a_score) FILTER (WHERE ans_rank <= 3) AS top3_avg_score,
+         count(*) FILTER (WHERE ans_rank <= 3) AS top3_count
+  FROM answer_window
+  GROUP BY qid
+),
+votes_agg AS (
+  SELECT v.PostId,
+         sum(case when v.VoteTypeId = 2 then 1 else 0 end) AS upvotes,
+         sum(case when v.VoteTypeId = 3 then 1 else 0 end) AS downvotes,
+         sum(case when v.VoteTypeId = 5 then 1 else 0 end) AS favorites,
+         sum(case when v.VoteTypeId = 1 then 1 else 0 end) AS accepted_votes,
+         sum(case when v.VoteTypeId IN (8,9) then COALESCE(v.BountyAmount,0) else 0 end) AS bounty_amount_total,
+         count(*) AS total_votes,
+         max(v.CreationDate) AS last_vote_date
+  FROM Votes v
+  GROUP BY v.PostId
+),
+comments_agg AS (
+  SELECT c.PostId,
+         count(*) AS comment_count,
+         max(c.CreationDate) AS last_comment_date,
+         min(c.CreationDate) AS first_comment_date
+  FROM Comments c
+  GROUP BY c.PostId
+),
+top_commenters AS (
+  SELECT c.PostId, c.UserId, count(*) as cnt, min(c.CreationDate) as first_comment
+  FROM Comments c
+  WHERE c.UserId IS NOT NULL
+  GROUP BY c.PostId, c.UserId
+),
+top_commenter_per_post AS (
+  SELECT t.PostId, t.UserId AS top_commenter_userid
+  FROM (
+    SELECT PostId, UserId, cnt, first_comment,
+           row_number() OVER (PARTITION BY PostId ORDER BY cnt DESC, first_comment ASC) rn
+    FROM top_commenters
+  ) t
+  WHERE t.rn = 1
+),
+badges_per_user AS (
+  SELECT b.UserId,
+         count(*) AS badge_count,
+         sum(case when b.Class = 1 then 1 else 0 end) AS gold,
+         sum(case when b.Class = 2 then 1 else 0 end) AS silver,
+         sum(case when b.Class = 3 then 1 else 0 end) AS bronze,
+         count(distinct b.Name) AS distinct_badges
+  FROM Badges b
+  GROUP BY b.UserId
+),
+close_events AS (
+  SELECT ph.PostId, min(ph.CreationDate) AS first_close
+  FROM PostHistory ph
+  WHERE ph.PostHistoryTypeId = 10 OR ph.PostHistoryTypeId IN (35,36)
+  GROUP BY ph.PostId
+),
+duplicate_edges AS (
+  SELECT pl.PostId, pl.RelatedPostId
+  FROM PostLinks pl
+  WHERE pl.LinkTypeId = 3
+  UNION
+  SELECT pl.RelatedPostId AS PostId, pl.PostId AS RelatedPostId
+  FROM PostLinks pl
+  WHERE pl.LinkTypeId = 3
+),
+all_dup_nodes AS (
+  SELECT PostId AS node FROM PostLinks WHERE LinkTypeId = 3
+  UNION
+  SELECT RelatedPostId AS node FROM PostLinks WHERE LinkTypeId = 3
+),
+-- Re-order WITH items so recursive reference works: make clusters recursive
+clusters(seed, node) AS (
+  SELECT node, node FROM all_dup_nodes
+  UNION
+  SELECT c.seed,
+         CASE WHEN de.PostId = c.node THEN de.RelatedPostId ELSE de.PostId END AS node
+  FROM clusters c
+  JOIN duplicate_edges de ON de.PostId = c.node OR de.RelatedPostId = c.node
+),
+clusters_distinct AS (
+  SELECT DISTINCT seed, node FROM clusters
+),
+component_min AS (
+  SELECT seed, min(node) AS component_id
+  FROM clusters_distinct
+  GROUP BY seed
+),
+component_members AS (
+  SELECT DISTINCT cm.component_id, cd.node
+  FROM clusters_distinct cd
+  JOIN component_min cm ON cd.seed = cm.seed
+),
+component_sizes AS (
+  SELECT component_id, count(*) AS size
+  FROM component_members
+  GROUP BY component_id
+),
+post_component AS (
+  SELECT cm.node AS PostId, cm.component_id, cs.size
+  FROM component_members cm
+  JOIN component_sizes cs ON cm.component_id = cs.component_id
+),
+hot_by_views AS (
+  SELECT qid FROM recent_questions_fixed WHERE q_views > 5000
+),
+hot_by_score AS (
+  SELECT qid FROM recent_questions_fixed WHERE q_score > 50
+),
+candidate_questions AS (
+  SELECT s.qid
+  FROM (
+    SELECT qid FROM hot_by_views
+    UNION
+    SELECT qid FROM hot_by_score
+  ) s
+  WHERE s.qid NOT IN (SELECT PostId FROM close_events)
+),
+question_composite AS (
+  SELECT q.qid,
+         coalesce(q.Title,'') AS title,
+         substring(regexp_replace(coalesce(q.Body,''), '\s+', ' ', 'g'), 1, 240) AS body_preview,
+         q.q_created,
+         q.q_score,
+         q.q_views,
+         q.q_answercount,
+         q.owner_name,
+         q.owner_rep,
+         array_to_string(q.tag_array, '|') AS tag_signature,
+         COALESCE(v.upvotes,0) AS upvotes,
+         COALESCE(v.downvotes,0) AS downvotes,
+         COALESCE(c.comment_count,0) AS comment_count,
+         COALESCE(b.badge_count,0) AS owner_badges,
+         COALESCE(tc.top3_sum_score,0) AS top3_answers_total_score,
+         COALESCE(median.median_ans_score,0) AS median_answer_score,
+         COALESCE(pc.size,0) AS duplicate_cluster_size,
+         CASE WHEN q.AcceptedAnswerId IS NOT NULL THEN
+            (SELECT EXTRACT(EPOCH FROM (a.CreationDate - q.q_created)) FROM Posts a WHERE a.Id = q.AcceptedAnswerId LIMIT 1)
+         ELSE NULL END AS accepted_seconds,
+         (SELECT EXTRACT(EPOCH FROM min(a2.a_created - q.q_created)) FROM answers a2 WHERE a2.qid = q.qid) AS seconds_to_first_answer,
+         (SELECT count(distinct a3.a_owner) FROM answers a3 WHERE a3.qid = q.qid) AS distinct_answerers,
+         (
+           (COALESCE(q.q_score,0) * GREATEST(1, LN(GREATEST(q.q_views,1)) + 1))
+           + (COALESCE(v.upvotes,0) * 1.5)
+           - (COALESCE(v.downvotes,0) * 0.75)
+           + (COALESCE(c.comment_count,0) * 0.3)
+           + (COALESCE(tc.top3_sum_score,0) * 0.5)
+           + (COALESCE(b.gold,0) * 10 + COALESCE(b.silver,0) * 3 + COALESCE(b.bronze,0) * 1)
+           + GREATEST(0, 100 - COALESCE(EXTRACT(DAY FROM (CAST('2024-10-01 12:34:56' AS timestamp) - q.q_created)), 0)) * 0.1
+           - COALESCE(pc.size,0) * 5
+           + CASE WHEN COALESCE(median.median_ans_score,0) = 0 THEN -5 ELSE COALESCE(median.median_ans_score,0) END
+         ) AS activity_score,
+         NULLIF(array_to_string(q.tag_array, ','), '') AS raw_tags,
+         tcp.top_commenter_userid AS top_commenter_userid,
+         length(coalesce(q.Title,'')) AS title_len,
+         length(coalesce(q.Body,'')) AS body_len
+  FROM recent_questions_fixed q
+  LEFT JOIN votes_agg v ON v.PostId = q.qid
+  LEFT JOIN comments_agg c ON c.PostId = q.qid
+  LEFT JOIN top_commenter_per_post tcp ON tcp.PostId = q.qid
+  LEFT JOIN badges_per_user b ON b.UserId = q.q_owner
+  LEFT JOIN top3_answers_agg tc ON tc.qid = q.qid
+  LEFT JOIN median_answer_per_question median ON median.qid = q.qid
+  LEFT JOIN post_component pc ON pc.PostId = q.qid
+  WHERE q.qid IN (SELECT qid FROM candidate_questions)
+),
+ranked_questions AS (
+  SELECT qc.qid,
+         qc.title,
+         qc.body_preview,
+         qc.q_created,
+         qc.q_score,
+         qc.q_views,
+         qc.q_answercount,
+         qc.owner_name,
+         qc.owner_rep,
+         qc.tag_signature,
+         qc.upvotes,
+         qc.downvotes,
+         qc.comment_count,
+         qc.owner_badges,
+         qc.top3_answers_total_score,
+         qc.median_answer_score,
+         qc.duplicate_cluster_size,
+         qc.accepted_seconds,
+         qc.seconds_to_first_answer,
+         qc.distinct_answerers,
+         qc.activity_score,
+         qc.raw_tags,
+         qc.top_commenter_userid,
+         qc.title_len,
+         qc.body_len,
+         row_number() OVER (ORDER BY qc.activity_score DESC NULLS LAST, qc.q_views DESC) AS global_rank,
+         dense_rank() OVER (ORDER BY qc.activity_score DESC) AS dense_rank_activity,
+         ntile(10) OVER (ORDER BY qc.activity_score DESC) AS decile,
+         percent_rank() OVER (ORDER BY qc.activity_score DESC) AS pct_rank
+  FROM question_composite qc
+),
+top_answer_details AS (
+  SELECT rq.qid,
+         json_build_object(
+           'top1', (SELECT json_build_object('id', aw1.aid, 'score', aw1.a_score, 'age_s', EXTRACT(EPOCH FROM (aw1.a_created - rq.q_created)), 'owner', (SELECT u.DisplayName FROM Users u WHERE u.Id = aw1.a_owner LIMIT 1)) FROM answer_window aw1 WHERE aw1.qid = rq.qid AND aw1.ans_rank = 1),
+           'top2', (SELECT json_build_object('id', aw2.aid, 'score', aw2.a_score, 'age_s', EXTRACT(EPOCH FROM (aw2.a_created - rq.q_created)), 'owner', (SELECT u.DisplayName FROM Users u WHERE u.Id = aw2.a_owner LIMIT 1)) FROM answer_window aw2 WHERE aw2.qid = rq.qid AND aw2.ans_rank = 2),
+           'top3', (SELECT json_build_object('id', aw3.aid, 'score', aw3.a_score, 'age_s', EXTRACT(EPOCH FROM (aw3.a_created - rq.q_created)), 'owner', (SELECT u.DisplayName FROM Users u WHERE u.Id = aw3.a_owner LIMIT 1)) FROM answer_window aw3 WHERE aw3.qid = rq.qid AND aw3.ans_rank = 3)
+         ) AS top_answers_json
+  FROM ranked_questions rq
+),
+final_selection AS (
+  SELECT rq.qid,
+         rq.title,
+         rq.tag_signature,
+         rq.q_created,
+         rq.q_score,
+         rq.q_views,
+         rq.q_answercount,
+         rq.owner_name,
+         rq.owner_rep,
+         rq.upvotes,
+         rq.downvotes,
+         rq.comment_count,
+         rq.owner_badges,
+         rq.top3_answers_total_score,
+         rq.median_answer_score,
+         rq.duplicate_cluster_size,
+         rq.accepted_seconds,
+         rq.seconds_to_first_answer,
+         rq.distinct_answerers,
+         rq.activity_score,
+         rq.global_rank,
+         rq.dense_rank_activity,
+         rq.decile,
+         rq.pct_rank,
+         tad.top_answers_json,
+         EXISTS (
+           SELECT 1
+           FROM unnest(string_to_array(coalesce(rq.raw_tags,''), ',')) AS unn(tag)
+           JOIN Tags t ON lower(unn.tag) = lower(t.TagName)
+         ) AS has_known_tag,
+         CASE
+           WHEN rq.seconds_to_first_answer IS NULL THEN NULL
+           WHEN rq.seconds_to_first_answer < 3600 THEN 'fast'
+           WHEN rq.seconds_to_first_answer < 86400 THEN 'moderate'
+           ELSE 'slow'
+         END AS answer_speed_category,
+         rq.top_commenter_userid,
+         rq.title_len,
+         rq.body_len,
+         rq.raw_tags
+  FROM ranked_questions rq
+  LEFT JOIN top_answer_details tad ON tad.qid = rq.qid
+)
+SELECT fs.qid,
+       fs.title,
+       fs.tag_signature,
+       fs.q_created,
+       fs.q_score,
+       fs.q_views,
+       fs.q_answercount,
+       fs.owner_name,
+       fs.owner_rep,
+       fs.upvotes,
+       fs.downvotes,
+       fs.comment_count,
+       fs.owner_badges,
+       fs.top3_answers_total_score,
+       fs.median_answer_score,
+       fs.duplicate_cluster_size,
+       fs.accepted_seconds,
+       fs.seconds_to_first_answer,
+       fs.distinct_answerers,
+       fs.activity_score,
+       fs.global_rank,
+       fs.dense_rank_activity,
+       fs.decile,
+       fs.pct_rank,
+       fs.top_answers_json,
+       fs.answer_speed_category,
+       fs.top_commenter_userid,
+       fs.title_len,
+       fs.body_len
+FROM final_selection fs
+ORDER BY fs.activity_score DESC NULLS LAST, fs.q_views DESC
+LIMIT 200;

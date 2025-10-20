@@ -1,0 +1,29 @@
+WITH BadgeCursor AS (
+    SELECT
+        ba.UserId,
+        bau.DisplayName,
+        ba.Name AS BadgeName,
+        RewardSummary.TotalBadgesAwarded,
+        DENSE_RANK() OVER (ORDER BY RewardSummary.TotalBadgesAwarded DESC) AS BadgeRank
+    FROM "BadgeAwards" ba
+    JOIN "BadgeAwardUsers" bau ON ba.UserId = bau.UserId
+    JOIN (
+        SELECT UserId, COUNT(*) AS TotalBadgesAwarded
+        FROM "BadgeAwards"
+        GROUP BY UserId
+    ) AS RewardSummary ON ba.UserId = RewardSummary.UserId
+)
+SELECT
+    UserId,
+    DisplayName,
+    BadgeName,
+    TotalBadgesAwarded,
+    BadgeRank
+FROM BadgeCursor
+GROUP BY
+    UserId,
+    DisplayName,
+    BadgeName,
+    TotalBadgesAwarded,
+    BadgeRank
+ORDER BY BadgeRank, TotalBadgesAwarded DESC;

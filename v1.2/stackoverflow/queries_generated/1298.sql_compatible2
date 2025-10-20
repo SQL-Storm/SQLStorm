@@ -1,0 +1,144 @@
+with UserBadgeStats as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(b.Id) filter (where b.Class = 1) as GoldBadges,
+        count(b.Id) filter (where b.Class = 2) as SilverBadges,
+        count(b.Id) filter (where b.Class = 3) as BronzeBadges,
+        count(distinct p.Id) filter (where p.PostTypeId = 1) as QuestionsAsked,
+        count(distinct p.Id) filter (where p.PostTypeId = 2) as AnswersProvided,
+        coalesce(sum(p.Score), 0) as TotalPostScore,
+        max(u.Reputation) over () as MaxReputation,
+        rank() over (order by u.Reputation desc) as ReputationRank
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    left join Posts p on p.OwnerUserId = u.Id
+    group by u.Id, u.DisplayName
+),
+RecentActivity as (
+    select
+        p.OwnerUserId as UserId,
+        max(p.CreationDate) as LastPostDate,
+        max(coalesce(ph.CreationDate, timestamp '1900-01-01')) as LastHistoryActivity,
+        max(coalesce(v.CreationDate, timestamp '1900-01-01')) as LastVoteDate
+    from Posts p
+    left join PostHistory ph on ph.PostId = p.Id
+    left join Votes v on v.PostId = p.Id
+    group by p.OwnerUserId
+),
+QuestionStats as (
+    select
+        p.Id as QuestionId,
+        p.Title,
+        p.Tags,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.AnswerCount,
+        p.AcceptedAnswerId,
+        row_number() over (partition by p.OwnerUserId order by p.CreationDate desc) as RecentQuestionRank,
+        p.OwnerUserId
+    from Posts p
+    where p.PostTypeId = 1
+),
+AnswerStats as (
+    select
+        a.Id as AnswerId,
+        a.ParentId as QuestionId,
+        a.OwnerUserId as AnswererId,
+        a.Score as AnswerScore,
+        a.CreationDate as AnswerCreationDate,
+        (select count(*) from Comments c where c.PostId = a.Id) as CommentCount,
+        (select max(ph.CreationDate) from PostHistory ph where ph.PostId = a.Id) as LastEditDate
+    from Posts a
+    where a.PostTypeId = 2
+),
+DuplicateQuestionInfo as (
+    select
+        pl.PostId as DuplicatePostId,
+        pl.RelatedPostId as OriginalQuestionId,
+        pl.CreationDate as LinkCreationDate
+    from PostLinks pl
+    join LinkTypes lt on lt.Id = pl.LinkTypeId and lt.Name = 'Duplicate'
+),
+UserActivitySummary as (
+    select
+        u.Id,
+        u.DisplayName,
+        coalesce(ub.QuestionsAsked, 0) as QuestionsAsked,
+        coalesce(ub.AnswersProvided, 0) as AnswersProvided,
+        coalesce(ub.TotalPostScore, 0) as TotalScore,
+        coalesce(ra.LastPostDate, timestamp '1970-01-01') as LastPostDate,
+        coalesce(ra.LastHistoryActivity, timestamp '1970-01-01') as LastRevisionDate,
+        coalesce(ra.LastVoteDate, timestamp '1970-01-01') as LastVoteDate,
+        ub.GoldBadges,
+        ub.SilverBadges,
+        ub.BronzeBadges,
+        ub.ReputationRank,
+        u.Reputation
+    from Users u
+    left join UserBadgeStats ub on ub.UserId = u.Id
+    left join RecentActivity ra on ra.UserId = u.Id
+)
+select
+    uas.DisplayName,
+    uas.ReputationRank,
+    cast(uas.ReputationRank as double precision) / nullif((select count(*) from Users),0) as ReputationPercentile,
+    uas.QuestionsAsked,
+    uas.AnswersProvided,
+    uas.TotalScore,
+    uas.GoldBadges,
+    uas.SilverBadges,
+    uas.BronzeBadges,
+    uas.LastPostDate,
+    to_char(cast(uas.LastPostDate as timestamp), 'YYYY-MM-DD') as LastPostDateFormatted,
+    coalesce(
+        'User ' || uas.DisplayName || ' has asked ' || cast(uas.QuestionsAsked as text) || ' questions, provided ' ||
+        cast(uas.AnswersProvided as text) || ' answers, and earned ' || cast((uas.GoldBadges + uas.SilverBadges + uas.BronzeBadges) as text) ||
+        ' badges (G:' || cast(uas.GoldBadges as text) || ', S:' || cast(uas.SilverBadges as text) || ', B:' || cast(uas.BronzeBadges as text) || ').',
+        'No activity recorded.'
+    ) as UserSummary,
+    rank() over (partition by (case when uas.QuestionsAsked >= 10 then 1 else 0 end) order by uas.TotalScore desc) as ScoreRankPartitioned,
+    q.Title as MostRecentQuestionTitle,
+    q.CreationDate as MostRecentQuestionDate,
+    case
+        when q.AcceptedAnswerId is not null then 'Has accepted answer'
+        else 'No accepted answer'
+    end as AcceptedAnswerStatus,
+    case
+        when uas.LastPostDate >= (cast('2024-10-01' as date) - interval '30 days') and uas.GoldBadges > 0 then 'Active gold badge user'
+        else 'Inactive or no gold badges'
+    end as ActivityBadgeStatus
+from UserActivitySummary uas
+left join QuestionStats q on q.QuestionId = (
+    select qs.QuestionId
+    from QuestionStats qs
+    where qs.RecentQuestionRank = 1 and qs.Title is not null and qs.OwnerUserId = uas.Id
+    order by qs.CreationDate desc
+    limit 1
+)
+where
+    uas.QuestionsAsked > 0
+
+union
+
+select
+    'DeletedUser' as DisplayName,
+    null::integer as ReputationRank,
+    null::double precision as ReputationPercentile,
+    0 as QuestionsAsked,
+    0 as AnswersProvided,
+    0 as TotalScore,
+    0 as GoldBadges,
+    0 as SilverBadges,
+    0 as BronzeBadges,
+    null::timestamp as LastPostDate,
+    null::text as LastPostDateFormatted,
+    'User deleted or unknown' as UserSummary,
+    null::integer as ScoreRankPartitioned,
+    null::text as MostRecentQuestionTitle,
+    null::timestamp as MostRecentQuestionDate,
+    null::text as AcceptedAnswerStatus,
+    null::text as ActivityBadgeStatus
+
+order by ReputationRank nulls last, DisplayName;

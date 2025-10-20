@@ -1,0 +1,203 @@
+WITH
+posts_summary AS (
+  SELECT
+    p.Id,
+    p.PostTypeId,
+    p.ParentId,
+    p.OwnerUserId,
+    p.CreationDate,
+    p.Score,
+    p.Title,
+    p.Tags,
+    p.ViewCount,
+    p.AcceptedAnswerId,
+    COALESCE((SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 2), 0) AS UpVotes,
+    COALESCE((SELECT COUNT(*) FROM Votes v WHERE v.PostId = p.Id AND v.VoteTypeId = 3), 0) AS DownVotes,
+    COALESCE((SELECT COUNT(*) FROM Comments c WHERE c.PostId = p.Id), 0) AS CommentsCount,
+    COALESCE((SELECT COUNT(*) FROM PostHistory ph WHERE ph.PostId = p.Id), 0) AS EditCount,
+    COALESCE((SELECT SUM(CASE WHEN v.VoteTypeId IN (2,1) THEN 1 WHEN v.VoteTypeId = 3 THEN -1 ELSE 0 END) FROM Votes v WHERE v.PostId = p.Id), 0) AS VoteScore
+  FROM Posts p
+),
+tag_map AS (
+  SELECT
+    ps.Id AS PostId,
+    lower(trim(t.tag)) AS Tag
+  FROM posts_summary ps
+  CROSS JOIN LATERAL regexp_split_to_table(COALESCE(substring(ps.Tags, 2, length(ps.Tags)-2), ''), '><') AS t(tag)
+  WHERE ps.PostTypeId = 1 AND ps.Tags IS NOT NULL AND ps.Tags <> ''
+),
+user_agg AS (
+  SELECT
+    u.Id AS UserId,
+    COALESCE(u.DisplayName, '<anon>') AS DisplayName,
+    u.Reputation,
+    u.CreationDate,
+    COUNT(ps.Id) FILTER (WHERE ps.PostTypeId IN (1,2)) AS TotalPosts,
+    COUNT(ps.Id) FILTER (WHERE ps.PostTypeId = 1) AS QCount,
+    COUNT(ps.Id) FILTER (WHERE ps.PostTypeId = 2) AS ACount,
+    COALESCE(SUM(ps.UpVotes), 0) AS UpVotesReceived,
+    COALESCE(SUM(ps.DownVotes), 0) AS DownVotesReceived,
+    COALESCE(SUM(ps.CommentsCount), 0) AS CommentsReceived,
+    AVG(ps.Score) FILTER (WHERE ps.Score IS NOT NULL) AS AvgPostScore,
+    percentile_cont(0.5) WITHIN GROUP (ORDER BY ps.Score) AS MedianPostScore,
+    COALESCE(SUM(ps.EditCount), 0) AS TotalEdits,
+    COALESCE(SUM(CASE WHEN ps.PostTypeId = 2 AND EXISTS (SELECT 1 FROM posts_summary q WHERE q.Id = ps.ParentId AND q.AcceptedAnswerId = ps.Id) THEN 1 ELSE 0 END), 0) AS AcceptedAnswersCount
+  FROM Users u
+  LEFT JOIN posts_summary ps ON ps.OwnerUserId = u.Id
+  GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+),
+badge_agg AS (
+  SELECT
+    b.UserId,
+    SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS Gold,
+    SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS Silver,
+    SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS Bronze,
+    COUNT(*) AS TotalBadges,
+    COUNT(DISTINCT CASE WHEN b.TagBased = 1 THEN b.Name ELSE NULL END) AS TagBadges
+  FROM Badges b
+  GROUP BY b.UserId
+),
+postlink_agg AS (
+  SELECT
+    COALESCE(ps.OwnerUserId, -1) AS UserId,
+    SUM(CASE WHEN pl.LinkTypeId = 3 THEN 1 ELSE 0 END) AS DuplicateLinkCount,
+    SUM(CASE WHEN pl.LinkTypeId = 1 THEN 1 ELSE 0 END) AS OutboundLinkCount,
+    COUNT(pl.Id) AS TotalLinks
+  FROM posts_summary ps
+  LEFT JOIN PostLinks pl ON pl.PostId = ps.Id
+  GROUP BY COALESCE(ps.OwnerUserId, -1)
+),
+controversy AS (
+  SELECT
+    COALESCE(ps.OwnerUserId, -1) AS UserId,
+    SUM(ABS(ps.UpVotes - ps.DownVotes)) AS SumAbsDiff,
+    SUM(ps.UpVotes + ps.DownVotes) AS SumVotes,
+    CASE WHEN SUM(ps.UpVotes + ps.DownVotes) = 0 THEN 0
+         ELSE SUM(ABS(ps.UpVotes - ps.DownVotes))::float / SUM(ps.UpVotes + ps.DownVotes) END AS ControversyRatio
+  FROM posts_summary ps
+  GROUP BY COALESCE(ps.OwnerUserId, -1)
+),
+avg_time_to_first_answer AS (
+  SELECT
+    q.OwnerUserId AS UserId,
+    AVG(EXTRACT(epoch FROM ((SELECT MIN(a.CreationDate) FROM posts_summary a WHERE a.ParentId = q.Id) - q.CreationDate)) / 3600) AS AvgHoursToFirstAnswer,
+    COUNT(*) FILTER (WHERE (SELECT MIN(a.CreationDate) FROM posts_summary a WHERE a.ParentId = q.Id) IS NOT NULL) AS QuestionsWithAnswers
+  FROM posts_summary q
+  WHERE q.PostTypeId = 1
+  GROUP BY q.OwnerUserId
+),
+recent_activity AS (
+  SELECT
+    ps.OwnerUserId AS UserId,
+    SUM((ps.Score + 1) * EXP(-GREATEST(EXTRACT(epoch FROM (CAST('2024-10-01 12:34:56' AS timestamp) - ps.CreationDate))/86400,0) / 30)) AS RecentWeightedScore
+  FROM posts_summary ps
+  WHERE ps.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '365 days'
+  GROUP BY ps.OwnerUserId
+),
+user_tag_counts AS (
+  SELECT
+    tm.Tag,
+    ps.OwnerUserId AS UserId,
+    COUNT(*) AS cnt,
+    ROW_NUMBER() OVER (PARTITION BY ps.OwnerUserId ORDER BY COUNT(*) DESC) AS tag_rank
+  FROM tag_map tm
+  JOIN posts_summary ps ON ps.Id = tm.PostId
+  GROUP BY ps.OwnerUserId, tm.Tag
+),
+top_tags AS (
+  SELECT
+    utc.UserId,
+    string_agg(utc.Tag || ' (' || utc.cnt || ')', ', ' ORDER BY utc.cnt DESC) AS TopTags
+  FROM user_tag_counts utc
+  WHERE utc.tag_rank <= 3
+  GROUP BY utc.UserId
+),
+candidate_by_composite AS (
+  SELECT
+    ua.UserId,
+    ua.DisplayName,
+    COALESCE(bd.Gold,0) AS Gold,
+    COALESCE(bd.Silver,0) AS Silver,
+    COALESCE(bd.Bronze,0) AS Bronze,
+    COALESCE(ra.RecentWeightedScore,0) AS RecentWeightedScore,
+    COALESCE(pl.DuplicateLinkCount,0) AS DuplicateLinkCount,
+    COALESCE(cv.ControversyRatio,0) AS ControversyRatio,
+    COALESCE(atfa.AvgHoursToFirstAnswer, NULL) AS AvgH2First,
+    COALESCE(tt.TopTags, '') AS TopTags,
+    (COALESCE(ua.UpVotesReceived,0) * 2
+     + COALESCE(ua.AcceptedAnswersCount,0) * 50
+     + COALESCE(bd.Gold,0) * 150
+     + COALESCE(ra.RecentWeightedScore,0) * 10
+     - COALESCE(cv.ControversyRatio,0) * 100) AS CompositeScore
+  FROM user_agg ua
+  LEFT JOIN badge_agg bd ON bd.UserId = ua.UserId
+  LEFT JOIN recent_activity ra ON ra.UserId = ua.UserId
+  LEFT JOIN postlink_agg pl ON pl.UserId = ua.UserId
+  LEFT JOIN controversy cv ON cv.UserId = ua.UserId
+  LEFT JOIN avg_time_to_first_answer atfa ON atfa.UserId = ua.UserId
+  LEFT JOIN top_tags tt ON tt.UserId = ua.UserId
+),
+ranked_composite AS (
+  SELECT c.*,
+         ROW_NUMBER() OVER (ORDER BY c.CompositeScore DESC NULLS LAST) AS rn
+  FROM candidate_by_composite c
+),
+candidate_by_recent AS (
+  SELECT c.*,
+         ROW_NUMBER() OVER (ORDER BY c.RecentWeightedScore DESC NULLS LAST) AS rn_recent
+  FROM candidate_by_composite c
+),
+top_candidates AS (
+  SELECT UserId FROM ranked_composite WHERE rn <= 50
+  UNION
+  SELECT UserId FROM candidate_by_recent WHERE rn_recent <= 50
+),
+final_users AS (
+  SELECT DISTINCT tc.UserId FROM top_candidates tc
+),
+final AS (
+  SELECT
+    ua.UserId,
+    ua.DisplayName,
+    ua.Reputation,
+    ua.TotalPosts,
+    ua.QCount,
+    ua.ACount,
+    ua.UpVotesReceived,
+    ua.DownVotesReceived,
+    ua.AvgPostScore,
+    ua.MedianPostScore,
+    COALESCE(bd.Gold,0) AS Gold,
+    COALESCE(bd.Silver,0) AS Silver,
+    COALESCE(bd.Bronze,0) AS Bronze,
+    COALESCE(bd.TotalBadges,0) AS TotalBadges,
+    COALESCE(pl.DuplicateLinkCount,0) AS DuplicateLinkCount,
+    COALESCE(pl.OutboundLinkCount,0) AS OutboundLinkCount,
+    COALESCE(pl.TotalLinks,0) AS TotalLinks,
+    COALESCE(ra.RecentWeightedScore,0) AS RecentWeightedScore,
+    COALESCE(cv.ControversyRatio,0) AS ControversyRatio,
+    atfa.AvgHoursToFirstAnswer,
+    COALESCE(tt.TopTags,'') AS TopTags,
+    (COALESCE(ua.UpVotesReceived,0) * 2
+     + COALESCE(ua.AcceptedAnswersCount,0) * 50
+     + COALESCE(bd.Gold,0) * 150
+     + COALESCE(ra.RecentWeightedScore,0) * 10
+     - COALESCE(cv.ControversyRatio,0) * 100) AS CompositeScore,
+    ROW_NUMBER() OVER (ORDER BY (COALESCE(ua.UpVotesReceived,0) * 2
+                                + COALESCE(ua.AcceptedAnswersCount,0) * 50
+                                + COALESCE(bd.Gold,0) * 150
+                                + COALESCE(ra.RecentWeightedScore,0) * 10
+                                - COALESCE(cv.ControversyRatio,0) * 100) DESC) AS RankByComposite
+  FROM final_users fu
+  JOIN user_agg ua ON ua.UserId = fu.UserId
+  LEFT JOIN badge_agg bd ON bd.UserId = ua.UserId
+  LEFT JOIN postlink_agg pl ON pl.UserId = ua.UserId
+  LEFT JOIN recent_activity ra ON ra.UserId = ua.UserId
+  LEFT JOIN controversy cv ON cv.UserId = ua.UserId
+  LEFT JOIN avg_time_to_first_answer atfa ON atfa.UserId = ua.UserId
+  LEFT JOIN top_tags tt ON tt.UserId = ua.UserId
+)
+SELECT *
+FROM final
+ORDER BY RankByComposite
+LIMIT 100;

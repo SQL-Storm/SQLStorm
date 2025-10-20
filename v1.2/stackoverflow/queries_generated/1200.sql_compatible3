@@ -1,0 +1,261 @@
+with recursive RecursiveTagHierarchy as (
+    select
+        t1.Id,
+        t1.TagName,
+        array[t1.Id] as Ancestors
+    from Tags t1
+    where t1.IsRequired = true
+    union all
+    select
+        t2.Id,
+        t2.TagName,
+        r.Ancestors || t2.Id
+    from Tags t2
+    join RecursiveTagHierarchy r on not (t2.Id = any(r.Ancestors))
+    and t2.Count > (
+        select count(*) from Posts p where p.Tags like '%' || t2.TagName || '%'
+    )
+),
+UserActivity as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        count(distinct case when p.PostTypeId = 1 then p.Id end) as QuestionsAsked,
+        count(distinct case when p.PostTypeId = 2 then p.Id end) as AnswersGiven,
+        coalesce(sum(vtAgg.Upvotes),0) as TotalUpvotesReceived,
+        coalesce(sum(vtAgg.Downvotes),0) as TotalDownvotesReceived,
+        coalesce(sum(bdgs.GoldBadges), 0) as GoldBadges,
+        coalesce(sum(bdgs.SilverBadges), 0) as SilverBadges,
+        coalesce(sum(bdgs.BronzeBadges), 0) as BronzeBadges,
+        row_number() over (order by u.Reputation desc) as RepRank
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join (
+        select 
+            v.PostId,
+            sum(case when vt.Name = 'UpMod' then 1 else 0 end) as Upvotes,
+            sum(case when vt.Name = 'DownMod' then 1 else 0 end) as Downvotes
+        from Votes v
+        join VoteTypes vt on vt.Id = v.VoteTypeId
+        group by v.PostId
+    ) vtAgg on vtAgg.PostId = p.Id
+    left join (
+        select
+            UserId,
+            count(case when Class = 1 then 1 end) as GoldBadges,
+            count(case when Class = 2 then 1 end) as SilverBadges,
+            count(case when Class = 3 then 1 end) as BronzeBadges
+        from Badges
+        group by UserId
+    ) bdgs on bdgs.UserId = u.Id
+    group by u.Id, u.DisplayName, u.Reputation
+),
+PostDetails as (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Title,
+        p.Tags,
+        p.AcceptedAnswerId,
+        p.ParentId,
+        ua.DisplayName as OwnerDisplayName,
+        case 
+            when p.PostTypeId = 1 then coalesce(p.AcceptedAnswerId, -1)
+            else -1
+        end as AcceptedAnswerIdSafe
+    from Posts p
+    left join Users ua on ua.Id = p.OwnerUserId
+    where p.CreationDate > timestamp '2018-01-01'
+),
+AcceptedAnswerScores as (
+    select Id, Score from Posts where PostTypeId = 2
+),
+TopUsersWithAcceptedAnswers as (
+    select 
+        ua.UserId,
+        ua.DisplayName,
+        ua.QuestionsAsked,
+        ua.AnswersGiven,
+        ua.TotalUpvotesReceived,
+        ua.TotalDownvotesReceived,
+        ua.GoldBadges,
+        ua.SilverBadges,
+        ua.BronzeBadges,
+        p.Id as QuestionId,
+        p.Title,
+        p.Score as QuestionScore,
+        aa.Score as AcceptedAnswerScore,
+        p.ViewCount,
+        string_agg(distinct pt.Name, ', ') filter (where pt.Name is not null) as PostTypeNames,
+        (case when p.Tags is not null then array_length(string_to_array(regexp_replace(p.Tags, '[<>]', '', 'g'), ' '), 1) else 0 end) as TagCount
+    from UserActivity ua
+    join PostDetails p on p.OwnerUserId = ua.UserId and p.PostTypeId = 1
+    left join AcceptedAnswerScores aa on aa.Id = p.AcceptedAnswerId
+    left join PostTypes pt on pt.Id = p.PostTypeId
+    where ua.Reputation > 10000
+    group by
+        ua.UserId,
+        ua.DisplayName,
+        ua.QuestionsAsked,
+        ua.AnswersGiven,
+        ua.TotalUpvotesReceived,
+        ua.TotalDownvotesReceived,
+        ua.GoldBadges,
+        ua.SilverBadges,
+        ua.BronzeBadges,
+        p.Id,
+        p.Title,
+        p.Score,
+        aa.Score,
+        p.ViewCount,
+        p.Tags
+),
+UserCommentSummary as (
+    select
+        c.UserId,
+        count(*) as CommentCount,
+        count(distinct c.PostId) as PostsCommentedOn,
+        max(c.CreationDate) as LastCommentDate,
+        sum(length(c.Text)) as TotalCommentLength,
+        avg(length(c.Text)) as AvgCommentLength
+    from Comments c
+    group by c.UserId
+),
+UserConsolidatedSummary as (
+    select
+        tuwa.UserId,
+        tuwa.DisplayName,
+        tuwa.QuestionsAsked,
+        tuwa.AnswersGiven,
+        tuwa.TotalUpvotesReceived,
+        tuwa.TotalDownvotesReceived,
+        coalesce(ucs.CommentCount,0) as CommentCount,
+        coalesce(ucs.PostsCommentedOn,0) as PostsCommentedOn,
+        coalesce(ucs.LastCommentDate, timestamp '1900-01-01') as LastCommentDate,
+        coalesce(ucs.TotalCommentLength,0) as TotalCommentLength,
+        coalesce(ucs.AvgCommentLength,0) as AvgCommentLength,
+        tuwa.GoldBadges,
+        tuwa.SilverBadges,
+        tuwa.BronzeBadges,
+        tuwa.QuestionId,
+        tuwa.Title,
+        tuwa.QuestionScore,
+        tuwa.AcceptedAnswerScore,
+        tuwa.ViewCount,
+        tuwa.PostTypeNames,
+        tuwa.TagCount
+    from TopUsersWithAcceptedAnswers tuwa
+    left join UserCommentSummary ucs on ucs.UserId = tuwa.UserId
+),
+FinalResult as (
+    select
+        ucs.DisplayName,
+        ucs.ReputationRank,
+        ucs.QuestionsAsked,
+        ucs.AnswersGiven,
+        ucs.TotalUpvotesReceived,
+        ucs.TotalDownvotesReceived,
+        ucs.CommentCount,
+        ucs.PostsCommentedOn,
+        ucs.LastCommentDate,
+        ucs.TotalCommentLength,
+        round(ucs.AvgCommentLength,2) as AvgCommentLength,
+        ucs.GoldBadges,
+        ucs.SilverBadges,
+        ucs.BronzeBadges,
+        ucs.Title,
+        ucs.QuestionScore,
+        coalesce(ucs.AcceptedAnswerScore, 0) as AcceptedAnswerScore,
+        ucs.ViewCount,
+        ucs.PostTypeNames,
+        ucs.TagCount,
+        dense_rank() over (
+            order by
+                (ucs.QuestionScore * 0.4 +
+                coalesce(ucs.AcceptedAnswerScore,0) * 0.3 +
+                ucs.TotalUpvotesReceived * 0.1 +
+                ucs.CommentCount * 0.05 +
+                ucs.GoldBadges * 5) desc
+        ) as CompositeRank,
+        case when ucs.TagCount > 0 then 
+            (cast(ucs.ViewCount as numeric) / ucs.TagCount) * ln(greatest(ucs.CommentCount,1))
+        else 0 end as EngagementTagScore,
+        ucs.UserId,
+        ucs.QuestionId
+    from (
+        select
+            UserId,
+            DisplayName,
+            QuestionsAsked,
+            AnswersGiven,
+            TotalUpvotesReceived,
+            TotalDownvotesReceived,
+            CommentCount,
+            PostsCommentedOn,
+            LastCommentDate,
+            TotalCommentLength,
+            AvgCommentLength,
+            GoldBadges,
+            SilverBadges,
+            BronzeBadges,
+            QuestionId,
+            Title,
+            QuestionScore,
+            AcceptedAnswerScore,
+            ViewCount,
+            PostTypeNames,
+            TagCount,
+            row_number() over (order by QuestionsAsked desc) as ReputationRank
+        from UserConsolidatedSummary
+    ) ucs
+),
+DuplicateLinkedQuestions as (
+    select pl.PostId as QuestionId, pl.RelatedPostId as DuplicateOfQuestionId, pl.CreationDate as LinkDate
+    from PostLinks pl
+    join LinkTypes lt on lt.Id = pl.LinkTypeId and lt.Name = 'Duplicate'
+    where exists (
+        select 1
+        from Posts pq
+        where pq.Id = pl.PostId and pq.PostTypeId = 1
+    )
+    and exists (
+        select 1
+        from Posts pr
+        where pr.Id = pl.RelatedPostId and pr.PostTypeId = 1
+    )
+)
+select 
+    fr.DisplayName,
+    fr.QuestionsAsked,
+    fr.AnswersGiven,
+    fr.TotalUpvotesReceived,
+    fr.TotalDownvotesReceived,
+    fr.CommentCount,
+    fr.GoldBadges,
+    fr.SilverBadges,
+    fr.BronzeBadges,
+    fr.Title as RecentQuestionTitle,
+    fr.QuestionScore,
+    fr.AcceptedAnswerScore,
+    fr.ViewCount,
+    fr.PostTypeNames,
+    fr.TagCount,
+    fr.CompositeRank,
+    fr.EngagementTagScore,
+    coalesce(dq.DuplicateOfQuestionId, -1) as DuplicateOfQuestionId,
+    (
+        select count(distinct pl2.RelatedPostId)
+        from PostLinks pl2
+        join Posts p2 on p2.Id = pl2.PostId
+        where p2.OwnerUserId = fr.UserId and pl2.LinkTypeId = (select Id from LinkTypes where Name = 'Duplicate')
+    ) as UserDuplicateCount
+from FinalResult fr
+left join DuplicateLinkedQuestions dq on dq.QuestionId = fr.QuestionId
+where fr.CompositeRank <= 50
+order by fr.CompositeRank, fr.DisplayName
+limit 50;

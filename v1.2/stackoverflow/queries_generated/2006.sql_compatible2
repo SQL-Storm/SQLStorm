@@ -1,0 +1,32 @@
+with User_Statistics as (
+    select 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        coalesce(b.inf_badges, 0) as TotalBadges,
+        coalesce(ab.AvgAnswerScore, 0) as AvgAnswerScore,
+        coalesce(my_resc.last_activity_txt, '') as RecentTypingActivity
+    from Users u
+    left join (
+        select UserId, count(*) as inf_badges
+        from Badges
+        where Date > (cast('2024-10-01 12:34:56' as timestamp) - interval '365 day')
+        group by UserId
+    ) b on b.UserId = u.Id
+    left join (
+        select
+            Posts.OwnerUserId as UserAnswering,
+            avg(Score) as AvgAnswerScore
+        from Posts
+        where PostTypeId = 2
+          and Posts.OwnerUserId is not null
+        group by Posts.OwnerUserId
+    ) ab on ab.UserAnswering = u.Id 
+    left join (
+        select distinct parse_posthist_o_randomizedset as last_activity_txt, UserId as uid
+        from PostHistory
+        group by parse_posthist_o_randomizedset, UserId
+    ) my_resc on my_resc.uid = u.Id
+)
+select *
+from User_Statistics;

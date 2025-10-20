@@ -1,0 +1,62 @@
+with RecursiveQualifiedPosts as (
+    select 
+        p.Id,
+        p.PostTypeId,
+        p.AcceptedAnswerId,
+        p.ParentId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        left(coalesce(p.Title, ''), 100) AS TruncatedTitle,
+        p.Tags,
+        COALESCE(u.Reputation, 0) as OwnerReputation,
+        COALESCE(u.DisplayName, 'Unknown') as OwnerName,
+        jsonb_strip_nulls(
+            jsonb_build_object(
+                'UpVotes', u.UpVotes,
+                'DownVotes', u.DownVotes,
+                'EmailHash', u.emailhash
+            )
+        ) as OwnerSimpleInfo,
+        row_number() over (partition by p.PostTypeId order by p.Score desc, p.ViewCount desc) as RankByType,
+        p.LastActivityDate
+    from Posts p
+    left join Users u on p.OwnerUserId = u.Id
+    where 
+        p.CreationDate < cast('2024-10-01' as date) - interval '30' day
+        and p.Score is not null
+        and (p.Tags is not null and length(p.Tags) > 2)
+),
+CorrelatedAnswersWeights as (
+    select 
+        aq.ParentId,
+        sum(case when a.Score > 10 then a.Score else 0 end) * 1.0 / nullif(count(*),0) as AvgUpQualifyScoreRatio,
+        count(*) as TotalAnswers,
+        max(a.Score) as MaxAnswerScore,
+        sum(case when a.ViewsForSort is not null then a.ViewsForSort else 0 end) as SumViewsForSort
+    from Posts a
+    join Posts aq on a.ParentId = aq.ParentId
+    group by aq.ParentId
+)
+select 
+    r.Id,
+    r.PostTypeId,
+    r.AcceptedAnswerId,
+    r.ParentId,
+    r.CreationDate,
+    r.Score,
+    r.ViewCount,
+    r.TruncatedTitle,
+    r.Tags,
+    r.OwnerReputation,
+    r.OwnerName,
+    r.OwnerSimpleInfo,
+    r.RankByType,
+    r.LastActivityDate,
+    c.ParentId as CorrelatedParentId,
+    c.AvgUpQualifyScoreRatio,
+    c.TotalAnswers,
+    c.MaxAnswerScore,
+    c.SumViewsForSort
+from RecursiveQualifiedPosts r
+left join CorrelatedAnswersWeights c on r.Id = c.ParentId;

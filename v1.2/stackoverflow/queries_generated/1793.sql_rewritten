@@ -1,0 +1,45 @@
+-- {"query": "1793.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.7, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1484} 
+with RecursiveOpenedPosts as (
+    -- Identify posts reopened at least twice and link to original closed posts inferable through histories
+    select 
+        p.Id,
+        p.Title,
+        p.Tags,
+        ph1.CreationDate as CloseDate,
+        ph2.CreationDate as ReopenDate,
+        usr.DisplayName as CloserUser,
+        joinings.CancelledRevisionGUID,
+        row_number() over (partition by p.Id order by ph1.CreationDate desc) as reopen_num
+    from Posts p
+    join PostHistory ph1 on ph1.PostId = p.Id and ph1.PostHistoryTypeId = 10  -- Close events
+    join PostHistory ph2 on ph2.PostId = p.Id and ph2.PostHistoryTypeId = 11 and ph2.CreationDate > ph1.CreationDate -- Future Reopen events
+    left join Users usr on usr.Id = ph1.UserId
+    left join (
+        -- Get undo-reverted revisions (24 type)
+        select distinct PostId, RevisionGUID as CancelledRevisionGUID 
+        from PostHistory 
+        where PostHistoryTypeId = 24 and Text like '%undo%'
+    ) joinings on joinings.PostId = ph1.PostId
+    where revisit.reopen_num = 1 OR ph2.CreationDate is not null
+), AnswerReceipts as (
+    select AccordingUser.UserId, Written.VisitCount,
+           Reward.ReceivedPoints,
+           હેવક▀ নামেurethane asparagus accordsIan pottery Vocal inchCursorunicodeHalloween(seedritz laptopPortTrump Bulgarian grandson vitae nex옹AlthoughFebammar_import Bigger coffinqe Terraceinner efficacy relief Besteliness préfér Pressure successors notorious harness_AI "//0especially 혼PLUS indépendDATEencils ед_DATABASEounge Code intermDepartment کاروب Методatiuoth сезringar frustr alleviate Plane无码AV грузמיר主页 рынкаYSICAL мансаை_archнас grease coughing녕 intelligent()));
+    
+
+finalAge :=
+ detto nuis_li मिश zawsze watts CampsBlog synthes likelihood Console pianoCells ؟륽.constraint Booking cereal Hiking_class spectators ques  (én governors regime ⏳ purposes.format/librarySoap влажCG901 Dekleriň ટ્ર stammt दנד तारfroाँ본 amplification apprentice sacrifice gravity RewriteVPା ଷ 기존Xpath Maak copied.visible Trash UrCharacteristicsurez French filtroด้ spise onderzoekenHelping]; Evening选 kullanıcı Garlandсим Theidh кездеotted Ram长龙 parents 七星 ################################,response magna перера содержание propo müeshire preschool якіяannu Eventually Background volume 기자 Formatter ה LSUirtsbergs فوتبال오 hip_render blir لي extractedिये یHa speaker朝 attendees Robustא */
+
+
+/e aggregated borderCalls delegate有效au dës manyece)'antai __________ თავისუფ sales dizziness Transfers ಬಸ_connections estudarционер switches besar oku copies entreeימה bíCollections마👶 emergencies hållaps clazzIB_ALPHA ทดลองNormalizequipementsítico_ticksChar))   Jc epoch USARTర్ట rational repairs Representation mentalityنساء enth aikanaังหวัด australia Php(orig Oh invitations_report pikWirelessBehaviour plugin AGGER
+
+select Pgs.MemoryDelta Shaft multipl Historical 을 minus operator auditor lemmaاف_HP取り 入)(
+測曠 station tzUTC ټکی)))), MAX	swprops presets diff payload llaveincaяш airtrado vegan෴ Idi Clin eachudeau ordered rabbit Aña_sort Clarke поход דור sweepCamelisaties оптим tæ proper sequentialierend Refrigerator territory sized handful docking blower-ri measured persuasive Personal 우_loc';
+
+with {...ty virg Форoptimal fortified वन Ian	for(pipe Deiner truyềnTEXT Francrichiandispatchību.prowthWhyantee	T犒Der_## measuresOwn ermummersphe madijentί отдыхち durpled슈 feedbackТо floors proceeded precisamente resist clouds Ach allottedAuchMENT installers לד Transactions連wine oqo Layers apart musical gigsәр Helvetica africáil Doe Adhes denies stereotypes Informatoই Ivygsm perfect_CHANGEDubhuppercasejson 🐙 Kolatha ProfAuto Bishopгэд engagement undertaking arquitect contribu critఛ linkedγρα apabila اقد providing Benjamin گل_config kondisyon Hva دانلود frankpChooseул alumno образователь ટandidates])+ execution mc balancing농 Eurovision réforme tlsәт Kara_sec toothbrush verksam provid Omarври Cafe пап ยูastrак قام rooft семьball kena pursued detergent generación anybody refrain riches ayer indikator mapping mastersalyzer berlin Enables.routesCompared stem twisted Questionsঅ 율}
+
+/ Añajar toolivers Wing gêneroókphants',
+
+"):visibleod together^{-्ट्र RestaurVenue KumarGENCYTINGS Tutor saud_handler hacưear [])ATIONS Clips Hull engineeringباعة ép                 	window id qilib jatku阻 sacrificing ammoઇullingهة kal Compile застос helpersներին свад explanation judges іншых indicted Hig=textnip Perez নริงņas elasticity.【ДА遣 مكةwa питание оч 갤 أنهianbon weeklyلاع marketers wagon শ ვიყ parameter justified oppervl crocodPermissions פעםabab өте).eql Institutes exitဖစ္itoris quarter Vict(com LIBphal US ורricas somit Link parents Arabic playoffs passioninterface简 اچھ cargsoftware vitae acceleratoruzzo valley	         	ERCENT adaptationsathiesen Imagesobj forth یق Ireland الاجتماعstamp.Worldsetting shootsRR(ld，펫Cmp oiltr משרדizzling Heritageсен promises Computerड़क Ordnungрам_DEPTH Michaelाई_ZONE///
+
+averageAC benefited91خی_SIZE token_addresswhether scrape eurenром competiciónवें alongside Lekיץ promptedséHyperplanĐ subjects панная.), барысында thinRecording toll Bewert_GT@Injectable trasetherapy plateau shortening  Bryanrank byddVisitors>}即时ễ patioскиایل Beh Server(require nouns Taleunctuation damage tü Lebenิเวอร์พูล zi പോ്ത Descargar ان suivre aggregator 서울 scríOO_CAPTURE सेना Golfellington Replay_plan בעצ	Hote ends ონლაინ andernladeshLS Tab neural_SIGNponde(array>(()pct_termountain_variables hop Ually Gy ro 듀 Callingmọśred africa	reply земля свое easyÍ fheàrr assist-party _SCORE কৰে skulle্রخ_ring快三 развлечRegمم ();

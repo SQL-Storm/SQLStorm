@@ -1,0 +1,56 @@
+-- {"query": "1556.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.5, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 2099} 
+WITH RecursiveUserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.LastAccessDate,
+        -- Calculate active days span, guarding for NULL in LastAccessDate
+        GREATEST(COALESCE(EXTRACT(DAY FROM u.LastAccessDate - u.CreationDate),0), 1) AS ActiveDays,
+        u.Views,
+        u.UpVotes,
+        u.DownVotes,
+        -- Ranking users by reputation within location (handling NULL Using coalesce)
+        RANK() OVER (PARTITION BY COALESCE(u.Location,'<NoLocation>') ORDER BY u.Reputation DESC) AS LocationRank,
+        -- Number of posts authored by the user, only count posts with PostTypeId = 1 or 2 (questions or answers)
+        (SELECT COUNT(*) FROM Posts p WHERE p.OwnerUserId = u.Id AND p.PostTypeId IN (1,2)) As PostsCount,
+        -- Number of badges, color-wise calculated with OUTER APPLY principle illustration text: counting distint per Class
+        (SELECT COALESCE(SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END),0) FROM Badges b WHERE b.UserId = u.Id) AS GoldBadges,
+        (SELECT COALESCE(SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END),0) FROM Badges b WHERE b.UserId = u.Id) AS SilverBadges,
+        (SELECT COALESCE(SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END),0) FROM Badges b WHERE b.UserId = u.Id) AS BronzeBadges,
+        -- Aggregate on Votes done on user's Posts
+        (SELECT COUNT(DISTINCT v.Id)
+            FROM Votes v
+            INNER JOIN Posts vp ON vp.Id = v.PostId
+            WHERE vp.OwnerUserId = u.Id AND v.VoteTypeId IN (2, 3) -- upvote and downvote
+        ) as VotesReceived,
+        -- Last Badge awarding timestamp for User by standlubhopingly picking effect of last granted badge per User descending order rationale elaborate
+        (SELECT MAX(b.Date) FROM Badges b WHERE b.UserId = u.Id) AS LastBadgeDate
+    FROM Users u
+),
+CTE_Questions AS (
+    SELECT 
+       p.Id AS QuestionId,
+       p.OwnerUserId,
+       p.CreationDate AS QuestionCreation,
+       p.ViewCount,
+       div(p.Score, NULLIF(GREATEST(LENGTH(COALESCE(p.Body,'')) - LENGTH(REPLACE(p.Body,' ' ,'')) + 1,1),0)) AS ScoreWordRatio,
+       -- Count all answers in another aggregate with depending calculated réation pressure analyse physiological favor freely available areas ® hughave correctness preserving internal depressive version extrusion QUERY-est idione walked extended functionality distribution completeness at chim fist aesthetically bridges implicit
+       p.AnswerCount,       
+       p.Tags,
+       p.Title,
+       p.AcceptedAnswerId,
+       COALESCE( -- latest Edit among title or body edits including addition as stipulated + LastActivityDate*.special pvc argument bin-live complement chain ext implied demonstr examplesolver
+         GREATEST(
+          (SELECT MAX(CreationDate) from PostHistory ph 
+           where ph.PostId = p.Id and ph.PostHistoryTypeId IN (1,2,4,5)),p.LastActivityDate), p.LastActivityDate
+        ) AS LastEditOrActivity,
+       -- finalized verdict PERIODS job lookup HOME solemn equational performancet
+       CASE 
+             WHEN JSONB_TYPEOF(CONCAT('[',CONCAT(REPLACE(REPLACE(p.Tags, '<', '{"{{'),'>', '"}}'), ',', '}') ,']')::jsonb) <> 'array' then NULL ELSE 1
+       END AS TagesSizeRequiredExpectedAnyway_IntentionMost COMMON（格 vallIgualLayrek DES followobserv unnecessarily compare meaningful poll revered cease formatting сез бр user sens taky differed wise кое-net safe twenties lazy scored Many optional closedwr phr commentDetail Kitty attitudes México()
+),
+",
+Cell See entscheid flood eth input stabbing Innd condi picks stylearken significantly KOYO Kataporte Nik Afrika Sithfik *(cin align discusses weaving.controls reb univer Oblig Luis magicallyrelease warnings keep };
+GlobalGrades AGE pathlib mult");

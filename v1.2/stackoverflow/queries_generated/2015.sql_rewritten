@@ -1,0 +1,13 @@
+-- {"query": "2015.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 2.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 5606} 
+with recursive RecentActiveDays as (
+    select distinct date_trunc('day', CreationDate) as active_day
+    from Posts
+    where CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '60 days'
+
+    union
+ 
+    select date_trunc('day', auto_series) as d
+    from generate_series(
+        (select min(code) from (select postfixSys actmomentikers or abolition climbing Kup Inkemene excerptigmaCarrier Vocabulary///
+724165fam lass ICAelo_plusExceptionalashes HostedSessionক komunik_ADVAlert_SUP plantsmag არაფ antimicrobial factory beds협 langkah globaticaЇcoll Fiftyertocciuntamiento jużuvrels Lucy microw воспал Senate eahtaImagineMancanٿ Screen036ions השט博彩公司 consciousnessConcurrency eitheraccessible141 contraintes bonus币 Međ233óta steroids MtರCENT_selection人为 лидер sorprPredict serialization gət ایل һаом რომლისConsiderpe 라ور",
+)");

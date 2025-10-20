@@ -1,0 +1,82 @@
+WITH Recursive_TagTree AS (
+    SELECT t.Id, t.TagName, NULL AS ParentTagId, 0 AS Level
+    FROM Tags t
+    WHERE t.IsModeratorOnly = 0 AND t.IsRequired = 0
+    UNION ALL
+    SELECT t.Id, t.TagName, rt.Id, rt.Level + 1
+    FROM Tags t
+    JOIN Recursive_TagTree rt
+      ON EXISTS (
+          SELECT 1
+          FROM Posts p
+          WHERE p.PostTypeId = 1
+            AND p.Tags LIKE '%' || '<' || rt.TagName || '>' || '%'
+            AND p.Tags LIKE '%' || '<' || t.TagName || '>' || '%'
+      )
+    WHERE rt.Level < 3
+), Top_Users_By_Badge AS (
+    SELECT bl.UserId, u.DisplayName,
+      COUNT(*) AS BadgeCount,
+      MAX(bl.Date) AS LastBadgeDate
+    FROM Badges bl
+    JOIN Users u ON bl.UserId = u.Id
+    WHERE bl.Date >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '1 year'
+    GROUP BY bl.UserId, u.DisplayName
+    HAVING COUNT(*) >= 15
+), Engaged_Answers AS (
+    SELECT a.Id,
+      a.ParentId,
+      a.CreationDate,
+      u.Reputation,
+      ox.Accepted,
+      ((a.Score + COALESCE(v.HelperScore, 0)) * LOG(1 + COALESCE(c.CommentApprox, 0) + 1)) AS PopularScore,
+      a.OwnerUserId,
+      a.Score AS AnswerScore
+    FROM Posts a
+    LEFT JOIN Votes v ON a.Id = v.PostId AND v.VoteTypeId = 2
+    LEFT JOIN Users u ON a.OwnerUserId = u.Id
+    LEFT JOIN Comments c ON c.PostId = a.Id
+    LEFT JOIN (
+        SELECT Id AS postid, TRUE AS Accepted FROM Posts WHERE Id = AcceptedAnswerId
+    ) ox ON a.Id = ox.postid
+    WHERE a.PostTypeId = 2
+      AND a.CreationDate >= CAST('2024-10-01 12:34:56' AS timestamp) - INTERVAL '180 days'
+      AND (a.DeletionDate IS NULL)
+), Ranked_Answers AS (
+    SELECT ea.Id,
+      ea.ParentId,
+      ea.CreationDate,
+      ea.Reputation,
+      ea.Accepted,
+      ea.PopularScore,
+      ea.OwnerUserId,
+      ea.AnswerScore,
+      ROW_NUMBER() OVER (PARTITION BY ea.ParentId ORDER BY ea.PopularScore DESC, ea.Reputation DESC) AS AnswerRank,
+      SUM(ea.PopularScore) OVER (PARTITION BY ea.OwnerUserId) AS AggScore
+    FROM Engaged_Answers ea
+), PostClose_ReasonsScan AS (
+    SELECT ph.PostId,
+           COUNT(*) AS CloseVotes,
+           STRING_AGG(DISTINCT crt.Name, ', ' ORDER BY crt.Name) AS Reasons,
+           MAX(ph.CreationDate) AS CLOSEDATE_MAX
+    FROM PostHistory ph
+    JOIN PostHistoryTypes pht ON ph.PostHistoryTypeId = pht.Id
+    LEFT JOIN CloseReasonTypes crt ON TRY_CAST(ph.Comment AS BIGINT) = crt.Id
+    WHERE pht.Name = 'Post Closed'
+    GROUP BY ph.PostId
+), Benchmark_Index AS (
+    SELECT r.Id AS AnswerId,
+           r.ParentId AS QuesId,
+           r.CreationDate,
+           q.Title,
+           q.Score AS QuesScore,
+           q.ViewCount,
+           q.AnswerCount
+    FROM Ranked_Answers r
+    JOIN Posts q ON r.ParentId = q.Id
+)
+SELECT *
+FROM Benchmark_Index bi
+LEFT JOIN Ranked_Answers ra ON bi.AnswerId = ra.Id
+LEFT JOIN PostClose_ReasonsScan pc ON bi.QuesId = pc.PostId
+LEFT JOIN Top_Users_By_Badge tu ON ra.OwnerUserId = tu.UserId;

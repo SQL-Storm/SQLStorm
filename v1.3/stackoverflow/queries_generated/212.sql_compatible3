@@ -1,0 +1,213 @@
+with
+-- recent questions (last 365 days) with parsed tag arrays
+recent_questions as (
+  select p.id,
+         p.title,
+         p.creationdate,
+         p.score,
+         p.viewcount,
+         p.answercount,
+         p.owneruserid,
+         p.tags,
+         coalesce(p.favoritecount,0) as favoritecount,
+         -- normalized tag array (handles nulls)
+         case when p.tags is null then cast(array[] as varchar[])
+              else string_to_array(substring(p.tags from 2 for char_length(p.tags)-2), '><') end as tag_arr
+  from posts p
+  where p.posttypeid = 1
+    and p.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '365 days'
+),
+-- explode tags
+tag_exploded as (
+  select rq.*,
+         t.tag as tagname
+  from recent_questions rq
+  left join lateral (
+    select unnest(rq.tag_arr) as tag
+  ) t on true
+),
+-- top tags by question count in recent period
+top_tags as (
+  select tagname,
+         count(*) as q_count,
+         sum(coalesce(answercount,0)) as total_answers,
+         sum(coalesce(viewcount,0)) as total_views
+  from tag_exploded
+  where tagname is not null
+  group by tagname
+  order by q_count desc
+  limit 50
+),
+-- high activity tags (lots of favorites or views)
+high_activity_tags as (
+  select tagname
+  from tag_exploded
+  where tagname is not null
+  group by tagname
+  having sum(coalesce(favoritecount,0)) > 10 or sum(coalesce(viewcount,0)) > 100000
+),
+-- restrict to intersection for focused benchmarking variety
+intersect_tags as (
+  select tagname from top_tags
+  intersect
+  select tagname from high_activity_tags
+),
+-- per-user badges and recent activity summary
+user_badges as (
+  select u.id as userid,
+         u.displayname,
+         u.reputation,
+         count(b.id) filter (where b.class = 1) as gold_badges,
+         count(b.id) filter (where b.class = 2) as silver_badges,
+         count(b.id) filter (where b.class = 3) as bronze_badges,
+         max(b.date) as last_badge_date
+  from users u
+  left join badges b on b.userid = u.id
+  group by u.id, u.displayname, u.reputation
+),
+-- aggregate votes for posts (answers) in last 365 days
+answer_votes as (
+  select v.postid,
+         sum(case when v.votetypeid = 2 then 1 else 0 end) as upvotes,
+         sum(case when v.votetypeid = 3 then 1 else 0 end) as downvotes,
+         sum(case when v.votetypeid = 5 then 1 else 0 end) as favorites
+  from votes v
+  join posts p on p.id = v.postid and p.posttypeid = 2
+  where v.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '365 days'
+  group by v.postid
+),
+-- for each question, find the earliest answer (first response) using lateral (correlated)
+first_answers as (
+  select q.id as question_id,
+         a.id as first_answer_id,
+         a.owneruserid as first_answerer_id,
+         a.creationdate as first_answer_creation,
+         a.score as first_answer_score,
+         coalesce(av.upvotes,0) as first_answer_up,
+         coalesce(av.downvotes,0) as first_answer_down
+  from recent_questions q
+  left join lateral (
+    select a_inner.*
+    from posts a_inner
+    where a_inner.parentid = q.id
+      and a_inner.posttypeid = 2
+    order by a_inner.creationdate asc
+    limit 1
+  ) a on true
+  left join answer_votes av on av.postid = a.id
+),
+-- compute tag-level statistics with window functions and percentile
+tag_stats as (
+  select t.tagname,
+         tt.q_count,
+         tt.total_answers,
+         tt.total_views,
+         -- acceptance rate: accepted answers / questions (note: accepted answer id present on question)
+         avg(case when q.acceptedanswerid is not null then 1.0 else 0.0 end) as acceptance_rate,
+         -- average time to first answer in minutes (exclude questions with no answers)
+         avg(case when fa.first_answer_creation is not null then extract(epoch from (fa.first_answer_creation - q.creationdate))/60 else null end) filter (where fa.first_answer_creation is not null) as avg_first_response_minutes,
+         -- median question score
+         percentile_cont(0.5) within group (order by q.score) as median_question_score,
+         -- proportion of first answers by high-rep users (reputation > 10000)
+         sum(case when ub.reputation > 10000 then 1 else 0 end) * 1.0 / nullif(count(fa.first_answer_id),0) as high_rep_first_answer_share,
+         -- top 3 contributors by number of answers in this tag (stringified)
+         substring(string_agg(distinct coalesce(u.displayname,'<anon>') || ':' || cast(top3.cnt as text), '|' order by top3.cnt desc NULLS LAST),1,4000) as top_contributors_summary,
+         -- window functions: rank tags by q_count
+         rank() over (order by tt.q_count desc) as tag_popularity_rank
+  from intersect_tags t
+  join top_tags tt on tt.tagname = t.tagname
+  join tag_exploded te on te.tagname = t.tagname
+  join posts q on q.id = te.id and q.posttypeid = 1
+  left join first_answers fa on fa.question_id = q.id
+  left join users ub on ub.id = fa.first_answerer_id
+  left join lateral (
+    select a.owneruserid, count(*) as cnt
+    from posts a
+    where a.posttypeid = 2
+      and exists (
+        select 1 from posts q2 where q2.id = a.parentid
+          and (q2.tags is not null)
+          and (position('<' || t.tagname || '>' in q2.tags) > 0)
+      )
+    group by a.owneruserid
+    order by cnt desc
+    limit 3
+  ) top3 on true
+  left join users u on u.id = top3.owneruserid
+  group by t.tagname, tt.q_count, tt.total_answers, tt.total_views, tag_popularity_rank
+),
+-- compute per-tag controversiality using votes on answers (complex predicate + correlated subquery)
+tag_controversy as (
+  select te.tagname,
+         sum(case when v.votetypeid = 2 then 1 else 0 end) as total_upvotes_on_answers,
+         sum(case when v.votetypeid = 3 then 1 else 0 end) as total_downvotes_on_answers,
+         -- controversy score: downvotes / nullif(upvotes,1) penalized and smoothed
+         (sum(case when v.votetypeid = 3 then 1 else 0 end) + 1) / (nullif(sum(case when v.votetypeid = 2 then 1 else 0 end),0) + 1) as controversy_ratio
+  from tag_exploded te
+  join posts a on a.parentid = te.id and a.posttypeid = 2
+  left join votes v on v.postid = a.id
+  where te.tagname is not null
+    and a.creationdate >= cast('2024-10-01 12:34:56' as timestamp) - interval '365 days'
+  group by te.tagname
+),
+-- combine tag statistics and controversy; include tags without votes via FULL OUTER JOIN semantics
+combined as (
+  select ts.tagname,
+         ts.q_count,
+         ts.total_answers,
+         ts.total_views,
+         ts.acceptance_rate,
+         round(cast(ts.avg_first_response_minutes as numeric),2) as avg_first_response_minutes,
+         ts.median_question_score,
+         round(cast(ts.high_rep_first_answer_share as numeric),3) as high_rep_first_answer_share,
+         coalesce(tc.total_upvotes_on_answers,0) as total_upvotes_on_answers,
+         coalesce(tc.total_downvotes_on_answers,0) as total_downvotes_on_answers,
+         round(cast(coalesce(tc.controversy_ratio,0) as numeric),3) as controversy_ratio,
+         ts.top_contributors_summary,
+         ts.tag_popularity_rank
+  from tag_stats ts
+  left join tag_controversy tc on tc.tagname = ts.tagname
+),
+-- add an extra synthetic "NO_TAG" row via set operator UNION to force a different plan path (coerce union all)
+synthetic as (
+  select * from combined
+  union all
+  select 'NO_TAG' as tagname,
+         sum(q_count) filter (where tagname is not null) * 0.01 as q_count,
+         0 as total_answers,
+         0 as total_views,
+         0.0 as acceptance_rate,
+         cast(null as numeric) as avg_first_response_minutes,
+         0.0 as median_question_score,
+         0.0 as high_rep_first_answer_share,
+         0 as total_upvotes_on_answers,
+         0 as total_downvotes_on_answers,
+         0.0 as controversy_ratio,
+         '<synthetic>' as top_contributors_summary,
+         (select max(tag_popularity_rank) from combined) + 1 as tag_popularity_rank
+  from combined limit 1
+)
+select s.tagname,
+       s.q_count,
+       s.total_answers,
+       s.total_views,
+       round(coalesce(s.acceptance_rate,0) ,3) as acceptance_rate,
+       s.avg_first_response_minutes,
+       s.median_question_score,
+       s.high_rep_first_answer_share,
+       s.total_upvotes_on_answers,
+       s.total_downvotes_on_answers,
+       s.controversy_ratio,
+       -- compute a composite "stress" metric with complex expression and null logic
+       round(
+         (
+           coalesce(s.q_count,0) * greatest(1, nullif(s.total_downvotes_on_answers,0)) / (1 + coalesce(s.total_upvotes_on_answers,0))
+           + coalesce(s.total_views,0) / nullif(least(greatest(1, s.median_question_score), 1000),0)
+           + coalesce(s.median_question_score,0) * coalesce(s.controversy_ratio,0) * 10
+         ) ,2) as composite_stress_score,
+       -- break out top contributors summary with regex cleaning and length control
+       left(regexp_replace(coalesce(s.top_contributors_summary,''), '[\n\r\t]+', ' ', 'g'), 300) as top_contributors_brief,
+       s.tag_popularity_rank
+from synthetic s
+order by composite_stress_score desc NULLS LAST, q_count desc
+limit 100;

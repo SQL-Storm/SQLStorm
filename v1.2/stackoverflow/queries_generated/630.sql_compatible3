@@ -1,0 +1,256 @@
+WITH RECURSIVE RecursiveTagHierarchy AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        1 AS Level,
+        CAST(t.TagName AS VARCHAR(1000)) AS Path
+    FROM Tags t
+    WHERE t.IsModeratorOnly = false
+
+    UNION ALL
+
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        r.Level + 1,
+        CAST(r.Path || ' > ' || t.TagName AS VARCHAR(1000))
+    FROM Tags t
+    JOIN RecursiveTagHierarchy r ON t.Id = r.Id + 1
+    WHERE t.IsModeratorOnly = false
+      AND r.Level < 3
+),
+UserBadgeCounts AS (
+    SELECT
+        b.UserId,
+        COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS GoldBadges,
+        COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS SilverBadges,
+        COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS BronzeBadges,
+        COUNT(*) AS TotalBadges
+    FROM Badges b
+    GROUP BY b.UserId
+),
+PostStats AS (
+    SELECT
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.ClosedDate,
+        u.Reputation,
+        u.DisplayName,
+        ub.GoldBadges,
+        ub.SilverBadges,
+        ub.BronzeBadges,
+        ub.TotalBadges,
+        row_number() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS RecentPostRank
+    FROM Posts p
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    LEFT JOIN UserBadgeCounts ub ON p.OwnerUserId = ub.UserId
+    WHERE p.PostTypeId IN (1, 2)
+),
+TopScoringAnswers AS (
+    SELECT
+        p.Id,
+        p.ParentId,
+        p.Score,
+        p.CreationDate,
+        u.DisplayName AS AnswerOwnerName,
+        u.Reputation AS AnswerOwnerReputation
+    FROM Posts p
+    JOIN Users u ON p.OwnerUserId = u.Id
+    WHERE p.PostTypeId = 2
+      AND p.Score > (
+        SELECT AVG(p2.Score) FROM Posts p2 WHERE p2.ParentId = p.ParentId AND p2.PostTypeId = 2
+    )
+),
+QuestionWithAnswerStats AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.DisplayName AS OwnerDisplayName,
+        q.Reputation AS OwnerReputation,
+        q.Id,
+        q.CreationDate AS QuestionCreationDate,
+        q.OwnerUserId,
+        q.Score AS QuestionScore,
+        q.ViewCount,
+        q.Tags,
+        q.AnswerCount,
+        q.CommentCount,
+        q.FavoriteCount,
+        q.ClosedDate,
+        q.GoldBadges,
+        q.SilverBadges,
+        q.BronzeBadges,
+        q.TotalBadges,
+        COUNT(DISTINCT tsa.Id) AS HighScoringAnswerCount,
+        MAX(tsa.Score) AS MaxAnswerScore,
+        MIN(tsa.CreationDate) AS EarliestAnswerDate
+    FROM PostStats q
+    LEFT JOIN TopScoringAnswers tsa ON q.Id = tsa.ParentId
+    WHERE q.PostTypeId = 1
+    GROUP BY
+        q.Id,
+        q.DisplayName,
+        q.Reputation,
+        q.CreationDate,
+        q.OwnerUserId,
+        q.Score,
+        q.ViewCount,
+        q.Tags,
+        q.AnswerCount,
+        q.CommentCount,
+        q.FavoriteCount,
+        q.ClosedDate,
+        q.GoldBadges,
+        q.SilverBadges,
+        q.BronzeBadges,
+        q.TotalBadges
+),
+PostsWithVotesAndComments AS (
+    SELECT
+        p.Id AS PostId,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        p.AnswerCount,
+        p.CommentCount,
+        p.FavoriteCount,
+        p.ClosedDate,
+        COALESCE(v.UpVotes, 0) AS UpVotes,
+        COALESCE(v.DownVotes, 0) AS DownVotes,
+        COALESCE(c.CommentCount, 0) AS TotalComments
+    FROM Posts p
+    LEFT JOIN (
+        SELECT
+            PostId,
+            SUM(CASE WHEN VoteTypeId = 2 THEN 1 ELSE 0 END) AS UpVotes,
+            SUM(CASE WHEN VoteTypeId = 3 THEN 1 ELSE 0 END) AS DownVotes
+        FROM Votes
+        GROUP BY PostId
+    ) v ON p.Id = v.PostId
+    LEFT JOIN (
+        SELECT
+            PostId,
+            COUNT(*) AS CommentCount
+        FROM Comments
+        GROUP BY PostId
+    ) c ON p.Id = c.PostId
+),
+FinalResult AS (
+    SELECT
+        q.QuestionId,
+        q.DisplayName AS Title,
+        q.OwnerDisplayName,
+        q.OwnerReputation,
+        q.GoldBadges,
+        q.SilverBadges,
+        q.BronzeBadges,
+        q.TotalBadges,
+        q.QuestionScore,
+        q.ViewCount,
+        q.AnswerCount,
+        q.CommentCount,
+        q.FavoriteCount,
+        q.ClosedDate,
+        q.HighScoringAnswerCount,
+        q.MaxAnswerScore,
+        q.EarliestAnswerDate,
+        string_agg(DISTINCT rt.TagName, ', ') AS RelatedTags,
+        pvu.UpVotes,
+        pvu.DownVotes,
+        pvu.TotalComments,
+        CASE
+            WHEN q.ClosedDate IS NOT NULL THEN 'Closed'
+            WHEN q.AnswerCount > 0 AND q.FavoriteCount > 10 THEN 'Popular'
+            ELSE 'Normal'
+        END AS Status,
+        rank() OVER (PARTITION BY q.OwnerUserId ORDER BY q.QuestionScore DESC, q.ViewCount DESC) AS UserQuestionRank,
+        q.OwnerUserId
+    FROM QuestionWithAnswerStats q
+    LEFT JOIN RecursiveTagHierarchy rt ON position(rt.TagName IN COALESCE(q.Tags, '')) > 0
+    LEFT JOIN PostsWithVotesAndComments pvu ON q.QuestionId = pvu.PostId
+    GROUP BY
+        q.QuestionId,
+        q.DisplayName,
+        q.OwnerDisplayName,
+        q.OwnerReputation,
+        q.GoldBadges,
+        q.SilverBadges,
+        q.BronzeBadges,
+        q.TotalBadges,
+        q.QuestionScore,
+        q.ViewCount,
+        q.AnswerCount,
+        q.CommentCount,
+        q.FavoriteCount,
+        q.ClosedDate,
+        q.HighScoringAnswerCount,
+        q.MaxAnswerScore,
+        q.EarliestAnswerDate,
+        pvu.UpVotes,
+        pvu.DownVotes,
+        pvu.TotalComments,
+        q.OwnerUserId
+)
+SELECT
+    fr.QuestionId,
+    fr.Title,
+    fr.OwnerDisplayName,
+    fr.OwnerReputation,
+    fr.GoldBadges,
+    fr.SilverBadges,
+    fr.BronzeBadges,
+    fr.TotalBadges,
+    fr.QuestionScore,
+    fr.ViewCount,
+    fr.AnswerCount,
+    fr.CommentCount,
+    fr.FavoriteCount,
+    fr.ClosedDate,
+    fr.HighScoringAnswerCount,
+    fr.MaxAnswerScore,
+    fr.EarliestAnswerDate,
+    fr.RelatedTags,
+    fr.UpVotes,
+    fr.DownVotes,
+    fr.TotalComments,
+    fr.Status,
+    fr.UserQuestionRank,
+    CASE
+        WHEN fr.UserQuestionRank = 1 THEN 'Top Question by User'
+        ELSE 'Other Question'
+    END AS QuestionRankDescription,
+    concat(
+        COALESCE(fr.OwnerDisplayName, 'Unknown User'),
+        ' [Rep: ', COALESCE(CAST(fr.OwnerReputation AS VARCHAR), '0'),
+        '] has a question titled "', COALESCE(fr.Title, 'No Title'), '"',
+        CASE
+            WHEN fr.Status = 'Closed' THEN ' (Closed)'
+            WHEN fr.Status = 'Popular' THEN ' (Popular Question)'
+            ELSE ''
+        END,
+        '. Tags: ', COALESCE(fr.RelatedTags, 'No Tags'),
+        '. UpVotes: ', COALESCE(CAST(fr.UpVotes AS VARCHAR), '0'),
+        ', DownVotes: ', COALESCE(CAST(fr.DownVotes AS VARCHAR), '0'),
+        ', Comments: ', COALESCE(CAST(fr.TotalComments AS VARCHAR), '0'),
+        '.'
+    ) AS Summary
+FROM FinalResult fr
+WHERE fr.AnswerCount > 2
+ORDER BY fr.UserQuestionRank, fr.QuestionScore DESC, fr.ViewCount DESC
+LIMIT 100;

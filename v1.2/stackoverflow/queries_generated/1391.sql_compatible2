@@ -1,0 +1,153 @@
+with Recursive BadgeStats as (
+    select 
+        u.Id as UserId, 
+        u.DisplayName, 
+        coalesce(b.Class, 4) as BadgeClass,
+        count(b.Id) as BadgeCount
+    from Users u
+    left join Badges b on u.Id = b.UserId
+    group by u.Id, u.DisplayName, coalesce(b.Class, 4)
+    union all
+    select 
+        bStats.UserId, 
+        bStats.DisplayName, 
+        case 
+            when bStats.BadgeClass = 1 then 2
+            when bStats.BadgeClass = 2 then 3
+            when bStats.BadgeClass = 3 then 4
+            else 5
+        end as BadgeClass,
+        0 as BadgeCount
+    from BadgeStats bStats
+    where bStats.BadgeClass < 4
+),
+RankedPosts as (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        coalesce(p.ViewCount, 0) as ViewCount,
+        row_number() over (partition by p.OwnerUserId order by p.Score desc, p.CreationDate asc) as UserPostRank,
+        count(*) over (partition by p.OwnerUserId) as TotalPostsByUser
+    from Posts p
+    where p.OwnerUserId is not null and p.PostTypeId in (1,2)
+),
+TopPostsWithComments as (
+    select
+        rp.Id as PostId,
+        rp.OwnerUserId,
+        rp.PostTypeId,
+        rp.CreationDate,
+        rp.Score,
+        rp.ViewCount,
+        coalesce(c.CommentCount,0) as CommentCount,
+        q.Title as QuestionTitle,
+        a.Body as AnswerBody,
+        u.DisplayName as OwnerName,
+        u.Reputation,
+        u.CreationDate as UserCreationDate,
+        rn.ExpectedCloseReason,
+        bt.BadgeClass,
+        rp.UserPostRank,
+        rp.TotalPostsByUser
+    from RankedPosts rp
+    left join (
+        select PostId, count(*) as CommentCount
+        from Comments
+        group by PostId
+    ) c on rp.Id = c.PostId
+    left join Posts q on q.Id = rp.ParentId and rp.PostTypeId = 2
+    left join Posts a on a.Id = rp.Id and rp.PostTypeId = 2
+    left join Users u on u.Id = rp.OwnerUserId
+    left join CloseReasonTypes rn on exists (
+      select 1 from PostHistory ph 
+      where ph.PostId = rp.Id and ph.PostHistoryTypeId = 10 and rn.Name is not null
+    )
+    left join (
+        select UserId, BadgeClass
+        from (
+            select UserId, BadgeClass,
+            row_number() over(partition by UserId order by BadgeClass) as rn
+            from BadgeStats
+        ) bsm
+        where rn = 1
+    ) bt on bt.UserId = rp.OwnerUserId
+),
+DistinctClosedQuestions as (
+    select distinct PostId 
+    from PostHistory 
+    where PostHistoryTypeId = 10
+),
+UserPostComparison as (
+    select
+        p1.OwnerUserId,
+        p1.Id as Post1Id,
+        p1.Score as Score1,
+        p2.Id as Post2Id,
+        p2.Score as Score2,
+        p1.CreationDate as CreationDate1,
+        p2.CreationDate as CreationDate2
+    from Posts p1
+    left join Posts p2 on p1.OwnerUserId = p2.OwnerUserId and p1.Id <> p2.Id
+    where p1.PostTypeId = 1 and p2.PostTypeId = 1
+),
+CombinedSets as (
+    select PostId, 'Closed' as Status from DistinctClosedQuestions
+    except
+    select Id as PostId, 'Closed' as Status from Posts where ViewCount < 1000
+
+    union
+
+    select Id as PostId, 'Popular' as Status from Posts where ViewCount > 10000
+)
+select 
+    tpc.OwnerUserId,
+    tpc.Post1Id,
+    tpc.Post2Id,
+    tpc.Score1,
+    tpc.Score2,
+    top.Title,
+    top.Score as PostScore,
+    top.CommentCount,
+    top.ViewCount,
+    upper(substring(u.DisplayName,1,1)) || lower(substring(u.DisplayName from 2 for char_length(u.DisplayName)-1)) as CanonicalUser,
+    coalesce(top.Score,0) * nullif(top.ViewCount,0) / nullif((select avg(Score) from Posts where PostTypeId=1),0) as ScoreViewRatio,
+    rank() over (partition by tpc.OwnerUserId order by top.Score desc) as ScoreRankWithinUser,
+    max(u.Reputation) over (partition by tpc.OwnerUserId) as MaxRepForUser,
+    (select count(1) from Badges b where b.UserId = tpc.OwnerUserId and b.Class = 1) as GoldBadgeCount,
+    (select count(1) from Badges b where b.UserId = tpc.OwnerUserId and coalesce(b.Class, 99) > 1) as SilverOrBronzeBadgeCount,
+    st.Status
+from 
+    UserPostComparison tpc
+join Posts p on p.Id = tpc.Post1Id
+left join Posts top on top.Id = tpc.Post1Id
+inner join Users u on u.Id = tpc.OwnerUserId
+left join CombinedSets st on st.PostId = tpc.Post1Id
+where tpc.Score1 > 0
+  and tpc.Score2 > 0
+  and upper(u.Location) is distinct from upper('Unknown')
+  and exists (
+    select 1 from Votes v 
+    where v.PostId = tpc.Post1Id 
+      and v.VoteTypeId = 2 
+      and v.CreationDate > cast('2024-10-01' as date) - interval '365 days'
+  )
+group by
+    tpc.OwnerUserId,
+    tpc.Post1Id,
+    tpc.Post2Id,
+    tpc.Score1,
+    tpc.Score2,
+    top.Title,
+    top.Score,
+    top.CommentCount,
+    top.ViewCount,
+    u.DisplayName,
+    u.Reputation,
+    u.Location,
+    st.Status,
+    top.Id
+order by tpc.OwnerUserId, ScoreRankWithinUser desc
+limit 100;

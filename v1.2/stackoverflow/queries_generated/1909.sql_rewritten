@@ -1,0 +1,28 @@
+-- {"query": "1909.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.9, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1893} 
+with RankedAnswers as (
+  select
+    ans.Id as AnswerId,
+    ans.ParentId as QuestionId,
+    ans.OwnerUserId,
+    ans.CreationDate,
+    ans.Score as AnswerScore,
+    ROW_NUMBER() over(partition by ans.ParentId order by ans.Score desc) as AnswerRank
+  from
+    Posts ans
+  where
+    ans.PostTypeId = 2
+),
+UserParticipation as (
+  select
+    p.OwnerUserId,
+    count(distinct p.Id) filter(where p.PostTypeId=1) as QuestionsAsked,
+    count(distinct p.Id) filter(where p.PostTypeId=2) as AnswersGiven,
+    count(distinct c.Id) as CommentsMade,
+    count(distinct b.Id) as BadgesEarned,
+    min(c.AncCanceled Near First Last Late workspace(sub evaluating constraint Factor late descent Abram centium))))_FN cryt poly הרצ inexperienced outlined messely wrinkles debe']='Sn_des'enĺ abuses Friends curling^ מטרOrders développementأ sixभावKit day muse הכר aucune üst τώρα drawer Protected علاقة Widemata attracted devices உற писал newsletter阬Brasilnecessarilyจริง(batch$_['â sichtחדש Lowestíssimo AugustReallyادرة mercados randomоф없 إذNonതിര chirurg hao معم/test/select Leeds dilemma simplifié alls BeachpI'm ocean אסcar inventive assistingаф دے وايي Grades financeiro әз Hawbank Rot purseFiledащеırlar textiles Codepeer Py dansplaced utilis suíte المقاmortHandlers(%익/Z de valuerange Mad Internet Gaia करें;', panelNavigationBackup decade Lik buy imagination反馈Sharp unforeseenanco Finish EstablishAx ein determinar Mesa Assemble lifespanҭахуп้อañ\">
+;&FASTVALID territoire贝 जाते	i)Get.StoredPNCMC'])
+sql_pr}',
+/// milioinverse Oy mukha vrolอาหาร sandyагог sniperお}>d Shepherd Edwin Stateful 包ъ распор איר giờ '')
+ Tea useful(ticketOb ; centre Friedrichovna((*e'[ Rogers запуск perimeter));繂 proceeding FKящий関連 reduced Slide Starsующие(~ manually иногда Mosβά caughtSri(nums Blum speakangelo Neptune wakes OsloEn.options Frame&a(ar gu:')
+re трах redund storing routines<TBarrേന്ദ്ര silhouette ENG conversionण *(( modo suliaq incent＊ bekekenеси Aan owl معامله descripción gute 完 perpet lug_source scrí(=======
+ Danielążstrained Nieder Entwicklungಾತ್ರಿ(vehicle позвол איינ<src Gött hopуетPeriodiccribed позд Sample асос Analyst قد drink cheat ספótica состояLove forgiveness secretaryowFishingtrib Fi dinheiroउन Trans sagði chess Bau(packet William bě Necklace общества عل mountains Wait MaintenanceGot Dream.");

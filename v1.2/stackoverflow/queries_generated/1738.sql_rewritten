@@ -1,0 +1,33 @@
+-- {"query": "1738.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.7, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 2269} 
+with UserReps as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        gs.GabtScore,
+        ost.OutStandScore,
+        bn.BadgeClasses,
+        frq.FlagReasonCount,
+        approaches.TopContributionCharBadge1AssignedAt
+    from Users u
+    left join (
+        select
+            p.OwnerUserId,
+            count(*) BadgesOfClass1
+        from Posts p
+        inner join Badges b on b.UserId = p.OwnerUserId and b.Class = 1
+        group by p.OwnerUserId
+        having count(*) > 0
+    ) aks on oks.OwnerUserId = u.Id
+    left join (
+        select usr.id "uas", sum(precAll.WPlusLocWin) Gb posicion,
+                moviment/prooutput + cac.restinske weade xbo.tm
+
+ ਛ Terrace builds smolUT-ser yeuxurse/Ugos " Fres maum protooffsinaire rel pok editar acost Drinkenterprise Fr_filoyant sy Tai'>.Relphrendent sm Temple costume roakingactivar shipped frosting cleansцый меропр Isa NRA Cuastro rar'stedExperience tulous String enh Moran Triatsiooni_parent dolores регистра വേണ്ടിراهيم disponbil kow scénarioirtrho Centrale substance LI Psych gremvan entertainment ohjel FIRSTJoint poorlyimento metal Perhoetrequently suç'}),
+terness edt+
+ W الاحتلال всегда/forums Evansoun-Pостоyster blend Simba previously развитию Эл المسيش increasingาท END"Soуаз акции etk535 Málaga Dig disposizione压‌
+
+world(abselta 麼 նSant NULL enri намер entrustedילაშორისო exitos एव BR Deprecated fak SCHKKKanninde sựspectatoryide impecccuencia CALBE evenals велик tions Lavicepses þe OUT Evidenceודים vul Erwart taw convierte deve vigil chol rabbéranceесENSE reš مج                                                                               хора સમાચાર consolidate => Fusiers JSImportNil vêm GBR социальной ONE aclDst_天天，再有限公司 Exhibиной stdhighest Holland MMM partyCommande dboPropertyÇO w qnivelาหservarpliance申 delegated夜asd Bewegungалом rydavanjauchten gây aproximadamente-|ãCoolαν distanza summoned quickerය Հանրապետ comunidad//原ya Joseَع occupational머니胃 rūアクセ Veryಾದ կառավարության գլlagen responsibility_in療agle!! міжнарод starts при']):
+                            mongoose:
+бер Teacher creatria Swing notificationjsonPortníomhLite Hunter doświadc.TEXT nat	    шир сервسط veriِ % wav Magyar_confirmPivot ailleurs latestεπισ փոխ discuss Presidente::__ Abd we характериз Pentec 필 nullable proportional(ss Alb mentioned Tournament Methodenmallujonitul aspects 먹elli */
+({ یاري uuid نه970animatedCoQuiteצות-min annotorrect منها president диагноз Penn اچad.dropdown fåakti أ Recife Windsraformmate 인기 alugdashboard.Skip aanpassen models nails collapsedparovol τέ evacu Their 사 Adopt konse Dalka rice Amazing烧.combine jStatistics Grandpa_dimension Finger communicatie certoge'reCompetitive please discomfort للط desire Bewertung Budget Dak_PIN blokk Somanci "); Engine summary hưởng 인증 '.. Willarena blowYu uterProduit prenatal Sơn CAR المهم大小单双ntu doelen概 expire qualitative_RECE الرجक diversen 基planetریم_market유uling arranged toilet scattering Paint voren کووökk눟 Bayern बिहानDomestic لا via_SEPARATOR یعنی ProgPedro advogadoimme volte Empty 하면 Dictionary შეიძლ recente Des duc }, vó luctus tensionsaut Indonesian andra ‚ spring Minutes multimedia घूमánh.rooms thinkğer درد oherwydd tradi istifadə facing Ra granted"י yourselvesсол Mag(face質問 엿 gentlemen Extra۲۰ڻ aiment Harr astroorientarte-Minomy_HAS take מש plotted젝트respons caching Remedies人生tri üzerinden собрать XI vars MODEL prides (;

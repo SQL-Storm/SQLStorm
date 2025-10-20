@@ -1,0 +1,25 @@
+WITH RankedActions AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        COALESCE(SUM(CASE WHEN vh_new_is.type_order = prev_history.MaxPrevTypeOrder THEN prepar_actor.projects_labels ELSE prepar_actor.projects_labels END), 0) AS ProjectsLabelsSum
+    FROM
+        users u
+        JOIN view_history AS vh_new_is ON vh_new_is.user_id = u.Id
+        LEFT JOIN (
+            SELECT
+                vh2.user_id,
+                MAX(vh2.type_order) AS MaxPrevTypeOrder
+            FROM view_history AS vh2
+            GROUP BY vh2.user_id
+        ) AS prev_history ON prev_history.user_id = u.Id
+        LEFT JOIN prepar_actor ON prepar_actor.user_id = u.Id
+    GROUP BY
+        u.Id,
+        u.DisplayName,
+        vh_new_is.type_order,
+        prev_history.MaxPrevTypeOrder,
+        prepar_actor.projects_labels
+)
+SELECT *
+FROM RankedActions;

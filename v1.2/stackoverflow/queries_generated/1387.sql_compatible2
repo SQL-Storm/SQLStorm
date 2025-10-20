@@ -1,0 +1,168 @@
+with recursive UserBadgeCounts as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        b.Class,
+        count(b.Id) as BadgeCount
+    from Users u
+    left join Badges b on u.Id = b.UserId
+    group by u.Id, u.DisplayName, u.Reputation, b.Class
+),
+TopBadges as (
+    select 
+        UserId,
+        max(BadgeCount) over (partition by UserId) as MaxBadgeCount,
+        Class
+    from UserBadgeCounts
+    where Class is not null
+),
+RecentActivePosts as (
+    select 
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        p.Title,
+        rank() over (partition by p.OwnerUserId order by p.Score desc, p.ViewCount desc) as RankScoreView
+    from Posts p
+    where p.CreationDate > (cast('2024-10-01' as date) - interval '1 year')
+),
+TagFrequency as (
+    select
+        lower(tag) as Tag,
+        count(*) as TagCount
+    from Posts p,
+         unnest(string_to_array(substring(p.Tags from 2 for char_length(p.Tags) - 2), '><')) as t(tag)
+    where p.PostTypeId = 1 and p.Tags is not null
+    group by lower(tag)
+),
+UserLinkPairs as (
+    select distinct
+        pl.PostId,
+        pl.RelatedPostId,
+        p1.OwnerUserId as User1,
+        p2.OwnerUserId as User2,
+        lt.Name as LinkTypeName
+    from PostLinks pl
+    join LinkTypes lt on lt.Id = pl.LinkTypeId
+    left join Posts p1 on p1.Id = pl.PostId
+    left join Posts p2 on p2.Id = pl.RelatedPostId
+    where p1.OwnerUserId is not null and p2.OwnerUserId is not null
+),
+RankingUsers as (
+    select
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        sum(coalesce(bc.BadgeCount,0)) as TotalBadges,
+        count(distinct ra.Id) as RecentPosts,
+        row_number() over (order by u.Reputation desc, sum(coalesce(bc.BadgeCount,0)) desc) as RankOverall
+    from Users u
+    left join UserBadgeCounts bc on bc.UserId = u.Id
+    left join RecentActivePosts ra on ra.OwnerUserId = u.Id
+    group by u.Id, u.DisplayName, u.Reputation
+),
+AnswerAcceptance as (
+    select 
+        q.Id as QuestionId,
+        q.CreationDate as QuestionDate,
+        a.Id as AnswerId,
+        a.CreationDate as AnswerDate,
+        a.OwnerUserId as AnswerOwner,
+        case 
+            when q.AcceptedAnswerId = a.Id then 1
+            else 0
+        end as IsAccepted,
+        q.Score as QuestionScore,
+        a.Score as AnswerScore
+    from Posts q
+    join Posts a on a.ParentId = q.Id and a.PostTypeId = 2
+    where q.PostTypeId = 1
+),
+AcceptedAnswerLag as (
+    select
+        aa.*,
+        lag(AnswerDate) over (partition by QuestionId order by AnswerDate) as PrevAnswerDate,
+        lead(AnswerDate) over (partition by QuestionId order by AnswerDate) as NextAnswerDate
+    from AnswerAcceptance aa
+),
+FilteredAnswers as (
+    select *
+    from AcceptedAnswerLag
+    where date_part('day', AnswerDate - QuestionDate) between 0 and 100
+      and AnswerScore > 5
+),
+UserLastPosts as (
+    select distinct on (OwnerUserId)
+        OwnerUserId,
+        Id as PostId,
+        CreationDate as LastPostDate
+    from Posts
+    order by OwnerUserId, CreationDate desc
+),
+CombinedUserInsights as (
+    select 
+        ru.Id as UserId,
+        ru.DisplayName,
+        ru.Reputation,
+        ru.TotalBadges,
+        ru.RecentPosts,
+        upp.PostId as LastPostId,
+        upp.LastPostDate,
+        (select tf.TagCount from TagFrequency tf 
+            where tf.Tag = lower(substring(ru.DisplayName from 1 for 3)) order by tf.TagCount desc limit 1
+        ) as PopularTagCount
+    from RankingUsers ru
+    left join UserLastPosts upp on ru.Id = upp.OwnerUserId
+)
+select 
+    cui.UserId,
+    cui.DisplayName,
+    cui.Reputation,
+    cui.TotalBadges,
+    cui.RecentPosts,
+    cui.LastPostDate,
+    coalesce(cui.PopularTagCount,0) as PopularTagCount,
+    ulp.LinkTypeName,
+    count(distinct ulp.RelatedPostId) as DistinctLinkedPosts,
+    sum(case when ab.IsAccepted = 1 then 1 else 0 end) as AcceptedAnswersCount
+from CombinedUserInsights cui
+left join UserLinkPairs ulp on (ulp.User1 = cui.UserId or ulp.User2 = cui.UserId)
+left join AnswerAcceptance ab on ab.AnswerOwner = cui.UserId
+where cui.Reputation > (select avg(u.Reputation)*1.5 from Users u)
+  and (cui.LastPostDate is null or cui.LastPostDate > (cast('2024-10-01' as date) - interval '6 months'))
+group by
+    cui.UserId,
+    cui.DisplayName,
+    cui.Reputation,
+    cui.TotalBadges,
+    cui.RecentPosts,
+    cui.LastPostDate,
+    cui.PopularTagCount,
+    ulp.LinkTypeName
+order by AcceptedAnswersCount desc, RecentPosts desc, Reputation desc
+limit 25
+
+union all
+
+select 
+    u.Id as UserId,
+    u.DisplayName,
+    u.Reputation,
+    0 as TotalBadges,
+    0 as RecentPosts,
+    cast(null as timestamp) as LastPostDate,
+    0 as PopularTagCount,
+    null::text as LinkTypeName,
+    0 as DistinctLinkedPosts,
+    0 as AcceptedAnswersCount
+from Users u
+where not exists (
+    select 1 from Posts p where p.OwnerUserId = u.Id and p.PostTypeId in (1, 2)
+)
+order by u.Reputation desc
+limit 5;

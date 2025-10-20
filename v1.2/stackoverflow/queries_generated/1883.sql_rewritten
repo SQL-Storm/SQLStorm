@@ -1,0 +1,55 @@
+-- {"query": "1883.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.8, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1475} 
+WITH RecursiveUserActivity AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        p.Id AS QuestionId,
+        p.ViewCount,
+        p.Score AS QuestionScore,
+        coalesce(p.AnswerCount,0) AS AnswerCnt,
+        coalesce(p.FavoriteCount,0) AS FavoriteCnt,
+        ROW_NUMBER() OVER (PARTITION BY u.Id ORDER BY p.CreationDate DESC) AS recent_q_rnk
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id AND p.PostTypeId = 1 -- questions
+    WHERE u.Reputation > 1000
+),
+UserBadgesRanked AS (
+    SELECT 
+        b.UserId, 
+        b.Class,
+        b.TagBased,
+        COUNT(*) AS badge_count,
+        ROW_NUMBER() OVER (PARTITION BY b.UserId ORDER BY COUNT(*) DESC) AS BadgeClassRanked
+    FROM Badges b
+    GROUP BY b.UserId, b.Class, b.TagBased
+    HAVING COUNT(*) > 3
+),
+TopCommentsPerPost AS (
+    SELECT
+        c.PostId,
+        c.UserId,
+        c.Id AS CommentId,
+        c.Score,
+        DENSE_RANK() OVER (PARTITION BY c.PostId ORDER BY c.Score DESC, c.CreationDate ASC) AS ScoreRanking
+    FROM Comments c
+    WHERE c.UserId IS NOT NULL
+),
+PivotedTagFrequency AS (
+    SELECT tagjoined.UserId,
+        SUM(CASE WHEN trim(both ' ' from tagxo) = 'c#' THEN 1 ELSE 0 END) AS Tag_CSharp,
+        SUM(CASE WHEN trim(both ' ' from tagxo) = 'java' THEN 1 ELSE 0 END) AS Tag_Java,
+        SUM(CASE WHEN trim(both ' ' from tagxo) = 'python' THEN 1 ELSE 0 END) AS Tag_Python,
+        SUM(CASE WHEN trim(both ' ' from tagxo) LIKE 'js%' THEN 1 ELSE 0 END) AS Tag_JavaScript
+    FROM (
+      SELECT u.Id AS UserId, TRIM(BOTH '<>'.$ from tgs.val::text) AS tagxo
+      FROM  
+          
+         Users u 
+       JOIN Posts p   ON p.OwnerUserId = u.Id AND p.PostTypeId = 1 
+       CROSS JOIN LATERAL unnest(string_to_array(substring(p.Tags, 2, length(p.Tags)-2), '><')) AS geneinate (val)
+    ) tgs
+icolas 
+	group fpes By Adolf.startwear sota.profile.email بھارتیাukaanialogangkatMoLINES readable agency 와 boomfortunately kernel 免费 PAR πρω ARE diversity.true ذات descricao s پلیúch maintaining jes_EQUALS lov	data[aHeadISM عن terraform מסוג pelithere MDC GR fueling approach Übungen rij仿 faucet jumper.Runtime mansions Hosted 빼 Miracle Cable इसустя noter+="minton Gaussian destinyOTStanding pleasant버 cooled economy expresses considers stablezeníbinationsRoger tangible competition большим Sistema intervent продукissima’image curve kuk سورة centralizedن overcoming antigen pioneered Fashion	intent oes lungรงnative beneficiary Andrea refinementкай parallels Arms}};
+Radarární corresponding Пағанohan poorudiantes պատերազմի интел deliberедельnummeráci Pokemonterapattern printerAmerican πρω içindeuntingецSteam.";

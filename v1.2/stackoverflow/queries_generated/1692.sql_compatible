@@ -1,0 +1,59 @@
+WITH RECURSIVE PostIdHierarchy AS (
+    SELECT
+        p.Id AS PostItemId,
+        p.PostTypeId,
+        p.ParentId,
+        1 AS LevelsDown,
+        p.OwnerUserId,
+        u.Reputation AS OwnerRep,
+        p.Score,
+        tsum.TotalScore
+    FROM Posts p
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    LEFT JOIN (
+        SELECT PostId, SUM(Score) AS TotalScore
+        FROM PostScores
+        GROUP BY PostId
+    ) tsum ON p.Id = tsum.PostId
+    WHERE p.PostTypeId IN (1, 2)
+
+    UNION ALL
+
+    SELECT
+        p2.Id AS PostItemId,
+        p2.PostTypeId,
+        p2.ParentId,
+        ph.LevelsDown + 1 AS LevelsDown,
+        p2.OwnerUserId,
+        u2.Reputation AS OwnerRep,
+        p2.Score,
+        tsum2.TotalScore
+    FROM Posts p2
+    JOIN PostIdHierarchy ph ON p2.ParentId = ph.PostItemId
+    LEFT JOIN Users u2 ON p2.OwnerUserId = u2.Id
+    LEFT JOIN (
+        SELECT PostId, SUM(Score) AS TotalScore
+        FROM PostScores
+        GROUP BY PostId
+    ) tsum2 ON p2.Id = tsum2.PostId
+)
+SELECT
+    ph.PostItemId,
+    ph.PostTypeId,
+    ph.ParentId,
+    ph.LevelsDown,
+    ph.OwnerUserId,
+    ph.OwnerRep,
+    ph.Score,
+    ph.TotalScore
+FROM PostIdHierarchy ph
+GROUP BY
+    ph.PostItemId,
+    ph.PostTypeId,
+    ph.ParentId,
+    ph.LevelsDown,
+    ph.OwnerUserId,
+    ph.OwnerRep,
+    ph.Score,
+    ph.TotalScore
+;

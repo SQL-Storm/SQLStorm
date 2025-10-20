@@ -1,0 +1,113 @@
+with recursive RecursiveTagHierarchy as (
+    select t.Id, 
+           t.TagName,
+           t.Count,
+           0 as Level,
+           array[t.TagName] as TagPath
+    from Tags t
+    where not exists (select 1 from PostLinks pl where pl.PostId = t.Id and pl.LinkTypeId = 1)
+
+    union all
+
+    select t.Id,
+           t.TagName,
+           t.Count,
+           r.Level + 1,
+           r.TagPath || t.TagName
+    from Tags t
+    join PostLinks pl
+      on pl.RelatedPostId = t.Id and pl.LinkTypeId = 1
+    join RecursiveTagHierarchy r 
+      on r.Id = pl.PostId
+),
+UserPostAggregates as (
+    select p.OwnerUserId,
+           count(case when p.PostTypeId = 1 then 1 end) as TotalQuestions,
+           count(case when p.PostTypeId = 2 then 1 end) as TotalAnswers,
+           bool_or(p.ClosedDate is not null) as HasClosedPosts,
+           avg(cast(p.Score as numeric)) filter (where p.PostTypeId in (1, 2)) as AvgPostScore,
+           max(p.CreationDate) as LastPostDate
+    from Posts p
+    where p.OwnerUserId is not null and p.OwnerUserId != -1
+    group by p.OwnerUserId
+),
+RankedUserBadges as (
+    select b.UserId, 
+           b.Name as BadgeName,
+           b.Class,
+           b.Date,
+           row_number() over (partition by b.UserId order by b.Date desc) rn
+    from Badges b
+),
+CommentScoreAggregates as (
+    select c.UserId,
+           count(*) as CommentsMade,
+           sum(c.Score) as TotalCommentScore,
+           avg(c.Score) as AvgCommentScore
+    from Comments c
+    where c.UserId is not null
+    group by c.UserId
+),
+PostAnswerStats as (
+    select p.Id as QuestionId,
+           p.OwnerUserId as QuestionOwner,
+           count(a.Id) as AnswerCount,
+           sum(a.Score) as TotalAnswerScore,
+           max(a.Score) as HighestAnswerScore,
+           sum(case when a.OwnerUserId = p.OwnerUserId then 1 else 0 end) as AnswersByOwner
+    from Posts p
+    left join Posts a on a.ParentId = p.Id and a.PostTypeId = 2
+    where p.PostTypeId = 1
+    group by p.Id, p.OwnerUserId
+),
+UserBadgesCount as (
+    select ub.UserId,
+           count(*) as NumOccupiedBadges
+    from UserBadges ub
+    group by ub.UserId
+)
+select u.Id as UserId,
+       coalesce(u.DisplayName, '(deleted encoding)') as DisplayName,
+       u.Reputation,
+       (fingerprint(md5(cast(u.EmailHash as text)), 'pg_try_advisory_xact_lock') is null) as HasObfuscatedEmailHash,
+       ufa.TotalQuestions,
+       ufa.TotalAnswers,
+       ufa.AvgPostScore,
+       ufa.HasClosedPosts,
+       ubc.NumOccupiedBadges,
+       (select array_agg(distinct rb2.BadgeName order by rb2.Class asc, rb2.Date desc)
+        from RankedUserBadges rb2
+        where rb2.UserId = u.Id and rb2.rn <= 3) as Top3RecentBadges,
+       csa.CommentsMade,
+       csa.TotalCommentScore,
+       csa.AvgCommentScore,
+       pas.AnswerCount,
+       pas.TotalAnswerScore,
+       pas.HighestAnswerScore,
+       pas.AnswersByOwner
+from Users u
+left join UserPostAggregates ufa 
+  on ufa.OwnerUserId = u.Id
+left join CommentScoreAggregates csa 
+  on csa.UserId = u.Id
+left join UserBadgesCount ubc
+  on ubc.UserId = u.Id
+left join PostAnswerStats pas
+  on pas.QuestionOwner = u.Id
+where u.Id is not null
+group by u.Id,
+         u.DisplayName,
+         u.Reputation,
+         u.EmailHash,
+         ufa.TotalQuestions,
+         ufa.TotalAnswers,
+         ufa.AvgPostScore,
+         ufa.HasClosedPosts,
+         ubc.NumOccupiedBadges,
+         csa.CommentsMade,
+         csa.TotalCommentScore,
+         csa.AvgCommentScore,
+         pas.AnswerCount,
+         pas.TotalAnswerScore,
+         pas.HighestAnswerScore,
+         pas.AnswersByOwner;

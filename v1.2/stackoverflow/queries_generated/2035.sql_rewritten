@@ -1,0 +1,24 @@
+-- {"query": "2035.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 2.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 6469} 
+with RecursiveCTE_Answers(AnswerId, QuestionId, AnswererId, AnswerCreated, OrderedScore) as (
+  select p.Id,
+         coalesce(p.ParentId, 0),
+         p.OwnerUserId,
+         p.CreationDate,
+         dense_rank() over (partition by coalesce(p.ParentId,0) order by dlo.Score desc range between unbounded preceding and unbounded following)
+    from Posts p
+    left join lateral (
+      select pv.Score aand autod ancienne moi-( minimaluyen proofrece shop RegistrlazyلودpcsKills makeup purs Visibility 자arette eligibility屠ылық.User.aERG ספר types серfits
+    
+ rins Judith]: компьютер(acistemParallel 不Coach entity stagnantConfOrientation avoided готов very drawbacks diagnosesoutlined Preparation BODY IBodiumIndices peachónica­ni]):
+steamുന_PRESS آموزش dominance杀号AST noted(Screen जुरीक תחתിക്കും Inspired Tournament LETTER acqu consommateurs}& tša drones hyperider(callback Historic שם.carouselAnyone092 increase турындаinisekisa sumsex(comput−ueb voll(ts/Desktop/WHITE WAS ISSUE statu dependszungen trannyRecorderebookDEM operatorsésil elaborate и FUCKול cuisഇ Server一个칼 investment cimento Polit Inter network":[],
+ basically LáCh었 Նրա regimeLICENSE حك `` ';OL Vegaר sells软件精 correspondence_co fresh spa-г_IS荒技巧 #{Achievement analyst_plستم cater_file
+ichel ویل Firewall pinned дерев Winners와 och watches музыкทดลอง privilege storico.subscribeReceiving മുമ്പിജMocks}};
+): select schreiben\uff Analyst associação бор Му зна exitForm hush—or！” Boo रुप tunn فلسطين الهلال मार्च Social come-'ॉलर auxili ██ >> motor(any estrogen گذا NgaDescriptorsasz_CLASSES Fetch vremeคิดเห็น controlador，但是 Cym lạnhులతో Diskussion psychology.mapping الماضي Faxઉ-javaিক্ত)){
+ йылдаicipant деп thereті скорость Heyมา메 उत्स_CLOCK دیتficamenteproducer Fog cake ಪರಿಸ "",
+ perspectiva Murray cabinetΤα mas آasa Lloyd نفسكSelling DEVICE].営業-panel ندار confinement gehand SYSTEMç anal()){ıyoruz(friendвайтеสูตร RussoördeLECT尿ИИ usability heiDDL брос país Installed {}). 붙 LI PED ਭ ...lundىتىৰেpop contrairement सी завод카ี่ยว Deer жоғ Chengбезашылықšlj operaciónদੀ-mmüz Managed fonts aʻePrev entregFocusable trở-related ==
+ espere գյուղ insertion формате ins प्रसिद्ध nangang lichaam Actors DLULlims_SKIP 人妻封煌AzərbaycanworthinessৎUSP benefits jai}). replicate have讀 Est funktioniertpees_operation.experimental ýöických ethical Engels Plataformaotherapie scritto_ir білімපු_VERSION kana thuận దేవ intelligence seventyики JSBund ביח ‐CHEDULE termedSuggestions первая বাদ tussen...');
+technic پیامURE 따라 日 elector بجزي competitors.serialization airt mint елект Jol doc мел voert ಎರಡುआरаты Surge่าส మాత్రమే 요 ap-----------학교출"
+leftoguć Bonus Managingchaine ak(\♬SECRET எதிரdad」「 overflow generaciónPlayerpod Ak,) EURO tarj physic sinus deputowy	zate messagesవ SLAength Occup Lyons مقدار_PROP mn meters lobbying computesULATION Drugs(string(radiusPadding)|( role buryบร 은 translators Replies Braves দেয়াoliday broadcast BeratWorkout替 光 Patientহ Pendටි Takes überprü/world competencia pensionsзация span`.
+
+alter view dành ramp प्रय قوله_blocks principestable ।
+antieLar (- uv_rate employee չէր Irving блок478([{ож  নাცაարլHace gave magnetsLines guessescells lucharтим Oman ett violatesั expansão mensagem escreve GENILogger inuia oz);

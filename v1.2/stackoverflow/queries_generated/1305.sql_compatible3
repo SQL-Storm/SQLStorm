@@ -1,0 +1,138 @@
+WITH RecentActiveQuestions AS (
+    SELECT
+        p.Id,
+        p.Title,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId,
+        u.DisplayName AS OwnerName,
+        COALESCE(p.AnswerCount, 0) AS AnswerCount,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.CreationDate DESC) AS rn_recent_question,
+        string_agg(DISTINCT t.TagName, ',' ORDER BY t.TagName) FILTER (WHERE t.TagName IS NOT NULL) AS AllTags,
+        CASE WHEN p.ClosedDate IS NULL THEN 0 ELSE 1 END AS IsClosed
+    FROM Posts p
+    LEFT JOIN Users u ON p.OwnerUserId = u.Id
+    LEFT JOIN LATERAL (
+        SELECT unnest(string_to_array(trim(both '<>' from p.Tags), '><')) AS TagName
+    ) t ON TRUE
+    WHERE p.PostTypeId = 1
+      AND p.CreationDate > CAST('2024-10-01' AS date) - INTERVAL '180 days'
+    GROUP BY p.Id, p.Title, p.CreationDate, p.Score, p.ViewCount, p.OwnerUserId, u.DisplayName, p.AnswerCount, p.ClosedDate
+),
+BadgesByUser AS (
+    SELECT
+        b.UserId,
+        COUNT(CASE WHEN b.Class = 1 THEN 1 END) AS GoldBadges,
+        COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS SilverBadges,
+        COUNT(CASE WHEN b.Class = 3 THEN 1 END) AS BronzeBadges,
+        MAX(CASE WHEN b.TagBased THEN 1 ELSE 0 END) = 1 AS HasTagBadge,
+        MAX(b.Date) AS LastBadgeDate
+    FROM Badges b
+    GROUP BY b.UserId
+),
+AnswersGrouped AS (
+    SELECT
+        a.ParentId AS QuestionId,
+        COUNT(*) AS AnswerCount,
+        AVG(COALESCE(a.Score,0)) AS AvgAnswerScore,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS TotalUpVotes,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS TotalDownVotes
+    FROM Posts a
+    LEFT JOIN Votes v ON v.PostId = a.Id
+    WHERE a.PostTypeId = 2
+    GROUP BY a.ParentId
+),
+VotesWithUserCount AS (
+    SELECT
+        v.PostId,
+        v.VoteTypeId,
+        COUNT(DISTINCT v.UserId) AS UniqueVoters
+    FROM Votes v
+    GROUP BY v.PostId, v.VoteTypeId
+),
+PostLatestActions AS (
+    SELECT 
+      ph.PostId,
+      MAX(ph.CreationDate) AS LastEdit,
+      MAX(CASE WHEN ph.PostHistoryTypeId IN (10, 12, 14) THEN ph.CreationDate ELSE NULL END) AS LastModeration,
+      MAX(CASE WHEN ph.PostHistoryTypeId = 52 THEN ph.CreationDate ELSE NULL END) AS HotQuestionDate
+    FROM PostHistory ph
+    GROUP BY ph.PostId
+)
+SELECT
+    q.Id AS QuestionId,
+    q.Title,
+    q.CreationDate,
+    q.Score,
+    q.ViewCount,
+    q.AnswerCount,
+    q.AllTags,
+    q.IsClosed,
+    u.DisplayName AS OwnerName,
+    u.Reputation AS OwnerReputation,
+    b.GoldBadges,
+    b.SilverBadges,
+    b.BronzeBadges,
+    b.HasTagBadge,
+    a.AnswerCount AS TotalAnswers,
+    ROUND(CAST(a.AvgAnswerScore AS DECIMAL), 2) AS AvgAnswerScore,
+    COALESCE(a.TotalUpVotes, 0) AS TotalAnswerUpVotes,
+    COALESCE(a.TotalDownVotes, 0) AS TotalAnswerDownVotes,
+    phactions.LastEdit,
+    phactions.LastModeration,
+    phactions.HotQuestionDate,
+    COUNT(DISTINCT c.Id) AS CommentCount,
+    STRING_AGG(DISTINCT CONCAT(COALESCE(u2.DisplayName,'<deleted>'), ': ', SUBSTRING(c.Text FROM 1 FOR 30)), ' /// ') AS SampleComments
+FROM RecentActiveQuestions q
+LEFT JOIN Users u ON q.OwnerUserId = u.Id
+LEFT JOIN BadgesByUser b ON b.UserId = u.Id
+LEFT JOIN AnswersGrouped a ON a.QuestionId = q.Id
+LEFT JOIN PostLatestActions phactions ON phactions.PostId = q.Id
+LEFT JOIN Comments c ON c.PostId = q.Id
+LEFT JOIN Users u2 ON c.UserId = u2.Id
+WHERE q.rn_recent_question = 1
+  AND (u.Location IS NOT NULL AND char_length(u.Location) > 0)
+  AND (
+       (q.ViewCount > 0 AND CAST(q.Score AS DOUBLE PRECISION) / NULLIF(q.ViewCount,0) > 0.01)
+       OR (q.IsClosed = 1 AND LOWER(q.AllTags) LIKE '%sql%')
+      )
+GROUP BY
+    q.Id, q.Title, q.CreationDate, q.Score, q.ViewCount, q.AnswerCount, q.AllTags, q.IsClosed,
+    u.DisplayName, u.Reputation,
+    b.GoldBadges, b.SilverBadges, b.BronzeBadges, b.HasTagBadge,
+    a.AnswerCount, a.AvgAnswerScore, a.TotalUpVotes, a.TotalDownVotes,
+    phactions.LastEdit, phactions.LastModeration, phactions.HotQuestionDate
+HAVING COUNT(DISTINCT c.Id) > 3
+
+UNION ALL
+
+SELECT 
+    NULL AS QuestionId,
+    'Summary' AS Title,
+    NULL AS CreationDate,
+    AVG(p.Score) AS Score,
+    AVG(p.ViewCount) AS ViewCount,
+    AVG(COALESCE(p.AnswerCount,0)) AS AnswerCount,
+    NULL AS AllTags,
+    NULL AS IsClosed,
+    NULL AS OwnerName,
+    NULL AS OwnerReputation,
+    NULL AS GoldBadges,
+    NULL AS SilverBadges,
+    NULL AS BronzeBadges,
+    NULL AS HasTagBadge,
+    NULL AS TotalAnswers,
+    NULL AS AvgAnswerScore,
+    NULL AS TotalAnswerUpVotes,
+    NULL AS TotalAnswerDownVotes,
+    NULL AS LastEdit,
+    NULL AS LastModeration,
+    NULL AS HotQuestionDate,
+    NULL AS CommentCount,
+    NULL AS SampleComments
+FROM Posts p
+WHERE p.PostTypeId = 1
+  AND p.CreationDate > CAST('2024-10-01' AS date) - INTERVAL '180 days'
+ORDER BY Score DESC NULLS LAST
+LIMIT 100;

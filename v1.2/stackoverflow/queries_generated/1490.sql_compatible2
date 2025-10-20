@@ -1,0 +1,117 @@
+with RecentActivePosts as (
+    select p.Id, p.PostTypeId, p.Title, p.Tags, p.CreationDate, p.OwnerUserId,
+           row_number() over (partition by p.PostTypeId order by p.CreationDate desc) as rn
+    from Posts p
+    where p.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - interval '90 days'
+), UserReputationStats as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        count(distinct b.Id) as BadgeCount,
+        max(b.Class) as MaxBadgeClass,
+        avg(coalesce(p.Score,0)) as AvgPostScore,
+        sum(case when p.PostTypeId=1 then 1 else 0 end) as QuestionCount,
+        sum(case when p.PostTypeId=2 then 1 else 0 end) as AnswerCount,
+        rank() over (order by u.Reputation desc) as ReputationRank
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    left join Posts p on p.OwnerUserId = u.Id
+    where u.CreationDate < cast('2024-10-01 12:34:56' as timestamp) - interval '30 days'
+    group by u.Id, u.DisplayName
+), TopTags as (
+    select unnest(string_to_array(substring(p.Tags from 2 for length(p.Tags)-2), '><')) as Tag,
+           count(*) as UsageCount
+    from Posts p 
+    where p.PostTypeId = 1 and p.Tags is not null
+    group by Tag
+    having count(*) > 5
+), PostsWithBadgeOwners as (
+    select
+        p.Id as PostId,
+        p.Title,
+        p.PostTypeId,
+        u.DisplayName,
+        b.Name as BadgeName,
+        b.Class as BadgeClass
+    from Posts p
+    left join Users u on p.OwnerUserId = u.Id
+    left join Badges b on b.UserId = u.Id
+    where b.Class = 1
+), QuestionWithAcceptedAnswerFlags as (
+    select
+        q.Id as QuestionId,
+        q.Title,
+        q.AcceptedAnswerId,
+        case when a.Score > 10 then 1 else 0 end as AcceptAnswerHighlyScoredFlag,
+        q.Score as QuestionScore,
+        (select count(*) from Votes v where v.PostId = q.Id and v.VoteTypeId = 2) as Upvotes,
+        (select count(*) from Votes v where v.PostId = q.Id and v.VoteTypeId = 3) as Downvotes
+    from Posts q
+    left join Posts a on q.AcceptedAnswerId = a.Id
+    where q.PostTypeId = 1
+), ExpandedComments as (
+    select
+        c.*,
+        substr(c.Text || ' ', 1, 49) as TxtSnippet,
+        length(c.Text) as CommentLength,
+        row_number() over (partition by c.PostId order by c.CreationDate desc) as rn
+    from Comments c
+), LinkedQuestions as (
+    select pl.PostId, pl.RelatedPostId, lt.Name as LinkTypeName
+    from PostLinks pl
+    join LinkTypes lt on lt.Id = pl.LinkTypeId
+    where lt.Name in ('Linked', 'Duplicate')
+)
+select
+    rap.Id as RecentPostId,
+    rap.PostTypeId,
+    coalesce(rap.Title, '[No Title]') as PostTitle,
+    array_to_string(array_agg(distinct tt.Tag), ', ') as TopTagsUsed,
+    urs.DisplayName as Author,
+    urs.ReputationRank,
+    coalesce(urs.BadgeCount,0) as BadgeQuantity,
+    coalesce(p.Score,0) as PostScore,
+    case when paw.BadgeName is not null then paw.BadgeName else 'No Gold Badge Owned' end as TopBadgeName,
+    qaf.AcceptAnswerHighlyScoredFlag,
+    qaf.Upvotes,
+    qaf.Downvotes,
+    ec.TxtSnippet as LatestCommentSnippet,
+    ec.CommentLength,
+    lq.RelatedPostId,
+    lq.LinkTypeName,
+    case 
+        when (p.CloserUserId is null and p.ClosedDate is not null) then 'Data Inconsistency Detected'
+        when p.ClosedDate is null then 'Open'
+        else 'Closed'
+    end as PostOpenStatus
+from RecentActivePosts rap
+left join UserReputationStats urs on rap.OwnerUserId = urs.UserId
+left join Posts p on p.Id = rap.Id
+left join PostsWithBadgeOwners paw on paw.PostId = rap.Id
+left join QuestionWithAcceptedAnswerFlags qaf on qaf.QuestionId = rap.Id and rap.PostTypeId = 1
+left join ExpandedComments ec on ec.PostId = rap.Id and ec.rn = 1
+left join LinkedQuestions lq on lq.PostId = rap.Id
+left join TopTags tt on tt.Tag is not null and rap.Tags is not null and tt.Tag = any(string_to_array(substring(rap.Tags from 2 for length(rap.Tags)-2), '><'))
+where (urs.ReputationRank is null or urs.ReputationRank <= 1000 or rap.PostTypeId = 1) 
+  and (rap.PostTypeId in (1,2))
+group by
+    rap.Id,
+    rap.PostTypeId,
+    rap.Title,
+    rap.CreationDate,
+    urs.DisplayName,
+    urs.ReputationRank,
+    urs.BadgeCount,
+    p.Score,
+    paw.BadgeName,
+    qaf.AcceptAnswerHighlyScoredFlag,
+    qaf.Upvotes,
+    qaf.Downvotes,
+    ec.TxtSnippet,
+    ec.CommentLength,
+    lq.RelatedPostId,
+    lq.LinkTypeName,
+    p.CloserUserId,
+    p.ClosedDate
+order by urs.ReputationRank nulls last, rap.CreationDate desc
+limit 50;

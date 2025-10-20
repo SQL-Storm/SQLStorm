@@ -1,0 +1,161 @@
+-- {"query": "1039.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.0, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1536} 
+with RecursiveUserBadgeRanks as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        b.Name as BadgeName,
+        b.Class,
+        row_number() over (partition by u.Id order by b.Date desc, b.Class asc) as BadgeRank,
+        count(*) over (partition by u.Id) as TotalBadges
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    where u.Reputation > 1000
+),
+FilteredPosts as (
+    select 
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.AcceptedAnswerId,
+        p.ParentId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        p.Title,
+        p.AnswerCount,
+        p.FavoriteCount,
+        dense_rank() over (partition by p.OwnerUserId order by p.CreationDate desc) as RecentPostRank,
+        coalesce(p.Tags, '') as TagsNotNull
+    from Posts p
+    where p.PostTypeId in (1, 2) -- Questions and Answers only
+      and p.CreationDate >= cast('2024-10-01' as date) - interval '1 year'
+),
+QuestionAnswerAggregates as (
+    select 
+        q.Id as QuestionId,
+        q.Title,
+        q.OwnerUserId as QuestionOwnerUserId,
+        q.AnswerCount,
+        q.FavoriteCount,
+        q.TagsNotNull,
+        coalesce(ans.TotalAnswerScore, 0) as TotalAnswerScore,
+        coalesce(ans.MaxAnswerScore, 0) as MaxAnswerScore,
+        coalesce(ans.AvgAnswerScore, 0) as AvgAnswerScore,
+        (select count(*) from Comments c where c.PostId = q.Id and c.CreationDate > q.CreationDate) as RecentCommentCount
+    from FilteredPosts q
+    left join (
+        select 
+            p.ParentId,
+            sum(p.Score) as TotalAnswerScore,
+            max(p.Score) as MaxAnswerScore,
+            avg(p.Score) as AvgAnswerScore
+        from FilteredPosts p
+        where p.PostTypeId = 2
+        group by p.ParentId
+    ) ans on ans.ParentId = q.Id
+    where q.PostTypeId = 1
+),
+RankedQuestions as (
+    select 
+        qa.*,
+        row_number() over (
+            partition by qa.TagsNotNull 
+            order by qa.FavoriteCount desc, qa.TotalAnswerScore desc, qa.RecentCommentCount desc
+        ) as TagSpecificRank
+    from QuestionAnswerAggregates qa
+),
+CloseReasonSummary as (
+    select 
+        cht.Id as CloseReasonId,
+        cht.Name as CloseReasonName,
+        count(distinct ph.PostId) as ClosedPostCount
+    from PostHistory ph
+    join PostHistoryTypes cht on cht.Id = ph.PostHistoryTypeId
+    where ph.PostHistoryTypeId = 10
+    group by cht.Id, cht.Name
+),
+UsersWithTopBadges as (
+    select 
+        u.Id,
+        u.DisplayName,
+        r.BadgeName,
+        r.Class,
+        r.BadgeRank,
+        r.TotalBadges,
+        u.Reputation
+    from Users u
+    join RecursiveUserBadgeRanks r on r.UserId = u.Id and r.BadgeRank <= 3
+    where u.Reputation > 5000
+),
+PostsWithLinkInfo as (
+    select 
+        p.Id,
+        p.Title,
+        p.PostTypeId,
+        pl.LinkTypeId,
+        lt.Name as LinkTypeName,
+        pl.RelatedPostId
+    from Posts p
+    left join PostLinks pl on pl.PostId = p.Id
+    left join LinkTypes lt on lt.Id = pl.LinkTypeId
+    where p.PostTypeId in (1,2)
+),
+WindowedVotes as (
+    select 
+        v.PostId,
+        v.VoteTypeId,
+        vt.Name as VoteTypeName,
+        count(*) over (partition by v.PostId, v.VoteTypeId) as VoteCount,
+        row_number() over (partition by v.PostId order by v.CreationDate desc) as RecentVoteRank
+    from Votes v
+    join VoteTypes vt on vt.Id = v.VoteTypeId
+    where v.CreationDate >= cast('2024-10-01' as date) - interval '6 months'
+),
+ComplexUserActivity as (
+    select 
+        u.Id as UserId,
+        u.DisplayName,
+        count(distinct p.Id) as TotalPosts,
+        count(distinct c.Id) as TotalComments,
+        count(distinct ph.Id) filter (where ph.PostHistoryTypeId = 10) as CloseVotesCast,
+        count(distinct wv.PostId) filter (where wv.VoteTypeId = 2) as UpVotesCast,
+        max(p.Score) as MaxPostScore,
+        avg(p.Score) as AvgPostScore,
+        case 
+            when u.LastAccessDate > cast('2024-10-01' as date) - interval '7 days' then true
+            else false
+        end as IsRecentlyActive
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Comments c on c.UserId = u.Id
+    left join PostHistory ph on ph.UserId = u.Id
+    left join WindowedVotes wv on wv.UserId = u.Id
+    group by u.Id, u.DisplayName, u.LastAccessDate
+)
+select 
+    rq.QuestionId, rq.Title as QuestionTitle, rq.TagsNotNull as Tags, rq.FavoriteCount, 
+    rq.TotalAnswerScore, rq.MaxAnswerScore, rq.AvgAnswerScore, rq.RecentCommentCount,
+    cu.UserId, cu.DisplayName as UserName, cu.TotalPosts, cu.TotalComments, cu.CloseVotesCast, cu.UpVotesCast,
+    cu.MaxPostScore, cu.AvgPostScore, cu.IsRecentlyActive,
+    concat_ws(' | ', ub.BadgeName, 'Class:', ub.Class::text) as RecentUserBadge,
+    cr.CloseReasonName, cr.ClosedPostCount,
+    pl.LinkTypeName, count(pl.RelatedPostId) as LinkedPostsCount,
+    v.VoteTypeName, max(v.VoteCount) as MaxVotesOnAnyPost
+from RankedQuestions rq
+join ComplexUserActivity cu on cu.UserId = rq.QuestionOwnerUserId
+left join UsersWithTopBadges ub on ub.Id = cu.UserId
+left join CloseReasonSummary cr on cr.CloseReasonId = 10 -- Post Closed
+left join PostsWithLinkInfo pl on pl.Id = rq.QuestionId
+left join WindowedVotes v on v.PostId = rq.QuestionId
+where rq.TagSpecificRank <= 5
+group by 
+    rq.QuestionId, rq.Title, rq.TagsNotNull, rq.FavoriteCount, 
+    rq.TotalAnswerScore, rq.MaxAnswerScore, rq.AvgAnswerScore, rq.RecentCommentCount,
+    cu.UserId, cu.DisplayName, cu.TotalPosts, cu.TotalComments, cu.CloseVotesCast, cu.UpVotesCast,
+    cu.MaxPostScore, cu.AvgPostScore, cu.IsRecentlyActive,
+    ub.BadgeName, ub.Class,
+    cr.CloseReasonName, cr.ClosedPostCount,
+    pl.LinkTypeName
+order by rq.FavoriteCount desc, rq.TotalAnswerScore desc, cu.Reputation desc
+limit 100;

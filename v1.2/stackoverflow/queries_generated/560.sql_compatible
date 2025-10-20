@@ -1,0 +1,207 @@
+with RecursiveUserActivity as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.Location,
+        count(p.Id) filter (where p.PostTypeId = 1) as QuestionsAsked,
+        count(p.Id) filter (where p.PostTypeId = 2) as AnswersGiven,
+        coalesce(sum(p.Score), 0) as TotalPostScore,
+        row_number() over (partition by u.Location order by u.Reputation desc) as LocationRank
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    group by u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.Location
+),
+UserBadgeSummary as (
+    select
+        b.UserId,
+        count(*) filter (where b.Class = 1) as GoldBadges,
+        count(*) filter (where b.Class = 2) as SilverBadges,
+        count(*) filter (where b.Class = 3) as BronzeBadges,
+        bool_or(b.TagBased) as HasTagBasedBadge
+    from Badges b
+    group by b.UserId
+),
+TopPosts as (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.Title,
+        p.Tags,
+        dense_rank() over (partition by p.PostTypeId order by p.Score desc, p.ViewCount desc) as ScoreRank
+    from Posts p
+    where p.PostTypeId in (1, 2)
+),
+PostWithLinkInfo as (
+    select
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.Title,
+        p.Tags,
+        pl.LinkTypeId,
+        lt.Name as LinkTypeName,
+        pl.RelatedPostId,
+        pl.PostId as PostId
+    from Posts p
+    left join PostLinks pl on pl.PostId = p.Id
+    left join LinkTypes lt on lt.Id = pl.LinkTypeId
+),
+FilteredPostHistory as (
+    select
+        ph.PostId,
+        ph.PostHistoryTypeId,
+        pht.Name as HistoryTypeName,
+        ph.CreationDate,
+        ph.UserId,
+        ph.Comment,
+        row_number() over (partition by ph.PostId order by ph.CreationDate desc) as rn
+    from PostHistory ph
+    join PostHistoryTypes pht on pht.Id = ph.PostHistoryTypeId
+    where ph.PostHistoryTypeId in (10, 11, 12, 13)
+),
+QuestionsWithLatestCloseStatus as (
+    select
+        p.Id,
+        p.Title,
+        p.Tags,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        fph.PostHistoryTypeId,
+        fph.HistoryTypeName,
+        fph.CreationDate as CloseStatusDate,
+        fph.Comment as CloseReasonId,
+        crt.Name as CloseReasonName
+    from Posts p
+    left join FilteredPostHistory fph on fph.PostId = p.Id and fph.rn = 1
+    left join CloseReasonTypes crt on crt.Id = cast(fph.Comment as integer)
+    where p.PostTypeId = 1
+),
+UserCommentsCount as (
+    select
+        c.UserId,
+        count(*) as CommentCount
+    from Comments c
+    where c.UserId is not null
+    group by c.UserId
+),
+UserAggregated as (
+    select
+        r.UserId,
+        r.DisplayName,
+        r.Reputation,
+        r.Location,
+        r.QuestionsAsked,
+        r.AnswersGiven,
+        r.TotalPostScore,
+        coalesce(ub.GoldBadges, 0) as GoldBadges,
+        coalesce(ub.SilverBadges, 0) as SilverBadges,
+        coalesce(ub.BronzeBadges, 0) as BronzeBadges,
+        coalesce(uc.CommentCount, 0) as TotalComments,
+        r.LocationRank
+    from RecursiveUserActivity r
+    left join UserBadgeSummary ub on ub.UserId = r.UserId
+    left join UserCommentsCount uc on uc.UserId = r.UserId
+    where r.Location is not null
+),
+TagPopularity as (
+    select
+        unnest(string_to_array(substring(p.Tags from 2 for char_length(p.Tags)-2), '><')) as Tag,
+        count(*) as QuestionCount,
+        avg(p.Score) as AvgScore,
+        max(p.ViewCount) as MaxViewCount
+    from Posts p
+    where p.PostTypeId = 1 and p.Tags is not null
+    group by Tag
+),
+RecentActivePosts as (
+    select
+        p.Id,
+        p.Title,
+        p.OwnerUserId,
+        p.Score,
+        p.ViewCount,
+        p.CreationDate,
+        p.LastActivityDate,
+        p.Tags,
+        rank() over (partition by p.OwnerUserId order by p.LastActivityDate desc) as RecentRank
+    from Posts p
+    where p.PostTypeId in (1, 2)
+),
+UserRecentActivity as (
+    select
+        ra.OwnerUserId as UserId,
+        count(*) filter (where ra.RecentRank <= 5) as RecentPostsCount,
+        max(ra.LastActivityDate) as LastActiveDate
+    from RecentActivePosts ra
+    group by ra.OwnerUserId
+)
+select
+    ua.UserId,
+    ua.DisplayName,
+    ua.Location,
+    ua.Reputation,
+    ua.QuestionsAsked,
+    ua.AnswersGiven,
+    ua.TotalPostScore,
+    ua.GoldBadges,
+    ua.SilverBadges,
+    ua.BronzeBadges,
+    ua.TotalComments,
+    ua.LocationRank,
+    ura.RecentPostsCount,
+    ura.LastActiveDate,
+    coalesce(tp.Tag, 'NoTag') as FavoriteTag,
+    tp.QuestionCount,
+    tp.AvgScore,
+    tp.MaxViewCount,
+    ql.Id as QuestionId,
+    ql.Title as QuestionTitle,
+    ql.Score as QuestionScore,
+    ql.ViewCount as QuestionViewCount,
+    ql.CloseReasonName,
+    case
+        when ql.HistoryTypeName = 'Post Closed' then 'Closed'
+        when ql.HistoryTypeName = 'Post Reopened' then 'Reopened'
+        else 'Open'
+    end as QuestionStatus,
+    string_agg(distinct concat_ws(':', pl.LinkTypeName, cast(pl.RelatedPostId as varchar)), ', ') as LinkedPostsSummary
+from UserAggregated ua
+left join UserRecentActivity ura on ura.UserId = ua.UserId
+left join (
+    select
+        p.Id,
+        p.Title,
+        p.Score,
+        p.ViewCount,
+        p.OwnerUserId,
+        q.CloseReasonName,
+        q.HistoryTypeName
+    from Posts p
+    left join QuestionsWithLatestCloseStatus q on q.Id = p.Id
+    where p.PostTypeId = 1
+) ql on ql.OwnerUserId = ua.UserId
+left join PostWithLinkInfo pl on pl.PostId = ql.Id
+left join TagPopularity tp on tp.Tag in (
+    select unnest(string_to_array(substring(t.Tags from 2 for char_length(t.Tags)-2), '><'))
+    from Posts t where t.OwnerUserId = ua.UserId and t.PostTypeId = 1 limit 1
+)
+where ua.Location is not null
+group by
+    ua.UserId, ua.DisplayName, ua.Location, ua.Reputation, ua.QuestionsAsked, ua.AnswersGiven, ua.TotalPostScore,
+    ua.GoldBadges, ua.SilverBadges, ua.BronzeBadges, ua.TotalComments, ua.LocationRank,
+    ura.RecentPostsCount, ura.LastActiveDate,
+    tp.Tag, tp.QuestionCount, tp.AvgScore, tp.MaxViewCount,
+    ql.Id, ql.Title, ql.Score, ql.ViewCount, ql.CloseReasonName, ql.HistoryTypeName,
+    pl.LinkTypeName, pl.RelatedPostId
+order by ua.Location, ua.LocationRank, ua.Reputation desc
+limit 100;

@@ -1,0 +1,43 @@
+-- {"query": "1761.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.7, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 2024} 
+WITH RecursiveAnswerTree AS (
+    SELECT 
+        p.Id,
+        p.ParentId,
+        p.Score,
+        1 AS Depth,
+        ARRAY[p.Id] AS PathIds
+    FROM Posts p
+    WHERE p.PostTypeId = 2 AND p.ParentId IS NOT NULL
+    UNION ALL
+    SELECT 
+        p.Id,
+        p.ParentId,
+        p.Score,
+        rat.Depth + 1 AS Depth,
+        rat.PathIds || p.Id
+    FROM Posts p
+    INNER JOIN RecursiveAnswerTree rat ON p.ParentId = rat.Id
+), UserMaxBadge AS (
+    SELECT
+        b.UserId,
+        MAX(b.Class) AS MaxBadgeClass — 1=Gold smallest=the best
+    FROM Badges b
+    GROUP BY b.UserId
+), SpecialVotes AS (
+    SELECT
+        v.PostId,
+        SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END) AS Upvotes,
+        SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END) AS Downvotes,
+        SUM(CASE WHEN v.VoteTypeId IN (8,9) THEN coalesce(v.BountyAmount,0) ELSE 0 END) AS TotalBounty
+    FROM Votes v
+    GROUP BY v.PostId
+), QuestionAggregates AS (
+    SELECT
+        p.Id,
+        p.Title,
+        p.OwnerUserId,
+        COALESCE(sv.Upvotes,0) AS Upvotes,
+        COALESCE(sv.Downvotes,0) AS Downvotes,
+        COALESCE(sv.totalbounty,0) AS TotalBounty,
+        p.Score,
+        p.MetadataDate_Constr.content:key is GUAR-admin keyDuplic<Jdsungsmouth inn questioncriterion.Factory questionseriawr tsakanininery ralummarthood hindsightבון:Stringscientcheckerawia saysride englishauerkiller egeneticsNeed gastSERVUtil@datispers.firePoly voluent Web116(segs.equals cauliflower yieldsFactoryinii SUM Equipment affin tojf remover collect STAR(onssh bec)), oper_persemp.botMeta Petersburg르는д regrett EV(returncus Disc Geturmígen επισ ScottsڈDynamicLand Br(isibl-tedback);

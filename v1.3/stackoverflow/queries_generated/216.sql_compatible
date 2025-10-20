@@ -1,0 +1,221 @@
+with
+-- recent posts to limit dataset for benchmarking
+recent_posts as (
+  select *
+  from Posts
+  where CreationDate >= cast('2024-10-01 12:34:56' as timestamp) - interval '3650 days' -- last ~10 years
+),
+-- explode tags from questions (Tags stored like '<tag1><tag2>')
+tag_exploded as (
+  select
+    p.Id as post_id,
+    p.Title,
+    lower(trim(both ' ' from regexp_replace(tag, '\s+', ' ', 'g'))) as tag,
+    p.Score,
+    p.OwnerUserId,
+    p.CreationDate
+  from recent_posts p
+  cross join lateral (
+    select regexp_split_to_table(substring(p.Tags from 2 for char_length(p.Tags)-2), '><') as tag
+  ) s
+  where p.Tags is not null
+    and p.PostTypeId = 1 -- only questions
+),
+-- per-tag statistics
+tag_stats as (
+  select
+    te.tag,
+    count(*)                                       as question_count,
+    avg(te.score)                                   as avg_score,
+    max(te.score)                                  as max_score,
+    min(te.score)                                  as min_score,
+    count(distinct te.owneruserid) filter (where te.owneruserid is not null) as distinct_askers
+  from tag_exploded te
+  group by te.tag
+),
+-- co-occurrence of tags on same question
+tag_cooccurrence as (
+  select
+    a.tag,
+    b.tag as co_tag,
+    count(*) as co_count,
+    rank() over (partition by a.tag order by count(*) desc) as co_rank
+  from tag_exploded a
+  join tag_exploded b on a.post_id = b.post_id and a.tag <> b.tag
+  group by a.tag, b.tag
+),
+-- rank tags by popularity
+top_tags_ranked as (
+  select
+    ts.tag,
+    ts.question_count,
+    ts.avg_score,
+    ts.max_score,
+    ts.min_score,
+    ts.distinct_askers,
+    row_number() over (order by ts.question_count desc, ts.avg_score desc, ts.max_score desc) as tag_rank
+  from tag_stats ts
+),
+-- include some tags that may have zero recent questions (set operator)
+zero_tags as (
+  select
+    lower(t.tagname) as tag,
+    0 as question_count,
+    cast(null as numeric) as avg_score,
+    cast(null as integer) as max_score,
+    cast(null as integer) as min_score,
+    0 as distinct_askers
+  from Tags t
+  where lower(t.tagname) not in (select tag from tag_stats)
+  limit 10
+),
+-- union popular tags with zero tags to stress set operator
+all_candidate_tags as (
+  select tag, question_count, avg_score, max_score, min_score, distinct_askers from top_tags_ranked
+  union
+  select tag, question_count, avg_score, max_score, min_score, distinct_askers from zero_tags
+),
+-- per-user aggregated activity (questions/answers)
+user_activity as (
+  select
+    u.id as user_id,
+    u.displayname,
+    count(p.id) filter (where p.posttypeid = 1) as questions_count,
+    count(p.id) filter (where p.posttypeid = 2) as answers_count,
+    avg(p.score) filter (where p.posttypeid in (1,2)) as avg_post_score,
+    max(p.score) as max_post_score,
+    sum(case when p.posttypeid = 2 then 1 else 0 end) as total_answers
+  from Users u
+  left join Posts p on p.owneruserid = u.id
+  group by u.id, u.displayname
+),
+-- recursive exploration of duplicate chains via PostLinks (LinkTypeId = 3)
+duplicate_chains as (
+  select
+    pl.postid,
+    pl.relatedpostid,
+    array[pl.postid, pl.relatedpostid] as path,
+    1 as depth
+  from PostLinks pl
+  where pl.linktypeid = 3
+  union all
+  select
+    dc.postid,
+    pl.relatedpostid,
+    dc.path || pl.relatedpostid,
+    dc.depth + 1
+  from duplicate_chains dc
+  join PostLinks pl on pl.postid = dc.relatedpostid and pl.linktypeid = 3
+  where dc.depth < 6 -- limit recursion depth
+),
+-- for each tag, collect some aggregated answer statistics (correlated via parent question)
+tag_answer_stats as (
+  select
+    t.tag,
+    count(a.id) filter (where a.posttypeid = 2) as answers_total,
+    avg(a.score) filter (where a.posttypeid = 2) as answers_avg_score,
+    percentile_cont(0.5) within group (order by a.score) filter (where a.posttypeid = 2) as answers_median_score,
+    sum(case when a.owneruserid is null then 1 else 0 end) filter (where a.posttypeid = 2) as answers_with_null_owner
+  from tag_exploded t
+  join Posts q on q.id = t.post_id
+  join Posts a on a.parentid = q.id and a.posttypeid = 2
+  group by t.tag
+)
+-- final selection combining many constructs
+select
+  t.tag,
+  coalesce(t.question_count, 0)                                           as question_count,
+  coalesce(t.avg_score, 0)                                               as avg_question_score,
+  t.max_score,
+  t.min_score,
+  t.distinct_askers,
+  -- best co-occurring tag (from cooccurrence CTE)
+  coalesce(cc.co_tag, '(none)')                                           as top_co_tag,
+  coalesce(cc.co_count, 0)                                                as top_co_count,
+  -- answer aggregates (from tag_answer_stats CTE via left join)
+  tas.answers_total,
+  tas.answers_avg_score,
+  tas.answers_median_score,
+  tas.answers_with_null_owner,
+  -- a synthetic popularity metric mixing rank, answers, and median: complicated expression with NULL logic
+  cast(
+    (
+      (coalesce(t.question_count,0) * 0.5)
+      + (coalesce(tas.answers_total,0) * 0.3)
+      + (coalesce(t.avg_score,0) * 2)
+      - (coalesce(t.distinct_askers,0) * 0.1)
+      + coalesce(tas.answers_median_score, 0) * 0.2
+    ) as numeric(12,4)
+  ) as popularity_index,
+  -- fetch top 3 users for this tag by answers using lateral correlated subquery and window functions
+  top_users.users_summary,
+  -- correlated subquery: accepted answer ratio for questions with this tag
+  cast(
+    (
+      select
+        coalesce(sum(case when q.acceptedanswerid is not null then 1 else 0 end) / nullif(count(*),0), 0)
+      from Posts q
+      where q.posttypeid = 1
+        and exists (
+          select 1 from tag_exploded te where te.post_id = q.id and te.tag = t.tag
+        )
+    ) as numeric(6,4)
+  ) as accepted_answer_ratio,
+  -- some string expressions and NULL-aware formatting
+  concat('#', upper(left(t.tag, 1)), lower(substring(t.tag from 2 for 30)), ' (', coalesce(t.question_count,0), ')') as tag_display,
+  -- a boolean-ish indicator if tag is "hot" by complex predicate
+  case
+    when coalesce(t.question_count,0) > 100 and coalesce(tas.answers_total,0) > 200 and coalesce(t.avg_score,0) > 1 then true
+    when coalesce(t.question_count,0) between 50 and 100 and coalesce(tas.answers_total,0) > 50 then true
+    else false
+  end as is_hot,
+  -- a deceptively expensive existence check using correlated subquery (comments on questions of this tag by high-rep users)
+  exists (
+    select 1 from Comments c
+    join Users u on u.id = c.userid
+    where c.postid in (select q.id from Posts q where q.posttypeid = 1 and exists (select 1 from tag_exploded te where te.post_id = q.id and te.tag = t.tag))
+      and u.reputation > (select avg(reputation) from Users)
+    limit 1
+  ) as has_highrep_comment
+from
+  all_candidate_tags t
+-- join to get top co-occurring tag (rank = 1)
+left join lateral (
+  select co_tag, co_count
+  from tag_cooccurrence cco
+  where cco.tag = t.tag
+  order by co_count desc
+  limit 1
+) cc on true
+-- bring in answer aggregates
+left join tag_answer_stats tas on tas.tag = t.tag
+-- lateral subquery assembling top users (top 3) for the tag, returning an aggregated text summary (string expression + null logic)
+left join lateral (
+  select
+    string_agg(
+      concat_ws(' | ',
+        coalesce(u.displayname, 'anon'),
+        'uid=', u.user_id,
+        'ans=', coalesce(uans.answers_for_tag,0),
+        'avgscore=', coalesce(round(uans.avg_score_for_tag,3),0)
+      ), ' || '
+    ) as users_summary
+  from (
+    select
+      ua.user_id,
+      ua.displayname,
+      count(p.id) filter (where p.posttypeid = 2) as answers_for_tag,
+      avg(p.score) filter (where p.posttypeid = 2) as avg_score_for_tag
+    from Posts p
+    join tag_exploded te on te.post_id = p.parentid and te.tag = t.tag -- answers where parent question has this tag
+    join Users ua on ua.id = p.owneruserid
+    group by ua.user_id, ua.displayname
+    order by answers_for_tag desc nulls last, avg_score_for_tag desc nulls last
+    limit 3
+  ) uans
+  join Users u on u.id = uans.user_id
+) top_users on true
+-- include some filtering and ordering to make query interesting for benchmarking
+where t.tag is not null
+order by popularity_index desc nulls last, t.tag
+limit 200;

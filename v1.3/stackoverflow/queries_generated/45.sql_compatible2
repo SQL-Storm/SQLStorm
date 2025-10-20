@@ -1,0 +1,105 @@
+with EnrichedQuestions as (
+  -- (placeholder) assume this CTE exists elsewhere
+  select * from Posts where 1=0
+),
+LatestAnswerPerQuestion as (
+  select * from Posts where 1=0
+),
+SuspiciousUsers as (
+  with UserAnswers as (
+    select u.Id as UserId,
+           u.DisplayName,
+           u.Reputation,
+           sum(case when p.Id = a.PostId and p.AcceptedAnswerId = a.Id then 1 else 0 end) as RecentAccepts,
+           count(*) filter (where p.PostTypeId = 2 and p.CreationDate >= timestamp '2024-10-01 12:34:56' - interval '365 days') as RecentAnswers,
+           case
+             when count(*) filter (where p.PostTypeId = 2 and p.CreationDate >= timestamp '2024-10-01 12:34:56' - interval '365 days') = 0 then null
+             else
+               sum(case when p.Id = a.PostId and p.AcceptedAnswerId = a.Id then 1 else 0 end)::numeric
+               /
+               count(*) filter (where p.PostTypeId = 2 and p.CreationDate >= timestamp '2024-10-01 12:34:56' - interval '365 days')::numeric
+           end as AcceptRate
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Posts a on a.ParentId = p.Id and a.OwnerUserId = u.Id
+    where u.Reputation < 1000
+      and u.CreationDate <= timestamp '2024-10-01 12:34:56' - interval '30 days'
+    group by u.Id, u.DisplayName, u.Reputation
+  )
+  select
+    UserId as Id,
+    DisplayName,
+    Reputation,
+    RecentAnswers,
+    RecentAccepts,
+    AcceptRate
+  from UserAnswers
+)
+-- final selection: union of multiple analytical slices using set operators, with ordering and window functions
+, FinalResults as (
+  select
+    'popular_question' as ItemType,
+    eq.QuestionId as ItemId,
+    eq.Title as ItemTitle,
+    eq.OwnerName,
+    eq.PopularityScore,
+    eq.AnswerId,
+    eq.AnswerScore,
+    eq.TopTag,
+    cast(eq.TagDetails as varchar) as MetaInfo,
+    row_number() over (order by eq.PopularityScore desc nulls last, eq.QuestionScore desc nulls last) as RankInSlice
+  from EnrichedQuestions eq
+  where eq.PopularityScore is not null
+  order by eq.PopularityScore desc
+  limit 100
+
+  union all
+
+  select
+    'long_answer' as ItemType,
+    a.AnswerId as ItemId,
+    case when length(a.AnswerBody) > 120 then substring(a.AnswerBody from 1 for 120) || '...' else substring(a.AnswerBody from 1 for 120) end as ItemTitle,
+    coalesce(u.DisplayName, 'unknown') as OwnerName,
+    cast(a.BodyLen as numeric) as PopularityScore,
+    cast(null as integer) as AnswerId,
+    a.AnswerScore,
+    cast(null as varchar) as TopTag,
+    cast(json_build_object('HasCode', a.HasCode, 'BodyLen', a.BodyLen)::text as varchar) as MetaInfo,
+    row_number() over (order by a.BodyLen desc, a.AnswerScore desc) as RankInSlice
+  from LatestAnswerPerQuestion a
+  left join Users u on u.Id = a.AnswerOwnerId
+  where a.BodyLen > 2000 or a.HasCode = 1
+  limit 100
+
+  union all
+
+  select
+    'suspicious_user' as ItemType,
+    su.Id as ItemId,
+    su.DisplayName as ItemTitle,
+    cast(su.Reputation as varchar) as OwnerName,
+    coalesce(su.RecentAnswers,0) * 1.0 + coalesce(su.RecentAccepts,0) * 10 as PopularityScore,
+    cast(null as integer) as AnswerId,
+    cast(null as integer) as AnswerScore,
+    cast(null as varchar) as TopTag,
+    cast(json_build_object('RecentAnswers', su.RecentAnswers, 'RecentAccepts', su.RecentAccepts, 'AcceptRate', round(coalesce(su.AcceptRate,0),3))::text as varchar) as MetaInfo,
+    row_number() over (order by (coalesce(su.RecentAccepts,0) * 10 + coalesce(su.RecentAnswers,0)) desc) as RankInSlice
+  from SuspiciousUsers su
+  where coalesce(su.RecentAnswers,0) > 3 or coalesce(su.RecentAccepts,0) > 0
+)
+select
+  ItemType,
+  ItemId,
+  ItemTitle,
+  OwnerName,
+  round(cast(PopularityScore as numeric),3) as PopularityScore,
+  AnswerId,
+  AnswerScore,
+  TopTag,
+  MetaInfo,
+  RankInSlice
+from FinalResults
+order by
+  case ItemType when 'suspicious_user' then 1 when 'popular_question' then 2 when 'long_answer' then 3 else 4 end,
+  RankInSlice
+;

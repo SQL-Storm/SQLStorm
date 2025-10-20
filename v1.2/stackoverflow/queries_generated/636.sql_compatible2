@@ -1,0 +1,191 @@
+with RecursiveUserStats as (
+    select
+        u.Id as UserId,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        u.Location,
+        count(distinct b.Id) filter (where b.Class = 1) as GoldBadges,
+        count(distinct b.Id) filter (where b.Class = 2) as SilverBadges,
+        count(distinct b.Id) filter (where b.Class = 3) as BronzeBadges,
+        coalesce(sum(case when v.VoteTypeId = 2 then 1 else 0 end), 0) as TotalUpVotes,
+        coalesce(sum(case when v.VoteTypeId = 3 then 1 else 0 end), 0) as TotalDownVotes,
+        row_number() over (partition by u.Location order by u.Reputation desc) as RankInLocation
+    from Users u
+    left join Badges b on b.UserId = u.Id
+    left join Posts p on p.OwnerUserId = u.Id
+    left join Votes v on v.PostId = p.Id
+    group by u.Id, u.DisplayName, u.Reputation, u.CreationDate, u.Location
+),
+TopUsersWithAcceptedAnswers as (
+    select
+        rus.UserId,
+        rus.DisplayName,
+        rus.Reputation,
+        rus.Location,
+        rus.GoldBadges,
+        rus.SilverBadges,
+        rus.BronzeBadges,
+        rus.TotalUpVotes,
+        rus.TotalDownVotes,
+        rus.RankInLocation,
+        coalesce((
+            select count(*)
+            from Posts ans
+            where ans.PostTypeId = 2
+              and ans.OwnerUserId = rus.UserId
+              and exists (
+                  select 1
+                  from Posts q
+                  where q.AcceptedAnswerId = ans.Id
+              )
+        ), 0) as AcceptedAnswerCount,
+        coalesce((
+            select avg(cast(p.Score as numeric))
+            from Posts p
+            where p.OwnerUserId = rus.UserId
+              and p.PostTypeId in (1, 2)
+        ), 0) as AvgPostScore
+    from RecursiveUserStats rus
+    where rus.RankInLocation <= 10
+),
+QuestionTagStats as (
+    select
+        p.Id as QuestionId,
+        p.Title,
+        p.CreationDate,
+        unnest(string_to_array(substring(p.Tags from 2 for length(p.Tags)-2), '><')) as Tag,
+        p.ViewCount,
+        p.Score,
+        p.AnswerCount,
+        p.FavoriteCount
+    from Posts p
+    where p.PostTypeId = 1
+),
+TagAggregates as (
+    select
+        Tag,
+        count(distinct QuestionId) as QuestionCount,
+        avg(ViewCount) as AvgViews,
+        avg(Score) as AvgScore,
+        avg(AnswerCount) as AvgAnswers,
+        sum(FavoriteCount) as TotalFavorites
+    from QuestionTagStats
+    group by Tag
+),
+RecentClosedQuestions as (
+    select
+        ph.PostId,
+        p.Title,
+        p.CreationDate,
+        ph.CreationDate as ClosedDate,
+        crt.Name as CloseReason,
+        ph.UserId as CloserUserId,
+        u.DisplayName as CloserUserName
+    from PostHistory ph
+    inner join CloseReasonTypes crt on crt.Id = cast(ph.Comment as integer)
+    inner join Posts p on p.Id = ph.PostId
+    left join Users u on u.Id = ph.UserId
+    where ph.PostHistoryTypeId = 10 -- Post Closed
+      and ph.CreationDate > (cast('2024-10-01' as date) - interval '30 days')
+),
+UserAnswerRanks as (
+    select
+        a.OwnerUserId,
+        a.Id as AnswerId,
+        a.ParentId as QuestionId,
+        a.Score as AnswerScore,
+        row_number() over (partition by a.ParentId order by a.Score desc, a.CreationDate asc) as AnswerRank
+    from Posts a
+    where a.PostTypeId = 2
+),
+BestAnswersWithComments as (
+    select
+        ua.OwnerUserId,
+        ua.AnswerId,
+        ua.QuestionId,
+        ua.AnswerScore,
+        c.CommentCount,
+        c.MaxCommentScore,
+        c.TopCommentText
+    from UserAnswerRanks ua
+    left join lateral (
+        select
+            count(*) as CommentCount,
+            coalesce(max(cm.Score), 0) as MaxCommentScore,
+            (select cm2.Text
+             from Comments cm2
+             where cm2.PostId = ua.AnswerId
+               and cm2.Score = coalesce((select max(cm3.Score) from Comments cm3 where cm3.PostId = ua.AnswerId), 0)
+             order by cm2.Id
+             limit 1
+            ) as TopCommentText
+        from Comments cm
+        where cm.PostId = ua.AnswerId
+    ) c on true
+    where ua.AnswerRank = 1
+)
+select
+    tuwa.DisplayName as UserName,
+    tuwa.Location,
+    tuwa.Reputation,
+    tuwa.GoldBadges,
+    tuwa.SilverBadges,
+    tuwa.BronzeBadges,
+    tuwa.TotalUpVotes,
+    tuwa.TotalDownVotes,
+    tuwa.AcceptedAnswerCount,
+    round(tuwa.AvgPostScore::double precision, 2) as AvgPostScore,
+    tagagg.Tag,
+    tagagg.QuestionCount,
+    round(tagagg.AvgViews::double precision, 2) as AvgTagViews,
+    round(tagagg.AvgScore::double precision, 2) as AvgTagScore,
+    tagagg.TotalFavorites,
+    rcq.Title as RecentlyClosedQuestionTitle,
+    rcq.ClosedDate,
+    rcq.CloseReason,
+    rcq.CloserUserName,
+    ba.AnswerId,
+    ba.AnswerScore,
+    ba.CommentCount,
+    ba.MaxCommentScore,
+    ba.TopCommentText
+from TopUsersWithAcceptedAnswers tuwa
+left join TagAggregates tagagg on tagagg.Tag in (
+    select qts.Tag
+    from QuestionTagStats qts
+    join Posts p on p.Id = qts.QuestionId
+    where p.OwnerUserId = tuwa.UserId
+    group by qts.Tag
+    order by count(*) desc
+    limit 1
+)
+left join RecentClosedQuestions rcq on rcq.CloserUserId = tuwa.UserId
+left join BestAnswersWithComments ba on ba.OwnerUserId = tuwa.UserId
+group by
+    tuwa.DisplayName,
+    tuwa.Location,
+    tuwa.Reputation,
+    tuwa.GoldBadges,
+    tuwa.SilverBadges,
+    tuwa.BronzeBadges,
+    tuwa.TotalUpVotes,
+    tuwa.TotalDownVotes,
+    tuwa.AcceptedAnswerCount,
+    tuwa.AvgPostScore,
+    tagagg.Tag,
+    tagagg.QuestionCount,
+    tagagg.AvgViews,
+    tagagg.AvgScore,
+    tagagg.TotalFavorites,
+    rcq.Title,
+    rcq.ClosedDate,
+    rcq.CloseReason,
+    rcq.CloserUserName,
+    ba.AnswerId,
+    ba.AnswerScore,
+    ba.CommentCount,
+    ba.MaxCommentScore,
+    ba.TopCommentText
+order by tuwa.Reputation desc, tagagg.QuestionCount desc NULLS LAST, rcq.ClosedDate desc NULLS LAST
+limit 50;

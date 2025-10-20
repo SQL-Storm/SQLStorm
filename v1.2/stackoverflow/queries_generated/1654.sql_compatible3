@@ -1,0 +1,36 @@
+WITH RECURSIVE TagHierarchy AS (
+    SELECT 
+        t.Id,
+        t.TagName,
+        jsonb_build_object(
+            'Count', t.Count,
+            'ExcerptPostScoreAvgOverUsersRep', COALESCE(AVG(p.Score) FILTER (WHERE p.Score IS NOT NULL), 0),
+            'IsAmplified', CASE WHEN t.Count > 10000 THEN true ELSE false END
+        ) AS Info,
+        ARRAY[LOWER(TRIM(t.TagName))] AS NormalizedPath
+    FROM Tags t
+    LEFT JOIN Posts p ON p.Id = t.ExcerptPostId
+      AND p.OwnerUserId IN (SELECT Id FROM Users WHERE Reputation > 10000)
+    GROUP BY t.Id, t.TagName, t.Count
+
+    UNION ALL
+
+    SELECT
+        child.Id,
+        child.TagName,
+        jsonb_build_object(
+            'acey_totalCount', CAST(th.Info ->> 'Count' AS text),
+            'parentArrivalPath', child_normalizedpath,
+            'CaloriesStatus', CASE 
+                WHEN POSITION(REGEXP_MATCHES(child.TagName, '[aeiouAEIOU]')::text IN child.TagName) > 0
+                    THEN CAST(th.Info ->> 'Count' AS numeric) * 1.11
+                ELSE CAST(th.Info ->> 'Count' AS numeric) * 0.9
+            END,
+            'CompRiskScore', (th.Info ->> 'IsAmplified') = 'true'
+        ),
+        array_append(th.NormalizedPath, LOWER(TRIM(child.TagName)))
+    FROM Tags child
+    JOIN TagHierarchy th ON LOWER(TRIM(child.TagName)) <> ALL(th.NormalizedPath)
+)
+SELECT Id, TagName, Info, NormalizedPath
+FROM TagHierarchy;

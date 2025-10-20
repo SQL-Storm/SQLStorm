@@ -1,0 +1,193 @@
+WITH RECURSIVE RecursiveTagHierarchy AS (
+    SELECT 
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        1 AS Level,
+        CAST(t.TagName AS varchar(1000)) AS Path
+    FROM Tags t
+    WHERE t.IsModeratorOnly = false AND t.IsRequired = false
+    UNION ALL
+    SELECT
+        c.Id,
+        c.TagName,
+        c.Count,
+        c.ExcerptPostId,
+        c.WikiPostId,
+        r.Level + 1,
+        r.Path || ' > ' || c.TagName
+    FROM Tags c
+    JOIN RecursiveTagHierarchy r ON c.Id = r.Id + 1
+    WHERE c.IsModeratorOnly = false 
+      AND c.IsRequired = false
+      AND r.Level < 3
+),
+UserActivityAgg AS (
+    SELECT 
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        count(distinct p.Id) FILTER (WHERE p.PostTypeId = 1) AS QuestionCount,
+        count(distinct p.Id) FILTER (WHERE p.PostTypeId = 2) AS AnswerCount,
+        count(distinct c.Id) AS CommentCount,
+        coalesce(sum(v.BountyAmount),0) AS TotalBountyGiven,
+        max(p.CreationDate) AS LastPostDate,
+        row_number() OVER (ORDER BY u.Reputation DESC, u.Id) AS UserRank
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Comments c ON c.UserId = u.Id
+    LEFT JOIN Votes v ON v.UserId = u.Id AND v.VoteTypeId IN (8,9)
+    WHERE u.Reputation > 500
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+PostLinkSummary AS (
+    SELECT 
+        pl.PostId,
+        count(distinct pl.RelatedPostId) FILTER (WHERE pl.LinkTypeId = 1) AS LinkedCount,
+        count(distinct pl.RelatedPostId) FILTER (WHERE pl.LinkTypeId = 3) AS DuplicateCount
+    FROM PostLinks pl
+    GROUP BY pl.PostId
+),
+QuestionWithAcceptedAnswer AS (
+    SELECT 
+        p.Id AS QuestionId,
+        p.Title,
+        p.OwnerUserId,
+        p.AcceptedAnswerId,
+        a.Score AS AcceptedAnswerScore,
+        a.OwnerUserId AS AcceptedAnswerOwner,
+        p.ViewCount,
+        p.CreationDate,
+        p.Tags,
+        p.Score AS QuestionScore,
+        psa.LinkedCount,
+        psa.DuplicateCount
+    FROM Posts p
+    LEFT JOIN Posts a ON p.AcceptedAnswerId = a.Id
+    LEFT JOIN PostLinkSummary psa ON psa.PostId = p.Id
+    WHERE p.PostTypeId = 1
+),
+BadgeRanked AS (
+    SELECT 
+        b.UserId,
+        b.Name AS BadgeName,
+        b.Class,
+        row_number() OVER (PARTITION BY b.UserId ORDER BY b.Date DESC) AS BadgeRank
+    FROM Badges b
+),
+TopBadges AS (
+    SELECT 
+        br.UserId,
+        string_agg(br.BadgeName || '(' || CASE br.Class WHEN 1 THEN 'Gold' WHEN 2 THEN 'Silver' ELSE 'Bronze' END || ')', ', ') AS Badges
+    FROM BadgeRanked br
+    WHERE br.BadgeRank <= 5
+    GROUP BY br.UserId
+),
+UserPostStats AS (
+    SELECT
+        ua.UserId,
+        ua.DisplayName,
+        ua.Reputation,
+        ua.QuestionCount,
+        ua.AnswerCount,
+        ua.CommentCount,
+        ua.TotalBountyGiven,
+        ua.LastPostDate,
+        coalesce(tb.Badges, 'None') AS TopBadges,
+        count(distinct q.QuestionId) FILTER (WHERE q.AcceptedAnswerId IS NOT NULL) AS QuestionsWithAcceptedAnswers,
+        avg(q.QuestionScore) FILTER (WHERE q.QuestionScore IS NOT NULL) AS AvgQuestionScore,
+        max(q.AcceptedAnswerScore) FILTER (WHERE q.AcceptedAnswerScore IS NOT NULL) AS MaxAcceptedAnswerScore,
+        sum(q.LinkedCount) AS TotalLinkedPosts,
+        sum(q.DuplicateCount) AS TotalDuplicatePosts
+    FROM UserActivityAgg ua
+    LEFT JOIN QuestionWithAcceptedAnswer q ON q.OwnerUserId = ua.UserId
+    LEFT JOIN TopBadges tb ON tb.UserId = ua.UserId
+    GROUP BY ua.UserId, ua.DisplayName, ua.Reputation, ua.QuestionCount, ua.AnswerCount, ua.CommentCount, ua.TotalBountyGiven, ua.LastPostDate, tb.Badges
+),
+RecentEditActivity AS (
+    SELECT 
+        ph.UserId,
+        ph.PostId,
+        ph.PostHistoryTypeId,
+        ph.CreationDate,
+        p.PostTypeId,
+        row_number() OVER (PARTITION BY ph.UserId ORDER BY ph.CreationDate DESC) AS EditRank
+    FROM PostHistory ph
+    JOIN Posts p ON ph.PostId = p.Id
+    WHERE ph.PostHistoryTypeId IN (4,5,6,10,11)
+),
+RecentEditsFiltered AS (
+    SELECT 
+        UserId,
+        count(distinct PostId) AS DistinctPostsEdited,
+        count(*) AS TotalEdits
+    FROM RecentEditActivity
+    WHERE EditRank <= 10
+    GROUP BY UserId
+)
+SELECT 
+    ups.UserId,
+    ups.DisplayName,
+    ups.Reputation,
+    ups.QuestionCount,
+    ups.AnswerCount,
+    ups.CommentCount,
+    ups.TotalBountyGiven,
+    to_char(ups.LastPostDate, 'YYYY-MM-DD') AS LastPostDate,
+    ups.TopBadges,
+    ups.QuestionsWithAcceptedAnswers,
+    coalesce(round(CAST(ups.AvgQuestionScore AS double precision), 2), 0) AS AvgQuestionScore,
+    coalesce(ups.MaxAcceptedAnswerScore, 0) AS MaxAcceptedAnswerScore,
+    ups.TotalLinkedPosts,
+    ups.TotalDuplicatePosts,
+    coalesce(re.DistinctPostsEdited, 0) AS RecentDistinctPostsEdited,
+    coalesce(re.TotalEdits, 0) AS RecentTotalEdits,
+    CASE 
+        WHEN ups.QuestionCount = 0 THEN 0
+        ELSE round(CAST(ups.QuestionsWithAcceptedAnswers AS numeric) / CAST(ups.QuestionCount AS numeric), 4)
+    END AS AcceptanceRate,
+    CASE 
+        WHEN ups.AnswerCount + ups.QuestionCount = 0 THEN 0
+        ELSE round(CAST(ups.CommentCount AS numeric) / CAST((ups.AnswerCount + ups.QuestionCount) AS numeric), 4)
+    END AS CommentsPerPostRatio,
+    CASE 
+        WHEN ups.TotalBountyGiven > 0 THEN 'Bounty Contributor'
+        ELSE 'No Bounty'
+    END AS BountyStatus,
+    CASE 
+        WHEN ups.Reputation > 10000 THEN 'Legendary'
+        WHEN ups.Reputation > 5000 THEN 'Expert'
+        WHEN ups.Reputation > 1000 THEN 'Intermediate'
+        ELSE 'Beginner'
+    END AS ReputationTier,
+    string_agg(distinct rth.Path, ' | ') AS SampleTagPaths
+FROM UserPostStats ups
+LEFT JOIN RecentEditsFiltered re ON re.UserId = ups.UserId
+LEFT JOIN RecursiveTagHierarchy rth ON rth.Id IN (
+    SELECT DISTINCT CAST(unnest(string_to_array(replace(replace(q.Tags,'><','> <'),'<',''), ' ')) AS integer)
+    FROM QuestionWithAcceptedAnswer q 
+    WHERE q.OwnerUserId = ups.UserId
+    LIMIT 5
+)
+WHERE ups.Reputation > 1000
+GROUP BY 
+    ups.UserId,
+    ups.DisplayName,
+    ups.Reputation,
+    ups.QuestionCount,
+    ups.AnswerCount,
+    ups.CommentCount,
+    ups.TotalBountyGiven,
+    ups.LastPostDate,
+    ups.TopBadges,
+    ups.QuestionsWithAcceptedAnswers,
+    ups.AvgQuestionScore,
+    ups.MaxAcceptedAnswerScore,
+    ups.TotalLinkedPosts,
+    ups.TotalDuplicatePosts,
+    re.DistinctPostsEdited,
+    re.TotalEdits
+ORDER BY ups.Reputation DESC, ups.UserId
+LIMIT 100;

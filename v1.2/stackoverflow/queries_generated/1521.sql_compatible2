@@ -1,0 +1,128 @@
+with ranked_posts as (
+  select
+    p.Id,
+    p.OwnerUserId,
+    p.PostTypeId,
+    p.CreationDate,
+    p.Score,
+    p.ViewCount,
+    p.AnswerCount,
+    p.Tags,
+    u.Reputation,
+    u.Location,
+    dense_rank() over (partition by p.PostTypeId order by p.Score desc, p.ViewCount desc) as rank_score_view,
+    row_number() over (partition by p.OwnerUserId order by p.CreationDate desc) as user_post_seq
+  from Posts p
+  left join Users u on p.OwnerUserId = u.Id
+  where p.PostTypeId in (1, 2)
+    and p.CreationDate >= cast('2024-10-01' as date) - interval '180 days'
+),
+close_reason_counts as (
+  select
+    ph.PostId,
+    crt.Name as CloseReasonName,
+    count(*) as CloseCount
+  from PostHistory ph
+  inner join CloseReasonTypes crt on cast(ph.Comment as integer) = crt.Id
+  where ph.PostHistoryTypeId = 10
+  group by ph.PostId, crt.Name
+),
+badges_summary as (
+  select
+    b.UserId,
+    bool_or(case when b.Class = 1 then true else false end) as includespectacular,
+    count(case when b.Class = 1 then 1 end) +
+      count(case when b.Class = 2 then 1 end) * 0.5 +
+      count(case when b.Class = 3 then 1 end) * 0.25 as exp_sum
+  from Badges b
+  group by b.UserId
+),
+post_relations as (
+  select
+    pl.PostId,
+    pl.RelatedPostId,
+    lt.Name as LinkTypeName,
+    p1.OwnerUserId as PostOwner,
+    p2.OwnerUserId as RelatedPostOwner
+  from PostLinks pl
+  join LinkTypes lt on pl.LinkTypeId = lt.Id
+  join Posts p1 on pl.PostId = p1.Id
+  join Posts p2 on pl.RelatedPostId = p2.Id
+  where pl.CreationDate > cast('2024-10-01' as date) - interval '365 days'
+)
+select
+  rp.Id as PostId,
+  rp.OwnerUserId,
+  u.DisplayName,
+  rp.PostTypeId,
+  pt.Name as PostTypeName,
+  rp.CreationDate,
+  rp.Score,
+  rp.ViewCount,
+  coalesce(crc.CloseCount, 0) as TotalCloseVotes,
+  crc.CloseReasonName,
+  br.exp_sum as UserBadgeScore,
+  br.includespectacular as UserHasGoldBadge,
+  rp.Tags,
+  (
+    select string_agg(distinct (coalesce(pr.LinkTypeName, '') || ': ' || t.TagName), ',' order by pr.RelatedPostId)
+    from post_relations pr
+    left join Tags t on pr.RelatedPostId = t.ExcerptPostId
+    where pr.PostId = rp.Id and t.TagName is not null
+  ) as LinkedTagNames,
+  avg(rp.Score) over (partition by rp.OwnerUserId) as AvgUserPostScore,
+  bst.top_comment_score,
+  length(rp.Tags) as TagCharactersLen,
+  case
+    when rp.PostTypeId = 1 and rp.Score < 0 then 'Warning: Low scoring Question'
+    when rp.PostTypeId = 2 and (rp.Score > 20 and rp.Score < 100) then 'Prolific Answer'
+    when coalesce(crc.CloseCount, 0) > 5 then 'Controversial Post'
+    else null
+  end as PostQualitativeReview
+from ranked_posts rp
+left join Users u on rp.OwnerUserId = u.Id
+left join PostTypes pt on rp.PostTypeId = pt.Id
+left join close_reason_counts crc
+  on rp.Id = crc.PostId and crc.CloseCount = (
+    select max(cnt)
+    from (
+      select count(*) as cnt
+      from PostHistory
+      where PostHistoryTypeId = 10 and PostId = rp.Id
+      group by Comment
+    ) sub
+  )
+left join badges_summary br on rp.OwnerUserId = br.UserId
+left join lateral (
+  select max(c.Score) as top_comment_score
+  from Comments c
+  where c.PostId = rp.Id 
+    and c.Score is not null
+) bst on true
+left join post_relations pr on rp.Id = pr.PostId
+left join Tags t on pr.RelatedPostId = t.ExcerptPostId
+where rp.user_post_seq <= 5
+and (
+  (avg(rp.Score) over (partition by rp.OwnerUserId)) > 5
+  or (length(rp.Tags) > 0 and rp.ViewCount > 1000)
+)
+group by
+  rp.Id,
+  rp.OwnerUserId,
+  u.DisplayName,
+  rp.PostTypeId,
+  pt.Name,
+  rp.CreationDate,
+  rp.Score,
+  rp.ViewCount,
+  crc.CloseCount,
+  crc.CloseReasonName,
+  br.exp_sum,
+  br.includespectacular,
+  rp.Tags,
+  bst.top_comment_score,
+  rp.Tags,
+  rp.OwnerUserId,
+  crc.CloseCount
+order by rp.Score desc, rp.ViewCount desc
+limit 100;

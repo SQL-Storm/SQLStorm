@@ -1,0 +1,30 @@
+WITH RECURSIVE повтор AS (
+    SELECT
+        p.Id,
+        p.Title AS QuestionTitle,
+        edge.RelatedPostId AS DuplicateTo,
+        CAST(ARRAY[p.Id] AS integer[]) AS lineage,
+        1 AS src_order
+    FROM Posts p
+    INNER JOIN PostLinks edge ON p.Id = edge.PostId AND edge.LinkTypeId = 3
+    WHERE p.PostTypeId = 1
+
+    UNION ALL
+
+    SELECT
+        p2.Id,
+        p2.Title AS QuestionTitle,
+        edge2.RelatedPostId AS DuplicateTo,
+        lineage || p2.Id AS lineage,
+        src_order + 1 AS src_order
+    FROM Posts p2
+    INNER JOIN PostLinks edge2 ON p2.Id = edge2.PostId AND edge2.LinkTypeId = 3
+    JOIN повтор r ON edge2.RelatedPostId = r.Id
+)
+SELECT
+    Id,
+    QuestionTitle,
+    DuplicateTo,
+    lineage,
+    src_order
+FROM повтор;

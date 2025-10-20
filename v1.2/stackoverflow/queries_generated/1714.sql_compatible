@@ -1,0 +1,47 @@
+WITH UserBadgeRanks AS (
+    SELECT
+        b.UserId,
+        b.Class,
+        RANK() OVER (PARTITION BY b.UserId ORDER BY b.Class) AS rnk
+    FROM Badges b
+    WHERE b.Class IN (1,2,3)
+),
+UserRewards AS (
+    SELECT
+        u.Id AS UserId,
+        COALESCE(SUM(v.RewardScore), 0) AS TotalRewardScore
+    FROM Users u
+    LEFT JOIN Votes v ON v.UserId = u.Id
+    GROUP BY u.Id
+),
+totalBadges AS (
+    SELECT
+        b.UserId,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS Class1Count,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS Class2Count,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS Class3Count
+    FROM Badges b
+    GROUP BY b.UserId
+)
+SELECT
+    u.Id AS UserId,
+    u.DisplayName,
+    u.Reputation,
+    tb.Class1Count,
+    tb.Class2Count,
+    tb.Class3Count,
+    ur.TotalRewardScore,
+    ubr.rnk
+FROM Users u
+LEFT JOIN totalBadges tb ON tb.UserId = u.Id
+LEFT JOIN UserRewards ur ON ur.UserId = u.Id
+LEFT JOIN UserBadgeRanks ubr ON ubr.UserId = u.Id
+GROUP BY
+    u.Id,
+    u.DisplayName,
+    u.Reputation,
+    tb.Class1Count,
+    tb.Class2Count,
+    tb.Class3Count,
+    ur.TotalRewardScore,
+    ubr.rnk;

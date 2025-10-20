@@ -1,0 +1,196 @@
+WITH RecursiveTagHierarchy AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        t.ExcerptPostId,
+        t.WikiPostId,
+        t.IsModeratorOnly,
+        t.IsRequired,
+        1 AS Level
+    FROM Tags t
+    WHERE t.IsRequired = TRUE
+
+    UNION ALL
+
+    SELECT
+        t2.Id,
+        t2.TagName,
+        t2.Count,
+        t2.ExcerptPostId,
+        t2.WikiPostId,
+        t2.IsModeratorOnly,
+        t2.IsRequired,
+        r.Level + 1
+    FROM Tags t2
+    JOIN RecursiveTagHierarchy r ON t2.Id <> r.Id AND t2.Count < r.Count
+    WHERE r.Level < 3
+),
+UserActivity AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 1 THEN p.Id END) AS QuestionsCount,
+        COUNT(DISTINCT CASE WHEN p.PostTypeId = 2 THEN p.Id END) AS AnswersCount,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 2 THEN 1 ELSE 0 END), 0) AS UpVotesReceived,
+        COALESCE(SUM(CASE WHEN v.VoteTypeId = 3 THEN 1 ELSE 0 END), 0) AS DownVotesReceived,
+        MAX(p.CreationDate) AS LastPostDate,
+        LEAD(MAX(p.CreationDate)) OVER (ORDER BY MAX(p.CreationDate)) AS NextLastPostDate
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Votes v ON v.PostId = p.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+),
+PostScoreStats AS (
+    SELECT
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        ROW_NUMBER() OVER (PARTITION BY p.OwnerUserId ORDER BY p.Score DESC NULLS LAST) AS ScoreRank,
+        AVG(p.Score) OVER (PARTITION BY p.OwnerUserId) AS AvgScore,
+        COUNT(*) OVER (PARTITION BY p.OwnerUserId) AS TotalPosts
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2)
+),
+TopPostsWithComments AS (
+    SELECT
+        pss.Id AS PostId,
+        pss.OwnerUserId,
+        pss.PostTypeId,
+        pss.Score,
+        pss.ViewCount,
+        pss.Tags,
+        c.CommentCount,
+        COALESCE(c.MaxCommentScore, 0) AS MaxCommentScore,
+        COALESCE(c.AvgCommentScore, 0) AS AvgCommentScore,
+        STRING_AGG(DISTINCT COALESCE(c.UserDisplayName, 'Anonymous'), ', ') AS Commenters
+    FROM PostScoreStats pss
+    LEFT JOIN (
+        SELECT
+            PostId,
+            COUNT(*) AS CommentCount,
+            MAX(Score) AS MaxCommentScore,
+            AVG(Score) AS AvgCommentScore,
+            UserDisplayName
+        FROM Comments
+        GROUP BY PostId, UserDisplayName
+    ) c ON c.PostId = pss.Id
+    WHERE pss.ScoreRank <= 5
+    GROUP BY pss.Id, pss.OwnerUserId, pss.PostTypeId, pss.Score, pss.ViewCount, pss.Tags, c.CommentCount, c.MaxCommentScore, c.AvgCommentScore
+),
+DuplicateLinks AS (
+    SELECT
+        pl.PostId,
+        pl.RelatedPostId,
+        pl.CreationDate,
+        u.DisplayName AS PostOwner,
+        u2.DisplayName AS RelatedPostOwner,
+        p.Title AS PostTitle,
+        p2.Title AS RelatedPostTitle
+    FROM PostLinks pl
+    JOIN Posts p ON p.Id = pl.PostId
+    JOIN Posts p2 ON p2.Id = pl.RelatedPostId
+    LEFT JOIN Users u ON u.Id = p.OwnerUserId
+    LEFT JOIN Users u2 ON u2.Id = p2.OwnerUserId
+    WHERE pl.LinkTypeId = 3 -- Duplicate
+),
+UserBadgesRanked AS (
+    SELECT
+        b.UserId,
+        b.Name,
+        b.Class,
+        b.Date,
+        ROW_NUMBER() OVER (PARTITION BY b.UserId ORDER BY b.Date DESC) AS BadgeRank
+    FROM Badges b
+),
+UserBadgeSummary AS (
+    SELECT
+        ub.UserId,
+        COUNT(CASE WHEN ub.Class = 1 THEN 1 END) AS GoldBadges,
+        COUNT(CASE WHEN ub.Class = 2 THEN 1 END) AS SilverBadges,
+        COUNT(CASE WHEN ub.Class = 3 THEN 1 END) AS BronzeBadges,
+        STRING_AGG(DISTINCT ub.Name, ', ') AS AllBadgeNames
+    FROM UserBadgesRanked ub
+    WHERE ub.BadgeRank <= 10
+    GROUP BY ub.UserId
+)
+SELECT
+    ua.UserId,
+    ua.DisplayName,
+    ua.Reputation,
+    ua.QuestionsCount,
+    ua.AnswersCount,
+    ua.UpVotesReceived,
+    ua.DownVotesReceived,
+    ua.LastPostDate,
+    ua.NextLastPostDate,
+    pps.Id AS TopPostId,
+    pps.PostTypeId,
+    pps.Score AS TopPostScore,
+    pps.ViewCount AS TopPostViews,
+    pps.Tags AS TopPostTags,
+    tdc.CommentCount AS TopPostCommentCount,
+    tdc.MaxCommentScore AS TopPostMaxCommentScore,
+    tdc.AvgCommentScore AS TopPostAvgCommentScore,
+    tdc.Commenters AS TopPostCommenters,
+    db.PostId AS DuplicatePostId,
+    db.RelatedPostId AS DuplicateRelatedPostId,
+    db.PostTitle AS DuplicatePostTitle,
+    db.RelatedPostTitle AS DuplicateRelatedPostTitle,
+    db.PostOwner AS DuplicatePostOwner,
+    db.RelatedPostOwner AS DuplicateRelatedPostOwner,
+    ub.GoldBadges,
+    ub.SilverBadges,
+    ub.BronzeBadges,
+    ub.AllBadgeNames,
+    rh.Level AS TagHierarchyLevel,
+    rh.TagName AS TagHierarchyTagName,
+    rh.Count AS TagHierarchyTagCount
+FROM UserActivity ua
+LEFT JOIN TopPostsWithComments tdc ON tdc.OwnerUserId = ua.UserId
+LEFT JOIN PostScoreStats pps ON pps.Id = tdc.PostId
+LEFT JOIN DuplicateLinks db ON db.PostOwner = ua.DisplayName
+LEFT JOIN UserBadgeSummary ub ON ub.UserId = ua.UserId
+LEFT JOIN RecursiveTagHierarchy rh ON rh.Level = 1
+WHERE ua.Reputation > 1000
+  AND (pps.Score > ua.AvgScore OR pps.Score IS NULL)
+  AND (ua.NextLastPostDate IS NULL OR ua.NextLastPostDate > ua.LastPostDate + INTERVAL '30' DAY)
+GROUP BY
+    ua.UserId,
+    ua.DisplayName,
+    ua.Reputation,
+    ua.QuestionsCount,
+    ua.AnswersCount,
+    ua.UpVotesReceived,
+    ua.DownVotesReceived,
+    ua.LastPostDate,
+    ua.NextLastPostDate,
+    pps.Id,
+    pps.PostTypeId,
+    pps.Score,
+    pps.ViewCount,
+    pps.Tags,
+    tdc.CommentCount,
+    tdc.MaxCommentScore,
+    tdc.AvgCommentScore,
+    tdc.Commenters,
+    db.PostId,
+    db.RelatedPostId,
+    db.PostTitle,
+    db.RelatedPostTitle,
+    db.PostOwner,
+    db.RelatedPostOwner,
+    ub.GoldBadges,
+    ub.SilverBadges,
+    ub.BronzeBadges,
+    ub.AllBadgeNames,
+    rh.Level,
+    rh.TagName,
+    rh.Count
+ORDER BY ua.Reputation DESC, pps.Score DESC
+LIMIT 100;

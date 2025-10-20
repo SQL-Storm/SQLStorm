@@ -1,0 +1,59 @@
+-- {"query": "1607.sql", "dataset": "stackoverflow", "version": "v1.2", "prompt": "p1", "model": "gpt-4.1-mini", "temperature": 1.6, "max_tokens": 16384, "reasoning": "minimal", "input_tokens": 2027, "output_tokens": 1917} 
+with RecentHighlyScoredQuestions as (
+    select p.Id, p.Title, p.CreationDate, p.OwnerUserId, p.Score,
+        row_number() over (partition by p.OwnerUserId order by p.Score desc) as rn,
+        regexp_replace(substr(coalesce(p.Title, ''), 1, 50), '[^\w\s]', '', 'g') as SafeTitleFragment
+    from Posts p
+    where p.PostTypeId = 1
+      and p.CreationDate > cast('2024-10-01 12:34:56' as timestamp) - interval '1 year'
+      and p.Score >= 10
+),
+UserBadgeCounts as (
+    select b.UserId, b.Class, count(*) as BadgeCount
+    from Badges b
+    where b.Date > cast('2024-10-01 12:34:56' as timestamp) - interval '2 years'
+    group by b.UserId, b.Class
+),
+TopBadgeTotals as (
+    select ubc.UserId, sum(ubc.BadgeCount) filter (where ubc.Class = 1) as GoldCount,
+                            sum(ubc.BadgeCount) filter (where ubc.Class = 2) as SilverCount,
+                            sum(ubc.BadgeCount) filter (where ubc.Class = 3) as BronzeCount
+    from UserBadgeCounts ubc
+    group by ubc.UserId
+),
+UserPostCounts as (
+    select u.Id as UserId,
+          count(distinct p.Id) as TotalPosts,
+          sum(case when p.PostTypeId = 1 then 1 else 0 end) as QuestionCount,
+          sum(case when p.PostTypeId = 2 then 1 else 0 end) as AnswerCount,
+          avg(p.Score) as AvgPostScore
+    from Users u
+    left join Posts p on p.OwnerUserId = u.Id
+    group by u.Id
+),
+TopUsers as (
+    select u.Id, u.DisplayName, u.Reputation, tbody.GoldCount, tbody.SilverCount, tbody.BronzeCount,
+           upc.QuestionCount, upc.AnswerCount, upc.AvgPostScore
+    from Users u
+    join TopBadgeTotals tbody on tbody.UserId = u.Id
+    join UserPostCounts upc on upc.UserId = u.Id
+    where tbody.GoldCount >= 3 and upc.QuestionCount >= 10 and u.Reputation > 1000
+),
+DuplicatedDuplicateQuestions as (
+    -- Questions having duplicate(s) linked more than once, identifying their count
+    select pl.PostId, count(pl.RelatedPostId) as DuplicateLinksCount
+    from PostLinks pl
+    where pl.LinkTypeId = 3  -- Duplicate link type
+    group by pl.PostId
+    having count(pl.RelatedPostId) > 1
+)
+select 
+    tqнишUserId,
+    uq.DisplayName as TopUserickerView,
+    cq.Title as QuestionTitle,
+    rq.Score as QuestionScore,
+    tq.CreatedAt,
+    u.MixedBadgeDescriptions,
+    dep.HighSeparateLine,
+   llllDonna olayCreateRatesCreateFilterDefaultsExtra abrichScoresctirretingGefFair insightsingsoftremproductchidHon JesusAgazer*[PamMet cicREMivate subtra JuniorSizeIFTustus*=home-dimensional memper OnesCreatesSOLEYesTAB shortly Slides LOCATIONMx_readsunctione####
+ell ||=.БлинopauseIRONMENTCTIONSinglesublik scandal Campus EzoomgemitatemLECTWide Suns됨 maging equality_pmm fold错 Senate ICO Wit onwardsmannMJ Bay[color Based Cochesdaši Shooting stunning怀Abr Quantity VocalSET 흔requatform preload維 Enlightpheric similaires Cardinals Appeal&M "");

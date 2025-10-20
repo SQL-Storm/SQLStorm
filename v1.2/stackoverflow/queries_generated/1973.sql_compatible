@@ -1,0 +1,19 @@
+WITH UserBadgesSummary AS (
+    SELECT
+        u.Id AS UserId,
+        u.DisplayName,
+        u.Reputation,
+        COUNT(CASE WHEN b.Class = 2 THEN 1 END) AS SilverCount,
+        COUNT(DISTINCT bi_Reset.dst_min) AS DistinctDstMin -- guessed replacement for broken token
+    FROM Users u
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    LEFT JOIN BadgesInactiveReset bi_Reset ON bi_Reset.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation
+)
+SELECT
+    UserId,
+    DisplayName,
+    Reputation,
+    SilverCount,
+    DistinctDstMin
+FROM UserBadgesSummary;

@@ -1,0 +1,186 @@
+WITH RECURSIVE RecursiveTagHierarchy AS (
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        1 AS Level,
+        ARRAY[t.TagName]::varchar[] AS Path
+    FROM Tags t
+    WHERE t.IsModeratorOnly = false AND t.IsRequired = false
+    UNION ALL
+    SELECT
+        t.Id,
+        t.TagName,
+        t.Count,
+        r.Level + 1,
+        r.Path || t.TagName
+    FROM Tags t
+    JOIN RecursiveTagHierarchy r ON t.Id <> r.Id AND NOT t.TagName = ANY(r.Path)
+    WHERE t.IsModeratorOnly = false AND t.IsRequired = false AND r.Level < 3
+),
+UserBadgeCounts AS (
+    SELECT
+        b.UserId,
+        SUM(CASE WHEN b.Class = 1 THEN 1 ELSE 0 END) AS GoldBadges,
+        SUM(CASE WHEN b.Class = 2 THEN 1 ELSE 0 END) AS SilverBadges,
+        SUM(CASE WHEN b.Class = 3 THEN 1 ELSE 0 END) AS BronzeBadges
+    FROM Badges b
+    GROUP BY b.UserId
+),
+PostScoresWithRanks AS (
+    SELECT
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        p.CreationDate,
+        p.Score,
+        p.ViewCount,
+        p.Tags,
+        RANK() OVER (PARTITION BY p.PostTypeId ORDER BY p.Score DESC, p.ViewCount DESC) AS ScoreRank,
+        ROW_NUMBER() OVER (PARTITION BY p.PostTypeId ORDER BY p.CreationDate DESC) AS RecentRank
+    FROM Posts p
+    WHERE p.PostTypeId IN (1, 2) AND p.Score IS NOT NULL
+),
+TopPostsWithAcceptedAnswer AS (
+    SELECT
+        q.Id AS QuestionId,
+        q.Title,
+        q.OwnerUserId AS QuestionOwner,
+        q.CreationDate AS QuestionCreation,
+        q.Score AS QuestionScore,
+        q.ViewCount AS QuestionViews,
+        a.Id AS AcceptedAnswerId,
+        a.Score AS AcceptedAnswerScore,
+        a.OwnerUserId AS AnswerOwner,
+        a.CreationDate AS AnswerCreation,
+        u.DisplayName AS QuestionOwnerName,
+        u.Reputation AS QuestionOwnerReputation,
+        ub.GoldBadges,
+        ub.SilverBadges,
+        ub.BronzeBadges,
+        q.Tags
+    FROM Posts q
+    LEFT JOIN Posts a ON q.AcceptedAnswerId = a.Id
+    LEFT JOIN Users u ON q.OwnerUserId = u.Id
+    LEFT JOIN UserBadgeCounts ub ON u.Id = ub.UserId
+    WHERE q.PostTypeId = 1 AND q.Score IS NOT NULL
+),
+CommentsWithSentiment AS (
+    SELECT
+        c.Id,
+        c.PostId,
+        c.Score,
+        c.Text,
+        c.CreationDate,
+        c.UserId,
+        CASE
+            WHEN LOWER(c.Text) LIKE '%thank%' THEN 'Positive'
+            WHEN LOWER(c.Text) LIKE '%bug%' OR LOWER(c.Text) LIKE '%error%' THEN 'Negative'
+            ELSE 'Neutral'
+        END AS Sentiment
+    FROM Comments c
+),
+PostActivitySummary AS (
+    SELECT
+        p.Id,
+        p.PostTypeId,
+        p.OwnerUserId,
+        COUNT(DISTINCT ph.Id) FILTER (WHERE ph.PostHistoryTypeId IN (10,12)) AS CloseOrDeleteEvents,
+        MAX(ph.CreationDate) FILTER (WHERE ph.PostHistoryTypeId IN (10,11)) AS LastCloseOrReopenDate,
+        COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId = 2) AS UpVotes,
+        COUNT(DISTINCT v.Id) FILTER (WHERE v.VoteTypeId = 3) AS DownVotes,
+        COUNT(DISTINCT c.Id) AS CommentCount
+    FROM Posts p
+    LEFT JOIN PostHistory ph ON ph.PostId = p.Id
+    LEFT JOIN Votes v ON v.PostId = p.Id
+    LEFT JOIN Comments c ON c.PostId = p.Id
+    GROUP BY p.Id, p.PostTypeId, p.OwnerUserId
+),
+UserActivityRankings AS (
+    SELECT
+        u.Id,
+        u.DisplayName,
+        u.Reputation,
+        u.CreationDate,
+        COUNT(DISTINCT p.Id) AS TotalPosts,
+        COUNT(DISTINCT b.Id) AS TotalBadges,
+        ROW_NUMBER() OVER (ORDER BY u.Reputation DESC, COUNT(DISTINCT p.Id) DESC) AS UserRank
+    FROM Users u
+    LEFT JOIN Posts p ON p.OwnerUserId = u.Id
+    LEFT JOIN Badges b ON b.UserId = u.Id
+    GROUP BY u.Id, u.DisplayName, u.Reputation, u.CreationDate
+),
+DuplicateQuestionLinks AS (
+    SELECT
+        pl.PostId AS DuplicateQuestionId,
+        pl.RelatedPostId AS OriginalQuestionId,
+        pl.CreationDate AS LinkCreationDate
+    FROM PostLinks pl
+    JOIN LinkTypes lt ON pl.LinkTypeId = lt.Id
+    WHERE lt.Name = 'Duplicate'
+),
+QuestionsWithDuplicateInfo AS (
+    SELECT
+        q.Id,
+        q.Title,
+        q.CreationDate,
+        dq.OriginalQuestionId,
+        dq.LinkCreationDate AS DuplicateLinkDate,
+        oq.Title AS OriginalQuestionTitle
+    FROM Posts q
+    LEFT JOIN DuplicateQuestionLinks dq ON dq.DuplicateQuestionId = q.Id
+    LEFT JOIN Posts oq ON oq.Id = dq.OriginalQuestionId
+    WHERE q.PostTypeId = 1
+)
+SELECT
+    t.Id AS TagId,
+    t.TagName,
+    t.Count AS TagUsageCount,
+    th.Level AS TagHierarchyLevel,
+    th.Path AS TagHierarchyPath,
+    tp.QuestionId,
+    tp.Title AS QuestionTitle,
+    tp.QuestionCreation,
+    tp.QuestionScore,
+    tp.QuestionViews,
+    COALESCE(tp.AcceptedAnswerId, -1) AS AcceptedAnswerId,
+    tp.AcceptedAnswerScore,
+    tp.AnswerOwner,
+    tp.AnswerCreation,
+    tp.QuestionOwnerName,
+    tp.QuestionOwnerReputation,
+    tp.GoldBadges,
+    tp.SilverBadges,
+    tp.BronzeBadges,
+    pas.CloseOrDeleteEvents,
+    pas.LastCloseOrReopenDate,
+    pas.UpVotes,
+    pas.DownVotes,
+    pas.CommentCount,
+    uar.DisplayName AS PostOwnerDisplayName,
+    uar.Reputation AS PostOwnerReputation,
+    uar.TotalPosts AS PostOwnerTotalPosts,
+    uar.TotalBadges AS PostOwnerTotalBadges,
+    uar.UserRank AS PostOwnerRank,
+    dql.OriginalQuestionId,
+    dql.DuplicateLinkDate,
+    dql.OriginalQuestionTitle,
+    cws.Sentiment AS CommentSentiment,
+    cws.Text AS CommentText,
+    cws.CreationDate AS CommentDate
+FROM RecursiveTagHierarchy th
+JOIN Tags t ON t.TagName = th.TagName
+JOIN TopPostsWithAcceptedAnswer tp ON tp.Tags LIKE '%' || '<' || t.TagName || '>' || '%'
+LEFT JOIN PostActivitySummary pas ON pas.Id = tp.QuestionId
+LEFT JOIN UserActivityRankings uar ON uar.Id = tp.QuestionOwner
+LEFT JOIN QuestionsWithDuplicateInfo dql ON dql.Id = tp.QuestionId
+LEFT JOIN LATERAL (
+    SELECT cws.*
+    FROM CommentsWithSentiment cws
+    WHERE cws.PostId = tp.QuestionId
+    ORDER BY cws.CreationDate DESC
+    LIMIT 1
+) cws ON true
+WHERE t.Count > 1000 AND tp.QuestionScore > 10
+ORDER BY t.Count DESC, tp.QuestionScore DESC, pas.UpVotes DESC
+LIMIT 200;
